@@ -447,6 +447,12 @@
   color: var(--faint);
 }
 
+/* While a software keyboard covers part of the session, the bar yields to the terminal, its keys
+   and the field, and comes back when the keyboard goes. */
+.m-session[data-keyboard] .m-terminal-hud {
+  display: none;
+}
+
 .m-terminal-controls {
   display: flex;
   flex-wrap: wrap;
@@ -483,8 +489,13 @@
 
 /* ---- The composer and the accessory row ------------------------------------------------------ */
 
+/*
+ * Above a software keyboard the composer is lifted by what the keyboard covers beyond the padding
+ * and the tab bar under the session, which the session measures, and by nothing when it covers no
+ * more. The tab bar keeps clear of the home indicator for both.
+ */
 .m-composer {
-  padding-block-end: calc(var(--safe-bottom) + var(--keyboard));
+  padding-block-end: max(0px, calc(var(--keyboard) - var(--under-session, 0px)));
 }
 
 .m-composer-body {

@@ -72,9 +72,10 @@ the zoom and, in view mode, the four moves take one or two rows. The status take
 for the warnings and where the window is and one for what the mode does and how the host presents
 the view, each cut short until More shows all of it; a screen reader reads all of it either way.
 Then come the terminal keys, and the text field as one line with Send beside it. Attachments are
-added in the conversation. However much of the screen the keyboard covers, the terminal keeps at
-least four rows at its default size: when the composer needs more room than is left, it scrolls
-from the bottom, so the field and the keys stay in view above the keyboard. The host is told the
+added in the conversation. While a software keyboard covers part of the session, the bar gives
+way to the terminal, its keys and the field, and the field sits on the keyboard's top edge. The
+terminal keeps at least four rows at its default size in any case: when the composer needs more
+room than is left, it scrolls from the bottom, so the field stays in view. The host is told the
 grid the terminal's surface shows.
 
 A selection in either raw view takes the session's own selection colours. On the desktop a copy

@@ -775,6 +775,53 @@ describe("the phone's raw terminal view (KR-REQ-08.02, 13.18)", () => {
     expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled()
   })
 
+  it('lets the bar yield while a keyboard covers part of the session, and not for what lies under it', async () => {
+    const { port } = fakeHost()
+    // jsdom lays nothing out: a window 800 pixels high, and a session that ends 90 pixels above its
+    // bottom, over the shell's padding and its tab bar.
+    const window800 = Object.getOwnPropertyDescriptor(window, 'innerHeight')
+    Object.defineProperty(window, 'innerHeight', { configurable: true, value: 800 })
+    const rects = vi.spyOn(Element.prototype, 'getBoundingClientRect').mockImplementation(function (
+      this: Element
+    ) {
+      return this.classList.contains('m-session')
+        ? DOMRect.fromRect({ x: 0, y: 100, width: 390, height: 610 })
+        : new DOMRect()
+    })
+    const root = document.documentElement
+    try {
+      await onTerminal(port)
+      const session = document.querySelector<HTMLElement>('.m-session')
+      expect(session?.style.getPropertyValue('--under-session')).toBe('90px')
+      expect(session).not.toHaveAttribute('data-keyboard')
+      // A keyboard that covers no more than what lies under the session covers none of it.
+      act(() => {
+        root.style.setProperty('--keyboard', '80px')
+      })
+      await act(async () => {
+        await Promise.resolve()
+      })
+      expect(session).not.toHaveAttribute('data-keyboard')
+      act(() => {
+        root.style.setProperty('--keyboard', '300px')
+      })
+      await waitFor(() => {
+        expect(session).toHaveAttribute('data-keyboard')
+      })
+      act(() => {
+        root.style.removeProperty('--keyboard')
+      })
+      await waitFor(() => {
+        expect(session).not.toHaveAttribute('data-keyboard')
+      })
+    } finally {
+      rects.mockRestore()
+      root.style.removeProperty('--keyboard')
+      if (window800 === undefined) Reflect.deleteProperty(window, 'innerHeight')
+      else Object.defineProperty(window, 'innerHeight', window800)
+    }
+  })
+
   it('says in two lines what the view is doing, and all of it when asked', async () => {
     const { port } = fakeHost()
     const person = await onTerminal(port)

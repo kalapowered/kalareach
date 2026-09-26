@@ -140,6 +140,9 @@ export function MobileSession({
   // Whether the terminal's status shows all it says, rather than its first two lines.
   const [statusOpen, setStatusOpen] = useState(false)
   const statusId = useId()
+  // Whether a software keyboard hides part of the session.
+  const [keyboardUp, setKeyboardUp] = useState(false)
+  const sessionRef = useRef<HTMLDivElement | null>(null)
   // What the person picked, held here until there is a command that carries bytes to a host. It
   // is shown rather than dropped, because a file that vanishes after a success message is worse
   // than one that says plainly it has not gone anywhere.
@@ -264,6 +267,35 @@ export function MobileSession({
       observer.disconnect()
     }
   }, [pane, zoom, resize, measure])
+
+  // The document measures how much of the screen a software keyboard covers (`--keyboard`). Under
+  // the session there is already the shell's padding and its tab bar, which keeps clear of the
+  // home indicator, and a keyboard covers those first: the composer is lifted by what it covers
+  // beyond them and no more, and while it covers any of the session the terminal's bar yields to
+  // the terminal, its keys and the field.
+  useLayoutEffect(() => {
+    const element = sessionRef.current
+    if (element === null) return
+    const root = document.documentElement
+    const cover = () => {
+      const under = Math.max(0, window.innerHeight - element.getBoundingClientRect().bottom)
+      const covered = parseFloat(getComputedStyle(root).getPropertyValue('--keyboard')) || 0
+      element.style.setProperty('--under-session', `${under}px`)
+      setKeyboardUp(covered > under)
+    }
+    cover()
+    const resized = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(cover)
+    resized?.observe(element)
+    // The keyboard's measure is written on the document's own style.
+    const written = new MutationObserver(cover)
+    written.observe(root, { attributes: true, attributeFilter: ['style'] })
+    window.addEventListener('resize', cover)
+    return () => {
+      resized?.disconnect()
+      written.disconnect()
+      window.removeEventListener('resize', cover)
+    }
+  }, [])
 
   // Restoring the position happens after the view has drawn, which is the only moment the element
   // is tall enough to be scrolled to where it was.
@@ -408,7 +440,12 @@ export function MobileSession({
   ))
 
   return (
-    <div className="m-session" data-pane={pane}>
+    <div
+      className="m-session"
+      ref={sessionRef}
+      data-pane={pane}
+      data-keyboard={keyboardUp ? '' : undefined}
+    >
       <div>
         {lifecycle.banner ? (
           <Banner

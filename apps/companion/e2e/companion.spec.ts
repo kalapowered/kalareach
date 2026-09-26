@@ -913,12 +913,12 @@ test.describe("the phone's room for its terminal", () => {
   const FLOOR = 4
 
   /**
-   * Two phones: the rows the terminal keeps with the keyboard down, and how much of the screen a
-   * software keyboard covers on a phone that size.
+   * Two phones: how much of the screen a software keyboard covers on a phone that size, and the rows
+   * the terminal keeps with the keyboard down and with it up.
    */
   const PHONES = [
-    { width: 320, height: 720, rows: 8, keyboard: 260 },
-    { width: 390, height: 844, rows: 14, keyboard: 336 }
+    { width: 320, height: 720, keyboard: 260, rows: 8, typing: 8 },
+    { width: 390, height: 844, keyboard: 336, rows: 14, typing: 10 }
   ] as const
 
   /** Where a screenshot for this browser goes, so each engine keeps its own. */
@@ -1027,18 +1027,38 @@ test.describe("the phone's room for its terminal", () => {
               .map((element) => element.textContent || element.tagName)
           )
           expect(past).toEqual([])
+          // A keyboard over the page, as a phone's browser measures it: the bar yields, and the
+          // field sits on the keyboard's top edge with the terminal keys above it.
           await keyboard(page, phone.keyboard)
-          await expectRoom(page, FLOOR, 'with the keyboard up')
-          // The field and the terminal keys stay whole in view, above the keyboard.
-          const covered = phone.height - phone.keyboard
-          for (const control of [
-            page.getByLabel('Message this session'),
-            page.getByRole('group', { name: 'Terminal keys' })
-          ]) {
-            await expect(control).toBeInViewport({ ratio: 1 })
-            const box = await control.boundingBox()
-            expect(box === null ? Infinity : box.y + box.height).toBeLessThanOrEqual(covered + 0.5)
-          }
+          await expect(page.locator('.m-terminal-hud')).toBeHidden()
+          await expectRoom(page, phone.typing, 'with the keyboard up')
+          const edge = phone.height - phone.keyboard
+          const field = page.getByLabel('Message this session')
+          await expect(field).toBeInViewport({ ratio: 1 })
+          const box = await field.boundingBox()
+          expect(Math.abs((box === null ? 0 : box.y + box.height) - edge)).toBeLessThanOrEqual(1)
+          const keys = page.getByRole('group', { name: 'Terminal keys' })
+          await expect(keys).toBeInViewport({ ratio: 1 })
+          // The keyboard gone, the bar is back.
+          await keyboard(page, 0)
+          await expect(page.locator('.m-terminal-hud')).toBeVisible()
+          await expectRoom(page, phone.rows, 'with the keyboard gone')
+        })
+
+        // A keyboard that makes the page shorter, as a system that resizes the window for it does:
+        // the terminal keeps its four rows and the field stays whole in view.
+        test(`keeps room on ${surface} at ${phone.width}×${phone.height} in ${mode} mode, with a keyboard that makes the page shorter`, async ({
+          page
+        }) => {
+          await page.setViewportSize({ width: phone.width, height: phone.height })
+          await page.goto(`/harness.html?surface=${surface}&session=${SESSION_MAIN}`)
+          await page.getByRole('tab', { name: 'Terminal' }).click()
+          await expect(page.getByTestId('mobile-terminal-line').first()).toContainText('$ cargo')
+          if (mode === 'view') await page.getByRole('button', { name: 'Look around' }).click()
+          await page.setViewportSize({ width: phone.width, height: phone.height - phone.keyboard })
+          await expectRoom(page, FLOOR, 'on a page the keyboard made shorter')
+          // Whole to the pixel: WebKit can leave a scrolled box's last fraction of a pixel out.
+          await expect(page.getByLabel('Message this session')).toBeInViewport({ ratio: 0.99 })
         })
       }
     }
@@ -1064,7 +1084,7 @@ test.describe("the phone's room for its terminal", () => {
         await page.getByRole('button', { name: 'Less' }).click()
         await page.getByRole('button', { name: 'Take control' }).click()
         await keyboard(page, phone.keyboard)
-        await expectRoom(page, FLOOR, 'the keyboard up')
+        await expectRoom(page, phone.typing, 'the keyboard up')
         await still(page, `terminal-room-13.19-phone-${size}-keyboard-${theme}`)
       })
     }
