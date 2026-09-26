@@ -767,7 +767,15 @@ impl NativeBridges {
                 sources.push((destination.to_string(), bytes));
             }
         }
-        let facts = registration(&sources, &forwarder)?;
+        // A configuration value is as much a part of the registration as a file is: a settings
+        // key can start the forwarder too, so its invocations are read with the files'.
+        let mut registered = sources.clone();
+        for step in &recipe.install {
+            if let BridgeStep::AddConfigurationKey { file, key, value } = step {
+                registered.push((format!("{file} {key}"), value.as_bytes().to_vec()));
+            }
+        }
+        let facts = registration(&registered, &forwarder)?;
         // The forwarder a registration starts reports for the application it names, and a
         // launch of this package admits only its own: a registration for another package's
         // application would be a bridge no launch of either could use.

@@ -674,6 +674,47 @@ fn a_registration_for_another_packages_application_is_refused() {
     assert_eq!(settled, Settled::Applied);
 }
 
+/// A registration a recipe writes as a configuration value is read as a registration too: files
+/// that start the forwarder for the package's own application beside a settings key that starts
+/// it for another's are refused, and nothing is written.
+#[test]
+fn a_configuration_value_that_registers_another_application_is_refused() {
+    let site = Site::new();
+    let before = site.tree();
+    let mut recipe = serde_json::to_value(recipe()).expect("the recipe encodes");
+    let hooks = serde_json::json!({
+        "SessionStart": [{"hooks": [{"type": "command", "command": "kr-hook",
+                                      "args": ["another-agent", "hook"]}]}]
+    })
+    .to_string();
+    recipe["install"]
+        .as_array_mut()
+        .expect("the install steps")
+        .push(
+            serde_json::json!({"type": "add_configuration_key", "file": "settings.json",
+                                  "key": "hooks", "value": hooks}),
+        );
+    recipe["remove"]
+        .as_array_mut()
+        .expect("the removal steps")
+        .insert(
+            0,
+            serde_json::json!({"type": "remove_configuration_key", "file": "settings.json",
+                               "key": "hooks"}),
+        );
+    let target = BridgeTarget {
+        recipe: serde_json::from_value(recipe).expect("a recipe"),
+        ..site.release()
+    };
+    let settled = site
+        .bridges()
+        .reconcile(&plugin(), Some(&target))
+        .expect("reconciles");
+    let reason = refused(&settled);
+    assert!(reason.contains("another-agent"), "{reason}");
+    assert_eq!(site.tree(), before, "nothing was written");
+}
+
 /// A forwarder the host cannot name, and an application it does not know, refuse the recipe.
 #[test]
 fn a_recipe_the_host_cannot_place_is_refused() {
