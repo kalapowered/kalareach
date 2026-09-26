@@ -1,0 +1,16 @@
+[package]
+name = "kr-perf"
+description = "The performance harness: the record a figure is kept in beside its host's conditions, and the checks on the performance scripts"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dev-dependencies]
+# Each check gets a directory of its own on this machine's own disk, gone with the check.
+tempfile.workspace = true
+
+[lints]
+workspace = true
