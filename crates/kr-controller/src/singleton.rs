@@ -42,7 +42,8 @@ impl SingletonLock {
     /// # Errors
     ///
     /// Returns [`ControllerError::AlreadyRunning`] when another daemon holds the environment, and
-    /// a registry failure when the generation cannot be advanced.
+    /// [`ControllerError::Ipc`] naming the lock file when it cannot be opened or locked for any
+    /// other reason.
     pub fn acquire(path: &Path, environment_id: EnvironmentId) -> Result<Self> {
         let file = Self::open(path, environment_id)?;
         Self::lock(&file, path, environment_id)?;
@@ -112,16 +113,26 @@ impl SingletonLock {
     }
 
     /// What a lock that was not taken means.
+    ///
+    /// Only contention is another daemon: a lock another open file holds is refused with
+    /// `EWOULDBLOCK`. Any other refusal is the lock itself failing, such as `ENOLCK` from a
+    /// filesystem that cannot lock at all, and is reported as that failure, with the file.
     #[cfg(unix)]
     fn not_locked(
         error: rustix::io::Errno,
         path: &Path,
         environment_id: EnvironmentId,
     ) -> ControllerError {
-        let _ = (error, path);
-        ControllerError::AlreadyRunning {
-            environment: environment_id.to_string(),
+        if error == rustix::io::Errno::WOULDBLOCK {
+            return ControllerError::AlreadyRunning {
+                environment: environment_id.to_string(),
+            };
         }
+        ControllerError::Ipc(kr_ipc::IpcError::io(
+            "take the singleton lock",
+            path,
+            std::io::Error::from(error),
+        ))
     }
 
     #[cfg(windows)]
@@ -144,18 +155,25 @@ impl SingletonLock {
     }
 
     /// What an open of the lock file that failed means.
+    ///
+    /// The daemon that owns the environment holds the file open with no sharing, so every other
+    /// open of it fails with a sharing violation, and that is another daemon. The standard library
+    /// gives that error no kind of its own, so it is told by its code. Anything else, a refused
+    /// access among it, is the open failing, and is reported as that failure, with the file.
     #[cfg(windows)]
     fn not_opened(
         error: std::io::Error,
         path: &Path,
         environment_id: EnvironmentId,
     ) -> ControllerError {
-        match error.kind() {
-            std::io::ErrorKind::PermissionDenied => ControllerError::AlreadyRunning {
+        /// What Windows says when another handle holds the file.
+        const ERROR_SHARING_VIOLATION: i32 = 32;
+        if error.raw_os_error() == Some(ERROR_SHARING_VIOLATION) {
+            return ControllerError::AlreadyRunning {
                 environment: environment_id.to_string(),
-            },
-            _ => ControllerError::Ipc(kr_ipc::IpcError::io("open the singleton lock", path, error)),
+            };
         }
+        ControllerError::Ipc(kr_ipc::IpcError::io("open the singleton lock", path, error))
     }
 
     #[cfg(windows)]
