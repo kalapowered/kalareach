@@ -1449,6 +1449,175 @@ mod tests {
         });
     }
 
+    /// KR-REQ-03.07: a call that comes to the record while a step holds it waits no longer than
+    /// one bound from its own start, the bound its own publication would have shared. A first step
+    /// held inside its publication for longer than that keeps neither a second step nor an open
+    /// waiting after it: each writes nothing and answers a storage failure that names the record,
+    /// and the record is the first step's once it is let go.
+    #[test]
+    fn a_call_kept_waiting_past_its_bound_by_another_step_writes_nothing() {
+        let environment = Environment::create();
+        let store = environment.open();
+        let expected = store.group().expect("reads the group").expected();
+        let (arrived, arrival) = mpsc::channel();
+        let (resume, resumed) = mpsc::channel();
+        seam::register(
+            &environment.record(),
+            Boundary::Flushed,
+            Interruption::Pause {
+                arrived,
+                resume: resumed,
+            },
+        );
+        let resume = Resume(resume);
+        let (first_into, second_into) = (some_group(), some_group());
+        let (environment, store) = (&environment, &store);
+        std::thread::scope(|scope| {
+            let first = scope.spawn(move || {
+                store.join(&environment.lock, first_into, expected, &approval(), 2_000)
+            });
+            arrival
+                .recv_timeout(WAIT)
+                .expect("the first step reached its publication");
+            let (told, locking) = mpsc::channel();
+            seam::watch_lock(&environment.record(), told.clone());
+            seam::watch_lock(&environment.record(), told);
+            let (answered, answers) = mpsc::channel();
+            let started = std::time::Instant::now();
+            let second = {
+                let answered = answered.clone();
+                scope.spawn(move || {
+                    let taken =
+                        store.join(&environment.lock, second_into, expected, &approval(), 3_000);
+                    let _ = answered.send(started.elapsed());
+                    taken
+                })
+            };
+            let opener = scope.spawn(move || {
+                let opened = MachineStore::open(&environment.lock, &environment.paths(), 3_000);
+                let _ = answered.send(started.elapsed());
+                opened
+            });
+            for _ in 0..2 {
+                assert!(
+                    locking
+                        .recv_timeout(WAIT)
+                        .expect("a call came to the record"),
+                    "a call found the record free while the first step held it"
+                );
+            }
+            // The first step is held until both have answered, which is longer than the bound.
+            for _ in 0..2 {
+                let took = answers
+                    .recv_timeout(kr_flush::HELD_RENAME_BOUND + WAIT)
+                    .expect("a call answered while the first step still held the record");
+                assert!(
+                    took >= kr_flush::HELD_RENAME_BOUND,
+                    "it waited out its bound: {took:?}"
+                );
+                assert!(
+                    took < kr_flush::HELD_RENAME_BOUND + Duration::from_secs(5),
+                    "and answered within it: {took:?}"
+                );
+            }
+            let refused = [
+                second
+                    .join()
+                    .expect("the second step ran")
+                    .expect_err("the second step was kept waiting past its bound"),
+                opener
+                    .join()
+                    .expect("the open ran")
+                    .expect_err("the open was kept waiting past its bound"),
+            ];
+            for refused in refused {
+                assert_eq!(refused.code(), ErrorCode::StorageUnavailable, "{refused}");
+                let said = refused.to_string();
+                assert!(
+                    said.contains(&environment.record().display().to_string()),
+                    "names the record: {said}"
+                );
+                assert!(said.contains("another change"), "says why: {said}");
+            }
+            drop(resume);
+            let written = first
+                .join()
+                .expect("the first step ran")
+                .expect("the first step published its record");
+            assert_eq!(written.machine_id, first_into);
+            assert_eq!(environment.reopened(), written);
+        });
+        assert_eq!(
+            leftovers(environment.paths().state_dir()),
+            Vec::<String>::new()
+        );
+    }
+
+    /// KR-REQ-03.07: a step that comes to the record while another step holds it for less than the
+    /// bound waits its turn and then takes its own step, against the record the first published.
+    #[test]
+    fn a_step_behind_another_waits_its_turn_and_publishes() {
+        let environment = Environment::create();
+        let store = environment.open();
+        let before = store.group().expect("reads the group");
+        let (arrived, arrival) = mpsc::channel();
+        let (resume, resumed) = mpsc::channel();
+        seam::register(
+            &environment.record(),
+            Boundary::Flushed,
+            Interruption::Pause {
+                arrived,
+                resume: resumed,
+            },
+        );
+        let resume = Resume(resume);
+        let (first_into, second_into) = (some_group(), some_group());
+        let expected = before.expected();
+        let after_the_first = Expected {
+            machine_id: first_into,
+            revision: before.revision + 1,
+        };
+        let (environment, store) = (&environment, &store);
+        std::thread::scope(|scope| {
+            let first = scope.spawn(move || {
+                store.join(&environment.lock, first_into, expected, &approval(), 2_000)
+            });
+            arrival
+                .recv_timeout(WAIT)
+                .expect("the first step reached its publication");
+            let (told, locking) = mpsc::channel();
+            seam::watch_lock(&environment.record(), told);
+            let second = scope.spawn(move || {
+                store.join(
+                    &environment.lock,
+                    second_into,
+                    after_the_first,
+                    &approval(),
+                    3_000,
+                )
+            });
+            assert!(
+                locking
+                    .recv_timeout(WAIT)
+                    .expect("the second step came to the record"),
+                "the second step found the record free while the first held it"
+            );
+            drop(resume);
+            let first = first
+                .join()
+                .expect("the first step ran")
+                .expect("the first step published its record");
+            let second = second
+                .join()
+                .expect("the second step ran")
+                .expect("the second step published its record in turn");
+            assert_eq!(first.expected(), after_the_first);
+            assert_eq!(second.machine_id, second_into);
+            assert_eq!(second.revision, before.revision + 2);
+            assert_eq!(environment.reopened(), second);
+        });
+    }
+
     /// KR-REQ-03.07: a first start interrupted after any point of its publication, by a failure
     /// or by a crash, leaves no record, so the next start mints a group, or the whole record it
     /// published, which the next start keeps. Nothing it wrote is left behind once the next start
