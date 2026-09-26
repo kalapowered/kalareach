@@ -748,7 +748,8 @@ test.describe('how the host presents a raw view', () => {
       })
     })
 
-    // KR-REQ-08.02: the phone's raw view says the same, in the same words.
+    // KR-REQ-08.02: the phone's raw view says the same, in the same words, in its status: the first
+    // two lines of it until the person asks for all of it.
     test(`the phone's raw view says how it is presented and why, ${theme}, at 320 px`, async ({
       page
     }) => {
@@ -763,6 +764,8 @@ test.describe('how the host presents a raw view', () => {
       await expect(page.getByTestId('terminal-presentation')).toHaveText(
         "This view is shown a viewport because its client declared no terminal profile, so what the session's output would do on its terminal is not known."
       )
+      await page.getByRole('button', { name: 'More' }).click()
+      await expect(page.getByRole('button', { name: 'Less' })).toHaveAttribute('aria-expanded', 'true')
       await expect(page.locator('html')).toHaveAttribute('data-theme', theme)
       await page.screenshot({
         path: shotFor(`terminal-presentation-08.02-phone-320-${theme}`),
@@ -897,6 +900,175 @@ test.describe("a raw view's selection", () => {
     expect(await selected(piece)).toEqual(SESSION)
     expect(await selected(page.getByRole('tab', { name: 'Terminal' }))).toEqual(own)
   })
+})
+
+// KR-REQ-13.18, KR-REQ-13.19: the phone keeps room for its terminal. On a small phone and a larger
+// one, on both platforms, in both modes, with the keyboard down and up, the grid the host is told is
+// the grid the terminal's surface shows, never the one a view opens at when nothing can be
+// measured, and the surface holds at least the rows the layout keeps for it.
+test.describe("the phone's room for its terminal", () => {
+  const SESSION_MAIN = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
+
+  /** The rows the terminal keeps at the least, however much of the screen the keyboard covers. */
+  const FLOOR = 4
+
+  /**
+   * Two phones: the rows the terminal keeps with the keyboard down, and how much of the screen a
+   * software keyboard covers on a phone that size.
+   */
+  const PHONES = [
+    { width: 320, height: 720, rows: 8, keyboard: 260 },
+    { width: 390, height: 844, rows: 14, keyboard: 336 }
+  ] as const
+
+  /** Where a screenshot for this browser goes, so each engine keeps its own. */
+  const shotFor = (name: string): string => shot(`${name}-${test.info().project.name}`)
+
+  /** Opens the harness in one colour mode, whatever the system's. */
+  async function inTheme(page: Page, theme: 'light' | 'dark'): Promise<void> {
+    await page.addInitScript((mode) => {
+      localStorage.setItem('kalareach-theme', mode)
+    }, theme)
+  }
+
+  /**
+   * Takes a screenshot once every transition on the page has finished or been cancelled, so none is
+   * caught halfway.
+   */
+  async function still(page: Page, name: string): Promise<void> {
+    await page.evaluate(() =>
+      Promise.all(
+        document.getAnimations().map((animation) => animation.finished.catch(() => undefined))
+      )
+    )
+    await page.screenshot({ path: shotFor(name) })
+  }
+
+  /** Covers the bottom `inset` pixels of the screen, as a software keyboard does. */
+  async function keyboard(page: Page, inset: number): Promise<void> {
+    await page.evaluate((covered) => {
+      document.documentElement.style.setProperty('--keyboard', `${covered}px`)
+    }, inset)
+  }
+
+  /**
+   * The grid the terminal's surface shows, measured from what it draws: the line pitch between two
+   * drawn lines, a cell from a drawn piece, and the part of the surface a person sees, inside its
+   * border and the grid's padding, above the keyboard and inside the pane and the session's scroll
+   * area, which each clip it. With every grid the page has told the host.
+   */
+  async function shownAndTold(page: Page) {
+    return page.evaluate(() => {
+      const surface = document.querySelector<HTMLElement>('[data-testid="mobile-terminal"]')
+      const grid = surface?.querySelector<HTMLElement>('.m-terminal-grid')
+      const lines = Array.from(
+        surface?.querySelectorAll<HTMLElement>('[data-testid="mobile-terminal-line"]') ?? []
+      )
+      const piece = lines[0]?.querySelector<HTMLElement>('[data-cells]')
+      const pane = document.querySelector<HTMLElement>('.m-pane')
+      const main = document.querySelector<HTMLElement>('.m-main')
+      if (!surface || !grid || !piece || !pane || !main || lines.length < 2) return null
+      const pitch = (lines[1]?.getBoundingClientRect().top ?? 0) - (lines[0]?.getBoundingClientRect().top ?? 0)
+      const cell = piece.getBoundingClientRect().width / Number(piece.dataset.cells)
+      const style = getComputedStyle(grid)
+      const covered =
+        parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--keyboard')) || 0
+      const top = surface.getBoundingClientRect().top + surface.clientTop
+      const clips = [pane.getBoundingClientRect(), main.getBoundingClientRect()]
+      const seen =
+        Math.min(top + surface.clientHeight, window.innerHeight - covered, ...clips.map((box) => box.bottom)) -
+        Math.max(top, ...clips.map((box) => box.top))
+      const rows = Math.floor((seen - parseFloat(style.paddingTop) - parseFloat(style.paddingBottom)) / pitch)
+      const columns = Math.floor(
+        (surface.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight)) / cell
+      )
+      return { shown: { columns, rows }, told: window.krTestHost?.terminalViews.at(-1)?.grids ?? [] }
+    })
+  }
+
+  /** Waits for the page to tell the host the grid its surface shows, and checks the rows it holds. */
+  async function expectRoom(page: Page, rows: number, what: string): Promise<void> {
+    await expect
+      .poll(async () => {
+        const seen = await shownAndTold(page)
+        const told = seen?.told.at(-1)
+        return seen === null
+          ? 'nothing drawn'
+          : `shown ${seen.shown.columns}×${seen.shown.rows}, told ${told?.columns}×${told?.rows}`
+      }, { message: what })
+      .toMatch(/^shown (\d+)×(\d+), told \1×\2$/)
+    const seen = await shownAndTold(page)
+    expect(seen?.shown.rows ?? 0, what).toBeGreaterThanOrEqual(rows)
+    expect(seen?.told, what).not.toContainEqual({ columns: 80, rows: 24 })
+  }
+
+  for (const surface of ['ios', 'android'] as const) {
+    for (const phone of PHONES) {
+      for (const mode of ['control', 'view'] as const) {
+        test(`keeps room on ${surface} at ${phone.width}×${phone.height} in ${mode} mode, with the keyboard down and up`, async ({
+          page
+        }) => {
+          await page.setViewportSize({ width: phone.width, height: phone.height })
+          await page.goto(`/harness.html?surface=${surface}&session=${SESSION_MAIN}`)
+          await page.getByRole('tab', { name: 'Terminal' }).click()
+          await expect(page.getByTestId('mobile-terminal-line').first()).toContainText('$ cargo')
+          if (mode === 'view') await page.getByRole('button', { name: 'Look around' }).click()
+          await expectRoom(page, phone.rows, 'with the keyboard down')
+          // Nothing in the bar runs past the screen's edge; only the terminal keys scroll sideways.
+          const past = await page.evaluate(() =>
+            Array.from(
+              document.querySelectorAll<HTMLElement>('.m-composer button, .m-composer textarea, .m-terminal-status p')
+            )
+              .filter(
+                (element) =>
+                  element.closest('.m-accessory') === null &&
+                  element.getBoundingClientRect().right > window.innerWidth + 0.5
+              )
+              .map((element) => element.textContent || element.tagName)
+          )
+          expect(past).toEqual([])
+          await keyboard(page, phone.keyboard)
+          await expectRoom(page, FLOOR, 'with the keyboard up')
+          // The field and the terminal keys stay whole in view, above the keyboard.
+          const covered = phone.height - phone.keyboard
+          for (const control of [
+            page.getByLabel('Message this session'),
+            page.getByRole('group', { name: 'Terminal keys' })
+          ]) {
+            await expect(control).toBeInViewport({ ratio: 1 })
+            const box = await control.boundingBox()
+            expect(box === null ? Infinity : box.y + box.height).toBeLessThanOrEqual(covered + 0.5)
+          }
+        })
+      }
+    }
+  }
+
+  for (const theme of ['light', 'dark'] as const) {
+    for (const phone of PHONES) {
+      test(`the terminal and its bar at ${phone.width}×${phone.height}, ${theme}`, async ({ page }) => {
+        await inTheme(page, theme)
+        await page.setViewportSize({ width: phone.width, height: phone.height })
+        await page.goto(`/harness.html?surface=ios&session=${SESSION_MAIN}`)
+        await page.getByRole('tab', { name: 'Terminal' }).click()
+        await expect(page.getByTestId('mobile-terminal-line').first()).toContainText('$ cargo')
+        await expectRoom(page, phone.rows, 'control mode')
+        await expect(page.locator('html')).toHaveAttribute('data-theme', theme)
+        const size = `${phone.width}x${phone.height}`
+        await still(page, `terminal-room-13.19-phone-${size}-control-${theme}`)
+        await page.getByRole('button', { name: 'Look around' }).click()
+        await expectRoom(page, phone.rows, 'view mode')
+        await still(page, `terminal-room-13.19-phone-${size}-view-${theme}`)
+        await page.getByRole('button', { name: 'More' }).click()
+        await still(page, `terminal-room-13.19-phone-${size}-view-more-${theme}`)
+        await page.getByRole('button', { name: 'Less' }).click()
+        await page.getByRole('button', { name: 'Take control' }).click()
+        await keyboard(page, phone.keyboard)
+        await expectRoom(page, FLOOR, 'the keyboard up')
+        await still(page, `terminal-room-13.19-phone-${size}-keyboard-${theme}`)
+      })
+    }
+  }
 })
 
 // KR-REQ-08.75, KR-REQ-13.18: in view mode the wheel and a drag move the window across the session

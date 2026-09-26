@@ -16,6 +16,7 @@ import type { DocumentNode } from '@kalareach/plugin-sdk'
 
 import { AppProvider } from '../../src/app/state'
 import { fakeHost, terminalScreen, type HeldReads } from '../../src/host/fake'
+import { describeMode } from '../../src/mobile/model/gestures'
 import { MobileSession } from '../../src/mobile/views/MobileSession'
 import { useLifecycle } from '../../src/mobile/useLifecycle'
 import { SLOW_MS, WAITING } from '../../src/terminal/modes'
@@ -358,8 +359,9 @@ describe("the phone's raw terminal view (KR-REQ-08.02, 13.18)", () => {
 
   it('reports the grid a pinch leaves it with', async () => {
     // jsdom lays nothing out, so the few measurements the view takes are given here: a surface
-    // 336 pixels wide in a pane 420 high, 8 pixels of padding around the grid, and cells of 8 by 16
-    // pixels at the unscaled size, which grow with the zoom as the font does.
+    // 336 pixels wide and 420 high, 8 pixels of padding around the grid, and cells of 8 by 16
+    // pixels at the unscaled size, which grow with the zoom as the font does. The pane around the
+    // surface measures nothing: the grid is what the surface shows.
     const ownStyle = window.getComputedStyle.bind(window)
     const zoomOf = (element: Element) =>
       Number(
@@ -383,7 +385,7 @@ describe("the phone's raw terminal view (KR-REQ-08.02, 13.18)", () => {
     const heights = vi.spyOn(Element.prototype, 'clientHeight', 'get').mockImplementation(function (
       this: Element
     ) {
-      return this.classList.contains('m-pane') ? 420 : 0
+      return this.getAttribute('data-testid') === 'mobile-terminal' ? 420 : 0
     })
     const styles = vi.spyOn(window, 'getComputedStyle').mockImplementation((element, pseudo) =>
       element.classList.contains('m-terminal-grid')
@@ -434,8 +436,8 @@ describe("the phone's raw terminal view (KR-REQ-08.02, 13.18)", () => {
 
   /**
    * Gives the phone's view the measurements jsdom does not take: cells of `cell`, 8 by 16 pixels
-   * unless told, read at each measure, and a surface 336 pixels wide in a pane 420 high. Returns
-   * what puts them back.
+   * unless told, read at each measure, and a surface 336 pixels wide and 420 high. Returns what
+   * puts them back.
    */
   function measured(cell: { width: number; height: number } = { width: 8, height: 16 }): () => void {
     const rects = vi.spyOn(Element.prototype, 'getBoundingClientRect').mockImplementation(function (
@@ -453,9 +455,7 @@ describe("the phone's raw terminal view (KR-REQ-08.02, 13.18)", () => {
     const heights = vi.spyOn(Element.prototype, 'clientHeight', 'get').mockImplementation(function (
       this: Element
     ) {
-      return this.classList.contains('m-pane') || this.getAttribute('data-testid') === 'mobile-terminal'
-        ? 420
-        : 0
+      return this.getAttribute('data-testid') === 'mobile-terminal' ? 420 : 0
     })
     return () => {
       rects.mockRestore()
@@ -725,6 +725,108 @@ describe("the phone's raw terminal view (KR-REQ-08.02, 13.18)", () => {
     } finally {
       restore()
     }
+  })
+
+  it('folds the composer to one line with Send beside it while the terminal shows, and leaves the picker to the conversation', async () => {
+    const { port } = fakeHost()
+    const person = userEvent.setup()
+    render(
+      <AppProvider port={port}>
+        <OnSession sessionId={SESSION_MAIN} />
+      </AppProvider>
+    )
+    const empty = 'Write something, or add an attachment.'
+    expect(screen.getByRole('group', { name: 'Add an attachment' })).toBeInTheDocument()
+    expect(screen.getByText(empty)).toBeInTheDocument()
+
+    await person.click(screen.getByRole('tab', { name: 'Terminal' }))
+    const field = screen.getByLabelText('Message this session')
+    expect(field).toHaveAttribute('rows', '1')
+    expect(field.parentElement).toContainElement(screen.getByRole('button', { name: 'Send' }))
+    // An empty draft needs no words while Send stands disabled beside it, and attachments are
+    // added in the conversation.
+    expect(screen.queryByRole('group', { name: 'Add an attachment' })).toBeNull()
+    expect(screen.queryByText(empty)).toBeNull()
+    expect(field).not.toHaveAttribute('aria-describedby')
+
+    await person.click(screen.getByRole('tab', { name: 'Conversation' }))
+    expect(screen.getByRole('group', { name: 'Add an attachment' })).toBeInTheDocument()
+    expect(screen.getByText(empty)).toBeInTheDocument()
+  })
+
+  it('keeps every other reason Send is held back beside the folded field', async () => {
+    const { port } = fakeHost()
+    // The one answer that means nobody knows what became of a submission.
+    const uncertain = {
+      ...port,
+      composerSubmit: () =>
+        Promise.reject({
+          code: 'OUTCOME_UNKNOWN',
+          message: 'The host did not say what became of it.',
+          user_action: 'ask'
+        })
+    }
+    const person = await onTerminal(uncertain)
+    const field = screen.getByLabelText('Message this session')
+    await person.type(field, 'ls')
+    await person.click(screen.getByRole('button', { name: 'Send' }))
+    const reason = await screen.findByText(/no confirmed outcome yet/)
+    expect(field).toHaveAttribute('aria-describedby', reason.id)
+    expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled()
+  })
+
+  it('says in two lines what the view is doing, and all of it when asked', async () => {
+    const { port } = fakeHost()
+    const person = await onTerminal(port)
+    await waitFor(() => {
+      expect(screen.getAllByTestId('mobile-terminal-line')).toHaveLength(8)
+    })
+    const more = screen.getByRole('button', { name: 'More' })
+    const status = document.getElementById(more.getAttribute('aria-controls') ?? '')
+    expect(more).toHaveAttribute('aria-expanded', 'false')
+    expect(status).toHaveAttribute('data-expanded', 'false')
+    // All of it is there for a screen reader either way: the warnings, the mode's sentence and the
+    // host's presentation.
+    expect(status).toContainElement(screen.getByTestId('substituted-count'))
+    expect(status).toContainElement(screen.getByTestId('terminal-presentation'))
+    expect(status?.textContent).toContain(describeMode('control'))
+
+    await person.click(more)
+    expect(screen.getByRole('button', { name: 'Less' })).toHaveAttribute('aria-expanded', 'true')
+    expect(status).toHaveAttribute('data-expanded', 'true')
+    await person.click(screen.getByRole('button', { name: 'Less' }))
+    expect(screen.getByRole('button', { name: 'More' })).toHaveAttribute('aria-expanded', 'false')
+  })
+
+  it('reaches its controls from the keyboard in order: the mode, the moves, the status, the keys, the field and Send', async () => {
+    const { port } = fakeHost()
+    const person = await onTerminal(port)
+    await waitFor(() => {
+      expect(screen.getAllByTestId('mobile-terminal-line')).toHaveLength(8)
+    })
+    await person.click(screen.getByRole('button', { name: 'Look around' }))
+    await person.type(screen.getByLabelText('Message this session'), 'ls')
+    screen.getByRole('button', { name: 'Take control' }).focus()
+    const reached: string[] = []
+    for (let step = 0; step < 24; step += 1) {
+      await person.tab()
+      const focused = document.activeElement
+      reached.push(
+        focused?.tagName === 'TEXTAREA'
+          ? 'the field'
+          : (focused?.getAttribute('aria-label') ?? focused?.textContent ?? '')
+      )
+    }
+    const at = (name: string) => reached.indexOf(name)
+    expect(at('Move the window up')).toBe(0)
+    expect(at('More')).toBeGreaterThan(at('Move the window up'))
+    expect(at('Escape')).toBe(at('More') + 1)
+    expect(at('the field')).toBeGreaterThan(at('Escape'))
+    // The field gives Tab to the program, so Send is found as the next control after the field
+    // in the order a keyboard moves through the page.
+    const field = screen.getByLabelText('Message this session')
+    const controls = Array.from(document.querySelectorAll<HTMLElement>('button:not([disabled]), textarea'))
+    expect(controls[controls.indexOf(field) + 1]).toBe(screen.getByRole('button', { name: 'Send' }))
   })
 
   it('ends with the host words and attaches again when asked', async () => {

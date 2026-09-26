@@ -27,6 +27,9 @@
   --safe-right: env(safe-area-inset-right, 0px);
   /* How much of the screen the software keyboard is covering, measured, not guessed. */
   --keyboard: 0px;
+  /* The terminal's type before zoom, which the room kept for the terminal is counted in. */
+  --terminal-size: 0.8125rem;
+  --terminal-leading: 1.35;
 }
 
 .m-shell {
@@ -362,6 +365,26 @@
   min-block-size: 0;
 }
 
+/*
+ * While the terminal shows, it is the content and the composer is its bar. The terminal never has
+ * less than four rows at its type's own size, whatever the keyboard covers: four lines, the grid's
+ * padding, the surface's border and a pixel over, so rounding never takes the fourth. The composer
+ * takes what it needs of the rest, and the terminal all that is left.
+ */
+.m-session[data-pane='terminal'] {
+  --terminal-floor: calc(
+    4 * var(--terminal-size) * var(--terminal-leading) + 2 * var(--gap-2) + 3px
+  );
+  grid-template-rows: auto minmax(var(--terminal-floor), 1fr) minmax(0, auto);
+}
+
+/* The terminal fills its pane, under the words of a view that has ended. */
+.m-session[data-pane='terminal'] > .m-pane {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
 /* Streamed output never animates: text that fades in is text a person cannot read as it arrives. */
 .m-stream * {
   transition: none !important;
@@ -389,8 +412,9 @@
 
 .m-terminal {
   position: relative;
+  flex: 1 1 auto;
   overflow: hidden;
-  min-block-size: 12rem;
+  min-block-size: 0;
   border: 1px solid var(--line);
   border-radius: 10px;
   background: var(--surface);
@@ -402,28 +426,91 @@
   margin: 0;
   padding: var(--gap-2);
   font-family: var(--font-mono);
-  font-size: calc(0.8125rem * var(--zoom, 1));
-  line-height: 1.35;
+  font-size: calc(var(--terminal-size) * var(--zoom, 1));
+  line-height: var(--terminal-leading);
   white-space: pre;
   transform: translate3d(calc(var(--pan-x, 0) * 1px), calc(var(--pan-y, 0) * 1px), 0);
 }
 
+/*
+ * The terminal's bar: one row of controls, the moves on the next in view mode, and the status in
+ * two lines beside the control that shows all of it. Nothing here moves: the terminal is resized
+ * as the bar changes, and a resize tells the host a new grid.
+ */
 .m-terminal-hud {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
+  display: grid;
+  /* A column no wider than the phone, however long a line of the status is before it is cut. */
+  grid-template-columns: minmax(0, 1fr);
   gap: var(--gap-2);
   padding-block-start: var(--gap-2);
   font-size: 0.75rem;
   color: var(--faint);
 }
 
+.m-terminal-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--gap-2);
+}
+
+.m-terminal-status {
+  display: flex;
+  align-items: center;
+  gap: var(--gap-2);
+}
+
+.m-terminal-status > div {
+  flex: 1 1 auto;
+  min-inline-size: 0;
+}
+
+.m-terminal-status p {
+  margin: 0;
+  line-height: 1.4;
+}
+
+.m-terminal-status p > .badge {
+  margin-inline-end: var(--gap-1);
+}
+
+/* Until asked for all of it, each line of the status is one line on the screen. */
+.m-terminal-status > div[data-expanded='false'] p {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* ---- The composer and the accessory row ------------------------------------------------------ */
 
 .m-composer {
-  display: grid;
-  gap: var(--gap-2);
   padding-block-end: calc(var(--safe-bottom) + var(--keyboard));
+}
+
+.m-composer-body {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: var(--gap-2);
+}
+
+/*
+ * Under the terminal the composer scrolls when it holds more than the room it has, and it scrolls
+ * from its bottom: the field and the terminal keys stay in view above the keyboard, and the bar
+ * above them is what goes out of view first.
+ */
+.m-session[data-pane='terminal'] > .m-composer {
+  display: flex;
+  flex-direction: column-reverse;
+  overflow-y: auto;
+  overscroll-behavior-y: contain;
+}
+
+/* While the terminal shows, the field is one line with Send beside it. */
+.m-composer-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--gap-2);
 }
 
 .m-composer textarea {
@@ -443,6 +530,15 @@
 .m-composer textarea:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 1px;
+}
+
+.m-composer-line textarea {
+  flex: 1 1 10rem;
+  inline-size: auto;
+  min-inline-size: 0;
+  block-size: var(--target);
+  min-block-size: var(--target);
+  padding-block: var(--gap-2);
 }
 
 .m-composer-actions {

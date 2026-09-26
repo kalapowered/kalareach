@@ -137,6 +137,9 @@ export function MobileSession({
   const [zoom, setZoom] = useState(ZOOM_DEFAULT_INDEX)
   const [latch, setLatch] = useState<Latch>(NO_LATCH)
   const [busy, setBusy] = useState(false)
+  // Whether the terminal's status shows all it says, rather than its first two lines.
+  const [statusOpen, setStatusOpen] = useState(false)
+  const statusId = useId()
   // What the person picked, held here until there is a command that carries bytes to a host. It
   // is shown rather than dropped, because a file that vanishes after a success message is worse
   // than one that says plainly it has not gone anywhere.
@@ -196,22 +199,21 @@ export function MobileSession({
     }
   }, [port, sessionId])
 
-  // The terminal's grid: as many cells as the pane holds at the current zoom, measured from a probe
-  // of the grid's own font.
+  // The terminal's grid: as many cells as its surface shows at the current zoom, a column measured
+  // from a probe of the grid's own font and a row as tall as the grid's own lines.
   const terminalSurface = useRef<HTMLDivElement | null>(null)
   const cellProbe = useRef<HTMLSpanElement | null>(null)
   const measure = useCallback((): TerminalGrid => {
     const surfaceElement = terminalSurface.current
-    const probe = cellProbe.current
-    const pane = paneRef.current
-    const grid = probe?.parentElement
-    if (!surfaceElement || !probe || !pane || !grid) return FALLBACK_GRID
-    const cell = probe.getBoundingClientRect()
+    const grid = cellProbe.current?.parentElement
+    const cell = cellOf(cellProbe.current)
+    if (!surfaceElement || !grid || cell === null) return FALLBACK_GRID
     const style = getComputedStyle(grid)
     const across =
       surfaceElement.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight)
-    const down = pane.clientHeight - parseFloat(style.paddingTop) - parseFloat(style.paddingBottom)
-    const columns = Math.floor(across / (cell.width / PROBE_CELLS))
+    const down =
+      surfaceElement.clientHeight - parseFloat(style.paddingTop) - parseFloat(style.paddingBottom)
+    const columns = Math.floor(across / cell.width)
     const rows = Math.floor(down / cell.height)
     return Number.isFinite(columns) && Number.isFinite(rows) && columns > 0 && rows > 0
       ? { columns, rows }
@@ -247,12 +249,12 @@ export function MobileSession({
         ? null
         : placeOf(frame)
 
-  // The grid goes to the host when the terminal is shown, when the zoom changes, and as the pane
-  // is resized.
+  // The grid goes to the host when the terminal is shown, when the zoom changes, and as its surface
+  // is resized: by the screen, the keyboard, or the composer beneath it.
   useEffect(() => {
     if (pane !== 'terminal') return
     resize(measure())
-    const element = paneRef.current
+    const element = terminalSurface.current
     if (!element || typeof ResizeObserver === 'undefined') return
     const observer = new ResizeObserver(() => {
       resize(measure())
@@ -355,9 +357,58 @@ export function MobileSession({
     waiting.length > 0
       ? `${waiting.length === 1 ? 'One action has' : `${waiting.length} actions have`} no confirmed outcome yet. Sending again could run it twice.`
       : notSubmittableBecause(draft)
+  // While the terminal shows, a draft that is only empty needs no words: Send stands disabled on
+  // the field's own line, and attachments are added in the conversation. Every other reason stays.
+  const hint = pane === 'terminal' && waiting.length === 0 && draft.state === 'bound' ? null : blocked
+  const terminalWarnings = frame === null ? [] : warningsOf(frame, leftBlankOnPhone(frame))
+
+  const field = (
+    <textarea
+      id={`composer-${sessionId}`}
+      rows={pane === 'terminal' ? 1 : undefined}
+      value={draft.text}
+      placeholder={pane === 'terminal' ? 'Type into the terminal' : 'Message this session'}
+      aria-describedby={hint ? `composer-why-${sessionId}` : undefined}
+      onChange={(event) => {
+        setDraft(edit(draft, event.target.value, Date.now()))
+      }}
+      onKeyDown={(event) => {
+        if (pane !== 'terminal') return
+        const bytes = sequenceForKeyPress(event)
+        if (bytes === null) return
+        // A hardware keyboard drives the terminal directly; the field is only where the
+        // person is looking.
+        if (event.key.length === 1 && !event.ctrlKey && !event.altKey) return
+        event.preventDefault()
+        sendKeys(bytes)
+      }}
+    />
+  )
+  const sendButton = (
+    <Button
+      tone="primary"
+      disabled={!submittable(draft) || busy || waiting.length > 0}
+      style={{ minBlockSize: target }}
+      onClick={() => {
+        send(draft.text)
+      }}
+    >
+      Send
+    </Button>
+  )
+  const lastState = mine.slice(-1).map((submission) => (
+    <Badge
+      key={submission.localId}
+      tone={
+        submission.state === 'applied' ? 'success' : submission.state === 'queued' ? 'neutral' : 'accent'
+      }
+    >
+      {describeState(submission.state)}
+    </Badge>
+  ))
 
   return (
-    <div className="m-session">
+    <div className="m-session" data-pane={pane}>
       <div>
         {lifecycle.banner ? (
           <Banner
@@ -469,173 +520,173 @@ export function MobileSession({
       </div>
 
       <div className="m-composer">
-        {pane === 'terminal' ? (
-          <>
-            <div className="m-terminal-hud">
-              <Badge tone={mode === 'control' ? 'accent' : 'neutral'}>{mode === 'control' ? 'Control' : 'View'}</Badge>
-              <span>{describeMode(mode)}</span>
-              <Button
-                onClick={() => {
-                  // Taking control shows the program's live screen: a window in the history comes back.
-                  if (mode === 'view') live()
-                  setMode(mode === 'control' ? 'view' : 'control')
+        {/* One child, so a composer taller than the room it has scrolls with its bottom in view. */}
+        <div className="m-composer-body">
+          {pane === 'terminal' ? (
+            <>
+              <div className="m-terminal-hud">
+                <div className="m-terminal-controls">
+                  <Badge tone={mode === 'control' ? 'accent' : 'neutral'}>
+                    {mode === 'control' ? 'Control' : 'View'}
+                  </Badge>
+                  <Button
+                    onClick={() => {
+                      // Taking control shows the program's live screen: a window in the history comes back.
+                      if (mode === 'view') live()
+                      setMode(mode === 'control' ? 'view' : 'control')
+                    }}
+                  >
+                    {mode === 'control' ? 'Look around' : 'Take control'}
+                  </Button>
+                  <span>{`Zoom ${Math.round((ZOOM_STEPS[zoom] ?? 1) * 100)}%`}</span>
+                  {mode === 'view' ? (
+                    <span className="row" role="group" aria-label="Move the window">
+                      {PAGE_MOVES.map((move) => (
+                        <Button
+                          key={move.name}
+                          aria-label={`Move the window ${move.name}`}
+                          disabled={room === null || room[move.limit] === 0}
+                          onClick={() => {
+                            if (frame === null) return
+                            pan({
+                              across: move.across * frame.window.columns,
+                              down: move.down * frame.window.rows
+                            })
+                          }}
+                        >
+                          {move.label}
+                        </Button>
+                      ))}
+                    </span>
+                  ) : null}
+                </div>
+                {/*
+                 * What the view says, in two lines until the person asks for all of it: first the
+                 * warnings and where the window is, then what the mode does and how the host presents
+                 * the view. A screen reader reads all of it either way.
+                 */}
+                <div className="m-terminal-status">
+                  <div id={statusId} data-expanded={statusOpen}>
+                    {terminalWarnings.length > 0 || terminalPosition !== null ? (
+                      <p>
+                        {terminalWarnings.map((warning) => (
+                          <Badge key={warning.id} tone="warning" data-testid={warning.id}>
+                            {warning.words}
+                          </Badge>
+                        ))}
+                        {terminalPosition === null ? null : (
+                          <span data-testid="terminal-position">{terminalPosition}</span>
+                        )}
+                      </p>
+                    ) : null}
+                    <p>
+                      <span>{describeMode(mode)}</span>{' '}
+                      {terminal === null ? (
+                        <span data-testid="terminal-presentation" data-presentation="attaching">
+                          {ATTACHING}
+                        </span>
+                      ) : presented ? (
+                        <span data-testid="terminal-presentation" data-presentation={presented.state}>
+                          {presented.sentence}
+                        </span>
+                      ) : null}
+                    </p>
+                  </div>
+                  <Button
+                    aria-controls={statusId}
+                    aria-expanded={statusOpen}
+                    onClick={() => {
+                      setStatusOpen((open) => !open)
+                    }}
+                  >
+                    {statusOpen ? 'Less' : 'More'}
+                  </Button>
+                </div>
+              </div>
+              <AccessoryRow
+                surface={surface}
+                latch={latch}
+                onKey={(key) => {
+                  if (key.modifier) {
+                    setLatch((current) => pressModifier(current, key.modifier as 'ctrl' | 'alt' | 'shift'))
+                    return
+                  }
+                  const bytes = sequenceFor(key, latch)
+                  setLatch((current) => afterKey(current))
+                  if (bytes !== null) sendKeys(bytes)
                 }}
-              >
-                {mode === 'control' ? 'Look around' : 'Take control'}
-              </Button>
-              <span>{`Zoom ${Math.round((ZOOM_STEPS[zoom] ?? 1) * 100)}%`}</span>
-              {mode === 'view' ? (
-                <span className="row" role="group" aria-label="Move the window">
-                  {PAGE_MOVES.map((move) => (
-                    <Button
-                      key={move.name}
-                      aria-label={`Move the window ${move.name}`}
-                      disabled={room === null || room[move.limit] === 0}
-                      onClick={() => {
-                        if (frame === null) return
-                        pan({
-                          across: move.across * frame.window.columns,
-                          down: move.down * frame.window.rows
-                        })
-                      }}
-                    >
-                      {move.label}
-                    </Button>
-                  ))}
+              />
+            </>
+          ) : null}
+
+          {draft.attachments.length > 0 || heldFiles.length > 0 ? (
+            <div className="m-attachments">
+              {draft.attachments.map((attachment) => (
+                <span key={attachment.transferId} className="m-attachment">
+                  {attachment.name}
+                  <span className="m-row-detail">{describeBytes(attachment.byteLen)}</span>
                 </span>
-              ) : null}
-              {terminal === null ? (
-                <span data-testid="terminal-presentation" data-presentation="attaching">
-                  {ATTACHING}
+              ))}
+              {heldFiles.map(({ picked }) => (
+                <span key={`${picked.name}-${picked.byteLen}`} className="m-attachment">
+                  {picked.name}
+                  <span className="m-row-detail">
+                    {`${describeBytes(picked.byteLen)} · held in this screen`}
+                  </span>
                 </span>
-              ) : presented ? (
-                <span data-testid="terminal-presentation" data-presentation={presented.state}>
-                  {presented.sentence}
-                </span>
-              ) : null}
-              {terminalPosition === null ? null : (
-                <span data-testid="terminal-position">{terminalPosition}</span>
-              )}
-              {frame === null
-                ? null
-                : warningsOf(frame, leftBlankOnPhone(frame)).map((warning) => (
-                    <Badge key={warning.id} tone="warning" data-testid={warning.id}>
-                      {warning.words}
-                    </Badge>
-                  ))}
+              ))}
             </div>
-            <AccessoryRow
-              surface={surface}
-              latch={latch}
-              onKey={(key) => {
-                if (key.modifier) {
-                  setLatch((current) => pressModifier(current, key.modifier as 'ctrl' | 'alt' | 'shift'))
-                  return
-                }
-                const bytes = sequenceFor(key, latch)
-                setLatch((current) => afterKey(current))
-                if (bytes !== null) sendKeys(bytes)
-              }}
-            />
-          </>
-        ) : null}
+          ) : null}
+          {heldFiles.length > 0 ? (
+            <p className="m-hint">
+              {heldFiles.length === 1 ? 'That file is' : 'Those files are'} on this device and{' '}
+              {heldFiles.length === 1 ? 'has' : 'have'} not been sent: this build has no command that
+              carries picked bytes to a host. Nothing has been discarded.
+            </p>
+          ) : null}
 
-        {draft.attachments.length > 0 || heldFiles.length > 0 ? (
-          <div className="m-attachments">
-            {draft.attachments.map((attachment) => (
-              <span key={attachment.transferId} className="m-attachment">
-                {attachment.name}
-                <span className="m-row-detail">{describeBytes(attachment.byteLen)}</span>
-              </span>
-            ))}
-            {heldFiles.map(({ picked }) => (
-              <span key={`${picked.name}-${picked.byteLen}`} className="m-attachment">
-                {picked.name}
-                <span className="m-row-detail">
-                  {`${describeBytes(picked.byteLen)} · held in this screen`}
-                </span>
-              </span>
-            ))}
-          </div>
-        ) : null}
-        {heldFiles.length > 0 ? (
-          <p className="m-hint">
-            {heldFiles.length === 1 ? 'That file is' : 'Those files are'} on this device and{' '}
-            {heldFiles.length === 1 ? 'has' : 'have'} not been sent: this build has no command that
-            carries picked bytes to a host. Nothing has been discarded.
-          </p>
-        ) : null}
+          <label className="visually-hidden" htmlFor={`composer-${sessionId}`}>
+            Message this session
+          </label>
+          {pane === 'terminal' ? (
+            // While the terminal shows, the field is one line with Send beside it, as in a
+            // message thread: the rows it would take are the terminal's.
+            <div className="m-composer-line">
+              {field}
+              {sendButton}
+              {lastState}
+            </div>
+          ) : (
+            field
+          )}
+          {hint ? (
+            <p className="m-hint" id={`composer-why-${sessionId}`}>
+              {hint}
+            </p>
+          ) : null}
 
-        <label className="visually-hidden" htmlFor={`composer-${sessionId}`}>
-          Message this session
-        </label>
-        <textarea
-          id={`composer-${sessionId}`}
-          value={draft.text}
-          placeholder={pane === 'terminal' ? 'Type into the terminal' : 'Message this session'}
-          aria-describedby={blocked ? `composer-why-${sessionId}` : undefined}
-          onChange={(event) => {
-            setDraft(edit(draft, event.target.value, Date.now()))
-          }}
-          onKeyDown={(event) => {
-            if (pane !== 'terminal') return
-            const bytes = sequenceForKeyPress(event)
-            if (bytes === null) return
-            // A hardware keyboard drives the terminal directly; the field is only where the
-            // person is looking.
-            if (event.key.length === 1 && !event.ctrlKey && !event.altKey) return
-            event.preventDefault()
-            sendKeys(bytes)
-          }}
-        />
-        {blocked ? (
-          <p className="m-hint" id={`composer-why-${sessionId}`}>
-            {blocked}
-          </p>
-        ) : null}
+          {pane === 'semantic' ? (
+            <>
+              <AttachmentPicker
+                surface={surface}
+                onPicked={(files) => {
+                  for (const { picked, file } of files) {
+                    const admission = admit(picked)
+                    if (!admission.admitted) {
+                      say(admission.reason, 'danger')
+                      continue
+                    }
+                    setHeldFiles((current) => [...current, { picked, file }])
+                  }
+                }}
+              />
 
-        <AttachmentPicker
-          surface={surface}
-          onPicked={(files) => {
-            for (const { picked, file } of files) {
-              const admission = admit(picked)
-              if (!admission.admitted) {
-                say(admission.reason, 'danger')
-                continue
-              }
-              setHeldFiles((current) => [...current, { picked, file }])
-            }
-          }}
-        />
-
-        <div className="m-composer-actions">
-          <Button
-            tone="primary"
-            disabled={!submittable(draft) || busy || waiting.length > 0}
-            style={{ minBlockSize: target }}
-            onClick={() => {
-              send(draft.text)
-            }}
-          >
-            Send
-          </Button>
-          {lifecycle.state.submissions
-            .filter((submission) => isForSession(submission.localId, sessionId))
-            .slice(-1)
-            .map((submission) => (
-              <Badge
-                key={submission.localId}
-                tone={
-                  submission.state === 'applied'
-                    ? 'success'
-                    : submission.state === 'queued'
-                      ? 'neutral'
-                      : 'accent'
-                }
-              >
-                {describeState(submission.state)}
-              </Badge>
-            ))}
+              <div className="m-composer-actions">
+                {sendButton}
+                {lastState}
+              </div>
+            </>
+          ) : null}
         </div>
       </div>
     </div>
