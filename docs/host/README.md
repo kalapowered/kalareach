@@ -44,11 +44,15 @@ Endpoints are `c.sock` (clients), `r.sock` (the owner-only rendezvous), `t.sock`
 chunks) and `w<display>.sock` (one worker). On Windows they are named pipes scoped by user and
 environment, carrying an owner-only access-control list, because the pipe namespace has no directory
 permissions to inherit. That namespace is shared by every account on the machine, so the list is not
-the only line: the listener proves the connecting client's account from the connection itself and
-refuses another account before it reads a frame, and a client proves the pipe it reached is owned by
-this account, opening it for identification only, before it writes one. A name another account
-created first while the host was not listening is refused rather than served or trusted, and the
-host does not start on a name another account holds.
+the only line. The listener proves each caller's account from the connection itself, at the
+connection's first read, and nothing a caller of another account sends reaches a reader. This
+host's own clients open a pipe for identification only, so the server cannot act as them, and check
+before they write that the pipe is owned by this account's user, or by the owner this account's new
+objects receive, and that its list admits no account the machine does not already trust. Where that
+default owner is a group, such as the Administrators group of an elevated token, a pipe that group
+owns is trusted too: an account that already holds the machine that way is not something these
+checks keep out. A name another account created first while the host was not listening is refused
+rather than served or trusted, and the host does not start on a name another account holds.
 
 A session's output spool is created the same way rather than inheriting the process umask, because
 it holds the terminal's own output: mode 0700 on Unix, and on Windows the owner-only access list of
