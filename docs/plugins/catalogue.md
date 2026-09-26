@@ -349,7 +349,8 @@ The release's state is found by where the release came from, so a revocation rea
 an old release after an upgrade, or after the package moved to another repository. The first notice
 raises the trusted adapter item for the session, which escalates and repeats until the session holds
 no binding on a revoked release of that package, and the notice that says so resolves it. Both
-travel with the package's name while privacy mode withholds their words. `plugin.list` reports which
+travel with the package's name while privacy mode withholds their words, and a notice the session's
+journal cannot write yet is kept, in order, until the journal recovers. `plugin.list` reports which
 installations and live releases are revoked. No method sets the policy yet, so every catalogue warns
 only.
 

@@ -1168,17 +1168,17 @@ async fn page_of(link: &mut Link, wanted: usize) -> AttentionSourcePage {
     }
 }
 
-/// KR-REQ-25.22: a binding on a release its repository revoked is recorded in the session's
-/// journal as a host event of its own kind, which a page carries with its package and its
-/// transition and the warning a person reads. With privacy mode on the words are withheld and the
-/// transition still travels, so the item is raised and resolved all the same; once the session
-/// holds no binding on the package's revoked releases, that is recorded too. An application's
-/// notification with the very same words carries no transition.
-#[tokio::test]
-async fn an_adapter_transition_travels_with_its_package_whether_or_not_its_words_do() {
-    use kr_worker::broker::catalogue::testing::{self, Snapshot};
+/// One instance of the session bound to the Claude Code package, admitted in the worker's first
+/// frame.
+struct Bound {
+    _packages: tempfile::TempDir,
+    package: kr_protocol::admission::AdmittedPackage,
+    instance: kr_protocol::ids::ApplicationInstanceId,
+}
 
-    let host = host().await;
+fn bound(host: &Host) -> Bound {
+    use kr_worker::broker::catalogue::testing;
+
     let packages = tempfile::tempdir().expect("a directory on the internal disk");
     let source = kr_worker::broker::connectors::fixture::claude_code_package(
         packages.path(),
@@ -1187,9 +1187,13 @@ async fn an_adapter_transition_travels_with_its_package_whether_or_not_its_words
     .expect("the package is written");
     let package = testing::admitted(&source);
     let broker = host.service.broker();
-    let admissions = host.service.plugin_admissions();
-    let sources_held = host.service.connector_sources();
-    let frame = testing::admit(admissions, sources_held, broker, vec![package.clone()], 1);
+    let frame = testing::admit(
+        host.service.plugin_admissions(),
+        host.service.connector_sources(),
+        broker,
+        vec![package.clone()],
+        1,
+    );
     let instance = kr_protocol::ids::ApplicationInstanceId::new(kr_ipc::new_uuid());
     broker
         .register_instance(
@@ -1212,11 +1216,22 @@ async fn an_adapter_transition_travels_with_its_package_whether_or_not_its_words
             kr_ipc::now_ms(),
         )
         .expect("the package is bound");
+    Bound {
+        _packages: packages,
+        package,
+        instance,
+    }
+}
+
+/// Hands the worker a second frame in which its repository has revoked the bound release, and
+/// returns the warning a person reads about it.
+fn revoke(host: &Host, bound: &Bound) -> String {
+    use kr_worker::broker::catalogue::testing::{self, Snapshot};
 
     testing::hand_over(
-        admissions,
-        sources_held,
-        broker,
+        host.service.plugin_admissions(),
+        host.service.connector_sources(),
+        host.service.broker(),
         Snapshot {
             releases: vec![kr_protocol::admission::ReleaseState {
                 revocation: Nullable::some(kr_protocol::admission::AdmissionRevocation {
@@ -1224,15 +1239,30 @@ async fn an_adapter_transition_travels_with_its_package_whether_or_not_its_words
                     revoked_at: kr_protocol::scalars::TimestampMs::new(5),
                     statement: "Do not run this release.".to_owned(),
                 }),
-                ..testing::release_of(&package)
+                ..testing::release_of(&bound.package)
             }],
             ..Snapshot::admitting(2, Vec::new())
         },
     );
-    let warning = format!(
+    format!(
         "{} {} was revoked by its repository (compromised): Do not run this release.",
-        package.plugin_id, package.version
-    );
+        bound.package.plugin_id, bound.package.version
+    )
+}
+
+/// KR-REQ-25.22: a binding on a release its repository revoked is recorded in the session's
+/// journal as a host event of its own kind, which a page carries with its package and its
+/// transition and the warning a person reads. With privacy mode on the words are withheld and the
+/// transition still travels, so the item is raised and resolved all the same; once the session
+/// holds no binding on the package's revoked releases, that is recorded too. An application's
+/// notification with the very same words carries no transition.
+#[tokio::test]
+async fn an_adapter_transition_travels_with_its_package_whether_or_not_its_words_do() {
+    let host = host().await;
+    let bound = bound(&host);
+    let package = &bound.package;
+    let broker = host.service.broker();
+    let warning = revoke(&host, &bound);
     let mut link = daemon(&host, ControllerConnectionRole::Attention).await;
     let revoked = page_of(&mut link, 1).await;
     // Written after the transition, so it pages after it.
@@ -1269,7 +1299,10 @@ async fn an_adapter_transition_travels_with_its_package_whether_or_not_its_words
         "and the transition still travels"
     );
 
-    let ended = broker.end(instance, kr_worker::broker::InstanceEnding::NativeExit);
+    let ended = broker.end(
+        bound.instance,
+        kr_worker::broker::InstanceEnding::NativeExit,
+    );
     assert!(ended.instance_ended);
     let cleared = page_of(&mut link, 3).await;
     assert_eq!(
@@ -1281,6 +1314,111 @@ async fn an_adapter_transition_travels_with_its_package_whether_or_not_its_words
         "the session holds no binding on the revoked release any more"
     );
     assert_eq!(cleared.host_events.records[2].text.0, None);
+}
+
+/// The journal's write lock, held by a connection of the test's own as another writer holds it,
+/// until this is dropped, which rolls its transaction back. A write the session makes meanwhile
+/// waits out the store's busy timeout and is refused.
+struct WriteLock {
+    _holding: rusqlite::Connection,
+}
+
+impl WriteLock {
+    fn take(host: &Host) -> Self {
+        let connection = rusqlite::Connection::open(&host.journal_path).expect("opens the journal");
+        connection
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("takes the write lock");
+        Self {
+            _holding: connection,
+        }
+    }
+}
+
+/// Waits until the journal has opened `count` faults since the session started.
+async fn faults_opened(health: &kr_worker::persistence::JournalHealth, count: u64) {
+    let started = tokio::time::Instant::now();
+    while health.faults_opened() < count {
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the journal refuses the write"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// KR-REQ-25.22: a transition the journal refuses is kept, in order, and written once the journal
+/// has recovered, though nothing queues it again: the revocation's warning after one refusal, and
+/// the clearing after another, with no change of the release's state in between.
+///
+/// Each transition is queued before the lock is taken, so the only write the lock refuses is the
+/// notice's own, and this test's runtime runs nothing else until it waits. Only the journal
+/// recovers before each notice is looked for, so what brings the write is the journal's recovery,
+/// not the broker's or another notice.
+#[tokio::test]
+async fn an_adapter_transition_the_journal_refuses_is_written_once_the_journal_recovers() {
+    let host = host().await;
+    let bound = bound(&host);
+    let health = Arc::clone(
+        host.service
+            .runtime()
+            .session()
+            .journal_mut()
+            .expect("the session has a journal")
+            .health(),
+    );
+    let opened = health.faults_opened();
+    let mut link = daemon(&host, ControllerConnectionRole::Attention).await;
+
+    let warning = revoke(&host, &bound);
+    let lock = WriteLock::take(&host);
+    faults_opened(&health, opened + 1).await;
+    drop(lock);
+    assert!(
+        page(&mut link, sources(0, 0, 0))
+            .await
+            .host_events
+            .records
+            .is_empty(),
+        "nothing is written while the journal refuses"
+    );
+    assert!(
+        host.service.runtime().session().recover_journal().is_some(),
+        "the journal writes its gap and recovers"
+    );
+    let revoked = page_of(&mut link, 1).await;
+    assert_eq!(
+        revoked.host_events.records[0].adapter.0,
+        Some(kr_protocol::attention::AdapterNotice {
+            plugin_id: bound.package.plugin_id.clone(),
+            transition: kr_protocol::attention::AdapterTransition::Revoked,
+        })
+    );
+    assert_eq!(host_texts(&revoked), vec![Some(warning)]);
+    // The broker's half of the recovery, as the host's maintenance takes it.
+    host.service.recover_storage_now();
+
+    let ended = host.service.broker().end(
+        bound.instance,
+        kr_worker::broker::InstanceEnding::NativeExit,
+    );
+    assert!(ended.instance_ended);
+    let lock = WriteLock::take(&host);
+    faults_opened(&health, opened + 2).await;
+    drop(lock);
+    assert!(
+        host.service.runtime().session().recover_journal().is_some(),
+        "the journal writes its gap and recovers"
+    );
+    let cleared = page_of(&mut link, 2).await;
+    assert_eq!(
+        cleared.host_events.records[1].adapter.0,
+        Some(kr_protocol::attention::AdapterNotice {
+            plugin_id: bound.package.plugin_id.clone(),
+            transition: kr_protocol::attention::AdapterTransition::Cleared,
+        }),
+        "the clearing the journal refused is written once it recovers"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------

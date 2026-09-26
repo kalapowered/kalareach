@@ -446,36 +446,67 @@ impl WorkerService {
         self
     }
 
-    /// Writes each adapter notice the broker queues to the session's journal, as it is queued,
-    /// for as long as this service lives.
+    /// Writes each adapter notice the broker queues to the session's journal, in the order it was
+    /// queued, for as long as this service lives.
+    ///
+    /// Nothing queues a transition twice, so a notice the journal refuses is kept, with every
+    /// notice queued after it, and written once the journal's own recovery has made it healthy
+    /// again: a lost one would leave the attention item it raises, or the one it resolves, as it
+    /// was. A session with no journal has nowhere to write them, and keeps none.
     async fn record_adapter_notices(
         service: std::sync::Weak<Self>,
         broker: Arc<crate::broker::Broker>,
     ) {
+        let mut unwritten = std::collections::VecDeque::new();
+        let mut condition: Option<
+            tokio::sync::watch::Receiver<crate::persistence::fault::JournalCondition>,
+        > = None;
         loop {
-            broker.notices_waiting().await;
+            match condition.as_mut() {
+                // What the journal refused waits for its recovery, not for another notice.
+                Some(condition) if !unwritten.is_empty() => {
+                    if condition
+                        .wait_for(crate::persistence::fault::JournalCondition::is_healthy)
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                _ => broker.notices_waiting().await,
+            }
             let Some(service) = service.upgrade() else {
                 return;
             };
-            let notices = broker.take_notices();
-            if notices.is_empty() {
+            unwritten.extend(broker.take_notices());
+            if unwritten.is_empty() {
                 continue;
             }
             let mut session = service.runtime.session();
             let cursor = session.output_cursor();
             let now = kr_ipc::now_ms();
-            if let Some(journal) = session.journal_mut() {
-                for notice in notices {
-                    // A notice the journal refuses is its fault's to report; the next transition
-                    // of the same package is recorded when it comes.
-                    let _ = journal.record_adapter_event(
+            let Some(journal) = session.journal_mut() else {
+                unwritten.clear();
+                continue;
+            };
+            if condition.is_none() {
+                condition = Some(journal.health().watch());
+            }
+            while let Some(notice) = unwritten.front() {
+                // A refusal has faulted the journal, which is what the wait above waits out.
+                if journal
+                    .record_adapter_event(
                         notice.plugin_id.as_str(),
                         notice.transition,
                         &notice.text,
                         cursor,
                         now,
-                    );
+                    )
+                    .is_err()
+                {
+                    break;
                 }
+                unwritten.pop_front();
             }
         }
     }
