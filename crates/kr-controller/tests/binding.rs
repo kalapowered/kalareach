@@ -938,6 +938,15 @@ async fn a_lowered_package_limit_moves_the_admissions_to_a_new_revision() {
             .iter()
             .any(|package| package.plugin_id == plugin())
     );
+    let names_the_package = |warnings: &[String]| {
+        warnings
+            .iter()
+            .any(|warning| warning.contains(plugin().as_str()))
+    };
+    assert!(
+        !names_the_package(&hosted.controller().catalogue_warnings().await),
+        "an admitted package is nothing the doctor warns about"
+    );
 
     hosted
         .controller()
@@ -963,12 +972,30 @@ async fn a_lowered_package_limit_moves_the_admissions_to_a_new_revision() {
         "{:?}",
         after.left_out
     );
+    let warnings = hosted.controller().catalogue_warnings().await;
+    assert!(
+        warnings.iter().any(|warning| warning.contains(plugin().as_str())
+            && warning.contains("package_bytes")),
+        "the doctor names the package it cannot admit and the limit it is past: {warnings:?}"
+    );
     assert_eq!(
         hosted.counted_once_known().await,
         Nullable::some(U64::new(0)),
         "the worker answers at the new revision"
     );
     assert!(hosted.pending().await.is_empty());
+
+    // Disabled as well, the package is the owner's decision twice over and nothing to warn about.
+    hosted
+        .controller()
+        .apply_configuration(&Change::Enrolment(ConfiguredEnrolmentBudgets::default()))
+        .await
+        .expect("the limit back as it was");
+    hosted.change(Method::PluginDisable).await;
+    assert!(
+        !names_the_package(&hosted.controller().catalogue_warnings().await),
+        "a disabled package is nothing the doctor warns about"
+    );
 }
 
 /// A lowered package limit whose admission revision cannot be raised does not come into force:

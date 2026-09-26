@@ -167,9 +167,10 @@ pub fn check(source: Option<&dyn CatalogueEvidence>, budgets: EnrolmentBudgets) 
         },
         detail,
         degraded.then_some(
-            "A repository that cannot reach its budget keeps its last good generation, and a \
-             package a worker refused is not used in that session. Synchronise again, raise the \
-             budget in this host's configuration, or install the package again.",
+            "A repository that cannot reach its budget keeps its last good generation, an \
+             installation this host cannot admit is used by no new binding, and a package a \
+             worker refused is not used in that session. Synchronise again, raise the budget or \
+             the package limit in this host's configuration, or install the package again.",
         ),
     )
 }

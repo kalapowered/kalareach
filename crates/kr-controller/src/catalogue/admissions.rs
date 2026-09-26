@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use kr_plugin_catalogue::{
     AdmissionPlan, Admissions, Catalogue, CatalogueResult, DisablePolicy, HostPlatform,
+    NotAdmittedReason,
 };
 use kr_plugin_sdk::catalogue::MAX_QUALIFIED_BUILDS;
 use kr_plugin_sdk::digest::PayloadDigest;
@@ -42,7 +43,8 @@ pub struct Snapshot {
     pub packages: Vec<AdmittedPackage>,
     /// The state of every admitted release and of every release reported live.
     pub releases: Vec<ReleaseState>,
-    /// Every installation left out of `packages`, with why.
+    /// Every installation left out of `packages` for a reason other than being disabled, with
+    /// why: what the doctor names.
     pub left_out: Vec<(PluginId, String)>,
 }
 
@@ -265,6 +267,8 @@ pub fn wire(
     let mut left_out: Vec<(PluginId, String)> = admissions
         .not_admitted
         .iter()
+        // A disabled installation is its owner's decision, and nothing anybody needs telling.
+        .filter(|refused| !matches!(refused.reason, NotAdmittedReason::Disabled))
         .map(|refused| (refused.plugin_id.clone(), refused.detail()))
         .collect();
     let mut packages = Vec::new();

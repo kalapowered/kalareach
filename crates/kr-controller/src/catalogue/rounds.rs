@@ -54,11 +54,13 @@ impl Controller {
         }
     }
 
-    /// The catalogue's evidence for the doctor: each enrolled repository, each package a worker
+    /// The catalogue's evidence for the doctor: each enrolled repository, each installation the
+    /// admissions in force leave out for a reason other than being disabled, each package a worker
     /// said it would not read or bind, with its session, and each set of admissions this daemon
     /// could not hand over.
     pub(crate) async fn catalogue_evidence(&self) -> crate::catalogue::evidence::Evidence {
-        let deadline = tokio::time::Instant::now() + WORKER_EXCHANGE;
+        let start = tokio::time::Instant::now();
+        let deadline = start + WORKER_EXCHANGE;
         let mut warnings = Vec::new();
         let repositories = match self.catalogue.evidence_within(deadline).await {
             Ok(repositories) => repositories,
@@ -70,6 +72,14 @@ impl Controller {
                 Vec::new()
             }
         };
+        if let Some(snapshot) = self.current_snapshot(start).await {
+            warnings.extend(
+                snapshot
+                    .left_out
+                    .iter()
+                    .map(|(_, why)| format!("{why}, so no new binding uses it")),
+            );
+        }
         for (session_id, refusal) in self.plugin_bridge.refusals() {
             warnings.push(format!(
                 "session {session_id} did not use the package {}: {}{}",
@@ -409,6 +419,13 @@ impl Controller {
     #[cfg(feature = "testing")]
     pub async fn refresh_admissions(&self) -> bool {
         self.refreshed_view().await.counts.is_some()
+    }
+
+    /// The warnings the doctor's catalogue check carries now, with their words, which the check
+    /// itself withholds. For this host's own tests.
+    #[cfg(feature = "testing")]
+    pub async fn catalogue_warnings(&self) -> Vec<String> {
+        self.catalogue_evidence().await.warnings
     }
 
     /// Returns true while a round to the member for `session_id` is out. For this host's own tests.
