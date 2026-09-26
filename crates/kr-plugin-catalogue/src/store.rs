@@ -1318,6 +1318,7 @@ impl Store {
                     let place = StagedPlace {
                         staging: layout.staging,
                         name,
+                        remove: true,
                     };
                     let dir = open_child(&place.staging.dir, &path, Path::new(&place.name), false)?;
                     return Ok(StagedPackage {
@@ -1584,6 +1585,9 @@ pub struct StagedPackage {
 struct StagedPlace {
     staging: Area,
     name: String,
+    /// Whether dropping this removes the directory: it does until the directory has been renamed
+    /// into place, after which nothing of this attempt is left under the name.
+    remove: bool,
 }
 
 impl Drop for StagedPlace {
@@ -1591,11 +1595,12 @@ impl Drop for StagedPlace {
     /// made in.
     ///
     /// The directory is this attempt's own and nothing reads it, so an attempt that stops part way,
-    /// or whose activation was refused, leaves nothing behind. After an activation it has been
-    /// renamed into place and there is nothing here to remove. A removal that fails leaves a
+    /// or whose activation was refused, leaves nothing behind. A removal that fails leaves a
     /// directory no reader ever looks at, under a name no later attempt reuses.
     fn drop(&mut self) {
-        let _ = self.staging.dir.remove_dir_all(&self.name);
+        if self.remove {
+            let _ = self.staging.dir.remove_dir_all(&self.name);
+        }
     }
 }
 
@@ -1707,7 +1712,7 @@ impl StagedPackage {
     /// into staging, where taking the store's lock next removes it, and the activation is refused:
     /// a directory put in the staged one's place is never left where readers look.
     fn move_into_place(self, packages: &Area, name: &str) -> CatalogueResult<()> {
-        let Self { dir, place, .. } = self;
+        let Self { dir, mut place, .. } = self;
         let destination = packages.path.join(name);
         let staged = identity(&dir)?;
         let staged_path = dir.path.clone();
@@ -1719,6 +1724,7 @@ impl StagedPackage {
             .dir
             .rename(&place.name, &packages.dir, name)
             .map_err(|source| CatalogueError::storage(&destination, &source))?;
+        place.remove = false;
         let arrived = open_child(&packages.dir, &destination, Path::new(name), false)
             .and_then(|arrived| identity(&arrived));
         if arrived.as_ref().is_ok_and(|arrived| *arrived == staged) {
@@ -3131,6 +3137,15 @@ mod tests {
         assert!(!held.contains_key(&first) && held.contains_key(&second));
     }
 
+    /// Leaves a staged package as an operation that stopped leaves it: its directory stays in
+    /// staging, since nothing ran to remove it, and every handle it held is closed, as the
+    /// operating system closes a stopped process's handles.
+    fn stopped(staged: StagedPackage) {
+        let StagedPackage { dir, mut place, .. } = staged;
+        drop(dir);
+        place.remove = false;
+    }
+
     #[test]
     fn taking_the_lock_clears_what_an_operation_that_stopped_left_in_staging() {
         let (_directory, store) = store();
@@ -3138,8 +3153,7 @@ mod tests {
             .stage_package(PayloadDigest::of(b"left behind"))
             .expect("staged");
         let left = staged.path().to_path_buf();
-        // An operation that stopped leaves its staging behind: nothing ran to remove it.
-        std::mem::forget(staged);
+        stopped(staged);
         let temporary = store.root.join("staging").join("index.json.partial");
         std::fs::write(&temporary, b"half a document").expect("writable");
         assert!(left.is_dir() && temporary.is_file());
@@ -3163,7 +3177,7 @@ mod tests {
             .stage_package(PayloadDigest::of(b"left behind"))
             .expect("staged");
         let held = staged.path().join("assets");
-        std::mem::forget(staged);
+        stopped(staged);
         std::fs::create_dir_all(&held).expect("a directory");
         std::fs::write(held.join("icon.bin"), [0u8; 8]).expect("writable");
         std::fs::set_permissions(&held, std::fs::Permissions::from_mode(0o555)).expect("read-only");
