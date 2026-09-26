@@ -241,6 +241,46 @@ mod tests {
         ));
     }
 
+    /// A transcript renders its domain and how many bytes it holds, and nothing else of them, in
+    /// both forms and whichever constructor made it. What it holds is unchanged by that.
+    #[test]
+    fn a_transcript_renders_its_domain_and_its_length_only() {
+        const MARKER: &str = "an element no rendering shows";
+        let elements = || vec![CanonicalValue::text(MARKER)];
+        let built = SigningTranscript::from_elements("kr-test/1", elements());
+        let encoded = kr_cbor::encode(&signing_value("kr-test/1", elements()));
+        assert_eq!(built.as_bytes(), encoded.as_slice());
+        assert_eq!(
+            built.digest(),
+            Digest256::from_bytes(kr_cbor::sha256(&encoded))
+        );
+
+        let checked = SigningTranscript::from_canonical_bytes("kr-test/1", encoded.clone())
+            .expect("a domain-separated array");
+        let object = SigningTranscript::from_object("kr-test/1", &MARKER).expect("a transcript");
+        let marker_as_numbers = MARKER
+            .bytes()
+            .map(|byte| byte.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        for transcript in [&built, &checked, &object] {
+            let length = transcript.as_bytes().len();
+            let plain = format!("{transcript:?}");
+            let pretty = format!("{transcript:#?}");
+            assert!(!plain.contains(&marker_as_numbers), "{plain}");
+            assert_eq!(
+                plain,
+                format!("SigningTranscript {{ domain: \"kr-test/1\", bytes: {length} }}")
+            );
+            assert_eq!(
+                pretty,
+                format!(
+                    "SigningTranscript {{\n    domain: \"kr-test/1\",\n    bytes: {length},\n}}"
+                )
+            );
+        }
+    }
+
     /// KR-REQ-23.06: a signature covers every element of what it signs.
     #[test]
     fn a_changed_element_does_not_verify() {
