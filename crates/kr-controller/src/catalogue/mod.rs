@@ -835,10 +835,10 @@ impl CatalogueModule {
                 let mut render = settle(&mut answer, |transition| match transition {
                     Transition::Uninstalled {
                         plugin_id,
-                        closed_bindings,
+                        affected_bindings,
                     } => Ok(wire::PluginRemoveResult {
                         plugin_id: plugin_id.clone(),
-                        closed_bindings: U64::new(*closed_bindings),
+                        closed_bindings: U64::new(affected_bindings.unwrap_or(0)),
                     }),
                     _ => Err(unexpected(transition)),
                 });
@@ -846,6 +846,7 @@ impl CatalogueModule {
                     .uninstall_with(
                         params.environment_id,
                         &params.plugin_id,
+                        None,
                         &mut Change::settling(admission, key, now, &mut render),
                     )
                     .map_err(ProtocolError::from)?;
@@ -1296,7 +1297,8 @@ fn plugin_summary(view: &InstallationView) -> Answer<wire::PluginSummary> {
         enabled: installation.enabled,
         pinned: installation.pinned,
         revoked: view.revoked,
-        live_bindings: U64::new(view.live_bindings),
+        // The workers' own records are what counts bindings, and this answer asks none of them.
+        live_bindings: U64::new(0),
     })
 }
 

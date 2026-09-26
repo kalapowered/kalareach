@@ -37,6 +37,7 @@ use kr_protocol::ids::{EnvironmentId, RepositoryGeneration};
 use kr_protocol::receipt::ReceiptState;
 use rusqlite::{Connection, OpenFlags, OptionalExtension as _, TransactionBehavior, params};
 
+use crate::admission::ReleaseOrigin;
 use crate::authority::{Failure, Permit};
 use crate::ceiling::{InstallationGrant, capability_from_str};
 use crate::error::{CatalogueError, CatalogueResult};
@@ -425,6 +426,15 @@ CREATE TABLE IF NOT EXISTS settings (
     name   TEXT PRIMARY KEY,
     value  TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS retired_releases (
+    environment_id  TEXT NOT NULL,
+    plugin_id       TEXT NOT NULL,
+    package_digest  TEXT NOT NULL,
+    enrolment_key   TEXT NOT NULL,
+    repository_id   TEXT NOT NULL,
+    cap             TEXT NOT NULL,
+    PRIMARY KEY (environment_id, plugin_id, package_digest, enrolment_key)
+);
 CREATE TABLE IF NOT EXISTS receipts (
     actor           TEXT NOT NULL,
     action          TEXT NOT NULL,
@@ -441,6 +451,38 @@ CREATE TABLE IF NOT EXISTS receipts (
 );
 PRAGMA foreign_keys = ON;
 ";
+
+/// A release an installation left, with the most a binding still holding it may use.
+///
+/// An upgrade, a move to another repository and a removal each leave a release behind, which a
+/// running binding may still hold. The row records the effective grants the installation held on
+/// that release when it left it; a later grant change of the package in the environment only ever
+/// takes grants away from it. It records no binding: the workers' own records say what is bound.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RetiredRelease {
+    /// The environment the installation was in.
+    pub environment_id: EnvironmentId,
+    /// The package.
+    pub plugin_id: PluginId,
+    /// The release's exact package hash.
+    pub package_digest: PayloadDigest,
+    /// Where the release came from.
+    pub origin: ReleaseOrigin,
+    /// The most a binding on it may use.
+    pub cap: std::collections::BTreeSet<PluginCapability>,
+}
+
+impl RetiredRelease {
+    /// The key a release's state is found by: the package, its hash and where it came from.
+    #[must_use]
+    pub fn key(&self) -> (PluginId, PayloadDigest, ReleaseOrigin) {
+        (
+            self.plugin_id.clone(),
+            self.package_digest,
+            self.origin.clone(),
+        )
+    }
+}
 
 /// One accepted generation a repository keeps, and the index document that is its.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -699,6 +741,83 @@ impl Records<'_> {
             None => Ok(DisablePolicy::default()),
             Some(text) => DisablePolicy::parse(text).ok_or_else(|| unreadable(text)),
         }
+    }
+
+    /// Returns the admission revision: a counter every committed change that can alter what is
+    /// admitted raises, zero before the first.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogueError::StorageUnavailable`] when the setting cannot be read.
+    pub fn admission_revision(&self) -> CatalogueResult<u64> {
+        let value: Option<String> = self
+            .transaction
+            .query_row(
+                "SELECT value FROM settings WHERE name = 'admission_revision'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|source| self.failure(&source))?;
+        value.map_or(Ok(0), |text| text.parse().map_err(unreadable))
+    }
+
+    /// Returns every release an installation in one environment left, with its cap.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogueError::StorageUnavailable`] when a record cannot be read.
+    pub fn retired_releases(
+        &self,
+        environment_id: EnvironmentId,
+    ) -> CatalogueResult<Vec<RetiredRelease>> {
+        self.retired_where(Some(environment_id))
+    }
+
+    fn retired_where(
+        &self,
+        environment_id: Option<EnvironmentId>,
+    ) -> CatalogueResult<Vec<RetiredRelease>> {
+        let mut statement = self
+            .transaction
+            .prepare_cached(
+                "SELECT environment_id, plugin_id, package_digest, enrolment_key, repository_id, cap
+                   FROM retired_releases
+                  WHERE ?1 IS NULL OR environment_id = ?1
+                  ORDER BY environment_id, plugin_id, package_digest, enrolment_key",
+            )
+            .map_err(|source| self.failure(&source))?;
+        let rows = statement
+            .query_map(
+                params![environment_id.map(|environment| environment.to_string())],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                },
+            )
+            .map_err(|source| self.failure(&source))?;
+        let mut retired = Vec::new();
+        for row in rows {
+            let (environment_id, plugin_id, digest, key, repository_id, cap) =
+                row.map_err(|source| self.failure(&source))?;
+            retired.push(RetiredRelease {
+                environment_id: environment(&environment_id)?,
+                plugin_id: PluginId::new(plugin_id).map_err(unreadable)?,
+                package_digest: PayloadDigest::parse(&digest).map_err(unreadable)?,
+                origin: ReleaseOrigin {
+                    repository_id: RepositoryId::new(repository_id).map_err(unreadable)?,
+                    enrolment_key: EnrolmentKey::parse(&key)?,
+                },
+                cap: capabilities_from(&cap)?.into_iter().collect(),
+            });
+        }
+        Ok(retired)
     }
 
     /// Returns one action's receipt.
@@ -1017,6 +1136,139 @@ impl Changes<'_> {
             "DELETE FROM installations WHERE environment_id = ?1 AND plugin_id = ?2",
             params![environment_id.to_string(), plugin_id.as_str()],
         )?;
+        Ok(())
+    }
+
+    /// Raises the admission revision by one and returns the new revision.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogueError::StorageUnavailable`] when it cannot be read or written.
+    pub fn raise_admission_revision(&self) -> CatalogueResult<u64> {
+        let raised = self.admission_revision()?.saturating_add(1);
+        self.execute(
+            "INSERT INTO settings (name, value) VALUES ('admission_revision', ?1)
+             ON CONFLICT (name) DO UPDATE SET value = excluded.value",
+            params![raised.to_string()],
+        )?;
+        Ok(raised)
+    }
+
+    /// Records that an installation left a release, with the effective grants it held on it.
+    ///
+    /// A release already recorded keeps the narrower of the two caps: a cap only ever narrows.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogueError::StorageUnavailable`] when it cannot be read or written.
+    pub fn retire_release(&self, release: &RetiredRelease) -> CatalogueResult<()> {
+        let held = self
+            .retired_where(Some(release.environment_id))?
+            .into_iter()
+            .find(|row| row.key() == release.key());
+        let cap: Vec<PluginCapability> = match held {
+            Some(held) => held.cap.intersection(&release.cap).copied().collect(),
+            None => release.cap.iter().copied().collect(),
+        };
+        self.execute(
+            "INSERT INTO retired_releases
+                 (environment_id, plugin_id, package_digest, enrolment_key, repository_id, cap)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT (environment_id, plugin_id, package_digest, enrolment_key)
+                 DO UPDATE SET cap = excluded.cap, repository_id = excluded.repository_id",
+            params![
+                release.environment_id.to_string(),
+                release.plugin_id.as_str(),
+                release.package_digest.to_string(),
+                release.origin.enrolment_key.as_str(),
+                release.origin.repository_id.as_str(),
+                json(&capability_names(cap))?,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Takes `withdrawn` away from the cap of every release one package in one environment left.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogueError::StorageUnavailable`] when it cannot be read or written.
+    pub fn narrow_retired(
+        &self,
+        environment_id: EnvironmentId,
+        plugin_id: &PluginId,
+        withdrawn: &std::collections::BTreeSet<PluginCapability>,
+    ) -> CatalogueResult<()> {
+        if withdrawn.is_empty() {
+            return Ok(());
+        }
+        for row in self.retired_where(Some(environment_id))? {
+            if &row.plugin_id != plugin_id {
+                continue;
+            }
+            let cap: Vec<PluginCapability> = row.cap.difference(withdrawn).copied().collect();
+            self.execute(
+                "UPDATE retired_releases SET cap = ?5
+                  WHERE environment_id = ?1 AND plugin_id = ?2 AND package_digest = ?3
+                    AND enrolment_key = ?4",
+                params![
+                    row.environment_id.to_string(),
+                    row.plugin_id.as_str(),
+                    row.package_digest.to_string(),
+                    row.origin.enrolment_key.as_str(),
+                    json(&capability_names(cap))?,
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Forgets one release an installation left, because an installation holds it again.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogueError::StorageUnavailable`] when it cannot be written.
+    pub fn forget_retired(
+        &self,
+        environment_id: EnvironmentId,
+        plugin_id: &PluginId,
+        package_digest: PayloadDigest,
+        origin: &ReleaseOrigin,
+    ) -> CatalogueResult<()> {
+        self.execute(
+            "DELETE FROM retired_releases
+              WHERE environment_id = ?1 AND plugin_id = ?2 AND package_digest = ?3
+                AND enrolment_key = ?4",
+            params![
+                environment_id.to_string(),
+                plugin_id.as_str(),
+                package_digest.to_string(),
+                origin.enrolment_key.as_str(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Forgets every release an installation left that is not among `live`, in every environment.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogueError::StorageUnavailable`] when it cannot be read or written.
+    pub fn forget_retired_except(
+        &self,
+        live: &std::collections::BTreeSet<(PluginId, PayloadDigest, ReleaseOrigin)>,
+    ) -> CatalogueResult<()> {
+        for row in self.retired_where(None)? {
+            if live.contains(&row.key()) {
+                continue;
+            }
+            self.forget_retired(
+                row.environment_id,
+                &row.plugin_id,
+                row.package_digest,
+                &row.origin,
+            )?;
+        }
         Ok(())
     }
 

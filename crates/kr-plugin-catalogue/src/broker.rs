@@ -10,19 +10,26 @@
 //!   gateway admits it for one application instance, and admission is the gateway's: it owns the
 //!   transport, the fence and the arbitration the proxy sits behind.
 //!
-//! Both are reads. Nothing in this trait grants anything, and nothing in it dispatches: a
+//! * **What is live.** A reclaim that has to make room asks which releases the workers' live
+//!   bindings hold, and which workers have not yet said so at the admission revision the reclaim
+//!   runs at. A worker that has not said so may hold a release no record here describes, so a
+//!   reclaim that needs room waits for it rather than guessing.
+//!
+//! All three are reads. Nothing in this trait grants anything, and nothing in it dispatches: a
 //! catalogue that asked a broker for permission would be a second permission system, which is the
 //! thing section 11 says not to build.
 //!
 //! [`UnboundBroker`] is the answer when no broker is bound, which is also what a host does before
-//! a worker exists: there is no live evidence, no proxy is admitted, and nothing pretends
-//! otherwise. It is what the suites bind against, and what a host uses until a broker is there.
+//! a worker exists: there is no live evidence, no proxy is admitted, nothing is live and nobody is
+//! pending, and nothing pretends otherwise. It is what the suites bind against, and what a host
+//! uses until a broker is there.
 
 use kr_plugin_sdk::capability::{CapabilityEvidence, PluginCapability};
 use kr_plugin_sdk::digest::PayloadDigest;
 use kr_plugin_sdk::ids::PluginId;
 use kr_protocol::ids::EnvironmentId;
 
+use crate::admission::LiveRelease;
 use crate::error::{CatalogueError, CatalogueResult};
 
 /// What the catalogue asks the broker about.
@@ -60,6 +67,19 @@ pub struct ProxyAdmission {
     pub revision: kr_protocol::ids::CapabilityRevision,
 }
 
+/// What the workers hold live, as a reclaim at one admission revision needs it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LivePackages {
+    /// Every release a worker's accepted report lists as live.
+    pub releases: Vec<LiveRelease>,
+    /// Every worker that has not reported at the revision asked about, or whose report there
+    /// listed a release it had not been told the state of, named for a person.
+    ///
+    /// Any of them may hold a release nothing else here describes, so a reclaim that needs room
+    /// waits while this is not empty.
+    pub pending: Vec<String>,
+}
+
 /// The broker, as the catalogue needs it.
 pub trait BrokerBridge: core::fmt::Debug + Send + Sync {
     /// Returns the evidence a live binding established, where one has.
@@ -75,11 +95,14 @@ pub trait BrokerBridge: core::fmt::Debug + Send + Sync {
     /// Returns the refusal the gateway decided.
     fn admit_proxy(&self, request: &ProxyRequest) -> CatalogueResult<ProxyAdmission>;
 
-    /// Returns every package hash a live binding currently holds.
+    /// Returns what the workers hold live, and which of them have not yet reported it at the
+    /// admission revision `revision`.
     ///
-    /// A sync never evicts one of these to finish, so the catalogue asks before it reclaims rather
-    /// than after somebody's binding stopped working.
-    fn live_packages(&self) -> Vec<PayloadDigest>;
+    /// A sync never evicts a live release to finish, so the catalogue asks before it reclaims
+    /// rather than after somebody's binding stopped working, and it asks at the revision its own
+    /// transaction reads, so a change committed and not yet announced to the workers already
+    /// counts.
+    fn live_packages(&self, revision: u64) -> LivePackages;
 }
 
 /// The broker that is not bound.
@@ -105,8 +128,8 @@ impl BrokerBridge for UnboundBroker {
         })
     }
 
-    fn live_packages(&self) -> Vec<PayloadDigest> {
-        Vec::new()
+    fn live_packages(&self, _revision: u64) -> LivePackages {
+        LivePackages::default()
     }
 }
 
@@ -127,7 +150,7 @@ mod tests {
     #[test]
     fn an_unbound_broker_holds_nothing_and_admits_nothing() {
         let broker = UnboundBroker;
-        assert!(broker.live_packages().is_empty());
+        assert_eq!(broker.live_packages(7), LivePackages::default());
         assert!(
             broker
                 .live_evidence(&EvidenceRequest {

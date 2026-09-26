@@ -18,17 +18,18 @@ use std::sync::Arc;
 use kr_plugin_catalogue::budget::{Resource, Stage};
 use kr_plugin_catalogue::transport::RepositoryTransport;
 use kr_plugin_catalogue::{
-    Authority, BudgetLedger, CapabilityCeiling, Catalogue, CatalogueError, CatalogueResult, Change,
-    Claimed, Committed, DisablePolicy, Effect, Enrolment, FetchReason, Installation,
-    InstallationGrant, MatchIndex, Observation, Owner, ReceiptClaim, ReceiptKey, Recording,
-    RepositoryId, RepositoryKind, Transition, capability_from_str,
+    Authority, BrokerBridge, BudgetLedger, CapabilityCeiling, Catalogue, CatalogueError,
+    CatalogueResult, Change, Claimed, Committed, DisablePolicy, Effect, Enrolment, FetchReason,
+    HostPlatform, Installation, InstallationGrant, LivePackages, LiveRelease, MatchIndex,
+    NotAdmittedReason, Observation, Owner, ReceiptClaim, ReceiptKey, Recording, ReleaseOrigin,
+    RepositoryId, RepositoryKind, Transition, capability_from_str, this_host,
 };
 use kr_plugin_sdk::capability::{CapabilityState, EvidenceSource, PluginCapability};
 use kr_plugin_sdk::catalogue::{QualificationResult, RevocationReason, RevocationRecord};
 use kr_plugin_sdk::digest::PayloadDigest;
 use kr_plugin_sdk::ids::PluginId;
 use kr_plugin_sdk::limits::RepositoryBudgets;
-use kr_plugin_sdk::matching::Resolution;
+use kr_plugin_sdk::matching::{Architecture, OperatingSystem, PlatformSupport, Resolution};
 use kr_plugin_sdk::text::{Label, Summary};
 use kr_plugin_sdk::version::PackageVersion;
 use kr_protocol::error::ErrorCode;
@@ -84,8 +85,26 @@ async fn enrolled(
     budgets: RepositoryBudgets,
     ceiling: CapabilityCeiling,
 ) -> Catalogue {
-    let mut catalogue =
-        Catalogue::open(&home.join("catalogue"), local()).expect("an openable catalogue");
+    enrolled_with(
+        home,
+        generation,
+        budgets,
+        ceiling,
+        Arc::new(kr_plugin_catalogue::UnboundBroker),
+    )
+    .await
+}
+
+/// A catalogue under `home` against `broker`, with `generation`'s repository enrolled.
+async fn enrolled_with(
+    home: &std::path::Path,
+    generation: &Generation,
+    budgets: RepositoryBudgets,
+    ceiling: CapabilityCeiling,
+    broker: Arc<dyn BrokerBridge>,
+) -> Catalogue {
+    let mut catalogue = Catalogue::with_broker(&home.join("catalogue"), broker, local())
+        .expect("an openable catalogue");
     let enrolment = Enrolment::new(
         repository(),
         RepositoryKind::Official,
@@ -3132,7 +3151,7 @@ async fn kr_req_11_12_a_pinned_payload_is_never_evicted_to_finish_a_sync() {
 // ---------------------------------------------------------------------------------------------
 
 #[tokio::test]
-async fn kr_req_11_13_only_a_matching_enabled_package_binds() {
+async fn kr_req_11_13_only_an_enabled_installation_is_admitted() {
     let home = tempfile::tempdir().expect("a temporary directory");
     let generation = Generation::build(home.path(), GenerationSpec::default()).await;
     let mut catalogue = enrolled(
@@ -3164,28 +3183,37 @@ async fn kr_req_11_13_only_a_matching_enabled_package_binds() {
         executable_path: "/usr/local/bin/example-agent".to_owned(),
         distribution: None,
     };
-    let candidates = lookup.candidates(&observed);
-    assert_eq!(candidates.len(), 1);
+    assert_eq!(lookup.candidates(&observed).len(), 1);
 
-    let entry = index
-        .find(&plugin(), &version())
-        .expect("in the index")
-        .clone();
-
-    // Installed and not enabled: nothing is instantiated.
-    let refusal = catalogue
-        .bind(environment(), &entry, &observed.executable_path)
-        .expect_err("disabled");
-    assert_eq!(refusal.code(), ErrorCode::PluginDisabled);
+    // Installed and not enabled: nothing new may bind it.
+    let admissions = catalogue
+        .admissions(environment(), &[], &this_host())
+        .expect("readable");
+    assert!(admissions.packages.is_empty(), "{admissions:?}");
+    assert_eq!(admissions.not_admitted.len(), 1);
+    assert_eq!(
+        admissions.not_admitted[0].reason,
+        NotAdmittedReason::Disabled
+    );
 
     catalogue
         .set_enabled(environment(), &plugin(), true)
         .await
         .expect("enablable");
-    let binding = catalogue
-        .bind(environment(), &entry, &observed.executable_path)
-        .expect("enabled");
-    assert_eq!(binding.package_digest, generation.manifest_digest());
+    let admissions = catalogue
+        .admissions(environment(), &[], &this_host())
+        .expect("readable");
+    assert_eq!(admissions.packages.len(), 1, "{admissions:?}");
+    let admitted = &admissions.packages[0];
+    assert_eq!(admitted.package_digest, generation.manifest_digest());
+    assert_eq!(
+        admitted.package_dir,
+        catalogue
+            .store(&repository())
+            .expect("enrolled")
+            .package_dir(generation.manifest_digest())
+    );
+    assert!(admissions.not_admitted.is_empty());
 
     // A package nothing recognises is not a candidate at all.
     assert!(
@@ -3198,8 +3226,39 @@ async fn kr_req_11_13_only_a_matching_enabled_package_binds() {
     );
 }
 
+/// Marks the example package's entry revoked, as a later generation publishes it.
+fn revoke(entry: &mut kr_plugin_sdk::catalogue::IndexEntry) {
+    entry.revocation = Nullable(Some(RevocationRecord {
+        reason: RevocationReason::Vulnerable,
+        revoked_at: TimestampMs::new(1_760_000_100_000),
+        statement: Summary::new("Replaced by 0.1.1").expect("a valid statement"),
+    }));
+}
+
+/// A later generation of `first`'s repository, signed with its keys, carrying the same package.
+async fn same_package_again(
+    home: &std::path::Path,
+    first: &Generation,
+    generation: u64,
+    edit_entry: Option<fn(&mut kr_plugin_sdk::catalogue::IndexEntry)>,
+) -> Generation {
+    Generation::build(
+        &home.join(format!("generation-{generation}")),
+        GenerationSpec {
+            generation,
+            keys: Some(first.keys()),
+            edit_entry,
+            ..GenerationSpec::default()
+        },
+    )
+    .await
+}
+
+/// A generation that revokes the installed release's exact hash stops it being admitted, and the
+/// release's state carries the revocation for a binding that already holds it, under the
+/// administrator's policy. The entry is the current generation's, never one a caller supplies.
 #[tokio::test]
-async fn kr_req_25_22_a_revoked_release_stops_new_bindings_and_warns_the_live_one() {
+async fn kr_req_25_22_a_revoked_release_is_not_admitted_and_its_state_carries_the_revocation() {
     let home = tempfile::tempdir().expect("a temporary directory");
     let generation = Generation::build(home.path(), GenerationSpec::default()).await;
     let mut catalogue = enrolled(
@@ -3228,57 +3287,60 @@ async fn kr_req_25_22_a_revoked_release_stops_new_bindings_and_warns_the_live_on
         .set_enabled(environment(), &plugin(), true)
         .await
         .expect("enablable");
+    let before = catalogue
+        .admissions(environment(), &[], &this_host())
+        .expect("readable");
+    assert_eq!(before.packages.len(), 1);
 
-    let index = catalogue.index(&repository()).expect("activated");
-    let entry = index
-        .find(&plugin(), &version())
-        .expect("in the index")
-        .clone();
-    let binding = catalogue
-        .bind(environment(), &entry, "/usr/local/bin/example-agent")
-        .expect("enabled");
+    let revoking = same_package_again(home.path(), &generation, 2, Some(revoke)).await;
+    assert_eq!(revoking.manifest_digest(), generation.manifest_digest());
+    generation.replace_with(&revoking);
+    catalogue
+        .sync(&repository())
+        .await
+        .expect("the revoking generation");
 
-    let mut revoked = entry.clone();
-    revoked.revocation = Nullable(Some(RevocationRecord {
-        reason: RevocationReason::Vulnerable,
-        revoked_at: TimestampMs::new(1_760_000_100_000),
-        statement: Summary::new("Replaced by 0.1.1").expect("a valid statement"),
-    }));
-
-    // No new binding.
-    let refusal = catalogue
-        .bind(environment(), &revoked, "/usr/local/bin/example-agent")
-        .expect_err("revoked");
+    let admissions = catalogue
+        .admissions(environment(), &[], &this_host())
+        .expect("readable");
+    assert!(admissions.packages.is_empty(), "{admissions:?}");
     assert!(
-        refusal.to_string().contains("stops new bindings"),
-        "{refusal}"
+        matches!(&admissions.not_admitted[0].reason,
+            NotAdmittedReason::Revoked(record)
+                if record.statement.as_str() == "Replaced by 0.1.1"),
+        "{admissions:?}"
     );
+    assert!(admissions.revision > before.revision);
+    let state = admissions
+        .releases
+        .iter()
+        .find(|state| state.package_digest == generation.manifest_digest())
+        .expect("the installed release's state");
+    assert_eq!(
+        state
+            .revocation
+            .as_ref()
+            .map(|record| record.statement.as_str()),
+        Some("Replaced by 0.1.1")
+    );
+    assert!(
+        !state.ends_at_next_boundary,
+        "a revocation is the policy's to act on"
+    );
+    assert_eq!(admissions.policy, DisablePolicy::WarnOnly);
 
-    // The live one warns and keeps serving under the default policy.
-    let notices = catalogue.revocation_notices(&revoked).expect("readable");
-    assert_eq!(notices.len(), 1);
-    assert_eq!(notices[0].binding_id, binding.binding_id);
-    assert!(notices[0].keeps_serving);
-    assert_eq!(notices[0].policy, DisablePolicy::WarnOnly);
-
-    // Under an explicit administrator policy it stops at the next admission, not mid-request.
     catalogue
         .set_disable_policy(DisablePolicy::DisableAtOnce)
         .expect("recorded");
-    let notices = catalogue.revocation_notices(&revoked).expect("readable");
-    assert!(!notices[0].keeps_serving);
-    assert_eq!(
-        catalogue.bindings().len(),
-        1,
-        "the binding is not torn down by the notice itself"
-    );
+    let admissions = catalogue
+        .admissions(environment(), &[], &this_host())
+        .expect("readable");
+    assert_eq!(admissions.policy, DisablePolicy::DisableAtOnce);
 
     // A revoked release also stops matching, so nothing new is offered it.
-    let mut revoked_index = index.clone();
-    revoked_index.entries[0] = revoked;
-    let lookup = MatchIndex::build(&revoked_index);
+    let index = catalogue.index(&repository()).expect("activated");
     assert!(
-        lookup
+        MatchIndex::build(&index)
             .candidates(&Observation {
                 executable_path: "/usr/local/bin/example-agent".to_owned(),
                 distribution: None,
@@ -3287,15 +3349,52 @@ async fn kr_req_25_22_a_revoked_release_stops_new_bindings_and_warns_the_live_on
     );
 }
 
+/// A worker's live release, as it reports one: the example package at `digest`, from `origin`.
+fn live(digest: PayloadDigest, version: &str, origin: ReleaseOrigin) -> LiveRelease {
+    LiveRelease {
+        plugin_id: plugin(),
+        publisher_id: kr_plugin_sdk::ids::PublisherId::new("kalareach").expect("a publisher"),
+        version: PackageVersion::parse(version).expect("a valid version"),
+        package_digest: digest,
+        origin,
+    }
+}
+
+/// Where the example package's installation came from.
+fn origin_of(catalogue: &Catalogue) -> ReleaseOrigin {
+    ReleaseOrigin::of(
+        &catalogue
+            .installation(environment(), &plugin())
+            .expect("readable")
+            .expect("installed"),
+    )
+}
+
+/// The second release of the example package, in its own directory, signed with `first`'s keys.
+async fn second_release(home: &std::path::Path, first: &Generation) -> Generation {
+    Generation::build(
+        &home.join("second"),
+        GenerationSpec {
+            generation: 2,
+            package_version: "0.2.0".to_owned(),
+            keys: Some(first.keys()),
+            ..GenerationSpec::default()
+        },
+    )
+    .await
+}
+
 #[tokio::test]
-async fn kr_req_11_13_an_upgrade_leaves_a_live_binding_on_its_exact_package_hash() {
+async fn kr_req_11_13_an_upgrade_admits_the_new_hash_and_keeps_the_old_releases_state() {
     let home = tempfile::tempdir().expect("a temporary directory");
     let first = Generation::build(home.path(), GenerationSpec::default()).await;
-    let mut catalogue = enrolled(
+    let broker = Arc::new(Reporting::new());
+    let mut catalogue = enrolled_with(
         home.path(),
         &first,
         RepositoryBudgets::defaults(),
         CapabilityCeiling::default_ceiling(),
+        Arc::clone(&broker) as Arc<dyn BrokerBridge>,
     )
     .await;
     catalogue
@@ -3317,25 +3416,15 @@ async fn kr_req_11_13_an_upgrade_leaves_a_live_binding_on_its_exact_package_hash
         .set_enabled(environment(), &plugin(), true)
         .await
         .expect("enablable");
-    let index = catalogue.index(&repository()).expect("activated");
-    let entry = index
-        .find(&plugin(), &version())
-        .expect("in the index")
-        .clone();
-    catalogue
-        .bind(environment(), &entry, "/usr/local/bin/example-agent")
-        .expect("enabled");
+    let origin = origin_of(&catalogue);
+    let old = live(first.manifest_digest(), "0.1.0", origin.clone());
+    let cap = catalogue
+        .effective_capabilities(environment(), &plugin())
+        .expect("readable");
+    // A worker bound the first release and says so.
+    broker.report(vec![old.clone()], Vec::new());
 
-    let second = Generation::build(
-        &home.path().join("second"),
-        GenerationSpec {
-            generation: 2,
-            package_version: "0.2.0".to_owned(),
-            keys: Some(first.keys()),
-            ..GenerationSpec::default()
-        },
-    )
-    .await;
+    let second = second_release(home.path(), &first).await;
     first.replace_with(&second);
     catalogue
         .sync(&repository())
@@ -3353,26 +3442,940 @@ async fn kr_req_11_13_an_upgrade_leaves_a_live_binding_on_its_exact_package_hash
         .await
         .expect("installable");
 
+    let admissions = catalogue
+        .admissions(environment(), std::slice::from_ref(&old), &this_host())
+        .expect("readable");
+    assert_eq!(admissions.packages.len(), 1);
     assert_eq!(
-        catalogue
-            .installation(environment(), &plugin())
-            .expect("readable")
-            .expect("installed")
-            .package_digest,
-        second.manifest_digest()
+        admissions.packages[0].package_digest,
+        second.manifest_digest(),
+        "new bindings bind the new hash"
     );
+    let state = admissions
+        .releases
+        .iter()
+        .find(|state| state.package_digest == first.manifest_digest())
+        .expect("the live release keeps a state of its own");
+    assert_eq!(state.origin, origin);
+    assert!(!state.ends_at_next_boundary, "an upgrade ends nothing");
+    assert!(state.revocation.is_none());
     assert_eq!(
-        catalogue.bindings()[0].package_digest,
-        first.manifest_digest(),
-        "the live binding stays on the hash it was made against"
+        state.grant_cap, cap,
+        "what it held when the upgrade left it"
     );
 }
 
-/// A broker that reports the packages its live bindings hold.
-#[derive(Debug)]
-struct Reporting(Vec<PayloadDigest>);
+/// The example package's generation, listing only `platforms` in its own manifest.
+fn only_on(platforms: Vec<PlatformSupport>) -> GenerationSpec {
+    GenerationSpec {
+        platforms: Some(platforms),
+        ..GenerationSpec::default()
+    }
+}
 
-impl kr_plugin_catalogue::BrokerBridge for Reporting {
+/// Syncs the enrolled repository and installs and enables the example package from it.
+async fn installed_and_enabled(catalogue: &mut Catalogue, digest: PayloadDigest) {
+    catalogue
+        .sync(&repository())
+        .await
+        .expect("a verified generation");
+    catalogue
+        .install(
+            &repository(),
+            environment(),
+            &plugin(),
+            &version(),
+            digest,
+            InstallationGrant::none(),
+        )
+        .await
+        .expect("installable");
+    catalogue
+        .set_enabled(environment(), &plugin(), true)
+        .await
+        .expect("enablable");
+}
+
+/// A package whose own manifest does not list this host's operating system is not admitted, and
+/// separately one that lists the operating system and not this host's architecture there; each
+/// refusal says which of the two it was.
+#[tokio::test]
+async fn an_unsupported_operating_system_and_separately_an_unsupported_architecture_are_not_admitted()
+ {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let generation = Generation::build(
+        home.path(),
+        only_on(vec![PlatformSupport {
+            os: OperatingSystem::Linux,
+            architectures: vec![Architecture::X86_64],
+        }]),
+    )
+    .await;
+    let mut catalogue = enrolled(
+        home.path(),
+        &generation,
+        RepositoryBudgets::defaults(),
+        CapabilityCeiling::default_ceiling(),
+    )
+    .await;
+    installed_and_enabled(&mut catalogue, generation.manifest_digest()).await;
+
+    let supported = HostPlatform {
+        os: Some(OperatingSystem::Linux),
+        architecture: Some(Architecture::X86_64),
+    };
+    let admissions = catalogue
+        .admissions(environment(), &[], &supported)
+        .expect("readable");
+    assert_eq!(admissions.packages.len(), 1, "{admissions:?}");
+
+    for (host, what, words) in [
+        (
+            HostPlatform {
+                os: Some(OperatingSystem::MacOs),
+                architecture: Some(Architecture::X86_64),
+            },
+            kr_plugin_catalogue::Unsupported::OperatingSystem,
+            "operating system",
+        ),
+        (
+            HostPlatform {
+                os: Some(OperatingSystem::Linux),
+                architecture: Some(Architecture::Aarch64),
+            },
+            kr_plugin_catalogue::Unsupported::Architecture,
+            "architecture",
+        ),
+    ] {
+        let admissions = catalogue
+            .admissions(environment(), &[], &host)
+            .expect("readable");
+        assert!(admissions.packages.is_empty(), "{host:?}: {admissions:?}");
+        let refused = &admissions.not_admitted[0];
+        assert!(
+            matches!(&refused.reason,
+                NotAdmittedReason::Unsupported { what: found, .. } if *found == what),
+            "{host:?}: {refused:?}"
+        );
+        assert!(refused.detail().contains(words), "{}", refused.detail());
+    }
+}
+
+/// Every committed change that can alter what is admitted raises the admission revision in its own
+/// commit, and nothing else does: enrolling and changing an enrolment's settings leave it, and so
+/// does a change that is refused.
+#[tokio::test]
+async fn every_change_that_can_alter_admissions_raises_the_revision_and_no_other_does() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let generation = Generation::build(home.path(), GenerationSpec::default()).await;
+    let mut catalogue = enrolled(
+        home.path(),
+        &generation,
+        RepositoryBudgets::defaults(),
+        CapabilityCeiling::default_ceiling(),
+    )
+    .await;
+    let mut seen = catalogue.admission_revision().expect("readable");
+    let mut step = |catalogue: &Catalogue, what: &str, raises: bool| {
+        let now = catalogue.admission_revision().expect("readable");
+        if raises {
+            assert!(now > seen, "{what} raised nothing: {now}");
+        } else {
+            assert_eq!(now, seen, "{what} raised the revision");
+        }
+        seen = now;
+    };
+    step(&catalogue, "enrolling", false);
+    catalogue.sync(&repository()).await.expect("a generation");
+    step(&catalogue, "a sync", true);
+    let digest = generation.manifest_digest();
+    catalogue
+        .install(
+            &repository(),
+            environment(),
+            &plugin(),
+            &version(),
+            digest,
+            InstallationGrant::none(),
+        )
+        .await
+        .expect("installable");
+    step(&catalogue, "an installation", true);
+    catalogue
+        .set_enabled(environment(), &plugin(), true)
+        .await
+        .expect("enablable");
+    step(&catalogue, "an enable", true);
+    catalogue
+        .set_grant(environment(), &plugin(), InstallationGrant::none())
+        .expect("a grant");
+    step(&catalogue, "a grant", true);
+    catalogue
+        .pin_package(environment(), &plugin(), Some(digest))
+        .expect("pinnable");
+    step(&catalogue, "a package pin", true);
+    catalogue
+        .set_disable_policy(DisablePolicy::DisableAtNextAdmission)
+        .expect("recorded");
+    step(&catalogue, "the disable policy", true);
+    catalogue
+        .pin(&repository(), Some(RepositoryGeneration::new(1)))
+        .expect("pinnable");
+    step(&catalogue, "a repository pin", true);
+    let mut enrolment = catalogue
+        .repository(&repository())
+        .expect("readable")
+        .expect("enrolled");
+    enrolment.budgets.retained_generations = U64::new(3);
+    catalogue
+        .update_enrolment(enrolment, true)
+        .expect("updatable");
+    step(&catalogue, "an enrolment's settings", false);
+    catalogue
+        .pin_package(
+            environment(),
+            &plugin(),
+            Some(PayloadDigest::of(b"another release")),
+        )
+        .expect_err("a pin for another hash");
+    step(&catalogue, "a refused change", false);
+    catalogue
+        .uninstall(environment(), &plugin())
+        .expect("removable");
+    step(&catalogue, "a removal", true);
+    catalogue
+        .remove_repository(&repository())
+        .expect("removable");
+    step(&catalogue, "a repository's removal", true);
+}
+
+/// A removal answers with the count the workers reported only when it commits right after the
+/// revision their reports were at: another change in between makes the count unknown.
+#[tokio::test]
+async fn a_removal_counts_what_the_workers_reported_only_at_the_revision_it_follows() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let generation = Generation::build(home.path(), GenerationSpec::default()).await;
+    let mut catalogue = enrolled(
+        home.path(),
+        &generation,
+        RepositoryBudgets::defaults(),
+        CapabilityCeiling::default_ceiling(),
+    )
+    .await;
+    installed_and_enabled(&mut catalogue, generation.manifest_digest()).await;
+    let counted_at = catalogue.admission_revision().expect("readable");
+    let affected = catalogue
+        .uninstall_with(
+            environment(),
+            &plugin(),
+            Some((counted_at, 3)),
+            &mut Change::new(&Owner::acting()),
+        )
+        .expect("removable");
+    assert_eq!(affected, Some(3));
+
+    installed_and_enabled(&mut catalogue, generation.manifest_digest()).await;
+    let counted_at = catalogue.admission_revision().expect("readable");
+    catalogue
+        .set_disable_policy(DisablePolicy::WarnOnly)
+        .expect("another change in between");
+    let affected = catalogue
+        .uninstall_with(
+            environment(),
+            &plugin(),
+            Some((counted_at, 3)),
+            &mut Change::new(&Owner::acting()),
+        )
+        .expect("removable");
+    assert_eq!(affected, None, "the revision moved after the count");
+}
+
+/// Adds a build of the example agent for this host and one for another platform the example
+/// package lists.
+fn builds_here_and_elsewhere(entry: &mut kr_plugin_sdk::catalogue::IndexEntry) {
+    let here = this_host();
+    let (os, architecture) = (
+        here.os.expect("a named platform"),
+        here.architecture.expect("a named platform"),
+    );
+    let elsewhere = if os == OperatingSystem::Windows {
+        (OperatingSystem::Linux, Architecture::X86_64)
+    } else {
+        (OperatingSystem::Windows, Architecture::X86_64)
+    };
+    let build = |version: &str, (os, architecture): (OperatingSystem, Architecture)| {
+        kr_plugin_sdk::catalogue::QualifiedBuild {
+            application: Label::new("example-agent").expect("a label"),
+            distribution: Label::new("npm @kalareach/example-agent").expect("a label"),
+            version: PackageVersion::parse(version).expect("a version"),
+            os,
+            architecture,
+            executable_digest: PayloadDigest::of(version.as_bytes()),
+        }
+    };
+    entry.builds = vec![
+        build("1.4.0", (os, architecture)),
+        build("1.4.1", elsewhere),
+    ];
+}
+
+/// An admitted package carries the builds its current generation's entry names for this host's
+/// platform, and no other's; the installed release reads them too.
+#[tokio::test]
+async fn an_admitted_package_carries_the_builds_named_for_this_hosts_platform() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let generation = Generation::build(
+        home.path(),
+        GenerationSpec {
+            edit_entry: Some(builds_here_and_elsewhere),
+            ..GenerationSpec::default()
+        },
+    )
+    .await;
+    let mut catalogue = enrolled(
+        home.path(),
+        &generation,
+        RepositoryBudgets::defaults(),
+        CapabilityCeiling::default_ceiling(),
+    )
+    .await;
+    installed_and_enabled(&mut catalogue, generation.manifest_digest()).await;
+    let admissions = catalogue
+        .admissions(environment(), &[], &this_host())
+        .expect("readable");
+    let builds = &admissions.packages[0].builds;
+    assert_eq!(builds.len(), 1, "{builds:?}");
+    assert_eq!(builds[0].version.to_string(), "1.4.0");
+    let installation = catalogue
+        .installation(environment(), &plugin())
+        .expect("readable")
+        .expect("installed");
+    assert_eq!(
+        catalogue
+            .builds(&installation, &this_host())
+            .expect("readable"),
+        *builds
+    );
+}
+
+/// Names a build on a platform the example package does not list.
+fn build_on_an_unlisted_platform(entry: &mut kr_plugin_sdk::catalogue::IndexEntry) {
+    entry
+        .platforms
+        .retain(|platform| platform.os != OperatingSystem::MacOs);
+    entry.builds = vec![kr_plugin_sdk::catalogue::QualifiedBuild {
+        application: Label::new("example-agent").expect("a label"),
+        distribution: Label::new("npm @kalareach/example-agent").expect("a label"),
+        version: PackageVersion::parse("1.4.0").expect("a version"),
+        os: OperatingSystem::MacOs,
+        architecture: Architecture::Aarch64,
+        executable_digest: PayloadDigest::of(b"an executable"),
+    }];
+}
+
+/// Names one build more than an entry may.
+fn too_many_builds(entry: &mut kr_plugin_sdk::catalogue::IndexEntry) {
+    entry.builds = (0..=kr_plugin_sdk::catalogue::MAX_QUALIFIED_BUILDS)
+        .map(|n| kr_plugin_sdk::catalogue::QualifiedBuild {
+            application: Label::new("example-agent").expect("a label"),
+            distribution: Label::new("npm @kalareach/example-agent").expect("a label"),
+            version: PackageVersion::parse("1.4.0").expect("a version"),
+            os: OperatingSystem::Linux,
+            architecture: Architecture::X86_64,
+            executable_digest: PayloadDigest::of(&n.to_le_bytes()),
+        })
+        .collect();
+}
+
+/// An index whose entry names a build on a platform the release does not list, or more builds than
+/// an entry may, is refused when it is verified, and the generation in use stays.
+#[tokio::test]
+async fn an_index_that_breaks_the_builds_rules_is_refused_and_the_generation_in_use_stays() {
+    for (why, edit) in [
+        (
+            "does not list",
+            build_on_an_unlisted_platform as fn(&mut kr_plugin_sdk::catalogue::IndexEntry),
+        ),
+        ("at most", too_many_builds),
+    ] {
+        let home = tempfile::tempdir().expect("a temporary directory");
+        let generation = Generation::build(home.path(), GenerationSpec::default()).await;
+        let mut catalogue = enrolled(
+            home.path(),
+            &generation,
+            RepositoryBudgets::defaults(),
+            CapabilityCeiling::default_ceiling(),
+        )
+        .await;
+        catalogue.sync(&repository()).await.expect("generation 1");
+        let breaking = same_package_again(home.path(), &generation, 2, Some(edit)).await;
+        generation.replace_with(&breaking);
+        let refusal = catalogue
+            .sync(&repository())
+            .await
+            .expect_err("an index that breaks the rules");
+        assert!(
+            matches!(&refusal, CatalogueError::Untrusted { detail } if detail.contains(why)),
+            "{why}: {refusal:?}"
+        );
+        assert_eq!(
+            catalogue
+                .active(&repository())
+                .expect("readable")
+                .expect("a generation")
+                .generation,
+            1,
+            "{why}"
+        );
+    }
+}
+
+/// The capabilities the example package asks for in the cap tests, and the grant that gives it
+/// the two its repository's ceiling does not.
+const ASKED: [PluginCapability; 5] = [
+    PluginCapability::MetadataMatch,
+    PluginCapability::DeclarativePresentation,
+    PluginCapability::BrokerSemanticEvents,
+    PluginCapability::TerminalStream,
+    PluginCapability::UpstreamAction,
+];
+
+fn grant_of(capabilities: &[PluginCapability]) -> InstallationGrant {
+    let mut grant = InstallationGrant::none();
+    for capability in capabilities {
+        grant.add(*capability);
+    }
+    grant
+}
+
+/// Installs one release of the example package with `grant`, as the owner confirming it.
+async fn install_granted(
+    catalogue: &mut Catalogue,
+    repository_id: &RepositoryId,
+    version: &str,
+    digest: PayloadDigest,
+    grant: InstallationGrant,
+) {
+    catalogue
+        .install_with(
+            repository_id,
+            environment(),
+            &plugin(),
+            &PackageVersion::parse(version).expect("a valid version"),
+            digest,
+            grant,
+            None,
+            &mut Change::new(&Owner::confirming()),
+        )
+        .await
+        .expect("installable");
+}
+
+/// A grant withdrawn while a binding holds a release the installation has left narrows that
+/// release's cap for good: the owner restoring the grant for the installed release gives it back
+/// to the installed release only, and the narrowed cap is what the catalogue answers after it is
+/// opened again, whether the worker reported the old release before or only after.
+#[tokio::test]
+async fn a_withdrawal_reaches_a_left_release_and_a_later_widening_never_does() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let spec = |generation: u64, version: &str, keys: Option<KeySet>| GenerationSpec {
+        generation,
+        package_version: version.to_owned(),
+        capabilities: ASKED.to_vec(),
+        keys,
+        ..GenerationSpec::default()
+    };
+    let first = Generation::build(home.path(), spec(1, "0.1.0", None)).await;
+    let broker = Arc::new(Reporting::new());
+    let root = home.path().join("catalogue");
+    let mut catalogue = enrolled_with(
+        home.path(),
+        &first,
+        RepositoryBudgets::defaults(),
+        CapabilityCeiling::default_ceiling(),
+        Arc::clone(&broker) as Arc<dyn BrokerBridge>,
+    )
+    .await;
+    catalogue.sync(&repository()).await.expect("generation 1");
+    let both = [
+        PluginCapability::TerminalStream,
+        PluginCapability::UpstreamAction,
+    ];
+    install_granted(
+        &mut catalogue,
+        &repository(),
+        "0.1.0",
+        first.manifest_digest(),
+        grant_of(&both),
+    )
+    .await;
+    catalogue
+        .set_enabled(environment(), &plugin(), true)
+        .await
+        .expect("enablable");
+    let old = live(first.manifest_digest(), "0.1.0", origin_of(&catalogue));
+    broker.report(vec![old.clone()], Vec::new());
+
+    let second = Generation::build(
+        &home.path().join("second"),
+        spec(2, "0.2.0", Some(first.keys())),
+    )
+    .await;
+    first.replace_with(&second);
+    catalogue.sync(&repository()).await.expect("generation 2");
+    install_granted(
+        &mut catalogue,
+        &repository(),
+        "0.2.0",
+        second.manifest_digest(),
+        grant_of(&both),
+    )
+    .await;
+    // Revision R withdraws terminal.stream; R+1 gives it back to the installed release.
+    catalogue
+        .set_grant(
+            environment(),
+            &plugin(),
+            grant_of(&[PluginCapability::UpstreamAction]),
+        )
+        .expect("a narrower grant");
+    catalogue
+        .set_grant(environment(), &plugin(), grant_of(&both))
+        .expect("the owner widens it again");
+
+    let check = |catalogue: &Catalogue, when: &str| {
+        let admissions = catalogue
+            .admissions(environment(), std::slice::from_ref(&old), &this_host())
+            .expect("readable");
+        let installed = &admissions.packages[0];
+        assert_eq!(installed.package_digest, second.manifest_digest());
+        assert!(
+            installed.grants.contains(&PluginCapability::TerminalStream),
+            "{when}: the installed release has it again"
+        );
+        let left = admissions
+            .releases
+            .iter()
+            .find(|state| state.package_digest == first.manifest_digest())
+            .expect("the left release's state");
+        assert!(
+            !left.grant_cap.contains(&PluginCapability::TerminalStream),
+            "{when}: the left release never regains it: {:?}",
+            left.grant_cap
+        );
+        assert!(
+            left.grant_cap.contains(&PluginCapability::UpstreamAction),
+            "{when}: what was not withdrawn stays"
+        );
+    };
+    check(&catalogue, "before a restart");
+    drop(catalogue);
+
+    // A restarted controller hears of the old release only when a worker reports it again.
+    let reopened =
+        Catalogue::with_broker(&root, Arc::clone(&broker) as Arc<dyn BrokerBridge>, local())
+            .expect("reopened");
+    check(&reopened, "after a restart");
+}
+
+/// A release an installation moved away from, to another repository, keeps its origin: a
+/// revocation its own repository publishes afterwards reaches its state, before and after the
+/// catalogue is opened again, although the installation now comes from elsewhere.
+#[tokio::test]
+async fn a_release_left_for_another_repository_takes_its_revocation_from_its_own_origin() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let official = Generation::build(home.path(), GenerationSpec::default()).await;
+    let broker = Arc::new(Reporting::new());
+    let root = home.path().join("catalogue");
+    let mut catalogue = enrolled_with(
+        home.path(),
+        &official,
+        RepositoryBudgets::defaults(),
+        CapabilityCeiling::default_ceiling(),
+        Arc::clone(&broker) as Arc<dyn BrokerBridge>,
+    )
+    .await;
+    installed_and_enabled(&mut catalogue, official.manifest_digest()).await;
+    let p1 = live(official.manifest_digest(), "0.1.0", origin_of(&catalogue));
+    broker.report(vec![p1.clone()], Vec::new());
+
+    // P2 comes from another repository, under other keys.
+    let vendor_home = home.path().join("vendor");
+    let vendor = Generation::build(
+        &vendor_home,
+        GenerationSpec {
+            package_version: "0.2.0".to_owned(),
+            ..GenerationSpec::default()
+        },
+    )
+    .await;
+    let vendor_id = RepositoryId::new("vendor").expect("a repository identifier");
+    catalogue
+        .enrol(
+            Enrolment::new(
+                vendor_id.clone(),
+                RepositoryKind::Vendor,
+                vendor.metadata_url(),
+                vendor.targets_url(),
+                vendor.root_bytes(),
+                RepositoryBudgets::defaults(),
+                CapabilityCeiling::default_ceiling(),
+            )
+            .expect("an enrollable repository"),
+            true,
+        )
+        .expect("adopted");
+    catalogue
+        .sync(&vendor_id)
+        .await
+        .expect("the vendor's generation");
+    catalogue
+        .install(
+            &vendor_id,
+            environment(),
+            &plugin(),
+            &PackageVersion::parse("0.2.0").expect("a valid version"),
+            vendor.manifest_digest(),
+            InstallationGrant::none(),
+        )
+        .await
+        .expect("installable from the vendor");
+
+    // P1's own repository revokes it.
+    let revoking = same_package_again(home.path(), &official, 2, Some(revoke)).await;
+    official.replace_with(&revoking);
+    catalogue
+        .sync(&repository())
+        .await
+        .expect("the revoking generation");
+
+    let check = |catalogue: &Catalogue, when: &str| {
+        let admissions = catalogue
+            .admissions(environment(), std::slice::from_ref(&p1), &this_host())
+            .expect("readable");
+        assert_eq!(
+            admissions.packages[0].package_digest,
+            vendor.manifest_digest(),
+            "{when}"
+        );
+        let state = admissions
+            .releases
+            .iter()
+            .find(|state| state.package_digest == official.manifest_digest())
+            .expect("P1's state");
+        assert_eq!(state.origin.repository_id, repository(), "{when}");
+        assert!(
+            state.revocation.is_some(),
+            "{when}: the revocation reaches P1 from its own origin"
+        );
+    };
+    check(&catalogue, "before a restart");
+    drop(catalogue);
+    let reopened =
+        Catalogue::with_broker(&root, Arc::clone(&broker) as Arc<dyn BrokerBridge>, local())
+            .expect("reopened");
+    check(&reopened, "after a restart");
+}
+
+/// A release an installation left is forgotten once no worker holds it: at once where no worker
+/// exists, not while a worker reports it or has not reported, and at the next change once every
+/// worker has reported without it. Forgotten, it has no cap: a report of it later gets nothing.
+#[tokio::test]
+async fn a_left_release_is_forgotten_once_no_worker_holds_it() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let first = Generation::build(
+        home.path(),
+        GenerationSpec {
+            capabilities: ASKED.to_vec(),
+            ..GenerationSpec::default()
+        },
+    )
+    .await;
+    let second = Generation::build(
+        &home.path().join("second"),
+        GenerationSpec {
+            generation: 2,
+            package_version: "0.2.0".to_owned(),
+            capabilities: ASKED.to_vec(),
+            keys: Some(first.keys()),
+            ..GenerationSpec::default()
+        },
+    )
+    .await;
+    let broker = Arc::new(Reporting::new());
+    let mut catalogue = enrolled_with(
+        home.path(),
+        &first,
+        RepositoryBudgets::defaults(),
+        CapabilityCeiling::default_ceiling(),
+        Arc::clone(&broker) as Arc<dyn BrokerBridge>,
+    )
+    .await;
+    catalogue.sync(&repository()).await.expect("generation 1");
+    let both = [
+        PluginCapability::TerminalStream,
+        PluginCapability::UpstreamAction,
+    ];
+    install_granted(
+        &mut catalogue,
+        &repository(),
+        "0.1.0",
+        first.manifest_digest(),
+        grant_of(&both),
+    )
+    .await;
+    let old = live(first.manifest_digest(), "0.1.0", origin_of(&catalogue));
+    let cap_of = |catalogue: &Catalogue| {
+        catalogue
+            .admissions(environment(), std::slice::from_ref(&old), &this_host())
+            .expect("readable")
+            .releases
+            .into_iter()
+            .find(|state| state.package_digest == first.manifest_digest())
+            .expect("the left release's state")
+            .grant_cap
+    };
+
+    // A worker has not reported yet: the left release is kept although nobody lists it.
+    broker.report(Vec::new(), vec!["a session starting".to_owned()]);
+    first.replace_with(&second);
+    catalogue.sync(&repository()).await.expect("generation 2");
+    install_granted(
+        &mut catalogue,
+        &repository(),
+        "0.2.0",
+        second.manifest_digest(),
+        grant_of(&both),
+    )
+    .await;
+    assert!(cap_of(&catalogue).contains(&PluginCapability::UpstreamAction));
+
+    // It reports the old release: kept.
+    broker.report(vec![old.clone()], Vec::new());
+    catalogue
+        .set_disable_policy(DisablePolicy::WarnOnly)
+        .expect("a change");
+    assert!(cap_of(&catalogue).contains(&PluginCapability::UpstreamAction));
+
+    // Its binding closed and it said so: the next change forgets the release.
+    broker.report(Vec::new(), Vec::new());
+    catalogue
+        .set_disable_policy(DisablePolicy::WarnOnly)
+        .expect("a change");
+    assert!(
+        cap_of(&catalogue).is_empty(),
+        "a release nothing describes has no cap"
+    );
+}
+
+/// Installs the second release of the example package, as the owner acting directly.
+async fn install_second(
+    catalogue: &mut Catalogue,
+    digest: PayloadDigest,
+) -> CatalogueResult<Installation> {
+    catalogue
+        .install(
+            &repository(),
+            environment(),
+            &plugin(),
+            &PackageVersion::parse("0.2.0").expect("a valid version"),
+            digest,
+            InstallationGrant::none(),
+        )
+        .await
+}
+
+/// A reclaim that has to make room while a worker has not reported what it holds is refused,
+/// retryably and naming the worker, and removes nothing; once every worker has reported, the same
+/// installation proceeds and removes what nothing protects.
+#[tokio::test]
+async fn a_reclaim_that_needs_room_waits_for_a_pending_worker_and_removes_nothing() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let first = Generation::build(home.path(), GenerationSpec::default()).await;
+    let second = second_release(home.path(), &first).await;
+    let (a, b) = (payloads_of(&first), payloads_of(&second));
+    let presentation = presentation_size(&first);
+    let (ma, mb) = (a[&first.manifest_digest()], b[&second.manifest_digest()]);
+    // The first release cached and extracted; the second stages both files and fetches its
+    // manifest; one byte short.
+    let held = (ma + presentation) + (ma + presentation);
+    let needed = (mb + presentation) + mb;
+    let mut budgets = RepositoryBudgets::defaults();
+    budgets.payload_cache_bytes = U64::new(held + needed - 1);
+    let broker = Arc::new(Reporting::new());
+    let mut catalogue = enrolled_with(
+        home.path(),
+        &first,
+        budgets,
+        CapabilityCeiling::default_ceiling(),
+        Arc::clone(&broker) as Arc<dyn BrokerBridge>,
+    )
+    .await;
+    catalogue.sync(&repository()).await.expect("generation 1");
+    catalogue
+        .install(
+            &repository(),
+            environment(),
+            &plugin(),
+            &version(),
+            first.manifest_digest(),
+            InstallationGrant::none(),
+        )
+        .await
+        .expect("installable");
+    catalogue
+        .uninstall(environment(), &plugin())
+        .expect("removable");
+    first.replace_with(&second);
+    catalogue.sync(&repository()).await.expect("generation 2");
+    let store = catalogue.store(&repository()).expect("enrolled");
+
+    broker.report(Vec::new(), vec!["session 0198".to_owned()]);
+    let refusal = install_second(&mut catalogue, second.manifest_digest())
+        .await
+        .expect_err("a worker has not reported");
+    assert!(
+        matches!(&refusal, CatalogueError::Unreconciled { detail } if detail.contains("session 0198")),
+        "{refusal:?}"
+    );
+    assert_eq!(refusal.code(), ErrorCode::ResourceUnavailable);
+    assert!(
+        complete(&store, first.manifest_digest()),
+        "nothing was removed"
+    );
+
+    broker.report(Vec::new(), Vec::new());
+    install_second(&mut catalogue, second.manifest_digest())
+        .await
+        .expect("every worker reported, and nothing holds the first release");
+    assert!(
+        absent(&store, first.manifest_digest()),
+        "the room was made from what nothing protects"
+    );
+}
+
+/// A reclaim asks what the workers hold at the admission revision its own transaction reads: a
+/// change committed and not yet announced to them already counts, and a worker that reported only
+/// at the revision before it holds the reclaim up.
+#[tokio::test]
+async fn a_reclaim_asks_at_the_revision_its_own_transaction_reads() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let first = Generation::build(home.path(), GenerationSpec::default()).await;
+    let second = second_release(home.path(), &first).await;
+    let (a, b) = (payloads_of(&first), payloads_of(&second));
+    let presentation = presentation_size(&first);
+    let (ma, mb) = (a[&first.manifest_digest()], b[&second.manifest_digest()]);
+    let held = (ma + presentation) + (ma + presentation);
+    let needed = (mb + presentation) + mb;
+    let mut budgets = RepositoryBudgets::defaults();
+    budgets.payload_cache_bytes = U64::new(held + needed - 1);
+    let broker = Arc::new(Reporting::new());
+    let mut catalogue = enrolled_with(
+        home.path(),
+        &first,
+        budgets,
+        CapabilityCeiling::default_ceiling(),
+        Arc::clone(&broker) as Arc<dyn BrokerBridge>,
+    )
+    .await;
+    catalogue.sync(&repository()).await.expect("generation 1");
+    catalogue
+        .install(
+            &repository(),
+            environment(),
+            &plugin(),
+            &version(),
+            first.manifest_digest(),
+            InstallationGrant::none(),
+        )
+        .await
+        .expect("installable");
+    catalogue
+        .uninstall(environment(), &plugin())
+        .expect("removable");
+    first.replace_with(&second);
+    catalogue.sync(&repository()).await.expect("generation 2");
+
+    // The workers reported at the revision this sync left; a change then commits and nobody has
+    // heard of it yet.
+    let reported = catalogue.admission_revision().expect("readable");
+    broker.reconciled_only_at(reported);
+    catalogue
+        .set_disable_policy(DisablePolicy::DisableAtOnce)
+        .expect("committed, not yet announced");
+    let refusal = catalogue
+        .install(
+            &repository(),
+            environment(),
+            &plugin(),
+            &PackageVersion::parse("0.2.0").expect("a valid version"),
+            second.manifest_digest(),
+            InstallationGrant::none(),
+        )
+        .await
+        .expect_err("the workers have not heard of the change");
+    assert!(
+        matches!(&refusal, CatalogueError::Unreconciled { .. }),
+        "{refusal:?}"
+    );
+    assert!(
+        broker.asked().contains(&(reported + 1)),
+        "asked at the revision the change committed: {:?}",
+        broker.asked()
+    );
+    let store = catalogue.store(&repository()).expect("enrolled");
+    assert!(
+        complete(&store, first.manifest_digest()),
+        "nothing was removed"
+    );
+}
+
+/// A broker that reports what its workers hold, and which of them have not reported, as a test
+/// sets it; and remembers every revision it was asked about.
+#[derive(Debug, Default)]
+struct Reporting {
+    live: std::sync::Mutex<LivePackages>,
+    asked: std::sync::Mutex<Vec<u64>>,
+    /// The revision the workers reported at, where a test says; pending at every other.
+    reconciled_at: std::sync::Mutex<Option<u64>>,
+}
+
+impl Reporting {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// A broker whose workers report these packages live, at every revision.
+    fn holding(digests: Vec<PayloadDigest>) -> Self {
+        let broker = Self::new();
+        let origin = ReleaseOrigin {
+            repository_id: repository(),
+            enrolment_key: kr_plugin_catalogue::EnrolmentKey::generate().expect("a key"),
+        };
+        broker.report(
+            digests
+                .into_iter()
+                .map(|digest| live(digest, "0.1.0", origin.clone()))
+                .collect(),
+            Vec::new(),
+        );
+        broker
+    }
+
+    fn report(&self, releases: Vec<LiveRelease>, pending: Vec<String>) {
+        *self.live.lock().expect("the report") = LivePackages { releases, pending };
+    }
+
+    fn reconciled_only_at(&self, revision: u64) {
+        *self.reconciled_at.lock().expect("the revision") = Some(revision);
+    }
+
+    fn asked(&self) -> Vec<u64> {
+        self.asked.lock().expect("the questions").clone()
+    }
+}
+
+impl BrokerBridge for Reporting {
     fn live_evidence(
         &self,
         _request: &kr_plugin_catalogue::broker::EvidenceRequest,
@@ -3387,8 +4390,16 @@ impl kr_plugin_catalogue::BrokerBridge for Reporting {
         kr_plugin_catalogue::UnboundBroker.admit_proxy(request)
     }
 
-    fn live_packages(&self) -> Vec<PayloadDigest> {
-        self.0.clone()
+    fn live_packages(&self, revision: u64) -> LivePackages {
+        self.asked.lock().expect("the questions").push(revision);
+        let mut live = self.live.lock().expect("the report").clone();
+        if let Some(reconciled) = *self.reconciled_at.lock().expect("the revision")
+            && reconciled != revision
+        {
+            live.pending
+                .push("the session that reported at an earlier revision".to_owned());
+        }
+        live
     }
 }
 
@@ -3397,7 +4408,6 @@ impl kr_plugin_catalogue::BrokerBridge for Reporting {
 enum Holder {
     Nothing,
     Broker,
-    Binding,
     BrokerWithoutManifest,
     BrokerWithAlteredManifest,
     /// The broker reports a live package this repository's store holds nothing of: a worker
@@ -3405,9 +4415,8 @@ enum Holder {
     BrokerElsewhere,
 }
 
-/// A package an upgrade moved its installation off is kept whole while the broker reports it live
-/// or a local binding holds it, and room for the next release is made with it only where nothing
-/// does. Where the broker reports it and its manifest is gone or altered, nothing can say what it
+/// A package an upgrade moved its installation off is kept whole while a worker reports it live,
+/// and room for the next release is made with it only where nothing does. Where the broker reports it and its manifest is gone or altered, nothing can say what it
 /// consists of, and the reclaim is refused before anything is removed. A live package this store
 /// holds nothing of is not this store's to keep, and does not stop the reclaim.
 ///
@@ -3416,11 +4425,10 @@ enum Holder {
 /// payload is gone from the cache, or the first release's extracted copy is: a reclaim that
 /// protected the first release's package but not its payloads would take the payload and succeed.
 #[tokio::test]
-async fn kr_req_11_12_an_upgraded_package_is_kept_while_the_broker_or_a_binding_holds_it() {
+async fn kr_req_11_12_an_upgraded_package_is_kept_while_a_worker_holds_it() {
     for holder in [
         Holder::Nothing,
         Holder::Broker,
-        Holder::Binding,
         Holder::BrokerWithoutManifest,
         Holder::BrokerWithAlteredManifest,
         Holder::BrokerElsewhere,
@@ -3483,12 +4491,12 @@ async fn kr_req_11_12_an_upgraded_package_is_kept_while_the_broker_or_a_binding_
         let mut budgets = RepositoryBudgets::defaults();
         budgets.payload_cache_bytes = U64::new(held + needed - u - removed);
         let old = first.manifest_digest();
-        let broker: Arc<dyn kr_plugin_catalogue::BrokerBridge> = match holder {
-            Holder::Nothing | Holder::Binding => Arc::new(kr_plugin_catalogue::UnboundBroker),
-            Holder::BrokerElsewhere => Arc::new(Reporting(vec![PayloadDigest::of(
+        let broker: Arc<dyn BrokerBridge> = match holder {
+            Holder::Nothing => Arc::new(kr_plugin_catalogue::UnboundBroker),
+            Holder::BrokerElsewhere => Arc::new(Reporting::holding(vec![PayloadDigest::of(
                 b"a package another repository installed",
             )])),
-            _ => Arc::new(Reporting(vec![old])),
+            _ => Arc::new(Reporting::holding(vec![old])),
         };
         let mut catalogue = Catalogue::with_broker(&home.path().join("catalogue"), broker, local())
             .expect("an openable catalogue");
@@ -3532,16 +4540,6 @@ async fn kr_req_11_12_an_upgraded_package_is_kept_while_the_broker_or_a_binding_
                 )
                 .await
                 .unwrap_or_else(|refusal| panic!("{holder:?}: {version}: {refusal}"));
-            if number == 1 && matches!(holder, Holder::Binding) {
-                catalogue
-                    .set_enabled(environment(), &plugin(), true)
-                    .await
-                    .expect("enablable");
-                let entry = catalogue.index(&repository()).expect("an index").entries[0].clone();
-                catalogue
-                    .bind(environment(), &entry, "/usr/local/bin/example-agent")
-                    .expect("bound");
-            }
             if let Some(next) = next {
                 first.replace_with(next);
             }
@@ -3590,7 +4588,7 @@ async fn kr_req_11_12_an_upgraded_package_is_kept_while_the_broker_or_a_binding_
                     "{holder:?}"
                 );
             }
-            Holder::Broker | Holder::Binding => {
+            Holder::Broker => {
                 let refusal = outcome.expect_err("the first release's package is held");
                 assert!(
                     matches!(&refusal, CatalogueError::ResourceLimit(limit)
@@ -3915,6 +4913,43 @@ async fn the_development_generation_verifies_and_is_searchable_offline() {
 
     let store = catalogue.store(&repository()).expect("enrolled");
     assert!(complete(&store, entry.manifest_digest));
+
+    // Signed before an entry could name builds, it names none, and it admits with none.
+    catalogue
+        .set_enabled(environment(), &declarative, true)
+        .await
+        .expect("enablable");
+    let admissions = catalogue
+        .admissions(environment(), &[], &this_host())
+        .expect("readable");
+    assert_eq!(admissions.packages.len(), 1, "{admissions:?}");
+    assert!(admissions.packages[0].builds.is_empty());
+}
+
+/// Every signed index already written, the plugins repository's development generation and the
+/// controller suite's bridge generation among them, reads with no builds and is written again,
+/// byte for byte, as it was signed: an entry with no builds is rendered exactly as before the
+/// member existed, so none has to be signed again.
+#[test]
+fn every_committed_index_renders_again_byte_for_byte_with_no_builds() {
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    for fixture in [
+        "../../fixtures/plugins/catalogue/development/targets/index.json",
+        "../kr-controller/tests/fixtures/bridge-generation/targets/index.json",
+    ] {
+        let bytes = std::fs::read(manifest_dir.join(fixture)).expect("a committed index");
+        let index: kr_plugin_sdk::catalogue::CatalogueIndex =
+            serde_json::from_slice(&bytes).expect("it reads");
+        assert!(
+            index.entries.iter().all(|entry| entry.builds.is_empty()),
+            "{fixture}"
+        );
+        assert_eq!(
+            index.canonical_json().expect("it renders").as_bytes(),
+            bytes.as_slice(),
+            "{fixture} renders again as it was signed"
+        );
+    }
 }
 
 #[test]
@@ -4389,10 +5424,10 @@ async fn kr_req_11_09_installed_operations_survive_the_repository_being_removed(
     );
     assert!(!installed.ceiling.permits(PluginCapability::FilesystemRead));
 
-    let closed = catalogue
+    let affected = catalogue
         .uninstall(environment(), &plugin())
         .expect("uninstallable without its repository");
-    assert_eq!(closed, 0);
+    assert_eq!(affected, None, "nobody counted what held it");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -5098,7 +6133,7 @@ async fn a_change_refused_at_its_commit_changes_nothing() {
         "{enable:?}"
     );
     let uninstall =
-        catalogue.uninstall_with(environment(), &plugin(), &mut Change::new(&withdrawn));
+        catalogue.uninstall_with(environment(), &plugin(), None, &mut Change::new(&withdrawn));
     assert!(
         matches!(uninstall, Err(CatalogueError::PermissionDenied { .. })),
         "{uninstall:?}"

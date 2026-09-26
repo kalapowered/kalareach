@@ -80,6 +80,16 @@ pub enum CatalogueError {
         /// What failed, with the path it happened on.
         detail: String,
     },
+    /// Making room would have to be weighed against what a worker holds, and a worker has not yet
+    /// said what it holds.
+    ///
+    /// Nothing is removed. The workers are asked again on a cadence, so the same request succeeds
+    /// once each has answered or is known to have ended.
+    #[error("{detail}")]
+    Unreconciled {
+        /// Which workers the reclaim waits for.
+        detail: String,
+    },
     /// The bytes behind a content hash are not the bytes that hash names.
     #[error("{detail}")]
     Integrity {
@@ -138,6 +148,7 @@ impl CatalogueError {
             Self::NotFound { .. } => ErrorCode::ResourceUnavailable,
             Self::InvalidArgument { .. } => ErrorCode::InvalidArgument,
             Self::StorageUnavailable { .. } => ErrorCode::StorageUnavailable,
+            Self::Unreconciled { .. } => ErrorCode::ResourceUnavailable,
             Self::OwnerConfirmationRequired { .. } => ErrorCode::OwnerConfirmationRequired,
             Self::PermissionDenied { .. } => ErrorCode::PermissionDenied,
             Self::Refused(error) => error.code,

@@ -208,6 +208,8 @@ pub struct GenerationSpec {
     /// A change made to the package's index entry after it is derived from the manifest, before
     /// the index is signed: an index that says something the manifest does not.
     pub edit_entry: Option<fn(&mut IndexEntry)>,
+    /// The platforms the example package's manifest lists, where not the example's own.
+    pub platforms: Option<Vec<kr_plugin_sdk::matching::PlatformSupport>>,
 }
 
 impl Default for GenerationSpec {
@@ -234,6 +236,7 @@ impl Default for GenerationSpec {
             metadata_version: None,
             extra_targets: Vec::new(),
             edit_entry: None,
+            platforms: None,
         }
     }
 }
@@ -859,6 +862,9 @@ fn package_files(spec: &GenerationSpec) -> (PluginManifest, Vec<(String, Vec<u8>
     let presentation = kr_plugin_sdk::example::example_presentation_json();
     let mut manifest = kr_plugin_sdk::example::example_manifest_for(presentation.as_bytes());
     manifest.version = PackageVersion::parse(&spec.package_version).expect("a valid version");
+    if let Some(platforms) = &spec.platforms {
+        manifest.platforms.clone_from(platforms);
+    }
     if !spec.capabilities.is_empty() {
         manifest.capabilities = spec
             .capabilities

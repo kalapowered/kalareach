@@ -21,7 +21,9 @@
 //! | [`extract`] | What a package may contain, checked before a fetch and again before an activation |
 //! | [`ceiling`] | Which decision each capability needs, and what an upgrade may not widen |
 //! | [`search`] | Offline search and the match index activation reads |
-//! | [`install`] | Installed packages, live bindings and what revocation does to them |
+//! | [`install`] | Installed packages, and what a reclaim keeps for them |
+//! | [`admission`] | What new bindings may use, and what each live release is now |
+//! | [`platform`] | Which platform this host is, as a package names platforms |
 //! | [`evidence`] | The capability evidence a catalogue contributes, and what a qualification may not do |
 //! | [`broker`] | What the catalogue needs from the trusted broker, as a trait |
 //!
@@ -52,6 +54,7 @@
 //! atomic after all of its payloads verify, independently of the index. An interrupted index or
 //! payload fetch therefore leaves the previous valid index and the installed package usable.
 
+pub mod admission;
 pub mod authority;
 pub mod broker;
 pub mod budget;
@@ -61,6 +64,7 @@ pub mod error;
 pub mod evidence;
 pub mod extract;
 pub mod install;
+pub mod platform;
 pub mod repository;
 pub mod search;
 pub mod store;
@@ -72,15 +76,19 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use kr_plugin_sdk::capability::PluginCapability;
-use kr_plugin_sdk::catalogue::{CatalogueIndex, IndexEntry};
+use kr_plugin_sdk::catalogue::{CatalogueIndex, IndexEntry, QualifiedBuild};
 use kr_plugin_sdk::digest::PayloadDigest;
 use kr_plugin_sdk::ids::PluginId;
 use kr_plugin_sdk::package::MANIFEST_FILE;
 use kr_plugin_sdk::version::PackageVersion;
 use kr_protocol::ids::{EnvironmentId, RepositoryGeneration};
 
+pub use crate::admission::{
+    Admissions, AdmittedComponent, AdmittedPackage, LiveRelease, NotAdmitted, NotAdmittedReason,
+    PACKAGES_ROOT, ReleaseOrigin, ReleaseState,
+};
 pub use crate::authority::{Authority, Committed, Effect, Failure, Owner, Recording};
-pub use crate::broker::{BrokerBridge, UnboundBroker};
+pub use crate::broker::{BrokerBridge, LivePackages, UnboundBroker};
 pub use crate::budget::{BudgetLedger, Resource, ResourceLimit, Retained, Stage};
 pub use crate::ceiling::{
     CapabilityDecision, GrantRequirement, InstallationGrant, capability_from_str,
@@ -90,9 +98,8 @@ pub use crate::db::{
     ReceiptRecord,
 };
 pub use crate::error::{CatalogueError, CatalogueResult};
-pub use crate::install::{
-    Binding, BindingId, Bindings, DisablePolicy, Installation, RevocationNotice,
-};
+pub use crate::install::{DisablePolicy, Installation};
+pub use crate::platform::{HostPlatform, Unsupported, this_host};
 pub use crate::repository::{
     CapabilityCeiling, Enrolment, EnrolmentKey, RepositoryId, RepositoryKind,
 };
@@ -177,14 +184,15 @@ pub struct RepositoryView {
 }
 
 /// One installed package, as a caller is told about it.
+///
+/// How many bindings hold it is not the catalogue's to say: the workers' own records are the one
+/// account of what is bound, and a caller that counts asks them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InstallationView {
     /// What the catalogue holds for it.
     pub installation: Installation,
     /// Whether the release it is on is revoked in its repository's current generation.
     pub revoked: bool,
-    /// How many live bindings hold it.
-    pub live_bindings: u64,
     /// What each capability it asks for needs, and whether it has it.
     pub decisions: Vec<CapabilityDecision>,
 }
@@ -220,11 +228,34 @@ pub enum Transition {
     Uninstalled {
         /// The package.
         plugin_id: PluginId,
-        /// How many live bindings closed with it.
-        closed_bindings: u64,
+        /// How many live bindings the workers reported holding it at the admission revision the
+        /// removal committed after, which are the bindings told to end; `None` when that is not
+        /// known, because a worker had not answered or another change committed in between.
+        affected_bindings: Option<u64>,
     },
     /// The administrator's disable policy changed.
     PolicyChanged(DisablePolicy),
+}
+
+impl Transition {
+    /// Returns true when a change of this kind can alter what is admitted: which packages new
+    /// bindings may use, or the state of a release a live binding holds.
+    ///
+    /// Enrolling a repository and changing an enrolment's settings do neither: an installation
+    /// keeps the ceiling it was installed under, and a generation is what a sync activates.
+    #[must_use]
+    pub const fn alters_admissions(&self) -> bool {
+        match self {
+            Self::Enrolled(_) | Self::Updated(_) => false,
+            Self::Synced { .. }
+            | Self::Pinned(_)
+            | Self::Removed { .. }
+            | Self::Installed(_)
+            | Self::Changed(_)
+            | Self::Uninstalled { .. }
+            | Self::PolicyChanged(_) => true,
+        }
+    }
 }
 
 /// How a caller that keeps a receipt settles it in the change's own transaction.
@@ -285,7 +316,6 @@ impl<'a> Change<'a> {
 pub struct Catalogue {
     root: PathBuf,
     db: Db,
-    bindings: Bindings,
     fetches_network: bool,
     broker: Arc<dyn BrokerBridge>,
     transport: Arc<dyn tough::Transport + Send + Sync>,
@@ -333,7 +363,6 @@ impl Catalogue {
         Ok(Self {
             db: Db::open(&root)?,
             root,
-            bindings: Bindings::new(),
             fetches_network: true,
             broker,
             transport,
@@ -609,9 +638,7 @@ impl Catalogue {
                 .installations()?
                 .into_iter()
                 .filter(|installation| installation.environment_id == environment_id)
-                .map(|installation| {
-                    installation_view(&self.root, records, &self.bindings, installation)
-                })
+                .map(|installation| installation_view(&self.root, records, installation))
                 .collect()
         })
     }
@@ -630,7 +657,7 @@ impl Catalogue {
             let installation = records
                 .installation(environment_id, plugin_id)?
                 .ok_or_else(|| not_installed(plugin_id))?;
-            installation_view(&self.root, records, &self.bindings, installation)
+            installation_view(&self.root, records, installation)
         })
     }
 
@@ -689,47 +716,65 @@ impl Catalogue {
     }
 
     // -----------------------------------------------------------------------------------------
-    // Live bindings
+    // Admissions
     // -----------------------------------------------------------------------------------------
 
-    /// Returns every live binding, in the order they were made.
-    #[must_use]
-    pub fn bindings(&self) -> &[Binding] {
-        self.bindings.all()
-    }
-
-    /// Opens a binding against what the catalogue holds for the entry's package.
+    /// Returns the admission revision: every committed change that can alter what is admitted
+    /// raises it, in the change's own transaction.
     ///
     /// # Errors
     ///
-    /// Returns [`CatalogueError::NotFound`] when the package is not installed here, and the
-    /// refusal [`Bindings::bind`] decided.
-    pub fn bind(
-        &mut self,
+    /// Returns [`CatalogueError::StorageUnavailable`] when the setting cannot be read.
+    pub fn admission_revision(&self) -> CatalogueResult<u64> {
+        self.db.read(|records| records.admission_revision())
+    }
+
+    /// Returns one environment's admissions on `host`, from the records as they are now, in one
+    /// read: what new bindings may use, the state of each admitted release and of each release in
+    /// `live`, and every installation left out, with why.
+    ///
+    /// Nothing a caller supplies decides an admission. `live` is what the workers reported
+    /// holding, and it only adds releases whose state the answer carries.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogueError::StorageUnavailable`] when a record, an index or a package cannot
+    /// be read.
+    pub fn admissions(
+        &self,
         environment_id: EnvironmentId,
-        entry: &IndexEntry,
-        executable_path: &str,
-    ) -> CatalogueResult<Binding> {
-        let installation = self
-            .installation(environment_id, &entry.plugin_id)?
-            .ok_or_else(|| not_installed(&entry.plugin_id))?;
-        self.bindings.bind(&installation, entry, executable_path)
+        live: &[LiveRelease],
+        host: &HostPlatform,
+    ) -> CatalogueResult<Admissions> {
+        self.read_kept(|records| admission::admit(&self.root, records, environment_id, live, host))
     }
 
-    /// Closes one binding.
-    pub fn unbind(&mut self, binding_id: BindingId) {
-        self.bindings.unbind(binding_id);
-    }
-
-    /// Returns what a revocation means for every live binding of that release.
+    /// Returns the builds the current generation of an installation's origin names for its exact
+    /// release on `host`'s platform: the signed records that say which version an executable is.
     ///
     /// # Errors
     ///
-    /// Returns [`CatalogueError::StorageUnavailable`] when the policy cannot be read.
-    pub fn revocation_notices(&self, entry: &IndexEntry) -> CatalogueResult<Vec<RevocationNotice>> {
-        Ok(self
-            .bindings
-            .revocation_notices(entry, self.disable_policy()?))
+    /// Returns [`CatalogueError::StorageUnavailable`] when the record or the index cannot be read.
+    pub fn builds(
+        &self,
+        installation: &Installation,
+        host: &HostPlatform,
+    ) -> CatalogueResult<Vec<QualifiedBuild>> {
+        let (Some(os), Some(architecture)) = (host.os, host.architecture) else {
+            return Ok(Vec::new());
+        };
+        let entry = self.read_kept(|records| {
+            admission::current_entry(
+                &self.root,
+                records,
+                &installation.enrolment,
+                &installation.plugin_id,
+                installation.package_digest,
+            )
+        })?;
+        Ok(entry
+            .map(|entry| entry.builds_for(os, architecture).cloned().collect())
+            .unwrap_or_default())
     }
 
     // -----------------------------------------------------------------------------------------
@@ -833,7 +878,7 @@ impl Catalogue {
         // before the row that names it, so a row never names a directory that is not there.
         let key = EnrolmentKey::generate()?;
         Store::open(&self.root, &key)?;
-        committing(&mut self.db, change, |changes| {
+        committing(&mut self.db, &*self.broker, change, |changes| {
             changes.enrol(&key, &enrolment)?;
             let view = RepositoryView {
                 enrolment,
@@ -880,7 +925,7 @@ impl Catalogue {
     ) -> CatalogueResult<RepositoryView> {
         change.authority.check()?;
         let confirmed = change.authority.owner_confirmed();
-        committing(&mut self.db, change, |changes| {
+        committing(&mut self.db, &*self.broker, change, |changes| {
             let current = changes
                 .enrolment(&proposed.id)?
                 .ok_or_else(|| not_enrolled(&proposed.id))?;
@@ -934,7 +979,7 @@ impl Catalogue {
         change: &mut Change<'_>,
     ) -> CatalogueResult<RepositoryView> {
         change.authority.check()?;
-        committing(&mut self.db, change, |changes| {
+        committing(&mut self.db, &*self.broker, change, |changes| {
             let current = changes.enrolment(id)?.ok_or_else(|| not_enrolled(id))?;
             if let Some(generation) = generation {
                 let active = current
@@ -989,7 +1034,7 @@ impl Catalogue {
         change: &mut Change<'_>,
     ) -> CatalogueResult<(Enrolment, Vec<PluginId>)> {
         change.authority.check()?;
-        committing(&mut self.db, change, |changes| {
+        committing(&mut self.db, &*self.broker, change, |changes| {
             let current = changes.enrolment(id)?.ok_or_else(|| not_enrolled(id))?;
             let installed: Vec<PluginId> = changes
                 .installations()?
@@ -1016,6 +1061,7 @@ impl Catalogue {
     pub fn set_disable_policy(&mut self, policy: DisablePolicy) -> CatalogueResult<()> {
         committing(
             &mut self.db,
+            &*self.broker,
             &mut Change::new(&Owner::acting()),
             |changes| {
                 changes.set_disable_policy(policy)?;
@@ -1195,7 +1241,7 @@ impl Catalogue {
             store.write_index(permit, &rendered)
         })?;
         let checkpoint = store.checkpoint_bytes()?;
-        let synced = committing(&mut self.db, change, |changes| {
+        let synced = committing(&mut self.db, &*self.broker, change, |changes| {
             // Read again: the repository may have been removed, enrolled again or moved to
             // another generation while this sync fetched. Only the enrolment this sync
             // verified is changed, and only forward from the generation it holds now.
@@ -1393,7 +1439,6 @@ impl Catalogue {
         reclaim(
             &mut self.db,
             authority,
-            &self.bindings,
             &*self.broker,
             &enrolled.key,
             store,
@@ -1629,7 +1674,6 @@ impl Catalogue {
         reclaim(
             &mut self.db,
             authority,
-            &self.bindings,
             &*self.broker,
             &enrolled.key,
             store,
@@ -1771,7 +1815,6 @@ impl Catalogue {
         reclaim(
             &mut self.db,
             authority,
-            &self.bindings,
             &*self.broker,
             &enrolled.key,
             store,
@@ -1987,9 +2030,8 @@ impl Catalogue {
         )?;
 
         let root = self.root.clone();
-        let bindings = &self.bindings;
         let key = enrolled.key.clone();
-        committing(&mut self.db, change, |changes| {
+        committing(&mut self.db, &*self.broker, change, |changes| {
             // Read again, inside the commit. The enrolment may have changed while the package
             // was fetched, and the installation it replaces may have been pinned or granted
             // in the meantime: the decision is made against what is there now.
@@ -2023,9 +2065,25 @@ impl Catalogue {
                 installation.enabled = previous.enabled;
                 installation.pinned =
                     previous.pinned && previous.package_digest == entry.manifest_digest;
+                // The release the installation leaves may still be bound somewhere, and keeps
+                // what it held then as the most a binding on it may use.
+                let left = ReleaseOrigin::of(previous);
+                if previous.package_digest != installation.package_digest
+                    || left != ReleaseOrigin::of(&installation)
+                {
+                    changes.retire_release(&retired_from(previous))?;
+                }
             }
+            // A release installed again is described by its installation, whose grants the owner
+            // confirmed, and no longer by what it held when it was left.
+            changes.forget_retired(
+                environment_id,
+                plugin_id,
+                installation.package_digest,
+                &ReleaseOrigin::of(&installation),
+            )?;
             changes.install(&installation)?;
-            let view = installation_view(&root, changes, bindings, installation)?;
+            let view = installation_view(&root, changes, installation)?;
             Ok((view.clone(), Transition::Installed(view)))
         })
     }
@@ -2115,9 +2173,8 @@ impl Catalogue {
             }
         }
         let root = self.root.clone();
-        let bindings = &self.bindings;
         let digest = installation.package_digest;
-        committing(&mut self.db, change, |changes| {
+        committing(&mut self.db, &*self.broker, change, |changes| {
             let mut current = changes
                 .installation(environment_id, plugin_id)?
                 .ok_or_else(|| not_installed(plugin_id))?;
@@ -2133,7 +2190,7 @@ impl Catalogue {
             }
             current.enabled = enabled;
             changes.install(&current)?;
-            let view = installation_view(&root, changes, bindings, current)?;
+            let view = installation_view(&root, changes, current)?;
             Ok((view.clone(), Transition::Changed(view)))
         })
     }
@@ -2188,8 +2245,7 @@ impl Catalogue {
         change.authority.check()?;
         let confirmed = change.authority.owner_confirmed();
         let root = self.root.clone();
-        let bindings = &self.bindings;
-        committing(&mut self.db, change, |changes| {
+        committing(&mut self.db, &*self.broker, change, |changes| {
             let mut current = changes
                 .installation(environment_id, plugin_id)?
                 .ok_or_else(|| not_installed(plugin_id))?;
@@ -2226,15 +2282,24 @@ impl Catalogue {
                     ),
                 });
             }
+            // What this change withdraws is withdrawn from every release the installation left as
+            // well, and what it adds is added to none of them: a release no installation holds is
+            // one nobody confirmed anything for since.
+            let held = ceiling::effective(&current.requested, &current.ceiling, &current.grant);
+            let now = ceiling::effective(&current.requested, &current.ceiling, &grant);
+            changes.narrow_retired(
+                environment_id,
+                plugin_id,
+                &held.difference(&now).copied().collect(),
+            )?;
             current.grant = grant;
             changes.install(&current)?;
-            let view = installation_view(&root, changes, bindings, current)?;
+            let view = installation_view(&root, changes, current)?;
             Ok((view.clone(), Transition::Changed(view)))
         })
     }
 
-    /// Removes an installation and closes every binding that held it, as the owner acting
-    /// directly.
+    /// Removes an installation, as the owner acting directly, with no count of what held it.
     ///
     /// # Errors
     ///
@@ -2243,15 +2308,23 @@ impl Catalogue {
         &mut self,
         environment_id: EnvironmentId,
         plugin_id: &PluginId,
-    ) -> CatalogueResult<u64> {
+    ) -> CatalogueResult<Option<u64>> {
         self.uninstall_with(
             environment_id,
             plugin_id,
+            None,
             &mut Change::new(&Owner::acting()),
         )
     }
 
-    /// Removes an installation and closes every binding that held it.
+    /// Removes an installation.
+    ///
+    /// The release it leaves may still be bound, and is retired with what it held, so a binding
+    /// on it keeps no more than that and ends at its next admission boundary. `counted` is how
+    /// many live bindings the workers reported holding the package, and the admission revision
+    /// their reports were at: the removal answers with that count only when it commits right
+    /// after that revision, and with `None` when another change committed in between or there is
+    /// no count.
     ///
     /// # Errors
     ///
@@ -2260,25 +2333,28 @@ impl Catalogue {
         &mut self,
         environment_id: EnvironmentId,
         plugin_id: &PluginId,
+        counted: Option<(u64, u64)>,
         change: &mut Change<'_>,
-    ) -> CatalogueResult<u64> {
+    ) -> CatalogueResult<Option<u64>> {
         change.authority.check()?;
-        let closing = self.bindings.count_for(environment_id, plugin_id);
-        committing(&mut self.db, change, |changes| {
-            changes
+        committing(&mut self.db, &*self.broker, change, |changes| {
+            let current = changes
                 .installation(environment_id, plugin_id)?
                 .ok_or_else(|| not_installed(plugin_id))?;
+            let revision = changes.admission_revision()?;
+            let affected_bindings = counted
+                .filter(|(counted_at, _)| *counted_at == revision)
+                .map(|(_, count)| count);
+            changes.retire_release(&retired_from(&current))?;
             changes.uninstall(environment_id, plugin_id)?;
             Ok((
-                (),
+                affected_bindings,
                 Transition::Uninstalled {
                     plugin_id: plugin_id.clone(),
-                    closed_bindings: closing,
+                    affected_bindings,
                 },
             ))
-        })?;
-        // The installation is gone for good now, so the bindings that held it close with it.
-        Ok(self.bindings.close_for(environment_id, plugin_id))
+        })
     }
 
     /// Pins or unpins an installation to the exact hash it holds, as the owner acting directly.
@@ -2316,14 +2392,13 @@ impl Catalogue {
     ) -> CatalogueResult<InstallationView> {
         change.authority.check()?;
         let root = self.root.clone();
-        let bindings = &self.bindings;
-        committing(&mut self.db, change, |changes| {
+        committing(&mut self.db, &*self.broker, change, |changes| {
             let mut current = changes
                 .installation(environment_id, plugin_id)?
                 .ok_or_else(|| not_installed(plugin_id))?;
             current.pinned = current.pinned_to(package_digest)?;
             changes.install(&current)?;
-            let view = installation_view(&root, changes, bindings, current)?;
+            let view = installation_view(&root, changes, current)?;
             Ok((view.clone(), Transition::Changed(view)))
         })
     }
@@ -2334,8 +2409,16 @@ impl Catalogue {
 ///
 /// Files a change relies on are published before this, each in a commit of its own, so the row
 /// that names a file never commits before the file is whole and flushed.
+///
+/// A change that can alter what is admitted raises the admission revision in the same
+/// transaction, so the change and the revision that makes the workers hear of it commit together.
+/// And a release an installation left is forgotten here once no worker holds it: every worker has
+/// reported at the revision this change leaves, and none of those reports lists it. A worker that
+/// has not reported there may have bound it after its last report, while it was still admitted,
+/// so nothing is forgotten while one is pending.
 fn committing<T>(
     db: &mut Db,
+    broker: &dyn BrokerBridge,
     change: &mut Change<'_>,
     apply: impl FnOnce(&Changes<'_>) -> CatalogueResult<(T, Transition)>,
 ) -> CatalogueResult<T> {
@@ -2347,6 +2430,14 @@ fn committing<T>(
     committed(authority, &Effect::Records, move |permit| {
         pending.run(permit, |changes| {
             let (value, transition) = apply(changes)?;
+            if transition.alters_admissions() {
+                changes.raise_admission_revision()?;
+            }
+            let live = broker.live_packages(changes.admission_revision()?);
+            if live.pending.is_empty() {
+                changes
+                    .forget_retired_except(&live.releases.iter().map(LiveRelease::key).collect())?;
+            }
             if let Some(settlement) = settlement.as_mut() {
                 let result = (settlement.render)(&transition)?;
                 changes.settle_applied(&settlement.key, &result, settlement.now_ms)?;
@@ -2367,7 +2458,6 @@ fn committing<T>(
 fn reclaim(
     db: &mut Db,
     authority: &dyn Authority,
-    bindings: &Bindings,
     broker: &dyn BrokerBridge,
     key: &EnrolmentKey,
     store: &Store,
@@ -2392,17 +2482,34 @@ fn reclaim(
         {
             return Ok(store::ReclaimPlan::default());
         }
+        // What the workers hold is asked at the admission revision this transaction reads, so a
+        // change committed and not yet announced to them already counts. A worker that has not
+        // reported there may hold a release nothing here describes, and removing anything while
+        // one has not would be removing on a guess: the reclaim waits, and removes nothing.
+        let live = broker.live_packages(records.admission_revision()?);
+        if !live.pending.is_empty() {
+            return Err(CatalogueError::Unreconciled {
+                detail: format!(
+                    "making room for {subject} waits for {} to say what they hold; nothing was \
+                     removed, and the same request succeeds once each has answered or ended",
+                    live.pending.join(", ")
+                ),
+            });
+        }
+        let live: Vec<PayloadDigest> = live
+            .releases
+            .iter()
+            .map(|release| release.package_digest)
+            .collect();
         // A package's hash names its manifest. Protecting only that would leave the component and
         // the assets a live binding actually runs on evictable, so every payload of a protected
         // package is protected with it.
-        let mut protected: BTreeSet<PayloadDigest> = install::protected_payloads(
-            &records.installations()?,
-            bindings,
-            &broker.live_packages(),
-            |package| store.package_payloads(package),
-        )?
-        .into_iter()
-        .collect();
+        let mut protected: BTreeSet<PayloadDigest> =
+            install::protected_payloads(&records.installations()?, &live, |package| {
+                store.package_payloads(package)
+            })?
+            .into_iter()
+            .collect();
         protected.extend(also_protected.iter().copied());
         // A pinned generation is what a pin holds the repository at, so everything that
         // generation references stays too. A pinned index this host cannot read stops the
@@ -2599,24 +2706,19 @@ fn repository_view(enrolled: Enrolled) -> RepositoryView {
 fn installation_view(
     root: &Path,
     records: &Records<'_>,
-    bindings: &Bindings,
     installation: Installation,
 ) -> CatalogueResult<InstallationView> {
-    // Whether the release is revoked is what its repository's current generation says. A
-    // repository that is no longer enrolled, or has no generation, publishes nothing about it; an
-    // index this host cannot read is a failure and is returned as one.
-    let revoked = match records.enrolment_by_key(&installation.enrolment)? {
-        Some(Enrolled {
-            key,
-            active: Some(active),
-            ..
-        }) => Store::at(root, &key)
-            .index(&active)?
-            .find(&installation.plugin_id, &installation.version)
-            .is_some_and(|entry| !entry.accepts_new_bindings()),
-        _ => false,
-    };
-    let live_bindings = bindings.count_for(installation.environment_id, &installation.plugin_id);
+    // Whether the release is revoked is what its repository's current generation says about its
+    // exact package hash. A repository that is no longer enrolled, or has no generation, publishes
+    // nothing about it; an index this host cannot read is a failure and is returned as one.
+    let revoked = admission::current_entry(
+        root,
+        records,
+        &installation.enrolment,
+        &installation.plugin_id,
+        installation.package_digest,
+    )?
+    .is_some_and(|entry| !entry.accepts_new_bindings());
     let decisions = ceiling::decide(
         &installation.requested,
         &installation.ceiling,
@@ -2625,9 +2727,23 @@ fn installation_view(
     Ok(InstallationView {
         installation,
         revoked,
-        live_bindings,
         decisions,
     })
+}
+
+/// Returns the release an installation leaves, with the effective grants it held on it.
+fn retired_from(installation: &Installation) -> db::RetiredRelease {
+    db::RetiredRelease {
+        environment_id: installation.environment_id,
+        plugin_id: installation.plugin_id.clone(),
+        package_digest: installation.package_digest,
+        origin: ReleaseOrigin::of(installation),
+        cap: ceiling::effective(
+            &installation.requested,
+            &installation.ceiling,
+            &installation.grant,
+        ),
+    }
 }
 
 fn not_enrolled(id: &RepositoryId) -> CatalogueError {
