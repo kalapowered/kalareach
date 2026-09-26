@@ -489,9 +489,7 @@ fn prepare_private_directory(directory: &Path) -> Result<()> {
         check_path_is_unresolved(directory)?;
         check_owner_only(directory)?;
     }
-    std::fs::create_dir_all(directory).map_err(|error| CryptoError::SecretStore {
-        message: format!("create {}: {error}", directory.display()),
-    })?;
+    make_directories(directory)?;
     check_path_is_unresolved(directory)?;
     set_mode(directory, 0o700)?;
     check_owner_only(directory)
@@ -521,14 +519,61 @@ fn prepare_named_directory(directory: &Path) -> Result<PathBuf> {
     if directory.exists() {
         check_owner_only(&directory)?;
     }
-    std::fs::create_dir_all(&directory).map_err(|error| CryptoError::SecretStore {
-        message: format!("create {}: {error}", directory.display()),
-    })?;
+    make_directories(&directory)?;
     // Again after the creation: what exists now is what the mode below is set on.
     reject_link(&directory)?;
     set_mode(&directory, 0o700)?;
     check_owner_only(&directory)?;
     Ok(directory)
+}
+
+/// Makes `directory` and every missing directory above it, and flushes each one it made into the
+/// directory above it, so that none of them is lost to a crash.
+///
+/// A directory that was already there is not flushed: the directory above the store's own is not
+/// the store's, and this account may not be able to open it for a flush. So a flush that is refused
+/// removes again every directory this call made, and a later call makes and flushes them afresh.
+fn make_directories(directory: &Path) -> Result<()> {
+    let mut missing = Vec::new();
+    let mut next = Some(directory);
+    while let Some(path) = next.filter(|path| !path.as_os_str().is_empty()) {
+        match std::fs::symlink_metadata(path) {
+            Ok(_) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                missing.push(path);
+                next = path.parent();
+            }
+            Err(error) => {
+                return Err(CryptoError::SecretStore {
+                    message: format!("read {}: {error}", path.display()),
+                });
+            }
+        }
+    }
+    let mut made: Vec<&Path> = Vec::new();
+    for path in missing.into_iter().rev() {
+        match std::fs::create_dir(path) {
+            Ok(()) => made.push(path),
+            // Another writer made it meanwhile, and its own flush is that writer's to report.
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(CryptoError::SecretStore {
+                    message: format!("create {}: {error}", path.display()),
+                });
+            }
+        }
+        let above = path
+            .parent()
+            .filter(|above| !above.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        if let Err(refused) = flush(above, kr_flush::NameKind::Directory) {
+            for path in made.iter().rev() {
+                let _ = std::fs::remove_dir(path);
+            }
+            return Err(refused);
+        }
+    }
+    Ok(())
 }
 
 /// Rejects one path that is a symbolic link.
@@ -1567,6 +1612,47 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// KR-REQ-10.47: the store's own directory, made when the store is opened, is flushed into the
+    /// directory above it before the store is used. A flush that is refused is reported and the
+    /// directory it could not flush is removed again, so that the next opening makes and flushes it;
+    /// with nothing held, the store opens. The same holds for the owner-only fallback where section
+    /// 10 offers it.
+    #[test]
+    fn a_store_directory_made_when_the_store_opens_is_flushed_into_the_one_above_it() {
+        let above = scratch_directory("above");
+        std::fs::create_dir(&above).expect("the directory above the store's");
+        let base = above.join("store");
+        let refused = {
+            let _refused = FlushRefused::on(&above);
+            open_store_in(&base)
+                .expect_err("the store's directory is not flushed into the one above it")
+        };
+        assert!(is_refused_flush(&refused), "{refused}");
+        assert!(
+            !base.exists(),
+            "the directory it could not flush is removed again"
+        );
+        let opened = open_store_in(&base).expect("with nothing held, the store opens");
+        let name = SecretName::new("host/x").expect("a name");
+        opened.store.set(&name, b"seed").expect("a write");
+
+        if FILE_FALLBACK_SUPPORTED {
+            let fallback = above.join("fallback");
+            let refused = {
+                let _refused = FlushRefused::on(&above);
+                FileStore::open(&fallback)
+                    .expect_err("the fallback's directory is not flushed into the one above it")
+            };
+            assert!(is_refused_flush(&refused), "{refused}");
+            assert!(
+                !fallback.exists(),
+                "the directory it could not flush is removed again"
+            );
+            FileStore::open(&fallback).expect("with nothing held, the fallback opens");
+        }
+        let _ = std::fs::remove_dir_all(&above);
     }
 
     /// KR-REQ-10.47: a deleted secret's name is flushed out of its directory before the deletion is
