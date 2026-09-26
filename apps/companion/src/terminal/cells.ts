@@ -88,10 +88,9 @@ const UNDERLINE_STYLE: Readonly<
  * How one piece is drawn: its colours, with reverse video swapping them, and its attributes.
  *
  * Faint text is drawn at half strength and invisible text in no colour, each over the piece's own
- * background, as the desktop's renderer draws them in the palette's colours; an invisible piece
- * keeps its underline. That renderer draws faint text in a direct colour at full strength, and the
- * phone does not follow it there. CSS draws every line of one element in one style and colour, so a
- * strikethrough or an overline on an underlined piece takes the underline's.
+ * background; an invisible piece keeps its underline. CSS draws every line of one element in one
+ * style and colour, so a strikethrough or an overline on an underlined piece takes the underline's.
+ * The desktop draws its pieces with this too.
  */
 export function styleOf(rendition: CellRendition, palette: PaletteState): CSSProperties {
   const foreground = hex(palette.foreground.red, palette.foreground.green, palette.foreground.blue)

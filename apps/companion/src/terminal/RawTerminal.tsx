@@ -2,9 +2,10 @@
  * The raw terminal view.
  *
  * It draws the session's screen as native code holds it for this view: the part of the live screen
- * the host drew for the view's grid, as cells. It writes the renderer only this page's own fixed
- * sequences and each piece's text, so it runs no terminal state machine over the session's output
- * and nothing the session printed can make the renderer answer.
+ * the host drew for the view's grid, as cells. Each piece of a line is a box of its own at its
+ * canonical cells, in the session's palette (`frame.ts`), so a glyph the browser draws wider than
+ * its cells, joins to its neighbour or lays out right to left stays inside its own cells, and the
+ * view runs no terminal state machine: nothing the session printed can make it answer.
  *
  * Two modes, and the wheel belongs to whichever one is active. In control mode the application
  * inside the terminal gets the wheel, unchanged. In view mode the person is reading the screen: the
@@ -15,15 +16,31 @@
  * it held and nothing of anyone else's.
  */
 
-import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
-import { Terminal } from '@xterm/xterm'
-import { FitAddon } from '@xterm/addon-fit'
-import '@xterm/xterm/css/xterm.css'
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type CSSProperties,
+  type ReactNode
+} from 'react'
+
+import type { PaletteState } from '@kalareach/protocol'
 
 import { Badge, Button, Segmented } from '../components/ui'
 import { useApp } from '../app/state'
-import type { TerminalGrid } from '../host/port'
-import { backgroundOf, leftBlank, paint, themeOf } from './frame'
+import type { TerminalGrid, TerminalScreen } from '../host/port'
+import { styleOf } from './cells'
+import {
+  backgroundOf,
+  count,
+  cursorColourOf,
+  foregroundOf,
+  placedCursor,
+  placedPieces,
+  type PlacedCursor
+} from './frame'
 import {
   ATTACHING,
   clipping,
@@ -38,16 +55,110 @@ import {
   type ViewMode
 } from './modes'
 import { FALLBACK_GRID, useTerminalView } from './view'
-import { CELL_TABLE } from './widths'
 
-/** The base cell size before zoom. */
+const FONT_FAMILY = 'ui-monospace, SFMono-Regular, Consolas, monospace'
+
+/** The type size before zoom, in pixels. */
 const BASE_FONT_SIZE = 12
 
 /**
- * The surface's padding. The renderer sits inside it, on an element of its own, so the grid is
- * measured from the space the renderer actually has.
+ * The surface's padding. The grid sits inside it, on an element of its own, so the grid is
+ * measured from the space it actually has.
  */
 const SURFACE_INSET = 12
+
+/** How many cells the probe that measures a cell holds: its width over this is a cell's. */
+const PROBE_CELLS = 10
+
+/** One cell's size in pixels. */
+interface Cell {
+  readonly width: number
+  readonly height: number
+}
+
+/** The cell a grid is laid out with before its first measure, which a page with no layout keeps. */
+const UNMEASURED_CELL: Cell = { width: 8, height: 16 }
+
+/** How every piece's box is drawn: at its cells, its text laid out on its own and cut at its edges. */
+const PIECE: CSSProperties = {
+  position: 'absolute',
+  overflow: 'hidden',
+  whiteSpace: 'pre',
+  unicodeBidi: 'isolate',
+  direction: 'ltr'
+}
+
+/** The session's cursor, in its steady shape, over the cell it is in. */
+function cursorStyle(cursor: PlacedCursor, cell: Cell, palette: PaletteState): CSSProperties {
+  const colour = cursorColourOf(palette)
+  const edge =
+    cursor.shape === 'underline'
+      ? { borderBottom: `2px solid ${colour}` }
+      : cursor.shape === 'bar'
+        ? { borderLeft: `2px solid ${colour}` }
+        : { border: `1px solid ${colour}` }
+  return {
+    position: 'absolute',
+    left: cursor.column * cell.width,
+    top: cursor.line * cell.height,
+    width: cell.width,
+    height: cell.height,
+    boxSizing: 'border-box',
+    pointerEvents: 'none',
+    ...edge
+  }
+}
+
+/** The screen as the view draws it: each piece a box of its own at its cells, and the cursor. */
+function Grid({ screen, cell }: { readonly screen: TerminalScreen; readonly cell: Cell }): ReactNode {
+  const palette = screen.palette
+  const cursor = placedCursor(screen)
+  const columns = count(screen.window.columns)
+  const rows = count(screen.window.rows)
+  return (
+    <div
+      data-testid="terminal-grid"
+      data-columns={columns}
+      data-rows={rows}
+      style={{
+        position: 'relative',
+        width: columns * cell.width,
+        height: rows * cell.height,
+        lineHeight: `${cell.height}px`,
+        color: foregroundOf(palette)
+      }}
+    >
+      {placedPieces(screen).map((piece) => (
+        <span
+          key={`${piece.line}:${piece.column}`}
+          data-testid="terminal-piece"
+          data-line={piece.line}
+          data-column={piece.column}
+          data-cells={piece.cells}
+          style={{
+            ...PIECE,
+            left: piece.column * cell.width,
+            top: piece.line * cell.height,
+            width: piece.cells * cell.width,
+            height: cell.height,
+            ...styleOf(piece.rendition, palette)
+          }}
+        >
+          {piece.text}
+        </span>
+      ))}
+      {cursor === null ? null : (
+        <span
+          data-testid="terminal-cursor"
+          data-line={cursor.line}
+          data-column={cursor.column}
+          data-shape={cursor.shape}
+          style={cursorStyle(cursor, cell, palette)}
+        />
+      )}
+    </div>
+  )
+}
 
 /** The raw view of one session. */
 export function RawTerminal({
@@ -60,66 +171,36 @@ export function RawTerminal({
   const { port } = useApp()
   const host = useRef<HTMLDivElement | null>(null)
   const surface = useRef<HTMLDivElement | null>(null)
-  const renderer = useRef<{ readonly terminal: Terminal; readonly fit: FitAddon } | null>(null)
+  const probe = useRef<HTMLSpanElement | null>(null)
   const [mode, setMode] = useState<ViewMode>('control')
   const [zoom, setZoom] = useState(ZOOM_DEFAULT_INDEX)
-  // Which renderer the screen was last drawn into: a new one draws the last frame again at once.
-  const [generation, setGeneration] = useState(0)
+  const [cell, setCell] = useState<Cell | null>(null)
   const [wheelToApplication, setWheelToApplication] = useState(0)
+  const fontSize = BASE_FONT_SIZE * (ZOOM_STEPS[zoom] ?? 1)
 
-  /** The grid the surface holds at the current cell size, as the renderer measures its cells. */
+  // A cell is measured at the current type size before the grid is painted, so a zoom step lays
+  // the last frame out again at once, from its top-left corner.
+  useLayoutEffect(() => {
+    const box = probe.current?.getBoundingClientRect()
+    const measured =
+      box !== undefined && box.width > 0 && box.height > 0
+        ? { width: box.width / PROBE_CELLS, height: Math.ceil(box.height) }
+        : null
+    setCell((current) =>
+      current?.width === measured?.width && current?.height === measured?.height ? current : measured
+    )
+  }, [fontSize])
+
+  /** The grid the surface holds at the current cell size. */
   const measure = useCallback((): TerminalGrid => {
-    const proposed = renderer.current?.fit.proposeDimensions()
-    if (
-      proposed !== undefined &&
-      Number.isFinite(proposed.cols) &&
-      Number.isFinite(proposed.rows) &&
-      proposed.cols > 0 &&
-      proposed.rows > 0
-    ) {
-      return { columns: proposed.cols, rows: proposed.rows }
-    }
-    return FALLBACK_GRID
-  }, [])
-
-  // The renderer is created again for each session, so nothing written for one session can reach
-  // another's screen, and for each cell size, because it measures its cell once.
-  useEffect(() => {
     const element = host.current
-    if (!element) return
-    const created = new Terminal({
-      fontFamily: 'ui-monospace, SFMono-Regular, Consolas, monospace',
-      fontSize: BASE_FONT_SIZE * (ZOOM_STEPS[zoom] ?? 1),
-      convertEol: false,
-      cursorBlink: false,
-      // The host owns scrollback. A buffer here would be a second, disagreeing copy of it.
-      scrollback: 0,
-      allowProposedApi: true
-    })
-    // The renderer lays text out with the view's own cell table, the one each frame is measured
-    // by, so every piece lands in exactly its cells.
-    created.unicode.register(CELL_TABLE)
-    created.unicode.activeVersion = CELL_TABLE.version
-    const fit = new FitAddon()
-    created.loadAddon(fit)
-    created.open(element)
-    renderer.current = { terminal: created, fit }
-    setGeneration((count) => count + 1)
-    return () => {
-      created.dispose()
-      if (renderer.current?.terminal === created) renderer.current = null
-    }
-  }, [zoom, sessionId])
+    if (element === null || cell === null) return FALLBACK_GRID
+    const columns = Math.floor(element.clientWidth / cell.width)
+    const rows = Math.floor(element.clientHeight / cell.height)
+    return columns > 0 && rows > 0 ? { columns, rows } : FALLBACK_GRID
+  }, [cell])
 
   const { state, frame, slow, resize, again } = useTerminalView(port, sessionId, measure)
-
-  // The last complete screen, drawn in one write, in the palette the session has.
-  useEffect(() => {
-    const current = renderer.current
-    if (!current) return
-    if (frame !== null) current.terminal.options.theme = themeOf(frame.palette)
-    paint(current.terminal, frame)
-  }, [frame, generation])
 
   // The grid goes to the host whenever the surface or the cell size changes: at once, and then as
   // the surface is resized.
@@ -134,10 +215,10 @@ export function RawTerminal({
     return () => {
       observer.disconnect()
     }
-  }, [generation, resize, measure])
+  }, [resize, measure])
 
-  // The wheel is read here rather than through a React handler, because the renderer inside this
-  // element listens for it too. In control mode it must reach the program unchanged, so this
+  // The wheel is read here rather than through a React handler, so that in view mode it can be
+  // cancelled before the page scrolls. In control mode it must reach the program unchanged, so this
   // neither cancels it nor stops it; in view mode this is the owner and cancels it.
   useEffect(() => {
     const element = host.current
@@ -205,7 +286,8 @@ export function RawTerminal({
             <Badge tone="neutral" data-testid="terminal-size">
               {`${frame.dimensions.columns}×${frame.dimensions.rows}`}
             </Badge>
-            {warningsOf(frame, leftBlank(frame)).map((warning) => (
+            {/* Every piece is drawn, cut to its box, so the view leaves nothing blank of its own. */}
+            {warningsOf(frame, 0).map((warning) => (
               <Badge key={warning.id} tone="warning" data-testid={warning.id}>
                 {warning.words}
               </Badge>
@@ -235,7 +317,27 @@ export function RawTerminal({
           ...(frame ? { background: backgroundOf(frame.palette) } : {})
         }}
       >
-        <div ref={host} style={{ position: 'absolute', inset: SURFACE_INSET }} />
+        <div
+          ref={host}
+          style={{
+            position: 'absolute',
+            inset: SURFACE_INSET,
+            overflow: 'hidden',
+            fontFamily: FONT_FAMILY,
+            fontSize,
+            fontKerning: 'none',
+            fontVariantLigatures: 'none'
+          }}
+        >
+          <span
+            ref={probe}
+            aria-hidden="true"
+            style={{ position: 'absolute', visibility: 'hidden', pointerEvents: 'none', whiteSpace: 'pre' }}
+          >
+            {'M'.repeat(PROBE_CELLS)}
+          </span>
+          {frame === null ? null : <Grid screen={frame} cell={cell ?? UNMEASURED_CELL} />}
+        </div>
       </div>
 
       <footer className="terminal-footer between">

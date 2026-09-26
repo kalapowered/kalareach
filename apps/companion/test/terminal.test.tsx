@@ -3,15 +3,14 @@
  *
  * The scripted host publishes what native code does for a view: attached with no screen, a
  * complete screen of cells, waiting after the host's reset, ended with the host's words. What is
- * checked is what the page makes of them: nothing drawn before the first screen, the screen drawn
- * piece by piece at its columns, the last frame kept while the view waits, a view opened again
+ * checked is what the page makes of them: nothing drawn before the first screen, each piece drawn in
+ * a box of its own at its cells, the last frame kept while the view waits, a view opened again
  * after it ended, closed when it is left, and never a state of one session drawn in another's view.
  */
 
 import { describe, expect, it, vi } from 'vitest'
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { Terminal } from '@xterm/xterm'
 
 import { App } from '../src/App'
 import { AppProvider, type Place } from '../src/app/state'
@@ -42,22 +41,33 @@ async function settle(): Promise<void> {
   })
 }
 
-/** The renderer the view created last. */
-function renderer(opened: { mock: { contexts: unknown[] } }): Terminal {
-  return opened.mock.contexts.at(-1) as Terminal
+/**
+ * Every line of the grid as a person reads it: each piece's text at its column, with a space for
+ * each cell before it that no piece covers.
+ */
+function drawn(): string[] {
+  const grid = screen.queryByTestId('terminal-grid')
+  if (grid === null) return []
+  const lines: string[] = []
+  const reached: number[] = []
+  for (const box of Array.from(grid.querySelectorAll<HTMLElement>('[data-testid="terminal-piece"]'))) {
+    const line = Number(box.dataset.line)
+    const column = Number(box.dataset.column)
+    const gap = Math.max(0, column - (reached[line] ?? 0))
+    lines[line] = `${lines[line] ?? ''}${' '.repeat(gap)}${box.textContent ?? ''}`
+    reached[line] = column + Number(box.dataset.cells)
+  }
+  return Array.from({ length: Number(grid.dataset.rows) }, (_, index) => lines[index] ?? '')
 }
 
-/** Every line a renderer holds, once everything written to it has been processed. */
-async function drawn(terminal: Terminal): Promise<string[]> {
-  await new Promise<void>((resolve) => {
-    terminal.write('', resolve)
-  })
-  const buffer = terminal.buffer.active
-  const lines: string[] = []
-  for (let line = 0; line < buffer.length; line += 1) {
-    lines.push(buffer.getLine(line)?.translateToString(true) ?? '')
-  }
-  return lines
+/** Each piece's box as the grid places it: its line, column, cells and text. */
+function boxes(): [number, number, number, string][] {
+  return Array.from(document.querySelectorAll<HTMLElement>('[data-testid="terminal-piece"]')).map((box) => [
+    Number(box.dataset.line),
+    Number(box.dataset.column),
+    Number(box.dataset.cells),
+    box.textContent ?? ''
+  ])
 }
 
 const presentation = () => screen.getByTestId('terminal-presentation').textContent
@@ -65,7 +75,6 @@ const position = () => screen.getByTestId('terminal-position').textContent
 
 describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)', () => {
   it('draws nothing before its first screen, and says it is attaching', async () => {
-    const opened = vi.spyOn(Terminal.prototype, 'open')
     const { port, controls } = fakeHost()
     controls.holdTerminalViews()
     open(port)
@@ -75,7 +84,7 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
     expect(presentation()).toBe(ATTACHING)
     expect(screen.getByTestId('terminal-surface')).toHaveAttribute('aria-busy', 'true')
     expect(screen.queryByTestId('palette-provenance')).toBeNull()
-    expect((await drawn(renderer(opened))).join('').trim()).toBe('')
+    expect(screen.queryByTestId('terminal-grid')).toBeNull()
 
     // Attached, with no screen yet: the host's sentence, and the words for waiting at once.
     act(() => {
@@ -85,16 +94,14 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
       "This view is shown a viewport because its client declared no terminal profile, so what the session's output would do on its terminal is not known."
     )
     expect(position()).toBe(WAITING)
-    expect((await drawn(renderer(opened))).join('').trim()).toBe('')
-    opened.mockRestore()
+    expect(screen.queryByTestId('terminal-grid')).toBeNull()
   })
 
   it('draws a published screen piece by piece, each at its own column', async () => {
-    const opened = vi.spyOn(Terminal.prototype, 'open')
     const { port } = fakeHost()
     open(port)
     await screen.findByTestId('palette-provenance')
-    const lines = await drawn(renderer(opened))
+    const lines = drawn()
     expect(lines.slice(0, 6)).toEqual([
       '$ cargo test -p kr-client',
       '   Compiling kr-client v0.1.0',
@@ -110,11 +117,9 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
     expect(screen.getByTestId('terminal-size').textContent).toBe('80×8')
     expect(screen.getByTestId('substituted-count').textContent).toBe('1 left blank')
     expect(screen.getByTestId('terminal-surface')).toHaveAttribute('aria-busy', 'false')
-    opened.mockRestore()
   })
 
   it('draws the bottom-right cell without scrolling the screen', async () => {
-    const opened = vi.spyOn(Terminal.prototype, 'open')
     const { port, controls } = fakeHost()
     controls.holdTerminalViews()
     open(port)
@@ -134,139 +139,48 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
       controls.terminalViews[0]?.attach()
       controls.terminalViews[0]?.show(full)
     })
-    expect((await drawn(renderer(opened))).slice(0, 2)).toEqual(['abcd', 'efgh'])
-    opened.mockRestore()
+    expect(drawn().slice(0, 2)).toEqual(['abcd', 'efgh'])
   })
 
-  it("draws a mark in its letter's cell, and a character too wide for its cells as blank cells", async () => {
-    const opened = vi.spyOn(Terminal.prototype, 'open')
+  it('draws each piece in a box of its own at exactly its cells, whatever its text', async () => {
     const { port, controls } = fakeHost()
     controls.holdTerminalViews()
     open(port)
     await waitFor(() => {
       expect(controls.terminalViews).toHaveLength(1)
     })
-    const measured: TerminalScreen = {
-      ...terminalScreen(SESSION_MAIN, { columns: 6, rows: 2 }),
-      window: { columns: 6, rows: 2 },
+    const invisible = { ...piece(0, '').rendition, invisible: true }
+    const mixed: TerminalScreen = {
+      ...terminalScreen(SESSION_MAIN, { columns: 16, rows: 2 }),
+      window: { columns: 16, rows: 2 },
       lines: [
-        // A letter and a mark in one cell, then a blank cell and a letter.
         {
           row: '1',
           soft_wrapped: false,
           truncated: false,
-          pieces: [{ ...piece(0, 'a\u{1ab0}'), cells: 1 }, piece(2, 'b')]
+          // A letter and its mark, a wide character in one cell, a mark with nothing before it,
+          // native code's split of a man technologist, and a heart shown as a picture in one cell.
+          pieces: [
+            { ...piece(0, 'a\u{1ab0}'), cells: 1 },
+            { ...piece(1, '\u{4e2d}'), cells: 1 },
+            { ...piece(2, '\u{301}'), cells: 1 },
+            { ...piece(3, '\u{1f468}\u{200d}'), cells: 2 },
+            { ...piece(5, '\u{1f4bb}'), cells: 2 },
+            { ...piece(7, '\u{2764}\u{fe0f}'), cells: 1 },
+            piece(8, 'x')
+          ]
         },
-        // A wide character in a piece of one cell, from a state that did not come from native code.
         {
           row: '2',
           soft_wrapped: false,
           truncated: false,
-          pieces: [{ ...piece(0, '\u{4e2d}'), cells: 1 }, piece(2, 'c')]
-        }
-      ],
-      cursor: null
-    }
-    act(() => {
-      controls.terminalViews[0]?.attach()
-      controls.terminalViews[0]?.show(measured)
-    })
-    // Nothing is drawn past a piece's cells: the blank cell after each stays blank, and what the
-    // renderer could not fit is left out.
-    const terminal = renderer(opened)
-    expect((await drawn(terminal)).slice(0, 2)).toEqual(['a\u{1ab0} b', '  c'])
-    expect(terminal.buffer.active.getLine(0)?.getCell(0)?.getWidth()).toBe(1)
-    opened.mockRestore()
-  })
-
-  it('keeps a piece inside its cells in a window one column wide', async () => {
-    const opened = vi.spyOn(Terminal.prototype, 'open')
-    const { port, controls } = fakeHost()
-    controls.holdTerminalViews()
-    open(port)
-    await waitFor(() => {
-      expect(controls.terminalViews).toHaveLength(1)
-    })
-    const narrow: TerminalScreen = {
-      ...terminalScreen(SESSION_MAIN, { columns: 1, rows: 1 }),
-      window: { columns: 1, rows: 1 },
-      lines: [
-        {
-          row: '1',
-          soft_wrapped: false,
-          truncated: false,
-          pieces: [{ ...piece(0, '\u{4e2d}'), cells: 1 }]
-        }
-      ],
-      cursor: null
-    }
-    act(() => {
-      controls.terminalViews[0]?.attach()
-      controls.terminalViews[0]?.show(narrow)
-    })
-    // The renderer holds two columns at the least, so there is a second column a wide character
-    // could reach. The piece's one cell is a blank cell, and the second column holds nothing.
-    expect((await drawn(renderer(opened)))[0]).toBe(' ')
-    opened.mockRestore()
-  })
-
-  it("keeps a glyph too wide for the window's last column off the piece before it", async () => {
-    const opened = vi.spyOn(Terminal.prototype, 'open')
-    const { port, controls } = fakeHost()
-    controls.holdTerminalViews()
-    open(port)
-    await waitFor(() => {
-      expect(controls.terminalViews).toHaveLength(1)
-    })
-    const edge: TerminalScreen = {
-      ...terminalScreen(SESSION_MAIN, { columns: 2, rows: 1 }),
-      window: { columns: 2, rows: 1 },
-      lines: [
-        {
-          row: '1',
-          soft_wrapped: false,
-          truncated: false,
-          // A character this renderer gives two cells, in a piece of one at the window's last
-          // column, with a mark after it.
-          pieces: [piece(0, 'x'), { ...piece(1, '\u{4e2d}\u{301}'), cells: 1 }]
-        }
-      ],
-      cursor: null
-    }
-    act(() => {
-      controls.terminalViews[0]?.attach()
-      controls.terminalViews[0]?.show(edge)
-    })
-    // The x keeps its cell to itself, and the glyph that cannot be drawn in its one cell is a blank
-    // cell instead.
-    expect((await drawn(renderer(opened)))[0]).toBe('x ')
-    opened.mockRestore()
-  })
-
-  it('leaves no cell of no width, so every piece after it keeps its column', async () => {
-    const opened = vi.spyOn(Terminal.prototype, 'open')
-    const { port, controls } = fakeHost()
-    controls.holdTerminalViews()
-    open(port)
-    await waitFor(() => {
-      expect(controls.terminalViews).toHaveLength(1)
-    })
-    const line: TerminalScreen = {
-      ...terminalScreen(SESSION_MAIN, { columns: 4, rows: 1 }),
-      window: { columns: 4, rows: 1 },
-      lines: [
-        {
-          row: '1',
-          soft_wrapped: false,
-          truncated: false,
-          // An Arabic symbol an older table calls a mark, and a mark with no letter before it: the
-          // first is of a script the browser may join or reorder, the second would be a cell of
-          // no width, and both are drawn as blank cells.
+          // Two Arabic semicolons with marks, a Hebrew letter, and invisible text.
           pieces: [
-            piece(0, 'x'),
-            { ...piece(1, '\u{6de}'), cells: 1 },
-            { ...piece(2, '\u{301}'), cells: 1 },
-            piece(3, 'y')
+            { ...piece(0, '\u{61b}\u{64b}'), cells: 1 },
+            { ...piece(1, '\u{61b}\u{64c}'), cells: 1 },
+            { ...piece(2, '\u{5e9}'), cells: 1 },
+            { ...piece(3, '\u{4e2d}'), cells: 2, rendition: invisible },
+            piece(5, 'y')
           ]
         }
       ],
@@ -274,72 +188,58 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
     }
     act(() => {
       controls.terminalViews[0]?.attach()
-      controls.terminalViews[0]?.show(line)
+      controls.terminalViews[0]?.show(mixed)
     })
-    const terminal = renderer(opened)
-    expect((await drawn(terminal))[0]).toBe('x  y')
-    const row = terminal.buffer.active.getLine(0)
-    expect([0, 1, 2, 3].map((column) => row?.getCell(column)?.getWidth())).toEqual([1, 1, 1, 1])
-    opened.mockRestore()
-  })
-
-  it('draws a glyph narrower than its piece at its column, and fills the rest of its cells', async () => {
-    const opened = vi.spyOn(Terminal.prototype, 'open')
-    const { port, controls } = fakeHost()
-    controls.holdTerminalViews()
-    open(port)
-    await waitFor(() => {
-      expect(controls.terminalViews).toHaveLength(1)
-    })
-    const line: TerminalScreen = {
-      ...terminalScreen(SESSION_MAIN, { columns: 5, rows: 1 }),
-      window: { columns: 5, rows: 1 },
-      lines: [
-        {
-          row: '1',
-          soft_wrapped: false,
-          truncated: false,
-          // A symbol shown as a picture by its selector, which this renderer gives one cell, and an
-          // emoji that is a picture by default, which it gives two: both in pieces of two cells.
-          pieces: [
-            { ...piece(0, '\u{26a0}\u{fe0f}'), cells: 2 },
-            piece(2, 'z'),
-            { ...piece(3, '\u{1f44d}'), cells: 2 }
-          ]
-        }
-      ],
-      cursor: null
+    expect(boxes()).toEqual([
+      [0, 0, 1, 'a\u{1ab0}'],
+      [0, 1, 1, '\u{4e2d}'],
+      [0, 2, 1, '\u{301}'],
+      [0, 3, 2, '\u{1f468}\u{200d}'],
+      [0, 5, 2, '\u{1f4bb}'],
+      [0, 7, 1, '\u{2764}\u{fe0f}'],
+      [0, 8, 1, 'x'],
+      [1, 0, 1, '\u{61b}\u{64b}'],
+      [1, 1, 1, '\u{61b}\u{64c}'],
+      [1, 2, 1, '\u{5e9}'],
+      [1, 3, 2, '\u{4e2d}'],
+      [1, 5, 1, 'y']
+    ])
+    // Each box sits at its own cells, laid out on its own and cut at its edges. With no layout
+    // here, a cell is the grid's unmeasured one, 8 by 16 pixels.
+    const placed = Array.from(document.querySelectorAll<HTMLElement>('[data-testid="terminal-piece"]'))
+    for (const box of placed) {
+      expect(box.style.left).toBe(`${Number(box.dataset.column) * 8}px`)
+      expect(box.style.top).toBe(`${Number(box.dataset.line) * 16}px`)
+      expect(box.style.width).toBe(`${Number(box.dataset.cells) * 8}px`)
+      expect(box.style.position).toBe('absolute')
+      expect(box.style.overflow).toBe('hidden')
+      expect(box.style.unicodeBidi).toBe('isolate')
     }
-    act(() => {
-      controls.terminalViews[0]?.attach()
-      controls.terminalViews[0]?.show(line)
-    })
-    const terminal = renderer(opened)
-    expect((await drawn(terminal))[0]).toBe('\u{26a0}\u{fe0f} z\u{1f44d}')
-    const row = terminal.buffer.active.getLine(0)
-    expect([0, 1, 2, 3].map((column) => row?.getCell(column)?.getWidth())).toEqual([1, 1, 1, 2])
-    opened.mockRestore()
+    // The invisible text takes no colour, over its own cells.
+    expect(placed[10]?.style.color).toBe('transparent')
   })
 
-  it('counts each piece it draws as blank cells with the ones native code left blank', async () => {
+  it("draws the session's cursor in its steady shape at its cell", async () => {
     const { port, controls } = fakeHost()
     open(port)
     await screen.findByTestId('palette-provenance')
-    expect(screen.getByTestId('substituted-count').textContent).toBe('1 left blank')
-    const whole = terminalScreen(SESSION_MAIN, { columns: 80, rows: 8 })
+    const cursor = screen.getByTestId('terminal-cursor')
+    expect([cursor.dataset.line, cursor.dataset.column, cursor.dataset.shape]).toEqual([
+      '5',
+      '2',
+      'block'
+    ])
     act(() => {
-      controls.terminalViews[0]?.show({
-        ...whole,
-        lines: whole.lines.map((line, index) =>
-          index === 6 ? { ...line, pieces: [{ ...piece(0, '\u{4e2d}'), cells: 1 }] } : line
-        )
-      })
+      controls.terminalViews[0]?.show({ cursor: { line: 1, column: 4, style: 6, visible: true } })
     })
-    expect(screen.getByTestId('substituted-count').textContent).toBe('2 left blank')
+    expect(screen.getByTestId('terminal-cursor').dataset.shape).toBe('bar')
+    act(() => {
+      controls.terminalViews[0]?.show({ cursor: { line: 1, column: 4, style: 2, visible: false } })
+    })
+    expect(screen.queryByTestId('terminal-cursor')).toBeNull()
   })
 
   it('leaves out a piece that starts inside the one before it, and keeps that one whole', async () => {
-    const opened = vi.spyOn(Terminal.prototype, 'open')
     const { port, controls } = fakeHost()
     controls.holdTerminalViews()
     open(port)
@@ -364,8 +264,7 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
       controls.terminalViews[0]?.attach()
       controls.terminalViews[0]?.show(overlapping)
     })
-    expect((await drawn(renderer(opened)))[0]).toBe('abcdef g')
-    opened.mockRestore()
+    expect(drawn()[0]).toBe('abcdef g')
   })
 
   it('warns of cells left blank, rows cut short and a shortened screen', async () => {
@@ -390,7 +289,6 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
   })
 
   it('keeps the last frame while it waits, busy at once and saying so only after a moment', async () => {
-    const opened = vi.spyOn(Terminal.prototype, 'open')
     const { port, controls } = fakeHost()
     open(port)
     await screen.findByTestId('palette-provenance')
@@ -400,14 +298,14 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
     })
     expect(screen.getByTestId('terminal-surface')).toHaveAttribute('aria-busy', 'true')
     expect(position()).not.toBe(WAITING)
-    expect((await drawn(renderer(opened)))[0]).toBe('$ cargo test -p kr-client')
+    expect(drawn()[0]).toBe('$ cargo test -p kr-client')
     await waitFor(
       () => {
         expect(position()).toBe(WAITING)
       },
       { timeout: SLOW_MS * 20 }
     )
-    expect((await drawn(renderer(opened)))[0]).toBe('$ cargo test -p kr-client')
+    expect(drawn()[0]).toBe('$ cargo test -p kr-client')
 
     // The next complete screen replaces the frame, and the words go.
     act(() => {
@@ -415,7 +313,6 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
     })
     expect(position()).not.toBe(WAITING)
     expect(screen.getByTestId('terminal-surface')).toHaveAttribute('aria-busy', 'false')
-    opened.mockRestore()
   })
 
   it('says when the window shows only the top left of the session', async () => {
@@ -431,7 +328,6 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
 
   it('ends with the host words, keeps the last frame, and attaches again when asked', async () => {
     const person = userEvent.setup()
-    const opened = vi.spyOn(Terminal.prototype, 'open')
     const { port, controls } = fakeHost()
     open(port)
     await screen.findByTestId('palette-provenance')
@@ -442,7 +338,7 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
     expect(screen.getByTestId('terminal-ended')).toHaveTextContent('This session has closed.')
     expect(screen.getByTestId('terminal-surface')).toHaveAttribute('aria-busy', 'false')
     expect(screen.queryByTestId('terminal-presentation')).toBeNull()
-    expect((await drawn(renderer(opened)))[0]).toBe('$ cargo test -p kr-client')
+    expect(drawn()[0]).toBe('$ cargo test -p kr-client')
     await new Promise((resolve) => {
       setTimeout(resolve, SLOW_MS * 2)
     })
@@ -454,7 +350,6 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
     })
     expect(await screen.findByText(/declared no terminal profile/)).toBeInTheDocument()
     expect(screen.queryByTestId('terminal-ended')).toBeNull()
-    opened.mockRestore()
   })
 
   it('opens again when the host connection comes back after an open was refused', async () => {
@@ -527,7 +422,6 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
 
   it("never draws a late state of one session in another session's view", async () => {
     const person = userEvent.setup()
-    const opened = vi.spyOn(Terminal.prototype, 'open')
     const { port, controls } = fakeHost()
     open(port, { view: 'sessions' })
     await person.click(await screen.findByTestId('session-row-2'))
@@ -556,7 +450,7 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
       controls.terminalViews[1]?.attach()
       controls.terminalViews[1]?.show()
     })
-    expect((await drawn(renderer(opened)))[0]).toBe('$ pnpm -r build')
+    expect(drawn()[0]).toBe('$ pnpm -r build')
 
     // Session 1's view was closed, and a state it published before the close reached it arrives
     // now: it is session 1's, and it neither draws in session 2's view nor takes the place of what
@@ -569,26 +463,19 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
       })
     })
     await settle()
-    const lines = await drawn(renderer(opened))
+    const lines = drawn()
     expect(lines[0]).toBe('$ pnpm -r build')
     expect(lines.join('')).not.toContain('cargo test')
     expect(presentation()).toContain('declared no terminal profile')
     expect(screen.getByTestId('terminal-size').textContent).toBe('100×4')
-    opened.mockRestore()
   })
 
-  it('draws a query a malformed state carries as marks, and its renderer answers nothing', async () => {
-    const opened = vi.spyOn(Terminal.prototype, 'open')
+  it('draws the queries a malformed state carries as marks', async () => {
     const { port, controls } = fakeHost()
     controls.holdTerminalViews()
     open(port)
     await waitFor(() => {
       expect(controls.terminalViews).toHaveLength(1)
-    })
-    const terminal = renderer(opened)
-    const answered: string[] = []
-    const listening = terminal.onData((data) => {
-      answered.push(data)
     })
     const hostile: TerminalScreen = {
       ...terminalScreen(SESSION_MAIN, { columns: 40, rows: 1 }),
@@ -607,10 +494,7 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
       controls.terminalViews[0]?.attach()
       controls.terminalViews[0]?.show(hostile)
     })
-    expect((await drawn(terminal))[0]).toBe('a\u{fffd}[6n\u{fffd}]11;?\u{fffd}b')
-    expect(answered).toEqual([])
-    listening.dispose()
-    opened.mockRestore()
+    expect(drawn()[0]).toBe('a\u{fffd}[6n\u{fffd}]11;?\u{fffd}b')
   })
 
   it('gives the wheel to the program in control mode, and moves nothing with it in view mode', async () => {

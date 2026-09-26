@@ -283,53 +283,56 @@ function outsideTheRange(declared: Declared[]): Declared[] {
 }
 
 /**
- * Runs in the page. Puts every scrollbar on the terminal's surface through the classes the terminal
- * gives it when it shows the bar and then fades it away, and returns how many bars there are and
- * every transition or animation that started on the surface meanwhile or is still running after.
+ * Runs in the page. Starts recording every transition and animation that starts on the terminal's
+ * surface, into a list the page keeps.
  */
-async function scrollbarMotion(): Promise<{ bars: number; motion: string[] }> {
-  const surface = document.querySelector('[data-testid="terminal-surface"]')
+function startSurfaceRecord(): void {
+  const held = window as unknown as { krSurfaceMotion?: string[]; krSurfaceStop?: () => void }
+  held.krSurfaceStop?.()
   const motion: string[] = []
-  const record = (what: string, target: EventTarget | null): void => {
-    if (target instanceof Element && surface?.contains(target)) {
-      motion.push(`${what} on ${target.className}`)
-    }
-  }
   const started = (event: Event): void => {
+    const surface = document.querySelector('[data-testid="terminal-surface"]')
     const name =
       event instanceof TransitionEvent
         ? event.propertyName
         : (event as AnimationEvent).animationName
-    record(`${event.type} ${name}`, event.target)
+    if (event.target instanceof Element && surface?.contains(event.target)) {
+      motion.push(`${event.type} ${name} on ${event.target.getAttribute('data-testid') ?? event.target.tagName}`)
+    }
   }
-  const frames = (count: number): Promise<void> =>
-    new Promise((resolve) => {
-      const next = (left: number): void => {
-        if (left === 0) resolve()
-        else requestAnimationFrame(() => next(left - 1))
-      }
-      next(count)
-    })
   document.addEventListener('transitionrun', started, true)
   document.addEventListener('animationstart', started, true)
-  const bars = Array.from(surface?.querySelectorAll('.xterm-scrollable-element > .scrollbar') ?? [])
-  // Two frames after each change, so what it started has been started and reported.
-  for (const bar of bars) bar.classList.replace('invisible', 'visible')
-  for (const bar of bars) bar.classList.remove('fade')
-  await frames(2)
-  for (const bar of bars) bar.classList.replace('visible', 'invisible')
-  for (const bar of bars) bar.classList.add('fade')
-  await frames(2)
+  held.krSurfaceMotion = motion
+  held.krSurfaceStop = () => {
+    document.removeEventListener('transitionrun', started, true)
+    document.removeEventListener('animationstart', started, true)
+  }
+}
+
+/**
+ * Runs in the page. Waits two frames, so what was started has been started and reported, then
+ * stops the record and returns it with every animation still running on the surface.
+ */
+async function stopSurfaceRecord(): Promise<string[]> {
+  const held = window as unknown as { krSurfaceMotion?: string[]; krSurfaceStop?: () => void }
+  await new Promise<void>((resolve) => {
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        resolve()
+      })
+    })
+  })
+  const surface = document.querySelector('[data-testid="terminal-surface"]')
+  const motion = [...(held.krSurfaceMotion ?? [])]
   for (const animation of document.getAnimations()) {
     const effect = animation.effect
-    record(
-      `running ${animation.constructor.name}`,
-      effect instanceof KeyframeEffect ? effect.target : null
-    )
+    const target = effect instanceof KeyframeEffect ? effect.target : null
+    if (target instanceof Element && surface?.contains(target)) {
+      motion.push(`running ${animation.constructor.name} on ${target.getAttribute('data-testid') ?? target.tagName}`)
+    }
   }
-  document.removeEventListener('transitionrun', started, true)
-  document.removeEventListener('animationstart', started, true)
-  return { bars: bars.length, motion }
+  held.krSurfaceStop?.()
+  return motion
 }
 
 test.describe('motion', () => {
@@ -395,15 +398,14 @@ test.describe('motion', () => {
   })
 
   // KR-REQ-13.20: in each built bundle, as its page loads it, every transition and animation its
-  // stylesheets declare, the bundled terminal stylesheet's included, lasts 0 or 120 to 200 ms as
-  // the engine reads it, or never reaches an element. A declaration never reaches one when every
-  // selector of its top-level rule is a selector of a top-level rule, in a stylesheet that applies
-  // unconditionally, that declares the same duration important, and it is not important itself;
-  // the declaration that wins instead is important and is measured with the rest. The terminal's
-  // scrollbar fades, 100 ms in and 800 ms out, are the ones the application overrides. The same
-  // reading of a sheet this test adds shows what overrides: a list that names the selector does,
-  // and an override that is not important, sits inside a condition or inside `:not()`, or meets an
-  // important declaration, does not.
+  // stylesheets declare lasts 0 or 120 to 200 ms as the engine reads it, or never reaches an
+  // element. A declaration never reaches one when every selector of its top-level rule is a
+  // selector of a top-level rule, in a stylesheet that applies unconditionally, that declares the
+  // same duration important, and it is not important itself; the declaration that wins instead is
+  // important and is measured with the rest. The bundles carry no stylesheet of their own that the
+  // application overrides. The same reading of a sheet this test adds shows what overrides: a list
+  // that names the selector does, and an override that is not important, sits inside a condition or
+  // inside `:not()`, or meets an important declaration, does not.
   for (const [bundle, address] of [
     ['the harness bundle', '/harness.html'],
     ['the bundle the desktop window loads', DESKTOP_BUNDLE]
@@ -423,10 +425,7 @@ test.describe('motion', () => {
       const overridden = read.declared
         .filter(({ overridden }) => overridden)
         .map(({ where, seconds }) => `${where}: ${JSON.stringify(seconds)}`)
-      expect([...new Set(overridden)], 'what the application overrides').toEqual([
-        '.xterm .xterm-scrollable-element > .visible: [0.1]',
-        '.xterm .xterm-scrollable-element > .invisible.fade: [0.8]'
-      ])
+      expect([...new Set(overridden)], 'what the application overrides').toEqual([])
 
       const before = await page.evaluate(() => document.styleSheets.length)
       await page.addStyleTag({
@@ -456,12 +455,11 @@ test.describe('motion', () => {
     })
   }
 
-  // KR-REQ-13.20: nothing on the terminal's surface animates, with reduced motion or without. The
-  // bundled terminal stylesheet fades the scrollbar in over 100 ms and out over 800 ms; with the
-  // terminal focused, every scrollbar is put through the classes that stylesheet fades between,
-  // and no transition or animation starts anywhere on the surface. The same record, once the
-  // application's override is deleted from the page, sees the fade start, in both settings, so an
-  // empty record is a measurement rather than a record that cannot see.
+  // KR-REQ-13.20: nothing on the terminal's surface animates, with reduced motion or without. While
+  // the session's screen waits and is replaced and the text is made larger and smaller, no
+  // transition or animation starts anywhere on the surface. The same record sees the transition a
+  // style this test adds to the surface's boxes starts, in both settings, so an empty record is a
+  // measurement rather than a record that cannot see.
   test('nothing on the terminal surface animates, with reduced motion or without', async ({
     page
   }) => {
@@ -472,37 +470,35 @@ test.describe('motion', () => {
       await page.getByTestId('session-row-1').click()
       await page.getByRole('tab', { name: 'Terminal' }).click()
       const surface = page.getByTestId('terminal-surface')
-      await surface.locator('.xterm-scrollable-element > .scrollbar').first().waitFor({
-        state: 'attached'
+      await expect(surface).toContainText('cargo test -p kr-client')
+
+      await page.evaluate(startSurfaceRecord)
+      await page.evaluate(() => {
+        window.krTestHost?.terminalViews[0]?.wait()
+        window.krTestHost?.terminalViews[0]?.show()
       })
-      await surface.locator('.xterm-helper-textarea').focus()
+      await page.getByRole('tab', { name: 'View' }).click()
+      await page.getByTestId('zoom-in').click()
+      await page.getByTestId('zoom-out').click()
+      await expect(surface).toContainText('cargo test -p kr-client')
+      const still = await page.evaluate(stopSurfaceRecord)
+      expect(still, `${reducedMotion}: motion on the terminal's surface`).toEqual([])
 
-      const still = await page.evaluate(scrollbarMotion)
-      expect(still.bars, `${reducedMotion}: the terminal has scrollbars`).toBeGreaterThan(0)
-      expect(still.motion, `${reducedMotion}: motion on the terminal's surface`).toEqual([])
-
-      const deleted = await page.evaluate(() => {
-        let count = 0
-        for (const sheet of Array.from(document.styleSheets)) {
-          for (let index = sheet.cssRules.length - 1; index >= 0; index -= 1) {
-            const rule = sheet.cssRules[index]
-            if (
-              rule instanceof CSSStyleRule &&
-              rule.selectorText.includes('.xterm-scrollable-element') &&
-              rule.style.getPropertyPriority('transition-duration') === 'important'
-            ) {
-              sheet.deleteRule(index)
-              count += 1
-            }
-          }
+      await page.addStyleTag({
+        content: '[data-testid="terminal-piece"] { transition: opacity 400ms linear; }'
+      })
+      await page.evaluate(startSurfaceRecord)
+      await page.evaluate(() => {
+        for (const box of Array.from(
+          document.querySelectorAll<HTMLElement>('[data-testid="terminal-piece"]')
+        )) {
+          box.style.opacity = '0.5'
         }
-        return count
       })
-      expect(deleted, `${reducedMotion}: the page carries the override`).toBeGreaterThan(0)
-      const faded = await page.evaluate(scrollbarMotion)
+      const seen = await page.evaluate(stopSurfaceRecord)
       expect(
-        faded.motion.filter((entry) => entry.startsWith('transitionrun opacity')).length,
-        `${reducedMotion}: without the override the bundled fade starts: ${faded.motion.join('; ')}`
+        seen.filter((entry) => entry.startsWith('transitionrun opacity')).length,
+        `${reducedMotion}: the record sees a transition on the surface: ${seen.join('; ')}`
       ).toBeGreaterThan(0)
     }
   })

@@ -415,34 +415,37 @@ test.describe('the raw terminal', () => {
     const terminal = page.getByTestId('raw-terminal')
     await expect(terminal).toBeVisible()
     await expect(page.getByTestId('palette-provenance')).toContainText("the creating terminal's colours")
-    await expect(page.getByTestId('terminal-surface').locator('.xterm')).toBeVisible()
+    await expect(page.getByTestId('terminal-grid')).toBeVisible()
     await expect(page.getByTestId('terminal-surface')).toContainText('cargo test -p kr-client')
     await page.screenshot({ path: shot('terminal-04.04'), fullPage: true })
   })
 
-  test("draws the session's cursor where its screen has it, before anyone clicks into the view", async ({
-    page
-  }) => {
+  test("draws the session's cursor where its screen has it", async ({ page }) => {
     await openSession(page)
     await page.getByRole('tab', { name: 'Terminal' }).click()
     const surface = page.getByTestId('terminal-surface')
     await expect(surface).toContainText('cargo test -p kr-client')
     // The scripted screen's cursor is on its sixth line, just after the prompt's "$ ".
-    await expect(surface.locator('.xterm-cursor')).toHaveCount(1)
-    const line = surface.locator('.xterm-rows > div').nth(5)
-    await expect(line.locator('.xterm-cursor')).toHaveCount(1)
-    const column = await line.evaluate((row) => {
-      let cells = 0
-      for (const child of Array.from(row.children)) {
-        if (child.classList.contains('xterm-cursor')) return cells
-        cells += (child.textContent ?? '').length
+    const cursor = page.getByTestId('terminal-cursor')
+    await expect(cursor).toHaveAttribute('data-shape', 'block')
+    const offsets = await page.evaluate(() => {
+      const grid = document.querySelector<HTMLElement>('[data-testid="terminal-grid"]')
+      const mark = document.querySelector<HTMLElement>('[data-testid="terminal-cursor"]')
+      if (grid === null || mark === null) return null
+      const gridBox = grid.getBoundingClientRect()
+      const markBox = mark.getBoundingClientRect()
+      const cellWidth = gridBox.width / Number(grid.dataset.columns)
+      const cellHeight = gridBox.height / Number(grid.dataset.rows)
+      return {
+        across: Math.abs(markBox.left - gridBox.left - 2 * cellWidth),
+        down: Math.abs(markBox.top - gridBox.top - 5 * cellHeight)
       }
-      return -1
     })
-    expect(column).toBe(2)
+    expect(offsets?.across ?? Number.POSITIVE_INFINITY).toBeLessThan(0.5)
+    expect(offsets?.down ?? Number.POSITIVE_INFINITY).toBeLessThan(0.5)
   })
 
-  test('keeps every piece on its own column in a line of wide, joined and unknown characters', async ({
+  test('draws every piece in a box of its own at its cells, whatever the browser makes of its text', async ({
     page
   }) => {
     await openSession(page)
@@ -473,17 +476,17 @@ test.describe('the raw terminal', () => {
         hyperlink: null
       })
       window.krTestHost?.terminalViews[0]?.show({
-        dimensions: { columns: '16', rows: '1' },
-        window: { columns: 16, rows: 1 },
+        dimensions: { columns: '20', rows: '2' },
+        window: { columns: 20, rows: 2 },
         lines: [
           {
             row: '1',
             soft_wrapped: false,
             truncated: false,
-            // A symbol an older table calls a mark, a mark with nothing before it, a wide
+            // An Arabic symbol an older table calls a mark, a mark with nothing before it, a wide
             // character, an emoji shown as a picture, a man and a joiner then a laptop as native
-            // code places a man technologist, an invisible wide character and a Hebrew letter,
-            // then a bold e the renderer draws in a run of its own.
+            // code places a man technologist, an invisible wide character, a Hebrew letter, a
+            // heart shown as a picture in one cell, and a bold e.
             pieces: [
               at(0, 1, 'x'),
               at(1, 1, '\u{6de}'),
@@ -494,34 +497,52 @@ test.describe('the raw terminal', () => {
               at(9, 2, '\u{1f4bb}'),
               at(11, 2, '\u{4e2d}', false, true),
               at(13, 1, '\u{5e9}'),
-              at(14, 1, 'e', true),
-              at(15, 1, 'y')
+              at(14, 1, '\u{2764}\u{fe0f}'),
+              at(15, 1, 'e', true),
+              at(16, 1, 'y')
             ]
+          },
+          {
+            row: '2',
+            soft_wrapped: false,
+            truncated: false,
+            // Two Arabic semicolons with marks, which a browser lays out right to left when they
+            // share a run, then a bold x.
+            pieces: [at(0, 1, '\u{61b}\u{64b}'), at(1, 1, '\u{61b}\u{64c}'), at(2, 1, 'x', true)]
           }
         ],
         cursor: null
       })
     })
-    const row = surface.locator('.xterm-rows > div').first()
-    await expect(row).toContainText('y')
-    // How far the run holding the bold e starts from fourteen cells right of x, in a renderer
-    // sixteen cells wide. The renderer measures a glyph it has not drawn before after drawing it once and
-    // then draws the line again, so this is read until the line has settled.
-    const offset = () =>
-      row.evaluate((element) => {
-        const screenBox = element.closest('.xterm-screen')?.getBoundingClientRect()
-        const runs = Array.from(element.querySelectorAll('span'))
-        const first = runs.find((run) => (run.textContent ?? '').startsWith('x'))
-        const bold = runs.find((run) => (run.textContent ?? '').startsWith('e'))
-        if (screenBox === undefined || first === undefined || bold === undefined) {
-          return Number.POSITIVE_INFINITY
+    await expect(page.locator('[data-testid="terminal-piece"][data-line="0"][data-column="16"]')).toHaveText('y')
+    // Every box, measured where the browser put it: at its column and line, exactly its cells wide,
+    // and cutting what it holds at its edges.
+    const misplaced = await page.evaluate(() => {
+      const grid = document.querySelector<HTMLElement>('[data-testid="terminal-grid"]')
+      if (grid === null) return ['no grid']
+      const gridBox = grid.getBoundingClientRect()
+      const cellWidth = gridBox.width / Number(grid.dataset.columns)
+      const cellHeight = gridBox.height / Number(grid.dataset.rows)
+      const wrong: string[] = []
+      for (const box of Array.from(grid.querySelectorAll<HTMLElement>('[data-testid="terminal-piece"]'))) {
+        const placed = box.getBoundingClientRect()
+        const column = Number(box.dataset.column)
+        const line = Number(box.dataset.line)
+        const cells = Number(box.dataset.cells)
+        const style = getComputedStyle(box)
+        if (
+          Math.abs(placed.left - gridBox.left - column * cellWidth) > 0.5 ||
+          Math.abs(placed.top - gridBox.top - line * cellHeight) > 0.5 ||
+          Math.abs(placed.width - cells * cellWidth) > 0.5 ||
+          style.overflow !== 'hidden' ||
+          style.unicodeBidi !== 'isolate'
+        ) {
+          wrong.push(`${line}:${column} ${box.textContent ?? ''}`)
         }
-        const cell = screenBox.width / 16
-        return Math.abs(
-          bold.getBoundingClientRect().left - first.getBoundingClientRect().left - 14 * cell
-        )
-      })
-    await expect.poll(offset).toBeLessThan(1)
+      }
+      return wrong
+    })
+    expect(misplaced).toEqual([])
   })
 
   test('reports the same columns when only the height of its surface changes', async ({ page }) => {
@@ -719,8 +740,8 @@ test.describe('how the host presents a raw view', () => {
       .poll(async () => page.evaluate(() => window.krTestHost?.terminalViews[0]?.grids.at(-1)?.columns))
       .toBeLessThan(before?.columns ?? 0)
     // The top-left cell is still the first cell of the session's first line.
-    const firstLine = await surface.locator('.xterm-rows > div').first().textContent()
-    expect(firstLine?.startsWith('$ cargo')).toBe(true)
+    const first = page.locator('[data-testid="terminal-piece"][data-line="0"][data-column="0"]')
+    expect((await first.textContent())?.startsWith('$ cargo')).toBe(true)
 
     // The host's next screen for the smaller grid says how much of the session it shows.
     await page.evaluate(() => {

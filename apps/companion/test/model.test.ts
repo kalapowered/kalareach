@@ -8,7 +8,6 @@ import { describe, expect, it, vi } from 'vitest'
 
 import type { DocumentNode } from '@kalareach/plugin-sdk'
 import type { AttachmentSummary, PresentationReason } from '@kalareach/protocol'
-import type { Terminal } from '@xterm/xterm'
 
 import {
   applyNode,
@@ -46,8 +45,7 @@ import {
 } from '../src/model/receipts'
 import { emptyControlState, evaluate, isRendered, visibilityOf } from '../src/model/controls'
 import { leftBlankOnPhone, stretchesOf, styleOf } from '../src/terminal/cells'
-import { drawableText, frameOf, leftBlank, paint, REPLACEMENT, sgr } from '../src/terminal/frame'
-import { CELL_TABLE, cellsOf, standsAlone } from '../src/terminal/widths'
+import { drawableText, placedCursor, placedPieces, REPLACEMENT } from '../src/terminal/frame'
 import {
   clipping,
   describeProvenance,
@@ -420,45 +418,50 @@ describe('the raw terminal', () => {
     )
   })
 
-  it('writes a rendition as numbers from the plain pen, and never a blink', () => {
-    expect(sgr(PLAIN)).toBe('\u{1b}[0m')
-    expect(
-      sgr({
-        ...PLAIN,
-        bold: true,
-        italic: true,
-        reverse: true,
-        blink: 'rapid',
-        underline: 'curly',
-        underline_colour: { indexed: 9 },
-        foreground: { indexed: 1 },
-        background: { direct: { red: 1, green: 2, blue: 300 } }
-      })
-    ).toBe('\u{1b}[0;1;3;4:3;7;31;48;2;1;2;255;58;5;9m')
-    expect(sgr({ ...PLAIN, foreground: { indexed: 12 }, background: { indexed: 200 } })).toBe(
-      '\u{1b}[0;94;48;5;200m'
-    )
-  })
-
-  it('draws a screen in one write: reset, the normal buffer, autowrap off, each piece placed, the cursor last', () => {
-    const screen = terminalScreen('8a7b6c50-22bb-4c3d-8e4f-000000000102', { columns: 20, rows: 3 })
-    const written = frameOf(screen)
-    expect(written.startsWith('\u{1b}c\u{1b}[?1047l\u{1b}[?7l\u{1b}[?25l')).toBe(true)
-    expect(written).toContain('\u{1b}[1;1H\u{1b}[0m$ pnpm -r build')
-    // A cursor style that would blink is drawn steady.
-    expect(written.endsWith('\u{1b}[3;3H\u{1b}[2 q\u{1b}[?25h')).toBe(true)
-  })
-
-  it('clears the renderer and hides its cursor when there is no screen', () => {
-    const written: string[] = []
-    const renderer = {
-      write: (data: string) => {
-        written.push(data)
-      }
+  it('places each piece at its own cells, leaving out one inside another and cutting one at the edge', () => {
+    const whole = terminalScreen('8a7b6c50-22bb-4c3d-8e4f-000000000101', { columns: 80, rows: 8 })
+    const at = (column: number, cells: number, text: string) => ({
+      column,
+      cells,
+      text,
+      rendition: PLAIN,
+      hyperlink: null
+    })
+    const screen = {
+      ...whole,
+      window: { columns: 8, rows: 2 },
+      lines: [
+        {
+          row: '1',
+          soft_wrapped: false,
+          truncated: false,
+          // Out of order, one inside another, one of no cells and one past the window's edge.
+          pieces: [at(4, 1, '\u{1b}'), at(0, 3, 'abc'), at(2, 1, 'x'), at(3, 0, 'y'), at(6, 5, 'long')]
+        },
+        { row: '2', soft_wrapped: false, truncated: false, pieces: [at(0, 2, '\u{4e2d}')] }
+      ],
+      cursor: null
     }
-    paint(renderer as unknown as Terminal, null)
-    // A reset alone leaves the cursor as the last screen left it, shown over an empty surface.
-    expect(written).toEqual(['\u{1b}c\u{1b}[?25l'])
+    expect(
+      placedPieces(screen).map(({ line, column, cells, text }) => [line, column, cells, text])
+    ).toEqual([
+      [0, 0, 3, 'abc'],
+      [0, 4, 1, REPLACEMENT],
+      [0, 6, 2, 'long'],
+      [1, 0, 2, '\u{4e2d}']
+    ])
+  })
+
+  it('draws the cursor in its steady shape at its cell, and not when it is hidden or outside', () => {
+    const whole = terminalScreen('8a7b6c50-22bb-4c3d-8e4f-000000000101', { columns: 80, rows: 8 })
+    const at = (line: number, column: number, style: number, visible = true) =>
+      placedCursor({ ...whole, cursor: { line, column, style, visible } })
+    expect(at(5, 2, 1)).toEqual({ line: 5, column: 2, shape: 'block' })
+    expect(at(5, 2, 4)?.shape).toBe('underline')
+    expect(at(5, 2, 5)?.shape).toBe('bar')
+    expect(at(5, 2, 1, false)).toBeNull()
+    expect(at(8, 2, 1)).toBeNull()
+    expect(at(0, 80, 1)).toBeNull()
   })
 
   it('says where the palette came from for each of the protocol sources', () => {
@@ -503,119 +506,6 @@ describe('the raw terminal', () => {
     expect(stretchesOf(line).map((stretch) => stretch.column)).toEqual([0, 2, 3, 6])
     // The two drawn as blank cells are counted; the one cut and the one filled are not.
     expect(leftBlankOnPhone({ ...terminalScreen('8a7b6c50-22bb-4c3d-8e4f-000000000101', { columns: 9, rows: 1 }), lines: [line] })).toBe(2)
-  })
-
-  it("measures text in the cells the desktop's renderer gives it", () => {
-    const width = (text: string) => (CELL_TABLE.charProperties(text.codePointAt(0) ?? 0, 0) >> 1) & 3
-    expect(['a', '\u{301}', '\u{4e2d}', '\u{1f44d}', '\u{26a0}', '\u{6de}', '\u{3248}', '\u{e0a0}'].map(width)).toEqual([
-      1, 0, 2, 2, 1, 1, 1, 1
-    ])
-    expect(cellsOf('abc')).toBe(3)
-    // A mark joins the letter before it and takes no cell of its own.
-    expect(cellsOf('e\u{301}')).toBe(1)
-    expect(cellsOf('\u{4e2d}\u{301}')).toBe(2)
-    expect(cellsOf('\u{26a0}\u{fe0f}')).toBe(1)
-    // A mark with nothing before it would be a cell of no width: the text cannot be placed.
-    expect(cellsOf('\u{301}')).toBeNull()
-    expect(cellsOf('\u{301}a')).toBeNull()
-  })
-
-  it('draws only text the browser cannot join to, or reorder with, the text beside it', () => {
-    const alone = [
-      'abc',
-      '\u{e9}',
-      'e\u{301}',
-      '\u{4e2d}\u{6587}',
-      '\u{d55c}',
-      '\u{2014}',
-      '\u{26a0}\u{fe0f}',
-      '\u{1f468}\u{200d}\u{1f4bb}',
-      '\u{1f1ff}\u{1f1e6}'
-    ]
-    expect(alone.filter((text) => !standsAlone(text))).toEqual([])
-    const joining = [
-      // A joiner at the end joins the next cell's character.
-      '\u{1f468}\u{200d}',
-      // A skin tone or a sound mark at the start joins the cell before; one regional indicator
-      // makes a flag with the next.
-      '\u{1f3fb}',
-      '\u{ff9e}',
-      '\u{1f1ff}',
-      // Right-to-left and joining scripts, and characters that change the text's direction.
-      '\u{5e9}',
-      '\u{633}',
-      '\u{915}',
-      'a\u{202e}b',
-      // A jamo that composes with the jamo in the next cell.
-      '\u{1100}'
-    ]
-    expect(joining.filter((text) => standsAlone(text))).toEqual([])
-  })
-
-  it('draws a piece that would join its neighbour, or is invisible, as blank cells', () => {
-    const whole = terminalScreen('8a7b6c50-22bb-4c3d-8e4f-000000000101', { columns: 80, rows: 8 })
-    const at = (column: number, cells: number, text: string, invisible = false) => ({
-      column,
-      cells,
-      text,
-      rendition: { ...PLAIN, invisible },
-      hyperlink: null
-    })
-    const screen = {
-      ...whole,
-      window: { columns: 9, rows: 1 },
-      lines: [
-        {
-          row: '1',
-          soft_wrapped: false,
-          truncated: false,
-          // Native code's placement of a man technologist: the man and the joiner, then the laptop.
-          pieces: [
-            at(0, 2, '\u{1f468}\u{200d}'),
-            at(2, 2, '\u{1f4bb}'),
-            at(4, 2, '\u{4e2d}', true),
-            at(6, 1, 'x')
-          ]
-        }
-      ],
-      cursor: null
-    }
-    const written = frameOf(screen)
-    expect(written).toContain('\u{1b}[1;1H\u{1b}[0m  \u{1b}')
-    expect(written).toContain('\u{1b}[1;3H\u{1b}[0m\u{1f4bb}\u{1b}')
-    expect(written).toContain('\u{1b}[1;5H\u{1b}[0;8m  \u{1b}')
-    // The man is counted as left blank; the invisible character was never going to be seen.
-    expect(leftBlank(screen)).toBe(1)
-  })
-
-  it('draws a piece its text does not fit as blank cells, and counts it', () => {
-    const whole = terminalScreen('8a7b6c50-22bb-4c3d-8e4f-000000000101', { columns: 80, rows: 8 })
-    const at = (column: number, cells: number, text: string) => ({
-      column,
-      cells,
-      text,
-      rendition: PLAIN,
-      hyperlink: null
-    })
-    const screen = {
-      ...whole,
-      window: { columns: 8, rows: 1 },
-      lines: [
-        {
-          row: '1',
-          soft_wrapped: false,
-          truncated: false,
-          pieces: [at(0, 1, '\u{4e2d}'), at(1, 2, 'e\u{301}'), at(3, 1, '\u{301}'), at(4, 2, '\u{4e2d}')]
-        }
-      ],
-      cursor: null
-    }
-    const written = frameOf(screen)
-    expect(written).toContain('\u{1b}[1;1H\u{1b}[0m \u{1b}')
-    expect(written).toContain('\u{1b}[1;2H\u{1b}[0me\u{301} \u{1b}')
-    expect(written).toContain('\u{1b}[1;4H\u{1b}[0m \u{1b}')
-    expect(written).toContain('\u{1b}[1;5H\u{1b}[0m\u{4e2d}\u{1b}')
-    expect(leftBlank(screen)).toBe(2)
   })
 
   it('draws an underline on a phone in its own style and colour', () => {
