@@ -1384,8 +1384,6 @@ async fn accepted_enrolment_budgets_survive_a_restart_over_a_document_that_decid
     );
     let document = kr_worker::config::document_path(host.controller().paths());
     let accepted = std::fs::read(&document).expect("the document this host wrote");
-    let elsewhere = host.work().join("elsewhere.json");
-    std::fs::write(&elsewhere, &accepted).expect("written");
 
     for state in [
         DocumentState::Absent,
@@ -1395,8 +1393,12 @@ async fn accepted_enrolment_budgets_survive_a_restart_over_a_document_that_decid
     ] {
         let _ = std::fs::remove_file(&document);
         match state {
+            // Larger than the bound a read takes, which no platform reads.
             DocumentState::Unreadable => {
-                std::os::unix::fs::symlink(&elsewhere, &document).expect("a link");
+                let bound = usize::try_from(kr_protocol::hostinfo::configuration::MAX_LEN)
+                    .expect("a bound that fits");
+                kr_ipc::paths::write_owner_only_file(&document, &vec![b' '; bound + 1])
+                    .expect("written");
             }
             DocumentState::UnknownVersion | DocumentState::Invalid => {
                 let mut edited: serde_json::Value =
