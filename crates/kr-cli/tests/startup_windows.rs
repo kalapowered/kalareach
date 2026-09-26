@@ -888,6 +888,34 @@ fn three_first_invocations_at_once_leave_one_daemon_that_serves_every_caller() {
     }
 }
 
+/// KR-REQ-07.12: a log that has grown past its limit is emptied, through the handle `kr new` checked,
+/// before the task is asked for anything, and the start goes on: here the task is not registered,
+/// which is the failure `kr new` gives, and the log is empty.
+#[test]
+fn a_log_grown_past_its_limit_is_emptied_before_the_task_is_asked() {
+    let host = Host::create();
+    let _task = host.removes_its_task();
+    host.choose("standalone");
+    let log = host.environment().state_dir().join("controller.log");
+    kr_ipc::paths::write_owner_only_file(&log, &vec![b'x'; 2 * 1024 * 1024])
+        .expect("a log past its limit");
+    let output = finish(host.new_session().spawn().expect("kr new"), "kr new");
+    let failed = document(&output, "kr new");
+    assert_eq!(failed["code"], "HOST_NOT_CONFIGURED", "{failed}");
+    assert!(
+        failed["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("is not registered"),
+        "{failed}"
+    );
+    assert_eq!(
+        std::fs::metadata(&log).expect("the log").len(),
+        0,
+        "the log was emptied"
+    );
+}
+
 /// The variable that makes the helper test below act, naming the `kr` it runs.
 const HELPER: &str = "KR_STARTUP_TEST_KR";
 
