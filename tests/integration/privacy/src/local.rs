@@ -20,6 +20,7 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use base64::Engine as _;
 use kr_client::services::ServiceFuture;
@@ -58,8 +59,14 @@ impl fmt::Debug for LocalStack {
     }
 }
 
-/// One answer from an account route: the status and the envelope.
-#[derive(Clone, Debug, PartialEq)]
+/// How long one request to an account route may take, from connecting to the last byte.
+const REQUEST_DEADLINE: Duration = Duration::from_secs(30);
+
+/// How long connecting to the deployment may take.
+const CONNECT_DEADLINE: Duration = Duration::from_secs(10);
+
+/// One answer from an account or gateway route: the status and the envelope.
+#[derive(Clone, PartialEq)]
 pub struct Answer {
     /// The HTTP status.
     pub status: u16,
@@ -72,6 +79,24 @@ impl Answer {
     #[must_use]
     pub fn code(&self) -> Option<&str> {
         self.body["error"]["code"].as_str()
+    }
+}
+
+impl fmt::Debug for Answer {
+    /// The status, a refusal's code and message, and the names of what a success carries. Never a
+    /// value it carries: a gateway's answer to an authorisation holds the delivery credential.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let carries: Vec<&str> = self.body["data"]
+            .as_object()
+            .map(|data| data.keys().map(String::as_str).collect())
+            .unwrap_or_default();
+        formatter
+            .debug_struct("Answer")
+            .field("status", &self.status)
+            .field("code", &self.code())
+            .field("message", &self.body["error"]["message"].as_str())
+            .field("carries", &carries)
+            .finish()
     }
 }
 
@@ -146,6 +171,9 @@ impl LocalStack {
             .redirect(reqwest::redirect::Policy::none())
             // Loopback, always, whatever proxy this machine's environment names.
             .no_proxy()
+            // A deployment that stops answering ends the leg rather than holding it for ever.
+            .connect_timeout(CONNECT_DEADLINE)
+            .timeout(REQUEST_DEADLINE)
             .build()
             .expect("an HTTP client");
         Some(Self {
