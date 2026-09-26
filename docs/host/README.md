@@ -1769,7 +1769,14 @@ much it withheld, and an approval's record from before that moment is answered a
 host does not hold, unless the grant names that approval and it can still be decided. A worker says
 in its answer to the daemon's hello that it reads such a scope, one that names approvals by the
 broker's resource identity, and one that does not say so is sent none and refuses both reads
-itself. `grant.list` answers with
+itself. `events.subscribe` and `events.snapshot` go to the worker with the same scope, and the
+worker holds the resources the broker arbitrates to it by the rule the approval record follows: a
+snapshot, every page of it, carries an approval the grant names while it can still be decided, and
+any other resource only when it was recorded at or after the moment the grant reaches back to; a
+subscription is told a later transition only of a resource it was shown or of one that rule admits.
+A grant that keeps no retained history reaches, beside what it names, what is recorded after the
+device's first subscription of that attachment began. The local owner, and a read that comes with
+no scope, are shown every resource and every transition. `grant.list` answers with
 the grants the device issued and everything delegated from them, and it needs `session.share`.
 
 Four reads are refused as `UNSUPPORTED_CAPABILITY`, with the read and the reason in the message:
@@ -4180,6 +4187,20 @@ order the broker committed it: what changed, what it became, whether its record 
 binding revision it changed under, its place in the broker's stream and the event before it. It
 carries no output, so it costs no view its queue and never touches the screen. A consumer that
 wants to replay what it missed reads the outbox rather than the live stream.
+
+A view whose subscription came with a grant's history scope, a paired device's, is told only what
+that scope reaches, by the rule its snapshot was cut by, and each transition is decided before
+anything is queued for the view, so the notifications it is sent are numbered without gaps. A
+transition at or below the snapshot's position is already in the snapshot and is dropped, whatever
+it says. After that, a transition reaches the view when its resource is one the view was shown, so
+the end of an approval it was shown reaches it, or when the rule admits the resource as the broker
+holds it when the transition arrives, which adds the resource to what the view was shown: a request
+is decided as an approval once a decoder has interpreted it. A transition whose resource the broker
+cannot read reaches only a view that was shown it, and one of another run of the stream is decided
+by the rule alone. A resource the scope does not reach is absent from the pages and the stream
+alike, as a resource the host does not hold, and nothing counts what was withheld. A fresh snapshot
+on the same connection replaces the position and what the view was shown, and keeps the moment the
+attachment's first such subscription began.
 
 ## Reverse operations
 
