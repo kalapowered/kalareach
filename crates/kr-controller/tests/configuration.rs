@@ -1358,6 +1358,99 @@ async fn a_document_this_build_cannot_use_keeps_the_ceiling_and_reports_it() {
     host.stop().await;
 }
 
+/// The enrolment budgets this host accepted stay in force across a restart over a document that
+/// decides nothing (absent, unreadable, of an unknown version, invalid), and the report prints the
+/// budgets in force with why they are not the document's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn accepted_enrolment_budgets_survive_a_restart_over_a_document_that_decides_nothing() {
+    const MIB: u64 = 1024 * 1024;
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let mut host = Host::start(&owner).await;
+    host.controller()
+        .apply_configuration(&Change::Enrolment(
+            kr_protocol::hostinfo::configuration::ConfiguredEnrolmentBudgets {
+                metadata_bytes: Nullable::some(MIB),
+                ..Default::default()
+            },
+        ))
+        .await
+        .expect("the owner's budget");
+    assert_eq!(
+        host.controller()
+            .catalogue()
+            .budgets_in_force()
+            .metadata_bytes,
+        MIB
+    );
+    let document = kr_worker::config::document_path(host.controller().paths());
+    let accepted = std::fs::read(&document).expect("the document this host wrote");
+    let elsewhere = host.work().join("elsewhere.json");
+    std::fs::write(&elsewhere, &accepted).expect("written");
+
+    for state in [
+        DocumentState::Absent,
+        DocumentState::Unreadable,
+        DocumentState::UnknownVersion,
+        DocumentState::Invalid,
+    ] {
+        let _ = std::fs::remove_file(&document);
+        match state {
+            DocumentState::Unreadable => {
+                std::os::unix::fs::symlink(&elsewhere, &document).expect("a link");
+            }
+            DocumentState::UnknownVersion | DocumentState::Invalid => {
+                let mut edited: serde_json::Value =
+                    serde_json::from_slice(&accepted).expect("valid JSON");
+                if state == DocumentState::UnknownVersion {
+                    edited["version"] = serde_json::json!(u64::from(u32::MAX));
+                } else {
+                    edited["not_a_member"] = serde_json::json!(1);
+                }
+                kr_ipc::paths::write_owner_only_file(
+                    &document,
+                    serde_json::to_string(&edited).expect("JSON").as_bytes(),
+                )
+                .expect("written");
+            }
+            _ => {}
+        }
+        host = host.restart().await;
+        let controller = host.controller();
+        assert_eq!(
+            controller.catalogue().budgets_in_force().metadata_bytes,
+            MIB,
+            "{state:?}: the budget this host accepted is still in force"
+        );
+        let effective = controller.effective_configuration().await;
+        assert_eq!(effective.status.state, state);
+        let ceiling = effective
+            .ceilings
+            .iter()
+            .find(|ceiling| ceiling.key == "enrolment")
+            .expect("the enrolment ceiling");
+        assert!(
+            ceiling
+                .value
+                .as_str()
+                .starts_with(&format!("{MIB} metadata bytes")),
+            "{state:?}: the report prints the budgets in force: {ceiling:?}"
+        );
+        assert!(
+            ceiling
+                .narrowed_by
+                .as_ref()
+                .is_some_and(|why| why.as_str().contains("last accepted")),
+            "{state:?}: and says why: {ceiling:?}"
+        );
+        assert_eq!(
+            controller.catalogue().budgets_in_force().metadata_bytes,
+            MIB,
+            "{state:?}: and acceptance kept it"
+        );
+    }
+    host.stop().await;
+}
+
 /// KR-REQ-26.16: a grant ceiling edited outside this daemon fences dispatch, and a profile edited
 /// outside it invalidates the evidence taken under the old one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

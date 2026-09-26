@@ -94,6 +94,8 @@ pub struct Accepted {
     pub resolver: Resolver,
     /// The session number admission enforces.
     pub sessions: Enforced,
+    /// The enrolment budgets the catalogue enforces.
+    pub budgets: EnforcedBudgets,
     /// What this document owed beyond the registry write.
     pub owed: configuration::Owed,
     /// The fence this acceptance raised, when the document's authority ceiling moved.
@@ -197,9 +199,20 @@ impl Accepted {
             ceiling: ceilings::configured_rights(&resolver.ceilings()),
             from_document: resolver.loaded().document.is_some(),
         };
+        let budgets = catalogue::budgets_in_force(&resolver).map_or(
+            EnforcedBudgets {
+                value: configuration::EnrolmentBudgets::default(),
+                from_document: false,
+            },
+            |value| EnforcedBudgets {
+                value,
+                from_document: true,
+            },
+        );
         Self {
             resolver,
             sessions,
+            budgets,
             owed: configuration::Owed::default(),
             barrier: None,
             fence_owed: None,
@@ -221,6 +234,16 @@ pub struct Enforced {
     /// leave the restriction the owner accepted exactly where it was, and then this is false and
     /// the number is the retained one. Reporting the product default in that case would print a
     /// number nothing is enforcing.
+    pub from_document: bool,
+}
+
+/// The enrolment budgets the catalogue enforces, and where they came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EnforcedBudgets {
+    /// The budgets each enrolment and synchronisation is held to right now.
+    pub value: configuration::EnrolmentBudgets,
+    /// True when the document this report describes decided them. A document that decided
+    /// nothing leaves the budgets the owner accepted where they were, and then this is false.
     pub from_document: bool,
 }
 
@@ -479,7 +502,7 @@ pub fn effective(
         ceilings::session_limit(&ceilings, limits),
         accepted.sessions,
     );
-    let enrolment = ceilings::enrolment(&ceilings);
+    let enrolment = ceilings::enforced_budgets(ceilings::enrolment(&ceilings), accepted.budgets);
 
     let doc_path = resolver.document().display().to_string();
     let (session_source, session_origin) = if !accepted.sessions.from_document {
@@ -511,12 +534,25 @@ pub fn effective(
         .as_ref()
         .map(configuration::ConfiguredEnrolmentBudgets::supplied)
         .unwrap_or_default();
-    let enrolment_source = if supplied_budgets.is_empty() {
-        configuration::ValueSource::Default
+    // Where this reading decided nothing, the budgets in force are the ones this host last
+    // accepted, and no document in front of this report is their origin.
+    let (enrolment_source, enrolment_origin) = if !accepted.budgets.from_document {
+        (
+            if enrolment.value == configuration::EnrolmentBudgets::default() {
+                configuration::ValueSource::Default
+            } else {
+                configuration::ValueSource::HostConfiguration
+            },
+            None,
+        )
+    } else if supplied_budgets.is_empty() {
+        (configuration::ValueSource::Default, None)
     } else {
-        configuration::ValueSource::HostConfiguration
+        (
+            configuration::ValueSource::HostConfiguration,
+            Some(doc_path.clone()),
+        )
     };
-    let enrolment_origin = (!supplied_budgets.is_empty()).then(|| doc_path.clone());
 
     // What the document asks for, and the ceiling a paired device's request is decided against.
     // They are the same on an ordinary host. Where this reading decided nothing - no document, one

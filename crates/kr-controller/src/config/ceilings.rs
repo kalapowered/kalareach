@@ -152,6 +152,29 @@ pub fn enforced(intersected: Ceiling<u64>, sessions: crate::config::Enforced) ->
     }
 }
 
+/// Replaces the enrolment budgets a document asks for with the budgets in force, where this
+/// reading did not decide them, as [`enforced`] does for the session number.
+#[must_use]
+pub fn enforced_budgets(
+    intersected: Ceiling<EnrolmentBudgets>,
+    budgets: crate::config::EnforcedBudgets,
+) -> Ceiling<EnrolmentBudgets> {
+    if budgets.from_document {
+        return intersected;
+    }
+    Ceiling {
+        configured: intersected.configured,
+        value: budgets.value,
+        narrowed_by: (budgets.value != EnrolmentBudgets::default()).then(|| {
+            Sentence::new().stated(
+                "this host is still enforcing the budgets it last accepted, because this document \
+                 did not decide them",
+            )
+        }),
+        refused: false,
+    }
+}
+
 /// Returns the configured grant-rights ceiling, when the document sets one.
 ///
 /// A right this build does not know is dropped rather than refused. Validation has already

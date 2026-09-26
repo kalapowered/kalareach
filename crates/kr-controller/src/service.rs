@@ -1019,6 +1019,11 @@ impl Controller {
         let rights_ceiling = accepted_document
             .as_ref()
             .and_then(|document| crate::config::ceilings::configured_rights(&document.ceilings));
+        // So are the enrolment budgets it accepted. A startup reading that loaded a document
+        // replaces them below, by the session number's rule; one that decided nothing leaves them.
+        let accepted_budgets = accepted_document
+            .as_ref()
+            .map(|document| crate::config::catalogue::budgets(&document.ceilings));
         let mut accepted_configuration = crate::config::AcceptedState {
             revision: durably_accepted.revision,
             document: accepted_document,
@@ -1058,7 +1063,7 @@ impl Controller {
             Self::proxy_of(&started)?.as_ref(),
             Arc::clone(&plugin_bridge) as Arc<dyn kr_plugin_catalogue::BrokerBridge>,
         )?);
-        if let Some(budgets) = startup_budgets {
+        if let Some(budgets) = startup_budgets.or(accepted_budgets) {
             catalogue.put_budgets_in_force(budgets);
         }
         // The change-set service reads every repository through the project service's own opened
@@ -3793,6 +3798,13 @@ impl Controller {
     #[must_use]
     pub const fn paths(&self) -> &EnvironmentPaths {
         &self.paths
+    }
+
+    /// Returns the catalogue module, for tests that read what it holds in force.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn catalogue(&self) -> &crate::catalogue::CatalogueModule {
+        &self.catalogue
     }
 
     /// Returns which store this daemon keeps its keys in.
@@ -7509,9 +7521,19 @@ impl Controller {
             crate::config::InForce::of(&resolver);
         // The enrolment budgets the catalogue acts on, by the session number's rule: this reading
         // decides them when it loaded a document, and leaves them as they are when it did not.
-        if let Some(budgets) = crate::config::catalogue::budgets_in_force(&resolver) {
-            self.catalogue.put_budgets_in_force(budgets);
-        }
+        let budgets = match crate::config::catalogue::budgets_in_force(&resolver) {
+            Some(budgets) => {
+                self.catalogue.put_budgets_in_force(budgets);
+                crate::config::EnforcedBudgets {
+                    value: budgets,
+                    from_document: true,
+                }
+            }
+            None => crate::config::EnforcedBudgets {
+                value: self.catalogue.budgets_in_force(),
+                from_document: false,
+            },
+        };
         // The rights ceiling a paired device's request is decided against, from this reading when
         // it produced a document and as it was when it did not. Before the fence below, so a
         // narrower ceiling decides every request from here on while the work admitted under the
@@ -7732,6 +7754,7 @@ impl Controller {
         crate::config::Accepted {
             resolver,
             sessions,
+            budgets,
             owed,
             barrier,
             fence_owed,
@@ -8242,7 +8265,7 @@ impl Controller {
         // above because those are about whether this host is working; these are about what it is
         // working from.
         // The budgets the catalogue acts on, which the acceptance above put in force.
-        let budgets = self.catalogue.budgets_in_force();
+        let budgets = accepted.budgets.value;
         let effective = self.report_configuration(&accepted).await;
         // What the running network and voice services are doing, read from them, against what
         // the same reading of the document selects, so an edit that applies at the next start
