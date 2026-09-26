@@ -4,8 +4,7 @@
 //! ([`crate::agent_tools`]) and the native bridge recipes the catalogue applies. What both need
 //! lives here, once: a replacement that cannot leave a document truncated and keeps who can read
 //! it, the refusal to replace a document whose access controls the replacement would not carry,
-//! the refusal on the platform where this host cannot read those lists, the durable directory
-//! entries, and the digests a change is recorded by.
+//! the durable directory entries, and the digests a change is recorded by.
 
 use std::path::{Path, PathBuf};
 
@@ -32,32 +31,6 @@ pub(crate) fn create_directory_durably(path: &Path) -> Result<bool> {
         }
     }
     Ok(created)
-}
-
-/// Refuses a change to another program's files on a platform where this host cannot check that a
-/// replacement keeps who may read the file it replaces.
-///
-/// Every file an installer here rewrites, its own record included, is replaced by a new file
-/// renamed over it, and the new file carries whatever access-control list its directory gives it.
-/// Before one takes an existing file's place this host compares the two, and it reads those lists
-/// on macOS and Linux only (see [`guard_access_controls`] and [`write_atomically`]). Windows gives
-/// every file a list, so there every replacement would be refused, the first of them part way
-/// through, once the installation's record had been written. Rather than begin a change it would
-/// have to abandon, this host makes none on Windows. `change` says what is refused and `instead`
-/// what to do about it, in the caller's own words.
-pub(crate) fn supported_platform(change: &str, instead: &str) -> Result<()> {
-    // A compile-time value rather than a conditional body, so both answers are checked on every
-    // platform this crate builds for.
-    if cfg!(windows) {
-        return Err(ControllerError::PermissionDenied {
-            detail: format!(
-                "this host does not {change} on Windows, because it does not read access-control \
-                 lists there and so cannot tell whether replacing a file would change who can read \
-                 it; {instead}"
-            ),
-        });
-    }
-    Ok(())
 }
 
 /// Refuses to replace a document whose protection this host cannot carry across.
@@ -438,6 +411,23 @@ pub(crate) fn home_directory() -> Option<PathBuf> {
 mod tests {
     use super::*;
 
+    /// A document is replaced whole and nothing is left beside it, on every platform: a copy made
+    /// in the document's own directory keeps who can read it, so the check at the replacement
+    /// lets it take the document's place.
+    #[test]
+    fn a_document_is_replaced_whole_and_nothing_is_left_beside_it() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let document = directory.path().join("settings.json");
+        write_atomically(&document, b"first", PRIVATE).expect("creates it");
+        write_atomically(&document, b"second", PRIVATE).expect("replaces it");
+        assert_eq!(std::fs::read(&document).expect("reads it"), b"second");
+        let names: Vec<_> = std::fs::read_dir(directory.path())
+            .expect("lists the directory")
+            .map(|entry| entry.expect("an entry").file_name())
+            .collect();
+        assert_eq!(names, ["settings.json"], "no copy is left beside it");
+    }
+
     /// The Linux probe's answers, including the one that is not an answer.
     #[cfg(target_os = "linux")]
     #[test]
@@ -448,24 +438,6 @@ mod tests {
         // An NFSv4 share keeps its list somewhere this probe cannot see and refuses the question.
         // A refusal to answer is not an answer of "none".
         assert!(interpret_probe(Err(rustix::io::Errno::NOTSUP)).is_err());
-    }
-
-    /// The refusal names what is refused and what to do instead, and only where it applies.
-    #[test]
-    fn the_platform_guard_refuses_on_windows_alone() {
-        let answer = supported_platform("change this", "do that instead");
-        if cfg!(windows) {
-            let refused = answer.expect_err("refuses");
-            assert!(
-                matches!(refused, ControllerError::PermissionDenied { ref detail }
-                    if detail.contains("does not change this on Windows")
-                        && detail.contains("does not read access-control lists")
-                        && detail.ends_with("do that instead")),
-                "{refused:?}"
-            );
-        } else {
-            answer.expect("changes are made here");
-        }
     }
 
     /// A read of a file's access that failed is a storage failure, and a control the reader does

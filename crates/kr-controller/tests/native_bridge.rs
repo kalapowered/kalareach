@@ -688,6 +688,36 @@ fn a_package_file_that_is_not_what_the_recipe_names_is_refused() {
     assert_eq!(site.tree(), before);
 }
 
+/// On Windows the host changes no application's directory. Each reconciliation refuses before
+/// anything is written there and records why in the package's journal, and every one after the
+/// first replaces that journal with a copy compared with it, leaving nothing else beside it.
+#[cfg(windows)]
+#[test]
+fn on_windows_a_recipe_is_refused_and_recorded_at_every_reconciliation() {
+    let site = Site::new();
+    let before = site.tree();
+    let bridges = site.bridges();
+
+    for _ in 0..3 {
+        let settled = bridges
+            .reconcile(&plugin(), Some(&site.release()))
+            .expect("the refusal is recorded");
+        assert!(
+            refused(&settled).contains("does not apply or remove a native bridge on Windows"),
+            "{settled:?}"
+        );
+        assert_eq!(site.tree(), before, "nothing was written");
+    }
+    let reports = bridges.reports().expect("reads");
+    assert_eq!(reports.len(), 1, "{reports:?}");
+    assert_eq!(reports[0].state, "refused", "{reports:?}");
+    let journals: Vec<_> = std::fs::read_dir(site.root.join("state/native-bridges"))
+        .expect("the journals")
+        .map(|entry| entry.expect("an entry").file_name())
+        .collect();
+    assert_eq!(journals.len(), 1, "one journal and no copy: {journals:?}");
+}
+
 // ---------------------------------------------------------------------------------------------
 // What protects the application's directory
 // ---------------------------------------------------------------------------------------------
