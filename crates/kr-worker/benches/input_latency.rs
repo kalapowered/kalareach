@@ -484,10 +484,10 @@ fn added_input_forwarding_latency() {
     let outcome = runtime.block_on(measure_latency());
     let (samples, closed) = outcome;
     // The measurement first, because a failure in it is the interesting one and the closure has
-    // already been performed by the time either is looked at.
+    // already been performed by the time either is looked at. The figure is kept before the
+    // closure's outcome is, so a completed measurement is recorded whatever the closure did.
     let (samples, conditions) =
         samples.unwrap_or_else(|failure| panic!("the measurement: {failure}"));
-    closed.unwrap_or_else(|failure| panic!("the sessions this measurement created: {failure}"));
 
     let p95 = percentile(&samples, 0.95);
     let p99 = percentile(&samples, 0.99);
@@ -528,6 +528,7 @@ fn added_input_forwarding_latency() {
         "KR-PERF-001 added local input forwarding latency",
         &lines,
     );
+    closed.unwrap_or_else(|failure| panic!("the sessions this measurement created: {failure}"));
     assert!(
         p95 < P95_BOUND,
         "the ninety-fifth percentile is within {P95_BOUND:?}: {p95:?}"
@@ -765,8 +766,8 @@ fn paste_prefix_recogniser_deadline() {
         .build()
         .expect("a runtime");
     let (report, closed) = runtime.block_on(measure_recogniser());
+    // The figure is kept before the closure's outcome is, as above.
     let report = report.unwrap_or_else(|failure| panic!("the measurement: {failure}"));
-    closed.unwrap_or_else(|failure| panic!("the session this measurement created: {failure}"));
 
     let allowed = RECOGNISER_DEADLINE + RECOGNISER_TOLERANCE;
     let mut lines = report.conditions.lines();
@@ -825,6 +826,7 @@ fn paste_prefix_recogniser_deadline() {
         "KR-PERF-002 recogniser deadline for a held prefix",
         &lines,
     );
+    closed.unwrap_or_else(|failure| panic!("the session this measurement created: {failure}"));
     // The requirement's own bound, on the deadline this host is built with. It is asserted here
     // rather than inferred from a figure, because a measurement with an allowance around it cannot
     // tell a twenty-five millisecond deadline from a thirty-five millisecond one.
