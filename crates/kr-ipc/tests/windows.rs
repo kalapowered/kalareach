@@ -1215,12 +1215,15 @@ public static class KrSecondAccount
         Start-Sleep -Seconds 5
         $server.Dispose()
     } else {
+        # The byte is written under the second account's token too: a client that sets no quality
+        # of service has its context taken at each write, so a byte written under this account's
+        # own token would rightly be read as this account's.
         $client = [System.IO.Pipes.NamedPipeClientStream]::new('.', $Name, 'InOut', 'Asynchronous')
         [System.Security.Principal.WindowsIdentity]::RunImpersonated($token, [Action]{
             $client.Connect(30000)
+            $client.WriteByte(1)
+            $client.Flush()
         })
-        $client.WriteByte(1)
-        $client.Flush()
         Add-Content -Path $Status -Value 'connected'
         if ($Role -eq 'client-exit') { exit 0 }
         $buffer = New-Object byte[] 16
@@ -1263,6 +1266,28 @@ fn wait_for_line(path: &Path, token: &str) {
         assert!(
             Instant::now() < deadline,
             "waited for '{token}' in {}; it held:\n{text}",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Waits until `path` holds a line starting with `prefix`, and returns that line, or fails after
+/// [`PATIENCE`] with what it held.
+fn wait_for_prefix(path: &Path, prefix: &str) -> String {
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        if let Some(line) = text.lines().find(|line| line.starts_with(prefix)) {
+            return line.trim().to_owned();
+        }
+        assert!(
+            !text.lines().any(|line| line.starts_with("error=")),
+            "the helper failed while waiting for '{prefix}':\n{text}"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "waited for '{prefix}' in {}; it held:\n{text}",
             path.display()
         );
         std::thread::sleep(Duration::from_millis(100));
@@ -1330,10 +1355,14 @@ async fn a_client_refuses_a_server_of_another_account_and_the_host_bind_fails() 
     let mut helper = start_as_second(&host, "server", &endpoint.as_text(), &status);
     waited_for(&status, "ready").await;
 
-    // The host cannot take a name another account already holds, so it does not start on it.
+    // The host cannot take a name another account already holds, so it does not start on it, and it
+    // says the name is held rather than giving a bare access denial.
+    let refused = Listener::bind(&endpoint)
+        .expect_err("the host does not bind a name another account holds")
+        .to_string();
     assert!(
-        Listener::bind(&endpoint).is_err(),
-        "the host does not bind a name another account holds"
+        refused.contains("the name is held by another pipe"),
+        "the host says the name is held: {refused}"
     );
 
     // The client reads the pipe's owner and refuses it before it writes a frame, naming that owner.
@@ -1491,11 +1520,22 @@ try {
     Add-Content -Path $Status -Value 'ready'
     $server.WaitForConnection()
     [void]$server.ReadByte()
-    $level = 'unknown'
-    $server.RunAsClient({
-        $level = [System.Security.Principal.WindowsIdentity]::GetCurrent($true).ImpersonationLevel
-        Set-Variable -Name level -Value $level -Scope 1
-    })
+    # Read in compiled code: while it runs as an identification-only client, PowerShell itself could
+    # not load a command from disk.
+    Add-Type -TypeDefinition @'
+using System.IO.Pipes;
+using System.Security.Principal;
+public static class KrClientLevel
+{
+    public static string Of(NamedPipeServerStream server)
+    {
+        string level = "unknown";
+        server.RunAsClient(() => { level = WindowsIdentity.GetCurrent(true).ImpersonationLevel.ToString(); });
+        return level;
+    }
+}
+'@
+    $level = [KrClientLevel]::Of($server)
     Add-Content -Path $Status -Value ('level=' + $level)
     $server.Dispose()
 } catch {
@@ -1526,7 +1566,16 @@ async fn the_client_lets_a_server_identify_it_but_never_act_as_it() {
         .await
         .expect("the client reaches a pipe of its own account");
     client.write_all(&[1]).await.expect("the client speaks");
-    waited_for(&status, "level=Identification").await;
+    let level = tokio::task::spawn_blocking({
+        let status = status.clone();
+        move || wait_for_prefix(&status, "level=")
+    })
+    .await
+    .expect("the wait finishes");
+    assert_eq!(
+        level, "level=Identification",
+        "the server may identify the client and nothing more"
+    );
     let _ = child.wait();
 }
 
