@@ -953,11 +953,12 @@ fn read_at(file: &std::fs::File, buffer: &mut [u8], offset: u64) -> std::io::Res
 
 #[cfg(windows)]
 impl Log {
-    /// Opens the log for appending and reading, never through a link, and takes it only when it is
-    /// a regular file whose list grants no account this host does not trust: the same opening the
-    /// starter gives the daemon.
+    /// Opens the log for reading and emptying, never through a link, and takes it only when it is
+    /// a regular file whose list grants no account this host does not trust: the checks the
+    /// starter makes when it opens the log for the daemon to append to.
     fn open(path: &std::path::Path) -> Result<Self> {
-        let file = kr_ipc::starter::open_log(path).map_err(|error| match error {
+        let file = kr_ipc::starter::open_log(path, kr_ipc::starter::LogAccess::ReadAndTruncate)
+            .map_err(|error| match error {
             kr_ipc::IpcError::UntrustedFile { .. } => CliError::HostUnavailable(shown!(
                 "{} is not a file of this user's that only this user can read and write, so the \
                  control daemon's output is not written to it; remove it and run kr new again",

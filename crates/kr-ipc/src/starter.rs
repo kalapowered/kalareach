@@ -348,9 +348,9 @@ pub fn clear_recorded_session(environment: &EnvironmentPaths) -> Result<()> {
 
 #[cfg(windows)]
 pub use self::windows::{
-    ChildCommand, ChildRefusal, LaunchListener, LaunchStream, MAX_LAUNCH_FRAME, NamedLock,
-    PeerProcess, Reached, StartedChild, account_sid, connect, current_session, current_user_sid,
-    in_any_job, open_log, pipe_client_is_this_user, process_facts, start_child,
+    ChildCommand, ChildRefusal, LaunchListener, LaunchStream, LogAccess, MAX_LAUNCH_FRAME,
+    NamedLock, PeerProcess, Reached, StartedChild, account_sid, connect, current_session,
+    current_user_sid, in_any_job, open_log, pipe_client_is_this_user, process_facts, start_child,
 };
 
 #[cfg(all(windows, any(test, feature = "testing")))]
@@ -974,9 +974,21 @@ mod windows {
         Ok(written)
     }
 
-    /// Opens the environment's daemon log for appending and reading, creating it where it is
-    /// absent, and takes it only when it is a regular file whose access-control list grants no
-    /// account this host does not trust.
+    /// What the environment's daemon log is opened for.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum LogAccess {
+        /// Appending, for the daemon's output: every write lands at the file's end, wherever
+        /// another handle has left it.
+        Append,
+        /// Reading and truncating, for the command that starts the daemon, which reads what the
+        /// start wrote and empties the log once it has grown too large. Truncating needs the right
+        /// to write the file's data, which a handle opened for appending lacks.
+        ReadAndTruncate,
+    }
+
+    /// Opens the environment's daemon log for `access`, creating it where it is absent, and takes
+    /// it only when it is a regular file whose access-control list grants no account this host
+    /// does not trust.
     ///
     /// It is opened without following a reparse point, so a link planted under its name opens as
     /// the link and is refused rather than written through. A file created here carries the list
@@ -987,7 +999,7 @@ mod windows {
     /// Returns [`IpcError::UntrustedFile`](crate::IpcError::UntrustedFile) for a link, something
     /// other than a regular file, or a list that grants another account, and an I/O failure when
     /// it cannot be opened or its list cannot be read.
-    pub fn open_log(path: &Path) -> crate::Result<std::fs::File> {
+    pub fn open_log(path: &Path, access: LogAccess) -> crate::Result<std::fs::File> {
         use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
         use windows_sys::Win32::Storage::FileSystem::{
             FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT,
@@ -997,11 +1009,16 @@ mod windows {
             path: path.to_path_buf(),
             reason,
         };
-        let file = std::fs::OpenOptions::new()
+        let mut options = std::fs::OpenOptions::new();
+        options
             .read(true)
-            .append(true)
             .create(true)
-            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        match access {
+            LogAccess::Append => options.append(true),
+            LogAccess::ReadAndTruncate => options.write(true),
+        };
+        let file = options
             .open(path)
             .map_err(|error| crate::IpcError::io("open", path, error))?;
         let metadata = file
@@ -2867,7 +2884,8 @@ mod tests {
             let (shell, line) = waiting_command();
             let directory = std::env::temp_dir();
             let written = std::env::var_os(OUTPUT).map(|path| {
-                open_log(std::path::Path::new(&path)).expect("the output file this case names")
+                open_log(std::path::Path::new(&path), LogAccess::Append)
+                    .expect("the output file this case names")
             });
             let (shell, line) = if written.is_some() {
                 writing_command()
@@ -3062,10 +3080,10 @@ mod tests {
 
             let directory = Scratch::create();
             let log = directory.0.join("controller.log");
-            let mut opened = open_log(&log).expect("a new log is created");
+            let mut opened = open_log(&log, LogAccess::Append).expect("a new log is created");
             opened.write_all(b"first\n").expect("written");
             drop(opened);
-            let mut opened = open_log(&log).expect("the log is opened again");
+            let mut opened = open_log(&log, LogAccess::Append).expect("the log is opened again");
             opened.write_all(b"second\n").expect("appended");
             drop(opened);
             assert_eq!(
@@ -3075,17 +3093,49 @@ mod tests {
 
             let folder = directory.0.join("a-directory");
             std::fs::create_dir(&folder).expect("a directory where the log would be");
-            assert!(open_log(&folder).is_err(), "a directory is not a log");
+            for access in [LogAccess::Append, LogAccess::ReadAndTruncate] {
+                assert!(
+                    open_log(&folder, access).is_err(),
+                    "a directory is not a log"
+                );
+            }
 
             let shared = directory.0.join("shared.log");
             crate::paths::create_file_with_descriptor(&shared, "D:P(A;;GA;;;OW)(A;;FR;;;WD)")
                 .expect("a log everyone may read");
-            assert!(
-                matches!(
-                    open_log(&shared),
-                    Err(crate::IpcError::UntrustedFile { .. })
-                ),
-                "a log another account may read is refused"
+            for access in [LogAccess::Append, LogAccess::ReadAndTruncate] {
+                assert!(
+                    matches!(
+                        open_log(&shared, access),
+                        Err(crate::IpcError::UntrustedFile { .. })
+                    ),
+                    "a log another account may read is refused"
+                );
+            }
+        }
+
+        /// The command that starts the daemon empties a log that has grown too large through the
+        /// handle it checked, while a daemon's handle appends to it: the daemon's next line lands
+        /// at the start of the emptied file, not after a gap where the old lines were.
+        #[test]
+        fn a_log_opened_for_reading_is_emptied_while_a_daemon_appends_to_it() {
+            use std::io::{Read as _, Write as _};
+
+            let directory = Scratch::create();
+            let log = directory.0.join("controller.log");
+            let mut daemon = open_log(&log, LogAccess::Append).expect("the daemon's handle");
+            daemon.write_all(b"an earlier start\n").expect("written");
+            let mut command =
+                open_log(&log, LogAccess::ReadAndTruncate).expect("the command's handle");
+            let mut earlier = String::new();
+            command.read_to_string(&mut earlier).expect("read");
+            assert_eq!(earlier, "an earlier start\n");
+            command.set_len(0).expect("the log is emptied");
+            daemon.write_all(b"this start\n").expect("appended");
+            drop(daemon);
+            assert_eq!(
+                std::fs::read_to_string(&log).expect("the log"),
+                "this start\n"
             );
         }
     }

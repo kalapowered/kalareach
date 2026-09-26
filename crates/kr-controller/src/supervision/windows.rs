@@ -2004,7 +2004,11 @@ mod launching {
         // the daemon. A log that is not a regular file of this user's alone is not written
         // through: the daemon then runs with nothing to write to, and the command that asked for
         // it has already said what is wrong with the log.
-        let log = starter::open_log(&environment.state_dir().join(super::DAEMON_LOG)).ok();
+        let log = starter::open_log(
+            &environment.state_dir().join(super::DAEMON_LOG),
+            starter::LogAccess::Append,
+        )
+        .ok();
         // The admission point: the deadline is read again right before anything is created.
         if !taken.admits(&boot, kr_ipc::clock::boot_elapsed_ms()) {
             return StarterExit::Done;
