@@ -1567,10 +1567,13 @@ impl Broker {
 
     /// Records that a component fault has disabled one binding's rich capabilities.
     ///
-    /// Native traffic is untouched: nothing in this function reaches the forwarding path.
+    /// Native traffic is untouched: nothing in this function reaches the forwarding path. The
+    /// disabling is the fault's from here, whatever disabled the binding before: a revocation that
+    /// stops standing, or a policy that only warns, lifts nothing a fault did.
     pub fn disable_rich(&self, binding_id: BrokerBindingId, reason: impl Into<String>) {
         if let Some(binding) = self.state().bindings.get_mut(&binding_id) {
             binding.rich_disabled = Some(reason.into());
+            binding.revocation_disabled = false;
         }
     }
 

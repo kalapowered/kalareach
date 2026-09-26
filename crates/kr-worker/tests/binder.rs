@@ -1097,11 +1097,46 @@ fn kr_req_25_22_disable_at_next_admission_refuses_rich_admissions_until_the_revo
         .broker
         .disable_rich(binding(1), "the component faulted");
     revoke(4);
-    worker.admit(5, vec![package]);
+    worker.admit(5, vec![package.clone()]);
     assert_eq!(
         worker.broker.rich_disabled(binding(1)).as_deref(),
         Some("the component faulted"),
         "a fault's disabling is not a revocation's to lift"
+    );
+
+    // The other order: revoked and disabled for it, then a fault, then the revocation lifted, and
+    // then the policy that only warns. The fault stays.
+    let worker = Worker::open();
+    let source = worker.claude_code();
+    let package = testing::admitted(&source);
+    let first = worker.admit(1, vec![package.clone()]);
+    worker.register(1);
+    worker
+        .bind(1, 1, source.package_digest, first)
+        .expect("binds");
+    worker.hand_over(Snapshot {
+        policy: RevocationPolicy::DisableAtNextAdmission,
+        releases: vec![revoked(testing::release_of(&package))],
+        ..Snapshot::admitting(2, Vec::new())
+    });
+    worker
+        .broker
+        .disable_rich(binding(1), "the component faulted");
+    worker.hand_over(Snapshot {
+        policy: RevocationPolicy::WarnOnly,
+        releases: vec![revoked(testing::release_of(&package))],
+        ..Snapshot::admitting(3, Vec::new())
+    });
+    assert_eq!(
+        worker.broker.rich_disabled(binding(1)).as_deref(),
+        Some("the component faulted"),
+        "the policy that only warns lifts no fault"
+    );
+    worker.admit(4, vec![package]);
+    assert_eq!(
+        worker.broker.rich_disabled(binding(1)).as_deref(),
+        Some("the component faulted"),
+        "and nor does the revocation's end"
     );
 }
 
