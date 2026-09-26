@@ -768,6 +768,19 @@ impl NativeBridges {
             }
         }
         let facts = registration(&sources, &forwarder)?;
+        // The forwarder a registration starts reports for the application it names, and a
+        // launch of this package admits only its own: a registration for another package's
+        // application would be a bridge no launch of either could use.
+        if let Some(facts) = facts.as_ref() {
+            let own = package_name(&target.plugin_id);
+            if facts.application != own {
+                return Err(format!(
+                    "the registration starts the forwarder for {}, which is not the application \
+                     of {} ({own})",
+                    facts.application, target.plugin_id
+                ));
+            }
+        }
         let versions = self.versions(target)?;
         let mut steps = Vec::new();
         for step in &recipe.install {
@@ -2165,6 +2178,14 @@ fn removal_of(recipe: &NativeBridge) -> std::result::Result<Vec<Removal>, String
             },
         })
         .collect())
+}
+
+/// Returns a package's name under its publisher, the application name its forwarder reports for.
+fn package_name(plugin_id: &PluginId) -> &str {
+    plugin_id
+        .as_str()
+        .rsplit_once('/')
+        .map_or(plugin_id.as_str(), |(_, name)| name)
 }
 
 /// What the registration the recipe installs says: the application name its `kr-hook`

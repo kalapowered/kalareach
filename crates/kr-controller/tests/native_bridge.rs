@@ -644,6 +644,36 @@ fn a_version_no_signed_record_establishes_is_refused() {
     }
 }
 
+/// The registration a recipe installs starts the forwarder for its own package's application and
+/// for no other: a package whose registration names another package's application is refused
+/// before anything is written, and the package the registration names is applied.
+#[test]
+fn a_registration_for_another_packages_application_is_refused() {
+    let site = Site::new();
+    let before = site.tree();
+    let another = PluginId::new("kalareach/another-agent").expect("a plugin identifier");
+    let target = BridgeTarget {
+        plugin_id: another.clone(),
+        ..site.release()
+    };
+    let settled = site
+        .bridges()
+        .reconcile(&another, Some(&target))
+        .expect("reconciles");
+    let reason = refused(&settled);
+    assert!(
+        reason.contains("claude-code") && reason.contains("kalareach/another-agent"),
+        "{reason}"
+    );
+    assert_eq!(site.tree(), before, "nothing was written");
+
+    let settled = site
+        .bridges()
+        .reconcile(&plugin(), Some(&site.release()))
+        .expect("reconciles");
+    assert_eq!(settled, Settled::Applied);
+}
+
 /// A forwarder the host cannot name, and an application it does not know, refuse the recipe.
 #[test]
 fn a_recipe_the_host_cannot_place_is_refused() {
