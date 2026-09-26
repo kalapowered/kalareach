@@ -286,6 +286,32 @@ mod macos {
         }
         Ok(())
     }
+    /// A guarded window on the bundle, with a count of the page loads that have finished in it.
+    fn open_counting_loads(
+        app: &AppHandle,
+        label: &str,
+    ) -> Result<(WebviewWindow, Arc<std::sync::atomic::AtomicUsize>), String> {
+        let loads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counting = Arc::clone(&loads);
+        let builder = WebviewWindowBuilder::new(app, label, WebviewUrl::App("index.html".into()))
+            .title(label)
+            .inner_size(320.0, 240.0)
+            .on_page_load(move |_window, payload| {
+                if payload.event() == tauri::webview::PageLoadEvent::Finished {
+                    counting.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            });
+        let window = companion_tauri::account::navigation::guard(builder, None)
+            .build()
+            .map_err(|error| error.to_string())?;
+        wait_for(
+            &format!("{label} loading the bundle"),
+            Duration::from_secs(20),
+            || bundled(&window),
+        )?;
+        Ok((window, loads))
+    }
+
     /// The page-load check: two pages each hold a view, and reloading one ends only its own.
     fn page_load(
         app: &AppHandle,
@@ -295,10 +321,17 @@ mod macos {
     ) -> Result<(), String> {
         use companion_tauri::terminal::{TerminalViewState, TerminalViews};
 
-        let one = open(app, "view-one", true)?;
-        let _two = open(app, "view-two", true)?;
-        // The initial load's own events have passed before a view is opened on either page.
-        std::thread::sleep(Duration::from_secs(1));
+        // Each page's first load has finished before a view is opened on it, so the load that
+        // ends a view here is the reload and nothing earlier.
+        let (one, one_loads) = open_counting_loads(app, "view-one")?;
+        let (_two, two_loads) = open_counting_loads(app, "view-two")?;
+        for (page, loads) in [("view-one", &one_loads), ("view-two", &two_loads)] {
+            wait_for(
+                &format!("{page}'s first load finishing"),
+                Duration::from_secs(20),
+                || loads.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            )?;
+        }
         let heard: Arc<Mutex<Vec<(u8, TerminalViewState)>>> = Arc::default();
         let publish = |page: u8| -> companion_tauri::terminal::Publish {
             let heard = Arc::clone(&heard);
