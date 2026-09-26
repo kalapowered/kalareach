@@ -2294,7 +2294,11 @@ async fn kr_req_12_18_a_plugin_answer_goes_out_on_the_channel_and_reports_the_ac
         result.to_typed().expect("the action's own result");
     assert_eq!(result.action.as_str(), "approval.answer");
     assert_eq!(
-        result.mutation.provenance,
+        result
+            .mutation
+            .as_ref()
+            .expect("the answer went upstream")
+            .provenance,
         kr_protocol::broker::ActionProvenance::UpstreamTypedRpc
     );
     assert_eq!(
@@ -2806,5 +2810,147 @@ async fn kr_req_11_47_a_forwarded_action_needs_the_rights_of_its_class() {
         upstream.carried.load(std::sync::atomic::Ordering::SeqCst),
         2,
         "the two answers were carried"
+    );
+}
+
+/// Admits the example declarative package to the suite's worker and binds it to the suite's
+/// instance, as an adoption binds it: the package registers `status.refresh`, which the host
+/// carries out itself by redrawing the package's own document. Returns the binding, and the
+/// directory the package is in, which goes with the test.
+fn bind_the_example(host: &Host) -> (BrokerBindingId, tempfile::TempDir) {
+    use kr_worker::broker::catalogue::testing;
+    let packages = tempfile::tempdir().expect("a directory on the internal disk");
+    let source = kr_worker::broker::connectors::fixture::declarative_package(
+        packages.path(),
+        "example-declarative",
+        "example-agent",
+        kr_plugin_sdk::matching::MatchConfidence::Exact,
+    )
+    .expect("the package is written");
+    let admitted = testing::admitted(&source);
+    let broker = host.service.broker();
+    let frame = testing::admit(
+        host.service.plugin_admissions(),
+        host.service.connector_sources(),
+        broker,
+        vec![admitted.clone()],
+        1,
+    );
+    let bound = BrokerBindingId::new(Uuid::from_bytes([41; 16]));
+    broker
+        .bind(
+            bound,
+            instance(),
+            admitted.package_digest,
+            frame,
+            kr_worker::broker::binder::MatchedExecutable {
+                path: "/usr/local/bin/example-agent".to_owned(),
+                digest: Digest256::from_bytes([3; 32]),
+            },
+            TimestampMs::new(2),
+        )
+        .expect("the package is bound");
+    (bound, packages)
+}
+
+/// One `plugin.action.invoke` of the example package's `status.refresh` on the suite's instance.
+fn refresh_invocation(
+    host: &Host,
+    request_id: u64,
+    action_window_id: kr_protocol::ids::ActionWindowId,
+) -> MutationRequest {
+    let mut mutation = plugin_invocation(
+        host,
+        request_id,
+        action_window_id,
+        "status.refresh",
+        Nullable::null(),
+        &[],
+    );
+    mutation.params = ParamsValue::from_typed(&kr_protocol::agent::PluginActionInvokeParams {
+        target: AgentMutationTarget {
+            subject: subject(host.session_id, instance()),
+            binding_revision: AgentBindingRevision::new(1),
+        },
+        plugin_id: PluginId::new("kalareach/example-declarative").expect("valid"),
+        action: kr_protocol::broker::ActionName::new("status.refresh").expect("valid"),
+        draft_id: Nullable::null(),
+        resource_id: Nullable::null(),
+        parameters: kr_protocol::scalars::Bytes::from(
+            kr_cbor::to_canonical_vec(&serde_json::json!({ "detail": "summary" }))
+                .expect("the action's parameters"),
+        ),
+    })
+    .expect("encodes");
+    mutation
+}
+
+/// KR-REQ-11.47: an action the host carries out itself, by redrawing the package's own document,
+/// is admitted through `plugin.action.invoke` on the right its class needs and answered with its
+/// receipt, and nothing more: no token, no plan, and nothing leaves the host, so an instance with
+/// no transport bound serves it. A caller acting under a grant without `session.view` is refused
+/// before the marker, and so is the action through a binding whose rich capabilities are disabled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_11_47_a_presentation_action_is_admitted_on_its_class_right_and_nothing_leaves_the_host()
+ {
+    use kr_protocol::rights::ActionRight;
+    let host = host().await;
+    // The instance has no transport: nothing could carry an operation to its upstream.
+    register(&host, None);
+    let (bound, _packages) = bind_the_example(&host);
+
+    let mut client = cli(&host).await;
+    let mutation = refresh_invocation(&host, 130, client.action_window().action_window_id.clone());
+    let action_id = mutation.action_id;
+    let outcome = send(&mut client, mutation).await;
+    let Outcome::Ok(result) = outcome else {
+        panic!("the local owner's presentation action is admitted: {outcome:?}");
+    };
+    let result: kr_protocol::agent::PluginActionInvokeResult =
+        result.to_typed().expect("the action's own result");
+    assert_eq!(result.action.as_str(), "status.refresh");
+    assert!(
+        result.mutation.as_ref().is_none(),
+        "nothing went upstream: {result:?}"
+    );
+    assert_eq!(
+        receipt(&mut client, action_id).await.state,
+        ReceiptState::Applied,
+        "its receipt says it was applied"
+    );
+
+    let mut daemon = daemon(&host).await;
+    let window = || kr_protocol::ids::ActionWindowId::new("forwarded").expect("a window");
+    let refusal = forward_as_device(
+        &mut daemon,
+        &refresh_invocation(&host, 131, window()),
+        &[ActionRight::AgentPrompt],
+    )
+    .await
+    .expect_err("a grant without the class's right");
+    assert_eq!(refusal.code, ErrorCode::PermissionDenied, "{refusal:?}");
+    let admitted = forward_as_device(
+        &mut daemon,
+        &refresh_invocation(&host, 132, window()),
+        &[ActionRight::SessionView],
+    )
+    .await
+    .expect("a grant with the class's right");
+    let admitted: kr_protocol::agent::PluginActionInvokeResult =
+        admitted.to_typed().expect("the action's own result");
+    assert_eq!(admitted.action.as_str(), "status.refresh");
+
+    host.service
+        .broker()
+        .disable_rich(bound, "the package's component faulted");
+    let window_id = client.action_window().action_window_id.clone();
+    let outcome = send(&mut client, refresh_invocation(&host, 133, window_id)).await;
+    let Outcome::Error(refusal) = outcome else {
+        panic!("a binding whose rich capabilities are disabled admits nothing: {outcome:?}");
+    };
+    assert_eq!(
+        refusal.code,
+        ErrorCode::UnsupportedCapability,
+        "{refusal:?}"
     );
 }

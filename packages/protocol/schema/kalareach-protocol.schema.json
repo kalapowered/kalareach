@@ -21094,8 +21094,15 @@
           "description": "The action that ran."
         },
         "mutation": {
-          "$ref": "#/$defs/AgentMutationResult",
-          "description": "What the action did upstream."
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AgentMutationResult"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "What the action did upstream, or null for an action the host carries out itself, which\nsends nothing upstream."
         }
       },
       "required": [

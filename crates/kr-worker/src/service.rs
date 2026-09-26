@@ -4236,16 +4236,12 @@ impl WorkerService {
     }
 
     /// Wraps one broker admission as the work that happens once the session boundary ends.
-    fn handoff(
-        &self,
-        admitted: crate::broker::MutationAdmission,
-        kind: UpstreamKind,
-    ) -> UpstreamHandoff {
-        UpstreamHandoff {
+    fn handoff(&self, admitted: crate::broker::MutationAdmission, kind: UpstreamKind) -> Prepared {
+        Prepared::Upstream(Box::new(UpstreamHandoff {
             broker: Arc::clone(&self.broker),
             admitted,
             kind,
-        }
+        }))
     }
 
     /// Refuses, before the dispatch marker, everything the effect itself would refuse.
@@ -4261,7 +4257,7 @@ impl WorkerService {
         mutation: &MutationRequest,
         method: Method,
         caller: &Caller,
-    ) -> Result<Option<UpstreamHandoff>> {
+    ) -> Result<Option<Prepared>> {
         // Whether this session is still running, for the methods that need it to be. Each of those
         // effects asks this first, so this does too.
         if matches!(
@@ -4401,6 +4397,15 @@ impl WorkerService {
                 // An action that answers a pending request through the connector table's decision
                 // destination is admitted as that answer: the transaction an approval answer
                 // makes, with the action's own checks inside it, and no component involved.
+                // An action the host carries out itself, by redrawing the package's own document, is
+                // admitted on the right its class needs, checked above, and on what the broker
+                // holds now; it is answered with its receipt, and nothing leaves the host.
+                if let Some(registered) = registered.as_ref()
+                    && registered.presentation
+                {
+                    self.broker.admit_presentation(binding_id, &params)?;
+                    return Ok(Some(Prepared::Presentation(params.action)));
+                }
                 let answers = registered.is_some_and(|registered| registered.decision.is_some());
                 if answers {
                     self.wait_before_admission();
@@ -5485,7 +5490,7 @@ impl WorkerService {
         mutation: &MutationRequest,
         method: Method,
         caller: &Caller,
-        prepared: Option<UpstreamHandoff>,
+        prepared: Option<Prepared>,
     ) -> Result<(ParamsValue, AfterEffect)> {
         let params = &mutation.params;
         match method {
@@ -5782,27 +5787,35 @@ impl WorkerService {
             | Method::AgentTurnSteer
             | Method::AgentTurnCancel
             | Method::AgentApprovalRespond => {
-                let handoff = prepared.ok_or_else(|| {
-                    WorkerError::InvalidArgument(format!(
+                let Some(Prepared::Upstream(handoff)) = prepared else {
+                    return Err(WorkerError::InvalidArgument(format!(
                         "{} reached its effect without the admission that authorises it",
                         method.as_str()
-                    ))
-                })?;
-                Ok((
-                    ParamsValue::empty(),
-                    AfterEffect::Upstream(Box::new(handoff)),
-                ))
+                    )));
+                };
+                Ok((ParamsValue::empty(), AfterEffect::Upstream(handoff)))
             }
             Method::PluginActionInvoke => {
                 // An answer through the connector table's decision destination was admitted
                 // before the marker, and its admission leaves this boundary as an approval
-                // answer's does. Every other action was refused before the marker, so only a
-                // component's prepared effect, which does not reach this broker, meets the refusal.
-                if let Some(handoff) = prepared {
-                    return Ok((
-                        ParamsValue::empty(),
-                        AfterEffect::Upstream(Box::new(handoff)),
-                    ));
+                // answer's does. An action the host carries out itself was admitted on its
+                // class's right, and its receipt is all it is answered with. Every other action
+                // was refused before the marker, so only a component's prepared effect, which does
+                // not reach this broker, meets the refusal.
+                match prepared {
+                    Some(Prepared::Upstream(handoff)) => {
+                        return Ok((ParamsValue::empty(), AfterEffect::Upstream(handoff)));
+                    }
+                    Some(Prepared::Presentation(action)) => {
+                        return Ok((
+                            encode(&kr_protocol::agent::PluginActionInvokeResult {
+                                mutation: Nullable::null(),
+                                action,
+                            })?,
+                            AfterEffect::None,
+                        ));
+                    }
+                    None => {}
                 }
                 let params: kr_protocol::agent::PluginActionInvokeParams = parse(params)?;
                 Err(crate::broker::BrokerError::UnsupportedCapability {
@@ -7065,6 +7078,26 @@ enum UpstreamKind {
     },
 }
 
+/// What an admission before the dispatch marker hands the effect after it.
+#[derive(Debug)]
+pub enum Prepared {
+    /// An admitted operation whose transport work happens once the session boundary ends.
+    Upstream(Box<UpstreamHandoff>),
+    /// An action the host carries out itself by redrawing the package's own document, admitted on
+    /// its class's right: its receipt is all it is answered with, and nothing leaves the host.
+    Presentation(kr_protocol::broker::ActionName),
+}
+
+impl Prepared {
+    /// Gives the admission up without carrying it out.
+    fn abandon(self) {
+        match self {
+            Self::Upstream(handoff) => handoff.abandon(),
+            Self::Presentation(_) => {}
+        }
+    }
+}
+
 /// One admitted operation, waiting for the session boundary to end before it is transmitted.
 #[derive(Debug)]
 pub struct UpstreamHandoff {
@@ -7113,7 +7146,7 @@ impl UpstreamHandoff {
             UpstreamKind::PluginAnswer { action } => {
                 let answered = answer_within(&self.broker, &self.admitted, now, deadline).await?;
                 encode(&kr_protocol::agent::PluginActionInvokeResult {
-                    mutation: answered.mutation,
+                    mutation: Nullable::some(answered.mutation),
                     action,
                 })
             }

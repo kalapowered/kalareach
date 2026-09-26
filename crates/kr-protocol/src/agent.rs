@@ -429,8 +429,9 @@ pub struct PluginActionInvokeParams {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PluginActionInvokeResult {
-    /// What the action did upstream.
-    pub mutation: AgentMutationResult,
+    /// What the action did upstream, or null for an action the host carries out itself, which
+    /// sends nothing upstream.
+    pub mutation: Nullable<AgentMutationResult>,
     /// The action that ran.
     pub action: ActionName,
 }

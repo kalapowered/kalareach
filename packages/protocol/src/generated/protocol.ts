@@ -16304,28 +16304,11 @@ export interface PluginActionInvokeResult {
    * The action that ran.
    */
   action: string
-  mutation: AgentMutationResult2
-}
-/**
- * What the action did upstream.
- */
-export interface AgentMutationResult2 {
   /**
-   * Changes when the active upstream execution owner or selected thread changes.
+   * What the action did upstream, or null for an action the host carries out itself, which
+   * sends nothing upstream.
    */
-  binding_revision: string
-  /**
-   * How it reached the upstream.
-   */
-  provenance: 'upstream_typed_rpc' | 'authenticated_hook_response' | 'terminal_input'
-  /**
-   * The turn it applies to, where the upstream names one.
-   */
-  turn_id: AgentTurnId | null
-  /**
-   * The upstream's own identifier for it, where the upstream gave one.
-   */
-  upstream_request_id: UpstreamRequestId | null
+  mutation: AgentMutationResult1 | null
 }
 /**
  * Parameters of `plugin.capabilities`.

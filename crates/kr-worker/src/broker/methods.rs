@@ -729,12 +729,12 @@ impl ActionInFlight {
     pub async fn settled(self) -> Result<PluginActionInvokeResult> {
         let outcome = self.pending.outcome().await?;
         Ok(PluginActionInvokeResult {
-            mutation: AgentMutationResult {
+            mutation: Nullable::some(AgentMutationResult {
                 binding_revision: self.binding_revision,
                 provenance: outcome.provenance,
                 upstream_request_id: Nullable::from(outcome.upstream_request_id),
                 turn_id: Nullable::from(outcome.turn_id.or(self.turn_id)),
-            },
+            }),
             action: self.action,
         })
     }
@@ -772,6 +772,10 @@ pub struct RegisteredAction {
     /// The rights a caller acting under a grant must hold to invoke it: the ones the package
     /// contract names for its declared class, whatever the action is called.
     pub rights: kr_protocol::scalars::CanonicalSet<kr_protocol::rights::ActionRight>,
+    /// True for an action the host carries out itself by redrawing the package's own document:
+    /// it is admitted on its class's right and answered with its receipt, and nothing leaves the
+    /// host.
+    pub presentation: bool,
 }
 
 impl RegisteredAction {
@@ -870,6 +874,10 @@ impl RegisteredAction {
             operation,
             decision,
             rights: declaration.required_rights(),
+            presentation: matches!(
+                declaration.implementation,
+                ActionImplementation::Presentation {}
+            ),
         })
     }
 }
@@ -2024,6 +2032,34 @@ impl Broker {
         Ok(())
     }
 
+    /// Admits one action the host carries out itself, by redrawing the package's own document.
+    ///
+    /// It is admitted on the right its class needs, which the service holds the caller to, and on
+    /// what this broker holds now: the binding runs on the instance the call names, in this
+    /// worker's session, at the binding revision the call was prepared at; its package registered
+    /// the action as one it presents; the binding holds the grant the action's class needs; and
+    /// its rich capabilities are not disabled. Nothing more: no token is issued, no plan is asked
+    /// for, and nothing leaves the host. A call that names a draft or a pending request names
+    /// something a presentation does not act on, and is refused.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::UnknownSubject`] for a session, binding, instance or action this
+    /// broker does not hold, [`BrokerError::PermissionDenied`] for a binding bound to another
+    /// instance, [`BrokerError::InvalidArgument`] for an action its package does not present or a
+    /// call that names a draft or a pending request, [`BrokerError::Grant`] when the binding does
+    /// not hold the action's grant, [`BrokerError::UnsupportedCapability`] while its rich
+    /// capabilities are disabled, and [`BrokerError::StaleBinding`] when the binding revision has
+    /// moved.
+    pub fn admit_presentation(
+        &self,
+        binding_id: BrokerBindingId,
+        params: &PluginActionInvokeParams,
+    ) -> Result<()> {
+        self.check_subject(&params.target.subject)?;
+        self.state().admit_presentation_in(binding_id, params)
+    }
+
     /// Checks everything a plugin action call declares, without running it.
     ///
     /// # Errors
@@ -2099,6 +2135,62 @@ impl Broker {
 }
 
 impl crate::broker::BrokerState {
+    /// Admits one presentation action under the broker's lock. See [`Broker::admit_presentation`].
+    fn admit_presentation_in(
+        &self,
+        binding_id: BrokerBindingId,
+        params: &PluginActionInvokeParams,
+    ) -> Result<()> {
+        let binding = self
+            .bindings
+            .get(&binding_id)
+            .ok_or_else(|| crate::broker::unknown_binding(binding_id))?;
+        let application_instance_id = params.target.subject.application_instance_id;
+        if binding.application_instance_id != application_instance_id {
+            return Err(BrokerError::denied(format!(
+                "binding {binding_id} is not bound to {application_instance_id}"
+            )));
+        }
+        let registered = binding.actions.get(&params.action).ok_or_else(|| {
+            BrokerError::unknown(format!(
+                "{} is not an action {} registered",
+                params.action, params.plugin_id
+            ))
+        })?;
+        if !registered.presentation {
+            return Err(BrokerError::invalid(format!(
+                "{} is not an action its package presents",
+                params.action
+            )));
+        }
+        if params.draft_id.is_present() || params.resource_id.is_present() {
+            return Err(BrokerError::invalid(format!(
+                "{} redraws its package's own document, and acts on no draft and no pending \
+                 request",
+                params.action
+            )));
+        }
+        binding.grants.require(registered.grant)?;
+        if let Some(reason) = binding.rich_disabled.as_ref() {
+            return Err(BrokerError::UnsupportedCapability {
+                detail: format!("this binding's rich capabilities are disabled: {reason}"),
+            });
+        }
+        let instance = self
+            .instances
+            .get(&application_instance_id)
+            .ok_or_else(|| crate::broker::unknown_instance(application_instance_id))?;
+        if instance.binding_revision != params.target.binding_revision {
+            return Err(BrokerError::StaleBinding {
+                detail: format!(
+                    "{} was prepared at binding revision {} and the binding is at {}",
+                    params.action, params.target.binding_revision, instance.binding_revision
+                ),
+            });
+        }
+        Ok(())
+    }
+
     /// The answer transaction, under the broker's lock: the resource, the mutation, the claim and
     /// the resource's one transmission. See [`Broker::admit_approval`].
     fn admit_answer_in(
