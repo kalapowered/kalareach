@@ -2421,9 +2421,10 @@ impl ServiceHost {
             process,
             "the daemon leads a process group of its own"
         );
-        // launchd runs every job in the session it leads as process 1, which no terminal ends. A
-        // test that a launchd job runs, as on a hosted runner, is in that session too, so the
-        // daemon's session is named here rather than compared with this test's.
+        // launchd runs a per-user agent such as this one in the session it leads as process 1,
+        // which no terminal ends. A test that a launchd job runs, as on a hosted runner, is in
+        // that session too, so the daemon's session is named here rather than compared with this
+        // test's.
         #[cfg(target_os = "macos")]
         assert_eq!(
             rustix::process::getsid(Some(process))
