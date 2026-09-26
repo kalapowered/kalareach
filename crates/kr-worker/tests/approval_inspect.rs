@@ -6,11 +6,14 @@
 //! request identifier, the offered decisions, the deadline and where the request stands, open to
 //! inspection. These tests read that record on the worker's own socket, through the client
 //! library's typed read where a person's client would use it, and hold the answer to what the test
-//! itself gave the broker rather than to what the broker says about itself.
+//! itself gave the broker rather than to what the broker says about itself. They also read it, and
+//! the agent's shared state, as the control daemon forwards a paired device's read: narrowed by
+//! section 10's one host-side filter to the history scope of the grant the daemon decided it under.
 //!
 //! | Row | What proves it |
 //! | --- | --- |
-//! | KR-REQ-11.26 | `kr_req_11_26_a_local_caller_reads_what_the_decoder_read_and_offered`, `kr_req_11_26_the_record_says_where_the_request_stands_once_answered`, `kr_req_11_26_another_instances_resource_and_one_never_decoded_answer_unknown` |
+//! | KR-REQ-11.26 | `kr_req_11_26_a_local_caller_reads_what_the_decoder_read_and_offered`, `kr_req_11_26_the_record_says_where_the_request_stands_once_answered`, `kr_req_11_26_another_instances_resource_and_one_never_decoded_answer_unknown`, `kr_req_11_26_a_device_reads_the_approval_records_its_grants_scope_reaches` |
+//! | KR-REQ-23.39 | `kr_req_23_39_a_device_reads_the_agent_history_its_grants_scope_reaches` |
 
 use std::sync::Arc;
 
@@ -35,6 +38,7 @@ use kr_protocol::gateway::{
     DeclarativeEntry, DeclarativeTable, NativeFraming, NativeMethodClass, PendingState,
     RichMethodTable,
 };
+use kr_protocol::grant::HistoryScope;
 use kr_protocol::hello::PROTOCOL_VERSION;
 use kr_protocol::identity::{
     DesktopBinding, ProcessStartIdentity, ProcessStartSource, WorkerProfile,
@@ -465,9 +469,19 @@ async fn inspect(
 
 /// Connects as the control daemon and proves the generation this worker accepts.
 async fn daemon(host: &Host) -> LocalClient {
+    daemon_receiving(host, kr_protocol::hello::ReceiveLimits::default()).await
+}
+
+/// Connects as the control daemon declaring what it receives, and proves the generation.
+async fn daemon_receiving(host: &Host, limits: kr_protocol::hello::ReceiveLimits) -> LocalClient {
     let mut daemon = within(
         "the daemon's connection",
-        LocalClient::connect(&host.endpoint, LocalClientKind::Controller, build()),
+        LocalClient::connect_receiving(
+            &host.endpoint,
+            LocalClientKind::Controller,
+            build(),
+            limits,
+        ),
     )
     .await
     .expect("connects as the daemon");
@@ -562,6 +576,36 @@ fn forwarded<T: serde::Serialize>(
         actor,
         history: None,
     }))
+}
+
+/// One read, forwarded by the control daemon for the actor it vouches for, with the history scope
+/// of the grant the daemon decided it under.
+fn scoped<T: serde::Serialize>(
+    method: Method,
+    params: &T,
+    request_id: u64,
+    actor: ActorEnvelope,
+    history: HistoryScope,
+) -> ControlFrame {
+    let mut frame = forwarded(method, params, request_id, actor);
+    if let ControlFrame::ForwardedRead(read) = &mut frame {
+        read.history = Some(history);
+    }
+    frame
+}
+
+/// A grant's history scope reaching back to `lower_bound_ms` (none: no retained history), naming
+/// the approvals it names by their text.
+fn reach(lower_bound_ms: Option<u64>, named_approvals: &[&str]) -> HistoryScope {
+    HistoryScope {
+        lower_bound_ms: Nullable(lower_bound_ms.map(TimestampMs::new)),
+        include_live_screen: true,
+        named_questions: kr_protocol::scalars::CanonicalSet::new(),
+        named_approvals: named_approvals
+            .iter()
+            .map(|name| kr_protocol::ids::ApprovalRequestId::new(*name).expect("an identifier"))
+            .collect(),
+    }
 }
 
 /// Replaces the identifiers a refusal names with placeholders, leaving what it says about them.
@@ -789,37 +833,55 @@ async fn kr_req_11_26_the_record_says_where_the_request_stands_once_answered() {
     reader.close();
 }
 
-/// A read the control daemon forwards for a paired device does not reach the record: the method
-/// is served on the local socket only, so the worker refuses it through the method table before
-/// anything is read, and the refusal carries nothing of the record. The controls are the two agent
-/// reads the table admits for a device through the same frame: `agent.capabilities` is served, and
-/// `agent.snapshot` is refused by name as before.
+/// A read the control daemon forwards for a paired device without the history scope of the grant it
+/// decided the read under does not reach the record or the history: nothing here could hold the
+/// answer to the scope, so the worker refuses both with the reason, and the refusal carries
+/// nothing of the record. The control is the agent read that carries no history:
+/// `agent.capabilities` is served through the same frame.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_paired_devices_read_is_refused_by_the_method_table_and_carries_nothing() {
+async fn a_paired_devices_read_without_a_scope_is_refused_with_its_reason() {
     let host = host().await;
     let resource_id = offer(&host, &request_frame(11, 0));
+    converse(&host);
     let mut daemon = daemon(&host).await;
 
-    let refused = exchange(
-        &mut daemon,
-        forwarded(
-            Method::AgentApprovalInspect,
-            &params(&host, instance(), resource_id),
+    for (request_id, frame) in [
+        (
             31,
-            device(),
+            forwarded(
+                Method::AgentApprovalInspect,
+                &params(&host, instance(), resource_id),
+                31,
+                device(),
+            ),
         ),
-    )
-    .await;
-    let Outcome::Error(error) = refused else {
-        panic!("a forwarded read of the record is refused: {refused:?}");
-    };
-    assert_eq!(error.code, ErrorCode::PermissionDenied);
-    for withheld in ["kalareach.codex", "session/request_permission", "allow"] {
+        (
+            33,
+            forwarded(Method::AgentSnapshot, &snapshot_params(&host), 33, device()),
+        ),
+    ] {
+        let refused = exchange(&mut daemon, frame).await;
+        let Outcome::Error(error) = refused else {
+            panic!("read {request_id} without a scope is refused: {refused:?}");
+        };
+        assert_eq!(error.code, ErrorCode::UnsupportedCapability, "{request_id}");
         assert!(
-            !error.message.contains(withheld),
-            "the refusal carries nothing of the record: {}",
+            error.message.contains("history scope"),
+            "the refusal says why: {}",
             error.message
         );
+        for withheld in [
+            "kalareach.codex",
+            "session/request_permission",
+            "allow",
+            "said",
+        ] {
+            assert!(
+                !error.message.contains(withheld),
+                "the refusal carries nothing of the record or the history: {}",
+                error.message
+            );
+        }
     }
 
     let capabilities = exchange(
@@ -836,37 +898,17 @@ async fn a_paired_devices_read_is_refused_by_the_method_table_and_carries_nothin
     .await;
     assert!(
         matches!(capabilities, Outcome::Ok(_)),
-        "the same frame carries a read the table admits for a device: {capabilities:?}"
+        "the same frame carries a read that holds no history: {capabilities:?}"
     );
-
-    let snapshot = exchange(
-        &mut daemon,
-        forwarded(
-            Method::AgentSnapshot,
-            &AgentSnapshotParams {
-                subject: subject(host.session_id, instance()),
-                from_node: Nullable::null(),
-            },
-            33,
-            device(),
-        ),
-    )
-    .await;
-    let Outcome::Error(error) = snapshot else {
-        panic!("a forwarded snapshot is refused as before: {snapshot:?}");
-    };
-    assert_eq!(error.code, ErrorCode::UnsupportedCapability);
 }
 
 /// The host's one intersection of a grant with a request holds this method to the right its entry
 /// names: a grant without `session.view` is refused for it, whatever else it carries, and one with
-/// it passes that rule. A paired device does not reach the method at all, and the refusal names it.
+/// it passes that rule, on the local socket and from a paired device alike.
 #[test]
 fn a_grant_without_session_view_is_refused_by_the_methods_rights() {
     use kr_controller::grants::{AccessRequest, GrantRecord, HostPolicy, Refusal, decide};
-    use kr_protocol::grant::{
-        EnvironmentSelector, Grant, GrantExpiry, HistoryScope, SessionSelector,
-    };
+    use kr_protocol::grant::{EnvironmentSelector, Grant, GrantExpiry, SessionSelector};
     use kr_protocol::scalars::CanonicalSet;
     use kr_transport::clock::{ContinuousClock as _, ManualClock};
 
@@ -932,10 +974,14 @@ fn a_grant_without_session_view_is_refused_by_the_methods_rights() {
         decision(&with, ActorIngress::LocalIpc).is_ok(),
         "session.view is the right the entry names"
     );
+    assert!(
+        decision(&with, ActorIngress::PairedDevice).is_ok(),
+        "a paired device reads the record under session.view"
+    );
     assert_eq!(
-        decision(&with, ActorIngress::PairedDevice).expect_err("not a device's read"),
-        Refusal::MethodNotReachable {
-            method: "agent.approval.inspect"
+        decision(&without, ActorIngress::PairedDevice).expect_err("no session.view"),
+        Refusal::MissingRight {
+            right: ActionRight::SessionView
         }
     );
 }
@@ -1168,4 +1214,278 @@ async fn a_snapshot_forwarded_for_a_local_caller_under_a_grant_carries_none_of_t
     let snapshot: AgentSnapshotResult = value.to_typed().expect("the snapshot decodes");
     assert_eq!(said(&snapshot), ["said early", "said later"]);
     assert_eq!(snapshot.withheld_entries, U64::new(0));
+}
+
+/// The answer to a read that was served, decoded.
+fn answered<T: kr_protocol::wire::WireMessage>(outcome: Outcome) -> T {
+    let Outcome::Ok(value) = outcome else {
+        panic!("the read is answered: {outcome:?}");
+    };
+    value.to_typed().expect("the answer decodes")
+}
+
+/// The refusal a read was answered with.
+fn refusal(outcome: Outcome) -> ProtocolError {
+    let Outcome::Error(error) = outcome else {
+        panic!("the read is refused: {outcome:?}");
+    };
+    error
+}
+
+/// Records what the agent said around the moment a grant reaches back to, out of time order the
+/// way a clock stepped backwards leaves it: three things said before that moment, before, between
+/// and after two things said since.
+fn converse_around(host: &Host, grant_reaches_back_to: u64) {
+    let broker = host.service.broker();
+    for (text, at) in [
+        ("before the grant, first", grant_reaches_back_to - 1_000),
+        ("under the grant, first", grant_reaches_back_to + 500),
+        ("before the grant, between", grant_reaches_back_to - 500),
+        ("under the grant, second", grant_reaches_back_to + 1_000),
+        ("before the grant, last", grant_reaches_back_to - 800),
+    ] {
+        broker
+            .observe(instance(), "message", text, TimestampMs::new(at))
+            .expect("observed");
+    }
+}
+
+/// KR-REQ-23.39: a paired device reads an agent's shared state through the session's worker, and
+/// section 10's one host-side filter holds it to the scope of the grant the daemon decided the
+/// read under: what the agent said since the moment the grant reaches back to, in order, with a
+/// count of what it withheld, whether that came before, between or after what it kept. A grant
+/// that keeps no retained history reads none of it. A scope narrows whoever carries one, the
+/// owner's ingress included; the owner with no scope reads everything, as before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_23_39_a_device_reads_the_agent_history_its_grants_scope_reaches() {
+    let host = host().await;
+    converse_around(&host, 2_000);
+    let mut daemon = daemon(&host).await;
+    let snapshot = |request_id: u64, actor: ActorEnvelope, history: HistoryScope| {
+        scoped(
+            Method::AgentSnapshot,
+            &snapshot_params(&host),
+            request_id,
+            actor,
+            history,
+        )
+    };
+
+    let reached: AgentSnapshotResult =
+        answered(exchange(&mut daemon, snapshot(61, device(), reach(Some(2_000), &[]))).await);
+    assert_eq!(
+        said(&reached),
+        ["under the grant, first", "under the grant, second"]
+    );
+    assert_eq!(
+        reached.withheld_entries,
+        U64::new(3),
+        "the answer says how much it withheld"
+    );
+    assert!(!reached.continuation.is_present());
+    assert!(!reached.history_gap, "a filtered answer is not an eviction");
+
+    let nothing: AgentSnapshotResult =
+        answered(exchange(&mut daemon, snapshot(62, device(), reach(None, &[]))).await);
+    assert!(
+        nothing.entries.is_empty(),
+        "no retained history reads none of it, the live screen included: {:?}",
+        said(&nothing)
+    );
+    assert_eq!(nothing.withheld_entries, U64::new(5));
+
+    let narrowed: AgentSnapshotResult = answered(
+        exchange(
+            &mut daemon,
+            snapshot(63, local(false), reach(Some(2_000), &[])),
+        )
+        .await,
+    );
+    assert_eq!(
+        said(&narrowed),
+        ["under the grant, first", "under the grant, second"]
+    );
+
+    let whole: AgentSnapshotResult = answered(
+        exchange(
+            &mut daemon,
+            forwarded(
+                Method::AgentSnapshot,
+                &snapshot_params(&host),
+                64,
+                local(false),
+            ),
+        )
+        .await,
+    );
+    assert_eq!(said(&whole).len(), 5);
+    assert_eq!(whole.withheld_entries, U64::new(0));
+}
+
+/// KR-REQ-11.26: a paired device reads an approval's record through the session's worker when the
+/// scope of its grant reaches the moment the request arrived, the bound itself included. A record
+/// older than the bound, or any record under a grant that keeps no retained history, is answered
+/// exactly as a resource this host does not hold, so the answer does not say that a record exists
+/// outside the scope, and it carries nothing of the record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_11_26_a_device_reads_the_approval_records_its_grants_scope_reaches() {
+    let host = host().await;
+    let frame = request_frame(11, 0);
+    let resource_id = offer(&host, &frame);
+    let absent = PendingResourceId::new(Uuid::from_bytes([0xab; 16]));
+    let mut daemon = daemon(&host).await;
+    let inspect = |request_id: u64, resource_id: PendingResourceId, history: HistoryScope| {
+        scoped(
+            Method::AgentApprovalInspect,
+            &params(&host, instance(), resource_id),
+            request_id,
+            device(),
+            history,
+        )
+    };
+
+    for (request_id, bound) in [(71, 0), (72, RECORDED_AT.get())] {
+        let record: AgentApprovalInspectResult = answered(
+            exchange(
+                &mut daemon,
+                inspect(request_id, resource_id, reach(Some(bound), &[])),
+            )
+            .await,
+        );
+        assert_eq!(record.resource_id, resource_id);
+        assert_eq!(record.recorded_at, RECORDED_AT);
+        assert_eq!(record.decoding.source_bytes.as_slice(), frame.as_slice());
+        assert_eq!(record.decoding.projection.decisions, offered());
+    }
+
+    let unknown = refusal(exchange(&mut daemon, inspect(73, absent, reach(Some(0), &[]))).await);
+    assert_eq!(unknown.code, ErrorCode::StaleSession);
+    for (request_id, history) in [
+        (74, reach(Some(RECORDED_AT.get() + 1), &[])),
+        (75, reach(None, &[])),
+    ] {
+        let withheld =
+            refusal(exchange(&mut daemon, inspect(request_id, resource_id, history)).await);
+        assert_eq!(withheld.code, ErrorCode::StaleSession, "{request_id}");
+        assert_eq!(
+            shape(&withheld, resource_id, &host),
+            shape(&unknown, absent, &host),
+            "a record outside the scope answers exactly as one this host does not hold"
+        );
+        for carried in ["kalareach.codex", "session/request_permission", "allow"] {
+            assert!(
+                !withheld.message.contains(carried),
+                "the refusal carries nothing of the record: {}",
+                withheld.message
+            );
+        }
+    }
+}
+
+/// A grant's named approvals are upstream text identifiers, and an upstream's identifier does not
+/// pick out one recorded request: two connections both call their first request `1`. So no name a
+/// grant carries excepts a broker's record from the bound. A pending record older than the bound
+/// stays withheld even when the grant names its upstream identifier and its resource's own text;
+/// the control is the same grant reaching back far enough, which reads it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_broker_record_past_the_bound_stays_withheld_whatever_text_the_grant_names() {
+    let host = host().await;
+    let resource_id = offer(&host, &request_frame(11, 0));
+    let mut daemon = daemon(&host).await;
+    let resource_text = resource_id.to_string();
+    let names = ["11", resource_text.as_str()];
+    let inspect = |request_id: u64, history: HistoryScope| {
+        scoped(
+            Method::AgentApprovalInspect,
+            &params(&host, instance(), resource_id),
+            request_id,
+            device(),
+            history,
+        )
+    };
+
+    let withheld = refusal(
+        exchange(
+            &mut daemon,
+            inspect(81, reach(Some(RECORDED_AT.get() + 1), &names)),
+        )
+        .await,
+    );
+    assert_eq!(withheld.code, ErrorCode::StaleSession, "{withheld:?}");
+    assert_eq!(
+        host.service
+            .broker()
+            .decoding(resource_id)
+            .expect("the ledger reads")
+            .map(|entry| entry.upstream_request_id),
+        Some(UpstreamRequestId::new("11").expect("an identifier")),
+        "the grant names the record's own upstream identifier"
+    );
+
+    let record: AgentApprovalInspectResult =
+        answered(exchange(&mut daemon, inspect(82, reach(Some(0), &names))).await);
+    assert_eq!(record.state, PendingState::Pending);
+    assert_eq!(record.resource_id, resource_id);
+}
+
+/// The scope is decided before the size of the answer: a record outside the scope is answered as
+/// unknown however large it is, so its size does not say that it exists. The same record inside
+/// the scope is refused with both sizes, as before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_oversized_record_outside_the_scope_answers_as_unknown() {
+    let host = host().await;
+    let large = offer(&host, &request_frame(11, 100 * 1024));
+    let mut daemon = daemon_receiving(
+        &host,
+        kr_protocol::hello::ReceiveLimits {
+            max_control_frame_len: U64::new(64 * 1024),
+            ..kr_protocol::hello::ReceiveLimits::default()
+        },
+    )
+    .await;
+    let inspect = |request_id: u64, history: HistoryScope| {
+        scoped(
+            Method::AgentApprovalInspect,
+            &params(&host, instance(), large),
+            request_id,
+            device(),
+            history,
+        )
+    };
+
+    let outside = refusal(
+        exchange(
+            &mut daemon,
+            inspect(91, reach(Some(RECORDED_AT.get() + 1), &[])),
+        )
+        .await,
+    );
+    assert_eq!(outside.code, ErrorCode::StaleSession, "{outside:?}");
+    assert!(
+        !outside.message.contains(&(64 * 1024).to_string()),
+        "the refusal says nothing about the record's size: {}",
+        outside.message
+    );
+
+    let inside = refusal(exchange(&mut daemon, inspect(92, reach(Some(0), &[]))).await);
+    assert_eq!(inside.code, ErrorCode::InvalidArgument, "{inside:?}");
+    assert!(inside.message.contains(&(64 * 1024).to_string()));
+}
+
+/// A worker states, in its answer to a hello, that it reads the history scope a forwarded read
+/// carries, which is what a daemon reads before it sends one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_worker_states_that_it_reads_a_forwarded_scope() {
+    let host = host().await;
+    let client = within(
+        "a local connection",
+        LocalClient::connect(&host.endpoint, LocalClientKind::Controller, build()),
+    )
+    .await
+    .expect("connects");
+    assert!(
+        kr_protocol::local::reads_history_scopes(&client.acknowledgement().capabilities),
+        "stated: {:?}",
+        client.acknowledgement().capabilities
+    );
 }
