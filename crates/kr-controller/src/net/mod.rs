@@ -2090,7 +2090,6 @@ pub(crate) mod tests {
 
         // A daemon started afterwards, with the clock still wound back, decides from that floor.
         drop(controller);
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let controller = daemon(&temp).await;
         let refused = controller
             .decide_for_device(&expiring, &expiring_record, listing(&temp, now))
@@ -2895,7 +2894,6 @@ pub(crate) mod tests {
         );
 
         drop(controller);
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let controller = daemon(&temp).await;
         let refused = controller
             .decide_for_device(&lasting, &lasting_record, listing(&temp, now))
