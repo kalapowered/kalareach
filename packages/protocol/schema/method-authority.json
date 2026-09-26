@@ -2180,7 +2180,8 @@
       "history_filter": "named_current_resources",
       "idempotency": "idempotent_read",
       "ingress": [
-        "local_ipc"
+        "local_ipc",
+        "paired_device"
       ],
       "method": "agent.approval.inspect",
       "name": "agent.approval.inspect",

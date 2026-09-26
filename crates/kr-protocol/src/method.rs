@@ -839,11 +839,10 @@ methods! {
 
     // Section 11 asks for the publisher and the original request of an interpreted approval to be
     // open to inspection. The answer is the retained record of what the decoder read and offered,
-    // so it meets the history filter as a named current resource does. It is served on the local
-    // socket alone: a paired device's history scope does not travel with a forwarded read, and
-    // nothing narrower than the whole record could be answered without it.
+    // so it meets the history filter as a named current resource does. A paired device's read
+    // carries its grant's history scope to the session's worker, which holds the record to it.
     AgentApprovalInspect = "agent.approval.inspect", AgentState,
-    effect: Read, ingress: [LocalIpc], rights: [req(SessionView)],
+    effect: Read, ingress: [LocalIpc, PairedDevice], rights: [req(SessionView)],
     selectors: [Session, ApplicationInstance],
     history: NamedCurrentResources, capability: NO_CAPABILITY, freshness: CurrentAuthority,
     confirmation: None, idempotency: READ,

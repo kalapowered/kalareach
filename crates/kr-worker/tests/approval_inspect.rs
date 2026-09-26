@@ -1009,7 +1009,12 @@ async fn a_record_larger_than_the_peers_frame_is_refused_with_its_size() {
         &host
             .service
             .broker()
-            .inspect_approval(&params(&host, instance(), large))
+            .inspect_approval(
+                &params(&host, instance(), large),
+                &kr_worker::history_filter::HistoryFilter::new(
+                    kr_worker::history_filter::ViewerScope::owner(),
+                ),
+            )
             .expect("the broker reads the record"),
     )
     .expect("the record encodes")
