@@ -32,6 +32,12 @@ use kr_protocol::session::{
 #[path = "../../kr-controller/tests/teardown/mod.rs"]
 mod teardown;
 
+#[path = "../../../tests/perf/src/record.rs"]
+mod record;
+
+/// The record this suite's figures are kept in, under `KR_TEST_ARTIFACTS_DIR`.
+const RECORD: &str = "kr-worker-performance.md";
+
 /// How many idle sessions the memory requirement names.
 const IDLE_SESSIONS: usize = 20;
 
@@ -609,36 +615,6 @@ fn total<T: std::iter::Sum>(
         .sum()
 }
 
-/// Returns the one-, five- and fifteen-minute load averages, or says it could not read them.
-///
-/// A resource figure is about a machine under conditions. The script around this measurement records
-/// the load either side of the whole command, setup and cleanup included; this reads it at the two
-/// edges of the processor window itself, which is the interval the figure is an average over. It is
-/// a condition rather than a reading the figure is made of, so a host that will not report it says
-/// so among the conditions instead of losing the measurement.
-fn load_average() -> String {
-    let reading = std::fs::read_to_string("/proc/loadavg")
-        .ok()
-        .and_then(|text| first_three(&text))
-        .or_else(|| {
-            let output = std::process::Command::new("sysctl")
-                .args(["-n", "vm.loadavg"])
-                .output()
-                .ok()?;
-            first_three(&String::from_utf8_lossy(&output.stdout))
-        });
-    reading.unwrap_or_else(|| "unread".to_owned())
-}
-
-/// Returns the first three numbers of a load-average reading, in whichever form the host printed it.
-fn first_three(text: &str) -> Option<String> {
-    let text = text
-        .trim()
-        .trim_matches(|character| character == '{' || character == '}');
-    let reading: Vec<&str> = text.split_whitespace().take(3).collect();
-    (reading.len() == 3).then(|| reading.join(" "))
-}
-
 /// What the idle measurement established.
 struct Idle {
     cores: f64,
@@ -728,12 +704,14 @@ async fn idle(host: &Host, owned: &mut Owned) -> Result<Idle, String> {
     // The daemon is this test process.
     let daemon = std::process::id();
 
+    // The host is read at the two edges of the processor window itself, which is the interval the
+    // figure is an average over.
     let started = Instant::now();
-    let entering = load_average();
+    let window = record::Window::open();
     let before = each(&workers, daemon, processor_seconds)?;
     tokio::time::sleep(IDLE_WINDOW).await;
     let after = each(&workers, daemon, processor_seconds)?;
-    let leaving = load_average();
+    let conditions = window.close();
     let elapsed = started.elapsed().as_secs_f64();
     // Per process, because a total that missed its bound does not say what spent the time. A
     // reading that went backwards is an identifier that is no longer the process it was, and a
@@ -774,41 +752,54 @@ async fn idle(host: &Host, owned: &mut Owned) -> Result<Idle, String> {
     largest.sort_by(|left, right| right.1.total_cmp(&left.1));
     let resident = total(&workers, daemon, resident_kib)?;
 
-    println!("KR-PERF-003 measurement");
     let grid = kr_protocol::session::INVISIBLE_DEFAULT_DIMENSIONS;
-    println!(
-        "  conditions: {IDLE_SESSIONS} idle sessions, {ATTACHED_VIEWS} attached views, a release \
-         build, no application running; each session holds an allocated canonical grid of {}x{} \
-         with its scrollback cache",
+    let mut lines = conditions.lines();
+    lines.push(format!(
+        "  measurement       {IDLE_SESSIONS} idle sessions and {ATTACHED_VIEWS} attached views, no \
+         application running; each session holds an allocated canonical grid of {}x{} with its \
+         scrollback cache",
         grid.columns.get(),
         grid.rows.get()
-    );
-    println!("  processor: {cores:.5} of one core averaged over {elapsed:.0} seconds");
-    println!("  load average at the edges of that window: {entering} entering, {leaving} leaving");
-    println!(
-        "  processor time: {used:.3} s in all over {elapsed:.1} s: {in_hosts:.3} s across {hosts} \
+    ));
+    lines.push(format!(
+        "  processor         {cores:.5} of one core averaged over {elapsed:.0} seconds, against \
+         {IDLE_CORE_FRACTION}"
+    ));
+    lines.push(format!(
+        "  processor time    {used:.3} s in all over {elapsed:.1} s: {in_hosts:.3} s across {hosts} \
          session hosts, {in_roots:.3} s across {roots} root shells, and {in_daemon:.3} s in \
          {daemons} daemon, which is this measurement's own process and also holds the \
          {ATTACHED_VIEWS} views' client ends"
-    );
-    println!(
-        "  the processes that spent the most: {}",
+    ));
+    lines.push(format!(
+        "  spent the most    {}",
         largest
             .iter()
             .take(5)
             .map(|&(pid, seconds)| format!("{} {pid} {seconds:.3} s", kind(pid)))
             .collect::<Vec<_>>()
             .join(", ")
-    );
-    println!(
-        "  resident: {resident} KiB across {} processes (each session's worker and its root shell) \
-         and the daemon",
+    ));
+    lines.push(format!(
+        "  resident          {resident} KiB across {} processes (each session's worker and its \
+         root shell) and the daemon, against {RESIDENT_BOUND_KIB} KiB",
         workers.len()
+    ));
+    lines.push(
+        "  not measured      the whole product's memory with adapters and a description model \
+         active"
+            .to_owned(),
     );
-    println!(
-        "  not measured: the whole-product figure with adapters and a model active, which belongs \
-         to the tasks that add them"
-    );
+    lines.push(format!(
+        "  verdict           {}",
+        if cores < IDLE_CORE_FRACTION && resident < RESIDENT_BOUND_KIB {
+            "the target is met on this host"
+        } else {
+            "the target is not met on this host"
+        }
+    ));
+    // Before anything is asserted, so a run whose target failed keeps the figure.
+    record::report(RECORD, "KR-PERF-003 idle local terminal resources", &lines);
     // The views hold connections to the workers. They go before the sessions are closed.
     drop(views);
     Ok(Idle { cores, resident })
@@ -845,29 +836,59 @@ async fn attach(host: &Host, owned: &mut Owned) -> Result<Duration, String> {
     // Both presentations are measured. A terminal of the session's own size is handed the stream
     // directly; one of any other size is drawn a rendering of the canonical grid, and a person
     // waits for the screen either way.
+    let window = record::Window::open();
     let direct = attach_samples(host, created, Dimensions::new(120, 40)).await;
     let projected = attach_samples(host, created, Dimensions::new(80, 24)).await;
+    let conditions = window.close();
 
-    println!("KR-PERF-004 measurement");
-    println!(
-        "  conditions: a local attachment to a live session at 120x40, a release build, measured \
-         from the connection to the moment a person could look at the screen: the connection, the \
-         worker's proof, the attachment, the subscription, and the screen itself arriving, \
-         decoding and being made ready to look at. A terminal of the session's own size reaches \
-         that when bytes arrive that place the cursor, which is how a restoration ends; a \
-         projected one reaches it when the last row page of its snapshot arrives, the client \
-         library installs the screen and paints it, because a client holding part of a screen is \
-         holding no screen and a screen nobody has drawn is not one anybody can look at. Writing \
-         those bytes to a physical terminal, and that terminal's own render, are outside this \
-         figure: there is no terminal here."
+    let complete = direct.len() == 5 && projected.len() == 5;
+    let slowest = direct.iter().chain(projected.iter()).max().copied();
+    let mut lines = conditions.lines();
+    lines.push(
+        "  measurement       a local attachment to a live session at 120x40, from the connection \
+         to the moment a person could look at the screen: the connection, the worker's proof, the \
+         attachment, the subscription, and the screen itself arriving, decoding and being made \
+         ready to look at. A terminal of the session's own size reaches that when bytes arrive \
+         that place the cursor, which is how a restoration ends; a projected one reaches it when \
+         the last row page of its snapshot arrives, the client library installs the screen and \
+         paints it, because a client holding part of a screen is holding no screen and a screen \
+         nobody has drawn is not one anybody can look at. Writing those bytes to a physical \
+         terminal, and that terminal's own render, are outside this figure: there is no terminal \
+         here."
+            .to_owned(),
     );
-    println!(
-        "  direct, a terminal of the session's own size: {}",
+    lines.push(format!(
+        "  direct            {} (a terminal of the session's own size)",
         report(&direct)
-    );
-    println!(
-        "  projected, a terminal of 80x24 onto the same session: {}",
+    ));
+    lines.push(format!(
+        "  projected         {} (a terminal of 80x24 onto the same session)",
         report(&projected)
+    ));
+    lines.push(format!(
+        "  slowest           {} against {:.3} ms",
+        slowest.map_or_else(
+            || "none".to_owned(),
+            |slowest| format!("{:.3} ms", slowest.as_secs_f64() * 1000.0)
+        ),
+        ATTACH_BOUND.as_secs_f64() * 1000.0
+    ));
+    lines.push(format!(
+        "  verdict           {}",
+        match slowest {
+            _ if !complete => {
+                "this measurement is not valid: not every attachment reached a screen, so the \
+                 target is neither met nor missed here"
+            }
+            Some(slowest) if slowest < ATTACH_BOUND => "the target is met on this host",
+            _ => "the target is not met on this host",
+        }
+    ));
+    // Before anything is asserted, so a run whose target failed keeps the figure.
+    record::report(
+        RECORD,
+        "KR-PERF-004 local attach to a usable screen",
+        &lines,
     );
     if direct.len() != 5 {
         return Err("every direct attachment reached a screen".to_owned());
@@ -875,12 +896,7 @@ async fn attach(host: &Host, owned: &mut Owned) -> Result<Duration, String> {
     if projected.len() != 5 {
         return Err("every projected attachment reached a screen".to_owned());
     }
-    direct
-        .iter()
-        .chain(projected.iter())
-        .max()
-        .copied()
-        .ok_or_else(|| "samples".to_owned())
+    slowest.ok_or_else(|| "samples".to_owned())
 }
 
 /// Closes every session this measurement created and waits for the daemon to record each closure.

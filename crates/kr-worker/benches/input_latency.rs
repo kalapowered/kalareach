@@ -50,6 +50,12 @@ use kr_worker::runtime::SessionRuntime;
 use kr_worker::service::{ServiceBinding, WorkerService};
 use kr_worker::session::{Session, SessionConfig};
 
+#[path = "../../../tests/perf/src/record.rs"]
+mod record;
+
+/// The record these measurements' figures are kept in, under `KR_TEST_ARTIFACTS_DIR`.
+const RECORD: &str = "kr-worker-input.md";
+
 /// The bound section 27 puts on the ninety-fifth percentile.
 const P95_BOUND: Duration = Duration::from_millis(5);
 
@@ -466,25 +472,6 @@ fn percentile(sorted: &[Duration], fraction: f64) -> Duration {
     sorted[rank.max(1).min(sorted.len()) - 1]
 }
 
-fn load_average() -> String {
-    std::process::Command::new("sh")
-        .args([
-            "-c",
-            "sysctl -n vm.loadavg 2>/dev/null | tr -d '{}' || cut -d' ' -f1-3 /proc/loadavg",
-        ])
-        .output()
-        .ok()
-        .and_then(|output| String::from_utf8(output.stdout).ok())
-        .map(|text| text.trim().to_owned())
-        .unwrap_or_else(|| "unknown".to_owned())
-}
-
-fn processors() -> String {
-    std::thread::available_parallelism()
-        .map(|count| count.to_string())
-        .unwrap_or_else(|_| "unknown".to_owned())
-}
-
 /// KR-PERF-001: added local ordinary-input forwarding latency.
 #[test]
 #[ignore = "a measurement rather than a test; scripts/performance.sh runs it"]
@@ -498,34 +485,48 @@ fn added_input_forwarding_latency() {
     let (samples, closed) = outcome;
     // The measurement first, because a failure in it is the interesting one and the closure has
     // already been performed by the time either is looked at.
-    let samples = samples.unwrap_or_else(|failure| panic!("the measurement: {failure}"));
+    let (samples, conditions) =
+        samples.unwrap_or_else(|failure| panic!("the measurement: {failure}"));
     closed.unwrap_or_else(|failure| panic!("the sessions this measurement created: {failure}"));
 
     let p95 = percentile(&samples, 0.95);
     let p99 = percentile(&samples, 0.99);
-    println!("KR-PERF-001 measurement");
-    println!(
-        "  conditions: a release build on a host of {} logical processors, with \
-         {BACKGROUND_SESSIONS} live shells and {BACKGROUND_VIEWS} attached views; {SAMPLES} \
-         single-byte writes from a client on the session's own local socket, each measured to the \
-         byte arriving back at that client after the application echoed it. That is more than \
-         section 27 asks for - it includes the application's read and echo and the host's whole \
-         output path, where the section excludes the application - so it is an upper bound on the \
-         added forwarding latency rather than the figure itself. The terminal's render is outside \
-         it: nothing here draws.",
-        processors()
-    );
-    println!(
-        "  load average at the end: {}. Section 27 asks for a quiet reference host; this figure \
-         says what else the machine was doing while it was taken.",
-        load_average()
-    );
-    println!(
-        "  samples: {}, median {:?}, p95 {p95:?} (bound {P95_BOUND:?}), p99 {p99:?} (bound \
-         {P99_BOUND:?}), worst {:?}",
+    let mut lines = conditions.lines();
+    lines.push(format!(
+        "  measurement       {SAMPLES} single-byte writes from a client on the session's own \
+         local socket, each timed to the byte arriving back at that client after the application \
+         echoed it, with {BACKGROUND_SESSIONS} live shells and {BACKGROUND_VIEWS} attached views on \
+         the host. That is more than section 27 asks for - it includes the application's read and \
+         echo and the host's whole output path, where the section excludes the application - so it \
+         is an upper bound on the added forwarding latency rather than the figure itself. The \
+         terminal's render is outside it: nothing here draws."
+    ));
+    lines.push(format!(
+        "  samples           {}: median {}, p95 {}, p99 {}, worst {}",
         samples.len(),
-        percentile(&samples, 0.5),
-        samples.last().copied().unwrap_or_default()
+        milliseconds(percentile(&samples, 0.5)),
+        milliseconds(p95),
+        milliseconds(p99),
+        milliseconds(samples.last().copied().unwrap_or_default())
+    ));
+    lines.push(format!(
+        "  target            p95 below {} and p99 below {}",
+        milliseconds(P95_BOUND),
+        milliseconds(P99_BOUND)
+    ));
+    lines.push(format!(
+        "  verdict           {}",
+        if p95 < P95_BOUND && p99 < P99_BOUND {
+            "the target is met on this host"
+        } else {
+            "the target is not met on this host"
+        }
+    ));
+    // Before anything is asserted, so a run whose target failed keeps the figure.
+    record::report(
+        RECORD,
+        "KR-PERF-001 added local input forwarding latency",
+        &lines,
     );
     assert!(
         p95 < P95_BOUND,
@@ -537,8 +538,17 @@ fn added_input_forwarding_latency() {
     );
 }
 
-/// Sends the keystrokes and returns the sorted samples, plus what closing the sessions did.
-async fn measure_latency() -> (Result<Vec<Duration>, String>, Result<(), String>) {
+/// A duration as a record gives it, in milliseconds to the microsecond.
+fn milliseconds(duration: Duration) -> String {
+    format!("{:.3} ms", duration.as_secs_f64() * 1000.0)
+}
+
+/// Sends the keystrokes and returns the sorted samples and the host's conditions while they were
+/// taken, plus what closing the sessions did.
+async fn measure_latency() -> (
+    Result<(Vec<Duration>, record::Conditions), String>,
+    Result<(), String>,
+) {
     let (sessions, views) = background().await;
     let measured = hosted(ECHOES).await;
     let samples = latency_samples(&measured).await;
@@ -554,7 +564,7 @@ async fn measure_latency() -> (Result<Vec<Duration>, String>, Result<(), String>
     (samples, closed)
 }
 
-async fn latency_samples(hosted: &Hosted) -> Result<Vec<Duration>, String> {
+async fn latency_samples(hosted: &Hosted) -> Result<(Vec<Duration>, record::Conditions), String> {
     if arrival(
         &hosted.runtime,
         b"kr-ready.",
@@ -576,6 +586,7 @@ async fn latency_samples(hosted: &Hosted) -> Result<Vec<Duration>, String> {
     )
     .await?;
 
+    let window = record::Window::open();
     let mut samples = Vec::with_capacity(SAMPLES);
     for sequence in 0..SAMPLES {
         let params = InputWriteParams {
@@ -622,8 +633,9 @@ async fn latency_samples(hosted: &Hosted) -> Result<Vec<Duration>, String> {
         samples.push(elapsed);
     }
     drop(client);
+    let conditions = window.close();
     samples.sort_unstable();
-    Ok(samples)
+    Ok((samples, conditions))
 }
 
 /// One keystroke's two arrivals at the client: the host's answer to the write, and the
@@ -756,26 +768,62 @@ fn paste_prefix_recogniser_deadline() {
     let report = report.unwrap_or_else(|failure| panic!("the measurement: {failure}"));
     closed.unwrap_or_else(|failure| panic!("the session this measurement created: {failure}"));
 
-    println!("KR-PERF-002 measurement");
-    println!(
-        "  conditions: a release build, canonical bracketed paste enabled by the application, and \
-         one lone prefix per measurement with no keystroke behind it. Each figure runs from the \
-         write to the byte reaching the application, which the root program reports by echoing it, \
-         so it includes the host's deadline, the timer's wake-up, the write, that echo and this \
-         measurement's {POLL:?} polling interval. The bound is the deadline plus \
-         {RECOGNISER_TOLERANCE:?} for those."
-    );
-    println!(
-        "  load average at the end: {}. Section 27 asks for a quiet reference host; this figure \
-         says what else the machine was doing while it was taken.",
-        load_average()
-    );
+    let allowed = RECOGNISER_DEADLINE + RECOGNISER_TOLERANCE;
+    let mut lines = report.conditions.lines();
+    lines.push(format!(
+        "  measurement       canonical bracketed paste enabled by the application, and one lone \
+         prefix per measurement with no keystroke behind it. Each figure runs from the write to \
+         the byte reaching the application, which the root program reports by echoing it, so it \
+         includes the host's deadline, the timer's wake-up, the write, that echo and this \
+         measurement's {} polling interval.",
+        milliseconds(POLL)
+    ));
+    lines.push(format!(
+        "  deadline          {}, the one this host is built with, against section 27's {}",
+        milliseconds(kr_worker::input::RECOGNISER_DEADLINE),
+        milliseconds(RECOGNISER_DEADLINE)
+    ));
     for (what, held) in &report.holds {
-        println!("  {what}: held for {held:?} (deadline {RECOGNISER_DEADLINE:?})");
+        lines.push(format!(
+            "  held              {}: {what}",
+            milliseconds(*held)
+        ));
     }
-    println!(
-        "  a delimiter split across two frames: recognised once, in {:?}, with its payload kept",
-        report.split
+    lines.push(format!(
+        "  split delimiter   recognised once, in {}, with its payload kept{}",
+        milliseconds(report.split),
+        if report.paste_open_after_split {
+            ""
+        } else {
+            ", and the framer did not record the paste it opened"
+        }
+    ));
+    lines.push(format!(
+        "  bound             at least the deadline and at most {} for each hold, which allows {} \
+         for the path around the deadline",
+        milliseconds(allowed),
+        milliseconds(RECOGNISER_TOLERANCE)
+    ));
+    let met = kr_worker::input::RECOGNISER_DEADLINE == RECOGNISER_DEADLINE
+        && report
+            .holds
+            .iter()
+            .all(|(_, held)| *held >= RECOGNISER_DEADLINE && *held <= allowed)
+        && report.split <= allowed
+        && report.paste_open_after_split;
+    lines.push(format!(
+        "  verdict           {}",
+        if met {
+            "the target is met on this host"
+        } else {
+            "the target is not met on this host"
+        }
+    ));
+    // Before anything is asserted, so a run whose target failed keeps the figure.
+    record::report(
+        RECORD,
+        "KR-PERF-002 recogniser deadline for a held prefix",
+        &lines,
     );
     // The requirement's own bound, on the deadline this host is built with. It is asserted here
     // rather than inferred from a figure, because a measurement with an allowance around it cannot
@@ -785,7 +833,6 @@ fn paste_prefix_recogniser_deadline() {
         Duration::from_millis(25),
         "the recogniser's deadline is section 27's"
     );
-    let allowed = RECOGNISER_DEADLINE + RECOGNISER_TOLERANCE;
     for (what, held) in &report.holds {
         assert!(
             *held <= allowed,
@@ -817,6 +864,8 @@ struct Recogniser {
     split: Duration,
     /// Whether the framer recorded the paste that delimiter opened.
     paste_open_after_split: bool,
+    /// The host while the prefixes were measured.
+    conditions: record::Conditions,
 }
 
 async fn measure_recogniser() -> (Result<Recogniser, String>, Result<(), String>) {
@@ -839,6 +888,7 @@ async fn recogniser_samples(hosted: &Hosted) -> Result<Recogniser, String> {
         return Err("the root program never started reading".to_owned());
     }
     let (mut client, attachment_id, epoch) = controlling(hosted).await;
+    let window = record::Window::open();
     let mut sequence = 0_u64;
     let mut holds = Vec::new();
 
@@ -949,11 +999,13 @@ async fn recogniser_samples(hosted: &Hosted) -> Result<Recogniser, String> {
     // What the framer made of it, rather than only what the application received: a path that
     // forwarded the same bytes without recognising them would look identical in the output.
     let paste_open_after_split = hosted.runtime.session().paste_open();
+    let conditions = window.close();
     drop(client);
     Ok(Recogniser {
         holds,
         split,
         paste_open_after_split,
+        conditions,
     })
 }
 
