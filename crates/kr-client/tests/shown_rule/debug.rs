@@ -145,6 +145,10 @@ const PRELUDE: &[(&str, &str)] = &[
     ("Box", "std::boxed::Box"),
 ];
 
+/// What an alias's expansion writes for a parameter of the type the alias was used in, which no
+/// path can spell.
+const PARAMETER: &str = "{a parameter}";
+
 /// The primitive types whose `Debug` is a number or a switch.
 const NUMBERS: [&str; 15] = [
     "u8", "u16", "u32", "u64", "u128", "usize", "i8", "i16", "i32", "i64", "i128", "isize", "bool",
@@ -257,6 +261,8 @@ struct Debugs {
     shown_functions: BTreeSet<String>,
     /// The types whose `Debug` is their `Display`.
     as_display: BTreeSet<String>,
+    /// How many aliases are being expanded, one inside another.
+    expanding: std::cell::Cell<usize>,
 }
 
 /// Every crate under the workspace's `crates/`, by the name code gives it, and its library's root.
@@ -348,6 +354,7 @@ impl Debugs {
             shown_types: BTreeSet::new(),
             shown_functions: BTreeSet::new(),
             as_display: BTreeSet::new(),
+            expanding: std::cell::Cell::new(0),
         };
         debugs.plain = debugs
             .known
@@ -723,8 +730,9 @@ impl Debugs {
         if !punct(tokens.get(cursor), '=') {
             return;
         }
+        // The `;` that ends the item, not one inside an array's type.
         let end = (cursor..tokens.len())
-            .find(|&end| punct(tokens.get(end), ';'))
+            .find(|&end| punct(tokens.get(end), ';') && depth_between(tokens, cursor, end) == 0)
             .unwrap_or(tokens.len());
         let path = self.sources[index].defined_path(scope, &name);
         self.type_aliases.insert(
@@ -1020,16 +1028,32 @@ impl Debugs {
         carrying: &Carrying,
     ) -> Option<Why> {
         let (segments, after) = written_path(tokens);
-        let arguments: Vec<Vec<Located>> = if punct(tokens.get(after), '<') {
+        // Every argument but a lifetime, in its place, for an alias's parameters; and those that
+        // are types, for what a container holds.
+        let positional: Vec<Vec<Located>> = if punct(tokens.get(after), '<') {
             let close = angle_close(tokens, after).unwrap_or(tokens.len());
             split_commas(&tokens[after + 1..close.min(tokens.len())])
                 .into_iter()
                 .filter(|argument| {
                     !matches!(
                         argument.first().map(|located| &located.token),
-                        Some(Token::Lifetime(_) | Token::Number(_) | Token::Punct('{'))
+                        Some(Token::Lifetime(_))
                     )
                 })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let arguments: Vec<Vec<Located>> = if punct(tokens.get(after), '<') {
+            positional
+                .iter()
+                .filter(|argument| {
+                    !matches!(
+                        argument.first().map(|located| &located.token),
+                        Some(Token::Number(_) | Token::Punct('{'))
+                    )
+                })
+                .cloned()
                 .collect()
         } else {
             if after < tokens.len() {
@@ -1047,6 +1071,11 @@ impl Debugs {
         };
         if segments.len() == 1 && segments[0] == "Self" {
             return arguments_carry();
+        }
+        if segments.len() == 1 && segments[0] == PARAMETER {
+            // A parameter of the type an alias was used in: where that type is used, its
+            // argument is read there.
+            return None;
         }
         if written.generics.contains(&segments[0]) {
             // A parameter: where the type is used, its argument is read there.
@@ -1076,14 +1105,34 @@ impl Debugs {
             return None;
         }
         if let Some(alias) = self.find(&self.type_aliases, &path) {
-            let expanded = self.expand_alias(alias, written, &arguments);
-            return self.carries(&expanded, carrying);
+            let Some(expanded) = self.expand_alias(alias, written, &positional) else {
+                return Some(format!("{path}, an alias this reading cannot expand"));
+            };
+            let why = self.carries(&expanded, carrying);
+            self.expanding.set(self.expanding.get().saturating_sub(1));
+            return why;
         }
-        if self.find(&self.declared, &path).is_some() {
+        if let Some(declared) = self.find(&self.declared, &path) {
             if let Some(why) = self.carrying(carrying, &path) {
                 return Some(format!("{path}, which carries {why}"));
             }
-            return arguments_carry();
+            if positional.is_empty() || declared.derived.is_none() {
+                return arguments_carry();
+            }
+            // A generic type with a derived `Debug` is read with its arguments in place of its
+            // parameters, since an argument that is safe alone can be bytes in a sequence.
+            for member in declared.shapes.iter().flat_map(|shape| &shape.members) {
+                let Some(expanded) = self.expand_alias(&member.written, written, &positional)
+                else {
+                    return Some(format!("{path}, a generic type this reading cannot expand"));
+                };
+                let why = self.carries(&expanded, carrying);
+                self.expanding.set(self.expanding.get().saturating_sub(1));
+                if let Some(why) = why {
+                    return Some(format!("{path}, which with its arguments carries {why}"));
+                }
+            }
+            return None;
         }
         let root = path.split("::").next().unwrap_or_default();
         if self.crates.contains(root) {
@@ -1120,22 +1169,56 @@ impl Debugs {
             generics: Vec::new(),
             tokens: Vec::new(),
         };
-        self.resolve(&written, segments)
+        if let Some(path) = self.resolve(&written, segments) {
+            return Some(path);
+        }
+        let source = &self.sources[index];
+        let known = [
+            "std::fmt::Debug",
+            "kr_client::debug_as_name",
+            "kr_client::debug_fields",
+        ];
+        if let [name] = segments {
+            for visible in source.visible(scope) {
+                for (glob_scope, glob) in &source.glob_paths {
+                    let candidate = self.normal(&format!("{}::{name}", glob.join("::")));
+                    if *glob_scope == visible && known.contains(&candidate.as_str()) {
+                        return Some(candidate);
+                    }
+                }
+            }
+        }
+        // A name this reading cannot place is read as what it says it is: a trait named `Debug`
+        // is that trait, and a macro named as one of the two is that one.
+        let last = segments.last()?.as_str();
+        known
+            .iter()
+            .find(|path| path.rsplit("::").next() == Some(last))
+            .map(|path| (*path).to_owned())
     }
 
     /// A type alias as its use at `use_site` spells it: its parameters replaced by the arguments
     /// given there, each written as the full path it names at the use site, so the whole reads the
     /// same in the alias's own scope.
+    ///
+    /// `None` when an argument names a type this reading cannot place where it is written, when
+    /// the arguments do not fill the parameters, or past a depth no alias chain reaches: each is
+    /// a type this reading cannot follow, and so a carrier. While the expansion is read, the depth
+    /// it adds is held; the caller gives it back.
     fn expand_alias(
         &self,
         alias: &Written,
         use_site: &Written,
         arguments: &[Vec<Located>],
-    ) -> Written {
+    ) -> Option<Written> {
+        if self.expanding.get() >= 32 || arguments.len() != alias.generics.len() {
+            return None;
+        }
         let qualified: Vec<Vec<Located>> = arguments
             .iter()
             .map(|argument| self.qualified(use_site, argument))
-            .collect();
+            .collect::<Option<_>>()?;
+        self.expanding.set(self.expanding.get() + 1);
         let mut tokens = Vec::with_capacity(alias.tokens.len());
         for (at, located) in alias.tokens.iter().enumerate() {
             let standalone = !(at > 0 && punct(alias.tokens.get(at - 1), ':'))
@@ -1156,17 +1239,18 @@ impl Debugs {
                 _ => tokens.push(located.clone()),
             }
         }
-        Written {
+        Some(Written {
             source: alias.source,
             scope: alias.scope,
             generics: Vec::new(),
             tokens,
-        }
+        })
     }
 
-    /// `tokens` with each path in them written as the full path it names at `written`'s place; a
-    /// path this reading cannot place is left as it is, and stays one it cannot place.
-    fn qualified(&self, written: &Written, tokens: &[Located]) -> Vec<Located> {
+    /// `tokens` with each path in them written as the full path it names at `written`'s place, and
+    /// a parameter of the type written there as [`PARAMETER`]; `None` when a path cannot be placed
+    /// there, since read anywhere else it could name another type.
+    fn qualified(&self, written: &Written, tokens: &[Located]) -> Option<Vec<Located>> {
         let mut out = Vec::with_capacity(tokens.len());
         let mut at = 0;
         while at < tokens.len() {
@@ -1179,30 +1263,34 @@ impl Debugs {
             }
             let (segments, after) = written_path(&tokens[at..]);
             let line = tokens[at].line;
-            match self.resolve(written, &segments) {
-                Some(path) if !written.generics.contains(&segments[0]) => {
-                    for (position, segment) in path.split("::").enumerate() {
-                        if position > 0 {
-                            out.push(Located {
-                                token: Token::Punct(':'),
-                                line,
-                            });
-                            out.push(Located {
-                                token: Token::Punct(':'),
-                                line,
-                            });
-                        }
-                        out.push(Located {
-                            token: Token::Ident(segment.to_owned()),
-                            line,
-                        });
-                    }
+            if segments.len() == 1 && written.generics.contains(&segments[0]) {
+                out.push(Located {
+                    token: Token::Ident(PARAMETER.to_owned()),
+                    line,
+                });
+                at += after.max(1);
+                continue;
+            }
+            let path = self.resolve(written, &segments)?;
+            for (position, segment) in path.split("::").enumerate() {
+                if position > 0 {
+                    out.push(Located {
+                        token: Token::Punct(':'),
+                        line,
+                    });
+                    out.push(Located {
+                        token: Token::Punct(':'),
+                        line,
+                    });
                 }
-                _ => out.extend(tokens[at..at + after.max(1)].iter().cloned()),
+                out.push(Located {
+                    token: Token::Ident(segment.to_owned()),
+                    line,
+                });
             }
             at += after.max(1);
         }
-        out
+        Some(out)
     }
 
     /// Whether a type written at `written`'s place is one byte, through any aliases.
@@ -1214,6 +1302,14 @@ impl Debugs {
         let arguments: Vec<Vec<Located>> = if punct(tokens.get(after), '<') {
             let close = angle_close(tokens, after).unwrap_or(tokens.len());
             split_commas(&tokens[after + 1..close.min(tokens.len())])
+                .into_iter()
+                .filter(|argument| {
+                    !matches!(
+                        argument.first().map(|located| &located.token),
+                        Some(Token::Lifetime(_))
+                    )
+                })
+                .collect()
         } else if after == tokens.len() {
             Vec::new()
         } else {
@@ -1222,8 +1318,12 @@ impl Debugs {
         match self.resolve(written, &segments).as_deref() {
             Some("prim::u8") => true,
             Some(path) => self.find(&self.type_aliases, path).is_some_and(|alias| {
-                let expanded = self.expand_alias(alias, written, &arguments);
-                self.is_byte(&expanded, &expanded.tokens)
+                self.expand_alias(alias, written, &arguments)
+                    .is_some_and(|expanded| {
+                        let byte = self.is_byte(&expanded, &expanded.tokens);
+                        self.expanding.set(self.expanding.get().saturating_sub(1));
+                        byte
+                    })
             }),
             None => false,
         }
@@ -2566,6 +2666,36 @@ fn each_debug_that_can_print_text_is_named_with_its_place() {
             "formats std::string::String",
         ),
         (
+            "the Debug trait through a glob",
+            "use std::fmt::*;\npub struct Planted(String);\nimpl Debug for Planted {\n    fn fmt(&self, formatter: &mut Formatter<'_>) -> Result {\n        formatter.debug_tuple(\"Planted\").field(&self.0).finish()\n    }\n}\n",
+            5,
+            "a Debug written by hand that formats",
+        ),
+        (
+            "a Debug macro through a glob",
+            "use kr_client::*;\npub struct Planted {\n    pub text: String,\n}\ndebug_fields!(Planted { text });\n",
+            5,
+            "a Debug written by hand that formats",
+        ),
+        (
+            "an alias's argument that cannot be placed where it is written",
+            "mod aliases {\n    type Item = u64;\n    pub type Identity<T> = T;\n}\nmod values {\n    pub type Item = String;\n}\nuse values::*;\n#[derive(Debug)]\npub struct Planted(aliases::Identity<Item>);\n",
+            9,
+            "an alias this reading cannot expand",
+        ),
+        (
+            "an alias whose type argument follows a const one",
+            "type T = u64;\ntype Pair<const N: usize, T> = ([u16; N], T);\n#[derive(Debug)]\npub struct Planted(Pair<1, String>);\n",
+            3,
+            "std::string::String",
+        ),
+        (
+            "a generic type whose parameter is the element of a byte sequence",
+            "#[derive(Debug)]\npub struct Wrapper<T> {\n    pub items: Vec<T>,\n}\n#[derive(Debug)]\npub struct Planted {\n    pub wrapped: Wrapper<u8>,\n}\n",
+            5,
+            "which with its arguments carries bytes",
+        ),
+        (
             "a name that is not the program's words",
             "pub struct Planted {\n    pub name: &'static str,\n}\nimpl std::fmt::Debug for Planted {\n    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n        formatter.debug_struct(self.name).finish()\n    }\n}\n",
             6,
@@ -2596,7 +2726,7 @@ fn what_the_debug_rule_allows_is_not_named() {
                 kr_client::debug_as_name!(Store);\n\
                 pub struct Named {\n    pub id: u64,\n    pub text: String,\n}\n\
                 kr_client::debug_fields!(Named { id });\n\
-                #[derive(Debug)]\npub struct Holding {\n    pub store: Store,\n    pub named: Named,\n    pub mode: Option<u8>,\n}\n\
+                #[derive(Debug)]\npub struct Holding {\n    pub store: Store,\n    pub named: Named,\n    pub mode: Option<u8>,\n    pub pairs: Pairs,\n}\ntype Pair<const N: usize, T> = ([u16; N], T);\ntype Pairs = Pair<1, u64>;\n\
                 impl std::fmt::Debug for Said {\n    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n        match self {\n            Self::Text(text) => write!(formatter, \"Text({} bytes)\", text.len()),\n            Self::Count(count) => write!(formatter, \"Count({count})\"),\n        }\n    }\n}\n";
     let findings = debug_findings_in("debug-allowed", text, OTHER_CONTROL);
     assert!(findings.is_empty(), "{findings:?}");
