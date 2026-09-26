@@ -28,7 +28,7 @@
 //! | [`pairing`] | Pairing from a device's side: the room socket, the invitation reader, both candidate modes, the paired hosts and the owner's confirmations |
 //! | [`projection`] | The screen a projected client holds, and the renderer that draws it |
 //! | [`session`] | Requests, receipts, events and the action window |
-//! | [`shown`] | The one type of text a diagnostic may show, and the only ways input becomes it |
+//! | [`mod@shown`] | The one type of text a diagnostic may show, and the only ways input becomes it |
 //! | [`sync`] | Encrypted settings sync, its compare-and-swap client and its privacy hook |
 //! | [`cursors`] | Cursors, receipts and the order state is restored in |
 //! | [`reconnect`] | The reconnect loop and what it refuses to carry across |
@@ -54,12 +54,8 @@ pub mod encoder;
 pub mod error;
 pub mod ipc;
 pub mod pairing;
-/// The projected screen a client holds, and the renderer that paints it into a terminal.
-///
-/// The screen is held the same way on every system. Painting it, which measures text with the
-/// pinned Unicode width model, is present when the `terminal` feature is on, which is the default;
-/// a client on a system with no local terminal takes this library without it and draws the held
-/// screen itself.
+// The module documents itself. A doc comment here as well would be joined to its own, and the links
+// in that would then be read from this crate's root, where they name nothing.
 pub mod projection;
 pub mod reconnect;
 pub mod recovery;
