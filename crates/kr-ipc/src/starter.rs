@@ -2262,10 +2262,19 @@ mod tests {
         );
         let lapsed = claim(1_000);
         leave_claim(&environment, &lapsed).expect("a second claim is left");
-        take_claim(&environment, &boot(1), 5_000)
+        // A starter stops at the first claim it may act on; one that looks after it takes the
+        // lapsed claim and acts on nothing.
+        let taken = take_claim(&environment, &boot(1), 5_000)
             .expect("the directory is read")
             .expect("the live claim is taken");
+        assert_eq!(taken.claim(), &left);
         assert!(claim_taken(&environment, left.request), "the live one");
+        assert!(
+            take_claim(&environment, &boot(1), 5_000)
+                .expect("the directory is read")
+                .is_none(),
+            "nothing else may be acted on"
+        );
         assert!(
             claim_taken(&environment, lapsed.request),
             "and the lapsed one, which was taken and not acted on"
