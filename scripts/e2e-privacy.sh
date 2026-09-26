@@ -497,6 +497,12 @@ if [ "$mode" = deployment ]; then
   echo "  sync: every request identity ended and every collection emptied; the service keeps each identity's receipt for 30 days, a content-free record of each removed object's place, spent nonces and the ledger's record of the run's installation"
 elif [ "$stopped" -eq 1 ]; then
   echo "  nothing: every process this run started stopped, and nothing was sent anywhere but this machine"
+  # The gateway reaches its provider only by first asking the stub for a token, which it never gets.
+  if [ -f "$evidence/provider.log" ]; then
+    asked="$(grep -c ' POST /token ' "$evidence/provider.log" || true)"
+    other="$(grep -c -v ' POST /token ' "$evidence/provider.log" || true)"
+    echo "  the push provider's token endpoint, this run's stub, refused ${asked:-0} requests and received ${other:-0} others"
+  fi
 else
   failed=$((failed + 1))
   echo "  a process this run started did not stop; see $evidence/deployment.log"
