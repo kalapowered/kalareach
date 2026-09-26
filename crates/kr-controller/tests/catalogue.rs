@@ -2695,6 +2695,23 @@ mod native_bridges {
             .expect("readable")
     }
 
+    /// What the daemon records for release 0.3.0 on Windows, where this host applies no native
+    /// bridge: the recipe is refused before anything is written, nothing is applied, and the
+    /// refusal is on record with its reason.
+    fn refused_on_windows(host: &Host, digest: &str) {
+        assert!(bridge_facts(host, digest).is_none(), "nothing is applied");
+        let reports = host.module.native_bridges().reports().expect("reads");
+        assert_eq!(reports.len(), 1, "{reports:?}");
+        assert_eq!(reports[0].state, "refused", "{reports:?}");
+        assert!(
+            reports[0]
+                .notes
+                .iter()
+                .any(|note| note.contains("does not apply or remove a native bridge on Windows")),
+            "{reports:?}"
+        );
+    }
+
     /// The directory as the recipe leaves it, from what it held before.
     fn applied(
         before: &BTreeMap<String, Option<Vec<u8>>>,
@@ -2737,6 +2754,8 @@ mod native_bridges {
     /// KR-REQ-11.42: an installation the owner confirmed applies its release's recipe once the
     /// installation has committed; a refused confirmation installs nothing and writes nothing; a
     /// disable and an enable leave the registration; a removal restores Claude Code's directory.
+    /// On Windows the installation commits and its recipe is refused and recorded, and nothing is
+    /// written in Claude Code's directory at any step.
     #[tokio::test]
     async fn kr_req_11_42_a_confirmed_installation_applies_the_recipe_and_its_removal_undoes_it() {
         let site = Site::new();
@@ -2761,26 +2780,35 @@ mod native_bridges {
 
         let installed: wire::PluginInstallResult = ok(install(&host, &digest, true).await);
         assert_eq!(installed.plugin.package_digest, digest);
+        let placed = if cfg!(windows) {
+            before.clone()
+        } else {
+            applied(&before, &host.working)
+        };
         assert_eq!(
             site.tree(),
-            applied(&before, &host.working),
+            placed,
             "the recipe's files and key, and nothing else"
         );
-        let facts = bridge_facts(&host, &digest).expect("applied");
-        assert_eq!(facts.application, "claude-code");
-        assert_eq!(
-            facts.surfaces,
-            [BridgeSurface::Hook, BridgeSurface::Channel]
-                .into_iter()
-                .collect()
-        );
-        assert_eq!(facts.forwarder, site.root.join("bin/kr-hook"));
+        if cfg!(windows) {
+            refused_on_windows(&host, &digest);
+        } else {
+            let facts = bridge_facts(&host, &digest).expect("applied");
+            assert_eq!(facts.application, "claude-code");
+            assert_eq!(
+                facts.surfaces,
+                [BridgeSurface::Hook, BridgeSurface::Channel]
+                    .into_iter()
+                    .collect()
+            );
+            assert_eq!(facts.forwarder, site.root.join("bin/kr-hook"));
+        }
 
         for method in [Method::PluginDisable, Method::PluginEnable] {
             let _: wire::PluginEnableResult = ok(plugin_change(&host, method).await);
             assert_eq!(
                 site.tree(),
-                applied(&before, &host.working),
+                placed,
                 "{}: the registration stays with the installation",
                 method.as_str()
             );
@@ -2803,7 +2831,8 @@ mod native_bridges {
     }
 
     /// KR-REQ-11.42: a grant that withdraws the bridge's capability takes the registration out,
-    /// and the installation stays.
+    /// and the installation stays. On Windows there is no registration to take out: the recipe
+    /// was refused and recorded when the installation committed.
     #[tokio::test]
     async fn kr_req_11_42_withdrawing_the_bridge_grant_takes_the_registration_out() {
         let site = Site::new();
@@ -2811,7 +2840,12 @@ mod native_bridges {
         let digest = synchronised(&host).await;
         let before = site.tree();
         let _: wire::PluginInstallResult = ok(install(&host, &digest, true).await);
-        assert_ne!(site.tree(), before);
+        if cfg!(windows) {
+            assert_eq!(site.tree(), before);
+            refused_on_windows(&host, &digest);
+        } else {
+            assert_ne!(site.tree(), before);
+        }
 
         let narrower: Vec<String> = GRANT
             .iter()
@@ -2857,7 +2891,7 @@ mod native_bridges {
     }
 
     /// KR-REQ-11.42: a restarted daemon reads the record back, and changes nothing that is already
-    /// in place.
+    /// in place. On Windows the record it reads back is the refusal.
     #[tokio::test]
     async fn kr_req_11_42_a_restart_reads_the_record_back() {
         let site = Site::new();
@@ -2865,16 +2899,24 @@ mod native_bridges {
         let digest = synchronised(&host).await;
         let _: wire::PluginInstallResult = ok(install(&host, &digest, true).await);
         let after = site.tree();
-        let before_restart = bridge_facts(&host, &digest).expect("applied");
+        let before_restart = bridge_facts(&host, &digest);
+        if cfg!(windows) {
+            refused_on_windows(&host, &digest);
+        } else {
+            assert!(before_restart.is_some(), "applied");
+        }
 
         restarted(&mut host, &site);
 
-        assert_eq!(bridge_facts(&host, &digest), Some(before_restart));
+        assert_eq!(bridge_facts(&host, &digest), before_restart);
+        if cfg!(windows) {
+            refused_on_windows(&host, &digest);
+        }
         assert_eq!(site.tree(), after, "nothing was written again");
     }
 
     /// An application that stops part way is not reported as applied, and the daemon's next start
-    /// finishes it.
+    /// finishes it. On Windows the next start refuses the recipe again and writes nothing.
     #[tokio::test]
     async fn an_application_stopped_part_way_is_finished_when_the_daemon_starts_again() {
         let site = Site::new();
@@ -2894,17 +2936,26 @@ mod native_bridges {
             "not reported as applied"
         );
         restarted(&mut host, &site);
-        assert_eq!(
-            site.tree(),
-            applied(&before, &host.working),
-            "finished at the start"
-        );
-        assert!(bridge_facts(&host, &digest).is_some());
+        if cfg!(windows) {
+            assert_eq!(
+                site.tree(),
+                before,
+                "nothing is written at the start either"
+            );
+            refused_on_windows(&host, &digest);
+        } else {
+            assert_eq!(
+                site.tree(),
+                applied(&before, &host.working),
+                "finished at the start"
+            );
+            assert!(bridge_facts(&host, &digest).is_some());
+        }
     }
 
     /// With no signed record establishing the executable's version, which is what the catalogue's
     /// signed records give today, a confirmed installation commits and its recipe places nothing,
-    /// and says why.
+    /// and says why. On Windows the reason is the platform's, which is checked first.
     #[tokio::test]
     async fn a_release_without_signed_version_evidence_places_nothing() {
         let site = Site {
@@ -2919,6 +2970,10 @@ mod native_bridges {
 
         assert_eq!(installed.plugin.package_digest, digest);
         assert_eq!(site.tree(), before, "nothing was placed");
+        if cfg!(windows) {
+            refused_on_windows(&host, &digest);
+            return;
+        }
         let reports = host.module.native_bridges().reports().expect("reads");
         assert_eq!(reports.len(), 1, "{reports:?}");
         assert_eq!(reports[0].state, "refused");
