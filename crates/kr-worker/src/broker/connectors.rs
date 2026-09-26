@@ -442,15 +442,24 @@ const FORWARDER: &str = "kr-hook";
 /// Returns the application an integration's flags register the forwarder's hook for, where they
 /// register one.
 ///
-/// Each flag that is a JSON document is read for the objects that start the forwarder, by the rule
-/// the host applies to a native bridge's files: `command` is `kr-hook` and `args` is the
-/// application and the registration. A launch's flags may register only a hook, and only for
-/// `own`, the package's own name; the forwarder started any other way is refused.
+/// The forwarder may appear in a flag in one form only, the one the host applies to a native
+/// bridge's files: a JSON object whose `command` is exactly `kr-hook` and whose `args` are the
+/// application and `hook`. A launch's flags register only a hook, and only for `own`, the package's
+/// own name. Any other mention of the forwarder, a shell command that runs it, a path to it, an
+/// argument naming it or a flag that is not JSON, is refused, so no flag starts it in a way the
+/// launch's bridge does not account for.
 fn registered_hook(flags: &[String], own: &str) -> Result<Option<String>, String> {
     let mut applications = BTreeSet::new();
     for flag in flags {
-        if let Ok(document) = serde_json::from_str::<serde_json::Value>(flag) {
-            forwarder_invocations(&document, &mut applications)?;
+        match serde_json::from_str::<serde_json::Value>(flag) {
+            Ok(document) => forwarder_invocations(&document, &mut applications)?,
+            Err(_) if flag.contains(FORWARDER) => {
+                return Err(format!(
+                    "names {FORWARDER} in {flag:?}, and a launch starts it only as a hook's own \
+                     command with its arguments"
+                ));
+            }
+            Err(_) => {}
         }
     }
     if let Some(other) = applications.iter().find(|application| *application != own) {
@@ -467,7 +476,9 @@ fn forwarder_invocations(
 ) -> Result<(), String> {
     match value {
         serde_json::Value::Object(members) => {
-            if members.get("command").and_then(serde_json::Value::as_str) == Some(FORWARDER) {
+            let registration =
+                members.get("command").and_then(serde_json::Value::as_str) == Some(FORWARDER);
+            if registration {
                 let arguments = members.get("args").and_then(serde_json::Value::as_array);
                 let words: Vec<&str> = arguments
                     .map(|arguments| {
@@ -488,7 +499,11 @@ fn forwarder_invocations(
                     }
                 }
             }
-            for nested in members.values() {
+            for (member, nested) in members {
+                // The registration's own command is the one place the forwarder's name may be.
+                if registration && member == "command" {
+                    continue;
+                }
                 forwarder_invocations(nested, applications)?;
             }
         }
@@ -496,6 +511,12 @@ fn forwarder_invocations(
             for item in items {
                 forwarder_invocations(item, applications)?;
             }
+        }
+        serde_json::Value::String(text) if text.contains(FORWARDER) => {
+            return Err(format!(
+                "names {FORWARDER} in {text:?}, and a launch starts it only as a hook's own \
+                 command with its arguments"
+            ));
         }
         _ => {}
     }

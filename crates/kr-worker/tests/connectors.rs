@@ -251,14 +251,14 @@ fn a_command_the_package_does_not_recognise_is_refused() {
 
 /// The inline hooks of a `--settings` flag that start the forwarder with `arguments`.
 fn hooks_starting(arguments: &[&str]) -> String {
-    serde_json::json!({
-        "hooks": {
-            "SessionStart": [{
-                "hooks": [{ "type": "command", "command": "kr-hook", "args": arguments, "timeout": 5 }]
-            }]
-        }
-    })
-    .to_string()
+    hooks_running(&serde_json::json!({
+        "type": "command", "command": "kr-hook", "args": arguments, "timeout": 5
+    }))
+}
+
+/// The inline hooks of a `--settings` flag whose one hook is `hook`.
+fn hooks_running(hook: &serde_json::Value) -> String {
+    serde_json::json!({ "hooks": { "SessionStart": [{ "hooks": [hook] }] } }).to_string()
 }
 
 /// KR-REQ-12.22: Qoder CLI's launch flags register the forwarder's hook for Qoder CLI, so the
@@ -318,12 +318,47 @@ fn kr_req_12_22_qoder_cli_s_flags_give_its_launch_a_hook_bridge_on_this_installa
 
 /// A launch's bridge is the package's own and comes from one place: flags that start the forwarder
 /// for another application, for a channel or with other arguments are refused, and so are flags
-/// that start it beside the native bridge the package installs.
+/// that start it beside the native bridge the package installs. The forwarder appears in a flag
+/// only as a hook's own command with its arguments: a shell command that runs it, a path to it and
+/// a flag that is not JSON but names it are refused too, beside a native bridge or not.
 #[test]
 fn flags_that_start_the_forwarder_for_another_application_a_channel_or_a_second_bridge_are_refused()
 {
     let store = Store::new("flags");
+    let shell_form = hooks_running(&serde_json::json!({
+        "type": "command", "command": "kr-hook qoder-cli hook", "timeout": 5
+    }));
+    let path_form = hooks_running(&serde_json::json!({
+        "type": "command", "command": "/opt/kalareach/bin/kr-hook", "args": ["qoder-cli", "hook"]
+    }));
+    let qoder_flags = |flags: &[&str]| fixture::Shape {
+        integration: Some(fixture::declaration("qodercli", flags, &[])),
+        ..fixture::Shape::qoder_cli()
+    };
     for (shape, what) in [
+        (
+            qoder_flags(&["--settings", &shell_form]),
+            "a shell command that runs the forwarder",
+        ),
+        (
+            qoder_flags(&["--settings", &path_form]),
+            "a path to the forwarder",
+        ),
+        (
+            qoder_flags(&["--hook-command=kr-hook qoder-cli hook"]),
+            "a flag that is not JSON and names the forwarder",
+        ),
+        (
+            fixture::Shape {
+                integration: Some(fixture::declaration(
+                    "claude",
+                    &["--settings", &shell_form],
+                    &[],
+                )),
+                ..fixture::Shape::claude_code()
+            },
+            "a shell command that runs the forwarder beside the native bridge",
+        ),
         (
             fixture::Shape {
                 integration: Some(fixture::declaration(
