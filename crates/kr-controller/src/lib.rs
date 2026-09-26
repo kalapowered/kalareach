@@ -55,6 +55,8 @@ pub mod service;
 pub mod sharing;
 pub mod singleton;
 pub mod supervision;
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
 pub mod transfer;
 pub mod voice;
 

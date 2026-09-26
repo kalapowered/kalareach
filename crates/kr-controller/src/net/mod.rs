@@ -1813,32 +1813,16 @@ pub(crate) mod tests {
         .await
     }
 
-    /// How long a daemon is given to take over an environment a daemon before it held.
-    ///
-    /// A daemon lets go of its environment once nothing of it is left, and its own tasks can still
-    /// hold it for a moment after the test has let it go: one asking its registry a question, or
-    /// reading its clocks. A replacement started at once can therefore find the environment held.
-    /// That is a liveness condition: what these tests assert is that the replacement takes the
-    /// environment over, not how soon the last reference goes.
-    const ENVIRONMENT_HANDOVER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
-
     /// Starts a daemon with `start`, and again while a daemon this test let go still holds the
-    /// environment, until [`ENVIRONMENT_HANDOVER_DEADLINE`]. Any other failure fails the test.
+    /// environment ([`crate::testing::taken_over`]). Any other failure fails the test.
     pub(crate) async fn started<F, S>(start: F) -> Arc<Controller>
     where
-        F: Fn() -> S,
+        F: FnMut() -> S,
         S: std::future::Future<Output = crate::error::Result<Arc<Controller>>>,
     {
-        let begun = std::time::Instant::now();
-        loop {
-            match start().await {
-                Ok(controller) => return controller,
-                Err(crate::error::ControllerError::AlreadyRunning { .. })
-                    if begun.elapsed() < ENVIRONMENT_HANDOVER_DEADLINE => {}
-                Err(error) => panic!("the daemon starts: {error}"),
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
+        crate::testing::taken_over(start)
+            .await
+            .unwrap_or_else(|error| panic!("the daemon starts: {error}"))
     }
 
     /// Clocks this test moves by hand: a continuous clock, and a wall clock that reads what the
