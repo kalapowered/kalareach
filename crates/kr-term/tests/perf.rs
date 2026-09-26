@@ -34,6 +34,23 @@ fn processors() -> usize {
     std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
 }
 
+/// The lines every record starts with: the build and the host it ran on.
+fn host_lines() -> Vec<String> {
+    vec![
+        format!(
+            "  build             {}",
+            if cfg!(debug_assertions) {
+                "debug"
+            } else {
+                "release"
+            }
+        ),
+        format!("  host              {HOST_OS} {HOST_ARCH}"),
+        format!("  processors        {}", processors()),
+        format!("  processor         {}", processor_model()),
+    ]
+}
+
 /// What one rate measurement reports: the host it ran on, every pass, the figure and the verdict.
 ///
 /// One shape for both streams, so the retained record and the step's output say the same thing in
@@ -47,25 +64,15 @@ fn rate_lines(
 ) -> Vec<String> {
     let best = fastest(runs);
     let (lane, session, cache) = peaks(passes);
-    let mut lines = vec![
-        format!(
-            "  build             {}",
-            if cfg!(debug_assertions) {
-                "debug"
-            } else {
-                "release"
-            }
-        ),
-        format!("  host              {HOST_OS} {HOST_ARCH}"),
-        format!("  processors        {}", processors()),
-        format!("  processor         {}", processor_model()),
+    let mut lines = host_lines();
+    lines.extend([
         format!("  stream            {} bytes", stream.len()),
         format!("  chunk             {CHUNK_BYTES} bytes"),
         format!(
             "  warm-up pass      {:.3} s, {:.2} MiB/s, discarded",
             warm.elapsed_secs, warm.mib_per_second
         ),
-    ];
+    ]);
     for (pass, run) in runs.iter().enumerate() {
         lines.push(format!(
             "  pass {pass}            {:.3} s, {:.2} MiB/s",
@@ -646,10 +653,6 @@ fn a_read_costs_the_same_whatever_the_history_holds() {
             .lane_mut()
             .drain(LaneGate::default(), 8 * 1024, 0);
     }
-    assert!(
-        evicted,
-        "the deep phase has to be evicting, and {fills} reads did not make it so"
-    );
     let deep_rows = deep_engine.grid().scrollback_rows();
     let deep_bytes = deep_engine.grid().history_bytes();
     let mut deep = f64::MAX;
@@ -667,15 +670,42 @@ fn a_read_costs_the_same_whatever_the_history_holds() {
         deep = deep.min(elapsed / READS as f64);
     }
 
-    println!("KR-PERF-007 read cost against history depth");
-    println!("  read              {} bytes", read.len());
-    println!("  reads to fill     {fills}");
-    println!("  shallow history   at most {shallow_rows} rows");
-    println!("  shallow read      {:.4} ms", shallow * 1_000.0);
-    println!("  deep history      {deep_rows} rows, {deep_bytes} of {limit} bytes");
-    println!("  deep read         {:.4} ms", deep * 1_000.0);
-    println!("  ratio             {:.2}", deep / shallow);
+    // What decides the verdict is also what the assertions below check, so the record says whether
+    // the figure stands before a failed assertion can end the run.
+    let verdict = if !evicted {
+        format!("not valid: the deep phase was not evicting after {fills} reads")
+    } else if deep_rows <= shallow_rows * 10 {
+        format!(
+            "not valid: the two phases do not differ in depth, {deep_rows} rows against at most \
+             {shallow_rows}"
+        )
+    } else if deep_bytes <= limit * 9 / 10 {
+        "not valid: the deep phase is not at its bound".to_owned()
+    } else if deep > shallow * TOLERANCE {
+        "not met on this host: the cost of a read grows with the history".to_owned()
+    } else {
+        "the target is met on this host".to_owned()
+    };
+    let mut lines = host_lines();
+    lines.extend([
+        format!("  read              {} bytes", read.len()),
+        format!("  reads to fill     {fills}"),
+        format!("  shallow history   at most {shallow_rows} rows"),
+        format!("  shallow read      {:.4} ms", shallow * 1_000.0),
+        format!("  deep history      {deep_rows} rows, {deep_bytes} of {limit} bytes"),
+        format!("  deep read         {:.4} ms", deep * 1_000.0),
+        format!(
+            "  ratio             {:.2}, against at most {TOLERANCE:.1}",
+            deep / shallow
+        ),
+        format!("  verdict           {verdict}"),
+    ]);
+    report("KR-PERF-007 read cost against history depth", &lines);
 
+    assert!(
+        evicted,
+        "the deep phase has to be evicting, and {fills} reads did not make it so"
+    );
     assert!(
         deep_rows > shallow_rows * 10,
         "the two phases have to differ in depth: {deep_rows} rows against at most {shallow_rows}"
@@ -758,15 +788,29 @@ fn a_read_reads_as_many_rows_as_the_geometry_has() {
     }
     let deep_read = deep.grid().rows_read() - filled;
 
-    println!("KR-PERF-007 rows read against history depth");
-    println!("  reads             {READS}");
-    println!("  shallow history   at most {shallow_rows} rows");
-    println!("  shallow rows read {shallow_read}");
-    println!(
-        "  deep history      {deep_rows} rows, {} bytes",
-        deep.grid().history_bytes()
-    );
-    println!("  deep rows read    {deep_read}");
+    let verdict = if deep_rows <= shallow_rows * 10 {
+        format!(
+            "not valid: the two sessions do not differ in depth, {deep_rows} rows against at most \
+             {shallow_rows}"
+        )
+    } else if deep_read > shallow_read.saturating_mul(TOLERANCE) {
+        "not met on this host: the rows a read reads grow with the history".to_owned()
+    } else {
+        "the target is met on this host".to_owned()
+    };
+    let mut lines = host_lines();
+    lines.extend([
+        format!("  reads             {READS}"),
+        format!("  shallow history   at most {shallow_rows} rows"),
+        format!("  shallow rows read {shallow_read}"),
+        format!(
+            "  deep history      {deep_rows} rows, {} bytes",
+            deep.grid().history_bytes()
+        ),
+        format!("  deep rows read    {deep_read}, against at most {TOLERANCE} times the shallow"),
+        format!("  verdict           {verdict}"),
+    ]);
+    report("KR-PERF-007 rows read against history depth", &lines);
 
     assert!(
         deep_rows > shallow_rows * 10,
