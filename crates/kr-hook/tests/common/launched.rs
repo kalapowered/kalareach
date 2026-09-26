@@ -192,7 +192,11 @@ impl Application {
             .wait()
             .map(|_| ())
             .map_err(|error| format!("the application could not be collected: {error}"));
-        group.and(collected)
+        match (group, collected) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(failure), Ok(())) | (Ok(()), Err(failure)) => Err(failure),
+            (Err(group), Err(collected)) => Err(format!("{group}, and {collected}")),
+        }
     }
 }
 
