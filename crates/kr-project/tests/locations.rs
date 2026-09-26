@@ -3267,25 +3267,201 @@ const NOT_EXERCISED: i32 = 77;
 #[cfg(target_os = "linux")]
 const IN_NAMESPACE: &str = "KR_PROJECT_LOCATION_GRAFTS";
 
-/// Another mount put at a directory for as long as the value lives: a disk image this account
-/// attaches on macOS, a bind mount inside this account's own mount namespace on Linux.
+/// Another mount put at a directory: a disk image this account attaches on macOS, a bind mount
+/// inside this account's own mount namespace on Linux. The case takes it off with
+/// [`Self::remove`] before it ends.
+///
+/// Dropped without that, as when the case fails first, it still takes the mount off, and a
+/// removal that fails then is reported rather than passed over: on macOS an image left attached
+/// keeps its helper serving it, and that helper holds the volume the image lives on.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-struct Graft(std::path::PathBuf);
+struct Graft {
+    /// The disk image on macOS, and what is bound at `at` on Linux.
+    source: std::path::PathBuf,
+    at: std::path::PathBuf,
+    removed: bool,
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+impl Graft {
+    fn new(source: std::path::PathBuf, at: &Path) -> Self {
+        Self {
+            source,
+            at: at.to_path_buf(),
+            removed: false,
+        }
+    }
+
+    /// Takes the mount off.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`take_off`] reports when the mount does not come off.
+    fn remove(mut self) -> Result<(), String> {
+        self.removed = true;
+        take_off(&self.source, &self.at)
+    }
+}
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 impl Drop for Graft {
     fn drop(&mut self) {
-        #[cfg(target_os = "macos")]
-        let _ = std::process::Command::new("/usr/bin/hdiutil")
-            .args(["detach", "-force", "-quiet"])
-            .arg(&self.0)
-            .status();
-        #[cfg(target_os = "linux")]
-        let _ = std::process::Command::new("umount")
-            .arg("-l")
-            .arg(&self.0)
-            .status();
+        if self.removed {
+            return;
+        }
+        if let Err(report) = take_off(&self.source, &self.at) {
+            // A second panic while the first unwinds would abort the whole test binary, so a case
+            // that has already failed says it here instead.
+            if std::thread::panicking() {
+                eprintln!("{report}");
+            } else {
+                panic!("{report}");
+            }
+        }
     }
+}
+
+/// Takes the mount at `at` off: detaches the disk image `source` from it.
+///
+/// # Errors
+///
+/// Returns why it did not come off: what `hdiutil` said, the image and the mount point, and every
+/// process `hdiutil info` still shows serving the image.
+#[cfg(target_os = "macos")]
+fn take_off(source: &Path, at: &Path) -> Result<(), String> {
+    let said = match std::process::Command::new("/usr/bin/hdiutil")
+        .args(["detach", "-force"])
+        .arg(at)
+        .output()
+    {
+        Ok(output) if output.status.success() => return Ok(()),
+        Ok(output) => format!(
+            "hdiutil ended with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+        Err(error) => format!("hdiutil could not be run: {error}"),
+    };
+    Err(format!(
+        "the disk image {} did not detach from {} ({said}); {}",
+        source.display(),
+        at.display(),
+        serving(source)
+    ))
+}
+
+/// Says which processes `hdiutil info` shows serving `image`, by number and name.
+#[cfg(target_os = "macos")]
+fn serving(image: &Path) -> String {
+    // The listing names an image by its resolved path: the temporary directory is reached
+    // through a link.
+    let resolved = std::fs::canonicalize(image).unwrap_or_else(|_| image.to_path_buf());
+    let listed = match std::process::Command::new("/usr/bin/hdiutil")
+        .arg("info")
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        }
+        Ok(output) => return format!("hdiutil info ended with {}", output.status),
+        Err(error) => return format!("hdiutil info could not be run: {error}"),
+    };
+    let mut current = None;
+    let mut processes = Vec::new();
+    for line in listed.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        match key.trim() {
+            "image-path" => current = Some(std::path::PathBuf::from(value.trim())),
+            "process ID" if current.as_deref() == Some(resolved.as_path()) => {
+                let pid = value.trim();
+                let name = std::process::Command::new("/bin/ps")
+                    .args(["-o", "comm=", "-p", pid])
+                    .output()
+                    .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+                    .unwrap_or_default();
+                processes.push(format!("{pid} ({name})"));
+            }
+            _ => {}
+        }
+    }
+    if processes.is_empty() {
+        "hdiutil info shows no process serving it".to_owned()
+    } else {
+        format!(
+            "hdiutil info shows it still served by process {}",
+            processes.join(", ")
+        )
+    }
+}
+
+/// Takes the mount at `at` off: the bind mount of `source` there, inside this namespace.
+///
+/// # Errors
+///
+/// Returns why it did not come off: what `umount` said, with what was bound and where.
+#[cfg(target_os = "linux")]
+fn take_off(source: &Path, at: &Path) -> Result<(), String> {
+    let said = match std::process::Command::new("umount")
+        .arg("-l")
+        .arg(at)
+        .output()
+    {
+        Ok(output) if output.status.success() => return Ok(()),
+        Ok(output) => format!(
+            "umount ended with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+        Err(error) => format!("umount could not be run: {error}"),
+    };
+    Err(format!(
+        "the bind mount of {} at {} did not come off ({said})",
+        source.display(),
+        at.display()
+    ))
+}
+
+/// Takes a case's grafts off before it ends, every one of them, and fails the case with the
+/// report of each that did not come off.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn take_off_all<const N: usize>(grafts: [Graft; N]) {
+    let reports: Vec<String> = grafts
+        .into_iter()
+        .filter_map(|graft| graft.remove().err())
+        .collect();
+    assert!(reports.is_empty(), "{}", reports.join("; "));
+}
+
+/// A mount that does not come off is reported, naming what was mounted and where, rather than
+/// passed over without a word. The removal here is of a mount point with nothing mounted on it,
+/// which fails as any failed removal does.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_graft_that_does_not_come_off_is_reported_by_name() {
+    let root = tempfile::tempdir().expect("a directory");
+    let at = root.path().join("nothing-mounted");
+    std::fs::create_dir(&at).expect("a mount point");
+    let source = root.path().join("never-mounted");
+    let report =
+        take_off(&source, &at).expect_err("a mount point with nothing on it stays as it is");
+    assert!(
+        report.contains(&source.display().to_string())
+            && report.contains(&at.display().to_string()),
+        "the report names what was mounted and where: {report}"
+    );
+}
+
+/// The same failure, met by a graft the case did not take off, fails the case with the report.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+#[should_panic(expected = "did not")]
+fn a_graft_dropped_before_it_comes_off_fails_with_the_report() {
+    let root = tempfile::tempdir().expect("a directory");
+    let at = root.path().join("nothing-mounted");
+    std::fs::create_dir(&at).expect("a mount point");
+    drop(Graft::new(root.path().join("never-mounted"), &at));
 }
 
 /// Puts another mount at `at`, or returns `None` where this host will not.
@@ -3316,7 +3492,7 @@ fn graft(at: &Path, scratch: &Path) -> Option<Graft> {
         .status();
     attached
         .is_ok_and(|status| status.success())
-        .then(|| Graft(at.to_path_buf()))
+        .then(|| Graft::new(image, at))
 }
 
 /// Puts another mount at `at`, or returns `None` where this host will not.
@@ -3341,7 +3517,7 @@ fn bind(source: &Path, at: &Path) -> Option<Graft> {
         .arg(at)
         .status()
         .is_ok_and(|status| status.success())
-        .then(|| Graft(at.to_path_buf()))
+        .then(|| Graft::new(source.to_path_buf(), at))
 }
 
 /// Ends a case whose host would not put another mount inside the location, as a failure rather
@@ -3442,7 +3618,7 @@ fn bind_mount_and_cross_device_grafts_are_refused() {
             221,
         );
 
-        let Some(_grafted) = graft(&sources.join("grafted"), &scratch) else {
+        let Some(grafted) = graft(&sources.join("grafted"), &scratch) else {
             return no_graft_here();
         };
         ordinary_repository(&sources.join("grafted"), "repo");
@@ -3456,7 +3632,7 @@ fn bind_mount_and_cross_device_grafts_are_refused() {
         assert!(refusal.to_string().contains("mount"), "{refusal}");
 
         let metadata = ordinary_repository(&sources, "metadata");
-        let Some(_objects) = graft(&metadata.join(".git/objects"), &scratch) else {
+        let Some(objects) = graft(&metadata.join(".git/objects"), &scratch) else {
             return no_graft_here();
         };
         let refusal = clone_into(
@@ -3472,7 +3648,7 @@ fn bind_mount_and_cross_device_grafts_are_refused() {
         {
             let patterned = ordinary_repository(&sources, "patterned");
             std::fs::write(patterned.join(".git/info/exclude"), b"").expect("a pattern file");
-            let Some(_exclude) = graft(&patterned.join(".git/info/exclude"), &scratch) else {
+            let Some(exclude) = graft(&patterned.join(".git/info/exclude"), &scratch) else {
                 return no_graft_here();
             };
             let refusal = clone_into(
@@ -3483,12 +3659,14 @@ fn bind_mount_and_cross_device_grafts_are_refused() {
             )
             .expect_err("a pattern file on another mount refuses the repository");
             assert!(refusal.to_string().contains("info/exclude"), "{refusal}");
+            take_off_all([exclude]);
         }
         assert!(
             names_in(&projects).is_empty(),
             "nothing was created: {:?}",
             names_in(&projects)
         );
+        take_off_all([objects, grafted]);
     });
 }
 
@@ -3532,7 +3710,7 @@ fn recursive_removal_refuses_a_grafted_mount() {
         .0
         .expect("a workspace");
         let tree = workspaces.join("ws");
-        let Some(_graft) = graft(&tree.join("grafted"), &scratch) else {
+        let Some(grafted) = graft(&tree.join("grafted"), &scratch) else {
             return no_graft_here();
         };
         std::fs::write(tree.join("grafted/kept"), b"elsewhere\n").expect("a file over there");
@@ -3554,5 +3732,6 @@ fn recursive_removal_refuses_a_grafted_mount() {
             b"elsewhere\n",
             "nothing on the other mount was reached"
         );
+        take_off_all([grafted]);
     });
 }
