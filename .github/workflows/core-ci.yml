@@ -116,17 +116,19 @@ jobs:
 
       # Documentation is built with warnings refused, so a link that resolves to nothing, or to an
       # item its reader cannot see, fails here rather than going unnoticed. These are the crates
-      # whose documentation builds without one.
+      # whose documentation builds without one. The client library is built a second time without
+      # its default features, as a phone builds it.
       - name: Documentation without warnings
         if: ${{ !cancelled() }}
         env:
           RUSTDOCFLAGS: "-D warnings"
-        run: >-
-          cargo doc --locked --no-deps
-          -p companion-platform -p kr-attention -p kr-automation -p kr-backup-integration
-          -p kr-cbor -p kr-e2e-agents -p kr-flush -p kr-hook -p kr-pairing -p kr-plugin-host
-          -p kr-plugin-runtime -p kr-plugin-sdk -p kr-plugin-service -p kr-privacy-integration
-          -p kr-sync-integration -p kr-transport
+        run: |
+          cargo doc --locked --no-deps \
+            -p companion-platform -p kr-attention -p kr-automation -p kr-backup-integration \
+            -p kr-cbor -p kr-client -p kr-e2e-agents -p kr-flush -p kr-hook -p kr-pairing \
+            -p kr-plugin-host -p kr-plugin-runtime -p kr-plugin-sdk -p kr-plugin-service \
+            -p kr-privacy-integration -p kr-sync-integration -p kr-transport
+          cargo doc --locked --no-deps -p kr-client --no-default-features
 
       # The project service encloses every Git invocation in a boundary the kernel applies, and what
       # that boundary is differs by platform. This runs its tests again on their own and prints what
