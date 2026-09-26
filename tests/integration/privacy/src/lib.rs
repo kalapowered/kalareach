@@ -35,6 +35,9 @@
 //! days, a content-free record of each removed object's place in the order, spent nonces, and the
 //! ledger's record of the installation the run key made.
 
+pub mod giveback;
+pub mod held;
+
 pub use kr_sync_integration::{
     Deployment, GIVE_BACK, ORIGIN_VARIABLE, REQUIRE_VARIABLE, RunKey, fresh_uuid, now_ms, proved,
 };
