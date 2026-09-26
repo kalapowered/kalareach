@@ -420,6 +420,28 @@ test.describe('the raw terminal', () => {
     await page.screenshot({ path: shot('terminal-04.04'), fullPage: true })
   })
 
+  test("draws the session's cursor where its screen has it, before anyone clicks into the view", async ({
+    page
+  }) => {
+    await openSession(page)
+    await page.getByRole('tab', { name: 'Terminal' }).click()
+    const surface = page.getByTestId('terminal-surface')
+    await expect(surface).toContainText('cargo test -p kr-client')
+    // The scripted screen's cursor is on its sixth line, just after the prompt's "$ ".
+    await expect(surface.locator('.xterm-cursor')).toHaveCount(1)
+    const line = surface.locator('.xterm-rows > div').nth(5)
+    await expect(line.locator('.xterm-cursor')).toHaveCount(1)
+    const column = await line.evaluate((row) => {
+      let cells = 0
+      for (const child of Array.from(row.children)) {
+        if (child.classList.contains('xterm-cursor')) return cells
+        cells += (child.textContent ?? '').length
+      }
+      return -1
+    })
+    expect(column).toBe(2)
+  })
+
   test('gives the wheel to the application in control mode and takes it in view mode', async ({
     page
   }) => {

@@ -3,9 +3,10 @@
  *
  * The screen arrives as cells: lines of pieces, each with its column and its rendition. What the
  * renderer is given is written here from those typed values alone: this page's own fixed sequences
- * (a full reset, autowrap off, the cursor placed, the rendition as numbers, the cursor's shape and
- * visibility) and each piece's text with every control character replaced. No host byte reaches the
- * renderer's parser, so nothing a session printed can make it answer a query or change a mode.
+ * (a full reset, the normal buffer, autowrap off, the cursor placed, the rendition as numbers, the
+ * cursor's shape and visibility) and each piece's text with every control character replaced. No
+ * host byte reaches the renderer's parser, so nothing a session printed can make it answer a query
+ * or change a mode.
  */
 
 import type { ITheme, Terminal } from '@xterm/xterm'
@@ -21,6 +22,16 @@ const ESC = '\u{1b}'
 
 /** Resets the renderer: every mode, the pen, the screen and the cursor. */
 const FULL_RESET = `${ESC}c`
+
+/**
+ * DEC private mode 1047 off: the normal buffer, which a full reset has already selected.
+ *
+ * It changes nothing on the screen. It is written because xterm.js draws no cursor in a renderer
+ * that has had no focus, no key and no switch of buffers, and this counts as the switch: without it
+ * the session's cursor would show only after the person clicked into the view, and each zoom step
+ * makes a new renderer.
+ */
+const NORMAL_BUFFER = `${ESC}[?1047l`
 
 /** DEC private mode 7 off: nothing drawn can wrap onto the next line or scroll the screen. */
 const AUTOWRAP_OFF = `${ESC}[?7l`
@@ -136,7 +147,7 @@ function steadyCursor(style: number): number {
  * clears whatever an earlier write left, in the order the writes were made.
  */
 export function frameOf(screen: TerminalScreen): string {
-  let out = FULL_RESET + AUTOWRAP_OFF + CURSOR_HIDDEN
+  let out = FULL_RESET + NORMAL_BUFFER + AUTOWRAP_OFF + CURSOR_HIDDEN
   screen.lines.forEach((line, index) => {
     for (const piece of line.pieces) {
       const text = withinCells(drawableText(piece.text), count(piece.cells))
@@ -162,7 +173,8 @@ export function frameOf(screen: TerminalScreen): string {
  */
 export function paint(terminal: Terminal, screen: TerminalScreen | null): void {
   if (screen === null) {
-    terminal.write(FULL_RESET)
+    // A full reset leaves the cursor shown or hidden as the last screen left it.
+    terminal.write(FULL_RESET + CURSOR_HIDDEN)
     return
   }
   const columns = Math.max(1, count(screen.window.columns))
