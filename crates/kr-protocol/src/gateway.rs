@@ -787,7 +787,10 @@ pub enum RichRejection {
 pub struct DownstreamRequestId {
     /// The connection the identifier belongs to.
     pub connection: GatewayConnectionId,
-    /// The identifier exactly as the upstream wrote it.
+    /// The upstream's identifier, as this host's JSON form of its value.
+    ///
+    /// Two spellings of one value are one identifier here, which is what a correlation key has to
+    /// be. The upstream's own spelling of it stays in the frame it arrived in.
     pub upstream: UpstreamRequestId,
 }
 
