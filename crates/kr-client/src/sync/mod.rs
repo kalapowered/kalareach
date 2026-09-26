@@ -291,8 +291,18 @@ impl ClientSelection {
 /// is not: dropping it clears it, on every path out. It covers the buffers this crate allocates
 /// itself; the intermediate value trees the encoder builds belong to the crate that owns the
 /// encoder, and the cryptography reference records that.
-#[derive(Debug)]
+
 pub(crate) struct Zeroising(pub Vec<u8>);
+
+impl std::fmt::Debug for Zeroising {
+    /// How many bytes it holds. Never the bytes, which are a plaintext.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Zeroising")
+            .field("0", &self.0.len())
+            .finish()
+    }
+}
 
 impl Drop for Zeroising {
     fn drop(&mut self) {
