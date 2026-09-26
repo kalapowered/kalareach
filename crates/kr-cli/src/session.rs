@@ -546,17 +546,22 @@ struct Ownership {
 /// every one of them: a move or a return carries this terminal's newest size too, and its answer
 /// can name this terminal as the owner of a session that is still at another size. `looking_at` is
 /// the size this terminal is looking at, when it has one; an owner looking at another size than the
-/// session's owes the resize that puts the session at its own.
+/// session's owes the resize that puts the session at its own, unless one of the owner's resizes
+/// still in flight, whose sizes `resizing` holds, already asks for it: an answer written before that
+/// resize was applied still carries the old size, and a second resize to the same size would quote
+/// the epoch the first one moves on from, and be refused.
 fn ownership(
     geometry: &kr_protocol::attachment::GeometryState,
     attachment_id: kr_protocol::ids::AttachmentId,
     looking_at: Option<Dimensions>,
+    resizing: &[Dimensions],
 ) -> Ownership {
     let owns = geometry.owner.as_ref() == Some(&attachment_id);
     Ownership {
         epoch: geometry.epoch,
         owns,
-        resize: looking_at.filter(|size| owns && *size != geometry.dimensions),
+        resize: looking_at
+            .filter(|size| owns && *size != geometry.dimensions && !resizing.contains(size)),
     }
 }
 
@@ -1174,12 +1179,25 @@ struct Attached {
 enum Outstanding {
     /// Input at this sequence number.
     Input(u64),
-    /// A size change this terminal made as the size owner.
-    Resize,
+    /// A size change this terminal made as the size owner, to this size.
+    Resize(Dimensions),
     /// A viewport report, which `WindowReports` holds.
     Window,
     /// A fresh screen this terminal asked for after a resynchronisation marker.
     Resubscribe,
+}
+
+/// The sizes this terminal's resizes as the owner asked for, of those still waiting for an answer.
+fn resizes_in_flight(
+    outstanding: &std::collections::BTreeMap<kr_protocol::ids::RequestId, Outstanding>,
+) -> Vec<Dimensions> {
+    outstanding
+        .values()
+        .filter_map(|what| match what {
+            Outstanding::Resize(dimensions) => Some(*dimensions),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Runs the attachment's input, output and connection in one loop.
@@ -1527,7 +1545,7 @@ async fn drive(
                             // A size report is a report, not an insistence. Another attachment may
                             // own the size, and the answer then says so; the terminal is shown that
                             // size rather than taking it, and the attachment carries on.
-                            (Outstanding::Resize, outcome) => match outcome {
+                            (Outstanding::Resize(_), outcome) => match outcome {
                                 kr_protocol::envelope::Outcome::Ok(value) => {
                                     if let Ok(result) = value
                                         .to_typed::<kr_protocol::attachment::GeometryResult>()
@@ -1606,7 +1624,12 @@ async fn drive(
                                             u64::from(size.rows),
                                         )
                                     });
-                                let owner = ownership(&result.geometry, attachment_id, looking_at);
+                                let owner = ownership(
+                                    &result.geometry,
+                                    attachment_id,
+                                    looking_at,
+                                    &resizes_in_flight(&outstanding),
+                                );
                                 geometry_epoch = owner.epoch;
                                 owns_geometry = owner.owns;
                                 if let Some(dimensions) = owner.resize {
@@ -1629,7 +1652,7 @@ async fn drive(
                                     {
                                         return AttachOutcome::Disconnected;
                                     }
-                                    outstanding.insert(request_id, Outstanding::Resize);
+                                    outstanding.insert(request_id, Outstanding::Resize(dimensions));
                                 }
                             }
                             (
@@ -1720,7 +1743,7 @@ async fn drive(
                 {
                     return AttachOutcome::Disconnected;
                 }
-                outstanding.insert(request_id, Outstanding::Resize);
+                outstanding.insert(request_id, Outstanding::Resize(dimensions));
             }
             bytes = input.recv() => {
                 let Some(bytes) = bytes else {
@@ -2025,8 +2048,9 @@ async fn wait_for_resize(_resized: &mut Option<&mut WindowChanges>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        Answer, AttachOutcome, Heard, Ownership, SCROLL_BACK_KEY, SCROLL_FORWARD_KEY, Sending,
-        Subscriptions, WindowReports, landed, ownership, scroll_keys, scroll_step, scrolled,
+        Answer, AttachOutcome, Heard, Outstanding, Ownership, SCROLL_BACK_KEY, SCROLL_FORWARD_KEY,
+        Sending, Subscriptions, WindowReports, landed, ownership, resizes_in_flight, scroll_keys,
+        scroll_step, scrolled,
     };
     use kr_client::shown::Shown;
     use kr_protocol::attachment::ViewportPosition;
@@ -2862,7 +2886,7 @@ mod tests {
         // A return that carried this terminal's newer size, answered after the owner left and this
         // terminal inherited the size at the one it reported before.
         assert_eq!(
-            ownership(&geometry(this, 80, 24), this, Some(size(100, 30))),
+            ownership(&geometry(this, 80, 24), this, Some(size(100, 30)), &[]),
             Ownership {
                 epoch: kr_protocol::ids::GeometryEpoch::new(7),
                 owns: true,
@@ -2871,12 +2895,12 @@ mod tests {
             "the owner resizes the session to what it is looking at"
         );
         assert_eq!(
-            ownership(&geometry(this, 100, 30), this, Some(size(100, 30))).resize,
+            ownership(&geometry(this, 100, 30), this, Some(size(100, 30)), &[]).resize,
             None,
             "an owner already at its size owes nothing"
         );
         assert_eq!(
-            ownership(&geometry(other, 80, 24), this, Some(size(100, 30))),
+            ownership(&geometry(other, 80, 24), this, Some(size(100, 30)), &[]),
             Ownership {
                 epoch: kr_protocol::ids::GeometryEpoch::new(7),
                 owns: false,
@@ -2885,9 +2909,68 @@ mod tests {
             "a terminal that does not own the size resizes nothing"
         );
         assert_eq!(
-            ownership(&geometry(this, 80, 24), this, None).resize,
+            ownership(&geometry(this, 80, 24), this, None, &[]).resize,
             None,
             "a terminal with no size of its own asks for none"
+        );
+    }
+
+    /// An answer written before the owner's resize was applied still carries the session's old
+    /// size. The resize in flight already asks for the size this terminal is looking at, so the
+    /// answer owes no second one: it would quote the epoch the one in flight moves on from, and be
+    /// refused.
+    #[test]
+    fn an_answer_owes_no_resize_the_owner_has_in_flight() {
+        let this =
+            kr_protocol::ids::AttachmentId::new(kr_protocol::scalars::Uuid::from_bytes([4; 16]));
+        let before_the_resize = kr_protocol::attachment::GeometryState {
+            owner: Nullable::some(this),
+            epoch: kr_protocol::ids::GeometryEpoch::new(7),
+            dimensions: size(80, 24),
+        };
+        let mut outstanding = std::collections::BTreeMap::new();
+        outstanding.insert(
+            kr_protocol::ids::RequestId::new(12),
+            Outstanding::Resize(size(100, 30)),
+        );
+        outstanding.insert(kr_protocol::ids::RequestId::new(11), Outstanding::Window);
+        assert_eq!(resizes_in_flight(&outstanding), vec![size(100, 30)]);
+        assert_eq!(
+            ownership(
+                &before_the_resize,
+                this,
+                Some(size(100, 30)),
+                &resizes_in_flight(&outstanding)
+            ),
+            Ownership {
+                epoch: kr_protocol::ids::GeometryEpoch::new(7),
+                owns: true,
+                resize: None,
+            },
+            "the resize in flight is the one this terminal owes"
+        );
+    }
+
+    /// A size no resize in flight asks for still goes at once, as the owner's.
+    #[test]
+    fn a_size_no_resize_in_flight_asks_for_still_goes() {
+        let this =
+            kr_protocol::ids::AttachmentId::new(kr_protocol::scalars::Uuid::from_bytes([4; 16]));
+        let before_the_resize = kr_protocol::attachment::GeometryState {
+            owner: Nullable::some(this),
+            epoch: kr_protocol::ids::GeometryEpoch::new(7),
+            dimensions: size(80, 24),
+        };
+        assert_eq!(
+            ownership(
+                &before_the_resize,
+                this,
+                Some(size(120, 40)),
+                &[size(100, 30)]
+            )
+            .resize,
+            Some(size(120, 40)),
+            "a newer size than the one in flight"
         );
     }
 
