@@ -1487,16 +1487,18 @@ async fn kr_req_10_51_a_named_approval_is_read_while_current_although_it_predate
         .broker()
         .admit_approval(&answering(), &answer(&host, resource_id), DECODED_AT)
         .expect("an answer claims the approval");
-    let claimed = exchange(
-        &mut daemon,
-        inspect(105, resource_id, reach(past, &[resource_id])),
-    )
-    .await;
-    assert_eq!(
-        state_read(claimed),
-        PendingState::Claimed,
-        "an approval an answer has claimed can still be decided"
-    );
+    for (request_id, bound) in [(105, past), (106, None)] {
+        let claimed = exchange(
+            &mut daemon,
+            inspect(request_id, resource_id, reach(bound, &[resource_id])),
+        )
+        .await;
+        assert_eq!(
+            state_read(claimed),
+            PendingState::Claimed,
+            "an approval an answer has claimed can still be decided ({request_id})"
+        );
+    }
     drop(admitted);
 }
 
