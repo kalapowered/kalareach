@@ -482,7 +482,7 @@ mod tests {
                 idle_after: idle,
                 ended: at,
                 idle_resolution: 0.0,
-                time_resolution: 0.0,
+                time_resolution: 0.02,
             }
         }
     }
@@ -637,7 +637,8 @@ mod tests {
     fn a_pool_made_for_each_piece_of_work_counts_through_its_process() {
         // The run's first thread moves by a tenth of a second while a pool it makes for each piece
         // of work runs two seconds on threads no listing sees. The process's whole time holds both,
-        // less its one thread's tick.
+        // less the whole reading's allowance: its one thread's tick and the rounding of its two tick
+        // counts, which is then what the bound sets aside.
         let stand_in = StandIn::new(1);
         stand_in.process(RUN, 1, OLD, 100, 1);
         stand_in.thread(RUN, 'S', OLD, 1.0);
@@ -650,7 +651,9 @@ mod tests {
                 stand_in.time(RUN, 1.1);
             },
         );
-        assert!(close(summary.bound, TICK / 2.0), "{summary:?}");
+        let allowance = TICK + 0.02;
+        assert!(close(summary.bound, allowance / 2.0), "{summary:?}");
+        assert!(close(summary.allowance, allowance / 2.0), "{summary:?}");
     }
 
     #[test]
