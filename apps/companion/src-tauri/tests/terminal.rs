@@ -972,6 +972,27 @@ async fn a_close_during_a_pending_open_leaves_nothing() {
     }
 }
 
+/// A close while the view is still in its opening exchange, before the worker has acknowledged the
+/// hello or answered the challenge, closes the connection and publishes nothing: no attach was made.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_close_during_the_opening_exchange_leaves_nothing() {
+    for held in [Challenge::HeldAtHello, Challenge::HeldAtProof] {
+        let mut worker = ScriptedWorker::start(held);
+        let page_view = Page::new(worker.paths());
+        let view = page_view.open(worker.session_id, 10, 2, 3);
+        worker.holding().await;
+        page_view.close(&view);
+        worker.abandoned().await;
+        assert!(!worker.connected(), "{held:?}: no link reached an attach");
+        tokio::time::sleep(QUIET).await;
+        assert!(
+            page_view.states(3).is_empty(),
+            "{held:?}: nothing is published"
+        );
+        assert_eq!(page_view.held(), 0, "{held:?}");
+    }
+}
+
 /// Every close returns only once the view has ended: two closes at once, or a close after the page
 /// has loaded again, each wait for the view's task, so nothing it publishes or holds outlives the
 /// call that closed it.

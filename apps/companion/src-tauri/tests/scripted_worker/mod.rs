@@ -57,6 +57,12 @@ pub enum Challenge {
     Answered,
     /// With a key of another worker's, which the view must refuse.
     Forged,
+    /// Not at all before the view leaves: the worker holds each connection at its hello, before
+    /// it acknowledges it, and reports when the view closes it there.
+    HeldAtHello,
+    /// Not before the view leaves: the worker acknowledges the hello, reads the challenge, holds
+    /// the connection there without a proof, and reports when the view closes it.
+    HeldAtProof,
 }
 
 /// The display number of the next worker this process starts, so two never share an endpoint.
@@ -71,6 +77,10 @@ pub struct ScriptedWorker {
     pub session_id: SessionId,
     pub descriptor: WorkerDescriptor,
     accepted: tokio::sync::mpsc::UnboundedReceiver<Link>,
+    /// Connections the worker has begun to hold before the view could attach.
+    holding: tokio::sync::mpsc::UnboundedReceiver<()>,
+    /// Connections the view closed while the worker held them before the view could attach.
+    abandoned: tokio::sync::mpsc::UnboundedReceiver<()>,
     serving: tokio::task::JoinHandle<()>,
 }
 
@@ -147,6 +157,8 @@ impl ScriptedWorker {
         kr_ipc::descriptor::publish(&environment, &descriptor)
             .expect("the descriptor is published");
         let (handing, accepted) = tokio::sync::mpsc::unbounded_channel();
+        let (leaving, abandoned) = tokio::sync::mpsc::unbounded_channel();
+        let (held, holding) = tokio::sync::mpsc::unbounded_channel();
         let endpoint_text = endpoint.as_text();
         let serving = tokio::spawn(async move {
             loop {
@@ -157,6 +169,13 @@ impl ScriptedWorker {
                 let Ok(ControlFrame::Hello(_)) = reader.read_message::<ControlFrame>().await else {
                     continue;
                 };
+                if challenge == Challenge::HeldAtHello {
+                    // Held until the view gives up: the next read ends when it closes.
+                    let _ = held.send(());
+                    let _ = reader.read_message::<ControlFrame>().await;
+                    let _ = leaving.send(());
+                    continue;
+                }
                 let connection_id = ConnectionId::new(kr_ipc::new_uuid());
                 let acknowledgement = LocalHelloAck {
                     selected_version: PROTOCOL_VERSION,
@@ -195,6 +214,12 @@ impl ScriptedWorker {
                 let signer = match challenge {
                     Challenge::Answered => &identity,
                     Challenge::Forged => &impostor,
+                    Challenge::HeldAtHello | Challenge::HeldAtProof => {
+                        let _ = held.send(());
+                        let _ = reader.read_message::<ControlFrame>().await;
+                        let _ = leaving.send(());
+                        continue;
+                    }
                 };
                 let proof = signer
                     .answer(&asked, &endpoint_text)
@@ -221,6 +246,8 @@ impl ScriptedWorker {
             session_id,
             descriptor,
             accepted,
+            holding,
+            abandoned,
             serving,
         }
     }
@@ -236,6 +263,22 @@ impl ScriptedWorker {
     /// Whether a view has connected since the last one the test took.
     pub fn connected(&mut self) -> bool {
         !self.accepted.is_empty()
+    }
+
+    /// Waits until the worker holds a view's connection before its attach.
+    pub async fn holding(&mut self) {
+        tokio::time::timeout(WATCHDOG, self.holding.recv())
+            .await
+            .expect("a view connected within the watchdog")
+            .expect("the worker is still listening");
+    }
+
+    /// Waits until a view closed a connection the worker was holding before its attach.
+    pub async fn abandoned(&mut self) {
+        tokio::time::timeout(WATCHDOG, self.abandoned.recv())
+            .await
+            .expect("the view closed the held connection within the watchdog")
+            .expect("the worker is still listening");
     }
 }
 
