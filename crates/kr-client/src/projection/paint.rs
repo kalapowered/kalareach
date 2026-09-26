@@ -2047,8 +2047,9 @@ mod fixtures {
     }
 
     /// Screens whose runs reach every branch of a run's placement: clusters the window's edges cut
-    /// on both sides, a run whose text disagrees with its cells, a mark with no base of its own,
-    /// control characters inside a run's text, and a styled run inside a link.
+    /// on both sides, whole clusters before its left edge in a run that reaches into it, a run whose
+    /// text disagrees with its cells, a mark with no base of its own, runs of no cells inside the
+    /// window, control characters inside a run's text, and a styled run inside a link.
     fn placement_screens() -> Vec<(&'static str, Screen, Window)> {
         let edges = serde_json::json!({
             "window": {"top_row": 0, "left_column": 2, "rows": 3, "columns": 8},
@@ -2081,7 +2082,20 @@ mod fixtures {
             "cursor": {"column": 11, "row": 1, "visible": false, "style": 5,
                        "pending_wrap": true}
         });
+        let overlap = serde_json::json!({
+            "window": {"top_row": 0, "left_column": 3, "rows": 2, "columns": 6},
+            "rows": [
+                {"row": 0, "soft_wrapped": false, "runs": [
+                    {"column": 0, "cells": 5, "text": "abcde"},
+                    {"column": 6, "cells": 0, "text": "\u{301}"}]},
+                {"row": 1, "soft_wrapped": false, "runs": [
+                    {"column": 3, "cells": 2, "text": "xy"},
+                    {"column": 5, "cells": 0, "text": "\u{301}\u{302}"}]}
+            ],
+            "cursor": {"column": 3, "row": 0, "visible": true, "style": 1, "pending_wrap": false}
+        });
         let (edges_screen, edges_window) = screen_of(&edges);
+        let (overlap_screen, overlap_window) = screen_of(&overlap);
         let (mut styled_screen, styled_window) = screen_of(&styled);
         if let Some(row) = styled_screen.rows.get_mut(&(ProjectedBuffer::Primary, 5)) {
             row.runs[1].rendition = CellRendition {
@@ -2117,6 +2131,7 @@ mod fixtures {
         vec![
             ("edges", edges_screen, edges_window),
             ("styled", styled_screen, styled_window),
+            ("overlap", overlap_screen, overlap_window),
         ]
     }
 
@@ -2201,6 +2216,17 @@ mod fixtures {
         assert_eq!(comparison.clusters_replaced, 3, "clusters replaced");
         assert_eq!(comparison.cells_clipped, 8, "cells clipped");
 
+        // Whole clusters left of the window are neither drawn nor counted, and a run of no cells
+        // inside it is counted and produces nothing.
+        let (_, overlap, window) = placement_screens()
+            .into_iter()
+            .find(|(name, _, _)| *name == "overlap")
+            .expect("the placement screen");
+        let comparison = install(&overlap, window, Keyboard::EVERYTHING).comparison;
+        assert_eq!(comparison.runs_replaced, 0, "runs replaced");
+        assert_eq!(comparison.clusters_replaced, 2, "clusters replaced");
+        assert_eq!(comparison.cells_clipped, 3, "cells clipped");
+
         // And the control characters inside a placed run never reach the destination: no bell,
         // and no C1 control sequence introducer, which UTF-8 carries as two bytes.
         let (_, styled, window) = placement_screens()
@@ -2257,6 +2283,10 @@ mod fixtures {
         "styled install-nothing 621c30aaf3506f1e4e63cf2abc4c453f7305b0c229083ce722b225ebc96a693a",
         "styled update d009c8fc97e0447edc9f427c715c6dfc719a49dac1dd9dfe4f0086c62c9e116d",
         "styled update-rows 0f9af589d5e2dd7f7f8b5acfaceec5726f2db6ccb09adb0ca3981a7e3f392009",
+        "overlap install 9c6534b8f6eb1eddc90d09989bb6933c54b459e535a69e7a508064ee0a0509cb",
+        "overlap install-nothing 894a5b439ff2643d74888cd1a0848ff2434647f5fbd786231990abed42ffa4f0",
+        "overlap update d727110534e1438c782a857dd154730fb5749d8f2867853bfea2470e0ae72719",
+        "overlap update-rows a1fd8719ae9e2f32d473a9ec4992c2800ee1e8af84183812b8ce956cdcc00adb",
     ];
 
     /// A screen with a scroll region of its own, and origin mode on.
