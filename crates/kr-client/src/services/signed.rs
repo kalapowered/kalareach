@@ -358,7 +358,7 @@ impl SignedService {
         let answer = self
             .send(path, method, body, request_limit, sending)
             .await?;
-        answer_of(&answer).map_err(|error| unanswered(method, answer.status, error))
+        answer_of(&answer, method).map_err(|error| unanswered(method, answer.status, error))
     }
 
     /// Sends one signed request, signed now, that travels as `carriage` says, and returns what the
@@ -388,7 +388,7 @@ impl SignedService {
         let answer = self
             .send(path, method, body, request_limit, sending)
             .await?;
-        answer_of(&answer).map_err(|error| unanswered(method, answer.status, error))
+        answer_of(&answer, method).map_err(|error| unanswered(method, answer.status, error))
     }
 
     /// Sends one signed request, signed now, whose success is content rather than a document, and
@@ -415,7 +415,7 @@ impl SignedService {
             .send(path, method, body, request_limit, sending)
             .await?;
         let status = answer.status;
-        content_of(answer).map_err(|error| unanswered(method, status, error))
+        content_of(answer, method).map_err(|error| unanswered(method, status, error))
     }
 
     /// The one path every request takes: the document, the token, the credential, the bound, and
@@ -612,6 +612,8 @@ impl Answer {
 /// [`super::json::read`], so an answer that names any member twice, the code's and the ones an
 /// adapter reads among them, is not a refusal this client reads.
 pub(crate) struct Refusal {
+    /// The method of the request it answered.
+    method: Method,
     status: u16,
     code: String,
     message: ServiceMessage,
@@ -654,9 +656,23 @@ impl Refusal {
 
     /// The error the service named, with the delay it asked for when it named one.
     pub(crate) fn into_error(self) -> ClientError {
-        let (code, action) = classify(&self.code, self.status);
+        let message = plain_message(&self.code, &self.message);
+        let (code, action, message) = if leaves_outcome_unknown(self.method, &self.code) {
+            (
+                ErrorCode::OutcomeUnknown,
+                UserAction::CheckTheOutcome,
+                crate::shown!(
+                    "the service failed while it handled this request, so whether it carried the \
+                     request out is unknown: {}",
+                    message
+                ),
+            )
+        } else {
+            let (code, action) = classify(&self.code, self.status);
+            (code, action, message)
+        };
         ClientError::Refused {
-            error: crate::error::refusal(code, plain_message(&self.code, &self.message)),
+            error: crate::error::refusal(code, message),
             retry_after_seconds: self.retry_after_seconds,
             action,
         }
@@ -697,7 +713,7 @@ fn plain_message(code: &str, message: &ServiceMessage) -> Shown {
 /// `error`, and nothing else, so another member beside them, or a success and a refusal at once,
 /// says the answer is not the service's own. Inside `data` and `error` the members are each
 /// adapter's to read, and a member it does not read is one a newer service may add.
-fn answer_of(answer: &ServiceHttpAnswer) -> Result<Answer> {
+fn answer_of(answer: &ServiceHttpAnswer, method: Method) -> Result<Answer> {
     /// The two members beside `ok` are each absent (`None`) or present, and a present one may be
     /// `null` (`Some(None)`), so a member that is there with nothing in it is still there.
     #[derive(Deserialize)]
@@ -757,6 +773,7 @@ fn answer_of(answer: &ServiceHttpAnswer) -> Result<Answer> {
         return Err(unreadable(answer.status, "its refusal names no error"));
     };
     Ok(Answer::Refused(Refusal {
+        method,
         status: answer.status,
         code: named.code,
         message: ServiceMessage::from_refusal(named.message),
@@ -772,11 +789,11 @@ fn answer_of(answer: &ServiceHttpAnswer) -> Result<Answer> {
 /// content, and nothing here reads them. Anything else is read as an envelope, and a refusal is the
 /// one thing it may be, because a success envelope under a status that says the request failed is
 /// not this service's answer.
-fn content_of(answer: ServiceHttpAnswer) -> Result<Content> {
+fn content_of(answer: ServiceHttpAnswer, method: Method) -> Result<Content> {
     if (200..300).contains(&answer.status) {
         return Ok(Content::Bytes(answer.body));
     }
-    match answer_of(&answer)? {
+    match answer_of(&answer, method)? {
         Answer::Refused(refusal) => Ok(Content::Refused(refusal)),
         Answer::Data(_) => Err(unreadable(
             answer.status,
@@ -911,6 +928,17 @@ fn unanswered(method: Method, status: u16, error: ClientError) -> Unanswered {
     Unanswered::Sent(error)
 }
 
+/// Whether a refusal the service named leaves the outcome of a request of `method` unknown.
+///
+/// `INTERNAL` is the service failing while it handled the request, which it can do after it acted
+/// on it. So for a request that is not safe to send again ([`repeat_is_safe`]) it says nothing
+/// about whether the request ran, as a gateway's lost answer does not ([`unanswered`]), and it is
+/// an unknown outcome, never sent again. For any other request it is the transient failure
+/// [`classify`] names.
+fn leaves_outcome_unknown(method: Method, code: &str) -> bool {
+    code == "INTERNAL" && !repeat_is_safe(method)
+}
+
 /// Whether a request of `method` may be sent again, signed afresh, after its answer was lost.
 ///
 /// A read changes nothing. A write qualifies when every operation its method carries is answered,
@@ -1031,7 +1059,7 @@ mod tests {
                 r#"{{"ok":false,"error":{{"code":"FORBIDDEN","message":"Only the host issues its own revisions.","detail":"{NEVER_RENDERED}"}}}}"#
             )
             .into_bytes(),
-        })
+        }, Method::MailboxRead)
         .and_then(Answer::data)
         .expect_err("a refusal");
 
@@ -1052,10 +1080,13 @@ mod tests {
 
     #[test]
     fn an_answer_this_client_cannot_read_is_reported_without_quoting_it() {
-        let error = answer_of(&ServiceHttpAnswer {
-            status: 200,
-            body: NEVER_RENDERED.as_bytes().to_vec(),
-        })
+        let error = answer_of(
+            &ServiceHttpAnswer {
+                status: 200,
+                body: NEVER_RENDERED.as_bytes().to_vec(),
+            },
+            Method::MailboxRead,
+        )
         .expect_err("that is not this service's envelope");
         for rendering in [
             error.to_string(),
@@ -1076,10 +1107,13 @@ mod tests {
             r#"{"ok":false,"error":{"code":"RATE_LIMITED","message":"wait","message":"now"}}"#,
             r#"{"ok":false,"error":{"code":"RATE_LIMITED","message":"wait","retryAfterSeconds":1,"retryAfterSeconds":900}}"#,
         ] {
-            let error = answer_of(&ServiceHttpAnswer {
-                status: 409,
-                body: body.as_bytes().to_vec(),
-            })
+            let error = answer_of(
+                &ServiceHttpAnswer {
+                    status: 409,
+                    body: body.as_bytes().to_vec(),
+                },
+                Method::MailboxRead,
+            )
             .expect_err("not a refusal this client reads");
             assert!(matches!(error, ClientError::Host(_)), "{body}");
         }
@@ -1090,10 +1124,13 @@ mod tests {
             r#"{"ok":false,"error":{"code":"KEY_EPOCH_RETIRED","message":"retired","key_epoch":"1","key_epoch":"2"}}"#,
             r#"{"ok":false,"error":{"code":"RATE_LIMITED","message":"wait","detail":"a","detail":"b"}}"#,
         ] {
-            let error = answer_of(&ServiceHttpAnswer {
-                status: 409,
-                body: body.as_bytes().to_vec(),
-            })
+            let error = answer_of(
+                &ServiceHttpAnswer {
+                    status: 409,
+                    body: body.as_bytes().to_vec(),
+                },
+                Method::MailboxRead,
+            )
             .expect_err("not a refusal this client reads");
             assert!(matches!(error, ClientError::Host(_)), "{body}");
             assert!(
@@ -1112,7 +1149,7 @@ mod tests {
         let answer = answer_of(&ServiceHttpAnswer {
             status: 409,
             body: br#"{"ok":false,"error":{"code":"KEY_EPOCH_RETIRED","message":"retired","key_epoch":"1"}}"#.to_vec(),
-        })
+        }, Method::MailboxRead)
         .expect("a refusal");
         let Answer::Refused(refusal) = answer else {
             panic!("a refusal: {answer:?}");
@@ -1139,10 +1176,13 @@ mod tests {
             format!(r#"{{"ok":true,"data":{{"pages":[{{"at":"1","at":"{NEVER_RENDERED}"}}]}}}}"#),
             format!(r#"{{"ok":true,"ok":true,"data":{{"note":"{NEVER_RENDERED}"}}}}"#),
         ] {
-            let error = answer_of(&ServiceHttpAnswer {
-                status: 200,
-                body: body.clone().into_bytes(),
-            })
+            let error = answer_of(
+                &ServiceHttpAnswer {
+                    status: 200,
+                    body: body.clone().into_bytes(),
+                },
+                Method::MailboxRead,
+            )
             .expect_err("a member named twice");
             assert_eq!(error.code(), ErrorCode::OutcomeUnknown, "{body}");
             for rendering in [
@@ -1200,10 +1240,13 @@ mod tests {
                 ErrorCode::UpstreamUnavailable,
             ),
         ] {
-            let error = answer_of(&ServiceHttpAnswer {
-                status,
-                body: body.as_bytes().to_vec(),
-            })
+            let error = answer_of(
+                &ServiceHttpAnswer {
+                    status,
+                    body: body.as_bytes().to_vec(),
+                },
+                Method::MailboxRead,
+            )
             .expect_err(body);
             assert!(matches!(error, ClientError::Host(_)), "{body}");
             assert_eq!(error.code(), expected, "{body}");
@@ -1211,16 +1254,19 @@ mod tests {
 
         // The controls: the two envelopes the service writes are read as they always were, and the
         // members a refusal carries beside its code stay the adapter's to read.
-        let answer = answer_of(&ServiceHttpAnswer {
-            status: 200,
-            body: br#"{"ok":true,"data":{"note":"x","more":1}}"#.to_vec(),
-        })
+        let answer = answer_of(
+            &ServiceHttpAnswer {
+                status: 200,
+                body: br#"{"ok":true,"data":{"note":"x","more":1}}"#.to_vec(),
+            },
+            Method::MailboxRead,
+        )
         .expect("an answer");
         assert!(matches!(answer, Answer::Data(_)), "{answer:?}");
         let answer = answer_of(&ServiceHttpAnswer {
             status: 409,
             body: br#"{"ok":false,"error":{"code":"KEY_EPOCH_RETIRED","message":"retired","key_epoch":"1","missing":["x"]}}"#.to_vec(),
-        })
+        }, Method::MailboxRead)
         .expect("a refusal");
         let Answer::Refused(refusal) = answer else {
             panic!("a refusal: {answer:?}");
@@ -1230,10 +1276,13 @@ mod tests {
 
     #[test]
     fn a_success_with_no_data_is_an_unknown_outcome_rather_than_an_empty_answer() {
-        let error = answer_of(&ServiceHttpAnswer {
-            status: 200,
-            body: br#"{"ok":true}"#.to_vec(),
-        })
+        let error = answer_of(
+            &ServiceHttpAnswer {
+                status: 200,
+                body: br#"{"ok":true}"#.to_vec(),
+            },
+            Method::MailboxRead,
+        )
         .expect_err("an envelope with no data");
         assert_eq!(error.code(), ErrorCode::OutcomeUnknown);
     }
@@ -1913,10 +1962,13 @@ mod tests {
             })
         };
         let read = |document: &serde_json::Value| {
-            answer_of(&ServiceHttpAnswer {
-                status: 403,
-                body: serde_json::to_vec(document).expect("an answer"),
-            })
+            answer_of(
+                &ServiceHttpAnswer {
+                    status: 403,
+                    body: serde_json::to_vec(document).expect("an answer"),
+                },
+                Method::MailboxRead,
+            )
             .and_then(Answer::data)
             .expect_err("a refusal, or an answer this client cannot read")
         };
@@ -2239,14 +2291,17 @@ mod tests {
                 UserAction::Wait,
             ),
         ] {
-            let error = answer_of(&ServiceHttpAnswer {
-                status,
-                body: serde_json::to_vec(&serde_json::json!({
-                    "ok": false,
-                    "error": { "code": code, "message": message, "retryAfterSeconds": 2 },
-                }))
-                .expect("a refusal"),
-            })
+            let error = answer_of(
+                &ServiceHttpAnswer {
+                    status,
+                    body: serde_json::to_vec(&serde_json::json!({
+                        "ok": false,
+                        "error": { "code": code, "message": message, "retryAfterSeconds": 2 },
+                    }))
+                    .expect("a refusal"),
+                },
+                Method::MailboxRead,
+            )
             .and_then(Answer::data)
             .expect_err("a refusal");
             assert_eq!(error.code(), expected, "{code}");
