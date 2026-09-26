@@ -6372,6 +6372,31 @@ fn replace_with_link(home: &std::path::Path, directory: &std::path::Path) -> std
     elsewhere
 }
 
+/// [`replace_with_link`] for a directory the running operation may hold open, which on Windows
+/// cannot be renamed at all: the store opens its directories without sharing their deletion, so no
+/// link can take the place of one it holds. Returns the directory elsewhere, or `None` when the
+/// directory is held that way and was left where it is.
+fn replace_unless_held(
+    home: &std::path::Path,
+    directory: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    let elsewhere = home.join("elsewhere");
+    support::copy_tree(directory, &elsewhere);
+    std::fs::write(elsewhere.join("unrelated.txt"), b"not the catalogue's").expect("writable");
+    match std::fs::rename(directory, home.join("aside")) {
+        Ok(()) => {}
+        // Another handle on the directory does not share its deletion.
+        #[cfg(windows)]
+        Err(error) if error.raw_os_error() == Some(32) => {
+            std::fs::remove_dir_all(&elsewhere).expect("the copy removed");
+            return None;
+        }
+        Err(error) => panic!("moved aside: {error}"),
+    }
+    link_directory(&elsewhere, directory);
+    Some(elsewhere)
+}
+
 /// Every file and directory under `directory`, following no link, with each file's bytes.
 fn tree_of(
     directory: &std::path::Path,
@@ -6609,8 +6634,9 @@ async fn a_store_directory_linked_while_the_store_is_held_is_refused_at_the_next
                 "/packages/"
             },
             then: Arc::new(std::sync::Mutex::new(Some(Box::new(move || {
-                let elsewhere = replace_with_link(&step_home, &directory);
-                *step_before.lock().expect("the tree") = Some(tree_of(&elsewhere));
+                let elsewhere = replace_unless_held(&step_home, &directory);
+                *step_before.lock().expect("the tree") =
+                    Some(elsewhere.map(|elsewhere| tree_of(&elsewhere)));
             })))),
         }));
 
@@ -6623,6 +6649,16 @@ async fn a_store_directory_linked_while_the_store_is_held_is_refused_at_the_next
         };
         let Some(before) = before.lock().expect("the tree").take() else {
             written_through.push(format!("{operation} {depth}: nothing was fetched"));
+            continue;
+        };
+        // Held by the operation, which on Windows keeps anything from putting a link in its place:
+        // the operation goes on through the directory it holds.
+        let Some(before) = before else {
+            if !cfg!(windows) {
+                written_through.push(format!("{operation} {depth}: held, off Windows"));
+            } else if let Err(error) = outcome {
+                written_through.push(format!("{operation} {depth}: held, and refused: {error:?}"));
+            }
             continue;
         };
         match outcome {
