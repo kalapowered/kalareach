@@ -9,13 +9,15 @@
 //!
 //! [`Upload`] is the plan, not the connection. It holds the content, the layout the host chose and
 //! the chunks the host has acknowledged, and [`Upload::next`] says what to send now. The caller
-//! sends it and hands the answer back through [`Upload::accept`]. Nothing here opens a stream,
-//! so a desktop application that carries chunks on its control connection and a client that
-//! carries them on the protocol's attachment-chunk stream drive the same plan over their own lane.
+//! sends it and hands the answer back through [`Upload::accept`].
 //!
-//! That separation is also what makes resumption ordinary. A reconnected client rebuilds the plan,
-//! feeds it the bitmap `upload.status` returned, and the plan asks only for the chunks the host is
-//! still missing.
+//! [`send`] is that caller for every client. The reservation, the status and the publication go on
+//! the session; every chunk goes on the transfer's attachment-chunk lane ([`crate::chunks`]),
+//! because section 23 keeps a chunk off the control connection whatever its size.
+//!
+//! The separation is also what makes resumption ordinary. A client whose lane dropped, or whose
+//! session did, feeds the plan the bitmap `upload.status` returned, and the plan asks only for the
+//! chunks the host is still missing, under the same upload identifier.
 //!
 //! ```text
 //! Begin ──▶ Chunk(0) ──▶ Chunk(1) ──▶ … ──▶ Finish ──▶ Done(handle)
@@ -23,16 +25,21 @@
 //!   └── status ┴── a lost reply resumes from the bitmap ────┘
 //! ```
 
-use kr_protocol::ids::{DeviceId, EnvironmentId, SessionId};
+use kr_protocol::envelope::ActionTarget;
+use kr_protocol::ids::{ActionId, DeviceId, EnvironmentId, SessionId};
 use kr_protocol::limits::UPLOAD_CHUNK_LEN;
-use kr_protocol::scalars::{Bytes, Digest256, Nullable, U64};
+use kr_protocol::method::Method;
+use kr_protocol::scalars::{Bytes, Digest256, DurationMs, Nullable, U64};
 use kr_protocol::transfer::{
     AttachmentHandle, ChunkBitmap, ChunkDescriptor, ChunkLayout, UploadBeginParams,
     UploadBeginResult, UploadChunkParams, UploadChunkResult, UploadFinishParams,
-    UploadFinishResult, UploadStatusResult,
+    UploadFinishResult, UploadStatusParams, UploadStatusResult,
 };
 
+use crate::Session;
+use crate::chunks::{ChunkLane, ChunkRoute};
 use crate::error::{ClientError, Result};
+use crate::retry::{Attempts, Failure, Recovery, RequestClass};
 
 /// The bytes an upload carries, and how they are read.
 ///
@@ -198,6 +205,8 @@ pub struct Upload {
     transfer_id: Option<kr_protocol::ids::TransferId>,
     handle: Option<AttachmentHandle>,
     phase: Phase,
+    /// The reservation whose reply was lost, when one was.
+    unknown_reservation: Option<ActionId>,
 }
 
 impl Upload {
@@ -216,6 +225,19 @@ impl Upload {
             transfer_id: None,
             handle: None,
             phase: Phase::Reserving,
+            unknown_reservation: None,
+        }
+    }
+
+    /// Records that the reservation this plan asked for has an outcome nobody knows.
+    ///
+    /// An `upload.begin` whose reply was lost may have reserved a transfer this plan cannot name,
+    /// holding one of the device's transfer slots and part of the environment's budget. Asking
+    /// again would be a second reservation for one intent, so the plan refuses to: a new upload of
+    /// the same file is the person's new choice, made knowing the first one's outcome is unknown.
+    pub fn reservation_unknown(&mut self, action_id: ActionId) {
+        if self.phase == Phase::Reserving {
+            self.unknown_reservation = Some(action_id);
         }
     }
 
@@ -283,21 +305,19 @@ impl Upload {
     /// Returns a failure when the content cannot produce the chunk the layout names.
     pub fn next(&self) -> Result<Step> {
         match self.phase {
-            Phase::Reserving => Ok(Step::Begin(Box::new(UploadBeginParams {
-                environment_id: self.subject.environment_id,
-                session_id: self
-                    .subject
-                    .session_id
-                    .map_or(Nullable::null(), Nullable::some),
-                device_id: self
-                    .subject
-                    .device_id
-                    .map_or(Nullable::null(), Nullable::some),
-                declared_byte_len: U64::new(self.content.byte_len()),
-                declared_digest: self.content.digest(),
-                declared_media_type: self.subject.declared_media_type.clone(),
-                original_file_name: self.subject.original_file_name.clone(),
-            }))),
+            Phase::Reserving => {
+                if let Some(action_id) = self.unknown_reservation {
+                    return Err(ClientError::refusal(
+                        kr_protocol::error::ErrorCode::OutcomeUnknown,
+                        crate::shown!(
+                            "this upload's reservation, action {}, has an unknown outcome; a new \
+                             upload is a new choice",
+                            action_id
+                        ),
+                    ));
+                }
+                self.reserve()
+            }
             Phase::Sending => {
                 let transfer_id = self.transfer_id.ok_or_else(|| {
                     ClientError::refusal(
@@ -342,6 +362,25 @@ impl Upload {
                 Ok(Step::Done(Box::new(handle)))
             }
         }
+    }
+
+    /// The reservation this plan asks for.
+    fn reserve(&self) -> Result<Step> {
+        Ok(Step::Begin(Box::new(UploadBeginParams {
+            environment_id: self.subject.environment_id,
+            session_id: self
+                .subject
+                .session_id
+                .map_or(Nullable::null(), Nullable::some),
+            device_id: self
+                .subject
+                .device_id
+                .map_or(Nullable::null(), Nullable::some),
+            declared_byte_len: U64::new(self.content.byte_len()),
+            declared_digest: self.content.digest(),
+            declared_media_type: self.subject.declared_media_type.clone(),
+            original_file_name: self.subject.original_file_name.clone(),
+        })))
     }
 
     /// Folds one answer into the plan.
@@ -509,6 +548,142 @@ impl Upload {
             bytes: Bytes::from(bytes),
         })
     }
+}
+
+/// The preconditions an upload's calls state, which are none: each one it relies on is a
+/// parameter of the method itself.
+#[derive(Debug, serde::Serialize)]
+struct Unconditional {}
+
+/// Drives one upload to its published handle: the reservation, the status and the publication on
+/// `session`, every chunk on the lane `route` opens for the transfer.
+///
+/// `target` and `requested_ttl` are those of every call the upload makes, chunks included. The plan
+/// stays the caller's, so a call that fails leaves it holding what the host has confirmed:
+///
+/// * A plan that already holds a transfer starts from `upload.status`. Calling this again after a
+///   lost `upload.finish` reply, a dropped session or a restart ([`Upload::resuming`]) therefore
+///   publishes nothing twice and sends only what the host is missing, under the same upload
+///   identifier.
+/// * A lane that cannot be opened, a lane that fails and a chunk the host refuses with a transient
+///   code are retried as [`RequestClass::TransferChunk`] under one [`Attempts`] budget: the lane is
+///   let go, the driver waits the backoff, reads `upload.status` and hands the plan the host's
+///   bitmap before it sends again. Progress the host has confirmed, by acknowledging a chunk or in
+///   its bitmap, restores the budget; failures in a row spend it.
+/// * A reservation whose reply was lost is recorded in the plan ([`Upload::reservation_unknown`]),
+///   which refuses to reserve again.
+///
+/// # Errors
+///
+/// Returns [`ClientError::SubmissionUncertain`] when the session ended with a reservation or a
+/// publication unanswered, a refusal the host decided under its own code, the last failure once
+/// the retries are spent, and the plan's refusal when the host's status says the upload was
+/// cancelled, invalidated or expired.
+pub async fn send(
+    session: &Session,
+    route: &ChunkRoute,
+    target: &ActionTarget,
+    plan: &mut Upload,
+    requested_ttl: DurationMs,
+) -> Result<AttachmentHandle> {
+    if let (Some(transfer_id), None) = (plan.transfer_id().copied(), plan.handle()) {
+        plan.accept(Answer::Status(Box::new(
+            status(session, transfer_id).await?,
+        )))?;
+    }
+    let mut lane: Option<ChunkLane> = None;
+    let mut attempts = Attempts::new();
+    loop {
+        match plan.next()? {
+            Step::Begin(params) => {
+                let settled = match session
+                    .mutate(
+                        Method::UploadBegin,
+                        target.clone(),
+                        None,
+                        &Unconditional {},
+                        &*params,
+                        requested_ttl,
+                    )
+                    .await
+                {
+                    Ok(settled) => settled,
+                    Err(ClientError::SubmissionUncertain { action_id }) => {
+                        plan.reservation_unknown(action_id);
+                        return Err(ClientError::SubmissionUncertain { action_id });
+                    }
+                    Err(error) => return Err(error),
+                };
+                plan.accept(Answer::Begun(Box::new(settled.to_typed()?)))?;
+            }
+            Step::Chunk(params) => {
+                let confirmed = plan.acknowledged_chunks();
+                match send_chunk(&mut lane, route, target, &params, requested_ttl).await {
+                    Ok(accepted) => plan.accept(Answer::Chunked(Box::new(accepted)))?,
+                    Err(error) => {
+                        let decision = attempts
+                            .decide(Failure::new(error.code()), RequestClass::TransferChunk);
+                        let Recovery::Retry { delay } = decision.recovery else {
+                            return Err(error);
+                        };
+                        // Whatever failed, the host's record decides what is sent next: the answer
+                        // to the chunk in flight may have been lost with the connection, and a
+                        // chunk the host refused may still be one it holds. A lane whose
+                        // connection failed carries nothing more, so the next chunk opens another.
+                        lane = None;
+                        tokio::time::sleep(delay).await;
+                        plan.accept(Answer::Status(Box::new(
+                            status(session, params.transfer_id).await?,
+                        )))?;
+                    }
+                }
+                if plan.acknowledged_chunks() > confirmed {
+                    attempts = Attempts::new();
+                }
+            }
+            Step::Finish(params) => {
+                // Every chunk is acknowledged, so the lane has nothing left to carry.
+                lane = None;
+                let settled = session
+                    .mutate(
+                        Method::UploadFinish,
+                        target.clone(),
+                        None,
+                        &Unconditional {},
+                        &params,
+                        requested_ttl,
+                    )
+                    .await?;
+                plan.accept(Answer::Finished(Box::new(settled.to_typed()?)))?;
+            }
+            Step::Done(handle) => return Ok(*handle),
+        }
+    }
+}
+
+/// Sends one chunk on the transfer's lane, opening the lane first when there is none.
+async fn send_chunk(
+    lane: &mut Option<ChunkLane>,
+    route: &ChunkRoute,
+    target: &ActionTarget,
+    params: &UploadChunkParams,
+    requested_ttl: DurationMs,
+) -> Result<UploadChunkResult> {
+    let lane = match lane {
+        Some(lane) => lane,
+        None => lane.insert(route.open(params.transfer_id).await?),
+    };
+    lane.send_chunk(target, params, requested_ttl).await
+}
+
+/// What the host holds of one upload.
+async fn status(
+    session: &Session,
+    transfer_id: kr_protocol::ids::TransferId,
+) -> Result<UploadStatusResult> {
+    session
+        .read(Method::UploadStatus, &UploadStatusParams { transfer_id })
+        .await
 }
 
 /// The protocol's chunk length, republished so a caller can size its reads without reaching past
@@ -843,5 +1018,30 @@ mod tests {
         upload.accept(answer).expect("the reservation folds in");
         assert!(matches!(upload.next().expect("a step"), Step::Finish(_)));
         assert_eq!(upload.progress(), 1.0);
+    }
+
+    #[test]
+    fn a_reservation_of_unknown_outcome_is_never_asked_for_again() {
+        let action = ActionId::new(
+            "22222222-2222-4222-8222-222222222222"
+                .parse()
+                .expect("a uuid"),
+        );
+        let mut upload = Upload::new(subject(), Box::new(Held::new(b"hello".to_vec())));
+        upload.reservation_unknown(action);
+        let refusal = upload.next().expect_err("the plan does not reserve again");
+        assert_eq!(
+            refusal.code(),
+            kr_protocol::error::ErrorCode::OutcomeUnknown
+        );
+        assert!(refusal.to_string().contains(&action.to_string()));
+
+        // A plan that already holds its transfer has nothing uncertain about its reservation, so a
+        // later record changes nothing.
+        let mut reserved = Upload::new(subject(), Box::new(Held::new(b"hello".to_vec())));
+        let answer = begun(&reserved, 1, &ChunkBitmap::empty(1));
+        reserved.accept(answer).expect("the reservation folds in");
+        reserved.reservation_unknown(action);
+        assert!(matches!(reserved.next().expect("a step"), Step::Chunk(_)));
     }
 }
