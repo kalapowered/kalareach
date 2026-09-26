@@ -463,26 +463,42 @@ impl LocalClient {
     /// Hands a worker one snapshot of plugin admissions, every part in order, and returns its
     /// report, every part of it, once it has applied the snapshot.
     ///
-    /// The worker answers only a complete snapshot, on this connection. What this returns is the
-    /// report's parts as the worker sent them; judging them is the caller's.
+    /// Each part sent and each part received has `per_part` to go or come, so a worker that stops
+    /// part way holds this connection for no more than one part's time. A report of more parts
+    /// than a report may have is refused rather than read. What this returns is the report's parts
+    /// as the worker sent them; judging them is the caller's. After an error the connection's
+    /// position is unknown, and a caller retires it.
     ///
     /// # Errors
     ///
-    /// Returns [`IpcError::IdentityUnavailable`] when the worker refused the snapshot,
-    /// [`IpcError::UnexpectedMessage`] when it answered something other than a report, or the
-    /// report's parts do not agree with each other, and whatever writing or reading failed with.
+    /// Returns [`IpcError::IdentityUnavailable`] when the worker refused the snapshot or a part
+    /// ran out of time, [`IpcError::UnexpectedMessage`] when the worker answered something other
+    /// than a report, or the report's parts do not agree with each other or are too many, and
+    /// whatever writing or reading failed with.
     pub async fn exchange_admissions(
         &mut self,
         parts: Vec<kr_protocol::admission::PluginAdmissions>,
+        per_part: std::time::Duration,
     ) -> Result<Vec<kr_protocol::admission::PluginAdmissionsAck>> {
+        let late = || IpcError::IdentityUnavailable {
+            what: "the worker did not take or answer its plugin admissions in time",
+            detail: format!("each part has {} ms", per_part.as_millis()),
+        };
         for part in parts {
-            self.writer
-                .write_message(&ControlFrame::PluginAdmissions(Box::new(part)))
-                .await?;
+            tokio::time::timeout(
+                per_part,
+                self.writer
+                    .write_message(&ControlFrame::PluginAdmissions(Box::new(part))),
+            )
+            .await
+            .map_err(|_| late())??;
         }
         let mut report: Vec<kr_protocol::admission::PluginAdmissionsAck> = Vec::new();
         loop {
-            match self.read_socket_frame().await? {
+            let frame = tokio::time::timeout(per_part, self.read_socket_frame())
+                .await
+                .map_err(|_| late())??;
+            match frame {
                 ControlFrame::PluginAdmissionsAck(part) => {
                     let expected = u32::try_from(report.len() + 1).unwrap_or(u32::MAX);
                     let agrees = part.part == expected
@@ -491,9 +507,13 @@ impl LocalClient {
                                 && first.frame == part.frame
                                 && first.report_seq == part.report_seq
                         });
-                    if !agrees || part.parts == 0 {
+                    if !agrees
+                        || part.parts == 0
+                        || part.parts > kr_protocol::limits::MAX_ADMISSION_PARTS
+                    {
                         return Err(IpcError::UnexpectedMessage(
-                            "the worker's report on its admissions came in parts that do not agree",
+                            "the worker's report on its admissions came in parts that do not agree \
+                             or are more than a report may have",
                         ));
                     }
                     let done = part.part == part.parts;

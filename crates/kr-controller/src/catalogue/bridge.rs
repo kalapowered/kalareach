@@ -47,6 +47,9 @@ pub fn key_of(release: &LiveRelease) -> ReleaseKey {
 /// What the workers reported, as `plugin.list` counts it.
 #[derive(Clone, Debug, Default)]
 pub struct LiveView {
+    /// The admission revision the counts were read at; counts read at another revision than the
+    /// one the answer renders are not given.
+    pub revision: u64,
     /// Every release a worker's accepted report lists, with whether it is ending there.
     pub live: BTreeMap<ReleaseKey, (LiveRelease, bool)>,
     /// The counts from reports every worker made after the read began, where every worker did.
@@ -254,7 +257,9 @@ impl WorkerBridge {
     }
 
     /// Takes the next frame for a recorded member at `revision`, keeping its record with the
-    /// releases the frame covers, and marks a round in flight. `None` for a member not sent rounds.
+    /// releases the frame covers, and marks a round in flight: the round that takes it owns it
+    /// until its answer is used or it ends without one. `None` for a member not sent rounds, and
+    /// for one with a round already in flight, so two rounds never retire each other's records.
     ///
     /// A fifth record retires the oldest, so a member that never answers costs a bounded record.
     pub fn next_frame(
@@ -265,7 +270,7 @@ impl WorkerBridge {
     ) -> Option<FrameId> {
         let mut members = self.members();
         let member = members.members.get_mut(&session_id)?;
-        if member.standing != Standing::Recorded {
+        if member.standing != Standing::Recorded || member.in_flight {
             return None;
         }
         let frame = FrameId {
@@ -595,6 +600,25 @@ mod tests {
         }
     }
 
+    /// A member added when its claim commits is found by a fence that lands before its first
+    /// snapshot is made: the first frame leaves it fenced, the kernel is asked about it, it is
+    /// never sent a round, and it leaves only when its process has ended.
+    #[test]
+    fn a_fence_before_the_first_snapshot_keeps_the_member_until_its_end() {
+        let bridge = WorkerBridge::new(ControllerGeneration::new(1));
+        let member = session(9);
+        bridge.claimed(member, Some(process(9)));
+        bridge.fenced(member);
+        let _ = bridge.first_frame(member, 1, BTreeSet::new());
+        bridge.recorded(member, process(9));
+        assert!(bridge.holds(member));
+        assert!(bridge.recorded_members().is_empty(), "never sent a round");
+        assert_eq!(bridge.to_check(), vec![(member, Some(process(9)))]);
+        assert!(bridge.next_frame(member, 1, BTreeSet::new()).is_none());
+        bridge.ended(member);
+        assert!(!bridge.holds(member));
+    }
+
     fn report(frame: FrameId, report_seq: u64, bindings: Vec<LiveBinding>) -> Report {
         Report {
             frame,
@@ -635,6 +659,11 @@ mod tests {
         let first = bridge
             .next_frame(member, 5, BTreeSet::new())
             .expect("a frame");
+        assert!(
+            bridge.next_frame(member, 5, BTreeSet::new()).is_none(),
+            "one round at a time: a second is not taken while the first is out"
+        );
+        bridge.unanswered(member);
         let second = bridge
             .next_frame(member, 5, BTreeSet::new())
             .expect("a frame");
@@ -666,9 +695,11 @@ mod tests {
         let member = recorded(&bridge, 1);
         let frames: Vec<FrameId> = (0..10)
             .map(|_| {
-                bridge
+                let frame = bridge
                     .next_frame(member, 5, BTreeSet::new())
-                    .expect("a frame")
+                    .expect("a frame");
+                bridge.unanswered(member);
+                frame
             })
             .collect();
         assert_eq!(

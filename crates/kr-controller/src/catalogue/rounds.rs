@@ -9,7 +9,6 @@
 use std::sync::Arc;
 
 use kr_protocol::admission::{LiveRelease, PluginAdmissions};
-use kr_protocol::identity::ProcessStartIdentity;
 use kr_protocol::ids::SessionId;
 
 use crate::catalogue::admissions::Snapshot;
@@ -35,10 +34,15 @@ impl Controller {
             .collect()
     }
 
-    /// Computes the admissions in force now, or `None` with the refusal recorded for the doctor.
-    async fn current_snapshot(&self) -> Option<Snapshot> {
+    /// Computes the admissions in force now, within one bounded exchange of `start`, or `None`
+    /// with the refusal recorded for the doctor.
+    async fn current_snapshot(&self, start: tokio::time::Instant) -> Option<Snapshot> {
         let live = self.reported_live();
-        match self.catalogue.snapshot(&live).await {
+        match self
+            .catalogue
+            .snapshot_within(&live, start + WORKER_EXCHANGE)
+            .await
+        {
             Ok(snapshot) => Some(snapshot),
             Err(error) => {
                 self.note_admissions(format!(
@@ -62,17 +66,18 @@ impl Controller {
     }
 
     /// The first snapshot a worker is handed, with its launch specification, once its
-    /// reservation's claim is consumed: it becomes a member first, so a reclaim that needs room
-    /// waits for it from here on.
-    pub(super) async fn first_admissions(
-        &self,
-        session_id: SessionId,
-        launcher: ProcessStartIdentity,
-    ) -> Vec<PluginAdmissions> {
-        self.plugin_bridge.claimed(session_id, Some(launcher));
-        let snapshot = match self.current_snapshot().await {
+    /// reservation's claim is consumed. The member was added when the claim committed, so a
+    /// reclaim that needs room waits for it from there on.
+    pub(super) async fn first_admissions(&self, session_id: SessionId) -> Vec<PluginAdmissions> {
+        let start = tokio::time::Instant::now();
+        let snapshot = match self.current_snapshot(start).await {
             Some(snapshot) => snapshot,
-            None => Snapshot::nothing(self.catalogue.admission_revision().await.unwrap_or(0)),
+            None => Snapshot::nothing(
+                self.catalogue
+                    .admission_revision_within(start + WORKER_EXCHANGE)
+                    .await
+                    .unwrap_or(0),
+            ),
         };
         let frame =
             self.plugin_bridge
@@ -99,8 +104,13 @@ impl Controller {
         }
     }
 
+    /// One round: the snapshot, a frame this round owns, the exchange, and the answer used.
+    ///
+    /// It runs on a task of its own and is never cut part way by a caller that stopped waiting:
+    /// every step is bounded by itself, and a client whose exchange did not finish is retired, so
+    /// the next round opens a connection whose position is known.
     async fn one_round(&self, session_id: SessionId) -> Option<Acceptance> {
-        let snapshot = self.current_snapshot().await?;
+        let snapshot = self.current_snapshot(tokio::time::Instant::now()).await?;
         let frame =
             self.plugin_bridge
                 .next_frame(session_id, snapshot.revision, snapshot.covered())?;
@@ -108,23 +118,19 @@ impl Controller {
             Ok(parts) => parts,
             Err(why) => {
                 self.note_admissions(format!("session {session_id}: {why}"));
-                self.plugin_bridge.unanswered(session_id);
-                return None;
+                return self.unanswered(session_id);
             }
         };
-        let bound = WORKER_EXCHANGE.saturating_mul(u32::try_from(parts.len()).unwrap_or(1).max(1));
         let answered =
             match tokio::time::timeout(WORKER_EXCHANGE, self.worker_client_of(session_id)).await {
                 Ok(Ok(mut held)) => {
                     let exchanged = match held.as_mut() {
-                        Some(client) => {
-                            tokio::time::timeout(bound, client.exchange_admissions(parts)).await
-                        }
+                        Some(client) => client.exchange_admissions(parts, WORKER_EXCHANGE).await,
                         None => return self.unanswered(session_id),
                     };
                     match exchanged {
-                        Ok(Ok(report)) => Some(report),
-                        Ok(Err(_)) | Err(_) => {
+                        Ok(report) => Some(report),
+                        Err(_) => {
                             // A client whose stream position nothing knows is retired, as an
                             // announcement retires one.
                             *held = None;
@@ -137,7 +143,9 @@ impl Controller {
         let Some(parts) = answered else {
             return self.unanswered(session_id);
         };
-        let first = parts.first()?;
+        let Some(first) = parts.first() else {
+            return self.unanswered(session_id);
+        };
         if first.session_id != session_id {
             return self.unanswered(session_id);
         }
@@ -171,18 +179,26 @@ impl Controller {
         let Some(controller) = self.me.upgrade() else {
             return;
         };
-        let mut rounds = tokio::task::JoinSet::new();
-        for session_id in members {
-            let controller = Arc::clone(&controller);
-            rounds.spawn(async move { controller.admissions_round(session_id).await });
-        }
+        // Handles, never a set that aborts its tasks when dropped: a caller that stops waiting (a
+        // refresh past its deadline, a connection that went away) leaves each round to finish on
+        // its own bound.
+        let rounds: Vec<tokio::task::JoinHandle<()>> = members
+            .into_iter()
+            .map(|session_id| {
+                let controller = Arc::clone(&controller);
+                tokio::spawn(async move { controller.admissions_round(session_id).await })
+            })
+            .collect();
         drop(controller);
-        let all = async { while rounds.join_next().await.is_some() {} };
+        let all = async {
+            for round in rounds {
+                let _ = round.await;
+            }
+        };
         match deadline {
             None => all.await,
             Some(deadline) => {
                 let _ = tokio::time::timeout_at(deadline, all).await;
-                rounds.detach_all();
             }
         }
     }
@@ -191,20 +207,29 @@ impl Controller {
     /// read began say: every member answers within one bounded exchange, or the counts are
     /// unknown. A member with a round already out is not sent a second one; its answer counts.
     pub(crate) async fn refreshed_view(&self) -> LiveView {
+        // One bound from entry covers the whole read: the wait for the catalogue, the rounds and
+        // the wait for rounds already out.
+        let deadline = tokio::time::Instant::now() + WORKER_EXCHANGE;
         let mark = self.plugin_bridge.mark();
-        let revision = self.catalogue.admission_revision().await.unwrap_or(0);
+        let Ok(revision) = self.catalogue.admission_revision_within(deadline).await else {
+            return LiveView {
+                revision: 0,
+                live: self.plugin_bridge.live(),
+                counts: None,
+            };
+        };
         let asked: Vec<SessionId> = self
             .plugin_bridge
             .recorded_members()
             .into_iter()
             .filter(|session_id| !self.plugin_bridge.in_flight(*session_id))
             .collect();
-        let deadline = tokio::time::Instant::now() + WORKER_EXCHANGE;
         self.rounds_to(asked, Some(deadline)).await;
         while !self.plugin_bridge.answered_since(mark) && tokio::time::Instant::now() < deadline {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         LiveView {
+            revision,
             live: self.plugin_bridge.live(),
             counts: self.plugin_bridge.counts_since(mark, revision),
         }
@@ -214,7 +239,12 @@ impl Controller {
     /// release no installation describes, and a question to the kernel about every member whose
     /// end is not confirmed.
     pub(crate) async fn admissions_pass(&self) {
-        let revision = self.catalogue.admission_revision().await.unwrap_or(0);
+        // The kernel first: letting go of an ended member waits for nothing else.
+        self.check_unconfirmed_members();
+        let deadline = tokio::time::Instant::now() + WORKER_EXCHANGE;
+        let Ok(revision) = self.catalogue.admission_revision_within(deadline).await else {
+            return;
+        };
         let installed = self.catalogue.installed_releases().await;
         let due: Vec<SessionId> = self
             .plugin_bridge
@@ -228,7 +258,6 @@ impl Controller {
             })
             .collect();
         self.rounds_to(due, None).await;
-        self.check_unconfirmed_members();
     }
 
     /// Asks the kernel about every member whose end is not confirmed, and lets go of each whose
@@ -350,9 +379,9 @@ impl Controller {
         let removal = if method == kr_protocol::method::Method::PluginRemove {
             let plugin = crate::catalogue::plugin_named(method, &mutation.params);
             let view = self.refreshed_view().await;
-            match (plugin, before, view.counts) {
-                (Some(plugin), Some(revision), Some(counts)) => Some((
-                    revision,
+            match (plugin, view.counts) {
+                (Some(plugin), Some(counts)) => Some((
+                    view.revision,
                     counts
                         .iter()
                         .filter(|(key, _)| key.0 == plugin)

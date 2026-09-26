@@ -4144,7 +4144,13 @@ impl Controller {
         let reservation = {
             let mut registry = self.registry.lock().await;
             match registry.claim_rendezvous(claim.reservation_id, claim.worker_public_key) {
-                Ok(reservation) => reservation,
+                Ok(reservation) => {
+                    // A member from the moment the claim commits, before anything is awaited: a
+                    // second claim that fences this reservation meanwhile finds it a member.
+                    self.plugin_bridge
+                        .claimed(claim.session_id, Some(launcher.clone()));
+                    reservation
+                }
                 Err(error) => {
                     // A claim on a reservation already claimed fences it, and the worker that
                     // made the first claim may hold admissions by now: it stays a member, never
@@ -4184,13 +4190,16 @@ impl Controller {
         } else {
             Nullable::null()
         };
-        let admissions = self
-            .first_admissions(reservation.session_id, launcher.clone())
-            .await;
-        let plugins = kr_protocol::admission::AdmissionsHeader {
-            frame: admissions[0].frame,
-            parts: admissions[0].parts,
-        };
+        let admissions = self.first_admissions(reservation.session_id).await;
+        let plugins = admissions
+            .first()
+            .map(|first| kr_protocol::admission::AdmissionsHeader {
+                frame: first.frame,
+                parts: first.parts,
+            })
+            .ok_or_else(|| {
+                ControllerError::supervision("the first admissions for this worker are empty")
+            })?;
         Ok((
             WorkerLaunchSpec {
                 session_id: reservation.session_id,

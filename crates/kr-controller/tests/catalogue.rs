@@ -1604,6 +1604,45 @@ async fn catalogue_mutations_are_retained_and_prevent_duplicate_execution() {
 // A disk error is a disk error in every answer
 // ---------------------------------------------------------------------------------------------
 
+/// Counts the workers gave at one admission revision are shown only while that is the revision
+/// the answer renders: a change committed after the workers answered leaves them unknown.
+#[tokio::test]
+async fn counts_read_at_an_earlier_revision_are_not_shown() {
+    let host = host();
+    let _ = installed(&host).await;
+    let current = host.module.admission_revision().await.expect("readable");
+    let listed = |revision: u64| {
+        let view = kr_controller::catalogue::bridge::LiveView {
+            revision,
+            live: std::collections::BTreeMap::new(),
+            counts: Some(std::collections::BTreeMap::new()),
+        };
+        let host = &host;
+        async move {
+            let listed: wire::PluginListResult = ok(host
+                .module
+                .read_frame(
+                    ActorIngress::LocalIpc,
+                    &request(
+                        Method::PluginList,
+                        &wire::PluginListParams {
+                            environment_id: host.environment_id,
+                        },
+                    ),
+                    Some(&view),
+                )
+                .await);
+            listed.plugins[0].live_bindings
+        }
+    };
+    assert_eq!(listed(current).await, Nullable::some(U64::new(0)));
+    assert_eq!(
+        listed(current.saturating_sub(1)).await,
+        Nullable::null(),
+        "counts from before the last change are unknown"
+    );
+}
+
 /// Enrols and synchronises the development catalogue, installs its example package, and returns
 /// the package hash.
 async fn installed(host: &Host) -> String {
@@ -2965,6 +3004,64 @@ mod native_bridges {
             refused_on_windows(&host, &digest);
         }
         assert_eq!(site.tree(), after, "nothing was written again");
+    }
+
+    /// A change that holds the catalogue (here, one whose bridge is being placed) holds a round's
+    /// snapshot and revision no longer than the bound the round gives them: both are refused as
+    /// busy by then, and both are answered once the change is done.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_busy_catalogue_holds_a_round_no_longer_than_its_bound() {
+        let site = Site::new();
+        let host = host(&site);
+        let digest = synchronised(&host).await;
+        let (entered, entering) = std::sync::mpsc::channel::<()>();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let entered = std::sync::Mutex::new(entered);
+        let released = std::sync::Mutex::new(released);
+        host.module.native_bridges().before_publishing(move |_| {
+            let _ = entered
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .send(());
+            let _ = released
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .recv_timeout(std::time::Duration::from_secs(60));
+        });
+        let bound = std::time::Duration::from_millis(300);
+        let asking = async {
+            let entering = tokio::task::spawn_blocking(move || {
+                entering.recv_timeout(std::time::Duration::from_secs(60))
+            });
+            entering
+                .await
+                .expect("the wait ended")
+                .expect("the change is placing its bridge");
+            let started = tokio::time::Instant::now();
+            let snapshot = host.module.snapshot_within(&[], started + bound).await;
+            let revision = host
+                .module
+                .admission_revision_within(tokio::time::Instant::now() + bound)
+                .await;
+            let waited = started.elapsed();
+            drop(release);
+            (snapshot.map(|_| ()), revision, waited)
+        };
+        let (installed, (snapshot, revision, waited)) =
+            tokio::join!(install(&host, &digest, true), asking);
+        let _: wire::PluginInstallResult = ok(installed);
+        assert_eq!(
+            snapshot.map_err(|error| error.code),
+            Err(ErrorCode::ResourceUnavailable)
+        );
+        assert_eq!(
+            revision.map_err(|error| error.code),
+            Err(ErrorCode::ResourceUnavailable)
+        );
+        assert!(waited < bound * 4, "{waited:?}");
+        let later = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        assert!(host.module.snapshot_within(&[], later).await.is_ok());
+        assert!(host.module.admission_revision_within(later).await.is_ok());
     }
 
     /// An application that stops part way is not reported as applied, and the daemon's next start

@@ -204,6 +204,17 @@ pub struct CatalogueModule {
     environment_id: EnvironmentId,
     /// The native bridges installed packages put in their applications' own directories.
     bridges: Arc<native_bridge::NativeBridges>,
+    /// The last snapshot of admissions computed, with the revision and the live releases it was
+    /// computed for: rounds at an unchanged revision reuse it.
+    snapshots: Arc<std::sync::Mutex<Option<CachedSnapshot>>>,
+}
+
+/// One computed snapshot and what it was computed for.
+#[derive(Debug)]
+struct CachedSnapshot {
+    revision: u64,
+    live: Vec<kr_protocol::admission::LiveRelease>,
+    snapshot: admissions::Snapshot,
 }
 
 impl CatalogueModule {
@@ -269,6 +280,7 @@ impl CatalogueModule {
             catalogue: Arc::new(Mutex::new(catalogue)),
             environment_id,
             bridges,
+            snapshots: Arc::new(std::sync::Mutex::new(None)),
         })
     }
 
@@ -282,22 +294,70 @@ impl CatalogueModule {
     /// Returns the admissions in force now, as records on the wire, for this host: what new
     /// bindings may use and the state of every admitted release and of every release in `live`.
     ///
+    /// The wait for the catalogue ends at `deadline`, since a synchronisation holds it across its
+    /// network work, and the package checks run on a thread that may block. A snapshot computed at
+    /// this revision for these live releases is reused.
+    ///
     /// # Errors
     ///
-    /// Returns the refusal the catalogue decided when its records cannot be read.
-    pub async fn snapshot(
+    /// Returns `RESOURCE_UNAVAILABLE` when the catalogue stays busy past `deadline`, and the refusal
+    /// the catalogue decided when its records cannot be read.
+    pub async fn snapshot_within(
         &self,
         live: &[kr_protocol::admission::LiveRelease],
+        deadline: tokio::time::Instant,
     ) -> Answer<admissions::Snapshot> {
-        let catalogue = self.catalogue.lock().await;
-        admissions::snapshot(
-            &catalogue,
-            &self.bridges,
-            self.environment_id,
-            live,
-            &kr_plugin_catalogue::this_host(),
-        )
-        .map_err(ProtocolError::from)
+        let catalogue = tokio::time::timeout_at(deadline, Arc::clone(&self.catalogue).lock_owned())
+            .await
+            .map_err(|_| busy())?;
+        let bridges = Arc::clone(&self.bridges);
+        let snapshots = Arc::clone(&self.snapshots);
+        let environment_id = self.environment_id;
+        let live = live.to_vec();
+        tokio::task::spawn_blocking(move || {
+            let revision = catalogue
+                .admission_revision()
+                .map_err(ProtocolError::from)?;
+            let mut cached = snapshots
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(held) = cached.as_ref()
+                && held.revision == revision
+                && held.live == live
+            {
+                return Ok(held.snapshot.clone());
+            }
+            let snapshot = admissions::snapshot(
+                &catalogue,
+                &bridges,
+                environment_id,
+                &live,
+                &kr_plugin_catalogue::this_host(),
+            )
+            .map_err(ProtocolError::from)?;
+            *cached = Some(CachedSnapshot {
+                revision,
+                live,
+                snapshot: snapshot.clone(),
+            });
+            Ok(snapshot)
+        })
+        .await
+        .map_err(|error| ProtocolError::new(ErrorCode::StorageUnavailable, error.to_string()))?
+    }
+
+    /// Returns the admission revision now, waiting for the catalogue no later than `deadline`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `RESOURCE_UNAVAILABLE` when the catalogue stays busy past `deadline`, and the refusal
+    /// the catalogue decided when the record cannot be read.
+    pub async fn admission_revision_within(&self, deadline: tokio::time::Instant) -> Answer<u64> {
+        tokio::time::timeout_at(deadline, self.catalogue.lock())
+            .await
+            .map_err(|_| busy())?
+            .admission_revision()
+            .map_err(ProtocolError::from)
     }
 
     /// Returns the admission revision now.
@@ -462,11 +522,17 @@ impl CatalogueModule {
                     .map_err(ProtocolError::from)?;
                 let empty = bridge::LiveView::default();
                 let view = view.unwrap_or(&empty);
+                // Counts read at another revision than the one this answer renders are not given:
+                // a change committed since the workers answered makes them unknown.
+                let current = catalogue
+                    .admission_revision()
+                    .map_err(ProtocolError::from)?;
+                let counts = view.counts.as_ref().filter(|_| view.revision == current);
                 let mut plugins = Vec::with_capacity(views.len());
                 for installation in &views {
                     let mut summary = plugin_summary(installation)?;
                     let key = installed_key(&installation.installation);
-                    summary.live_bindings = Nullable::from(view.counts.as_ref().map(|counts| {
+                    summary.live_bindings = Nullable::from(counts.map(|counts| {
                         U64::new(counts.get(&key).map_or(0, |(_, count, _)| *count))
                     }));
                     plugins.push(summary);
@@ -512,7 +578,7 @@ impl CatalogueModule {
                             )
                             .to_string(),
                             catalogue_id: release.origin.repository_id.clone(),
-                            live_bindings: Nullable::from(view.counts.as_ref().map(|counts| {
+                            live_bindings: Nullable::from(counts.map(|counts| {
                                 U64::new(counts.get(&key).map_or(0, |(_, count, _)| *count))
                             })),
                             ending: view.live.get(&key).is_some_and(|(_, ending)| *ending)
@@ -1144,6 +1210,14 @@ impl CatalogueModule {
             format!("this daemon owns environment {}", self.environment_id),
         ))
     }
+}
+
+/// The refusal of a read that waited for a busy catalogue past its bound.
+fn busy() -> ProtocolError {
+    ProtocolError::new(
+        ErrorCode::ResourceUnavailable,
+        "the catalogue is busy with another change; the workers are asked again on the cadence",
+    )
 }
 
 /// The key an installation's release is found by among the releases the workers report.
