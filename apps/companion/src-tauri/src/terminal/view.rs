@@ -10,7 +10,11 @@
 //! The view reports its size and where the page moved its window, one report at a time, through
 //! [`WindowReports`]: each report is settled by the screen its answer names, and the page is told a
 //! move is settled only with a screen that holds it.
+//!
+//! It takes control of the program when the person asks, and writes the wheel turns and keys they
+//! make under the input lease, through [`Lease`]. A change of control is told to the page at once.
 
+use kr_client::encoder::Modifiers;
 use kr_client::projection::{Applied, Projection, decode, is_projection_event};
 use kr_client::shown::Shown;
 use kr_ipc::client::LocalClient;
@@ -23,14 +27,16 @@ use kr_protocol::envelope::{
     Response,
 };
 use kr_protocol::ids::{ActionId, RequestId, SessionId};
+use kr_protocol::input::{InputAcquireParams, InputReleaseParams, InputWriteParams};
 use kr_protocol::local::LocalClientKind;
 use kr_protocol::method::{Method, MethodVersion};
 use kr_protocol::recovery::{EventStream, EventsSubscribeParams};
-use kr_protocol::scalars::{CanonicalSet, DurationMs, Nullable, U64};
+use kr_protocol::scalars::{Bytes, CanonicalSet, DurationMs, Nullable, U64};
 use kr_protocol::session::{Dimensions, SESSION_CLOSED_EVENT};
 use kr_protocol::worker::WorkerDescriptor;
 use tokio::sync::mpsc::UnboundedReceiver;
 
+use super::input::{Input, Lease, Owed, PROFILE, wheel_reports};
 use super::screen::{TerminalViewState, state_of};
 use super::window::{Answer, WindowReports};
 use super::{Locate, Publish};
@@ -41,9 +47,14 @@ pub(super) enum Command {
     Resize(Dimensions),
     /// The page moved the window.
     Move(super::window::Move),
+    /// The person's input, and where to say whether the view took it.
+    Input(Input, Taken),
     /// The page is done with the view.
     Close,
 }
+
+/// Where a view says whether it took an input: at once, or why it may not write it.
+pub(super) type Taken = tokio::sync::oneshot::Sender<Result<(), String>>;
 
 /// How many recoveries in a row may pass without a complete screen before the view ends.
 ///
@@ -79,8 +90,10 @@ pub(super) async fn run(
     mut commands: UnboundedReceiver<Command>,
     publish: &Publish,
 ) {
-    // The window's reports, which take the page's sizes and moves while the view is opening too.
+    // The window's reports, which take the page's sizes and moves while the view is opening too, and
+    // control of the program, which a take made while it opens asks for once it is attached.
     let mut window = WindowReports::new(dimensions);
+    let mut lease = Lease::default();
     let opened = {
         let opening = open(locate, session_id, dimensions);
         tokio::pin!(opening);
@@ -90,6 +103,22 @@ pub(super) async fn run(
                 command = commands.recv() => match command {
                     Some(Command::Resize(size)) => window.measured(size),
                     Some(Command::Move(asked)) => window.take(asked),
+                    // Nothing is attached yet, so nothing is controlled and nothing is written.
+                    Some(Command::Input(input, answer)) => {
+                        let _ = answer.send(match input {
+                            Input::Take { number } => {
+                                lease.request(number, true);
+                                Ok(())
+                            }
+                            Input::Release { number } => {
+                                lease.request(number, false);
+                                Ok(())
+                            }
+                            Input::Wheel { take, .. } | Input::Keys { take, .. } => {
+                                lease.write(take).map(|_| ())
+                            }
+                        });
+                    }
                     // A close while the view opens cancels the open. The link goes with it, and a
                     // closed connection detaches whatever the attach had made.
                     Some(Command::Close) | None => return,
@@ -113,6 +142,7 @@ pub(super) async fn run(
         projection: Projection::new(),
         next_request: LOOP_REQUESTS,
         window,
+        lease,
         resubscription: None,
         replaced_stream: false,
         recoveries: 0,
@@ -120,6 +150,7 @@ pub(super) async fn run(
         held: false,
         drawn: None,
         told: 0,
+        last: None,
         publish: publish.clone(),
     };
     view.publish_state();
@@ -163,15 +194,17 @@ async fn open(
     })?;
     let mut requested = CanonicalSet::new();
     requested.insert(AttachmentCapability::ObserveTerminal);
-    // No terminal profile, so the host shows this view a viewport of the session, which is what a
-    // terminal nobody has qualified is shown; and no geometry claim, so opening a view never takes
-    // the session's size from anyone.
+    // Able to take the input lease, which asking for this does not do: only the person's own take
+    // does. The view's own profile, which the host has not qualified, so it shows the view a
+    // viewport of the session and takes the view to send the ordinary encoding of keys. No geometry
+    // claim, so opening a view never takes the session's size from anyone.
+    requested.insert(AttachmentCapability::Input);
     let params = SessionAttachParams {
         session_id,
         mode: AttachMode::Terminal,
         claim_geometry: false,
         dimensions: Nullable::some(dimensions),
-        terminal_profile_id: Nullable::null(),
+        terminal_profile_id: Nullable::some(PROFILE.to_owned()),
         requested,
     };
     let answer = client
@@ -284,6 +317,8 @@ struct View {
     next_request: u64,
     /// Where the window is, and the reports it owes.
     window: WindowReports,
+    /// Whether the view controls the program, and what it owes the session for it.
+    lease: Lease,
     /// The resubscription waiting for its answer.
     resubscription: Option<RequestId>,
     /// Whether the stream a resubscription replaced is still being dropped: until the new stream's
@@ -299,6 +334,8 @@ struct View {
     drawn: Option<u64>,
     /// The newest of its moves the page was last told is settled.
     told: u64,
+    /// The state the page was last sent.
+    last: Option<TerminalViewState>,
     publish: Publish,
 }
 
@@ -332,6 +369,7 @@ impl View {
                     self.window.take(asked);
                     None
                 }
+                Next::Command(Some(Command::Input(input, taken))) => self.input(input, taken).await,
                 Next::Command(Some(Command::Close) | None) => Some(Ending::CLOSED),
                 Next::Frame(Ok(ControlFrame::Notification(notification))) => {
                     self.notification(notification).await
@@ -410,6 +448,16 @@ impl View {
     }
 
     async fn response(&mut self, response: Response) -> Option<Ending> {
+        if self.lease.owns(response.request_id) {
+            let outcome = match response.outcome {
+                Outcome::Ok(value) => Ok(value),
+                Outcome::Error(refusal) => Err(refusal),
+            };
+            if self.lease.answered(response.request_id, outcome) {
+                self.control_changed();
+            }
+            return None;
+        }
         if self.window.is_in_flight(response.request_id) {
             // A refusal settles the report and changes nothing; an acceptance settles it once a
             // screen naming its revision has arrived, whichever came first. A screen that waited
@@ -508,8 +556,150 @@ impl View {
             }
             self.window.sent(request_id);
         }
+        while let Some(owed) = self.lease.owed() {
+            let request_id = self.next_id();
+            let sent = match owed {
+                Owed::Acquire => {
+                    // An immediate takeover: whoever holds the lease loses it, without being asked.
+                    let params = InputAcquireParams {
+                        session_id: self.session_id,
+                        attachment_id: self.attachment.attachment_id,
+                        expected_epoch: Nullable::null(),
+                    };
+                    self.mutation(request_id, Method::InputAcquire, &params)
+                        .await
+                }
+                Owed::Release(epoch) => {
+                    let params = InputReleaseParams {
+                        session_id: self.session_id,
+                        attachment_id: self.attachment.attachment_id,
+                        epoch,
+                    };
+                    self.mutation(request_id, Method::InputRelease, &params)
+                        .await
+                }
+            };
+            if !sent {
+                return Some(Ending::lost());
+            }
+            self.lease.sent(owed, request_id);
+        }
         self.tell();
         None
+    }
+
+    /// Takes the person's `input`: a change of control, or a wheel turn or keys, written only while
+    /// the view controls the program under the take they name. Says on `taken` whether it took it,
+    /// and returns how the loop ended when writing it lost the link.
+    async fn input(&mut self, input: Input, taken: Taken) -> Option<Ending> {
+        match input {
+            Input::Take { number } => {
+                if self.lease.request(number, true) {
+                    self.control_changed();
+                }
+                let _ = taken.send(Ok(()));
+                None
+            }
+            Input::Release { number } => {
+                if self.lease.request(number, false) {
+                    self.control_changed();
+                }
+                let _ = taken.send(Ok(()));
+                None
+            }
+            Input::Wheel {
+                take,
+                column,
+                line,
+                turns,
+                shift,
+                alt,
+                control,
+            } => {
+                if !self.lease.controls(take) {
+                    let _ = taken.send(self.lease.write(take).map(|_| ()));
+                    return None;
+                }
+                // Measured against the newest screen the view holds: the cell and the modes are the
+                // session's as they now stand. A turn that reaches no program is no error.
+                let modifiers = Modifiers {
+                    shift,
+                    alt,
+                    control,
+                    superkey: false,
+                };
+                let Some(reports) = self
+                    .projection
+                    .screen()
+                    .and_then(|screen| wheel_reports(screen, column, line, turns, modifiers))
+                else {
+                    let _ = taken.send(Ok(()));
+                    return None;
+                };
+                self.write_input(take, reports, taken).await
+            }
+            Input::Keys { take, keys } => self.write_input(take, keys.into_bytes(), taken).await,
+        }
+    }
+
+    /// Writes `bytes` to the program under the lease the view holds for the page's take `take`.
+    ///
+    /// The page is told the input is taken as soon as it has its place in the stream, before it is
+    /// written: the write waits on the link, and the page's call never waits on it.
+    async fn write_input(&mut self, take: u64, bytes: Vec<u8>, taken: Taken) -> Option<Ending> {
+        let writing = match self.lease.write(take) {
+            Ok(writing) => writing,
+            Err(refusal) => {
+                let _ = taken.send(Err(refusal));
+                return None;
+            }
+        };
+        let _ = taken.send(Ok(()));
+        let params = InputWriteParams {
+            session_id: self.session_id,
+            attachment_id: self.attachment.attachment_id,
+            epoch: writing.epoch,
+            sequence: writing.sequence,
+            bytes: Bytes::new(bytes),
+        };
+        let Ok(params) = ParamsValue::from_typed(&params) else {
+            return Some(Ending::ended("This view's input could not be written."));
+        };
+        let request_id = self.next_id();
+        // Raw input is an ordered stream, not a mutation: it carries no action identifier and gets
+        // no receipt, only the session's answer.
+        let request = Request {
+            request_id,
+            method: Method::InputWrite.into(),
+            method_version: MethodVersion::V1,
+            params,
+        };
+        if self
+            .client
+            .writer()
+            .write_message(&ControlFrame::Request(request))
+            .await
+            .is_err()
+        {
+            return Some(Ending::lost());
+        }
+        self.lease.written(request_id, writing.epoch);
+        None
+    }
+
+    /// Tells the page that control changed, at once. A screen that waits for its report's answer
+    /// is not the page's yet, so the change goes with the state the page was last sent, its screen
+    /// and settlement as they were.
+    fn control_changed(&mut self) {
+        if self.held {
+            if let Some(last) = self.last.take() {
+                let state = last.with_control(self.lease.control());
+                self.last = Some(state.clone());
+                (self.publish)(state);
+            }
+        } else {
+            self.publish_state();
+        }
     }
 
     /// Writes the detach, and leaves the link to close when the view is dropped: the worker
@@ -592,6 +782,8 @@ impl View {
             self.drawn = Some(screen.window_revision);
         }
         self.told = self.window.told(self.drawn);
-        (self.publish)(state_of(&self.attachment, screen, self.told));
+        let state = state_of(&self.attachment, screen, self.told, self.lease.control());
+        self.last = Some(state.clone());
+        (self.publish)(state);
     }
 }

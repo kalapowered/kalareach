@@ -28,6 +28,8 @@ pub enum TerminalViewState {
         attachment: AttachmentSummary,
         /// The newest of the page's moves it may take as settled.
         settled: u64,
+        /// Whether the view controls the program.
+        control: TerminalControl,
     },
     /// Attached, with a complete screen.
     Showing {
@@ -37,12 +39,79 @@ pub enum TerminalViewState {
         screen: TerminalScreen,
         /// The newest of the page's moves it may take as settled.
         settled: u64,
+        /// Whether the view controls the program.
+        control: TerminalControl,
     },
     /// The view has ended, and why, in the host's words or the link's.
     Ended {
         /// Why.
         reason: String,
     },
+}
+
+impl TerminalViewState {
+    /// The same state, saying `control` of the program. An ended view has no control to say.
+    #[must_use]
+    pub fn with_control(self, control: TerminalControl) -> Self {
+        match self {
+            Self::Waiting {
+                attachment,
+                settled,
+                ..
+            } => Self::Waiting {
+                attachment,
+                settled,
+                control,
+            },
+            Self::Showing {
+                attachment,
+                screen,
+                settled,
+                ..
+            } => Self::Showing {
+                attachment,
+                screen,
+                settled,
+                control,
+            },
+            ended @ Self::Ended { .. } => ended,
+        }
+    }
+}
+
+/// Whether a view controls the program, as the page is told.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct TerminalControl {
+    /// The page's newest control request the view took, or 0 before the first.
+    pub number: u64,
+    /// Whether the view watches, is taking control, or controls the program.
+    pub state: ControlState,
+    /// Why control last ended or was refused, until a newer request.
+    pub ended: Option<String>,
+}
+
+/// Whether a view watches, is taking control, or controls the program.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlState {
+    /// Nothing of the person's reaches the program.
+    Watching,
+    /// The view asked the session for control and waits for the answer.
+    Taking,
+    /// The view holds the session's input: the program gets its wheel and its keys.
+    Controlling,
+}
+
+/// Whether a wheel turn over the screen reaches its program, and why not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Wheel {
+    /// The program reports the mouse in an encoding the view writes.
+    Reaches,
+    /// The program does not report the mouse.
+    Unreported,
+    /// The program reports the mouse in an encoding the view does not write.
+    Unwritable,
 }
 
 /// The part of a session's screen one view shows.
@@ -64,6 +133,8 @@ pub struct TerminalScreen {
     pub degraded: bool,
     /// How many runs and clusters could not be placed, and are blank or left out.
     pub replaced: u64,
+    /// Whether a wheel turn over the screen reaches the program.
+    pub wheel: Wheel,
 }
 
 /// The window the host drew for a view: its size in cells, and where it starts.
@@ -205,6 +276,7 @@ pub fn of(screen: &Screen) -> TerminalScreen {
         palette: screen.palette.clone(),
         degraded: screen.degraded,
         replaced,
+        wheel: super::input::wheel_of(screen),
     }
 }
 
@@ -414,21 +486,24 @@ fn cursor(screen: &Screen, top: u64, rows: u32, left: u64, columns: u32) -> Opti
 }
 
 /// The state a view is in while it holds `screen`, or waits for one, with the newest of the page's
-/// moves it may take as settled.
+/// moves it may take as settled and whether it controls the program.
 pub(crate) fn state_of(
     attachment: &AttachmentSummary,
     screen: Option<&Screen>,
     settled: u64,
+    control: TerminalControl,
 ) -> TerminalViewState {
     match screen {
         Some(screen) => TerminalViewState::Showing {
             attachment: attachment.clone(),
             screen: of(screen),
             settled,
+            control,
         },
         None => TerminalViewState::Waiting {
             attachment: attachment.clone(),
             settled,
+            control,
         },
     }
 }

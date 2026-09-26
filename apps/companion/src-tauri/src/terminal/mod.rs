@@ -16,7 +16,9 @@
 //! | [`screen`] | The shape the page draws: a view's state, its screen, lines and pieces |
 //! | `view` | One view's task: the link, the attachment, the projection and the reports |
 //! | `window` | Where a view's window is, the moves the page makes and the reports they owe |
+//! | `input` | Control of the program, and the wheel turns and keys the view writes to it |
 
+mod input;
 pub mod screen;
 mod view;
 mod window;
@@ -29,6 +31,7 @@ use kr_ipc::paths::EnvironmentPaths;
 use kr_protocol::ids::SessionId;
 use kr_protocol::session::Dimensions;
 
+pub use input::Input;
 pub use screen::TerminalViewState;
 pub use window::Move;
 
@@ -142,6 +145,36 @@ impl TerminalViews {
         if let Some(entry) = self.lock().get(&id) {
             let _ = entry.commands.send(view::Command::Move(asked));
         }
+    }
+
+    /// Hands a view the person's `input`, and answers once its task has taken it: a take or a
+    /// release at once, and a wheel turn or keys once written, or refused because the view does not
+    /// control the program under the take they name. What the session answers reaches the page as
+    /// the view's state. A view that has ended takes nothing, and has nothing to refuse.
+    ///
+    /// # Errors
+    ///
+    /// Returns why a wheel turn or keys may not be written.
+    pub async fn input(&self, view: &str, input: Input) -> Result<(), String> {
+        let Ok(id) = view.parse::<u64>() else {
+            return Ok(());
+        };
+        let (answer, answered) = tokio::sync::oneshot::channel();
+        {
+            let held = self.lock();
+            let Some(entry) = held.get(&id) else {
+                return Ok(());
+            };
+            if entry
+                .commands
+                .send(view::Command::Input(input, answer))
+                .is_err()
+            {
+                return Ok(());
+            }
+        }
+        // A task that ends before it answers drops the answer, and has ended with its view.
+        answered.await.unwrap_or(Ok(()))
     }
 
     /// Closes a view and returns once its task has ended: it detaches, closes its link and publishes

@@ -49,16 +49,17 @@ pub const NAMED_COMMANDS: &[(&str, Option<Method>)] = &[
     ("session_create", Some(Method::SessionCreate)),
     ("session_close", Some(Method::SessionClose)),
     // The raw terminal view. Its attachment is made on the session's own worker, from native
-    // code: the page names a session, a size and the moves it makes, never a method.
+    // code: the page names a session, a size, the moves it makes and the person's input, never a
+    // method.
     ("terminal_view_open", None),
     ("terminal_view_resize", None),
     ("terminal_view_move", None),
+    ("terminal_view_input", None),
     ("terminal_view_close", None),
     // Input.
     ("input_acquire", Some(Method::InputAcquire)),
     ("input_release", Some(Method::InputRelease)),
     ("input_interrupt", Some(Method::InputInterrupt)),
-    ("input_write", Some(Method::InputWrite)),
     // The launch surface.
     ("shell_launch", Some(Method::ShellLaunch)),
     // Drafts and attachments.
@@ -149,9 +150,10 @@ pub const NATIVE_METHODS: &[(&str, &[Method])] = &[
             Method::OwnerConfirmationComplete,
         ],
     ),
-    // A view attaches, subscribes, reports its size and its window's place and detaches on the
-    // session's worker. The page supplies a session, a grid and its moves; what reaches the worker
-    // is built here.
+    // A view attaches, subscribes, reports its size and its window's place, takes and gives back
+    // the input lease, writes the person's wheel turns and keys under it, and detaches, all on the
+    // session's worker. The page supplies a session, a grid, its moves and the person's input; what
+    // reaches the worker is built here.
     (
         "terminal_view_open",
         &[
@@ -163,6 +165,14 @@ pub const NATIVE_METHODS: &[(&str, &[Method])] = &[
     ),
     ("terminal_view_resize", &[Method::AttachmentViewport]),
     ("terminal_view_move", &[Method::AttachmentViewport]),
+    (
+        "terminal_view_input",
+        &[
+            Method::InputAcquire,
+            Method::InputRelease,
+            Method::InputWrite,
+        ],
+    ),
     ("terminal_view_close", &[Method::SessionDetach]),
 ];
 
@@ -183,11 +193,11 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static
         terminal_view_open,
         terminal_view_resize,
         terminal_view_move,
+        terminal_view_input,
         terminal_view_close,
         input_acquire,
         input_release,
         input_interrupt,
-        input_write,
         shell_launch,
         draft_create,
         draft_update,
@@ -848,19 +858,6 @@ pub async fn attachment_upload(
     encode(&handle)
 }
 
-/// Writes one ordered batch of raw terminal input.
-///
-/// Raw input is the one write that is not a mutation: section 9 makes it an ordered stream keyed
-/// by connection, lease epoch and sequence, with no action identifier and no receipt. It has its
-/// own command for that reason.
-#[tauri::command]
-pub async fn input_write(state: State<'_, AppState>, params: Value) -> Result<Value> {
-    let typed: kr_protocol::input::InputWriteParams = decode(params)?;
-    let session = state.session()?;
-    let answer = session.write_input(&typed).await?;
-    encode(&answer)
-}
-
 /// Changes the origin, before an attempt starts.
 #[tauri::command]
 pub fn pairing_set_origin(
@@ -1227,6 +1224,27 @@ pub fn terminal_view_move(
     Ok(())
 }
 
+/// Hands an open view the person's input: a take or a release of control of the program, numbered
+/// by the page in the order it makes them, or a turn of the program's wheel at a cell of the
+/// session's grid or keys, each naming the take it was made under.
+///
+/// The input is read as the page sends it, and anything else is refused before the view is asked.
+/// It answers once the view has taken the input, not once the program has: what the session
+/// answers reaches the page as the view's state. A wheel turn or keys the view may not write, since
+/// it does not control the program under the take they name, are refused, and nothing is written.
+#[tauri::command]
+pub async fn terminal_view_input(
+    views: State<'_, crate::terminal::TerminalViews>,
+    view: String,
+    input: Value,
+) -> Result<()> {
+    let input: crate::terminal::Input = decode(input)?;
+    views
+        .input(&view, input)
+        .await
+        .map_err(|refused| CommandError::new(kr_protocol::error::ErrorCode::LeaseLost, refused))
+}
+
 /// Closes a view: it detaches, closes its link and publishes nothing more.
 #[tauri::command]
 pub async fn terminal_view_close(
@@ -1465,10 +1483,12 @@ mod tests {
                 "account_sign_out",
                 "account_status",
                 "account_usage",
-                // The raw terminal view's four. The view attaches on the session's own worker,
+                // The raw terminal view's five. The view attaches on the session's own worker,
                 // which the control daemon does not proxy for this computer, so the page names a
-                // session, a size and its moves, and native code makes every call.
+                // session, a size, its moves and the person's input, and native code makes every
+                // call.
                 "terminal_view_close",
+                "terminal_view_input",
                 "terminal_view_move",
                 "terminal_view_open",
                 "terminal_view_resize",
@@ -1528,7 +1548,7 @@ mod tests {
             BTreeSet::from(["pairing_start_read"])
         );
         // A terminal view's calls are the view's own, on its own link: no page method attaches,
-        // subscribes, reports a window, resizes, configures or detaches.
+        // subscribes, reports a window, resizes, configures, writes input or detaches.
         for method in [
             Method::SessionAttach,
             Method::SessionDetach,
@@ -1537,6 +1557,7 @@ mod tests {
             Method::TerminalResize,
             Method::EventsSubscribe,
             Method::EventsSnapshot,
+            Method::InputWrite,
         ] {
             assert!(!page.contains(&method), "{method} is a page method");
         }
@@ -1556,6 +1577,19 @@ mod tests {
                 "terminal_view_resize"
             ])
         );
+        // The view's input goes through one command: taking and giving back the lease, and every
+        // write under it.
+        for method in [
+            Method::InputAcquire,
+            Method::InputRelease,
+            Method::InputWrite,
+        ] {
+            assert_eq!(
+                performing(method),
+                BTreeSet::from(["terminal_view_input"]),
+                "{method}"
+            );
+        }
     }
 
     /// KR-REQ-10.06: a review names a reference and nothing else. A request that also carries a
@@ -1631,7 +1665,6 @@ mod tests {
             input_acquire,
             input_release,
             input_interrupt,
-            input_write,
             shell_launch,
             draft_create,
             draft_update,

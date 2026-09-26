@@ -18,6 +18,8 @@ use std::time::Duration;
 use kr_protocol::attachment::{
     AttachMode, AttachmentCapability, AttachmentViewportParams, SessionDetachParams,
 };
+use kr_protocol::error::ErrorCode;
+use kr_protocol::input::{InputAcquireParams, InputReleaseParams, InputWriteParams};
 use kr_protocol::method::Method;
 use kr_protocol::projection::{
     PROJECTION_DELTA_EVENT, PROJECTION_RESET_EVENT, PROJECTION_ROWS_EVENT,
@@ -26,8 +28,8 @@ use kr_protocol::projection::{
 use kr_protocol::recovery::{EventStream, EventsSubscribeParams};
 use kr_protocol::session::Dimensions;
 use scripted_worker::{
-    Challenge, Frame, Link, ScriptedWorker, WATCHDOG, delta, frame, frame_delta, page as rows_page,
-    reset, row, screen, snapshot,
+    CallKind, Challenge, Frame, Link, Mouse, ScriptedWorker, WATCHDOG, WorkerLease, delta, frame,
+    frame_delta, mouse_delta, page as rows_page, reset, row, screen, snapshot,
 };
 use serde_json::{Value, json};
 use tauri::Manager as _;
@@ -73,6 +75,7 @@ impl Page {
                 companion_tauri::commands::terminal_view_open,
                 companion_tauri::commands::terminal_view_resize,
                 companion_tauri::commands::terminal_view_move,
+                companion_tauri::commands::terminal_view_input,
                 companion_tauri::commands::terminal_view_close,
             ]);
         let app = companion_tauri::terminal::install(
@@ -246,12 +249,14 @@ async fn showing(page: &Page, worker: &mut ScriptedWorker, channel: u32) -> (Str
     (view, link)
 }
 
-/// KR-REQ-08.02: the view attaches on the worker's own endpoint, after the worker has proved who it
-/// is, in terminal mode with no geometry claim and no terminal profile, observing only, at the size
-/// the page measured; it subscribes from the attach's own cursor; and its first state carries the
-/// attachment's summary, a viewport for want of a profile.
+/// KR-REQ-08.02, KR-REQ-13.18: the view attaches on the worker's own endpoint, after the worker has
+/// proved who it is, in terminal mode with no geometry claim, at the size the page measured, asking
+/// to observe and to be able to take input, under the terminal profile that names this view; it
+/// subscribes from the attach's own cursor; and its first state carries the attachment's summary, a
+/// viewport for a profile the host has not qualified, and says the view watches.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_view_attaches_on_the_workers_endpoint_with_no_claim_and_no_profile() {
+async fn a_view_attaches_on_the_workers_endpoint_with_no_claim_asking_for_input_under_its_profile()
+{
     let mut worker = ScriptedWorker::start(Challenge::Answered);
     let page = Page::new(worker.paths());
     let _view = page.open(worker.session_id, 30, 5, 7);
@@ -261,10 +266,17 @@ async fn a_view_attaches_on_the_workers_endpoint_with_no_claim_and_no_profile() 
     assert_eq!(asked.mode, AttachMode::Terminal);
     assert!(!asked.claim_geometry, "a view makes no geometry claim");
     assert_eq!(asked.dimensions.0, Some(Dimensions::new(30, 5)));
-    assert_eq!(asked.terminal_profile_id.0, None, "and declares no profile");
+    assert_eq!(
+        asked.terminal_profile_id.0.as_deref(),
+        Some("kalareach-companion"),
+        "and names itself, so the host can say whether it may take the keys"
+    );
     assert_eq!(
         asked.requested.iter().copied().collect::<Vec<_>>(),
-        vec![AttachmentCapability::ObserveTerminal]
+        vec![
+            AttachmentCapability::ObserveTerminal,
+            AttachmentCapability::Input
+        ]
     );
     let waiting = page.state(7, 0).await;
     assert_eq!(waiting["state"], "waiting");
@@ -275,7 +287,12 @@ async fn a_view_attaches_on_the_workers_endpoint_with_no_claim_and_no_profile() 
     assert_eq!(waiting["attachment"]["presentation"], "viewport");
     assert_eq!(
         waiting["attachment"]["presentation_reason"],
-        "no_terminal_profile"
+        "unqualified_terminal_profile"
+    );
+    assert_eq!(
+        waiting["control"],
+        json!({"number": 0, "state": "watching", "ended": null}),
+        "a view opens watching: opening takes control from nobody"
     );
     screen(&mut link, 1, 40, vec![row(0, "hello")], 0).await;
     let shown = page.state(7, 1).await;
@@ -294,10 +311,11 @@ async fn the_view_subscribes_from_the_attach_cursor() {
     let mut link = worker.link().await;
     let attach = link.expect(Method::SessionAttach).await;
     let attachment_id = kr_protocol::ids::AttachmentId::new(kr_ipc::new_uuid());
+    let asked: kr_protocol::attachment::SessionAttachParams = attach.params();
     link.answer(
         &attach,
         &kr_protocol::attachment::SessionAttachResult {
-            attachment: scripted_worker::summary(attachment_id, Dimensions::new(30, 5)),
+            attachment: scripted_worker::summary(attachment_id, &asked),
             geometry: kr_protocol::attachment::GeometryState {
                 owner: kr_protocol::scalars::Nullable::null(),
                 epoch: kr_protocol::ids::GeometryEpoch::new(1),
@@ -396,7 +414,7 @@ async fn a_refused_first_subscription_ends_the_view() {
         &kr_protocol::attachment::SessionAttachResult {
             attachment: scripted_worker::summary(
                 kr_protocol::ids::AttachmentId::new(kr_ipc::new_uuid()),
-                Dimensions::new(30, 5),
+                &attach.params::<kr_protocol::attachment::SessionAttachParams>(),
             ),
             geometry: kr_protocol::attachment::GeometryState {
                 owner: kr_protocol::scalars::Nullable::null(),
@@ -724,7 +742,7 @@ async fn a_size_measured_while_attaching_goes_once_the_view_is_subscribed() {
         &kr_protocol::attachment::SessionAttachResult {
             attachment: scripted_worker::summary(
                 kr_protocol::ids::AttachmentId::new(kr_ipc::new_uuid()),
-                Dimensions::new(10, 2),
+                &attach.params::<kr_protocol::attachment::SessionAttachParams>(),
             ),
             geometry: kr_protocol::attachment::GeometryState {
                 owner: kr_protocol::scalars::Nullable::null(),
@@ -980,7 +998,7 @@ async fn a_close_during_a_pending_open_leaves_nothing() {
                 &kr_protocol::attachment::SessionAttachResult {
                     attachment: scripted_worker::summary(
                         kr_protocol::ids::AttachmentId::new(kr_ipc::new_uuid()),
-                        Dimensions::new(10, 2),
+                        &attach.params::<kr_protocol::attachment::SessionAttachParams>(),
                     ),
                     geometry: kr_protocol::attachment::GeometryState {
                         owner: kr_protocol::scalars::Nullable::null(),
@@ -1898,5 +1916,806 @@ async fn a_screen_says_where_its_window_is_and_how_far_it_can_move() {
     assert_eq!(
         shown["screen"]["room"],
         json!({"up": 23, "down": 1, "left": 0, "right": 10})
+    );
+}
+
+// ---- The person's input ----------------------------------------------------------------------
+
+impl Page {
+    /// Sends `input` to `view`, as the page does.
+    fn input(&self, view: &str, input: Value) -> Result<Value, Value> {
+        self.invoke(
+            "main",
+            "terminal_view_input",
+            json!({"view": view, "input": input}),
+        )
+    }
+
+    /// Takes control of `view` as the page's control request `number`.
+    fn take(&self, view: &str, number: u64) {
+        self.input(view, json!({"kind": "take", "number": number}))
+            .expect("the take is taken");
+    }
+
+    /// Gives control of `view` back as the page's control request `number`.
+    fn release(&self, view: &str, number: u64) {
+        self.input(view, json!({"kind": "release", "number": number}))
+            .expect("the release is taken");
+    }
+
+    /// Turns the program's wheel `turns` times at canonical `column` and `line`, as made under the
+    /// page's take `take`.
+    fn wheel(
+        &self,
+        view: &str,
+        take: u64,
+        column: u32,
+        line: u32,
+        turns: i32,
+    ) -> Result<Value, Value> {
+        self.input(
+            view,
+            json!({
+                "kind": "wheel", "take": take, "column": column, "line": line, "turns": turns,
+                "shift": false, "alt": false, "control": false,
+            }),
+        )
+    }
+
+    /// Types `keys`, as made under the page's take `take`.
+    fn keys(&self, view: &str, take: u64, keys: &str) -> Result<Value, Value> {
+        self.input(view, json!({"kind": "keys", "take": take, "keys": keys}))
+    }
+}
+
+/// Which control request a state answers, and what it says of control.
+fn control(state: &Value) -> (u64, String) {
+    (
+        state["control"]["number"]
+            .as_u64()
+            .expect("a request number"),
+        state["control"]["state"]
+            .as_str()
+            .expect("a control state")
+            .to_owned(),
+    )
+}
+
+/// The code a command was refused with.
+fn code(refusal: &Value) -> &str {
+    refusal["code"].as_str().expect("a refusal's code")
+}
+
+/// The newest state `channel` has been sent.
+fn newest_now(page: &Page, channel: u32) -> Value {
+    page.states(channel).last().cloned().expect("a state")
+}
+
+/// A session of 20 columns and 6 rows whose program reports the mouse as `mouse` says, shown to a
+/// view of 10 by 2 at its live screen's first line.
+fn reporting(mouse: Mouse) -> Frame {
+    Frame::live((20, 6), (10, 2), 0).reporting(mouse)
+}
+
+/// A view showing `at` whose control the page took as its request 1, and the worker gave it.
+async fn controlling(
+    page: &Page,
+    worker: &mut ScriptedWorker,
+    channel: u32,
+    at: &Frame,
+    lease: &mut WorkerLease,
+) -> (String, Link) {
+    let (view, mut link) = panned(page, worker, channel, at).await;
+    page.take(&view, 1);
+    let acquire = link.expect(Method::InputAcquire).await;
+    lease.answer(&mut link, &acquire).await;
+    page.newest(channel, |state| {
+        control(state) == (1, "controlling".to_owned())
+    })
+    .await;
+    (view, link)
+}
+
+/// KR-REQ-13.18: taking control is one acquire, sent as a mutation with no expected epoch, an
+/// immediate takeover. The page is told at once that the view is taking control, and that it
+/// controls the program once the session answers; a second take while the first is in flight asks
+/// nothing more.
+#[tokio::test(flavor = "multi_thread")]
+async fn taking_control_acquires_once() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page_view = Page::new(worker.paths());
+    let (view, mut link) = panned(&page_view, &mut worker, 3, &reporting(Mouse::Sgr)).await;
+    page_view.take(&view, 1);
+    let taking = page_view
+        .newest(3, |state| control(state) == (1, "taking".to_owned()))
+        .await;
+    assert_eq!(taking["state"], "showing", "the screen goes on showing");
+    let acquire = link.expect(Method::InputAcquire).await;
+    assert_eq!(acquire.kind, CallKind::Mutation);
+    let asked: InputAcquireParams = acquire.params();
+    assert_eq!(asked.session_id, worker.session_id);
+    assert_eq!(asked.expected_epoch.0, None, "an immediate takeover");
+    page_view.take(&view, 2);
+    assert!(
+        link.quiet_for(QUIET).await,
+        "one acquire in flight at a time"
+    );
+    let mut lease = WorkerLease::at(4);
+    lease.answer(&mut link, &acquire).await;
+    let held = page_view
+        .newest(3, |state| control(state) == (2, "controlling".to_owned()))
+        .await;
+    assert_eq!(held["control"]["ended"], Value::Null);
+    assert_eq!(lease.holder, Some(asked.attachment_id));
+    assert!(
+        link.quiet_for(QUIET).await,
+        "and nothing more once it is held"
+    );
+}
+
+/// KR-REQ-08.76, KR-REQ-13.18: a wheel turn at a canonical cell is one wheel event there, never an
+/// arrow key, in the encoding the program asked for, written as a request under the lease's epoch
+/// at the stream's next number; each turn of an input is one event, and the next input takes the
+/// next number.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_wheel_turn_is_one_wheel_event_at_its_cell_under_the_epoch_and_next_number() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page_view = Page::new(worker.paths());
+    let mut lease = WorkerLease::at(4);
+    let (view, mut link) = controlling(
+        &page_view,
+        &mut worker,
+        3,
+        &reporting(Mouse::Sgr),
+        &mut lease,
+    )
+    .await;
+    page_view
+        .wheel(&view, 1, 7, 1, 1)
+        .expect("the turn is taken");
+    let write = link.expect(Method::InputWrite).await;
+    assert_eq!(
+        write.kind,
+        CallKind::Request,
+        "input is an ordered stream, not a mutation"
+    );
+    let asked: InputWriteParams = write.params();
+    assert_eq!(asked.epoch.get(), 5);
+    assert_eq!(asked.sequence.get(), 0);
+    assert_eq!(
+        asked.bytes.as_slice(),
+        b"\x1b[<65;8;2M",
+        "the wheel turned down, at column 8 and row 2 counted from 1"
+    );
+    lease.answer(&mut link, &write).await;
+    page_view
+        .wheel(&view, 1, 0, 5, -2)
+        .expect("the turns are taken");
+    let write = link.expect(Method::InputWrite).await;
+    let asked: InputWriteParams = write.params();
+    assert_eq!(asked.sequence.get(), 1);
+    assert_eq!(
+        asked.bytes.as_slice(),
+        b"\x1b[<64;1;6M\x1b[<64;1;6M",
+        "two turns up are two events"
+    );
+    lease.answer(&mut link, &write).await;
+    assert_eq!(lease.written.len(), 2);
+    assert!(link.quiet_for(QUIET).await);
+}
+
+/// Shift, Alt and Control go with the wheel as the report's own bits.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_modifiers_go_with_the_wheel() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page_view = Page::new(worker.paths());
+    let mut lease = WorkerLease::default();
+    let (view, mut link) = controlling(
+        &page_view,
+        &mut worker,
+        3,
+        &reporting(Mouse::Sgr),
+        &mut lease,
+    )
+    .await;
+    for (shift, alt, held_control, button) in [
+        (true, false, false, 69),
+        (false, true, false, 73),
+        (false, false, true, 81),
+        (true, true, true, 93),
+    ] {
+        page_view
+            .input(
+                &view,
+                json!({
+                    "kind": "wheel", "take": 1, "column": 0, "line": 0, "turns": 1,
+                    "shift": shift, "alt": alt, "control": held_control,
+                }),
+            )
+            .expect("the turn is taken");
+        let write = link.expect(Method::InputWrite).await;
+        let asked: InputWriteParams = write.params();
+        assert_eq!(
+            asked.bytes.as_slice(),
+            format!("\x1b[<{button};1;1M").as_bytes()
+        );
+        lease.answer(&mut link, &write).await;
+    }
+}
+
+/// Without 1006 the wheel goes in the original report, which carries a column as far as 223
+/// counted from 1: a turn past it sends nothing and leaves control as it was.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_original_report_carries_the_wheel_as_far_as_its_range() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page_view = Page::new(worker.paths());
+    let mut lease = WorkerLease::default();
+    let at = Frame::live((300, 6), (10, 2), 0).reporting(Mouse::Original);
+    let (view, mut link) = controlling(&page_view, &mut worker, 3, &at, &mut lease).await;
+    page_view
+        .wheel(&view, 1, 222, 0, 1)
+        .expect("the turn is taken");
+    let write = link.expect(Method::InputWrite).await;
+    let asked: InputWriteParams = write.params();
+    assert_eq!(
+        asked.bytes.as_slice(),
+        &[0x1b, b'[', b'M', 65 + 32, 223 + 32, 1 + 32]
+    );
+    lease.answer(&mut link, &write).await;
+    page_view
+        .wheel(&view, 1, 223, 0, 1)
+        .expect("the turn is taken, and nothing is written");
+    assert!(
+        link.quiet_for(QUIET).await,
+        "the original report has no room for column 224"
+    );
+    assert_eq!(
+        control(&newest_now(&page_view, 3)),
+        (1, "controlling".to_owned())
+    );
+    page_view
+        .wheel(&view, 1, 3, 1, -1)
+        .expect("the turn is taken");
+    let write = link.expect(Method::InputWrite).await;
+    let asked: InputWriteParams = write.params();
+    assert_eq!(asked.sequence.get(), 1, "nothing was written in between");
+    assert_eq!(
+        asked.bytes.as_slice(),
+        &[0x1b, b'[', b'M', 64 + 32, 4 + 32, 2 + 32]
+    );
+}
+
+/// KR-REQ-13.18: a program that does not report the mouse is sent nothing, and neither is one that
+/// asks for an encoding the view does not write; the page is told which, as the program changes it.
+/// A cell outside the session's grid is sent nothing either.
+#[tokio::test(flavor = "multi_thread")]
+async fn nothing_reaches_a_program_that_does_not_read_the_wheel_from_this_view() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page_view = Page::new(worker.paths());
+    let mut lease = WorkerLease::default();
+    let at = reporting(Mouse::Off);
+    let (view, mut link) = controlling(&page_view, &mut worker, 3, &at, &mut lease).await;
+    assert_eq!(newest_now(&page_view, 3)["screen"]["wheel"], "unreported");
+    page_view
+        .wheel(&view, 1, 1, 1, 3)
+        .expect("the turns are taken");
+    assert!(link.quiet_for(QUIET).await);
+    link.push(
+        PROJECTION_DELTA_EVENT,
+        &mouse_delta(&at, 40, 41, Mouse::Utf8),
+    )
+    .await;
+    page_view
+        .newest(3, |state| state["screen"]["wheel"] == "unwritable")
+        .await;
+    page_view
+        .wheel(&view, 1, 1, 1, 3)
+        .expect("the turns are taken");
+    assert!(link.quiet_for(QUIET).await);
+    link.push(
+        PROJECTION_DELTA_EVENT,
+        &mouse_delta(&at, 41, 42, Mouse::Sgr),
+    )
+    .await;
+    page_view
+        .newest(3, |state| state["screen"]["wheel"] == "reaches")
+        .await;
+    page_view
+        .wheel(&view, 1, 20, 1, 1)
+        .expect("the turn is taken");
+    page_view
+        .wheel(&view, 1, 1, 6, 1)
+        .expect("the turn is taken");
+    assert!(
+        link.quiet_for(QUIET).await,
+        "a cell outside the session's grid has no effect"
+    );
+    page_view
+        .wheel(&view, 1, 19, 5, 1)
+        .expect("the turn is taken");
+    let write = link.expect(Method::InputWrite).await;
+    assert_eq!(
+        write.params::<InputWriteParams>().bytes.as_slice(),
+        b"\x1b[<65;20;6M"
+    );
+}
+
+/// KR-REQ-13.18: `LEASE_LOST` ends control, and the page is told why. The view gives back nothing
+/// it no longer holds, and an input made later under that take is refused by the command, the
+/// words kept.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lost_lease_ends_control_and_says_so() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page_view = Page::new(worker.paths());
+    let mut lease = WorkerLease::default();
+    let (view, mut link) = controlling(
+        &page_view,
+        &mut worker,
+        3,
+        &reporting(Mouse::Sgr),
+        &mut lease,
+    )
+    .await;
+    lease.taken_over();
+    page_view
+        .wheel(&view, 1, 1, 1, 1)
+        .expect("taken: the view has not heard yet");
+    let write = link.expect(Method::InputWrite).await;
+    lease.answer(&mut link, &write).await;
+    let ended = page_view
+        .newest(3, |state| control(state).1 == "watching")
+        .await;
+    assert_eq!(control(&ended), (1, "watching".to_owned()));
+    assert_eq!(
+        ended["control"]["ended"],
+        "Control ended: another view took it, or the program changed how it reads keys."
+    );
+    let refused = page_view
+        .keys(&view, 1, "q")
+        .expect_err("the view no longer controls the program");
+    assert_eq!(code(&refused), "LEASE_LOST");
+    assert!(
+        link.quiet_for(QUIET).await,
+        "no release of a lease another holds, and no write"
+    );
+    assert_eq!(
+        newest_now(&page_view, 3)["control"]["ended"],
+        ended["control"]["ended"],
+        "the words stay"
+    );
+    assert!(lease.written.is_empty());
+}
+
+/// Any other refusal of a write ends control too, whether the stream took the write's number or
+/// not: the view gives its epoch back, and what it wrote is never written again. Control taken again
+/// is a new epoch from the stream's first number.
+#[tokio::test(flavor = "multi_thread")]
+async fn another_refusal_ends_control_and_gives_the_epoch_back() {
+    for consumes in [false, true] {
+        let mut worker = ScriptedWorker::start(Challenge::Answered);
+        let page_view = Page::new(worker.paths());
+        let mut lease = WorkerLease::at(4);
+        let (view, mut link) = controlling(
+            &page_view,
+            &mut worker,
+            3,
+            &reporting(Mouse::Sgr),
+            &mut lease,
+        )
+        .await;
+        page_view.keys(&view, 1, "a").expect("the keys are taken");
+        let write = link.expect(Method::InputWrite).await;
+        lease
+            .refuse_write(
+                &mut link,
+                &write,
+                ErrorCode::ResourceUnavailable,
+                "the application is not reading its input",
+                consumes,
+            )
+            .await;
+        let ended = page_view
+            .newest(3, |state| control(state).1 == "watching")
+            .await;
+        assert_eq!(
+            ended["control"]["ended"],
+            "Control ended. The session refused this view's input: the application is not reading its input"
+        );
+        let release = link.expect(Method::InputRelease).await;
+        assert_eq!(release.kind, CallKind::Mutation);
+        assert_eq!(release.params::<InputReleaseParams>().epoch.get(), 5);
+        lease.answer(&mut link, &release).await;
+        assert_eq!(lease.holder, None);
+        page_view.take(&view, 2);
+        let acquire = link.expect(Method::InputAcquire).await;
+        lease.answer(&mut link, &acquire).await;
+        page_view
+            .newest(3, |state| control(state) == (2, "controlling".to_owned()))
+            .await;
+        page_view.keys(&view, 2, "b").expect("the keys are taken");
+        let write = link.expect(Method::InputWrite).await;
+        lease.answer(&mut link, &write).await;
+        assert_eq!(
+            lease.written,
+            vec![(7, 0, b"b".to_vec())],
+            "a refusal that consumed a number ({consumes}) or did not: nothing written twice"
+        );
+    }
+}
+
+/// Looking around gives the lease back at once: the page is told the view watches, the epoch is
+/// released, and an input made under the take before it is refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn looking_around_gives_the_epoch_back_and_stops_writing() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page_view = Page::new(worker.paths());
+    let mut lease = WorkerLease::at(4);
+    let (view, mut link) = controlling(
+        &page_view,
+        &mut worker,
+        3,
+        &reporting(Mouse::Sgr),
+        &mut lease,
+    )
+    .await;
+    page_view.release(&view, 2);
+    let watching = page_view
+        .newest(3, |state| control(state) == (2, "watching".to_owned()))
+        .await;
+    assert_eq!(watching["control"]["ended"], Value::Null);
+    let release = link.expect(Method::InputRelease).await;
+    assert_eq!(release.params::<InputReleaseParams>().epoch.get(), 5);
+    lease.answer(&mut link, &release).await;
+    assert_eq!(
+        code(
+            &page_view
+                .wheel(&view, 1, 1, 1, 1)
+                .expect_err("the take is over")
+        ),
+        "LEASE_LOST"
+    );
+    assert!(link.quiet_for(QUIET).await);
+    assert!(lease.written.is_empty());
+}
+
+/// Closing a view that controls the program detaches it, which gives the lease back on the host, and
+/// writes nothing after.
+#[tokio::test(flavor = "multi_thread")]
+async fn closing_a_controlling_view_detaches_and_writes_nothing_after() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page_view = Page::new(worker.paths());
+    let mut lease = WorkerLease::default();
+    let (view, mut link) = controlling(
+        &page_view,
+        &mut worker,
+        3,
+        &reporting(Mouse::Sgr),
+        &mut lease,
+    )
+    .await;
+    let holder = lease.holder.expect("the view holds the lease");
+    page_view.close(&view);
+    let sent = link.closed().await;
+    assert_eq!(
+        sent.iter()
+            .map(|call| call.method.as_str())
+            .collect::<Vec<_>>(),
+        vec!["session.detach"]
+    );
+    let detach: SessionDetachParams = sent[0].params();
+    assert_eq!(detach.attachment_id.0, Some(holder));
+}
+
+/// An acquire answered after the person looked around gives the page nothing: the view releases
+/// the epoch it was handed, and control stays given back. Closing while an acquire is in flight
+/// detaches, which gives back whatever it took.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_acquire_answered_after_looking_around_is_released_and_restores_nothing() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page_view = Page::new(worker.paths());
+    let (view, mut link) = panned(&page_view, &mut worker, 3, &reporting(Mouse::Sgr)).await;
+    page_view.take(&view, 1);
+    let acquire = link.expect(Method::InputAcquire).await;
+    page_view.release(&view, 2);
+    page_view
+        .newest(3, |state| control(state) == (2, "watching".to_owned()))
+        .await;
+    let mut lease = WorkerLease::at(4);
+    lease.answer(&mut link, &acquire).await;
+    let release = link.expect(Method::InputRelease).await;
+    assert_eq!(release.params::<InputReleaseParams>().epoch.get(), 5);
+    lease.answer(&mut link, &release).await;
+    tokio::time::sleep(QUIET).await;
+    assert!(
+        page_view
+            .states(3)
+            .iter()
+            .all(|state| control(state).1 != "controlling"),
+        "control was never restored"
+    );
+    assert_eq!(
+        code(
+            &page_view
+                .wheel(&view, 1, 1, 1, 1)
+                .expect_err("the take was given back")
+        ),
+        "LEASE_LOST"
+    );
+
+    page_view.take(&view, 3);
+    let _acquire = link.expect(Method::InputAcquire).await;
+    page_view.close(&view);
+    let sent = link.closed().await;
+    assert_eq!(
+        sent.iter()
+            .map(|call| call.method.as_str())
+            .collect::<Vec<_>>(),
+        vec!["session.detach"]
+    );
+}
+
+/// A release and a take made one after the other each go in order under their own epochs; a late
+/// answer for the old epoch changes nothing, and an input made under the old take is refused once
+/// the new one controls the program.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_release_and_a_new_take_keep_their_epochs_apart() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page_view = Page::new(worker.paths());
+    let mut lease = WorkerLease::at(4);
+    let (view, mut link) = controlling(
+        &page_view,
+        &mut worker,
+        3,
+        &reporting(Mouse::Sgr),
+        &mut lease,
+    )
+    .await;
+    page_view.keys(&view, 1, "a").expect("the keys are taken");
+    let old_write = link.expect(Method::InputWrite).await;
+    page_view.release(&view, 2);
+    page_view.take(&view, 3);
+    let release = link.expect(Method::InputRelease).await;
+    assert_eq!(release.params::<InputReleaseParams>().epoch.get(), 5);
+    let acquire = link.expect(Method::InputAcquire).await;
+    lease.answer(&mut link, &release).await;
+    lease.answer(&mut link, &acquire).await;
+    page_view
+        .newest(3, |state| control(state) == (3, "controlling".to_owned()))
+        .await;
+    link.refuse_with(&old_write, ErrorCode::LeaseLost, "the lease has moved on")
+        .await;
+    tokio::time::sleep(QUIET).await;
+    assert_eq!(
+        control(&newest_now(&page_view, 3)),
+        (3, "controlling".to_owned()),
+        "an old epoch's answer changes nothing"
+    );
+    assert_eq!(
+        code(
+            &page_view
+                .keys(&view, 1, "late")
+                .expect_err("an input of the old take")
+        ),
+        "LEASE_LOST"
+    );
+    page_view.keys(&view, 3, "b").expect("the keys are taken");
+    let write = link.expect(Method::InputWrite).await;
+    let asked: InputWriteParams = write.params();
+    assert_eq!((asked.epoch.get(), asked.sequence.get()), (7, 0));
+    lease.answer(&mut link, &write).await;
+    assert_eq!(lease.written, vec![(7, 0, b"b".to_vec())]);
+}
+
+/// Section 8 ¶3: while the program reads keys in an encoding the view does not offer, the session
+/// refuses it control, and the page is told why. An encoding negotiated after the takeover ends the
+/// lease, which the view hears at its next write; back on the ordinary encoding a take succeeds.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_program_reading_another_encoding_keeps_control_from_the_view() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page_view = Page::new(worker.paths());
+    let mut lease = WorkerLease::default();
+    let (view, mut link) = controlling(
+        &page_view,
+        &mut worker,
+        3,
+        &reporting(Mouse::Sgr),
+        &mut lease,
+    )
+    .await;
+    lease.enhance();
+    page_view.keys(&view, 1, "a").expect("the keys are taken");
+    let write = link.expect(Method::InputWrite).await;
+    lease.answer(&mut link, &write).await;
+    page_view
+        .newest(3, |state| control(state) == (1, "watching".to_owned()))
+        .await;
+    page_view.take(&view, 2);
+    let acquire = link.expect(Method::InputAcquire).await;
+    lease.answer(&mut link, &acquire).await;
+    let refused = page_view
+        .newest(3, |state| {
+            control(state) == (2, "watching".to_owned()) && !state["control"]["ended"].is_null()
+        })
+        .await;
+    assert_eq!(
+        refused["control"]["ended"],
+        "This view cannot take control: the program reads keys in a form the view does not send."
+    );
+    lease.ordinary();
+    page_view.take(&view, 3);
+    let acquire = link.expect(Method::InputAcquire).await;
+    lease.answer(&mut link, &acquire).await;
+    let held = page_view
+        .newest(3, |state| control(state) == (3, "controlling".to_owned()))
+        .await;
+    assert_eq!(held["control"]["ended"], Value::Null);
+}
+
+/// A change of control is told at once whatever the screen is doing. While a moved window's screen
+/// waits for its report's answer, the change goes with the state the page was last sent, so the
+/// waiting screen and its settlement stay back until the answer; while the view waits for a screen
+/// after a resynchronisation, it goes with that waiting state.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_change_of_control_is_told_at_once_while_a_screen_is_held_or_awaited() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page_view = Page::new(worker.paths());
+    let at = wide_session().reporting(Mouse::Sgr);
+    let (view, mut link) = panned(&page_view, &mut worker, 3, &at).await;
+    page_view.pan(&view, 1, 2, 0);
+    let (call, _) = report(&mut link).await;
+    frame(&mut link, &at.at(0, 2).revision(1)).await;
+    tokio::time::sleep(QUIET).await;
+    let before = newest_now(&page_view, 3);
+    assert_eq!(
+        before["state"], "waiting",
+        "the moved window's screen is held"
+    );
+    page_view.take(&view, 1);
+    let taking = page_view
+        .newest(3, |state| control(state) == (1, "taking".to_owned()))
+        .await;
+    assert_eq!(taking["state"], "waiting", "the held screen stays held");
+    assert_eq!(taking["settled"], before["settled"]);
+    let acquire = link.expect(Method::InputAcquire).await;
+    let mut lease = WorkerLease::default();
+    lease.answer(&mut link, &acquire).await;
+    let held = page_view
+        .newest(3, |state| control(state) == (1, "controlling".to_owned()))
+        .await;
+    assert_eq!(held["state"], "waiting");
+    assert_eq!(held["settled"], before["settled"]);
+    link.answer(&call, &viewport_answer(1)).await;
+    let moved = page_view.newest(3, |state| settled(state, 1)).await;
+    assert_eq!(moved["state"], "showing");
+    assert_eq!(place(&moved), (2, 0, 0));
+    assert_eq!(control(&moved), (1, "controlling".to_owned()));
+
+    link.push("session.resync", &resync_marker(60)).await;
+    let subscribe = link.expect(Method::EventsSubscribe).await;
+    page_view
+        .newest(3, |state| state["state"] == "waiting")
+        .await;
+    page_view.release(&view, 2);
+    let watching = page_view
+        .newest(3, |state| control(state) == (2, "watching".to_owned()))
+        .await;
+    assert_eq!(watching["state"], "waiting");
+    let release = link.expect(Method::InputRelease).await;
+    lease.answer(&mut link, &release).await;
+    link.answer(&subscribe, &scripted_worker::subscribed())
+        .await;
+    link.restart_stream();
+    frame(&mut link, &at.at(0, 2).revision(1)).await;
+    let back = page_view
+        .newest(3, |state| state["state"] == "showing")
+        .await;
+    assert_eq!(control(&back), (2, "watching".to_owned()));
+}
+
+/// Keys and the wheel before the view controls the program reach nothing: the command refuses them,
+/// while the take is in flight as well, and the view writes nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn input_before_the_view_controls_the_program_is_refused_and_reaches_nothing() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page_view = Page::new(worker.paths());
+    let (view, mut link) = panned(&page_view, &mut worker, 3, &reporting(Mouse::Sgr)).await;
+    for take in [0, 1] {
+        assert_eq!(
+            code(
+                &page_view
+                    .keys(&view, take, "exit\r")
+                    .expect_err("no control")
+            ),
+            "LEASE_LOST"
+        );
+        assert_eq!(
+            code(
+                &page_view
+                    .wheel(&view, take, 1, 1, 1)
+                    .expect_err("no control")
+            ),
+            "LEASE_LOST"
+        );
+    }
+    page_view.take(&view, 1);
+    let _acquire = link.expect(Method::InputAcquire).await;
+    assert_eq!(
+        code(
+            &page_view
+                .keys(&view, 1, "x")
+                .expect_err("still taking control")
+        ),
+        "LEASE_LOST"
+    );
+    assert!(link.quiet_for(QUIET).await);
+}
+
+/// KR-REQ-10.01: what is not the view's input shape is refused before anything is sent: the page's
+/// old wheel and bytes requests, an unknown kind or field, no turn or more than an input carries, a
+/// cell below zero, and keys that are empty or longer than one input frame. The most turns one input
+/// carries still go.
+#[tokio::test(flavor = "multi_thread")]
+async fn inputs_that_are_not_the_views_shape_are_refused_before_anything_is_sent() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page_view = Page::new(worker.paths());
+    let mut lease = WorkerLease::default();
+    let (view, mut link) = controlling(
+        &page_view,
+        &mut worker,
+        3,
+        &reporting(Mouse::Sgr),
+        &mut lease,
+    )
+    .await;
+    let session = worker.session_id.to_string();
+    let turning = |turns: i64, column: i64| {
+        json!({
+            "kind": "wheel", "take": 1, "column": column, "line": 0, "turns": turns,
+            "shift": false, "alt": false, "control": false,
+        })
+    };
+    for shape in [
+        json!({"session_id": session, "wheel": {"lines": 3}}),
+        json!({"session_id": session, "bytes": "\u{1b}[A"}),
+        json!({"kind": "scroll", "take": 1}),
+        json!({"kind": "take"}),
+        json!({"kind": "keys", "take": 1, "keys": "a", "session_id": session}),
+        turning(0, 0),
+        turning(1025, 0),
+        turning(-1025, 0),
+        turning(1, -1),
+        json!({"kind": "keys", "take": 1, "keys": ""}),
+        json!({"kind": "keys", "take": 1, "keys": "x".repeat(64 * 1024 + 1)}),
+    ] {
+        let refused = page_view.input(&view, shape.clone()).expect_err("refused");
+        assert_eq!(code(&refused), "INVALID_ARGUMENT", "{shape}");
+    }
+    assert!(link.quiet_for(QUIET).await, "nothing reached the session");
+    page_view
+        .wheel(&view, 1, 0, 0, 1024)
+        .expect("the most turns one input carries");
+    let write = link.expect(Method::InputWrite).await;
+    assert_eq!(
+        write.params::<InputWriteParams>().bytes.as_slice(),
+        b"\x1b[<65;1;1M".repeat(1024).as_slice()
+    );
+}
+
+/// A control request whose number is not above the newest the view took changes nothing: a take
+/// that arrives after a later release takes no control.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_control_request_not_above_the_newest_changes_nothing() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page_view = Page::new(worker.paths());
+    let (view, mut link) = panned(&page_view, &mut worker, 3, &reporting(Mouse::Sgr)).await;
+    page_view.release(&view, 2);
+    page_view
+        .newest(3, |state| control(state) == (2, "watching".to_owned()))
+        .await;
+    page_view.take(&view, 1);
+    assert!(link.quiet_for(QUIET).await, "no acquire");
+    assert_eq!(
+        control(&newest_now(&page_view, 3)),
+        (2, "watching".to_owned())
     );
 }

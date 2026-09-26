@@ -291,12 +291,20 @@ pub struct Link {
     session_id: SessionId,
 }
 
+/// How a call reached the worker: as a plain request, or as a mutation with an action identifier.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CallKind {
+    Request,
+    Mutation,
+}
+
 /// One call a view made: a read or a mutation, with what it asked.
 #[derive(Debug)]
 pub struct Call {
     pub request_id: RequestId,
     pub method: String,
     pub params: ParamsValue,
+    pub kind: CallKind,
 }
 
 impl Call {
@@ -320,11 +328,13 @@ impl Link {
                 request_id: request.request_id,
                 method: request.method.to_string(),
                 params: request.params,
+                kind: CallKind::Request,
             },
             ControlFrame::Mutation(mutation) => Call {
                 request_id: mutation.request_id,
                 method: mutation.method.to_string(),
                 params: mutation.params,
+                kind: CallKind::Mutation,
             },
             other => panic!("the view sent {other:?} rather than a call"),
         }
@@ -354,11 +364,13 @@ impl Link {
                         request_id: request.request_id,
                         method: request.method.to_string(),
                         params: request.params,
+                        kind: CallKind::Request,
                     }),
                     Ok(ControlFrame::Mutation(mutation)) => sent.push(Call {
                         request_id: mutation.request_id,
                         method: mutation.method.to_string(),
                         params: mutation.params,
+                        kind: CallKind::Mutation,
                     }),
                     Ok(_) => {}
                     Err(_) => return,
@@ -387,10 +399,16 @@ impl Link {
 
     /// Refuses `call` with `message`.
     pub async fn refuse(&mut self, call: &Call, message: &str) {
+        self.refuse_with(call, ErrorCode::InvalidArgument, message)
+            .await;
+    }
+
+    /// Refuses `call` with the host's `code` and `message`.
+    pub async fn refuse_with(&mut self, call: &Call, code: ErrorCode, message: &str) {
         self.writer
             .write_message(&ControlFrame::Response(Response {
                 request_id: call.request_id,
-                outcome: Outcome::Error(ProtocolError::new(ErrorCode::InvalidArgument, message)),
+                outcome: Outcome::Error(ProtocolError::new(code, message)),
             }))
             .await
             .expect("the refusal is written");
@@ -427,14 +445,14 @@ impl Link {
         let call = self.expect(Method::SessionAttach).await;
         let asked: SessionAttachParams = call.params();
         let attachment_id = AttachmentId::new(kr_ipc::new_uuid());
-        let dimensions = asked
-            .dimensions
-            .0
-            .expect("a terminal attachment names its size");
+        assert!(
+            asked.dimensions.0.is_some(),
+            "a terminal attachment names its size"
+        );
         self.answer(
             &call,
             &SessionAttachResult {
-                attachment: summary(attachment_id, dimensions),
+                attachment: summary(attachment_id, &asked),
                 geometry: GeometryState {
                     owner: Nullable::null(),
                     epoch: GeometryEpoch::new(1),
@@ -450,20 +468,23 @@ impl Link {
     }
 }
 
-/// The summary a worker gives a view that declared no terminal profile.
-pub fn summary(attachment_id: AttachmentId, dimensions: Dimensions) -> AttachmentSummary {
-    let mut granted = CanonicalSet::new();
-    granted.insert(kr_protocol::attachment::AttachmentCapability::ObserveTerminal);
+/// The summary a worker gives the attachment `asked` for, as the local owner: granted what it
+/// asked for, and shown a viewport, since this worker has qualified no terminal to take its stream.
+pub fn summary(attachment_id: AttachmentId, asked: &SessionAttachParams) -> AttachmentSummary {
     AttachmentSummary {
         attachment_id,
         ordinal: kr_protocol::ids::AttachmentOrdinal::new(2),
         mode: AttachMode::Terminal,
         claim_geometry: false,
-        dimensions: Nullable::some(dimensions),
+        dimensions: asked.dimensions,
         presentation: Nullable::some(TerminalPresentationMode::Viewport),
-        presentation_reason: Some(kr_protocol::attachment::PresentationReason::NoTerminalProfile),
-        terminal_profile_id: Nullable::null(),
-        granted,
+        presentation_reason: Some(if asked.terminal_profile_id.0.is_some() {
+            kr_protocol::attachment::PresentationReason::UnqualifiedTerminalProfile
+        } else {
+            kr_protocol::attachment::PresentationReason::NoTerminalProfile
+        }),
+        terminal_profile_id: asked.terminal_profile_id.clone(),
+        granted: asked.requested.clone(),
         attached_at_ms: TimestampMs::new(1),
     }
 }
@@ -731,6 +752,38 @@ pub struct Frame {
     pub oldest: u64,
     /// Which buffer is showing.
     pub buffer: ProjectedBuffer,
+    /// How the program reports the mouse.
+    pub mouse: Mouse,
+}
+
+/// How a program reports the mouse, as the DEC modes it has set say.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mouse {
+    /// It does not: none of 1000, 1002 and 1003 is set.
+    Off,
+    /// Presses and the wheel (1000) in the SGR encoding (1006).
+    Sgr,
+    /// Presses and the wheel (1000) in the original report.
+    Original,
+    /// Presses and the wheel (1000) in the UTF-8 encoding (1005), which no client here writes.
+    Utf8,
+}
+
+/// The modes `mouse` sets and clears, as a header lists every tracked mode and an update lists
+/// those that changed.
+pub fn mouse_modes(mouse: Mouse) -> Vec<kr_protocol::projection::ProjectedMode> {
+    let dec = |mode: u64, enabled: bool| kr_protocol::projection::ProjectedMode {
+        kind: kr_protocol::projection::ProjectedModeKind::Dec,
+        mode: U64::new(mode),
+        enabled,
+    };
+    vec![
+        dec(1000, mouse != Mouse::Off),
+        dec(1002, false),
+        dec(1003, false),
+        dec(1005, mouse == Mouse::Utf8),
+        dec(1006, mouse == Mouse::Sgr),
+    ]
 }
 
 impl Frame {
@@ -750,7 +803,13 @@ impl Frame {
             column: 0,
             oldest: 0,
             buffer: ProjectedBuffer::Primary,
+            mouse: Mouse::Off,
         }
+    }
+
+    /// The same window, of a program that reports the mouse as `mouse` says.
+    pub fn reporting(self, mouse: Mouse) -> Self {
+        Self { mouse, ..self }
     }
 
     /// The same session, the window at line `line` of the live screen and column `column`.
@@ -825,6 +884,7 @@ pub async fn frame(link: &mut Link, frame: &Frame) {
     header.viewport = frame.viewport();
     header.active_buffer = frame.buffer;
     header.oldest_retained_row = U64::new(frame.oldest);
+    header.modes = mouse_modes(frame.mouse);
     link.push(kr_protocol::projection::PROJECTION_SNAPSHOT_EVENT, &header)
         .await;
     let mut rows = page(frame.generation, frame.cursor, frame.rows(), false);
@@ -849,4 +909,185 @@ pub fn frame_delta(frame: &Frame, base: u64, next: u64) -> ProjectionDelta {
     update.buffer = frame.buffer;
     update.oldest_retained_row = U64::new(frame.oldest);
     update
+}
+
+/// An update from `base` to `next` that leaves `frame`'s window and rows as they are and changes how
+/// the program reports the mouse to `mouse`.
+pub fn mouse_delta(frame: &Frame, base: u64, next: u64, mouse: Mouse) -> ProjectionDelta {
+    let mut update = frame_delta(frame, base, next);
+    update.modes = mouse_modes(mouse);
+    update
+}
+
+// ---- The input lease -------------------------------------------------------------------------
+
+/// The session's input lease, kept the way the worker keeps it, answering a view's acquire, release
+/// and write as the worker does: a takeover and a release each advance the epoch, a write is taken
+/// only from the holder at the current epoch and only at the next number of its ordered stream, and
+/// an acquire is refused while the program reads an encoding the view does not offer.
+#[derive(Debug, Default)]
+pub struct WorkerLease {
+    pub epoch: u64,
+    pub holder: Option<AttachmentId>,
+    /// The next number the holder's ordered input stream has to write.
+    pub next: u64,
+    /// Whether the program has negotiated an encoding the view does not offer.
+    pub enhanced: bool,
+    /// Every batch the worker took, in order: its epoch, its number and its bytes.
+    pub written: Vec<(u64, u64, Vec<u8>)>,
+}
+
+impl WorkerLease {
+    /// A lease whose epoch has already moved `epoch` times.
+    pub fn at(epoch: u64) -> Self {
+        Self {
+            epoch,
+            ..Self::default()
+        }
+    }
+
+    fn state(&self) -> kr_protocol::input::InputLeaseState {
+        kr_protocol::input::InputLeaseState {
+            epoch: kr_protocol::ids::InputLeaseEpoch::new(self.epoch),
+            holder: Nullable(self.holder),
+            connection_id: Nullable::null(),
+            next_sequence: kr_protocol::ids::InputSequence::new(self.next),
+        }
+    }
+
+    /// Answers `call`, an acquire, a release or a write, as the worker does.
+    pub async fn answer(&mut self, link: &mut Link, call: &Call) {
+        if call.method == Method::InputAcquire.to_string() {
+            assert_eq!(call.kind, CallKind::Mutation, "an acquire is a mutation");
+            let asked: kr_protocol::input::InputAcquireParams = call.params();
+            if let Some(expected) = asked.expected_epoch.0
+                && expected.get() != self.epoch
+            {
+                link.refuse_with(call, ErrorCode::LeaseLost, "the lease has moved on")
+                    .await;
+                return;
+            }
+            if self.enhanced {
+                link.refuse_with(
+                    call,
+                    ErrorCode::InputIncompatible,
+                    "the application reads the Kitty keyboard protocol with flags 1, and this \
+                     attachment offers the ordinary terminal encoding only",
+                )
+                .await;
+                return;
+            }
+            self.epoch += 1;
+            self.holder = Some(asked.attachment_id);
+            self.next = 0;
+            let answer = kr_protocol::input::InputAcquireResult {
+                lease: self.state(),
+                discarded_bytes: U64::ZERO,
+                closed_open_paste: false,
+            };
+            link.answer(call, &answer).await;
+        } else if call.method == Method::InputRelease.to_string() {
+            assert_eq!(call.kind, CallKind::Mutation, "a release is a mutation");
+            let asked: kr_protocol::input::InputReleaseParams = call.params();
+            if self.holder != Some(asked.attachment_id) || asked.epoch.get() != self.epoch {
+                link.refuse_with(
+                    call,
+                    ErrorCode::LeaseLost,
+                    "this attachment does not hold it",
+                )
+                .await;
+                return;
+            }
+            self.epoch += 1;
+            self.holder = None;
+            self.next = 0;
+            let answer = kr_protocol::input::InputLeaseResult {
+                lease: self.state(),
+            };
+            link.answer(call, &answer).await;
+        } else if call.method == Method::InputWrite.to_string() {
+            assert_eq!(
+                call.kind,
+                CallKind::Request,
+                "input is a request, not a mutation"
+            );
+            let asked: kr_protocol::input::InputWriteParams = call.params();
+            if self.holder != Some(asked.attachment_id) || asked.epoch.get() != self.epoch {
+                link.refuse_with(call, ErrorCode::LeaseLost, "the lease has moved on")
+                    .await;
+                return;
+            }
+            if asked.sequence.get() != self.next {
+                link.refuse(
+                    call,
+                    &format!(
+                        "input sequence {} does not follow {}",
+                        asked.sequence.get(),
+                        self.next
+                    ),
+                )
+                .await;
+                return;
+            }
+            self.next += 1;
+            let bytes = asked.bytes.as_slice().to_vec();
+            let forwarded = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+            self.written.push((self.epoch, asked.sequence.get(), bytes));
+            let answer = kr_protocol::input::InputWriteResult {
+                sequence: asked.sequence,
+                forwarded_bytes: U64::new(forwarded),
+                held_prefix_bytes: U64::ZERO,
+            };
+            link.answer(call, &answer).await;
+        } else {
+            panic!("{} is not a call of the input lease", call.method);
+        }
+    }
+
+    /// Refuses the write `call` with the host's `code`, as the worker does for a refusal it decides
+    /// before the stream takes the write's number (`consumes` false) or after (`consumes` true).
+    pub async fn refuse_write(
+        &mut self,
+        link: &mut Link,
+        call: &Call,
+        code: ErrorCode,
+        message: &str,
+        consumes: bool,
+    ) {
+        assert_eq!(call.method, Method::InputWrite.to_string());
+        if consumes {
+            self.next += 1;
+        }
+        link.refuse_with(call, code, message).await;
+    }
+
+    /// Another attachment takes the lease over, as a takeover does.
+    pub fn taken_over(&mut self) {
+        self.epoch += 1;
+        self.holder = Some(AttachmentId::new(kr_ipc::new_uuid()));
+        self.next = 0;
+    }
+
+    /// The program negotiates an encoding the view does not offer: the worker ends its lease.
+    pub fn enhance(&mut self) {
+        self.enhanced = true;
+        if self.holder.take().is_some() {
+            self.epoch += 1;
+            self.next = 0;
+        }
+    }
+
+    /// The program goes back to the ordinary encoding.
+    pub fn ordinary(&mut self) {
+        self.enhanced = false;
+    }
+
+    /// A detach, which releases a lease its attachment holds.
+    pub fn detached(&mut self, attachment_id: AttachmentId) {
+        if self.holder == Some(attachment_id) {
+            self.epoch += 1;
+            self.holder = None;
+            self.next = 0;
+        }
+    }
 }
