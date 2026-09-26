@@ -671,8 +671,9 @@ fn builder_trusting(
 /// TLS 1.3, or 1.2 with a server that has no newer, and the platform's own trust: the operating
 /// system's verifier on macOS, Windows, iOS and Android, and on Linux the distribution's certificate
 /// store, read from its fixed locations with no environment variable consulted.
-/// `extra_roots` adds authorities beside the platform's: every shipped client passes none, and a
-/// test passes the authority its own server was issued by.
+/// `extra_roots` adds authorities beside the platform's everywhere but Android, whose verifier takes
+/// none: every shipped client passes none, and a test passes the authority its own server was
+/// issued by.
 ///
 /// # Errors
 ///
