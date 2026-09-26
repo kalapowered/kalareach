@@ -2656,7 +2656,25 @@ pub fn question_event(session_id: SessionId, record: &AttentionQuestionRecord) -
 /// rather than by what it said. Anything else moves the cursor and nothing more.
 #[must_use]
 pub fn host_event(session_id: SessionId, record: &AttentionHostRecord) -> SourceEvent {
-    let kind = if record.notification {
+    // A worker's notice about a plugin binding it holds is the trusted adapter rule's. Only the
+    // worker writes the member, so an application's notification, which never carries it, cannot
+    // raise or resolve one; the transition travels whether or not the text does.
+    let kind = if let Some(notice) = record.adapter.0.as_ref() {
+        match notice.transition {
+            kr_protocol::attention::AdapterTransition::Revoked => EventKind::AdapterFailed {
+                plugin_id: notice.plugin_id.clone(),
+                session_id: Some(session_id),
+                detail: record
+                    .text
+                    .0
+                    .clone()
+                    .unwrap_or_else(|| "revoked by its repository".to_owned()),
+            },
+            kr_protocol::attention::AdapterTransition::Cleared => EventKind::AdapterRecovered {
+                plugin_id: notice.plugin_id.clone(),
+            },
+        }
+    } else if record.notification {
         EventKind::ApplicationNotice {
             session_id,
             notice: kr_attention::event::ApplicationNotice {
@@ -3000,6 +3018,63 @@ mod tests {
     use kr_protocol::session::DisplayNumber;
 
     use super::*;
+
+    /// A worker's adapter notice is the trusted adapter rule's, keyed on the package and carrying
+    /// the session: `revoked` raises it with the text or, withheld, a line of this build's own,
+    /// and `cleared` resolves it. An application's notification saying the same thing is an
+    /// application notice and nothing else.
+    #[test]
+    fn an_adapter_notice_is_the_adapter_rule_and_a_notification_is_not() {
+        let session = SessionId::new(kr_protocol::scalars::Uuid::from_bytes([7; 16]));
+        let plugin = kr_protocol::ids::PluginId::new("kalareach/claude-code").expect("an id");
+        let record =
+            |text: Option<&str>,
+             notification: bool,
+             transition: Option<kr_protocol::attention::AdapterTransition>| {
+                AttentionHostRecord {
+                    sequence: U64::new(1),
+                    notification,
+                    recorded_at_ms: TimestampMs::new(0),
+                    text: Nullable::from(text.map(str::to_owned)),
+                    fingerprint: Nullable::null(),
+                    adapter: Nullable::from(transition.map(|transition| {
+                        kr_protocol::attention::AdapterNotice {
+                            plugin_id: plugin.clone(),
+                            transition,
+                        }
+                    })),
+                }
+            };
+        let warning = "kalareach/claude-code 1.0.0 was revoked by its repository";
+        let revoked = kr_protocol::attention::AdapterTransition::Revoked;
+        let cleared = kr_protocol::attention::AdapterTransition::Cleared;
+        assert_eq!(
+            host_event(session, &record(Some(warning), false, Some(revoked))).kind,
+            EventKind::AdapterFailed {
+                plugin_id: plugin.clone(),
+                session_id: Some(session),
+                detail: warning.to_owned(),
+            }
+        );
+        assert_eq!(
+            host_event(session, &record(None, false, Some(revoked))).kind,
+            EventKind::AdapterFailed {
+                plugin_id: plugin.clone(),
+                session_id: Some(session),
+                detail: "revoked by its repository".to_owned(),
+            }
+        );
+        assert_eq!(
+            host_event(session, &record(None, false, Some(cleared))).kind,
+            EventKind::AdapterRecovered {
+                plugin_id: plugin.clone(),
+            }
+        );
+        assert!(matches!(
+            host_event(session, &record(Some(warning), true, None)).kind,
+            EventKind::ApplicationNotice { .. }
+        ));
+    }
 
     /// A reach that connects to nothing and answers a closure as the test says.
     struct Stub {
