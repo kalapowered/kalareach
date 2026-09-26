@@ -580,7 +580,21 @@ mod platform {
                 .name(name)
                 .security_descriptor(descriptor)
                 .create_tokio()
-                .map_err(|error| IpcError::socket("bind", error))?;
+                .map_err(|error| {
+                    // The first instance is created exclusively, so a name that already exists is
+                    // refused with an access denial whoever holds it: a live listener of this
+                    // account, or a pipe another account made first. Neither can be told from the
+                    // other here, so the refusal says what happened without naming a holder.
+                    if error.kind() == std::io::ErrorKind::PermissionDenied {
+                        IpcError::socket(
+                            "bind (the name is held by another pipe, or its list refuses this \
+                             account)",
+                            error,
+                        )
+                    } else {
+                        IpcError::socket("bind", error)
+                    }
+                })?;
             Ok(Self { inner })
         }
 
