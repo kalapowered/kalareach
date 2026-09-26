@@ -26,13 +26,14 @@
 //! an expression it does not read. `shown!("{}", value)` is always read: the compiler holds its
 //! parts to `Plain`.
 //!
-//! Each name is placed as the compiler places it, through scopes, imports, globs, namespaces and
-//! every set of `cfg` conditions, and a name this reading cannot place counts against the code: in
-//! the two crates a trait, a macro, an attribute or a derive it cannot place is a finding where it
-//! is written, and a type it cannot place carries. The name `Debug` itself is the standard
-//! library's alone in the two crates, its trait and its derive: an item named `Debug`, an import
-//! renamed to it, and an import or a glob that can give the name anything else, or that this
-//! reading cannot follow, are findings, so no scope or condition leads the name elsewhere.
+//! Each name is placed where the compiler places it, through scopes, imports, globs, namespaces
+//! and every set of `cfg` conditions, within the limits below, and a name this reading cannot
+//! place counts against the code: in the two crates a trait, a macro, an attribute or a derive it
+//! cannot place is a finding where it is written, and a type it cannot place carries. The name
+//! `Debug` itself is the standard library's alone in the two crates, its trait and its derive: an
+//! item named `Debug`, an import renamed to it, and an import or a glob that can give the name
+//! anything else, or that this reading cannot follow, are findings. So no item, import or glob
+//! this reading sees there gives the name to anything else.
 //!
 //! This reads the code the workspace writes, not every program Rust accepts, and it does not try
 //! to hold code written to get past it. What it does not read:
@@ -42,6 +43,14 @@
 //!   of that crate can give a name this reading does not know of, which it then places where the
 //!   scopes around the glob place it. In the two crates, outside the files that define what may
 //!   be shown, a macro used is one this reading reads or lists, or a finding;
+//! * the namespaces an item it does not read is in, and the conditions an item has in each
+//!   namespace behind an import: an item of the standard library, one from outside the workspace
+//!   and a value of the workspace count as a type, a trait and a macro at once, and an import
+//!   counts as there in every namespace its item is in whenever the import itself is. So a glob
+//!   can give a name as a macro, or as a trait a `cfg` can leave out, which this reading then takes
+//!   for the trait where the compiler goes on to a trait of that name further out. The naming rule
+//!   leaves no such import or glob of the name `Debug` in the two crates; for any other name, the
+//!   standard library's `Debug` imported under another name among them, this is a limit;
 //! * values: a function, a constant or a static is not read, so a glob that gives the name `Debug`
 //!   only to one of them is not found. The compiler never takes a value for a type, a trait or a
 //!   macro.
