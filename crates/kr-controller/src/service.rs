@@ -5732,8 +5732,9 @@ impl Controller {
             );
             // The owner's own ceremony, checked by this host's pairing service against its owner
             // devices. `None` is a host that is not on the network and so has no owner device, and
-            // the two confirmed methods are then refused rather than performed under the identity
-            // of whoever asked.
+            // every method that needs the owner's confirmation (adopting a root, a grant, an
+            // installation that widens what a package may do) is then refused rather than
+            // performed under the identity of whoever asked.
             let pairing = self.network.get().map(|guard| Arc::clone(guard.pairing()));
             let confirmations = pairing
                 .as_deref()

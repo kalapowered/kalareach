@@ -1717,8 +1717,9 @@ impl RemoteConnection {
                     deadline: Some(accepted.deadline),
                 };
                 // The owner's own ceremony, checked by this host's pairing service against its owner
-                // devices; a host with none refuses the two confirmed methods rather than
-                // performing them under the identity of whoever asked.
+                // devices; a host with none refuses every method that needs the owner's
+                // confirmation (adopting a root, a grant, an installation that widens what a
+                // package may do) rather than performing it under the identity of whoever asked.
                 let pairing = self
                     .controller
                     .network

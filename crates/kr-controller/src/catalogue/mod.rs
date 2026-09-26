@@ -529,9 +529,10 @@ impl CatalogueModule {
 
     /// Serves one catalogue or plugin mutation.
     ///
-    /// `confirmations` is where the two confirmed methods check the owner's decision. `None` is a
-    /// host with no enrolled owner signer, which refuses them rather than performing them under
-    /// the identity of whoever called.
+    /// `confirmations` is where the methods that need the owner's confirmation (adopting a root, a
+    /// grant, an installation that widens what a package may do) check the owner's decision.
+    /// `None` is a host with no enrolled owner signer, which refuses them rather than performing
+    /// them under the identity of whoever called.
     ///
     /// # Errors
     ///
