@@ -332,18 +332,40 @@ fn powershell_on_path() -> Option<PathBuf> {
 /// The variable one shell's entries share, so the integration loads once in each shell.
 pub const ENTRY_GUARD_VARIABLE: &str = "KR_SHELL_ENTRY";
 
+/// A package entry that cannot be named in a startup file, because its path is not text.
+///
+/// A startup file is text, and so is the path an entry names in it. A path that is not UTF-8 has
+/// no spelling there: converted with replacement characters, it would name another path, which
+/// the shell reading the file would then source or fail to find. It is refused instead, by name.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("{} cannot be written into a startup file: it is not UTF-8", .path.display())]
+pub struct NotText {
+    /// The package's entry, as the package names it.
+    pub path: PathBuf,
+}
+
 /// What one guarded entry contains.
 ///
 /// The body is the package's own file, sourced by one line. Nothing of the integration's logic is
 /// copied into the user's configuration, so upgrading the package changes what runs without
 /// rewriting anything the user owns.
-#[must_use]
-pub fn entry(target: &StartupTarget, package_entry: &Path, nsh_bypass: bool) -> String {
+///
+/// # Errors
+///
+/// Returns [`NotText`] when the package's entry is not UTF-8, which no startup file can name.
+pub fn entry(
+    target: &StartupTarget,
+    package_entry: &Path,
+    nsh_bypass: bool,
+) -> Result<String, NotText> {
     let kind = target.kind;
+    let text = package_entry.to_str().ok_or_else(|| NotText {
+        path: package_entry.to_path_buf(),
+    })?;
     // The path is quoted for the shell that will read this file, by the same rules a launch is
     // quoted by. An installation directory with an apostrophe in it would otherwise end the string
     // and turn the rest of the path into shell syntax.
-    let path = crate::host::quoting::quote(kind, &package_entry.display().to_string());
+    let path = crate::host::quoting::quote(kind, text);
     let mut body = String::new();
     body.push_str(MARKER_BEGIN);
     body.push('\n');
@@ -406,7 +428,7 @@ pub fn entry(target: &StartupTarget, package_entry: &Path, nsh_bypass: bool) -> 
     }
     body.push_str(MARKER_END);
     body.push('\n');
-    body
+    Ok(body)
 }
 
 /// What installing or removing an entry did.
@@ -1019,7 +1041,8 @@ mod tests {
             &for_shell(ShellKind::Zsh),
             Path::new("/opt/kr/entry"),
             false,
-        );
+        )
+        .expect("the path is text");
         assert_eq!(install(&path, &body).expect("installs"), Change::Added);
         assert!(installed(&path));
         assert_eq!(remove(&path).expect("removes"), Change::Removed);
@@ -1089,7 +1112,11 @@ mod tests {
                 powershell: None,
             };
             for target in layout.targets(ShellKind::Bash) {
-                install(&target.path, &entry(&target, &package, false)).expect("installs");
+                install(
+                    &target.path,
+                    &entry(&target, &package, false).expect("the path is text"),
+                )
+                .expect("installs");
             }
 
             // A login Bash: it reads the login file, and in two of these three that file runs
@@ -1171,7 +1198,8 @@ mod tests {
             &for_shell(ShellKind::Zsh),
             Path::new("/opt/kr/zsh-entry.zsh"),
             false,
-        );
+        )
+        .expect("the path is text");
         assert_eq!(install(&path, &body).expect("installs"), Change::Added);
         assert!(
             std::fs::read_to_string(&path)
@@ -1199,7 +1227,8 @@ mod tests {
             &for_shell(ShellKind::PowerShell),
             Path::new("/opt/kr/entry.ps1"),
             false,
-        );
+        )
+        .expect("the path is text");
         assert_eq!(install(&path, &body).expect("installs"), Change::Added);
         assert!(installed(&path));
     }
@@ -1220,7 +1249,8 @@ mod tests {
             &for_shell(ShellKind::Zsh),
             Path::new("/opt/kr/zsh-entry.zsh"),
             false,
-        );
+        )
+        .expect("the path is text");
         assert_eq!(install(&path, &body).expect("installs"), Change::Added);
         assert_eq!(remove(&path).expect("removes"), Change::Removed);
         assert_eq!(
@@ -1302,7 +1332,8 @@ mod tests {
             &for_shell(ShellKind::Zsh),
             Path::new("/opt/kr/zsh-entry.zsh"),
             false,
-        );
+        )
+        .expect("the path is text");
         assert_eq!(install(&path, &body).expect("installs"), Change::Added);
         let after = std::fs::read_to_string(&path).expect("reads");
         assert!(after.starts_with(theirs), "the user's own lines are first");
@@ -1314,7 +1345,8 @@ mod tests {
             &for_shell(ShellKind::Zsh),
             Path::new("/opt/kr/zsh-entry.zsh"),
             true,
-        );
+        )
+        .expect("the path is text");
         assert_eq!(
             install(&path, &updated).expect("installs"),
             Change::Replaced
@@ -1350,7 +1382,8 @@ mod tests {
             &for_shell(ShellKind::Zsh),
             Path::new("/opt/kr/zsh-entry.zsh"),
             false,
-        );
+        )
+        .expect("the path is text");
         assert_eq!(install(&link, &body).expect("installs"), Change::Added);
         assert!(
             link.symlink_metadata()
@@ -1390,7 +1423,8 @@ mod tests {
             &for_shell(ShellKind::Zsh),
             Path::new("/opt/kr/zsh-entry.zsh"),
             false,
-        );
+        )
+        .expect("the path is text");
         assert_eq!(install(&link, &body).expect("installs"), Change::Added);
         assert_eq!(remove(&link).expect("removes"), Change::Removed);
         assert!(
@@ -1422,7 +1456,8 @@ mod tests {
             &for_shell(ShellKind::Zsh),
             Path::new("/opt/kr/zsh-entry.zsh"),
             false,
-        );
+        )
+        .expect("the path is text");
         assert_eq!(install(&path, &body).expect("installs"), Change::Added);
         assert_eq!(
             std::fs::read_to_string(&bystander).expect("reads"),
@@ -1473,7 +1508,8 @@ mod tests {
     #[test]
     fn the_bypass_is_only_ever_set_inside_a_kalareach_shell() {
         for kind in ShellKind::ALL {
-            let with = entry(&for_shell(*kind), Path::new("/opt/kr/entry"), true);
+            let with = entry(&for_shell(*kind), Path::new("/opt/kr/entry"), true)
+                .expect("the path is text");
             assert!(
                 with.contains(NSH_BYPASS_VARIABLE),
                 "{kind} offers the documented bypass"
@@ -1482,7 +1518,8 @@ mod tests {
                 with.contains("KR_SHELL_BRIDGE"),
                 "{kind} sets it only where the bridge was exported"
             );
-            let without = entry(&for_shell(*kind), Path::new("/opt/kr/entry"), false);
+            let without = entry(&for_shell(*kind), Path::new("/opt/kr/entry"), false)
+                .expect("the path is text");
             assert!(
                 !without.contains(NSH_BYPASS_VARIABLE),
                 "{kind} sets nothing when the option is off"
@@ -1497,7 +1534,8 @@ mod tests {
                 &for_shell(*kind),
                 Path::new("/home/it's mine/kr/entry"),
                 false,
-            );
+            )
+            .expect("the path is text");
             // The apostrophe is escaped rather than ending the string, so the line still names one
             // path and nothing after it is read as shell syntax.
             assert!(
@@ -1508,10 +1546,32 @@ mod tests {
         }
     }
 
+    /// KR-REQ-07.29: a package entry that is not text is refused by name, rather than written into
+    /// a startup file as another path.
+    ///
+    /// Unix, where a path is bytes and one of them can be a byte UTF-8 has no character for.
+    #[cfg(unix)]
+    #[test]
+    fn a_package_entry_that_is_not_text_is_refused_rather_than_written_as_another_path() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let package = Path::new(std::ffi::OsStr::from_bytes(b"/opt/kr\xff/entry"));
+        for kind in ShellKind::ALL {
+            let refused = entry(&for_shell(*kind), package, false)
+                .expect_err("a path that is not text has no spelling in a startup file");
+            assert_eq!(refused.path, package, "{kind}: the refusal names the path");
+            assert!(
+                refused.to_string().contains("not UTF-8"),
+                "{kind} says why: {refused}"
+            );
+        }
+    }
+
     #[test]
     fn nothing_replaces_a_profile_or_points_at_another_zdotdir() {
         for kind in ShellKind::ALL {
-            let body = entry(&for_shell(*kind), Path::new("/opt/kr/entry"), true);
+            let body = entry(&for_shell(*kind), Path::new("/opt/kr/entry"), true)
+                .expect("the path is text");
             for forbidden in ["ZDOTDIR=", "--rcfile", "--norc", "--noprofile", "exec "] {
                 assert!(
                     !body.contains(forbidden),

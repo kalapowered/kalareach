@@ -144,25 +144,41 @@ fn entries_only(kind: ShellKind, layout: &HomeLayout) -> ShellReport {
 
 /// Adds one package's guarded entry to every file that shell reads.
 ///
+/// Every entry is made before any file is touched, so an entry that cannot be made leaves every
+/// startup file as it was.
+///
 /// # Errors
 ///
-/// Returns a resource failure when a startup file cannot be read or written.
+/// Returns a usage failure naming the package's entry when that path is not text, which no startup
+/// file can name, and a resource failure when a startup file cannot be read or written.
 pub fn install(
     package: &ShellPackage,
     layout: &HomeLayout,
     nsh_bypass: bool,
     dry_run: bool,
 ) -> Result<ShellReport> {
-    let targets = layout.targets(package.kind());
+    let package_entry = package.startup_entry();
+    // The entry each file gets is the entry for that file: `.profile` is read by shells that are
+    // not this one, and its entry says so.
+    let bodies = layout
+        .targets(package.kind())
+        .into_iter()
+        .map(|target| {
+            startup::entry(&target, &package_entry, nsh_bypass).map(|body| (target.path, body))
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|refused| {
+            CliError::Usage(shown!(
+                "{} cannot be written into a shell's startup file: it is not UTF-8",
+                Shown::root(&refused.path)
+            ))
+        })?;
     let mut reported = report(package, layout);
     for entry in &mut reported.entries {
         let path = std::path::Path::new(&entry.path);
-        // The entry each file gets is the entry for that file: `.profile` is read by shells that
-        // are not this one, and its entry says so.
-        let Some(target) = targets.iter().find(|target| target.path == path) else {
+        let Some((_, body)) = bodies.iter().find(|(target, _)| target == path) else {
             continue;
         };
-        let body = startup::entry(target, &package.startup_entry(), nsh_bypass);
         let change = if dry_run {
             if startup::installed(path) {
                 Change::Unchanged
@@ -170,7 +186,7 @@ pub fn install(
                 Change::Added
             }
         } else {
-            startup::install(path, &body).map_err(|error| {
+            startup::install(path, body).map_err(|error| {
                 CliError::Other(shown!("{}: {}", Shown::root(path), Shown::io(&error)))
             })?
         };
@@ -388,7 +404,8 @@ mod tests {
             &layout.targets(ShellKind::Zsh)[0],
             std::path::Path::new("/gone/entry.zsh"),
             false,
-        );
+        )
+        .expect("the path is text");
         assert_eq!(
             startup::install(&zshrc, &body).expect("installs"),
             Change::Added
@@ -417,5 +434,66 @@ mod tests {
             shells(Some("ksh")).expect_err("refused"),
             CliError::Usage(_)
         ));
+    }
+
+    /// KR-REQ-07.29: a package whose entry is not text is refused by name, and no startup file
+    /// changes.
+    ///
+    /// Unix, where a path is bytes and one of them can be a byte UTF-8 has no character for.
+    #[cfg(unix)]
+    #[test]
+    fn a_package_whose_entry_is_not_text_is_refused_and_nothing_is_written() {
+        use kr_shell_integration::host::package::{
+            PackageManifest, PackageShell, PackageStartupEntry,
+        };
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let home = tempfile::tempdir().expect("a directory");
+        let layout = HomeLayout {
+            home: home.path().to_path_buf(),
+            zdotdir: None,
+            xdg_config_home: None,
+            powershell: None,
+        };
+        let theirs = "export EDITOR=vim\n";
+        let zshrc = home.path().join(".zshrc");
+        std::fs::write(&zshrc, theirs).expect("writes");
+        // A package in a directory whose name is not text. Nothing is read from it, which is as
+        // well: a file system that keeps its names as UTF-8 could not hold it.
+        let directory =
+            std::path::PathBuf::from(std::ffi::OsStr::from_bytes(b"/opt/kr\xff/zsh/identity-1"));
+        let package = ShellPackage {
+            manifest: PackageManifest {
+                identity: "identity-1".to_owned(),
+                shell: PackageShell {
+                    kind: ShellKind::Zsh,
+                    executable: directory.join("bin/zsh"),
+                    upstream_version: "5.9".to_owned(),
+                    editor_abi: "zle-5.9".to_owned(),
+                    integration_version: "1".to_owned(),
+                    patches: Vec::new(),
+                    modules: Vec::new(),
+                },
+                startup_entry: PackageStartupEntry {
+                    file: "startup/entry".to_owned(),
+                },
+            },
+            directory,
+        };
+        for dry_run in [false, true] {
+            let outcome = install(&package, &layout, false, dry_run);
+            assert_eq!(
+                std::fs::read_to_string(&zshrc).expect("reads"),
+                theirs,
+                "no startup file changes (dry run: {dry_run})"
+            );
+            let refused = outcome.expect_err("an entry that is not text is refused");
+            assert!(matches!(refused, CliError::Usage(_)), "{refused}");
+            let said = refused.to_string();
+            assert!(
+                said.contains("identity-1/startup/entry") && said.contains("not UTF-8"),
+                "the refusal names the path and says why: {said}"
+            );
+        }
     }
 }
