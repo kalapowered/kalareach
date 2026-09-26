@@ -1623,14 +1623,26 @@ async fn an_anonymous_caller_is_refused_and_the_listener_serves_the_owner() {
         .expect("an anonymous client of this account opens the pipe");
     anonymous.write_all(&[1]).await.expect("it speaks");
 
-    let (mut unread, _) = tokio::time::timeout(PATIENCE, listener.accept())
+    let (unread, _) = tokio::time::timeout(PATIENCE, listener.accept())
         .await
         .expect("the listener accepts in time")
         .expect("the listener accepts the connection");
-    let refused = first_read(&mut unread, 1)
-        .await
-        .expect_err("an unreadable caller gets nothing through");
-    assert_eq!(refused.kind(), std::io::ErrorKind::PermissionDenied);
+    // Read the way a host reads, through the frame reader, which reports the refusal under the
+    // permission code rather than as a failed socket.
+    let (mut reader, _writer) =
+        kr_ipc::framed::split(unread, kr_protocol::frame::StreamKind::Control);
+    let refused = tokio::time::timeout(
+        PATIENCE,
+        reader.read_message::<kr_protocol::envelope::ControlFrame>(),
+    )
+    .await
+    .expect("the read settles in time")
+    .expect_err("an unreadable caller gets nothing through");
+    assert_eq!(
+        refused.code(),
+        kr_protocol::error::ErrorCode::PermissionDenied,
+        "the refusal keeps its permission code: {refused}"
+    );
     assert!(
         refused.to_string().contains("could not be read"),
         "the refusal says the account could not be read, not that it is another: {refused}"
@@ -1724,6 +1736,41 @@ async fn a_cancelled_connect_to_a_busy_pipe_leaves_nothing_behind() {
             .await
             .is_err(),
         "no connection arrives from the connect that was cancelled"
+    );
+}
+
+/// A connect to a pipe whose every instance stays busy gives up at its deadline, rather than waiting
+/// for ever, and says so.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_connect_to_a_pipe_that_stays_busy_gives_up_at_its_deadline() {
+    let endpoint = Endpoint::from_name(format!("kalareach-test-{}", kr_ipc::new_uuid()))
+        .expect("a short name");
+    let path = local_name(&endpoint);
+    let server = tokio::net::windows::named_pipe::ServerOptions::new()
+        .first_pipe_instance(true)
+        .max_instances(1)
+        .create(&path)
+        .expect("a one-instance pipe");
+    let _holder = tokio::net::windows::named_pipe::ClientOptions::new()
+        .open(&path)
+        .expect("the holder takes the only instance");
+    server.connect().await.expect("the holder is connected");
+
+    let began = Instant::now();
+    let gave_up = tokio::time::timeout(Duration::from_secs(45), Connection::connect(&endpoint))
+        .await
+        .expect("the connect gives up by itself, well before this bound")
+        .expect_err("a pipe that stays busy is not reached");
+    assert!(
+        gave_up
+            .to_string()
+            .contains("stayed busy until the deadline"),
+        "the connect says why it gave up: {gave_up}"
+    );
+    assert!(
+        began.elapsed() >= Duration::from_secs(25),
+        "it waited for the pipe first rather than failing at once: {:?}",
+        began.elapsed()
     );
 }
 
