@@ -8,6 +8,7 @@
 //!
 //! * it is drawn the screen that is showing, and never the buffer behind it;
 //! * it is not served the session's retained output;
+//! * it is given the last command only when its history scope reaches it;
 //! * it detaches the attachments its own connection made, and no other;
 //! * an authority revision takes its input lease away;
 //! * it cancels its own undispatched intents, and no other actor's.
@@ -21,7 +22,7 @@
 //! | Row | What proves it |
 //! | --- | --- |
 //! | KR-REQ-10.50 | `a_local_caller_under_a_grant_is_drawn_the_live_screen_alone`, `the_local_owner_is_drawn_the_whole_screen_and_a_device_the_live_screen` |
-//! | KR-REQ-10.49 | `a_local_caller_under_a_grant_is_refused_the_retained_history`, `the_local_owner_reads_the_retained_history_on_either_socket` |
+//! | KR-REQ-10.49 | `a_local_caller_under_a_grant_is_refused_the_retained_history`, `the_local_owner_reads_the_retained_history_on_either_socket`, `a_local_caller_under_a_grant_reads_the_last_command_only_inside_its_scope`, `the_local_owner_reads_the_last_command_on_either_socket` |
 //! | KR-REQ-10.41 | `a_local_caller_under_a_grant_detaches_only_what_its_own_connection_made`, `the_local_owner_detaches_another_windows_attachment_and_a_device_does_not` |
 //! | KR-REQ-10.45 | `a_revision_takes_the_lease_from_a_local_caller_under_a_grant`, `a_revision_takes_a_devices_lease_and_leaves_the_local_owners` |
 //! | KR-REQ-23.46 | `a_local_caller_under_a_grant_cancels_its_own_intent_and_no_other`, `the_local_owner_cancels_another_actors_intent_and_a_device_does_not` |
@@ -44,11 +45,12 @@ use kr_protocol::envelope::{
     ActionTarget, ControlFrame, MutationRequest, Outcome, ParamsValue, Request,
 };
 use kr_protocol::error::{ErrorCode, ProtocolError};
+use kr_protocol::grant::HistoryScope;
 use kr_protocol::hello::PROTOCOL_VERSION;
 use kr_protocol::identity::{DesktopBinding, WorkerProfile};
 use kr_protocol::ids::{
     ActionId, ActionWindowId, ActorId, AttachmentId, AuthorityRevision, BuildId, ConnectionId,
-    ControllerGeneration, DeviceId, GrantId, RequestId, SessionEpoch, SessionId,
+    ControllerGeneration, DeviceId, GrantId, InputLeaseEpoch, RequestId, SessionEpoch, SessionId,
 };
 use kr_protocol::input::InputAcquireParams;
 use kr_protocol::local::{ControllerConnectionRole, ForwardedRequest, LocalClientKind};
@@ -58,9 +60,24 @@ use kr_protocol::recovery::{
     EventStream, EventsSubscribeParams, HistoryPageParams, HistoryPageResult, OutputEvent,
 };
 use kr_protocol::rights::ActionRight;
+use kr_protocol::root::{CwdRevision, PromptGeneration, RootCommandBlockParams};
 use kr_protocol::scalars::{CanonicalSet, Digest256, Nullable, TimestampMs, U64, Uuid};
-use kr_protocol::session::{ClosureReason, Dimensions, DisplayNumber, ShellMode};
+use kr_protocol::session::{
+    ClosureReason, Dimensions, DisplayNumber, SessionReadParams, SessionReadResult, ShellMode,
+};
 use kr_protocol::worker::AuthorityRevisionNotice;
+use kr_shell_integration::contract::events::{BridgeEvent, EofGesture, HooksActivated};
+use kr_shell_integration::contract::fence::LeaseView;
+use kr_shell_integration::contract::qualification::ShellKind;
+use kr_shell_integration::contract::transport::{
+    EventOutcome, HandshakeOutcome, WorkerExpectation,
+};
+use kr_shell_integration::host::endpoint::HostEndpoint;
+use kr_shell_integration::host::scripted::{
+    ReferenceShell, ScriptedBridge, ToBridge, qualified_hello,
+};
+use kr_transport::clock::SystemContinuousClock;
+use kr_worker::fence::FenceDriver;
 use kr_worker::journal::Submission;
 use kr_worker::runtime::SessionRuntime;
 use kr_worker::service::{Caller, ServiceBinding, WorkerService};
@@ -230,11 +247,16 @@ fn printable(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).escape_debug().to_string()
 }
 
-/// One read, forwarded by the control daemon for the actor it vouches for.
+/// One read, forwarded by the control daemon for the actor it vouches for, with the history scope
+/// of the grant the daemon decided it under when one travels with it.
 ///
 /// A caller under a grant has authority that runs out, so its read carries a deadline; the owner's
 /// does not.
-fn forwarded_read(actor: &ActorEnvelope, request: Request) -> ControlFrame {
+fn forwarded_read(
+    actor: &ActorEnvelope,
+    request: Request,
+    history: Option<HistoryScope>,
+) -> ControlFrame {
     ControlFrame::ForwardedRead(Box::new(ForwardedRequest {
         request,
         authority_deadline_boot_ms: if actor.grant_id.is_present() {
@@ -243,8 +265,19 @@ fn forwarded_read(actor: &ActorEnvelope, request: Request) -> ControlFrame {
             Nullable::null()
         },
         actor: actor.clone(),
-        history: None,
+        history,
     }))
+}
+
+/// A grant's history scope that reaches back to `lower_bound_ms`, or that retains no history, and
+/// includes the live screen either way.
+fn reaching(lower_bound_ms: Option<u64>) -> HistoryScope {
+    HistoryScope {
+        lower_bound_ms: Nullable(lower_bound_ms.map(TimestampMs::new)),
+        include_live_screen: true,
+        named_questions: CanonicalSet::new(),
+        named_approvals: CanonicalSet::new(),
+    }
 }
 
 /// Writes one request and returns the worker's answer to it.
@@ -284,6 +317,9 @@ struct Wired {
     endpoint: kr_ipc::paths::Endpoint,
     controller: Arc<ControllerIdentity>,
     boot: kr_protocol::identity::BootIdentity,
+    /// The root shell's side of a managed session's bridge, which this test plays, and the task
+    /// serving the worker's side. Neither exists for an unmanaged session.
+    bridge: Option<(ScriptedBridge, tokio::task::JoinHandle<()>)>,
 }
 
 impl Wired {
@@ -472,6 +508,7 @@ impl Wired {
         let frame = forwarded_read(
             actor,
             self.subscription(request_id, attached.attachment.attachment_id),
+            None,
         );
         drawn(daemon, frame, request_id).await
     }
@@ -511,7 +548,7 @@ impl Wired {
         actor: &ActorEnvelope,
     ) -> Result<HistoryPageResult, ProtocolError> {
         let request_id = next_request();
-        let frame = forwarded_read(actor, self.page(request_id));
+        let frame = forwarded_read(actor, self.page(request_id), None);
         answer(daemon, frame, request_id)
             .await
             .map(|page| page.to_typed().expect("a history page"))
@@ -524,6 +561,82 @@ impl Wired {
         answer(window, frame, request_id)
             .await
             .map(|page| page.to_typed().expect("a history page"))
+    }
+
+    /// Reports, as a managed root shell's hooks do, that `command` started at `started_at_ms`, and
+    /// returns once the worker has recorded it.
+    async fn report_command(&mut self, command: &str, started_at_ms: u64) {
+        let session_id = self.session_id;
+        let (bridge, _) = self.bridge.as_mut().expect("a managed session");
+        within(
+            "the command's report",
+            bridge.send_event(BridgeEvent::CommandBlock(Box::new(
+                RootCommandBlockParams {
+                    session_id,
+                    prompt_generation: PromptGeneration::new(2),
+                    command: command.to_owned(),
+                    started_at_ms: TimestampMs::new(started_at_ms),
+                    duration_ms: Nullable::null(),
+                    exit_status: Nullable::null(),
+                    cwd: "/tmp/project".to_owned(),
+                    cwd_revision: CwdRevision::new(1),
+                },
+            ))),
+        )
+        .await
+        .expect("reports the command");
+        within("the worker's record of the command", async {
+            loop {
+                if let ToBridge::EventResult { result, .. } =
+                    bridge.recv().await.expect("the worker answers")
+                    && let EventOutcome::CommandBlockRecorded(_) = *result
+                {
+                    return;
+                }
+            }
+        })
+        .await;
+    }
+
+    /// A read of the session's metadata and current state.
+    fn session_read(&self, request_id: RequestId) -> Request {
+        Request {
+            request_id,
+            method: Method::SessionRead.into(),
+            method_version: MethodVersion::V1,
+            params: ParamsValue::from_typed(&SessionReadParams {
+                session_id: self.session_id,
+            })
+            .expect("encodes"),
+        }
+    }
+
+    /// Forwards a session read for `actor`, with the history scope the daemon decided it under
+    /// when one travels with it.
+    async fn read_for(
+        &self,
+        daemon: &mut LocalClient,
+        actor: &ActorEnvelope,
+        history: Option<HistoryScope>,
+    ) -> SessionReadResult {
+        let request_id = next_request();
+        let frame = forwarded_read(actor, self.session_read(request_id), history);
+        answer(daemon, frame, request_id)
+            .await
+            .expect("the session is read")
+            .to_typed()
+            .expect("a session read")
+    }
+
+    /// Reads the session in one of the owner's windows.
+    async fn read_in(&self, window: &mut LocalClient) -> SessionReadResult {
+        let request_id = next_request();
+        let frame = ControlFrame::Request(self.session_read(request_id));
+        answer(window, frame, request_id)
+            .await
+            .expect("the session is read")
+            .to_typed()
+            .expect("a session read")
     }
 
     /// Forwards a request for the input lease for `actor`'s attachment.
@@ -640,10 +753,25 @@ impl Wired {
             .close(ClosureReason::CloseRequested)
             .1
             .release();
+        if let Some((_, serving)) = self.bridge.as_ref() {
+            serving.abort();
+        }
     }
 }
 
 async fn wired(script: &str) -> Wired {
+    wired_in(script, ShellMode::NativeCompat).await
+}
+
+/// A managed session, whose root shell's bridge this test plays.
+///
+/// What the shell's private hooks report reaches the worker over that bridge, so a test that needs
+/// a command block reports one there, exactly as a managed root shell would.
+async fn managed() -> Wired {
+    wired_in("exec cat", ShellMode::Managed).await
+}
+
+async fn wired_in(script: &str, shell_mode: ShellMode) -> Wired {
     let temp = kr_ipc::testing::TempHost::create();
     let environment = temp.environment();
     let environment_id = temp.environment_id();
@@ -654,7 +782,7 @@ async fn wired(script: &str) -> Wired {
         environment_id,
         display_number: DisplayNumber::new(1),
         shell: kr_worker::testing::posix_script(script),
-        shell_mode: ShellMode::NativeCompat,
+        shell_mode,
         worker_profile: WorkerProfile::HeadlessUser,
         desktop: DesktopBinding::none(),
         dimensions: Dimensions::new(80, 24),
@@ -673,7 +801,7 @@ async fn wired(script: &str) -> Wired {
             session_id,
             SessionEpoch::V1,
             boot.clone(),
-            process,
+            process.clone(),
             PROTOCOL_VERSION,
         )
         .expect("a session key"),
@@ -683,12 +811,33 @@ async fn wired(script: &str) -> Wired {
     let controller = ControllerIdentity::initialise(store.store.as_ref(), environment_id)
         .expect("a controller identity");
 
+    // A managed session's bridge endpoint is in its own owner-only runtime directory, on the
+    // internal disk, and it is bound before the shell starts.
+    let bridge_endpoint = (shell_mode == ShellMode::Managed).then(|| {
+        HostEndpoint::open_for_session(
+            environment.runtime_root(),
+            environment.runtime_dir(),
+            session_id,
+        )
+        .expect("binds the bridge")
+    });
     let mut session = Session::open(config).expect("opens the session");
     session.launch().expect("launches the shell");
+    if bridge_endpoint.is_some() {
+        session.install_fence(FenceDriver::new(
+            session_id,
+            LeaseView::unheld(InputLeaseEpoch::new(0)),
+            Arc::new(SystemContinuousClock::new()),
+        ));
+    }
     let runtime = Arc::new(
         SessionRuntime::start(session, Arc::new(kr_ipc::clock::SystemSharedClock))
             .expect("starts the runtime"),
     );
+    let bridge = match bridge_endpoint {
+        Some(host_endpoint) => Some(bridged(&runtime, host_endpoint, session_id, process).await),
+        None => None,
+    };
     let endpoint = environment
         .worker_endpoint(DisplayNumber::new(1))
         .expect("an endpoint");
@@ -719,7 +868,62 @@ async fn wired(script: &str) -> Wired {
         endpoint,
         controller: Arc::new(controller),
         boot,
+        bridge,
     }
+}
+
+/// Registers this test as the managed session's root shell, and returns its side of the bridge.
+///
+/// The reference bridge runs in this process, so this process is the root shell the worker expects
+/// on the endpoint. The integration's hooks are then reported live, which is when a managed root
+/// shell starts reporting what its commands do.
+async fn bridged(
+    runtime: &Arc<SessionRuntime>,
+    host_endpoint: HostEndpoint,
+    session_id: SessionId,
+    process: kr_protocol::identity::ProcessStartIdentity,
+) -> (ScriptedBridge, tokio::task::JoinHandle<()>) {
+    let address = host_endpoint.address().clone();
+    let secret = host_endpoint.secret().clone();
+    let expectation = WorkerExpectation {
+        session_id,
+        root_process: process.clone(),
+        supported_editor_abis: vec!["zle-5.9".to_owned()],
+        supported_integration_versions: vec!["1".to_owned()],
+        launched_package: None,
+        already_registered: false,
+        gesture: EofGesture::default(),
+    };
+    let serving = tokio::spawn(
+        kr_worker::fence::bridge::BridgeServer::new(
+            Arc::clone(runtime),
+            host_endpoint,
+            expectation,
+        )
+        .serve(),
+    );
+    let shell = ReferenceShell::new(ShellKind::Zsh, "/bin/cat", "5.9", "zle-5.9");
+    let hello = qualified_hello(&shell, session_id, &address, process, &secret).expect("a hello");
+    let (mut bridge, outcome) = within(
+        "the bridge's registration",
+        ScriptedBridge::connect(&address, &hello),
+    )
+    .await
+    .expect("connects");
+    assert!(
+        matches!(outcome, HandshakeOutcome::Accepted(_)),
+        "a qualified root shell registers: {outcome:?}"
+    );
+    within(
+        "the hooks' report",
+        bridge.send_event(BridgeEvent::HooksActivated(HooksActivated {
+            session_id,
+            prompt_generation: PromptGeneration::new(1),
+        })),
+    )
+    .await
+    .expect("reports the hooks live");
+    (bridge, serving)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -893,6 +1097,100 @@ async fn the_local_owner_reads_the_retained_history_on_either_socket() {
         carries(page.bytes.as_slice(), BEHIND),
         "{}",
         printable(page.bytes.as_slice())
+    );
+
+    drop((window, proxy));
+    wired.close();
+}
+
+// ---------------------------------------------------------------------------------------------
+// KR-REQ-10.49: the last command a session read carries
+// ---------------------------------------------------------------------------------------------
+
+/// KR-REQ-10.49: a caller the daemon heard on its local socket, acting under a grant, is given a
+/// session's last command only when a history scope came with the read and reaches back to when
+/// the command started, and so is a paired device.
+///
+/// The command block is a command line and the directory it ran in: what a person typed, and
+/// where. That is retained history, which the shared filter decides by the moment it was produced,
+/// and a caller with no scope to decide it by is given none of it. The rest of the read is
+/// metadata and is served either way. The daemon narrows a paired device's own read by the same
+/// rule before it answers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_local_caller_under_a_grant_reads_the_last_command_only_inside_its_scope() {
+    let mut wired = managed().await;
+    let started_at_ms = kr_ipc::now_ms().get();
+    wired.report_command("cargo test", started_at_ms).await;
+
+    let caller = local_under_a_grant(1);
+    let mut proxy = wired.daemon(ControllerConnectionRole::Proxy).await;
+    // No scope came with the read, so nothing here can place the command inside the grant.
+    let read = wired.read_for(&mut proxy, &caller, None).await;
+    assert!(
+        read.last_command_block.0.is_none(),
+        "a caller under a grant with no scope is given no command: {read:?}"
+    );
+    assert_eq!(
+        read.session.session_id, wired.session_id,
+        "and the rest of the read is served"
+    );
+    // A scope whose history begins after the command started, and one that retains no history at
+    // all: the live screen it includes is not a command line.
+    for (history, what) in [
+        (
+            reaching(Some(started_at_ms + 1)),
+            "begins after the command",
+        ),
+        (reaching(None), "retains no history"),
+    ] {
+        let read = wired.read_for(&mut proxy, &caller, Some(history)).await;
+        assert!(
+            read.last_command_block.0.is_none(),
+            "a scope that {what} is given no command: {read:?}"
+        );
+    }
+    // A scope that reaches back to when the command started is given it.
+    let read = wired
+        .read_for(&mut proxy, &caller, Some(reaching(Some(started_at_ms))))
+        .await;
+    assert_eq!(
+        read.last_command_block.0.map(|block| block.command),
+        Some("cargo test".to_owned())
+    );
+
+    // A paired device the daemon forwarded with no scope is given no command either.
+    let mut phone = wired.daemon(ControllerConnectionRole::Proxy).await;
+    let read = wired.read_for(&mut phone, &device(1), None).await;
+    assert!(read.last_command_block.0.is_none(), "{read:?}");
+
+    drop((proxy, phone));
+    wired.close();
+}
+
+/// KR-REQ-10.49: the local owner reads the last command on either socket, as it always did.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_local_owner_reads_the_last_command_on_either_socket() {
+    let mut wired = managed().await;
+    wired
+        .report_command("cargo test", kr_ipc::now_ms().get())
+        .await;
+
+    // In one of its own windows.
+    let mut window = wired.window().await;
+    let read = wired.read_in(&mut window).await;
+    assert_eq!(
+        read.last_command_block.0.map(|block| block.command),
+        Some("cargo test".to_owned())
+    );
+
+    // And as the daemon forwards it.
+    let mut proxy = wired.daemon(ControllerConnectionRole::Proxy).await;
+    let read = wired
+        .read_for(&mut proxy, &the_owner_forwarded(), None)
+        .await;
+    assert_eq!(
+        read.last_command_block.0.map(|block| block.command),
+        Some("cargo test".to_owned())
     );
 
     drop((window, proxy));
