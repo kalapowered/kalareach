@@ -17,10 +17,11 @@
 //! [`VoiceStart`] has three cases rather than a result and an error:
 //!
 //! * a call is running;
-//! * the broker could not tell whether the provider created a session
-//!   ([`VoiceStart::CreationUnknown`]). Section 15 ¶4 and the frozen provider profile both say the
-//!   same thing about it: **nothing retries it automatically**, no SDP answer exists for that
-//!   attempt, and the reservation is reconciled by the service. It is a state, not an error code;
+//! * the broker could not tell whether the provider created a session, or a gateway in front of the
+//!   broker lost the broker's answer ([`VoiceStart::CreationUnknown`]). Section 15 ¶4 and the
+//!   frozen provider profile both say the same thing about it: **nothing retries it
+//!   automatically**, no SDP answer exists for that attempt, and the reservation is reconciled by
+//!   the service. It is a state, not an error code;
 //! * the broker refused, with a reason in its own vocabulary and the paths that still work.
 //!
 //! # The control socket
@@ -1256,6 +1257,16 @@ pub fn read_start_answer(answer: &ServiceHttpAnswer) -> VoiceStart {
     }
 
     let Ok(envelope) = super::json::read::<Envelope>(&answer.body) else {
+        // A gateway in front of the service answers 502 or 504 when the service's answer did not
+        // reach it, which it can say after the service started the call.
+        if matches!(answer.status, 502 | 504) {
+            return VoiceStart::CreationUnknown {
+                attempt_id: None,
+                message: "The answer to this start was lost on its way back, so the call may \
+                          have started."
+                    .to_owned(),
+            };
+        }
         return refused(
             VoiceRefusalReason::Unrecognised,
             "The managed service answered something this client cannot read.".to_owned(),

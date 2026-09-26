@@ -37,6 +37,17 @@
 //! callers never present the same refresh token. Across processes on one machine the embedder names
 //! a lock file, which is taken after the in-process lock and released before it.
 //!
+//! # An answer a gateway lost
+//!
+//! A gateway in front of the service answers 502 or 504 when the service's answer did not reach it,
+//! which it can do after the service spent a code or rotated a refresh token. So such an answer to
+//! an exchange or a refresh, naming no OAuth error of the service's, is `OUTCOME_UNKNOWN`, and
+//! nothing sends the request again. A refresh whose answer was lost keeps the stored grant as it
+//! was: its next refresh rotates the token when the service never received the first, and ends the
+//! sign-in when it did, because the token it presents was spent and the new one was only in the
+//! lost answer. Nothing short of signing in again recovers that. A revocation, an identity read and
+//! a usage read are safe to send again, so the same answer to one of them stays transient.
+//!
 //! # What is never rendered
 //!
 //! [`AccountToken`], [`RefreshToken`], [`AuthorisationRequest`], [`AuthorisationGrant`],
@@ -1263,6 +1274,13 @@ impl ManagedAccountService {
         super::json::read(&answer.body)
     }
 
+    /// Whether an answer is a gateway's that lost the service's own: a 502 or 504 naming no OAuth
+    /// error, which a gateway in front of the service gives when the service's answer did not reach
+    /// it, and can give after the service acted on the request.
+    fn lost_by_a_gateway(answer: &ServiceHttpAnswer) -> bool {
+        matches!(answer.status, 502 | 504) && !Self::names_error(answer)
+    }
+
     /// Whether a refused answer names an OAuth error.
     fn names_error(answer: &ServiceHttpAnswer) -> bool {
         Self::json(answer)
@@ -1309,6 +1327,23 @@ fn upstream(what: &'static str, status: u16) -> ClientError {
     )
 }
 
+/// A request that may have run, whose answer a gateway lost.
+///
+/// The service may have spent the code, or rotated the refresh token, before the gateway gave up.
+/// A code is spent once, and a rotated refresh token presented again revokes its family, so sending
+/// the request again is not safe, and what became of it is unknown.
+fn lost(what: &'static str, status: u16) -> ClientError {
+    ClientError::refusal(
+        ErrorCode::OutcomeUnknown,
+        crate::shown!(
+            "a gateway answered {} with status {}, so whether the account service carried it out \
+             is unknown",
+            what,
+            status
+        ),
+    )
+}
+
 /// A success this client cannot read, with what was wrong with it and where, and nothing it held.
 fn unreadable(what: &'static str, fault: Unreadable) -> ClientError {
     ClientError::refusal(
@@ -1335,6 +1370,9 @@ impl AccountService for ManagedAccountService {
             if answer.status != 200 {
                 if (400..500).contains(&answer.status) {
                     return Ok(Exchanged::Refused { leftover: None });
+                }
+                if Self::lost_by_a_gateway(&answer) {
+                    return Err(lost("the exchange", answer.status));
                 }
                 return Err(upstream("the exchange", answer.status));
             }
@@ -1364,6 +1402,9 @@ impl AccountService for ManagedAccountService {
             if answer.status != 200 {
                 if (400..500).contains(&answer.status) && Self::names_error(&answer) {
                     return Ok(Refreshed::Ended);
+                }
+                if Self::lost_by_a_gateway(&answer) {
+                    return Err(lost("the refresh", answer.status));
                 }
                 return Err(upstream("the refresh", answer.status));
             }

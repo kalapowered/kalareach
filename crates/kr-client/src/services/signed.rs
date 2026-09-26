@@ -863,8 +863,11 @@ fn classify(code: &str, status: u16) -> (ErrorCode, UserAction) {
 /// What a caller may do about it turns on one question: whether the request may have been carried
 /// out. A success status with an unreadable body is the dangerous case, because the service acted
 /// and this client cannot see what it did, so it is an unknown outcome and never retried
-/// automatically. A fault or a rate limit is transient. Anything else without an envelope never
-/// reached this service's own routes, which is a configuration between here and it.
+/// automatically. A fault or a rate limit is transient, a gateway's 502 or 504 included: that can
+/// follow the service acting on the request, but every method this client carries is an idempotent
+/// read or keyed, and its service answers a repeat of a keyed write from what it decided the first
+/// time, so sending it again is safe. Anything else without an envelope never reached this
+/// service's own routes, which is a configuration between here and it.
 fn unreadable(status: u16, what: impl Into<Shown>) -> ClientError {
     let code = if (200..300).contains(&status) {
         ErrorCode::OutcomeUnknown
