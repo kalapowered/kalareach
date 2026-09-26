@@ -244,7 +244,8 @@ pub struct DecodingTrust {
     pub plugin_id: PluginId,
     /// The publisher that signed that package.
     pub publisher_id: PublisherId,
-    /// The digest of the exact component bytes the trust was granted to.
+    /// The hash that package was installed under, which names its exact contents, the decoder
+    /// included. The trust is granted to that package and to no other bytes.
     pub package_digest: Digest256,
     /// The upstream methods this component may decode into a pending resource.
     ///
