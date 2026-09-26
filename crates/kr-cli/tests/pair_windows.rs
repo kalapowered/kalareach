@@ -653,7 +653,7 @@ impl WorkerTerminal {
                     attachment_id: self.attachment_id,
                     epoch: self.epoch,
                     sequence: kr_protocol::ids::InputSequence::new(self.sequence),
-                    bytes: kr_protocol::scalars::Bytes::new(format!("{line}\r").into_bytes()),
+                    bytes: kr_protocol::scalars::Bytes::new(format!("{line}\n").into_bytes()),
                 },
             )
             .await
@@ -823,7 +823,8 @@ impl WorkerHost {
         }
     }
 
-    /// Creates a session whose root shell is PowerShell 7, through this host's daemon.
+    /// Creates a session whose root shell is the POSIX shell Git for Windows installs, as the host
+    /// tests' sessions have, through this host's daemon.
     async fn session(&self) -> kr_protocol::ids::SessionId {
         let runtime_root = self.tree.paths().runtime_root().to_path_buf();
         let state_root = self.tree.paths().state_root().to_path_buf();
@@ -838,7 +839,7 @@ impl WorkerHost {
                     "--cwd",
                     &cwd,
                     "--shell",
-                    &kr_worker::testing::powershell(),
+                    &kr_worker::testing::posix_shell(),
                 ])
                 .env("KR_RUNTIME_DIR", runtime_root)
                 .env("KR_STATE_DIR", state_root)
@@ -872,52 +873,52 @@ impl Drop for WorkerHost {
 /// confirmed, even with `KR_SESSION` and `KR_ATTACHMENT` removed from it. `kr` asks every live
 /// session's worker whether it is one of its own, and the worker, which put the session's shell in
 /// its job before the shell ran, answers that it is. The worker is a process of its own, which the
-/// environment's scheduled task started outside this test's job; the session's root shell is
-/// PowerShell on the worker's pseudo-console, which `kr` runs on. With the variables left in place
-/// the refusal is theirs, which shows they were there to remove.
+/// environment's scheduled task started outside this test's job; `kr` runs from the session's root
+/// shell on the worker's pseudo-console. With the variables left in place the refusal is theirs,
+/// which shows they were there to remove.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_first_owner_is_not_confirmed_in_a_real_workers_session_without_its_variables() {
     let host = WorkerHost::start().await;
     let session_id = host.session().await;
     let environment = host.tree.environment();
     let mut terminal = WorkerTerminal::attach(&environment, session_id).await;
-    terminal
-        .shown("PS ", "the session's shell prompts, as it retains")
-        .await;
     let kr_path = kr();
     let roots = format!(
-        "$env:KR_RUNTIME_DIR = '{}'; $env:KR_STATE_DIR = '{}'",
+        "export KR_RUNTIME_DIR='{}' KR_STATE_DIR='{}'",
         host.tree.paths().runtime_root().display(),
         host.tree.paths().state_root().display()
     );
-    // Each marker is put together by the shell, so the line as typed, which the console echoes,
+    // Each marker is put together by the shell, so the line as typed, which the terminal echoes,
     // does not hold it: only the shell's answer does, once `kr` has ended.
     terminal
         .type_line(&format!(
-            "{roots}; Remove-Item Env:KR_SESSION, Env:KR_ATTACHMENT -ErrorAction SilentlyContinue; \
-             & '{}' pair invite --owner --direct; ('KR' + 'EXIT') + $LASTEXITCODE + ('KR' + 'END')",
+            "{roots}; unset KR_SESSION KR_ATTACHMENT; '{}' pair invite --owner --direct; \
+             printf 'KR-%s-%s\\n' exit \"$?\"",
             kr_path.display()
         ))
         .await;
     let seen = terminal
-        .shown("KREND", "kr runs in the session with its variables removed")
+        .shown(
+            "KR-exit-",
+            "kr runs in the session with its variables removed",
+        )
         .await;
     assert!(
         seen.contains(&format!("this process is inside session {session_id}")),
         "the session's worker recognised kr as its own: {seen}"
     );
     assert!(!seen.contains("Type pair"), "nothing was asked: {seen}");
-    assert!(!seen.contains("KREXIT0KREND"), "and kr refused: {seen}");
+    assert!(!seen.contains("KR-exit-0"), "and kr refused: {seen}");
 
     terminal
         .type_line(&format!(
-            "$env:KR_SESSION = '{session_id}'; & '{}' pair invite --owner --direct; \
-             ('KR' + 'CONTROL') + $LASTEXITCODE + ('KR' + 'DONE')",
+            "KR_SESSION='{session_id}' '{}' pair invite --owner --direct; \
+             printf 'KR-%s-%s\\n' control \"$?\"",
             kr_path.display()
         ))
         .await;
     let seen = terminal
-        .shown("KRDONE", "the control, with the variable in place")
+        .shown("KR-control-", "the control, with the variable in place")
         .await;
     assert!(
         seen.contains("KR_SESSION is set"),
