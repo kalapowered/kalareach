@@ -1168,7 +1168,14 @@ if (-not $user -or -not $password) { throw 'no second account in the environment
 $secure = ConvertTo-SecureString $password -AsPlainText -Force
 $cred = [System.Management.Automation.PSCredential]::new($user, $secure)
 $self = (Get-Process -Id $PID).Path
-Start-Process -FilePath $self -Credential $cred -WindowStyle Hidden -ArgumentList @(
+# The child runs in the shared directory, which the second account can reach; the owner-only clone
+# it would otherwise inherit is not readable by that account and the launch would fail silently.
+# Its console output is captured beside the status file so a launch failure is visible.
+$work = Split-Path -Parent $Status
+$out = Join-Path $work 'child-out.txt'
+$err = Join-Path $work 'child-err.txt'
+Start-Process -FilePath $self -Credential $cred -WorkingDirectory $work -WindowStyle Hidden `
+    -RedirectStandardOutput $out -RedirectStandardError $err -ArgumentList @(
     '-NoLogo','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',$Child,$Name,$Status
 ) | Out-Null
 Write-Output 'launched'
