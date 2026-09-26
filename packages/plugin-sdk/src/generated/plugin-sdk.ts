@@ -191,6 +191,7 @@ export type Predicate1 =
         | 'approval.decode'
         | 'approval.respond'
         | 'native_bridge.install'
+        | 'command_integration.launch'
       op: 'capability'
       /**
        * The state it must be in.
@@ -312,6 +313,7 @@ export type Predicate =
         | 'approval.decode'
         | 'approval.respond'
         | 'native_bridge.install'
+        | 'command_integration.launch'
       op: 'capability'
       /**
        * The state it must be in.
@@ -576,6 +578,8 @@ export type FindingCode =
   | 'duplicate_element_id'
   | 'control_parameters_widen'
   | 'qualification_invalid'
+  | 'integration_without_capability'
+  | 'integration_invalid'
 /**
  * How messages are separated on the wire.
  */
@@ -650,6 +654,7 @@ export type PluginCapability =
   | 'approval.decode'
   | 'approval.respond'
   | 'native_bridge.install'
+  | 'command_integration.launch'
 /**
  * A fact about the current presentation that a control can depend on.
  */
@@ -1057,6 +1062,7 @@ export interface CapabilityRequest {
     | 'approval.decode'
     | 'approval.respond'
     | 'native_bridge.install'
+    | 'command_integration.launch'
   /**
    * Why the package needs it. Shown in the installation grant.
    */
@@ -1811,6 +1817,7 @@ export interface Control {
           | 'approval.decode'
           | 'approval.respond'
           | 'native_bridge.install'
+          | 'command_integration.launch'
         op: 'capability'
         /**
          * The state it must be in.
@@ -1975,6 +1982,7 @@ export interface Control {
           | 'approval.decode'
           | 'approval.respond'
           | 'native_bridge.install'
+          | 'command_integration.launch'
         op: 'capability'
         /**
          * The state it must be in.
@@ -2125,6 +2133,7 @@ export interface Control1 {
           | 'approval.decode'
           | 'approval.respond'
           | 'native_bridge.install'
+          | 'command_integration.launch'
         op: 'capability'
         /**
          * The state it must be in.
@@ -2289,6 +2298,7 @@ export interface Control1 {
           | 'approval.decode'
           | 'approval.respond'
           | 'native_bridge.install'
+          | 'command_integration.launch'
         op: 'capability'
         /**
          * The state it must be in.
@@ -2427,6 +2437,7 @@ export interface Control2 {
           | 'approval.decode'
           | 'approval.respond'
           | 'native_bridge.install'
+          | 'command_integration.launch'
         op: 'capability'
         /**
          * The state it must be in.
@@ -2591,6 +2602,7 @@ export interface Control2 {
           | 'approval.decode'
           | 'approval.respond'
           | 'native_bridge.install'
+          | 'command_integration.launch'
         op: 'capability'
         /**
          * The state it must be in.
@@ -2729,6 +2741,7 @@ export interface Control3 {
           | 'approval.decode'
           | 'approval.respond'
           | 'native_bridge.install'
+          | 'command_integration.launch'
         op: 'capability'
         /**
          * The state it must be in.
@@ -2893,6 +2906,7 @@ export interface Control3 {
           | 'approval.decode'
           | 'approval.respond'
           | 'native_bridge.install'
+          | 'command_integration.launch'
         op: 'capability'
         /**
          * The state it must be in.
@@ -3043,6 +3057,15 @@ export interface PluginManifest {
    * What the package asks to be permitted.
    */
   capabilities: CapabilityRequest[]
+  /**
+   * The command integration, where the package declares one: the command it integrates, the
+   * flags it adds to an interactive invocation and the variables it sets for it.
+   *
+   * A package that declares none leaves the member out, so a manifest written before the member
+   * existed reads and hashes exactly as it did. A host applies one only from this verified
+   * manifest and only with `command_integration.launch` granted.
+   */
+  command_integration?: CommandIntegration | null
   /**
    * The one-line catalogue description.
    */
@@ -3225,6 +3248,42 @@ export interface AttachmentContribution {
    * Maximum attachments per draft.
    */
   max_count: number
+}
+/**
+ * What a package declares about the command it integrates.
+ */
+export interface CommandIntegration {
+  /**
+   * The command name a person types, with no directory.
+   */
+  command: string
+  /**
+   * The flags the integration adds to an interactive invocation, each one element of the
+   * argument vector, in the order they are added.
+   */
+  flags: string[]
+  /**
+   * What the grant tells the person before they accept it, beside the exact list the host
+   * renders from this declaration.
+   */
+  grant_statement: string
+  /**
+   * The environment variables the integration sets for that invocation, in order.
+   */
+  variables: IntegrationVariable[]
+}
+/**
+ * One environment variable a command integration sets.
+ */
+export interface IntegrationVariable {
+  /**
+   * The variable's name.
+   */
+  name: string
+  /**
+   * Its value.
+   */
+  value: string
 }
 /**
  * A native bridge installation recipe.
@@ -3420,6 +3479,8 @@ export interface Finding {
     | 'duplicate_element_id'
     | 'control_parameters_widen'
     | 'qualification_invalid'
+    | 'integration_without_capability'
+    | 'integration_invalid'
   /**
    * What exactly is wrong.
    */

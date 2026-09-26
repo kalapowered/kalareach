@@ -143,6 +143,11 @@ pub enum FindingCode {
     ControlParametersWiden,
     /// A catalogue qualification result claims something the catalogue cannot know.
     QualificationInvalid,
+    /// The package declares a command integration without requesting the capability to apply it.
+    IntegrationWithoutCapability,
+    /// A command integration names something other than a bare command of the package, adds a
+    /// flag it may not, or sets a variable the contract does not permit.
+    IntegrationInvalid,
 }
 
 impl FindingCode {
@@ -192,6 +197,8 @@ impl FindingCode {
         Self::DuplicateElementId,
         Self::ControlParametersWiden,
         Self::QualificationInvalid,
+        Self::IntegrationWithoutCapability,
+        Self::IntegrationInvalid,
     ];
 
     /// Returns the stable wire string.
@@ -242,6 +249,8 @@ impl FindingCode {
             Self::DuplicateElementId => "duplicate_element_id",
             Self::ControlParametersWiden => "control_parameters_widen",
             Self::QualificationInvalid => "qualification_invalid",
+            Self::IntegrationWithoutCapability => "integration_without_capability",
+            Self::IntegrationInvalid => "integration_invalid",
         }
     }
 }

@@ -115,6 +115,36 @@ fn the_contract_table_carries_the_limits_and_the_vocabularies() {
         .as_array()
         .expect("the ceiling is an array");
     assert_eq!(ceiling.len(), 3);
+
+    // Every release that asks for a native bridge or a command integration is the owner's to
+    // confirm, and the contract says so for each capability.
+    let confirmed: Vec<&str> = contract["capabilities"]
+        .as_array()
+        .expect("the capabilities are an array")
+        .iter()
+        .filter(|entry| entry["confirmed_on_every_release"] == true)
+        .map(|entry| entry["capability"].as_str().expect("a capability name"))
+        .collect();
+    assert_eq!(
+        confirmed,
+        ["native_bridge.install", "command_integration.launch"]
+    );
+
+    // What a command integration may declare: its bounds, and the variables it may set, by exact
+    // name and value.
+    let integration = &contract["command_integration"];
+    assert_eq!(integration["max_command_bytes"], 64);
+    assert_eq!(integration["max_flags"], 16);
+    assert_eq!(integration["max_flag_bytes"], 4096);
+    assert_eq!(
+        integration["permitted_variables"][0]["name"],
+        "GEMINI_CLI_NO_RELAUNCH"
+    );
+    assert_eq!(integration["permitted_variables"][0]["value"], "true");
+    assert_eq!(
+        integration["permitted_variables"].as_array().map(Vec::len),
+        Some(1)
+    );
 }
 
 /// KR-REQ-23.53: every effect class in the generated plugin contract names the rights it needs,

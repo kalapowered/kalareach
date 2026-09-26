@@ -34,6 +34,8 @@
 //! * [`capability`] separates what a package requests from what a host has evidence for, and
 //!   rejects a signed record that claims a host result it cannot establish.
 //! * [`paths`] admits only paths that mean one unambiguous file on Linux, macOS and Windows.
+//! * [`integration`] adds only whole flags a person confirmed to the command it names, and sets
+//!   only environment variables the contract permits by exact name and value.
 //!
 //! # Modules
 //!
@@ -53,6 +55,7 @@
 //! | [`presentation`] | The document node union and declarative controls |
 //! | [`connector`] | The declarative native-proxy table |
 //! | [`plugin`] | The `plugin.json` manifest |
+//! | [`integration`] | A package's command integration: its command, flags and variables |
 //! | [`catalogue`] | The signed catalogue index |
 //! | [`package`] | The on-disk package layout |
 //! | [`validate`] | Package validation and its stable finding codes |
@@ -95,6 +98,7 @@ pub mod effect;
 pub mod example;
 pub mod identity;
 pub mod ids;
+pub mod integration;
 pub mod limits;
 pub mod matching;
 pub mod package;

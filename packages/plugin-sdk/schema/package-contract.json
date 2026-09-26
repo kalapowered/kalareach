@@ -2,83 +2,116 @@
   "capabilities": [
     {
       "capability": "metadata.match",
+      "confirmed_on_every_release": false,
       "required_right": null,
       "requires_installation_grant": false,
       "within_default_ceiling": true
     },
     {
       "capability": "presentation.declarative",
+      "confirmed_on_every_release": false,
       "required_right": null,
       "requires_installation_grant": false,
       "within_default_ceiling": true
     },
     {
       "capability": "broker.semantic_events",
+      "confirmed_on_every_release": false,
       "required_right": null,
       "requires_installation_grant": false,
       "within_default_ceiling": true
     },
     {
       "capability": "terminal.stream",
+      "confirmed_on_every_release": false,
       "required_right": "session.view",
       "requires_installation_grant": false,
       "within_default_ceiling": false
     },
     {
       "capability": "terminal.transcript_tail",
+      "confirmed_on_every_release": false,
       "required_right": "session.view",
       "requires_installation_grant": false,
       "within_default_ceiling": false
     },
     {
       "capability": "terminal.input",
+      "confirmed_on_every_release": false,
       "required_right": "terminal.input",
       "requires_installation_grant": true,
       "within_default_ceiling": false
     },
     {
       "capability": "filesystem.read",
+      "confirmed_on_every_release": false,
       "required_right": "files.read",
       "requires_installation_grant": true,
       "within_default_ceiling": false
     },
     {
       "capability": "network.outbound",
+      "confirmed_on_every_release": false,
       "required_right": "host.manage",
       "requires_installation_grant": true,
       "within_default_ceiling": false
     },
     {
       "capability": "process.observe",
+      "confirmed_on_every_release": false,
       "required_right": null,
       "requires_installation_grant": false,
       "within_default_ceiling": false
     },
     {
       "capability": "upstream.action",
+      "confirmed_on_every_release": false,
       "required_right": "agent.prompt",
       "requires_installation_grant": false,
       "within_default_ceiling": false
     },
     {
       "capability": "approval.decode",
+      "confirmed_on_every_release": false,
       "required_right": null,
       "requires_installation_grant": true,
       "within_default_ceiling": false
     },
     {
       "capability": "approval.respond",
+      "confirmed_on_every_release": false,
       "required_right": "agent.approval.respond",
       "requires_installation_grant": true,
       "within_default_ceiling": false
     },
     {
       "capability": "native_bridge.install",
+      "confirmed_on_every_release": true,
+      "required_right": null,
+      "requires_installation_grant": true,
+      "within_default_ceiling": false
+    },
+    {
+      "capability": "command_integration.launch",
+      "confirmed_on_every_release": true,
       "required_right": null,
       "requires_installation_grant": true,
       "within_default_ceiling": false
     }
   ],
+  "command_integration": {
+    "max_command_bytes": 64,
+    "max_flag_bytes": 4096,
+    "max_flags": 16,
+    "permitted_variables": [
+      {
+        "application": "Gemini CLI",
+        "name": "GEMINI_CLI_NO_RELAUNCH",
+        "reason": "Gemini CLI runs the session in the process that was launched rather than in a copy of itself it starts, so its hooks are that process's own",
+        "value": "true"
+      }
+    ]
+  },
   "default_repository_ceiling": [
     "metadata.match",
     "presentation.declarative",
@@ -201,7 +234,9 @@
     "bridge_recipe_invalid",
     "duplicate_element_id",
     "control_parameters_widen",
-    "qualification_invalid"
+    "qualification_invalid",
+    "integration_without_capability",
+    "integration_invalid"
   ],
   "index_version": 1,
   "instance_limits": {
@@ -235,7 +270,7 @@
     "retained_generations": "2",
     "retained_metadata_bytes": "134217728"
   },
-  "sdk_version": "0.1.1",
+  "sdk_version": "0.1.2",
   "wit_package": {
     "export_interface": "adapter",
     "exports": [

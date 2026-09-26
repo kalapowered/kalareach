@@ -155,7 +155,8 @@ fn vocabulary(generator: &mut SchemaGenerator) -> Schema {
 ///
 /// Consumers that are not written in Rust read this file instead of re-deriving the tables. It
 /// carries the effect classes with the rights each one needs, the capabilities with their default
-/// ceiling, the node union, the execution limits and the repository budgets.
+/// ceiling, the node union, the execution limits, the repository budgets and what a command
+/// integration may declare.
 #[must_use]
 pub fn package_contract() -> Value {
     let effects: Vec<Value> = EffectClass::ALL
@@ -180,6 +181,7 @@ pub fn package_contract() -> Value {
                 "capability": capability.as_str(),
                 "within_default_ceiling": capability.within_default_ceiling(),
                 "requires_installation_grant": capability.requires_installation_grant(),
+                "confirmed_on_every_release": capability.confirmed_on_every_release(),
                 "required_right": capability.required_right().map(|right| right.as_str()),
             })
         })
@@ -216,6 +218,20 @@ pub fn package_contract() -> Value {
         "predicate_bounds": {
             "max_depth": crate::predicate::MAX_PREDICATE_DEPTH,
             "max_terms": crate::predicate::MAX_PREDICATE_TERMS,
+        },
+        "command_integration": {
+            "max_command_bytes": crate::integration::MAX_COMMAND_BYTES,
+            "max_flags": crate::integration::MAX_FLAGS,
+            "max_flag_bytes": crate::integration::MAX_FLAG_BYTES,
+            "permitted_variables": crate::integration::PERMITTED_VARIABLES
+                .iter()
+                .map(|permitted| json!({
+                    "name": permitted.name,
+                    "value": permitted.value,
+                    "application": permitted.application,
+                    "reason": permitted.reason,
+                }))
+                .collect::<Vec<_>>(),
         },
         "package_bounds": {
             "max_files": crate::package::MAX_PACKAGE_FILES,

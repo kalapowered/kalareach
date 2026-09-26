@@ -72,6 +72,10 @@ pub enum PluginCapability {
     /// Install files into an application's documented native plugin or hook location.
     #[serde(rename = "native_bridge.install")]
     NativeBridgeInstall,
+    /// Add the flags and set the variables the package's command integration declares to an
+    /// interactive invocation of its command in a managed root shell.
+    #[serde(rename = "command_integration.launch")]
+    CommandIntegrationLaunch,
 }
 
 impl PluginCapability {
@@ -90,6 +94,7 @@ impl PluginCapability {
         Self::ApprovalDecode,
         Self::ApprovalRespond,
         Self::NativeBridgeInstall,
+        Self::CommandIntegrationLaunch,
     ];
 
     /// The capabilities a newly enrolled repository permits without any further grant.
@@ -116,6 +121,7 @@ impl PluginCapability {
             Self::ApprovalDecode => "approval.decode",
             Self::ApprovalRespond => "approval.respond",
             Self::NativeBridgeInstall => "native_bridge.install",
+            Self::CommandIntegrationLaunch => "command_integration.launch",
         }
     }
 
@@ -128,8 +134,9 @@ impl PluginCapability {
     /// Returns true when granting this capability always needs an explicit installation grant.
     ///
     /// These are the capabilities nobody gets by default under any repository ceiling: an
-    /// executable bridge that runs under the application's own permissions, anything that writes,
-    /// and the trust to interpret or answer native requests.
+    /// executable bridge that runs under the application's own permissions, a command integration
+    /// that changes how an application runs, anything that writes, and the trust to interpret or
+    /// answer native requests.
     ///
     /// This is the floor, not the whole rule. Section 11 also requires an explicit grant for any
     /// *increase* over what was previously granted, which compares two capability sets rather than
@@ -141,6 +148,7 @@ impl PluginCapability {
         matches!(
             self,
             Self::NativeBridgeInstall
+                | Self::CommandIntegrationLaunch
                 | Self::TerminalInput
                 | Self::FilesystemRead
                 | Self::NetworkOutbound
@@ -162,7 +170,8 @@ impl PluginCapability {
             | Self::BrokerSemanticEvents
             | Self::ProcessObserve
             | Self::ApprovalDecode
-            | Self::NativeBridgeInstall => None,
+            | Self::NativeBridgeInstall
+            | Self::CommandIntegrationLaunch => None,
             Self::TerminalStream | Self::TranscriptTail => Some(ActionRight::SessionView),
             Self::TerminalInput => Some(ActionRight::TerminalInput),
             Self::FilesystemRead => Some(ActionRight::FilesRead),
@@ -170,6 +179,22 @@ impl PluginCapability {
             Self::UpstreamAction => Some(ActionRight::AgentPrompt),
             Self::ApprovalRespond => Some(ActionRight::AgentApprovalRespond),
         }
+    }
+
+    /// Returns true when every release that asks for this capability needs the owner's own
+    /// confirmation of that exact release, whatever an earlier release was granted.
+    ///
+    /// Section 10 makes granting an executable or native-bridge capability the owner's decision.
+    /// What these two do is carried by the release itself, so it can change with every release
+    /// while the capability's name stays the same: a native bridge's files run under the
+    /// application's own permissions, and a command integration's flags and variables change how
+    /// the application runs. A grant held from an earlier release says nothing about this one.
+    #[must_use]
+    pub const fn confirmed_on_every_release(self) -> bool {
+        matches!(
+            self,
+            Self::NativeBridgeInstall | Self::CommandIntegrationLaunch
+        )
     }
 }
 
@@ -602,5 +627,26 @@ mod tests {
         }
         assert!(!PluginCapability::TerminalInput.within_default_ceiling());
         assert!(PluginCapability::NativeBridgeInstall.requires_installation_grant());
+    }
+
+    #[test]
+    fn a_native_bridge_and_a_command_integration_are_confirmed_on_every_release() {
+        let confirmed: Vec<PluginCapability> = PluginCapability::ALL
+            .iter()
+            .copied()
+            .filter(|capability| capability.confirmed_on_every_release())
+            .collect();
+        assert_eq!(
+            confirmed,
+            [
+                PluginCapability::NativeBridgeInstall,
+                PluginCapability::CommandIntegrationLaunch
+            ]
+        );
+        for capability in confirmed {
+            assert!(capability.requires_installation_grant(), "{capability}");
+            assert!(!capability.within_default_ceiling(), "{capability}");
+            assert_eq!(capability.required_right(), None, "{capability}");
+        }
     }
 }

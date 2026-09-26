@@ -14,6 +14,7 @@ use crate::capability::CapabilityRequest;
 use crate::digest::{ByteSize, PayloadDigest};
 use crate::effect::{ActionDeclaration, AttachmentContribution};
 use crate::ids::{PluginName, PublisherId};
+use crate::integration::CommandIntegration;
 use crate::matching::{MatchRule, PlatformSupport};
 use crate::paths::PackagePath;
 use crate::text::{CompactDescription, Label, Summary};
@@ -213,6 +214,14 @@ pub struct PluginManifest {
     pub attachments: Nullable<AttachmentContribution>,
     /// The native bridge recipe, where the package installs one.
     pub native_bridge: Nullable<NativeBridge>,
+    /// The command integration, where the package declares one: the command it integrates, the
+    /// flags it adds to an interactive invocation and the variables it sets for it.
+    ///
+    /// A package that declares none leaves the member out, so a manifest written before the member
+    /// existed reads and hashes exactly as it did. A host applies one only from this verified
+    /// manifest and only with `command_integration.launch` granted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_integration: Option<CommandIntegration>,
 }
 
 impl PluginManifest {

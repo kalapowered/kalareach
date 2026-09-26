@@ -908,6 +908,41 @@
       ],
       "type": "object"
     },
+    "CommandIntegration": {
+      "additionalProperties": false,
+      "description": "What a package declares about the command it integrates.",
+      "properties": {
+        "command": {
+          "description": "The command name a person types, with no directory.",
+          "type": "string"
+        },
+        "flags": {
+          "description": "The flags the integration adds to an interactive invocation, each one element of the\nargument vector, in the order they are added.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "grant_statement": {
+          "$ref": "#/$defs/Summary",
+          "description": "What the grant tells the person before they accept it, beside the exact list the host\nrenders from this declaration."
+        },
+        "variables": {
+          "description": "The environment variables the integration sets for that invocation, in order.",
+          "items": {
+            "$ref": "#/$defs/IntegrationVariable"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "command",
+        "flags",
+        "variables",
+        "grant_statement"
+      ],
+      "type": "object"
+    },
     "CompactDescription": {
       "description": "The one-line catalogue description. One line, no control or bidirectional characters.",
       "maxLength": 200,
@@ -1818,6 +1853,16 @@
           "const": "qualification_invalid",
           "description": "A catalogue qualification result claims something the catalogue cannot know.",
           "type": "string"
+        },
+        {
+          "const": "integration_without_capability",
+          "description": "The package declares a command integration without requesting the capability to apply it.",
+          "type": "string"
+        },
+        {
+          "const": "integration_invalid",
+          "description": "A command integration names something other than a bare command of the package, adds a\nflag it may not, or sets a variable the contract does not permit.",
+          "type": "string"
         }
       ]
     },
@@ -2087,6 +2132,25 @@
         "observation_queue_bytes",
         "faults_before_disable",
         "fault_window_ms"
+      ],
+      "type": "object"
+    },
+    "IntegrationVariable": {
+      "additionalProperties": false,
+      "description": "One environment variable a command integration sets.",
+      "properties": {
+        "name": {
+          "description": "The variable's name.",
+          "type": "string"
+        },
+        "value": {
+          "description": "Its value.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "value"
       ],
       "type": "object"
     },
@@ -2921,7 +2985,8 @@
         "upstream.action",
         "approval.decode",
         "approval.respond",
-        "native_bridge.install"
+        "native_bridge.install",
+        "command_integration.launch"
       ],
       "type": "string"
     },
@@ -2988,6 +3053,17 @@
             "$ref": "#/$defs/CapabilityRequest"
           },
           "type": "array"
+        },
+        "command_integration": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CommandIntegration"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The command integration, where the package declares one: the command it integrates, the\nflags it adds to an interactive invocation and the variables it sets for it.\n\nA package that declares none leaves the member out, so a manifest written before the member\nexisted reads and hashes exactly as it did. A host applies one only from this verified\nmanifest and only with `command_integration.launch` granted."
         },
         "description": {
           "$ref": "#/$defs/CompactDescription",
