@@ -2372,15 +2372,31 @@ impl WorkerService {
     /// Every way this service ends an attachment comes through here: its own detach, its
     /// connection going, and a withdrawal taking it back. A set that only grew would keep one entry
     /// per attachment made under a grant for as long as this worker ran. The one removal that does
-    /// not is the detach gesture at an empty root prompt, which the session makes when the root
-    /// editor's reader asks for it; that entry stays until the attachment's connection goes, and
-    /// no lease is held under it by then, because the session released the lease with the
-    /// attachment.
+    /// not is the detach gesture at an empty root prompt, which the session makes itself when the
+    /// root editor's reader asks for it; what that leaves goes the next time the set is read or
+    /// added to ([`Self::granted_attachments`]).
     fn forget_granted_attachment(&self, attachment_id: AttachmentId) {
         self.granted_attachments
             .lock()
             .expect("the granted attachment set is not poisoned")
             .remove(&attachment_id);
+    }
+
+    /// The attachments made under a grant, holding only attachments `session` still has.
+    ///
+    /// Whatever reads the set or adds to it takes it through here, so an attachment the session
+    /// let go of without this service, as the empty-prompt gesture does, is gone from the set
+    /// before anything is decided on it or added beside it.
+    fn granted_attachments(
+        &self,
+        session: &Session,
+    ) -> std::sync::MutexGuard<'_, std::collections::BTreeSet<AttachmentId>> {
+        let mut granted = self
+            .granted_attachments
+            .lock()
+            .expect("the granted attachment set is not poisoned");
+        granted.retain(|held| session.attachment_capabilities(*held).is_some());
+        granted
     }
 
     /// Takes the input lease away from a caller acting under a grant, with whatever it had not
@@ -2409,11 +2425,7 @@ impl WorkerService {
         if only.is_some_and(|named| named != holder) {
             return;
         }
-        let granted = self
-            .granted_attachments
-            .lock()
-            .expect("the granted attachment set is not poisoned")
-            .contains(&holder);
+        let granted = self.granted_attachments(session).contains(&holder);
         if !granted {
             return;
         }
@@ -3265,7 +3277,7 @@ impl WorkerService {
         // Revalidate inside the boundary. Anything that was true at acceptance may not be now, and
         // this is the last moment at which checking it still means something.
         let revalidated = self
-            .validate(&session, state, mutation, method)
+            .validate(&session, state, mutation, method, caller)
             .and_then(|()| Self::check_preconditions(&session, mutation))
             .and_then(|()| {
                 // The deadline the host derived is the deadline it keeps, measured on the
@@ -3821,6 +3833,7 @@ impl WorkerService {
         state: &ConnectionState,
         mutation: &MutationRequest,
         method: Method,
+        caller: &Caller,
     ) -> Result<()> {
         match method {
             Method::SessionAttach => {
@@ -3830,12 +3843,18 @@ impl WorkerService {
             // An attachment of this session, not only one this connection made. The local owner is
             // the operating-system user the listener has already authenticated, and `kr detach`
             // from another of its windows is the ordinary way to end an attachment whose own
-            // terminal has gone; every other caller is held to its own connection's attachments
-            // by the effect. An identifier that names no attachment of this session is still
-            // refused.
+            // terminal has gone. Every other caller acts under a grant, whichever socket it came in
+            // on, and an attachment identifier is not permission: it detaches what its own
+            // connection created and nothing else. That is decided here, before the dispatch
+            // marker, on the attachment the request resolves to, so naming nothing is not a way
+            // around it and a refusal is a rejection rather than an outcome nobody can establish.
+            // An identifier that names no attachment of this session is still refused.
             Method::SessionDetach => {
                 let params: SessionDetachParams = parse(&mutation.params)?;
                 let attachment_id = Self::detach_subject(session, &params)?;
+                if !caller.is_local_owner() {
+                    Self::check_attachment(state, attachment_id)?;
+                }
                 if session.attachment_capabilities(attachment_id).is_some() {
                     Ok(())
                 } else {
@@ -5313,10 +5332,7 @@ impl WorkerService {
                     session.narrow_content(attachment_id, filter.screen_scope());
                     // And what the attachment was admitted to do ends with the authority behind
                     // it: a revision or the grant's own expiry takes its input lease away.
-                    self.granted_attachments
-                        .lock()
-                        .expect("the granted attachment set is not poisoned")
-                        .insert(attachment_id);
+                    self.granted_attachments(session).insert(attachment_id);
                 }
                 state.add_attachment(attachment_id);
                 Ok((encode(&result)?, AfterEffect::None))
@@ -5327,17 +5343,9 @@ impl WorkerService {
                 // same held session: a request that named nothing is about the attachment its
                 // line's own capability names, never about whatever the session has most recently
                 // recorded.
+                // Whose attachment this caller may detach was decided by the validation, on this
+                // same held session, before the dispatch marker.
                 let attachment_id = Self::detach_subject(session, &params)?;
-                // Whose attachment a caller may detach depends on whether it is the local owner.
-                // The owner is the one operating-system user a local listener authenticated,
-                // holding no grant, and detaching from another of its windows is something a
-                // person does on purpose. Every other caller acts under a grant, whichever socket
-                // it came in on, and an attachment identifier is not permission: it detaches what
-                // its own connection created and nothing else. The resolved attachment is what
-                // that check is applied to, so naming nothing is not a way around it.
-                if !caller.is_local_owner() {
-                    Self::check_attachment(state, attachment_id)?;
-                }
                 let outcome = session.detach(attachment_id);
                 // Detaching releases the lease, which moves the input fence, and can produce the
                 // terminator of a paste the attachment had open. Both are published here, *before*

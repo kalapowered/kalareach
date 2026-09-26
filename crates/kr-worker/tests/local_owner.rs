@@ -795,7 +795,7 @@ impl Wired {
                 prompt_generation: PromptGeneration::new(2),
                 reader_revision: ReaderRevision::new(1),
                 reader_context: ReaderContext::Primary,
-                editor: editor.clone(),
+                editor,
                 cwd_revision: CwdRevision::new(1),
             })),
         )
@@ -821,7 +821,7 @@ impl Wired {
                                             reader_context: ReaderContext::Primary,
                                             queues: QueueDrainReport::CLEAR,
                                             snapshot: KeyQueueSnapshot::drained(),
-                                            editor: editor.clone(),
+                                            editor,
                                             cwd_revision: CwdRevision::new(1),
                                         },
                                     )),
