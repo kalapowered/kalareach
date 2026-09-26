@@ -350,6 +350,14 @@ mod tests {
     use crate::error::CliError;
     use marker::{MARKER, assert_unmarked, failure_renderings};
 
+    /// What the command line makes of a line it refuses.
+    fn refused(line: &[&str]) -> clap::Error {
+        match crate::cli::Cli::try_parse_from(line) {
+            Ok(_) => panic!("the command line refuses {line:?}"),
+            Err(error) => error,
+        }
+    }
+
     /// A usage failure never repeats what was typed. An argument this command does not take, a
     /// value where none goes, a subcommand it does not have, a value outside a declared set and a
     /// value that cannot be read are each said by their kind and the command's own declarations.
@@ -383,7 +391,7 @@ mod tests {
             ),
         ];
         for (class, line) in cases {
-            let error = crate::cli::Cli::try_parse_from(line).expect_err(class);
+            let error = refused(line);
             // The negative control: clap's own rendering, which the command wrote on standard
             // error and into its failure document, repeats what was typed.
             assert!(
@@ -408,21 +416,13 @@ mod tests {
     /// What the command declares is said: the argument, the values it takes and the usage line.
     #[test]
     fn a_usage_failure_says_what_the_command_declares() {
-        let error = crate::cli::Cli::try_parse_from([
-            "kr",
-            "workspace",
-            "create",
-            "project",
-            "--kind",
-            "neither",
-        ])
-        .expect_err("not a kind");
+        let error = refused(&["kr", "workspace", "create", "project", "--kind", "neither"]);
         let said = usage(&error).to_string();
         assert!(said.contains("--kind <KIND>"), "{said}");
         assert!(said.contains("it takes shared, isolated"), "{said}");
         assert!(!said.contains("neither"), "{said}");
 
-        let error = crate::cli::Cli::try_parse_from(["kr", "attach"]).expect_err("no session");
+        let error = refused(&["kr", "attach"]);
         let said = usage(&error).to_string();
         assert!(said.contains("Usage: kr attach"), "{said}");
     }
@@ -542,7 +542,7 @@ mod tests {
     /// invoked it.
     #[test]
     fn a_usage_failure_names_the_command_as_it_declares_itself() {
-        let error = crate::cli::Cli::try_parse_from([MARKER, "attach"]).expect_err("no session");
+        let error = refused(&[MARKER, "attach"]);
         let said = usage(&error).to_string();
         assert!(said.contains("Usage: kr attach"), "{said}");
         assert_unmarked("the usage line", &[said]);

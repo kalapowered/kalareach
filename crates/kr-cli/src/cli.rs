@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 /// The KalaReach command line.
-#[derive(Debug, Parser)]
+#[derive(Parser)]
 #[command(
     name = "kr",
     // The usage a failure prints names the command by this, never by how it was invoked: the
@@ -31,7 +31,7 @@ pub struct Cli {
 }
 
 /// One KalaReach command.
-#[derive(Debug, Subcommand)]
+#[derive(Subcommand)]
 pub enum Command {
     /// Create a session.
     #[command(visible_alias = "n")]
@@ -96,7 +96,7 @@ pub enum Command {
 }
 
 /// The environment one command acts in.
-#[derive(Debug, Args)]
+#[derive(Args)]
 pub struct EnvironmentSelector {
     /// The environment to act in, by identifier. Without it, this installation's own.
     #[arg(long)]
@@ -104,7 +104,7 @@ pub struct EnvironmentSelector {
 }
 
 /// One `kr project` operation.
-#[derive(Debug, Subcommand)]
+#[derive(Subcommand)]
 pub enum ProjectCommand {
     /// List the repositories this environment knows.
     List(ProjectListArguments),
@@ -117,7 +117,7 @@ pub enum ProjectCommand {
 }
 
 /// `kr project list`.
-#[derive(Debug, Args)]
+#[derive(Args)]
 pub struct ProjectListArguments {
     /// The environment.
     #[command(flatten)]
@@ -125,7 +125,7 @@ pub struct ProjectListArguments {
 }
 
 /// `kr project init`.
-#[derive(Debug, Args)]
+#[derive(Args)]
 pub struct ProjectInitArguments {
     /// The directory to create. Its parent has to exist, and it must not.
     pub path: PathBuf,
@@ -141,7 +141,7 @@ pub struct ProjectInitArguments {
 }
 
 /// `kr project clone`.
-#[derive(Debug, Args)]
+#[derive(Args)]
 pub struct ProjectCloneArguments {
     /// Where to clone from: an `https://` URL, an ssh remote (`ssh://host/path` or
     /// `user@host:path`), the absolute path of a repository on this machine, or the identifier of
@@ -164,7 +164,7 @@ pub struct ProjectCloneArguments {
 }
 
 /// `kr project adopt`.
-#[derive(Debug, Args)]
+#[derive(Args)]
 pub struct ProjectAdoptArguments {
     /// The Git checkout to register.
     pub path: PathBuf,
@@ -177,7 +177,7 @@ pub struct ProjectAdoptArguments {
 }
 
 /// One `kr workspace` operation.
-#[derive(Debug, Subcommand)]
+#[derive(Subcommand)]
 pub enum WorkspaceCommand {
     /// List workspaces. Listing one never removes anything.
     List(WorkspaceListArguments),
@@ -188,7 +188,7 @@ pub enum WorkspaceCommand {
 }
 
 /// `kr workspace list`.
-#[derive(Debug, Args)]
+#[derive(Args)]
 pub struct WorkspaceListArguments {
     /// Only the workspaces of this repository, by identifier.
     #[arg(long)]
@@ -234,7 +234,7 @@ pub enum InclusionArgument {
 }
 
 /// `kr workspace create`.
-#[derive(Debug, Args)]
+#[derive(Args)]
 pub struct WorkspaceCreateArguments {
     /// The repository to make a working copy of, by identifier.
     pub project: String,
@@ -269,7 +269,7 @@ pub struct WorkspaceCreateArguments {
 }
 
 /// `kr workspace remove`.
-#[derive(Debug, Args)]
+#[derive(Args)]
 pub struct WorkspaceRemoveArguments {
     /// The workspace, by identifier.
     pub workspace: String,
@@ -283,7 +283,7 @@ pub struct WorkspaceRemoveArguments {
 }
 
 /// One `kr changeset` operation.
-#[derive(Debug, Subcommand)]
+#[derive(Subcommand)]
 pub enum ChangesetCommand {
     /// Capture an immutable version of a workspace's work.
     Capture(ChangesetCaptureArguments),
@@ -305,7 +305,7 @@ pub enum ConsistencyArgument {
 }
 
 /// `kr changeset capture`.
-#[derive(Debug, Args)]
+#[derive(Args)]
 pub struct ChangesetCaptureArguments {
     /// The workspace to capture, by identifier.
     pub workspace: String,
@@ -345,7 +345,7 @@ pub struct ChangesetCaptureArguments {
 }
 
 /// `kr changeset read`.
-#[derive(Debug, Args)]
+#[derive(Args)]
 pub struct ChangesetReadArguments {
     /// The change set, by identifier.
     pub change_set: String,
@@ -369,7 +369,7 @@ pub enum PurposeArgument {
 }
 
 /// `kr changeset materialize`.
-#[derive(Debug, Args)]
+#[derive(Args)]
 pub struct ChangesetMaterializeArguments {
     /// The change set, by identifier.
     pub change_set: String,
@@ -387,7 +387,7 @@ pub struct ChangesetMaterializeArguments {
 }
 
 /// One `kr diff` operation.
-#[derive(Debug, Subcommand)]
+#[derive(Subcommand)]
 pub enum DiffCommand {
     /// Read the changes of a workspace's live tree or of a captured version.
     Read(DiffReadArguments),
@@ -398,7 +398,7 @@ pub enum DiffCommand {
 }
 
 /// `kr diff read`.
-#[derive(Debug, Args)]
+#[derive(Args)]
 pub struct DiffReadArguments {
     /// The workspace whose live tree to read, by identifier.
     #[arg(
@@ -430,7 +430,7 @@ pub enum DestinationArgument {
 }
 
 /// `kr diff apply` and `kr diff revert`.
-#[derive(Debug, Args)]
+#[derive(Args)]
 pub struct DiffApplyArguments {
     /// The change set, by identifier.
     pub change_set: String,
@@ -470,7 +470,7 @@ pub struct DiffApplyArguments {
 }
 
 /// One `kr device` operation.
-#[derive(Debug, Subcommand)]
+#[derive(Subcommand)]
 pub enum DeviceCommand {
     /// List the paired devices, and the last authority revision each one acknowledged.
     List(DeviceListArguments),
@@ -479,7 +479,7 @@ pub enum DeviceCommand {
 }
 
 /// `kr device list`.
-#[derive(Debug, Args)]
+#[derive(Args)]
 pub struct DeviceListArguments {
     /// Include devices that have been revoked.
     #[arg(long)]
@@ -490,7 +490,7 @@ pub struct DeviceListArguments {
 }
 
 /// `kr device revoke`.
-#[derive(Debug, Args)]
+#[derive(Args)]
 pub struct DeviceRevokeArguments {
     /// The device, by identifier.
     pub device: String,
@@ -500,7 +500,7 @@ pub struct DeviceRevokeArguments {
 }
 
 /// One `kr plugin` operation.
-#[derive(Debug, Subcommand)]
+#[derive(Subcommand)]
 pub enum PluginCommand {
     /// List the plugins installed in an environment.
     List(PluginListArguments),
@@ -520,7 +520,7 @@ pub enum PluginCommand {
 }
 
 /// `kr plugin list`.
-#[derive(Debug, Args)]
+#[derive(Args)]
 pub struct PluginListArguments {
     /// The environment.
     #[command(flatten)]
@@ -528,7 +528,7 @@ pub struct PluginListArguments {
 }
 
 /// `kr plugin install`.
-#[derive(Debug, Args)]
+#[derive(Args)]
 pub struct PluginInstallArguments {
     /// The repository to install from.
     pub catalogue: String,
@@ -549,7 +549,7 @@ pub struct PluginInstallArguments {
 }
 
 /// `kr plugin remove`, `kr plugin enable` and `kr plugin disable`.
-#[derive(Debug, Args)]
+#[derive(Args)]
 pub struct PluginArguments {
     /// The installed package.
     pub plugin: String,
@@ -559,7 +559,7 @@ pub struct PluginArguments {
 }
 
 /// `kr plugin pin`.
-#[derive(Debug, Args)]
+#[derive(Args)]
 pub struct PluginPinArguments {
     /// The installed package.
     pub plugin: String,
@@ -572,7 +572,7 @@ pub struct PluginPinArguments {
 }
 
 /// One `kr plugin repo` operation.
-#[derive(Debug, Subcommand)]
+#[derive(Subcommand)]
 pub enum PluginRepoCommand {
     /// List the enrolled repositories, their roots, generations and budgets.
     List(PluginListArguments),
@@ -587,7 +587,7 @@ pub enum PluginRepoCommand {
 }
 
 /// `kr plugin repo add`.
-#[derive(Debug, Args)]
+#[derive(Args)]
 pub struct PluginRepoAddArguments {
     /// The identifier this host gives the repository.
     pub catalogue: String,
@@ -606,7 +606,7 @@ pub struct PluginRepoAddArguments {
 }
 
 /// `kr plugin repo sync` and `kr plugin repo remove`.
-#[derive(Debug, Args)]
+#[derive(Args)]
 pub struct PluginRepoArguments {
     /// The repository.
     pub catalogue: String,
@@ -616,7 +616,7 @@ pub struct PluginRepoArguments {
 }
 
 /// `kr plugin repo pin`.
-#[derive(Debug, Args)]
+#[derive(Args)]
 pub struct PluginRepoPinArguments {
     /// The repository.
     pub catalogue: String,
@@ -629,7 +629,7 @@ pub struct PluginRepoPinArguments {
 }
 
 /// One `kr pair` operation.
-#[derive(Debug, Subcommand)]
+#[derive(Subcommand)]
 pub enum PairCommand {
     /// Issue an invitation for a new device, and show its code or QR code.
     ///
@@ -665,29 +665,8 @@ pub struct PairInviteArguments {
     pub environment: Option<String>,
 }
 
-impl std::fmt::Debug for PairInviteArguments {
-    /// The origin as a diagnostic names one: an origin typed with a user name or a password in it
-    /// is not printed at all.
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("PairInviteArguments")
-            .field("owner", &self.owner)
-            .field("view", &self.view)
-            .field("direct", &self.direct)
-            .field("origin", &self.origin.as_deref().map(Shown::address))
-            .field(
-                "environment",
-                &self
-                    .environment
-                    .as_deref()
-                    .map(crate::shown::parsed_identifier::<kr_protocol::ids::EnvironmentId>),
-            )
-            .finish()
-    }
-}
-
 /// `kr pair confirm` and `kr pair status`.
-#[derive(Debug, Args)]
+#[derive(Args)]
 pub struct PairInvitationArguments {
     /// The invitation, as `kr pair invite` named it.
     pub invitation: String,
@@ -697,7 +676,7 @@ pub struct PairInvitationArguments {
 }
 
 /// `kr pair cancel`.
-#[derive(Debug, Args)]
+#[derive(Args)]
 pub struct PairCancelArguments {
     /// The invitation, as `kr pair invite` named it.
     pub invitation: String,
@@ -716,7 +695,7 @@ pub struct PairCancelArguments {
 /// container host runs the equivalent against an enrolled container identifier. So `--stdio` is a
 /// flag on this command rather than a word of its own, and the other operations are subcommands
 /// beside it.
-#[derive(Debug, Args)]
+#[derive(Args)]
 pub struct BridgeArguments {
     /// Serve this environment on standard input and output.
     #[arg(long)]
@@ -732,7 +711,7 @@ pub struct BridgeArguments {
 }
 
 /// One `kr bridge` operation on this host's enrolled environments.
-#[derive(Debug, Subcommand)]
+#[derive(Subcommand)]
 pub enum BridgeCommand {
     /// List the enrolled environments from this host's cached inventory.
     ///
@@ -747,7 +726,7 @@ pub enum BridgeCommand {
 }
 
 /// `kr bridge list`.
-#[derive(Debug, Args)]
+#[derive(Args)]
 pub struct BridgeListArguments {
     /// Report only this access class: `wsl`, `container`, `ssh` or `paired`.
     #[arg(long)]
@@ -755,7 +734,7 @@ pub struct BridgeListArguments {
 }
 
 /// `kr bridge enrol`.
-#[derive(Debug, Args)]
+#[derive(Args)]
 pub struct BridgeEnrolArguments {
     /// How this host reaches it: `wsl`, `container`, `ssh` or `paired`.
     #[arg(long)]
@@ -786,14 +765,14 @@ pub struct BridgeEnrolArguments {
 }
 
 /// `kr bridge forget`.
-#[derive(Debug, Args)]
+#[derive(Args)]
 pub struct BridgeForgetArguments {
     /// The label of the record to remove.
     pub label: String,
 }
 
 /// `kr bridge refresh`.
-#[derive(Debug, Args)]
+#[derive(Args)]
 pub struct BridgeRefreshArguments {
     /// The label of the record to observe.
     pub label: String,
@@ -803,7 +782,7 @@ pub struct BridgeRefreshArguments {
 }
 
 /// `kr account`.
-#[derive(Debug, Args)]
+#[derive(Args)]
 pub struct AccountArguments {
     /// What to do.
     #[command(subcommand)]
@@ -811,7 +790,7 @@ pub struct AccountArguments {
 }
 
 /// One `kr account` operation.
-#[derive(Debug, Subcommand)]
+#[derive(Subcommand)]
 pub enum AccountCommand {
     /// Manage the account token this host presents to managed services.
     #[command(subcommand)]
@@ -819,7 +798,7 @@ pub enum AccountCommand {
 }
 
 /// One `kr account token` operation.
-#[derive(Debug, Subcommand)]
+#[derive(Subcommand)]
 pub enum AccountTokenCommand {
     /// Read an account token from a file and write it where this host reads it.
     ///
@@ -831,14 +810,14 @@ pub enum AccountTokenCommand {
 }
 
 /// `kr account token import`.
-#[derive(Debug, Args)]
+#[derive(Args)]
 pub struct AccountTokenImportArguments {
     /// The file to read the token from.
     pub path: std::path::PathBuf,
 }
 
 /// `kr host`.
-#[derive(Debug, Args)]
+#[derive(Args)]
 pub struct HostArguments {
     /// What to inspect or change.
     #[command(subcommand)]
@@ -846,7 +825,7 @@ pub struct HostArguments {
 }
 
 /// One `kr host` operation.
-#[derive(Debug, Subcommand)]
+#[derive(Subcommand)]
 pub enum HostCommand {
     /// Show or change whether this host keeps itself awake for work it has admitted.
     Power(PowerArguments),
@@ -857,7 +836,7 @@ pub enum HostCommand {
 }
 
 /// `kr host startup`.
-#[derive(Debug, Args)]
+#[derive(Args)]
 pub struct StartupArguments {
     /// The way to choose: `service`, which writes this user's service manager a definition of the
     /// daemon that `kr new` then asks it to start, or `standalone`, which has `kr new` start the
@@ -872,7 +851,7 @@ pub struct StartupArguments {
 }
 
 /// `kr host terminal`.
-#[derive(Debug, Args)]
+#[derive(Args)]
 pub struct TerminalArguments {
     /// The application to prefer, by its identifier. Without it, what this host has and what it
     /// prefers are shown and nothing changes.
@@ -884,7 +863,7 @@ pub struct TerminalArguments {
 }
 
 /// `kr host power`.
-#[derive(Debug, Args)]
+#[derive(Args)]
 pub struct PowerArguments {
     /// The choice to make: `off`, `mains_only` or `battery_too`. Without it, the current setting
     /// and what it is doing are shown and nothing changes.
@@ -893,7 +872,7 @@ pub struct PowerArguments {
 }
 
 /// Which execution context a new session runs in.
-#[derive(Debug, Args)]
+#[derive(Args)]
 #[group(multiple = false)]
 pub struct Execution {
     /// Run in this host's current desktop. The session closes when that desktop's login ends.
@@ -906,7 +885,7 @@ pub struct Execution {
 }
 
 /// `kr shell`.
-#[derive(Debug, Args)]
+#[derive(Args)]
 pub struct ShellArguments {
     /// What to do.
     #[command(subcommand)]
@@ -914,7 +893,7 @@ pub struct ShellArguments {
 }
 
 /// One `kr shell` operation.
-#[derive(Debug, Subcommand)]
+#[derive(Subcommand)]
 pub enum ShellCommand {
     /// Report the resolved executable, flags, version and integration mode.
     Status(ShellStatusArguments),
@@ -925,7 +904,7 @@ pub enum ShellCommand {
 }
 
 /// `kr shell status`.
-#[derive(Debug, Args)]
+#[derive(Args)]
 pub struct ShellStatusArguments {
     /// Report one shell rather than every installed package.
     #[arg(long)]
@@ -933,7 +912,7 @@ pub struct ShellStatusArguments {
 }
 
 /// `kr shell install`.
-#[derive(Debug, Args)]
+#[derive(Args)]
 pub struct ShellInstallArguments {
     /// Install the entry for one shell rather than every installed package.
     #[arg(long)]
@@ -949,7 +928,7 @@ pub struct ShellInstallArguments {
 }
 
 /// `kr shell remove`.
-#[derive(Debug, Args)]
+#[derive(Args)]
 pub struct ShellRemoveArguments {
     /// Remove the entry for one shell rather than every shell KalaReach qualifies.
     #[arg(long)]
@@ -960,7 +939,7 @@ pub struct ShellRemoveArguments {
 }
 
 /// `kr question`.
-#[derive(Debug, Subcommand)]
+#[derive(Subcommand)]
 pub enum QuestionCommand {
     /// List the questions waiting for an answer.
     List(QuestionListArguments),
@@ -978,7 +957,7 @@ pub enum QuestionCommand {
 }
 
 /// `kr question list`.
-#[derive(Debug, Args)]
+#[derive(Args)]
 pub struct QuestionListArguments {
     /// One session, by display number or identifier. Every session by default.
     #[arg(long)]
@@ -989,7 +968,7 @@ pub struct QuestionListArguments {
 }
 
 /// `kr question show` and `kr question cancel`.
-#[derive(Debug, Args)]
+#[derive(Args)]
 pub struct QuestionShowArguments {
     /// The question identifier.
     pub question: String,
@@ -1017,23 +996,8 @@ pub struct AnswerForm {
     pub other: Option<String>,
 }
 
-impl std::fmt::Debug for AnswerForm {
-    /// Which answer was given and how long it is, never what it says: an answer is what a person
-    /// wrote, and a choice is whatever was typed.
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("AnswerForm")
-            .field("text_bytes", &self.text.as_ref().map(String::len))
-            .field("choice_bytes", &self.choice.as_ref().map(String::len))
-            .field("yes", &self.yes)
-            .field("no", &self.no)
-            .field("other_bytes", &self.other.as_ref().map(String::len))
-            .finish()
-    }
-}
-
 /// `kr question answer`.
-#[derive(Debug, Args)]
+#[derive(Args)]
 pub struct QuestionAnswerArguments {
     /// The question identifier.
     pub question: String,
@@ -1043,7 +1007,7 @@ pub struct QuestionAnswerArguments {
 }
 
 /// `kr skill`.
-#[derive(Debug, Subcommand)]
+#[derive(Subcommand)]
 pub enum SkillCommand {
     /// Install the skill and register the tool server.
     Install(SkillArguments),
@@ -1054,7 +1018,7 @@ pub enum SkillCommand {
 }
 
 /// `kr skill install`, `kr skill status` and `kr skill remove`.
-#[derive(Debug, Args)]
+#[derive(Args)]
 pub struct SkillArguments {
     /// The agent: codex, claude-code, opencode, gemini-cli, kimi-code-cli or qoder-cli.
     #[arg(long)]
@@ -1068,7 +1032,7 @@ pub struct SkillArguments {
 }
 
 /// `kr agent-tools`.
-#[derive(Debug, Args)]
+#[derive(Args)]
 pub struct AgentToolsArguments {
     /// Speak the Model Context Protocol over this process's standard input and output.
     #[arg(long)]
@@ -1076,7 +1040,7 @@ pub struct AgentToolsArguments {
 }
 
 /// How a new session is presented.
-#[derive(Debug, Args)]
+#[derive(Args)]
 #[group(multiple = false)]
 pub struct Presentation {
     /// Create and attach in this terminal. The default when input and output are terminals.
@@ -1091,7 +1055,7 @@ pub struct Presentation {
 }
 
 /// `kr new`.
-#[derive(Debug, Args)]
+#[derive(Args)]
 pub struct NewArguments {
     /// How the session is presented. These are mutually exclusive.
     #[command(flatten)]
@@ -1169,7 +1133,7 @@ impl NewArguments {
 }
 
 /// `kr attach`.
-#[derive(Debug, Args)]
+#[derive(Args)]
 pub struct AttachArguments {
     /// The session, by display number or identifier.
     pub session: String,
@@ -1191,7 +1155,7 @@ pub struct AttachArguments {
 }
 
 /// `kr detach`.
-#[derive(Debug, Args)]
+#[derive(Args)]
 pub struct DetachArguments {
     /// The attachment to remove. Required outside the attachment's own context.
     #[arg(long)]
@@ -1201,7 +1165,7 @@ pub struct DetachArguments {
 }
 
 /// `kr close`.
-#[derive(Debug, Args)]
+#[derive(Args)]
 pub struct CloseArguments {
     /// The session, by display number or identifier. Defaults to the current session.
     pub session: Option<String>,
@@ -1211,7 +1175,7 @@ pub struct CloseArguments {
 }
 
 /// `kr list`.
-#[derive(Debug, Args)]
+#[derive(Args)]
 pub struct ListArguments {
     /// Include sessions that have already closed.
     #[arg(long)]
@@ -1222,7 +1186,7 @@ pub struct ListArguments {
 }
 
 /// `kr status`.
-#[derive(Debug, Args)]
+#[derive(Args)]
 pub struct StatusArguments {
     /// The session, by display number or identifier. Defaults to the current session.
     pub session: Option<String>,
@@ -1232,7 +1196,7 @@ pub struct StatusArguments {
 }
 
 /// `kr doctor`.
-#[derive(Debug, Args)]
+#[derive(Args)]
 pub struct DoctorArguments {
     /// Print every check's evidence, including the checks that passed. Without it, only a check
     /// that did not pass shows its evidence.
@@ -1308,70 +1272,6 @@ mod tests {
         Cli::command().debug_assert();
     }
 
-    /// The arguments a person typed an origin or an answer into render as what they are, never
-    /// what was typed.
-    #[test]
-    fn typed_origins_and_answers_render_without_what_was_typed() {
-        use crate::shown::marker::{MARKER, assert_unmarked};
-
-        let parsed = |line: &[&str]| Cli::try_parse_from(line).expect("the line parses").command;
-        let with_credentials = format!("https://{MARKER}:{MARKER}@reach.example/{MARKER}");
-        let without = format!("https://reach.example:8443/{MARKER}?{MARKER}");
-        for (origin, expected) in [
-            (with_credentials.as_str(), "Some(\"<not printed>\")"),
-            (without.as_str(), "Some(\"https://reach.example:8443\")"),
-        ] {
-            let Command::Pair(PairCommand::Invite(arguments)) =
-                parsed(&["kr", "pair", "invite", "--owner", "--origin", origin])
-            else {
-                unreachable!("the line is kr pair invite");
-            };
-            // The negative control: the field holds what was typed, which the derived form
-            // printed whole.
-            assert_eq!(arguments.origin.as_deref(), Some(origin));
-            assert_eq!(
-                format!("{arguments:?}"),
-                format!(
-                    "PairInviteArguments {{ owner: true, view: None, direct: false, origin: \
-                     {expected}, environment: None }}"
-                )
-            );
-            assert_unmarked(
-                "the pairing arguments",
-                &[format!("{arguments:?}"), format!("{arguments:#?}")],
-            );
-        }
-
-        for (flag, expected) in [
-            (
-                "--text",
-                "AnswerForm { text_bytes: Some(14), choice_bytes: None, yes: false, no: false, \
-                 other_bytes: None }",
-            ),
-            (
-                "--choice",
-                "AnswerForm { text_bytes: None, choice_bytes: Some(14), yes: false, no: false, \
-                 other_bytes: None }",
-            ),
-            (
-                "--other",
-                "AnswerForm { text_bytes: None, choice_bytes: None, yes: false, no: false, \
-                 other_bytes: Some(14) }",
-            ),
-        ] {
-            let Command::Question(QuestionCommand::Answer(arguments)) =
-                parsed(&["kr", "question", "answer", "question-id", flag, MARKER])
-            else {
-                unreachable!("the line is kr question answer");
-            };
-            assert_eq!(format!("{:?}", arguments.form), expected);
-            assert_unmarked(
-                "the answer arguments",
-                &[format!("{arguments:?}"), format!("{arguments:#?}")],
-            );
-        }
-    }
-
     /// KR-REQ-07.50: the standard `--help` is answered by the command and by every subcommand at
     /// every depth, and `--version` by the command; each answer is a report that exits with zero,
     /// while a command line that is wrong exits with something else.
@@ -1395,7 +1295,9 @@ mod tests {
         for path in &paths {
             let mut asked = path.clone();
             asked.push("--help".to_owned());
-            let answer = Cli::try_parse_from(&asked).expect_err("help is a report, not a command");
+            let Err(answer) = Cli::try_parse_from(&asked) else {
+                panic!("help is a report, not a command");
+            };
             assert_eq!(
                 answer.kind(),
                 clap::error::ErrorKind::DisplayHelp,
@@ -1403,11 +1305,15 @@ mod tests {
             );
             assert_eq!(answer.exit_code(), 0, "{asked:?}");
         }
-        let answer = Cli::try_parse_from(["kr", "--version"]).expect_err("a report");
+        let Err(answer) = Cli::try_parse_from(["kr", "--version"]) else {
+            panic!("a report");
+        };
         assert_eq!(answer.kind(), clap::error::ErrorKind::DisplayVersion);
         assert_eq!(answer.exit_code(), 0);
         // A command line that is wrong is a failure, and exits with something other than zero.
-        let wrong = Cli::try_parse_from(["kr", "new", "--no-such-option"]).expect_err("refused");
+        let Err(wrong) = Cli::try_parse_from(["kr", "new", "--no-such-option"]) else {
+            panic!("refused");
+        };
         assert_ne!(wrong.exit_code(), 0);
     }
 
