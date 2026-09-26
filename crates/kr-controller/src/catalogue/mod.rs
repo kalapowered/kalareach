@@ -204,22 +204,29 @@ pub struct CatalogueModule {
     environment_id: EnvironmentId,
     /// The native bridges installed packages put in their applications' own directories.
     bridges: Arc<native_bridge::NativeBridges>,
-    /// The last snapshot of admissions computed, with the revision, the bridge changes and the
-    /// live releases it was computed for: rounds at an unchanged revision reuse it.
+    /// The last snapshot of admissions computed, with the revision and the live releases it was
+    /// computed for: rounds at an unchanged revision reuse it. Nothing a snapshot carries moves
+    /// without the revision moving, the bridges included (see [`Self::write`]).
     snapshots: Arc<std::sync::Mutex<Option<CachedSnapshot>>>,
-    /// How many times a change reconciled native bridges, whether the change committed or not:
-    /// a bridge can move without the admission revision moving, and a snapshot is computed for
-    /// the bridges as they were.
-    bridge_changes: Arc<std::sync::atomic::AtomicU64>,
-    /// Run before a snapshot's package checks, for tests that hold one there.
+    /// Run at each [`TestingPoint`], for tests that hold a computation there.
     #[cfg(feature = "testing")]
-    before_package_checks: Arc<std::sync::Mutex<Option<TestingHook>>>,
+    testing_hook: Arc<std::sync::Mutex<Option<TestingHook>>>,
 }
 
-/// A hook a test runs at one point of a computation.
+/// Where a test may hold a computation of this module.
+#[cfg(feature = "testing")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TestingPoint {
+    /// A read of the records for a round, a refresh or the cadence, once the catalogue is held.
+    Records,
+    /// A snapshot's package checks, once the catalogue is let go.
+    PackageChecks,
+}
+
+/// A hook a test runs at each [`TestingPoint`].
 #[cfg(feature = "testing")]
 #[derive(Clone)]
-struct TestingHook(Arc<dyn Fn() + Send + Sync>);
+struct TestingHook(Arc<dyn Fn(TestingPoint) + Send + Sync>);
 
 #[cfg(feature = "testing")]
 impl std::fmt::Debug for TestingHook {
@@ -232,7 +239,6 @@ impl std::fmt::Debug for TestingHook {
 #[derive(Debug)]
 struct CachedSnapshot {
     revision: u64,
-    bridge_changes: u64,
     live: Vec<kr_protocol::admission::LiveRelease>,
     snapshot: admissions::Snapshot,
 }
@@ -301,9 +307,8 @@ impl CatalogueModule {
             environment_id,
             bridges,
             snapshots: Arc::new(std::sync::Mutex::new(None)),
-            bridge_changes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             #[cfg(feature = "testing")]
-            before_package_checks: Arc::new(std::sync::Mutex::new(None)),
+            testing_hook: Arc::new(std::sync::Mutex::new(None)),
         })
     }
 
@@ -340,10 +345,6 @@ impl CatalogueModule {
         let catalogue = tokio::time::timeout_at(deadline, Arc::clone(&self.catalogue).lock_owned())
             .await
             .map_err(|_| busy())?;
-        // Read while the catalogue is held: every change to the bridges happens under it.
-        let bridge_changes = self
-            .bridge_changes
-            .load(std::sync::atomic::Ordering::SeqCst);
         let bridges = Arc::clone(&self.bridges);
         let snapshots = Arc::clone(&self.snapshots);
         let environment_id = self.environment_id;
@@ -358,7 +359,6 @@ impl CatalogueModule {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .as_ref()
                 && held.revision == revision
-                && held.bridge_changes == bridge_changes
                 && held.live == live
             {
                 return Ok(First::Cached(held.snapshot.clone()));
@@ -385,22 +385,17 @@ impl CatalogueModule {
         let revision = planned.revision();
         let snapshots = Arc::clone(&self.snapshots);
         #[cfg(feature = "testing")]
-        let hook = self
-            .before_package_checks
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
+        let hook = self.testing_hook();
         let second = tokio::task::spawn_blocking(move || -> Answer<admissions::Snapshot> {
             #[cfg(feature = "testing")]
             if let Some(hook) = hook {
-                (hook.0)();
+                (hook.0)(TestingPoint::PackageChecks);
             }
             let snapshot = planned.complete().map_err(ProtocolError::from)?;
             *snapshots
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(CachedSnapshot {
                 revision,
-                bridge_changes,
                 live: key,
                 snapshot: snapshot.clone(),
             });
@@ -412,13 +407,21 @@ impl CatalogueModule {
             .map_err(|error| ProtocolError::new(ErrorCode::StorageUnavailable, error.to_string()))?
     }
 
-    /// Runs `hook` before each snapshot's package checks, after the catalogue is let go.
+    /// Runs `hook` at each [`TestingPoint`] a computation of this module reaches.
     #[cfg(feature = "testing")]
-    pub fn before_package_checks(&self, hook: impl Fn() + Send + Sync + 'static) {
+    pub fn at_testing_point(&self, hook: impl Fn(TestingPoint) + Send + Sync + 'static) {
         *self
-            .before_package_checks
+            .testing_hook
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(TestingHook(Arc::new(hook)));
+    }
+
+    #[cfg(feature = "testing")]
+    fn testing_hook(&self) -> Option<TestingHook> {
+        self.testing_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// Returns the admission revision now, waiting for the catalogue no later than `deadline`.
@@ -428,11 +431,36 @@ impl CatalogueModule {
     /// Returns `RESOURCE_UNAVAILABLE` when the catalogue stays busy past `deadline`, and the refusal
     /// the catalogue decided when the record cannot be read.
     pub async fn admission_revision_within(&self, deadline: tokio::time::Instant) -> Answer<u64> {
-        tokio::time::timeout_at(deadline, self.catalogue.lock())
+        self.read_within(deadline, |catalogue| {
+            catalogue.admission_revision().map_err(ProtocolError::from)
+        })
+        .await
+    }
+
+    /// Runs `read` on the catalogue on a thread that may block, waiting for the catalogue and for
+    /// the read no later than `deadline`. A read still running then finishes on its own, holding
+    /// the catalogue until it does, and its answer is dropped.
+    async fn read_within<T: Send + 'static>(
+        &self,
+        deadline: tokio::time::Instant,
+        read: impl FnOnce(&Catalogue) -> Answer<T> + Send + 'static,
+    ) -> Answer<T> {
+        let catalogue = tokio::time::timeout_at(deadline, Arc::clone(&self.catalogue).lock_owned())
+            .await
+            .map_err(|_| busy())?;
+        #[cfg(feature = "testing")]
+        let hook = self.testing_hook();
+        let task = tokio::task::spawn_blocking(move || {
+            #[cfg(feature = "testing")]
+            if let Some(hook) = hook {
+                (hook.0)(TestingPoint::Records);
+            }
+            read(&catalogue)
+        });
+        tokio::time::timeout_at(deadline, task)
             .await
             .map_err(|_| busy())?
-            .admission_revision()
-            .map_err(ProtocolError::from)
+            .map_err(|error| ProtocolError::new(ErrorCode::StorageUnavailable, error.to_string()))?
     }
 
     /// Returns the admission revision now.
@@ -460,20 +488,21 @@ impl CatalogueModule {
         &self,
         deadline: tokio::time::Instant,
     ) -> Answer<(u64, std::collections::BTreeSet<bridge::ReleaseKey>)> {
-        let catalogue = tokio::time::timeout_at(deadline, self.catalogue.lock())
-            .await
-            .map_err(|_| busy())?;
-        let revision = catalogue
-            .admission_revision()
-            .map_err(ProtocolError::from)?;
-        let installed = catalogue
-            .installations()
-            .map_err(ProtocolError::from)?
-            .into_iter()
-            .filter(|installation| installation.environment_id == self.environment_id)
-            .map(|installation| installed_key(&installation))
-            .collect();
-        Ok((revision, installed))
+        let environment_id = self.environment_id;
+        self.read_within(deadline, move |catalogue| {
+            let revision = catalogue
+                .admission_revision()
+                .map_err(ProtocolError::from)?;
+            let installed = catalogue
+                .installations()
+                .map_err(ProtocolError::from)?
+                .into_iter()
+                .filter(|installation| installation.environment_id == environment_id)
+                .map(|installation| installed_key(&installation))
+                .collect();
+            Ok((revision, installed))
+        })
+        .await
     }
 
     /// Returns true when this daemon serves the method.
@@ -860,6 +889,7 @@ impl CatalogueModule {
             Claimed::Retained(record) => return answered(&record, &digest, mutation.action_id),
             Claimed::Fresh => {}
         }
+        let revision = catalogue.admission_revision().ok();
         // Every change the action makes commits through this recording, so what it left behind
         // when it stops is known rather than guessed.
         let recording = Recording::new(&*admission);
@@ -905,13 +935,24 @@ impl CatalogueModule {
             }
             None => Vec::new(),
         };
-        // A bridge may move here whether or not the change committed, and the admission revision
-        // moves only with a commit: a snapshot computed for the bridges as they were is not
-        // reused after this.
-        if !subjects.is_empty() {
-            self.bridge_changes
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        }
+        // A bridge the admissions carry may move here, whether or not the change committed, so the
+        // admission revision rises first, under the change's own authority, unless the change
+        // already raised it: every snapshot computed before this write is below every one after
+        // it, and every worker is sent the bridges as they are now. Where the revision cannot
+        // rise, no bridge moves; the daemon's next start or the next change follows them.
+        let raised = subjects.is_empty()
+            || catalogue.admission_revision().ok() != revision
+            || match catalogue.raise_admission_revision(&*admission) {
+                Ok(_) => true,
+                Err(error) => {
+                    eprintln!(
+                        "kr-controller: the native bridges this change names were not followed, \
+                         because the admission revision could not rise: {error}"
+                    );
+                    false
+                }
+            };
+        let subjects = if raised { subjects } else { Vec::new() };
         for plugin_id in subjects {
             let bridges = Arc::clone(&self.bridges);
             let wanted = wanted_bridge(&catalogue, self.environment_id, &plugin_id);

@@ -749,6 +749,22 @@ impl Catalogue {
         self.admission_plan(environment_id, live, host)?.complete()
     }
 
+    /// Raises the admission revision under `authority`, for something the admissions carry that
+    /// moves with no record changing: the native bridges a change follows. Every snapshot of the
+    /// admissions computed before it is then below every one computed after it, and every worker
+    /// is sent a round.
+    ///
+    /// # Errors
+    ///
+    /// Returns what the authority refused, and [`CatalogueError::StorageUnavailable`] when the
+    /// record cannot be read or written.
+    pub fn raise_admission_revision(&mut self, authority: &dyn Authority) -> CatalogueResult<u64> {
+        let pending = self.db.begin()?;
+        committed(authority, &Effect::Records, move |permit| {
+            pending.run(permit, |changes| changes.raise_admission_revision())
+        })
+    }
+
     /// Reads what the records and the current indexes say about one environment's admissions on
     /// `host`, leaving the package checks to [`AdmissionPlan::complete`], which needs no catalogue.
     ///

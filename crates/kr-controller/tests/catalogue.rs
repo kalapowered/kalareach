@@ -9,7 +9,7 @@ use std::path::Path;
 
 use std::sync::Arc;
 
-use kr_controller::catalogue::{Admission, CatalogueModule};
+use kr_controller::catalogue::{Admission, CatalogueModule, TestingPoint};
 use kr_controller::sharing::{
     CatalogueTrustPlan, ConfirmedAction, OwnerConfirmations, PluginGrantPlan, PluginInstallPlan,
 };
@@ -1612,11 +1612,13 @@ async fn a_stalled_package_check_holds_its_snapshot_and_not_the_catalogue() {
     let _ = installed(&host).await;
     let (release, released) = std::sync::mpsc::channel::<()>();
     let released = std::sync::Mutex::new(released);
-    host.module.before_package_checks(move || {
-        let _ = released
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .recv_timeout(std::time::Duration::from_secs(60));
+    host.module.at_testing_point(move |point| {
+        if point == TestingPoint::PackageChecks {
+            let _ = released
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .recv_timeout(std::time::Duration::from_secs(60));
+        }
     });
     let bound = std::time::Duration::from_millis(300);
     let started = tokio::time::Instant::now();
@@ -1647,6 +1649,37 @@ async fn a_stalled_package_check_holds_its_snapshot_and_not_the_catalogue() {
         .await);
     assert_eq!(listed.plugins.len(), 1);
     drop(release);
+}
+
+/// A read of the records that stalls once the catalogue is held holds the cadence and a refresh
+/// no longer than their bound: each is refused as busy by then, while the read is still held.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stalled_records_read_holds_the_cadence_no_longer_than_its_bound() {
+    let host = host();
+    let _ = installed(&host).await;
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let released = std::sync::Mutex::new(released);
+    host.module.at_testing_point(move |point| {
+        if point == TestingPoint::Records {
+            let _ = released
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .recv_timeout(std::time::Duration::from_secs(60));
+        }
+    });
+    let bound = std::time::Duration::from_millis(300);
+    let started = tokio::time::Instant::now();
+    let installed = host.module.installed_within(started + bound).await;
+    let waited = started.elapsed();
+    assert_eq!(
+        installed.map(|_| ()).map_err(|error| error.code),
+        Err(ErrorCode::ResourceUnavailable)
+    );
+    assert!(waited < bound * 4, "{waited:?}");
+    drop(release);
+    let later = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    assert!(host.module.installed_within(later).await.is_ok());
+    assert!(host.module.admission_revision_within(later).await.is_ok());
 }
 
 /// Counts the workers gave at one admission revision are shown only while that is the revision
@@ -2260,9 +2293,11 @@ async fn an_installation_withdrawn_after_its_package_was_placed_is_unknown_and_n
     }
     let others = admission.others.load(std::sync::atomic::Ordering::SeqCst);
     assert!(others >= 2, "payloads and the package committed first");
+    // The second is the bridge follow-up's rise of the admission revision, which the withdrawn
+    // admission refuses too: nothing is written, and no bridge moves.
     assert_eq!(
         admission.records.load(std::sync::atomic::Ordering::SeqCst),
-        1
+        2
     );
 
     let read = host
@@ -2300,7 +2335,7 @@ async fn an_installation_withdrawn_after_its_package_was_placed_is_unknown_and_n
     );
     assert_eq!(
         admission.records.load(std::sync::atomic::Ordering::SeqCst),
-        1
+        2
     );
     let catalogue = host.module.catalogue().lock().await;
     assert!(
@@ -3051,40 +3086,21 @@ mod native_bridges {
         assert_eq!(site.tree(), after, "nothing was written again");
     }
 
-    /// A change that moves a bridge without moving the admission revision (here, a refused pin
-    /// whose bridge follow-up finishes an application stopped part way) is not hidden by a
-    /// snapshot computed before it.
-    #[tokio::test]
-    async fn a_bridge_moved_without_a_revision_change_is_not_hidden_by_an_earlier_snapshot() {
-        let site = Site::new();
-        let host = host(&site);
-        let digest = synchronised(&host).await;
+    /// Installs Claude Code's package with its bridge stopped part way, enables it, and returns
+    /// the package hash: the bridge is not applied.
+    async fn stopped_part_way(host: &Host) -> String {
+        let digest = synchronised(host).await;
         host.module.native_bridges().stop_before(20);
-        let _: wire::PluginInstallResult = ok(install(&host, &digest, true).await);
-        let _: wire::PluginEnableResult = ok(plugin_change(&host, Method::PluginEnable).await);
-        assert!(bridge_facts(&host, &digest).is_none(), "stopped part way");
-        let later = || tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-        let bridged = |snapshot: &kr_controller::catalogue::admissions::Snapshot| {
-            snapshot
-                .packages
-                .iter()
-                .any(|package| package.bridge.is_present())
-        };
-        let before = host
-            .module
-            .snapshot_within(&[], later())
-            .await
-            .expect("computed");
-        assert!(
-            !before.packages.is_empty() && !bridged(&before),
-            "{:?} {:?}",
-            before.packages,
-            before.left_out
-        );
-        let revision = host.module.admission_revision().await.expect("readable");
-
+        let _: wire::PluginInstallResult = ok(install(host, &digest, true).await);
+        let _: wire::PluginEnableResult = ok(plugin_change(host, Method::PluginEnable).await);
+        assert!(bridge_facts(host, &digest).is_none(), "stopped part way");
         host.module.native_bridges().stop_before(0);
-        let mut wrong = digest.clone();
+        digest
+    }
+
+    /// A pin the catalogue refuses, whose bridge follow-up finishes what was stopped.
+    async fn refused_pin(host: &Host, digest: &str) {
+        let mut wrong = digest.to_owned();
         let last = wrong.pop().expect("a hash");
         wrong.push(if last == '0' { '1' } else { '0' });
         let _ = refusal(
@@ -3105,19 +3121,103 @@ mod native_bridges {
                 .await,
         );
         assert!(
-            bridge_facts(&host, &digest).is_some(),
+            bridge_facts(host, digest).is_some(),
             "the follow-up finished it"
         );
-        assert_eq!(
-            host.module.admission_revision().await.expect("readable"),
-            revision
-        );
+    }
+
+    fn bridged(snapshot: &kr_controller::catalogue::admissions::Snapshot) -> bool {
+        snapshot
+            .packages
+            .iter()
+            .any(|package| package.bridge.is_present())
+    }
+
+    /// A change that follows a bridge raises the admission revision even when the change itself
+    /// is refused: the bridge it moved is handed over at a revision above every snapshot computed
+    /// before it, and every worker is sent a round for it.
+    #[tokio::test]
+    async fn a_bridge_followed_by_a_refused_change_raises_the_admission_revision() {
+        let site = Site::new();
+        let host = host(&site);
+        let digest = stopped_part_way(&host).await;
+        let later = || tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        let before = host
+            .module
+            .snapshot_within(&[], later())
+            .await
+            .expect("computed");
+        assert!(!before.packages.is_empty() && !bridged(&before));
+
+        refused_pin(&host, &digest).await;
+
         let after = host
             .module
             .snapshot_within(&[], later())
             .await
             .expect("computed");
+        assert!(
+            after.revision > before.revision,
+            "{} {}",
+            after.revision,
+            before.revision
+        );
         assert!(bridged(&after));
+    }
+
+    /// A snapshot whose package checks were still running when a change moved a bridge carries a
+    /// lower revision than the snapshot computed after the change, so a round that hands it over
+    /// later is still below the one that handed over the newer one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_snapshot_computed_across_a_bridge_move_is_below_the_one_after_it() {
+        let site = Site::new();
+        let host = host(&site);
+        let digest = stopped_part_way(&host).await;
+        let (entered, entering) = std::sync::mpsc::channel::<()>();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let entered = std::sync::Mutex::new(entered);
+        let released = std::sync::Mutex::new(released);
+        let first = std::sync::atomic::AtomicBool::new(true);
+        host.module.at_testing_point(move |point| {
+            if point == TestingPoint::PackageChecks
+                && first.swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                let _ = entered
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .send(());
+                let _ = released
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .recv_timeout(std::time::Duration::from_secs(60));
+            }
+        });
+        let later = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        let moving = async {
+            tokio::task::spawn_blocking(move || {
+                entering.recv_timeout(std::time::Duration::from_secs(60))
+            })
+            .await
+            .expect("the wait ended")
+            .expect("the first snapshot is checking its packages");
+            refused_pin(&host, &digest).await;
+            let newer = host
+                .module
+                .snapshot_within(&[], later)
+                .await
+                .expect("computed");
+            drop(release);
+            newer
+        };
+        let (older, newer) = tokio::join!(host.module.snapshot_within(&[], later), moving);
+        let older = older.expect("computed");
+        assert!(!bridged(&older) && bridged(&newer));
+        assert!(
+            older.revision < newer.revision,
+            "{} {}",
+            older.revision,
+            newer.revision
+        );
     }
 
     /// A change that holds the catalogue (here, one whose bridge is being placed) holds a round's
