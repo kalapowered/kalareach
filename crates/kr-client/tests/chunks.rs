@@ -85,6 +85,9 @@ struct Script {
     keepalives_before_renewal: usize,
     /// The control endpoint issues a window that admits nothing.
     no_control_window: bool,
+    /// The attachment-chunk endpoint follows its acknowledgement with a frame a lane does not
+    /// carry, and keeps the connection open.
+    stray_frame: bool,
     /// The attachment-chunk endpoint ends the connection instead of acknowledging the hello.
     drop_hello: bool,
     /// What the host answers `download.chunk` with, by index: the descriptor and the bytes.
@@ -475,6 +478,12 @@ async fn converse(
         .is_err()
     {
         return;
+    }
+    if leg.is_some() && host.script.stray_frame {
+        let stray = host.acknowledgement(&peer, environment_id, action_window(window("window-9")));
+        if writer.write_message(&stray).await.is_err() {
+            return;
+        }
     }
     let mut current = window("window-1");
     if let (Some(_), Some(renewal)) = (leg, host.script.renewal.clone()) {
@@ -1173,4 +1182,49 @@ async fn a_lane_behind_a_backlog_of_keepalives_sends_under_the_window_renewed_af
     .await
     .expect("the chunk goes under the renewed window");
     assert_eq!(host.seen().windows, vec!["window-2"]);
+}
+
+/// A lane whose reader stopped at a frame it cannot carry sends nothing more, even though the
+/// connection is still open: the next call fails with what the reader said.
+#[tokio::test]
+async fn a_lane_whose_reader_stopped_sends_nothing_more() {
+    let host = Host::start(Script {
+        stray_frame: true,
+        ..Script::default()
+    });
+    let session = host.session().await;
+    let bytes = pattern(4096);
+    let reserved = reserve(&host, &session, &bytes).await;
+    let mut lane = host
+        .route()
+        .open(reserved.transfer_id)
+        .await
+        .expect("a lane");
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let refused = lane
+        .send_chunk(
+            &host.target(),
+            &chunk_of(reserved.transfer_id, &bytes, 0),
+            TTL,
+        )
+        .await
+        .expect_err("the lane has stopped");
+    assert_eq!(refused.code(), ErrorCode::InvalidArgument, "{refused}");
+    let again = lane
+        .send_chunk(
+            &host.target(),
+            &chunk_of(reserved.transfer_id, &bytes, 0),
+            TTL,
+        )
+        .await
+        .expect_err("the lane stays stopped");
+    assert!(matches!(again, ClientError::ConnectionEnded), "{again}");
+    // Time for a chunk that did go out to reach the host's record.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(
+        host.seen().legs,
+        vec![Vec::<u64>::new()],
+        "no chunk went out"
+    );
 }

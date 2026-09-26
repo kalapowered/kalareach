@@ -156,6 +156,7 @@ impl ChunkLane {
             ));
         }
         let Carrier::Local(carrier) = &mut self.carrier;
+        carrier.usable()?;
         let window = carrier.window();
         let entry = Method::UploadChunk.entry();
         if entry.freshness == FreshnessRequirement::ActionWindow && window.valid_for_ms.get() == 0 {
@@ -200,6 +201,7 @@ impl ChunkLane {
     /// under its code, and `ATTACHMENT_INTEGRITY` when the answer is not the chunk described.
     pub async fn read_chunk(&mut self, expected: &ChunkDescriptor) -> Result<Bytes> {
         let Carrier::Local(carrier) = &mut self.carrier;
+        carrier.usable()?;
         let request_id = carrier.next_request_id();
         let request = Request {
             request_id,
@@ -343,6 +345,26 @@ impl LocalCarrier {
     /// The newest window the host has issued on this connection.
     fn window(&self) -> ActionWindow {
         self.window.borrow().clone()
+    }
+
+    /// Says whether this lane can still carry a call, before one is built.
+    ///
+    /// The reader stops when the connection ends or the host sends what this lane cannot read, and
+    /// a call built after that would go out on a connection nobody reads. What the reader said as
+    /// it stopped is the answer.
+    fn usable(&mut self) -> Result<()> {
+        if !self.ended && !self.reader.is_finished() {
+            return Ok(());
+        }
+        self.ended = true;
+        loop {
+            match self.answers.try_recv() {
+                Ok(Err(error)) => return Err(error),
+                // An answer to a call its caller abandoned.
+                Ok(Ok(_)) => {}
+                Err(_) => return Err(ClientError::ConnectionEnded),
+            }
+        }
     }
 
     fn next_request_id(&mut self) -> RequestId {
