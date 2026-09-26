@@ -1858,6 +1858,10 @@ mod tests {
                 &b"<html><body>Bad Gateway</body></html>"[..],
                 &b""[..],
                 &br#"{"message":"The upstream did not answer."}"#[..],
+                // An envelope with no refusal of the service's in it is not the service's answer.
+                &br#"{"ok":false}"#[..],
+                &br#"{"ok":false,"error":{"message":"No code."}}"#[..],
+                &br#"{"ok":true}"#[..],
             ] {
                 let start = read_start_answer(&ServiceHttpAnswer {
                     status,

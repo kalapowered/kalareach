@@ -1527,6 +1527,88 @@ mod tests {
         assert_eq!(wire.requests(), 0, "nothing reached the transport");
     }
 
+    /// Sends one request of `method` with no second authorisation, as an adapter of that method does.
+    async fn dispatched(
+        service: &SignedService,
+        method: Method,
+    ) -> std::result::Result<Answer, Unanswered> {
+        service
+            .dispatch(
+                "/api/a-method",
+                method,
+                &serde_json::json!({ "note": "a request" }),
+                256 * 1024,
+                None,
+                None,
+            )
+            .await
+    }
+
+    /// KR-REQ-23.57: a gateway's 502 or 504 with no envelope of the service's can follow the
+    /// service acting on the request, so a deletion or an authority feed request it answers has an
+    /// unknown outcome, which nothing sends again: the service holds a deletion's first target only
+    /// for the signature that asked for it, and a delegation has nothing to tell a repeat from a
+    /// later change. The controls: the service's own refusal on a 502 is an answer, and a request
+    /// that is safe to send again (a keyed delivery, an upload part, a read) stays transient on a
+    /// 503 and on a gateway's 502 or 504 alike.
+    #[tokio::test]
+    async fn kr_req_23_57_a_gateway_that_lost_a_deletion_or_an_authority_request_leaves_its_outcome_unknown()
+     {
+        let page = b"<html><body>Bad Gateway</body></html>".to_vec();
+        for method in [Method::StorageObjectDelete, Method::AuthoritySync] {
+            for status in [502, 504] {
+                let wire = Wire::answering(Ok(ServiceHttpAnswer {
+                    status,
+                    body: page.clone(),
+                }));
+                match dispatched(&service(&wire), method).await {
+                    Err(Unanswered::Sent(error)) => {
+                        assert_eq!(
+                            error.code(),
+                            ErrorCode::OutcomeUnknown,
+                            "{method:?} {status}"
+                        );
+                        assert_eq!(
+                            error
+                                .decision(crate::retry::RequestClass::IdempotentRead)
+                                .recovery,
+                            crate::retry::Recovery::QueryOutcome
+                        );
+                    }
+                    other => panic!("{method:?} {status} may have run: {other:?}"),
+                }
+            }
+            let wire = Wire::answering(Ok(ServiceHttpAnswer {
+                status: 502,
+                body: br#"{"ok":false,"error":{"code":"INTERNAL","message":"Not now."}}"#.to_vec(),
+            }));
+            match dispatched(&service(&wire), method).await {
+                Ok(Answer::Refused(refusal)) => assert_eq!(refusal.code(), "INTERNAL"),
+                other => panic!("{method:?}: the service's refusal is an answer: {other:?}"),
+            }
+        }
+        for method in [
+            Method::MailboxDeliver,
+            Method::StorageUploadPart,
+            Method::StorageObjectRead,
+        ] {
+            for status in [502, 503, 504] {
+                let wire = Wire::answering(Ok(ServiceHttpAnswer {
+                    status,
+                    body: page.clone(),
+                }));
+                match dispatched(&service(&wire), method).await {
+                    Err(Unanswered::Sent(error)) => assert_eq!(
+                        error.code(),
+                        ErrorCode::UpstreamUnavailable,
+                        "{method:?} {status}"
+                    ),
+                    other => panic!("{method:?} {status} may have run: {other:?}"),
+                }
+            }
+        }
+    }
+
     /// From the moment the transport is given a request, whatever goes wrong may have happened
     /// after the service received it: a transport that fails, and an answer this client cannot
     /// read. A refusal the service named is an answer, sent and answered.
