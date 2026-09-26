@@ -183,13 +183,14 @@ pub struct WorkerService {
     /// mutation; it does not cover a read or a subscription already running on a connection that
     /// was authorised a moment before its authority was withdrawn. This is what covers those.
     admitted: Mutex<std::collections::BTreeMap<ConnectionId, Registration>>,
-    /// The attachments a forwarded caller made, whose authority is a grant rather than this user.
+    /// The attachments made under a grant: by every caller but the local owner, whichever socket
+    /// it came in on.
     ///
     /// An authority revision fences what those attachments were admitted to do, and an attachment
-    /// identifier is the only thing the input lease records about who holds it. A local
-    /// attachment is not in here, because its authority is the operating-system identity the
+    /// identifier is the only thing the input lease records about who holds it. The local owner's
+    /// attachments are not in here, because its authority is the operating-system identity the
     /// socket authenticated and no revision replaces that.
-    remote_attachments: Mutex<std::collections::BTreeSet<AttachmentId>>,
+    granted_attachments: Mutex<std::collections::BTreeSet<AttachmentId>>,
     /// The session's questions, and the sources bound to them.
     questions: Arc<crate::questions::Questions>,
     /// The session's journal file, which the attention sources are read from.
@@ -398,7 +399,7 @@ impl WorkerService {
             dispatch: Mutex::new(()),
             connections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             admitted: Mutex::new(std::collections::BTreeMap::new()),
-            remote_attachments: Mutex::new(std::collections::BTreeSet::new()),
+            granted_attachments: Mutex::new(std::collections::BTreeSet::new()),
             questions,
             journal_path: binding.journal_path,
             attention_reader: Mutex::new(None),
@@ -1294,7 +1295,7 @@ impl WorkerService {
             let _ = session.detach(attachment_id);
             // The fence this detach moved, and any terminator it produced, reach the writer here.
             self.runtime.flush_locked(&mut session);
-            self.forget_remote_attachment(attachment_id);
+            self.forget_granted_attachment(attachment_id);
         }
         // A window that outlived its connection could first-admit a request through a connection
         // that no longer exists, so the connection's windows go when it does, and so does its
@@ -2267,7 +2268,7 @@ impl WorkerService {
             None => Ok(0),
         };
         outcome?;
-        self.fence_remote_input(&mut session, None);
+        self.fence_granted_input(&mut session, None);
         let mut authority = self
             .authority
             .lock()
@@ -2357,16 +2358,17 @@ impl WorkerService {
     /// Forgets an attachment that has gone, so the set holds only attachments that exist.
     ///
     /// Every way an attachment ends comes through here: its own detach, its connection going, and
-    /// a withdrawal taking it back. A set that only grew would keep one entry per remote
-    /// attachment for as long as this worker ran.
-    fn forget_remote_attachment(&self, attachment_id: AttachmentId) {
-        self.remote_attachments
+    /// a withdrawal taking it back. A set that only grew would keep one entry per attachment made
+    /// under a grant for as long as this worker ran.
+    fn forget_granted_attachment(&self, attachment_id: AttachmentId) {
+        self.granted_attachments
             .lock()
-            .expect("the remote attachment set is not poisoned")
+            .expect("the granted attachment set is not poisoned")
             .remove(&attachment_id);
     }
 
-    /// Takes the input lease away from a forwarded caller, with whatever it had not delivered.
+    /// Takes the input lease away from a caller acting under a grant, with whatever it had not
+    /// delivered.
     ///
     /// Section 10's input fence is what a revocation needs here. Input the worker accepted can sit
     /// in the lease's queue while the application is not taking bytes, so an acknowledgement that
@@ -2375,15 +2377,15 @@ impl WorkerService {
     /// the writer takes, which is the step a takeover already uses.
     ///
     /// `only` names the attachment whose authority ended, when one is known. A revision
-    /// acknowledgement knows no attachment: which device the revision was about is not something
-    /// this worker is told, so every forwarded lease is fenced. A grant that ran out knows exactly
-    /// which attachment it belonged to, and fences nothing else: another device may hold the lease
-    /// by then, and its authority is its own.
+    /// acknowledgement knows no attachment: which grant the revision was about is not something
+    /// this worker is told, so every lease held under a grant is fenced. A grant that ran out knows
+    /// exactly which attachment it belonged to, and fences nothing else: another caller may hold
+    /// the lease by then, and its authority is its own.
     ///
-    /// Either way the device acquires the lease again on its next request, under the authority
-    /// now in force; a local lease is untouched, because no revision and no grant replaces the
-    /// operating-system identity behind it.
-    fn fence_remote_input(&self, session: &mut Session, only: Option<AttachmentId>) {
+    /// Either way the caller acquires the lease again on its next request, under the authority
+    /// now in force; the local owner's lease is untouched, because no revision and no grant
+    /// replaces the operating-system identity behind it.
+    fn fence_granted_input(&self, session: &mut Session, only: Option<AttachmentId>) {
         let lease = session.lease();
         let Some(holder) = lease.holder.0 else {
             return;
@@ -2391,12 +2393,12 @@ impl WorkerService {
         if only.is_some_and(|named| named != holder) {
             return;
         }
-        let remote = self
-            .remote_attachments
+        let granted = self
+            .granted_attachments
             .lock()
-            .expect("the remote attachment set is not poisoned")
+            .expect("the granted attachment set is not poisoned")
             .contains(&holder);
-        if !remote {
+        if !granted {
             return;
         }
         let _ = session.release_input(holder, lease.epoch.get());
@@ -2487,7 +2489,7 @@ impl WorkerService {
             let _ = session.detach(attachment_id);
             // The fence this detach moved, and any terminator it produced, reach the writer here.
             self.runtime.flush_locked(&mut session);
-            self.forget_remote_attachment(attachment_id);
+            self.forget_granted_attachment(attachment_id);
         }
         // Last, and never before the latch above. Nobody is left to read the recovery this
         // connection was paging, and a first page still being cut for it finds the latch set and
@@ -3664,9 +3666,9 @@ impl WorkerService {
         if self.shared_clock.boot_elapsed_ms() < deadline {
             return Ok(());
         }
-        // Only this request's own attachment. Another device may hold the lease by now, and its
+        // Only this request's own attachment. Another caller may hold the lease by now, and its
         // authority has nothing to do with this one's having ended.
-        self.fence_remote_input(session, Some(attachment_id));
+        self.fence_granted_input(session, Some(attachment_id));
         Err(WorkerError::GenerationFenced {
             detail: "the authority this request was admitted under has run out".to_owned(),
         })
@@ -3809,11 +3811,12 @@ impl WorkerService {
                 let params: SessionAttachParams = parse(&mutation.params)?;
                 Self::check_session(session, params.session_id)
             }
-            // An attachment of this session, not only one this connection made. Every attachment
-            // of a local session belongs to the same operating-system user, whom the listener has
-            // already authenticated, and `kr detach` from another window is the ordinary way to
-            // end an attachment whose own terminal has gone. An identifier that names no
-            // attachment of this session is still refused.
+            // An attachment of this session, not only one this connection made. The local owner is
+            // the operating-system user the listener has already authenticated, and `kr detach`
+            // from another of its windows is the ordinary way to end an attachment whose own
+            // terminal has gone; every other caller is held to its own connection's attachments
+            // by the effect. An identifier that names no attachment of this session is still
+            // refused.
             Method::SessionDetach => {
                 let params: SessionDetachParams = parse(&mutation.params)?;
                 let attachment_id = Self::detach_subject(session, &params)?;
@@ -5102,12 +5105,14 @@ impl WorkerService {
                 // never records authority its grant never carried and the summary it is given says
                 // what it actually holds.
                 //
-                // Exactly one caller is not narrowed: the local owner, on this worker's own socket
-                // and holding no grant. Its peer credentials already proved it is this user and
-                // the worker's own authority covers its session. Everything else is narrowed,
-                // including a caller that reached the host some other way and named no grant,
-                // which under this rule receives nothing rather than everything.
-                let granted = if caller.is_local_owner() {
+                // Exactly one caller is not narrowed: the local owner, the operating-system user a
+                // local listener authenticated, holding no grant. Its peer credentials already
+                // proved it is this user and the worker's own authority covers its session.
+                // Everything else is narrowed, whichever socket it came in on, including a caller
+                // that reached the host some other way and named no grant, which under this rule
+                // receives nothing rather than everything.
+                let owner = caller.is_local_owner();
+                let granted = if owner {
                     params.requested.clone()
                 } else {
                     kr_protocol::rights::permitted_attachment_capabilities(
@@ -5115,22 +5120,24 @@ impl WorkerService {
                         &caller.grant_rights,
                     )
                 };
-                // And it is drawn the whole screen, because it holds no grant to be narrowed by.
-                // A forwarded caller is drawn the live screen alone: section 10's live-screen
-                // exception never reaches the buffer that is not showing, and this build serves a
-                // device no retained content beyond it.
+                // And the owner is drawn the whole screen, because it holds no grant to be
+                // narrowed by. Every other caller is drawn the live screen alone: section 10's
+                // live-screen exception never reaches the buffer that is not showing, and this
+                // build serves a grant no retained content beyond it.
                 let result = session.attach(&params, granted, attachment_id)?;
-                if caller.is_remote() {
-                    // The one filter decides how much of the screen a caller is drawn. A forwarded
-                    // caller's scope is section 10's live-screen exception, and asking the filter
+                if !owner {
+                    // The one filter decides how much of the screen a caller is drawn. A grant's
+                    // scope here is section 10's live-screen exception, and asking the filter
                     // rather than naming the scope here is what keeps that decision in one place.
                     let filter = crate::history_filter::HistoryFilter::new(
                         crate::history_filter::ViewerScope::forwarded(kr_ipc::now_ms().get()),
                     );
                     session.narrow_content(attachment_id, filter.screen_scope());
-                    self.remote_attachments
+                    // And what the attachment was admitted to do ends with the authority behind
+                    // it: a revision or the grant's own expiry takes its input lease away.
+                    self.granted_attachments
                         .lock()
-                        .expect("the remote attachment set is not poisoned")
+                        .expect("the granted attachment set is not poisoned")
                         .insert(attachment_id);
                 }
                 state.add_attachment(attachment_id);
@@ -5143,13 +5150,14 @@ impl WorkerService {
                 // line's own capability names, never about whatever the session has most recently
                 // recorded.
                 let attachment_id = Self::detach_subject(session, &params)?;
-                // Whose attachment a caller may detach depends on how it reached the host. Every
-                // local caller is the same authenticated operating-system user, and detaching from
-                // another window is something a person does on purpose. A forwarded caller is a
-                // different actor, and an attachment identifier is not permission: it detaches
-                // what its own connection created and nothing else. The resolved attachment is
-                // what that check is applied to, so naming nothing is not a way around it.
-                if caller.is_remote() {
+                // Whose attachment a caller may detach depends on whether it is the local owner.
+                // The owner is the one operating-system user a local listener authenticated,
+                // holding no grant, and detaching from another of its windows is something a
+                // person does on purpose. Every other caller acts under a grant, whichever socket
+                // it came in on, and an attachment identifier is not permission: it detaches what
+                // its own connection created and nothing else. The resolved attachment is what
+                // that check is applied to, so naming nothing is not a way around it.
+                if !caller.is_local_owner() {
                     Self::check_attachment(state, attachment_id)?;
                 }
                 let outcome = session.detach(attachment_id);
@@ -5162,7 +5170,7 @@ impl WorkerService {
                 self.runtime.flush_locked(session);
                 let result = outcome?;
                 state.remove_attachment(attachment_id);
-                self.forget_remote_attachment(attachment_id);
+                self.forget_granted_attachment(attachment_id);
                 Ok((encode(&result)?, AfterEffect::None))
             }
             Method::SessionClose => {
