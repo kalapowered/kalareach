@@ -873,7 +873,13 @@ async fn standalone(
         manager: None,
     };
     let last = match answered_by(endpoint, deadline, || {}).await {
-        Ok(client) => return Ok((client, Some(started))),
+        Ok(client) => {
+            // A daemon answered, whichever start it came from. The request is withdrawn, so no
+            // starter the Task Scheduler runs later acts on it; one that took it already is past
+            // the reach of this.
+            let _ = kr_ipc::starter::withdraw_claim(environment, asked.request);
+            return Ok((client, Some(started)));
+        }
         Err(last) => last,
     };
     Err(windows::unanswered(
@@ -1569,6 +1575,16 @@ mod windows {
         })
     }
 
+    /// Whether the Task Scheduler confirmed the run it was asked for.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Run {
+        /// It answered that it had been asked to run the task.
+        Confirmed,
+        /// It could not be asked, refused, or did not answer in time: whether the task ran is not
+        /// known.
+        Unconfirmed,
+    }
+
     /// A request left for the environment's starter, and the task run that is to take it.
     #[derive(Debug)]
     pub struct Asked {
@@ -1576,15 +1592,34 @@ mod windows {
         pub request: Uuid,
         /// The login session this command runs in, when it could be read.
         pub session: Option<u32>,
+        /// What the Task Scheduler said of the run.
+        pub run: Run,
+    }
+
+    /// What the Task Scheduler said of the run, as a failure begins.
+    pub(super) fn run_said(run: Run, environment_id: kr_protocol::ids::EnvironmentId) -> Shown {
+        match run {
+            Run::Confirmed => shown!(
+                "the Task Scheduler was asked to run the scheduled task {} for environment {}",
+                task::name(environment_id),
+                environment_id
+            ),
+            Run::Unconfirmed => shown!(
+                "the Task Scheduler did not confirm that it ran the scheduled task {} for \
+                 environment {}",
+                task::name(environment_id),
+                environment_id
+            ),
+        }
     }
 
     /// Checks the environment's task, leaves a request to start the daemon for its starter, and
     /// runs it, all under the environment's lock, which is let go before the command waits.
     ///
-    /// The request lapses at `deadline`, when the command stops waiting: a starter the Task
-    /// Scheduler runs later than that starts nothing for it. A run the Task Scheduler did not make
-    /// has the request withdrawn at once; when a starter took it first, the command waits as for
-    /// a run that was made.
+    /// The request lapses at `deadline`, when the command stops waiting: a starter that looks at
+    /// it later starts nothing for it. A run the Task Scheduler does not confirm has the request
+    /// withdrawn at once; when a starter took it first, or the withdrawal fails, the command waits
+    /// as for a run that was confirmed, and says afterwards that this one was not.
     pub fn ask(
         environment: &EnvironmentPaths,
         program: &Path,
@@ -1651,43 +1686,58 @@ mod windows {
                 ),
             });
         };
-        kr_ipc::starter::leave_claim(
+        if let Err(error) = kr_ipc::starter::leave_claim(
             environment,
             &kr_ipc::starter::StartClaim {
                 request,
                 boot,
                 deadline_boot_ms: lapses,
             },
-        )
-        .map_err(CliError::Ipc)?;
-        if let Err(failure) = supervision::windows::run(&definition) {
-            // A run can fail after the Task Scheduler began it, and another command's run can
-            // have a starter take this request: only a request withdrawn before any starter took
-            // it has nothing started for it.
-            if let Ok(Withdrawal::Withdrawn) = kr_ipc::starter::withdraw_claim(environment, request)
-            {
-                let asked = match failure {
-                    supervision::RunFailure::NotRun(_) => Shown::said("could not be asked to run"),
-                    supervision::RunFailure::Failed(_) => Shown::said("did not run"),
-                };
-                return Err(CliError::Unfinished {
-                    code: kr_protocol::error::ErrorCode::EnvironmentUnavailable,
-                    message: shown!(
-                        "the Task Scheduler {} the scheduled task {} for environment {}, and the \
-                         request this command left for its starter was withdrawn, so no control \
-                         daemon was started for it; schtasks /Query /TN {} shows what it holds",
-                        asked,
-                        name,
-                        environment_id,
-                        name
-                    ),
-                });
-            }
+        ) {
+            // A claim can be published and its directory then fail to flush: it is withdrawn, so
+            // nothing acts on a request this command gave up before running anything.
+            let _ = kr_ipc::starter::withdraw_claim(environment, request);
+            return Err(CliError::Ipc(error));
         }
+        let run = match supervision::windows::run(&definition) {
+            Ok(()) => Run::Confirmed,
+            Err(failure) => {
+                // A run can fail after the Task Scheduler began it, and another command's run can
+                // have a starter take this request: only a request withdrawn before any starter
+                // took it has nothing started for it. Whether the task ran stays unknown.
+                if let Ok(Withdrawal::Withdrawn) =
+                    kr_ipc::starter::withdraw_claim(environment, request)
+                {
+                    let asked = match failure {
+                        supervision::RunFailure::NotRun(_) => {
+                            Shown::said("could not be asked to run")
+                        }
+                        supervision::RunFailure::Failed(_) => {
+                            Shown::said("did not confirm that it ran")
+                        }
+                    };
+                    return Err(CliError::Unfinished {
+                        code: kr_protocol::error::ErrorCode::EnvironmentUnavailable,
+                        message: shown!(
+                            "the Task Scheduler {} the scheduled task {} for environment {}, and \
+                             the request this command left for its starter was withdrawn, so no \
+                             control daemon was started for it; schtasks /Query /TN {} shows what \
+                             it holds",
+                            asked,
+                            name,
+                            environment_id,
+                            name
+                        ),
+                    });
+                }
+                Run::Unconfirmed
+            }
+        };
         drop(held);
         Ok(Asked {
             request,
             session: kr_ipc::starter::current_session().ok(),
+            run,
         })
     }
 
@@ -1710,7 +1760,7 @@ mod windows {
             |line| super::last_line_said(&line),
         );
         match kr_ipc::starter::withdraw_claim(environment, asked.request) {
-            Ok(Withdrawal::Withdrawn) => not_taken(environment, bound, asked.session),
+            Ok(Withdrawal::Withdrawn) => not_taken(environment, bound, asked),
             Ok(Withdrawal::Taken) => super::unanswered(shown!(
                 "the starter of this user's scheduled task {} took the request to start the \
                  control daemon for environment {}, and no daemon answered within {} seconds: {}; \
@@ -1723,11 +1773,9 @@ mod windows {
                 Shown::root(&log.path)
             )),
             Err(error) => super::unanswered(shown!(
-                "the scheduled task {} was run for environment {} and no control daemon answered \
-                 within {} seconds: {}; whether its starter took the request cannot be told: {}; \
-                 {}; what the daemon writes is in {}",
-                name,
-                environment_id,
+                "{}, and no control daemon answered within {} seconds: {}; whether its starter \
+                 took the request cannot be told: {}; {}; what the daemon writes is in {}",
+                run_said(asked.run, environment_id),
                 bound.as_secs(),
                 *last,
                 Shown::ipc(&error),
@@ -1737,15 +1785,28 @@ mod windows {
         }
     }
 
-    /// The failure of a start whose request no starter took, and which was withdrawn: the Task
-    /// Scheduler did not start the task's starter, which it does only in a session where the user
-    /// is signed in.
-    fn not_taken(
-        environment: &EnvironmentPaths,
-        bound: Duration,
-        session: Option<u32>,
-    ) -> CliError {
+    /// The failure of a start whose request no starter took, and which was withdrawn. After a run
+    /// the Task Scheduler confirmed, that is a task it did not start, which it does only in a
+    /// session where the user is signed in; after one it did not confirm, the run is what failed.
+    fn not_taken(environment: &EnvironmentPaths, bound: Duration, asked: &Asked) -> CliError {
         let environment_id = environment.environment_id();
+        let name = task::name(environment_id);
+        let untaken = shown!(
+            "{}, and its starter did not take the request to start the control daemon within {} \
+             seconds, so the request was withdrawn and no daemon was started for it",
+            run_said(asked.run, environment_id),
+            bound.as_secs()
+        );
+        if asked.run == Run::Unconfirmed {
+            return CliError::Unfinished {
+                code: kr_protocol::error::ErrorCode::EnvironmentUnavailable,
+                message: shown!(
+                    "{}; schtasks /Query /TN {} shows what it holds",
+                    untaken,
+                    name
+                ),
+            };
+        }
         let program = super::daemon_program().ok();
         let last = program
             .and_then(|program| definition(environment, &program).ok())
@@ -1754,7 +1815,7 @@ mod windows {
                 || Shown::said("its last result cannot be read"),
                 task::last_result,
             );
-        let here = match session {
+        let here = match asked.session {
             Some(0) => {
                 Shown::said("; this command runs in no interactive session (login session 0)")
             }
@@ -1764,14 +1825,10 @@ mod windows {
         CliError::Unfinished {
             code: kr_protocol::error::ErrorCode::EnvironmentUnavailable,
             message: shown!(
-                "the scheduled task {} was run for environment {} and its starter did not take the \
-                 request to start the control daemon within {} seconds, so the request was \
-                 withdrawn and no daemon was started for it: the task starts it only in a session \
-                 where you are signed in{}; sign in to this computer, at its console or over \
-                 remote desktop, and run kr new again ({}, for all of the task's runs)",
-                task::name(environment_id),
-                environment_id,
-                bound.as_secs(),
+                "{}: the task starts it only in a session where you are signed in{}; sign in to \
+                 this computer, at its console or over remote desktop, and run kr new again ({}, \
+                 for all of the task's runs)",
+                untaken,
                 here,
                 last
             ),
@@ -2433,6 +2490,27 @@ mod tests {
     #[test]
     fn the_starter_writes_the_log_this_command_reads() {
         assert_eq!(kr_controller::supervision::windows::DAEMON_LOG, LOG_FILE);
+    }
+
+    /// KR-REQ-07.12: a failure after a run the Task Scheduler confirmed says it was asked to run
+    /// the task; after one it did not confirm, it says so, and never that the task ran.
+    #[cfg(windows)]
+    #[test]
+    fn a_run_the_task_scheduler_did_not_confirm_is_not_said_to_have_happened() {
+        let environment_id = kr_protocol::ids::EnvironmentId::new(kr_ipc::new_uuid());
+        let confirmed = windows::run_said(windows::Run::Confirmed, environment_id).into_string();
+        assert!(
+            confirmed.starts_with("the Task Scheduler was asked to run the scheduled task"),
+            "{confirmed}"
+        );
+        let unconfirmed =
+            windows::run_said(windows::Run::Unconfirmed, environment_id).into_string();
+        assert!(
+            unconfirmed.contains("did not confirm that it ran the scheduled task")
+                && !unconfirmed.contains("was asked to run")
+                && !unconfirmed.contains("was run"),
+            "{unconfirmed}"
+        );
     }
 
     /// A way of starting this build does not know is refused by naming the ones it does, and what

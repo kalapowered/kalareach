@@ -1425,7 +1425,7 @@ fn a_run_the_task_scheduler_refuses_has_its_request_withdrawn_at_once() {
     assert_eq!(failed["code"], "ENVIRONMENT_UNAVAILABLE", "{failed}");
     let message = failed["message"].as_str().unwrap_or_default();
     assert!(
-        message.contains("the Task Scheduler did not run the scheduled task")
+        message.contains("the Task Scheduler did not confirm that it ran the scheduled task")
             && message.contains(
                 "the request this command left for its starter was withdrawn, so no control \
                  daemon was started for it"
