@@ -1522,12 +1522,27 @@ mod windows {
 
     impl Drop for ImpersonatedClient {
         fn drop(&mut self) {
+            // A restoration this crate's own test makes fail, to prove the process then ends.
+            #[cfg(test)]
+            let fails = RESTORATION_FAILS.with(std::cell::Cell::get);
+            #[cfg(not(test))]
+            let fails = false;
             // SAFETY: restores this thread to its own token; the call has no preconditions.
-            if unsafe { RevertToSelf() } == 0 {
+            if fails || unsafe { RevertToSelf() } == 0 {
                 // The thread must never re-enter the runtime still impersonating another account.
                 std::process::abort();
             }
         }
+    }
+
+    #[cfg(test)]
+    thread_local! {
+        /// Makes the next account check unwind while it impersonates, for the restoration tests.
+        static UNWIND_WHILE_IMPERSONATING: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+        /// Makes every restoration on this thread report failure, for the test that the process
+        /// then ends rather than continue as the client.
+        static RESTORATION_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
     /// Whether the client connected to `pipe` runs as the account this process runs as.
@@ -1548,6 +1563,11 @@ mod windows {
         let own = Token::of(current_process())?;
         let client = {
             let _guard = ImpersonatedClient::of(pipe)?;
+            #[cfg(test)]
+            assert!(
+                !UNWIND_WHILE_IMPERSONATING.with(|flag| flag.replace(false)),
+                "an unwind this crate's own test injected while impersonating"
+            );
             Token::of_current_thread()
             // `_guard` drops here, restoring this thread, before the result is unwrapped below.
         }?;
@@ -1693,13 +1713,25 @@ mod windows {
     fn wide(text: &std::ffi::OsStr) -> Vec<u16> {
         text.encode_wide().chain(std::iter::once(0)).collect()
     }
-
     #[cfg(test)]
-    mod decision {
-        use windows_sys::Win32::Foundation::LocalFree;
-        use windows_sys::Win32::Security::Authorization::ConvertStringSidToSidW;
+    mod account {
+        use std::os::windows::io::{AsHandle as _, FromRawHandle as _, OwnedHandle};
+        use std::time::{Duration, Instant};
 
-        use super::{PSID, same_sid};
+        use windows_sys::Win32::Foundation::{
+            ERROR_NO_TOKEN, GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE, LocalFree,
+        };
+        use windows_sys::Win32::Security::Authorization::ConvertStringSidToSidW;
+        use windows_sys::Win32::Storage::FileSystem::{
+            CreateFileW, FILE_FLAG_OVERLAPPED, OPEN_EXISTING, SECURITY_ANONYMOUS,
+            SECURITY_SQOS_PRESENT,
+        };
+
+        use super::{
+            LaunchListener, LaunchStream, PSID, RESTORATION_FAILS, Reached, Side, Token,
+            UNWIND_WHILE_IMPERSONATING, connect, pipe_client_is_this_user, pipe_name, same_sid,
+        };
+        use crate::paths::Endpoint;
 
         /// One identifier parsed from its text form, freed when it is dropped.
         struct Sid(PSID);
@@ -1728,6 +1760,53 @@ mod windows {
             }
         }
 
+        fn endpoint() -> Endpoint {
+            Endpoint::from_name(format!("kalareach-test-{}", crate::new_uuid()))
+                .expect("a short name")
+        }
+
+        fn soon() -> Instant {
+            Instant::now() + Duration::from_secs(20)
+        }
+
+        /// Whether this thread carries a token of its own, which it does only while impersonating.
+        fn impersonating() -> bool {
+            match Token::of_current_thread() {
+                Ok(_) => true,
+                Err(error) => {
+                    assert_eq!(
+                        error.raw_os_error(),
+                        Some(ERROR_NO_TOKEN.cast_signed()),
+                        "a thread without a token of its own says so: {error}"
+                    );
+                    false
+                }
+            }
+        }
+
+        /// A launch-pipe instance a client of this account has reached and sent one byte on, so its
+        /// account can be read: Windows impersonates a pipe's client only once the server has read
+        /// something it sent.
+        fn spoken_to() -> (LaunchStream, LaunchStream) {
+            let endpoint = endpoint();
+            let listener = LaunchListener::create(&endpoint).expect("an instance");
+            let reaching = std::thread::spawn(move || {
+                let Reached::Connected(mut client) =
+                    connect(&endpoint, soon()).expect("the pipe is reached")
+                else {
+                    panic!("a waiting instance is reached");
+                };
+                client.send(b"x", soon()).expect("the client speaks");
+                client
+            });
+            let mut server = listener
+                .accept(soon())
+                .expect("the wait")
+                .expect("a client reached it");
+            assert_eq!(server.receive(soon()).expect("its byte"), b"x");
+            (server, reaching.join().expect("the client finishes"))
+        }
+
         /// The decision the account checks turn on: identifiers are the same account or they are
         /// not, and a missing identifier is never a match.
         #[test]
@@ -1747,6 +1826,135 @@ mod windows {
                 !same_sid(std::ptr::null_mut(), system.0),
                 "a missing identifier never matches"
             );
+        }
+
+        /// A client of this account is read from the connection as this account, and the thread
+        /// that read it carries no token of its own afterwards.
+        #[test]
+        fn a_client_of_this_account_is_read_and_the_thread_is_itself_again() {
+            let (server, _client) = spoken_to();
+            assert!(!impersonating(), "the thread starts as itself");
+            assert!(
+                pipe_client_is_this_user(server.pipe.as_handle()).expect("the account is read"),
+                "a client of this account is this account"
+            );
+            assert!(!impersonating(), "and the thread is itself again");
+        }
+
+        /// A client that opened the pipe anonymously gives no account to read, which is an error
+        /// rather than a pass, and the thread is itself again afterwards.
+        #[test]
+        fn an_anonymous_client_is_not_read_and_the_thread_is_itself_again() {
+            let endpoint = endpoint();
+            let listener = LaunchListener::create(&endpoint).expect("an instance");
+            let name = pipe_name(&endpoint);
+            // SAFETY: `name` is a terminated wide string; no attributes or template are given.
+            let handle = unsafe {
+                CreateFileW(
+                    name.as_ptr(),
+                    GENERIC_READ | GENERIC_WRITE,
+                    0,
+                    std::ptr::null(),
+                    OPEN_EXISTING,
+                    FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_ANONYMOUS,
+                    std::ptr::null_mut(),
+                )
+            };
+            assert_ne!(
+                handle, INVALID_HANDLE_VALUE,
+                "the anonymous client opens the pipe"
+            );
+            let mut client = LaunchStream {
+                // SAFETY: the call above returned a new handle that nothing else owns.
+                pipe: unsafe { OwnedHandle::from_raw_handle(handle) },
+                side: Side::Client,
+            };
+            let mut server = listener
+                .accept(soon())
+                .expect("the wait")
+                .expect("the anonymous client reached it");
+            client.send(b"x", soon()).expect("the client speaks");
+            assert_eq!(server.receive(soon()).expect("its byte"), b"x");
+            assert!(
+                pipe_client_is_this_user(server.pipe.as_handle()).is_err(),
+                "an anonymous client has no account to read"
+            );
+            assert!(!impersonating(), "and the thread is itself again");
+        }
+
+        /// An unwind while the client is impersonated still restores the thread on the way out.
+        #[test]
+        fn an_unwind_while_impersonating_leaves_the_thread_itself_again() {
+            let (server, _client) = spoken_to();
+            UNWIND_WHILE_IMPERSONATING.with(|flag| flag.set(true));
+            let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                pipe_client_is_this_user(server.pipe.as_handle())
+            }));
+            assert!(unwound.is_err(), "the injected unwind happened");
+            assert!(!impersonating(), "and the thread is itself again");
+        }
+
+        /// A restoration that fails ends the process without unwinding and without going on as
+        /// the client. Run in a process of its own, which this starts, since the process ends.
+        #[test]
+        fn a_restoration_that_fails_ends_the_process() {
+            let this = std::env::current_exe().expect("this test binary");
+            let output = std::process::Command::new(this)
+                .args([
+                    "--exact",
+                    "starter::windows::account::a_process_whose_restoration_fails",
+                    "--ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env("KR_TEST_RESTORATION_FAILS", "1")
+                .output()
+                .expect("the process starts");
+            let printed = String::from_utf8_lossy(&output.stdout);
+            // `abort` ends a Windows process through the fast-fail path, which reports this status.
+            assert_eq!(
+                output.status.code(),
+                Some(0xC000_0409_u32.cast_signed()),
+                "the process ended through abort: {printed}"
+            );
+            assert!(
+                printed.contains("impersonating"),
+                "it reached the check: {printed}"
+            );
+            assert!(
+                !printed.contains("continued"),
+                "it did not go on after the failed restoration: {printed}"
+            );
+            assert!(
+                !printed.contains("unwound"),
+                "and it did not unwind: {printed}"
+            );
+        }
+
+        /// The process [`a_restoration_that_fails_ends_the_process`] starts. It does nothing unless
+        /// that test asks, so a run that includes ignored tests is not ended by it.
+        #[test]
+        #[ignore = "a helper process of the restoration test, which starts it itself"]
+        fn a_process_whose_restoration_fails() {
+            use std::io::Write as _;
+
+            struct Unwound;
+            impl Drop for Unwound {
+                fn drop(&mut self) {
+                    println!("unwound");
+                }
+            }
+
+            if std::env::var_os("KR_TEST_RESTORATION_FAILS").is_none() {
+                return;
+            }
+            let (server, _client) = spoken_to();
+            RESTORATION_FAILS.with(|flag| flag.set(true));
+            let _unwound = Unwound;
+            println!("impersonating");
+            std::io::stdout().flush().expect("flushes");
+            let _ = pipe_client_is_this_user(server.pipe.as_handle());
+            println!("continued");
         }
     }
 }
