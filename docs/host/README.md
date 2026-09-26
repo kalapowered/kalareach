@@ -1751,17 +1751,20 @@ and agent state of the session it serves. `question.read` is answered by that wo
 to the grant's history scope: a device sees a question its grant names, or one asked at or after
 the moment its grant reaches back to, so a device whose grant keeps no history and names no
 question sees none. Asking for one question outside that scope is refused rather than answered
-empty. `agent.capabilities` and `agent.commands` name their session inside the subject they read,
-and that session is the one the grant is checked against and the read is routed to. `grant.list`
-answers with the grants the device issued and everything delegated from them, and it needs
-`session.share`.
+empty. The agent reads name their session inside the subject they read, and that session is the one
+the grant is checked against and the read is routed to. `agent.snapshot` and
+`agent.approval.inspect` carry retained content, so each goes to the worker with the history scope
+of the device's grant, and the worker holds the answer to it through the shared history filter: a
+snapshot carries what the agent said at or after the moment the grant reaches back to, and says how
+much it withheld, and an approval's record from before that moment is answered as a resource the
+host does not hold. A worker says in its answer to the daemon's hello that it reads such a scope,
+and one that does not say so is sent none and refuses both reads itself. `grant.list` answers with
+the grants the device issued and everything delegated from them, and it needs `session.share`.
 
-Five reads are refused as `UNSUPPORTED_CAPABILITY`, with the read and the reason in the message:
+Four reads are refused as `UNSUPPORTED_CAPABILITY`, with the read and the reason in the message:
 
 * `session.describe`, because this host runs no description service; `session.read` and
   `session.list` carry a session's metadata and verified state.
-* `agent.snapshot`, because the shared history filter does not reach an agent's retained history,
-  and an answer could carry more than the grant covers.
 * `upload.status`, `download.begin` and `download.chunk`, because a transfer's chunks travel on an
   attachment-chunk stream and this host opens none on a network connection.
 
@@ -4445,10 +4448,13 @@ unobserved pending approval from a transcript or a screen.
 The local owner reads the whole retained agent history, because its authority is the
 operating-system identity the listener authenticated and there is no grant to narrow: the same rule
 that draws a local attachment the whole screen. Every other caller acts under a grant, whichever
-socket the daemon heard it on, and its read is refused as `UNSUPPORTED_CAPABILITY` rather than
-answered. Section 10 narrows a grant's history in one place, the shared host-side filter, and the
-grant's history scope does not reach the worker with a forwarded read, so an answer could give the
-caller more than its grant covers.
+socket the daemon heard it on. Section 10 narrows a grant's history in one place, the shared
+host-side filter, and the daemon sends a paired device's read to the worker with the history scope
+of the device's grant. The filter admits each entry by the moment it was observed, before the entry
+counts against the page, so a withheld entry is counted rather than paid for; a grant that keeps no
+retained history reads none of it. A caller under a grant whose scope did not come with its read is
+refused as `UNSUPPORTED_CAPABILITY` rather than answered, because an answer could give it more than
+its grant covers.
 
 `agent.approval.inspect` reads what the approval ledger keeps for one pending resource of the
 instance it names: whose decoder read the request (the plugin, its publisher and the installed
@@ -4461,12 +4467,15 @@ read the bytes correctly, which is why the bytes come with the reading. The reco
 moment the request arrived, when the broker recorded its source frame; the interpretation can come
 much later. A resource of another instance, one no decoder interpreted and one this host does not
 hold all get the same `STALE_SESSION` refusal, and its text does not say which. The read needs
-`session.view` and is listed for the local socket only, because a grant's history scope does not
-travel with a forwarded read and the worker would have nothing to narrow the record to. A paired
-device is refused as for any method outside its ingress. A caller acting under a grant that reaches
-the worker anyway is refused as `UNSUPPORTED_CAPABILITY`, with that reason and nothing of the
-record. An answer larger than the control frame the connection declared is refused with both sizes
-rather than sent.
+`session.view`. A paired device reads a record through the session's worker, held to its grant's
+history scope at the moment the request arrived: a record from before the moment the grant reaches
+back to gets that same refusal, decided before the size of the answer, so neither says the record
+exists. An invitation names approvals by upstream identifiers, and an upstream's identifier does not
+pick out one recorded request, since two connections both call their first request `1`; so no name
+a grant carries excepts a record from that bound, and a named approval older than the bound is
+withheld with the rest. A caller under a grant whose scope did not come with its read is refused as
+`UNSUPPORTED_CAPABILITY`, with that reason and nothing of the record. An answer larger than the
+control frame the connection declared is refused with both sizes rather than sent.
 
 The five agent mutations each carry the binding revision they were prepared against. A revision
 behind the one in force is `STALE_SESSION`; a draft that moved is `DRAFT_CONFLICT`. A steer or a
