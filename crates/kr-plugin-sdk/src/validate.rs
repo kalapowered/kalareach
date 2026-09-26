@@ -1083,6 +1083,25 @@ fn check_manifest(
         }
         check_bridge(manifest, bridge, report);
     }
+    // A command integration changes how the application runs whether or not a bridge is
+    // installed, so it has a capability of its own, and what it may declare is closed.
+    if let Some(integration) = &manifest.command_integration {
+        if !manifest.requests(PluginCapability::CommandIntegrationLaunch) {
+            report.push(Finding::at(
+                FindingCode::IntegrationWithoutCapability,
+                MANIFEST_FILE,
+                "the package declares a command integration without requesting \
+                 command_integration.launch",
+            ));
+        }
+        for problem in integration.problems(&manifest.match_rules) {
+            report.push(Finding::at(
+                FindingCode::IntegrationInvalid,
+                MANIFEST_FILE,
+                problem,
+            ));
+        }
+    }
     if let Some(attachments) = &manifest.attachments.0 {
         if !manifest.requests(PluginCapability::UpstreamAction) {
             report.push(Finding::at(
