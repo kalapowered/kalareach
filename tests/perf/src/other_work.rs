@@ -9,16 +9,16 @@
 //! The bound for a stretch of time is the processors' time less their idle time, which is every
 //! processor's busy time, less the least the run's processes can have used over the same stretch.
 //!
-//! * Idle time is counted by the kernel as it happens, and a count taken while a processor is idle
-//!   includes the idle time so far. The processors' time is their number times the time between
-//!   the moment before the first count was taken and the moment after the last one, which is never
-//!   less than the time the two counts cover. The counts are kept in rounded units, and a count
-//!   can trail the moment it is read by a little; `idle_resolution` covers both.
+//! * The processors' time is their number times the time between the moment before the first idle
+//!   count was taken and the moment after the last one, which is never less than the time the two
+//!   counts cover. The counts are kept in rounded units, and one can trail the moment it is read by
+//!   a little; `idle_resolution` covers both. What a count means on each platform, and what it
+//!   rests on, is [`crate::machine`]'s to say.
 //! * The run is one process and everything descended from it, and a process that was once the
 //!   run's stays the run's whatever it is reparented to. A process is known by its identifier and
 //!   when it started, so an identifier the system reuses names a new process, and a parent counts as
-//!   one only when its own row shows it was that parent when the child's row was read: it was read
-//!   first, or it was already in the reading before. The least a run process used over a stretch
+//!   one only when the process holding its identifier was read both before and after the child's
+//!   row, so that it held the identifier when that row was read. The least a run process used over a stretch
 //!   is its time at the last reading in the stretch less its time at the first, less the rounding
 //!   of the two (`time_resolution`) and less what its time can have trailed at the first reading
 //!   (`lag`), and never less than nothing. A process that first appears inside the stretch started
@@ -137,6 +137,11 @@ pub struct Tally {
     /// The previous reading's table: each identifier with the start of the process that had it,
     /// where its row could be read.
     previous_table: HashMap<u32, Option<u64>>,
+    /// The previous reading's times of every process it could read.
+    previous_times: HashMap<Key, Time>,
+    /// The previous reading's parent links whose parent was read before its child: each counts
+    /// once this reading shows the parent again.
+    pending: Vec<(Key, Key)>,
     /// The reading at which each process first appeared, for those that appeared after the first.
     appeared: HashMap<Key, usize>,
     /// Each run process's times, reading by reading.
@@ -153,6 +158,8 @@ impl Tally {
             processors: None,
             ours: HashSet::new(),
             previous_table: HashMap::new(),
+            previous_times: HashMap::new(),
+            pending: Vec::new(),
             appeared: HashMap::new(),
             times: HashMap::new(),
             readings: Vec::new(),
@@ -245,41 +252,79 @@ impl Tally {
             }
         }
 
-        // Who is the run's. A child's row names its parent's identifier as it was when the child's
-        // row was read; the process that has that identifier in this reading is that parent if its
-        // row was read before the child's, or if it was already in the reading before, since an
-        // identifier is not given to a new process until every child has been handed to another.
-        self.ours.insert((run.pid, run.start));
-        let trusted = |child: &Process, parent: &Process| {
-            parent.start <= child.start
-                && (place[&parent.pid] < place[&child.pid]
-                    || self.previous_table.get(&parent.pid) == Some(&Some(parent.start)))
-        };
+        // Who is the run's. A child's row names the identifier its parent had when the row was
+        // read, and an identifier can pass to a new process at any moment after its holder ends.
+        // So a row that holds the identifier in this reading names the child's parent only where
+        // that process is known to have held it when the child's row was read: its row was read
+        // before the child's in one reading and after it in another, the reading before or the
+        // reading after. A parent read after its child, and seen in the reading before, counts now;
+        // a parent read before its child counts once the next reading shows it again.
         let by_pid: HashMap<u32, &Process> = processes
             .iter()
             .map(|process| (process.pid, *process))
             .collect();
+        let mut links: Vec<(Key, Key)> = Vec::new();
+        let mut pending: Vec<(Key, Key)> = Vec::new();
+        for child in &processes {
+            let Some(parent) = by_pid.get(&child.parent) else {
+                continue;
+            };
+            if parent.start > child.start {
+                continue;
+            }
+            let link = ((child.pid, child.start), (parent.pid, parent.start));
+            if place[&parent.pid] > place[&child.pid] {
+                if self.previous_table.get(&parent.pid) == Some(&Some(parent.start)) {
+                    links.push(link);
+                }
+            } else {
+                pending.push(link);
+            }
+        }
+        for (child, parent) in std::mem::take(&mut self.pending) {
+            if table.get(&parent.0) == Some(&Some(parent.1)) {
+                links.push((child, parent));
+            }
+        }
+        self.pending = pending;
+        let mut joined_now: Vec<Key> = Vec::new();
+        if self.ours.insert((run.pid, run.start)) {
+            joined_now.push((run.pid, run.start));
+        }
         loop {
-            let joined: Vec<Key> = processes
+            let joined: Vec<Key> = links
                 .iter()
-                .filter(|child| !self.ours.contains(&(child.pid, child.start)))
-                .filter(|child| {
-                    by_pid.get(&child.parent).is_some_and(|parent| {
-                        self.ours.contains(&(parent.pid, parent.start)) && trusted(child, parent)
-                    })
-                })
-                .map(|child| (child.pid, child.start))
+                .filter(|(child, parent)| !self.ours.contains(child) && self.ours.contains(parent))
+                .map(|(child, _)| *child)
                 .collect();
             if joined.is_empty() {
                 break;
             }
-            self.ours.extend(joined);
+            for key in joined {
+                if self.ours.insert(key) {
+                    joined_now.push(key);
+                }
+            }
         }
 
-        // The run's processes' times. A time below one read before is a misreading, and is not
-        // kept: taken as the start of a stretch it would add work that was not done.
+        // The run's processes' times. A process that has just been found to be the run's keeps its
+        // time from the reading before, where that reading could read it. A time below one read
+        // before is a misreading, and is not kept: taken as the start of a stretch it would add
+        // work that was not done.
+        for key in &joined_now {
+            if let Some(time) = self.previous_times.get(key) {
+                self.times.entry(*key).or_default().push(*time);
+            }
+        }
+        let mut current_times: HashMap<Key, Time> = HashMap::with_capacity(processes.len());
         for process in &processes {
             let key = (process.pid, process.start);
+            let time = Time {
+                reading: number,
+                own: process.own,
+                lag: process.lag,
+            };
+            current_times.insert(key, time);
             if !self.ours.contains(&key) {
                 continue;
             }
@@ -287,12 +332,9 @@ impl Tally {
             if times.last().is_some_and(|last| process.own < last.own) {
                 continue;
             }
-            times.push(Time {
-                reading: number,
-                own: process.own,
-                lag: process.lag,
-            });
+            times.push(time);
         }
+        self.previous_times = current_times;
 
         self.previous_table = table;
         self.readings.push(Kept {
@@ -322,6 +364,9 @@ impl Tally {
         // The step ran after the first reading ended and before the last one began, which the
         // order of the readings keeps apart.
         let window = (self.readings[last].began - self.readings[0].ended).min(window);
+        // No stretch can hold more than every processor's time, however far a run of readings
+        // reaches past the window it covers.
+        let processors = f64::from(self.processors.unwrap_or(0));
         let mut bound: f64 = 0.0;
         // The windows that start after reading `start - 1` ended and before reading `start` ended
         // are covered from reading `start - 1` to the first reading that begins at least a window
@@ -331,9 +376,10 @@ impl Tally {
             let end = (start..=last)
                 .find(|&end| self.readings[end].began >= reach)
                 .unwrap_or(last);
-            bound = bound.max(self.other(start - 1, end)? / window);
+            bound = bound.max((self.other(start - 1, end)? / window).min(processors));
         }
-        let average = self.other(0, last)? / (self.readings[last].ended - self.readings[0].began);
+        let average = (self.other(0, last)? / (self.readings[last].ended - self.readings[0].began))
+            .min(processors);
         Ok(Summary {
             bound,
             average,
@@ -624,12 +670,18 @@ mod tests {
 
     #[test]
     fn the_runs_new_processes_are_its_own_with_all_they_used() {
-        // A process the run starts between two readings, and its child, are the run's from the
-        // reading that first holds them, with everything they used before it.
+        // A process the run starts between two readings, and its child, used three seconds before
+        // the reading that first holds them. The next reading shows their parents again, and they
+        // are the run's with everything they used.
         let summary = tally(&[
             busy(0.0, 0.0, &[]),
             busy(
                 2.0,
+                3.0,
+                &[process(600, RUN, 20, 1.0), process(601, 600, 21, 2.0)],
+            ),
+            busy(
+                4.0,
                 3.0,
                 &[process(600, RUN, 20, 1.0), process(601, 600, 21, 2.0)],
             ),
@@ -649,37 +701,41 @@ mod tests {
     }
 
     #[test]
-    fn a_parent_identifier_reused_after_the_childs_row_was_read_is_not_its_parent() {
-        // Process 700's row, read first, names parent 800. By the time row 800 is read, 800 is a
-        // new process the run started; the identifier was reused, so 700 is not the run's, and
-        // its work is other work.
+    fn a_parent_identifier_that_passes_to_another_process_after_its_row_is_read_is_not_the_parent()
+    {
+        // The run's process 800 is read; it ends, its identifier passes to an unrelated process,
+        // which starts 900, and 900's row, read after 800's, names 800 as its parent. The next
+        // reading shows 800 held by the unrelated process, so 900 is not the run's, and its two
+        // seconds are other work.
         let summary = tally(&[
-            busy(0.0, 0.0, &[process(700, 1, 15, 0.0)]),
+            busy(0.0, 0.0, &[process(800, RUN, 30, 0.0)]),
+            busy(2.0, 0.0, &[process(800, RUN, 30, 0.0)]),
             busy(
+                4.0,
+                0.0,
+                &[process(800, RUN, 30, 0.0), process(900, 800, 60, 0.0)],
+            ),
+            busy(
+                6.0,
                 2.0,
-                2.0,
-                &[process(700, 800, 15, 2.0), process(800, RUN, 30, 0.0)],
+                &[process(800, 1, 50, 0.0), process(900, 800, 60, 2.0)],
             ),
         ])
         .unwrap();
-        assert!(close(summary.bound, 1.0), "{summary:?}");
+        assert!(close(summary.bound, 2.0 / 5.0), "{summary:?}");
     }
 
     #[test]
-    fn a_parent_read_before_its_child_or_already_known_is_its_parent() {
-        // Row 600 is read before its child 601; row 800 is read after its child 700 but was in the
-        // reading before. Both children are the run's.
+    fn a_parent_read_after_its_child_and_seen_before_is_the_parent() {
+        // Row 700 names 800, whose row is read after it and was in the reading before: 800 held
+        // its identifier throughout, so 700 is the run's at once.
         let summary = tally(&[
             busy(0.0, 0.0, &[process(800, RUN, 30, 0.0)]),
+            busy(2.0, 0.0, &[process(800, RUN, 30, 0.0)]),
             busy(
-                2.0,
-                3.0,
-                &[
-                    process(700, 800, 35, 1.0),
-                    process(800, RUN, 30, 0.0),
-                    process(600, RUN, 40, 0.0),
-                    process(601, 600, 41, 2.0),
-                ],
+                4.0,
+                1.0,
+                &[process(700, 800, 35, 1.0), process(800, RUN, 30, 0.0)],
             ),
         ])
         .unwrap();
@@ -687,10 +743,54 @@ mod tests {
     }
 
     #[test]
+    fn a_parent_read_before_its_child_counts_once_the_next_reading_shows_it_again() {
+        // Row 600 is read before its child 601. Until a later reading shows 600 again, 601's work
+        // is other work; once it does, 601 is the run's with the time it had.
+        let two = tally(&[
+            busy(0.0, 0.0, &[process(600, RUN, 40, 0.0)]),
+            busy(
+                2.0,
+                2.0,
+                &[process(600, RUN, 40, 0.0), process(601, 600, 41, 2.0)],
+            ),
+        ])
+        .unwrap();
+        assert!(close(two.bound, 1.0), "{two:?}");
+        let three = tally(&[
+            busy(0.0, 0.0, &[process(600, RUN, 40, 0.0)]),
+            busy(
+                2.0,
+                2.0,
+                &[process(600, RUN, 40, 0.0), process(601, 600, 41, 2.0)],
+            ),
+            busy(
+                4.0,
+                2.0,
+                &[process(600, RUN, 40, 0.0), process(601, 600, 41, 2.0)],
+            ),
+        ])
+        .unwrap();
+        assert!(close(three.bound, 0.0), "{three:?}");
+    }
+
+    #[test]
     fn a_run_shorter_than_a_second_is_not_spread_over_a_second() {
         // Half a second with one processor busy is one processor's worth over its own length.
         let summary = tally(&[busy(0.0, 0.0, &[]), busy(0.5, 0.5, &[])]).unwrap();
         assert!(close(summary.bound, 1.0), "{summary:?}");
+    }
+
+    #[test]
+    fn no_window_holds_more_than_every_processor() {
+        // Every processor busy for eight seconds, read every four: a window's run of readings
+        // covers all eight, and the bound is still the machine's four processors.
+        let summary = tally(&[
+            busy(0.0, 0.0, &[]),
+            busy(4.0, 16.0, &[]),
+            busy(8.0, 32.0, &[]),
+        ])
+        .unwrap();
+        assert!(close(summary.bound, 4.0), "{summary:?}");
     }
 
     #[test]

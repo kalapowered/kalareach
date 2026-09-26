@@ -1,25 +1,40 @@
 //! Readings of this machine for [`crate::other_work`]: its processors' idle time and every process
 //! on it.
 //!
-//! Linux keeps the processors' idle time on the first line of `/proc/stat`, and a kernel that stops
-//! the clock tick on an idle processor counts that time exactly, including the idle time of a
-//! processor that is idle as it is read. A process's time, in `/proc/<pid>/stat`, is the kernel's
-//! exact account of it, brought up to date for a running thread at every clock tick, so it trails
-//! by at most a tick for each thread running as it is read. Both are printed in hundredths of a
-//! second. A kernel that keeps a processor's clock tick running while it is idle, or stops it while
-//! a thread runs, gives neither guarantee, and the machine is not read.
+//! What this reads rests on how each kernel keeps its counts, and those are this module's
+//! assumptions:
 //!
-//! macOS keeps each processor's idle time in the kernel's processor load counters, in ticks of a
-//! hundredth of a second, and brings an idle processor's up to date as it is read. A process's
-//! time, from the kernel's task information, is exact, and a running thread's is brought up to date
-//! at least once in each scheduling quantum. The task information of another user's process cannot
-//! be read, and that process's row is listed as unread.
+//! * Linux keeps the processors' idle time on the first line of `/proc/stat`. A kernel that stops
+//!   the clock tick on an idle processor measures idle time as it passes, and a count taken while a
+//!   processor is idle includes the idle time so far. That needs a kernel built for it
+//!   (`CONFIG_NO_HZ_COMMON`), not started with it turned off (`nohz=`), and a timer that can fire
+//!   once, which x86-64 and ARM64 machines have; the first two are checked, and a kernel that fails
+//!   them is not read. A process's time, in `/proc/<pid>/stat`, is the kernel's account of it,
+//!   brought up to date for a running thread at every clock tick, so it trails by at most a tick for
+//!   each thread running as it is read; a processor that stops its tick while a thread runs
+//!   (`nohz_full`) breaks that, and a kernel with one is not read. Both are printed in hundredths of
+//!   a second.
+//! * macOS keeps each processor's idle time in its load counters, in ticks of a hundredth of a
+//!   second, and brings an idle processor's up to date as it is read. A process's time, from the
+//!   kernel's task information, is exact, and a running thread's is brought up to date at least
+//!   once in each ten-millisecond scheduling quantum. The task information of another user's
+//!   process cannot be read, and that process's row is listed as unread.
+//!
+//! Both kernels read a processor's idle count from more than one field without a lock, and a count
+//! taken as a processor goes idle or wakes can miss an idle stretch (Linux, when a task waiting for
+//! a disk is woken elsewhere) or count one twice (macOS). Each count is therefore taken three
+//! times: where a count starts a stretch the largest is kept, since a count that falls short would
+//! add idle time from before it, and where it ends a stretch the smallest, since a count that runs
+//! over would add idle time that did not happen. A stretch is misread only if all three are.
 //!
 //! Elsewhere nothing is read and every reading fails.
 
 use std::time::Instant;
 
 use crate::other_work::{Reading, Row};
+
+/// How many times each idle count is taken.
+const COUNTS: usize = 3;
 
 /// This machine, ready to be read.
 pub struct Machine {
@@ -50,9 +65,9 @@ impl Machine {
     /// number of processors changes while it is read.
     pub fn reading(&mut self) -> Result<Reading, String> {
         let began = self.clock.elapsed().as_secs_f64();
-        let (idle_before, processors) = self.counts.idle()?;
+        let (idle_before, processors) = self.idle(f64::max)?;
         let rows = self.counts.rows(processors)?;
-        let (idle_after, processors_after) = self.counts.idle()?;
+        let (idle_after, processors_after) = self.idle(f64::min)?;
         let ended = self.clock.elapsed().as_secs_f64();
         if processors_after != processors {
             return Err(format!(
@@ -70,6 +85,23 @@ impl Machine {
             idle_resolution: self.counts.idle_resolution(processors),
             time_resolution: self.counts.time_resolution(),
         })
+    }
+
+    /// The idle count, taken [`COUNTS`] times and kept as `pick` chooses: the largest where it
+    /// starts a stretch, the smallest where it ends one.
+    fn idle(&mut self, pick: fn(f64, f64) -> f64) -> Result<(f64, u32), String> {
+        let (mut idle, processors) = self.counts.idle()?;
+        for _ in 1..COUNTS {
+            let (again, processors_again) = self.counts.idle()?;
+            if processors_again != processors {
+                return Err(format!(
+                    "the machine went from {processors} processors to {processors_again} while it \
+                     was read"
+                ));
+            }
+            idle = pick(idle, again);
+        }
+        Ok((idle, processors))
     }
 }
 
@@ -117,12 +149,22 @@ mod platform {
             }
             let command_line = std::fs::read_to_string("/proc/cmdline")
                 .map_err(|error| format!("read the kernel's command line: {error}"))?;
+            // The kernel reads the setting as a truth value: off, no, false and zero turn it off.
             if command_line
                 .split_whitespace()
-                .any(|word| word == "nohz=off")
+                .filter_map(|word| word.strip_prefix("nohz="))
+                .any(|value| {
+                    let mut letters = value.chars();
+                    match letters.next() {
+                        Some('n' | 'N' | 'f' | 'F' | '0') => true,
+                        Some('o' | 'O') => matches!(letters.next(), Some('f' | 'F')),
+                        _ => false,
+                    }
+                })
             {
                 return Err(
-                    "this kernel was started with nohz=off, so it counts idle time by sampling it"
+                    "this kernel was started with its idle tick turned off, so it counts idle time \
+                     by sampling it"
                         .to_owned(),
                 );
             }
@@ -320,9 +362,10 @@ mod platform {
         seconds_per_tick: f64,
         seconds_per_unit: f64,
         /// Each processor's counters at the last count. They are 32 bits wide and wrap, so the
-        /// idle count is kept here, from their differences.
+        /// idle count is kept here, from their differences, signed: a counter misread high reads
+        /// lower the next time, and the difference then takes the excess back.
         last: Vec<[u32; 4]>,
-        idle_ticks: u64,
+        idle_ticks: i64,
     }
 
     impl Counts {
@@ -359,7 +402,7 @@ mod platform {
                 ));
             }
             for (now, last) in now.iter().zip(&self.last) {
-                self.idle_ticks += u64::from(now[IDLE].wrapping_sub(last[IDLE]));
+                self.idle_ticks += i64::from(now[IDLE].wrapping_sub(last[IDLE]).cast_signed());
             }
             self.last = now;
             #[expect(
