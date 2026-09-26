@@ -1670,8 +1670,10 @@ fn location(text: &str) -> Answer<url::Url> {
 /// Names a location a caller sent by its scheme and host alone.
 ///
 /// A location can carry a user name and a token before its host, and a refusal is read by whoever
-/// the answer reaches, so nothing else of the text is repeated: where no scheme can be read, it is
-/// named as "the location".
+/// the answer reaches, so nothing else of the text is repeated. Where the text holds a user name,
+/// the host cannot be told from it safely: a location that does not parse can have a `/`, `?` or
+/// `#` inside its user name or token, so the refusal names its scheme alone. Where no scheme can be
+/// read, it is named as "the location".
 fn shown_location(text: &str) -> String {
     let Some((scheme, rest)) = text.split_once("://") else {
         return "the location".to_owned();
@@ -1686,10 +1688,10 @@ fn shown_location(text: &str) -> String {
     if !is_scheme {
         return "the location".to_owned();
     }
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
-    let host = authority
-        .rsplit_once('@')
-        .map_or(authority, |(_, host)| host);
+    if rest.contains('@') {
+        return format!("the {scheme} location");
+    }
+    let host = rest.split(['/', '?', '#']).next().unwrap_or_default();
     format!("{scheme}://{host}")
 }
 
@@ -2132,17 +2134,35 @@ mod tests {
     }
 
     /// A location a caller sent can carry a user name and a token before its host, so a refusal of
-    /// one names its scheme and host and nothing else of what was sent.
+    /// one names its scheme and host and nothing else of what was sent; where a user name is there,
+    /// the host cannot be told from it, since one that does not parse can hold a separator, and the
+    /// refusal names the scheme alone.
     #[test]
     fn a_refused_location_names_only_its_scheme_and_host() {
         for (sent, shown) in [
             (
                 "https://someone:s3cret-token@plugins.exa mple/metadata/",
-                "https://plugins.exa mple",
+                "the https location",
             ),
             (
                 "https://s3cret-token@plugins.example:99999/",
-                "https://plugins.example:99999",
+                "the https location",
+            ),
+            (
+                "https://someone:s3cret/token@plugins.example",
+                "the https location",
+            ),
+            (
+                "https://someone:s3c?ret@plugins.example",
+                "the https location",
+            ),
+            (
+                "https://someone:s3c#ret@plugins.example",
+                "the https location",
+            ),
+            (
+                "https://plugins.exa mple/metadata/?token=s3cret",
+                "https://plugins.exa mple",
             ),
             ("s3cret-token plugins.example", "the location"),
         ] {
