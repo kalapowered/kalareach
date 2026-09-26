@@ -4786,30 +4786,36 @@ impl WorkerService {
     /// much was withheld, so a reader can tell a filtered answer from a complete one either way.
     fn agent_snapshot(&self, params: &ParamsValue, caller: &Caller) -> Result<ParamsValue> {
         let params: kr_protocol::agent::AgentSnapshotParams = parse(params)?;
-        // A local caller is the operating-system user the listener authenticated, and section 10's
-        // history rule narrows a *grant*; there is none to narrow, so it reads the whole retained
-        // history, exactly as a local attachment is drawn the whole screen.
-        //
-        // A forwarded caller does act under a grant, and section 10 narrows a grant's history in
-        // one place: the shared host-side filter. The retained agent history is not one of the
-        // surfaces that filter admits, so a forwarded read is refused rather than answered with
-        // more than the grant may cover; an unrestricted answer to a device is the failure this
-        // refusal exists to avoid.
-        if caller.is_remote() {
-            return Err(WorkerError::Broker(
-                crate::broker::BrokerError::UnsupportedCapability {
-                    detail:
-                        "a forwarded agent snapshot is narrowed by the shared host-side history \
-                             filter, and the retained agent history is not one of the surfaces \
-                             that filter admits; the terminal and the local reads are unaffected"
-                            .to_owned(),
-                },
-            ));
-        }
+        // The local owner reads the whole retained history, exactly as a local attachment is drawn
+        // the whole screen; anybody else acts under a grant and is refused with the reason.
+        Self::owner_only(caller, "an agent snapshot")?;
         let filter = crate::broker::GrantLowerBound {
             from: kr_protocol::ids::StreamCursor::new(0),
         };
         encode(&self.broker.agent_snapshot(&params, &filter)?)
+    }
+
+    /// Refuses a read of retained history to every caller but the local owner.
+    ///
+    /// Section 10 narrows the history of the grant a caller acts under, in one place, the shared
+    /// host-side filter, and the grant's history scope does not reach this worker with a forwarded
+    /// read. The local owner holds no grant, so there is nothing to narrow and it reads the whole
+    /// history. Anybody else is refused with the reason rather than answered with more than its
+    /// grant may cover, whichever socket the daemon heard it on: a caller the daemon vouches for
+    /// on its own local socket can name a grant as well as a paired device can.
+    fn owner_only(caller: &Caller, what: &str) -> Result<()> {
+        if caller.is_local_owner() {
+            return Ok(());
+        }
+        Err(WorkerError::Broker(
+            crate::broker::BrokerError::UnsupportedCapability {
+                detail: format!(
+                    "{what} is narrowed to the history scope of the grant a caller acts under, \
+                     and that scope does not reach this worker with a forwarded read; the local \
+                     owner reads it"
+                ),
+            },
+        ))
     }
 
     /// Answers `agent.commands`: what the bound agent advertises.
@@ -4838,16 +4844,7 @@ impl WorkerService {
         caller: &Caller,
     ) -> Result<ParamsValue> {
         let params: kr_protocol::agent::AgentApprovalInspectParams = parse(params)?;
-        if caller.acts_under_a_grant() {
-            return Err(WorkerError::Broker(
-                crate::broker::BrokerError::UnsupportedCapability {
-                    detail: "an approval's record is narrowed to the history scope of the grant a \
-                             caller acts under, and that scope does not reach this worker with a \
-                             forwarded read; the local owner reads it"
-                        .to_owned(),
-                },
-            ));
-        }
+        Self::owner_only(caller, "an approval's record")?;
         let record = self.broker.inspect_approval(&params)?;
         let measured = Self::answer_bytes(&record);
         if measured > Self::frame_bytes(state) {
@@ -4922,7 +4919,7 @@ impl WorkerService {
         action: &kr_protocol::broker::ActionName,
         rights: &CanonicalSet<kr_protocol::rights::ActionRight>,
     ) -> Result<()> {
-        if caller.ingress == ActorIngress::LocalIpc && !caller.grant_id.is_present() {
+        if caller.is_local_owner() {
             return Ok(());
         }
         let missing: Vec<&str> = rights
@@ -5107,15 +5104,14 @@ impl WorkerService {
                 // the worker's own authority covers its session. Everything else is narrowed,
                 // including a caller that reached the host some other way and named no grant,
                 // which under this rule receives nothing rather than everything.
-                let granted =
-                    if caller.ingress == ActorIngress::LocalIpc && !caller.grant_id.is_present() {
-                        params.requested.clone()
-                    } else {
-                        kr_protocol::rights::permitted_attachment_capabilities(
-                            &params.requested,
-                            &caller.grant_rights,
-                        )
-                    };
+                let granted = if caller.is_local_owner() {
+                    params.requested.clone()
+                } else {
+                    kr_protocol::rights::permitted_attachment_capabilities(
+                        &params.requested,
+                        &caller.grant_rights,
+                    )
+                };
                 // And it is drawn the whole screen, because it holds no grant to be narrowed by.
                 // A forwarded caller is drawn the live screen alone: section 10's live-screen
                 // exception never reaches the buffer that is not showing, and this build serves a
@@ -5567,14 +5563,17 @@ impl Caller {
         self.ingress.is_remote()
     }
 
-    /// Returns true when this caller's authority is a grant rather than the operating-system
-    /// identity of a local caller.
+    /// Returns true when this caller is the local owner: the operating-system user the listener
+    /// authenticated, acting under no grant.
     ///
-    /// A grant is what section 10's history rule narrows. A caller that reached the host over a
-    /// network transport acts under one whatever its envelope names.
+    /// A grant is what section 10's history rule and an attachment's rights narrow, and the owner
+    /// is the one caller that holds none. The rule is stated as what the owner is rather than as
+    /// what a grant holder is not, so every caller outside it is narrowed: one that named a grant
+    /// is held to it whichever socket the daemon heard it on, and one that reached the host any
+    /// other way is held to a grant even when it names none, which then carries nothing.
     #[must_use]
-    pub const fn acts_under_a_grant(&self) -> bool {
-        self.grant_id.is_present() || self.is_remote()
+    pub const fn is_local_owner(&self) -> bool {
+        matches!(self.ingress, ActorIngress::LocalIpc) && !self.grant_id.is_present()
     }
 
     /// Returns the paired device this caller is, when it is one.
