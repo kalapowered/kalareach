@@ -622,6 +622,10 @@ pub fn daemon_program() -> Result<PathBuf> {
     let this = std::env::current_exe()
         .and_then(std::fs::canonicalize)
         .map_err(unreadable)?;
+    // Resolved on Windows, a path carries the verbatim prefix, which the task that runs the daemon
+    // would then carry too: the same place is named without it.
+    #[cfg(windows)]
+    let this = kr_controller::supervision::windows::without_verbatim_prefix(this);
     let directory = this.parent().ok_or_else(|| {
         unreadable(std::io::Error::other(Shown::said(
             "this command's path has no directory",
