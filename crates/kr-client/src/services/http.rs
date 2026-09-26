@@ -1,6 +1,6 @@
 //! The managed-service transport.
 //!
-//! [`relay::ServiceHttp`] is the exchange every managed-service client is written against, and this
+//! [`super::ServiceHttp`] is the exchange every managed-service client is written against, and this
 //! is the implementation a shipped client uses. It is asynchronous, so a call that is dropped stops
 //! rather than continuing on a thread nobody is waiting for, and it is deliberately small: one
 //! origin, one signed JSON body, one bounded answer. It is also the account client's
@@ -668,7 +668,9 @@ fn builder_trusting(
 
 /// The TLS client configuration this product's clients verify a server with.
 ///
-/// TLS 1.3, or 1.2 with a server that has no newer, and the trust [`platform_verifier`] describes.
+/// TLS 1.3, or 1.2 with a server that has no newer, and the platform's own trust: the operating
+/// system's verifier on macOS, Windows, iOS and Android, and on Linux the distribution's certificate
+/// store, read from its fixed locations with no environment variable consulted.
 /// `extra_roots` adds authorities beside the platform's: every shipped client passes none, and a
 /// test passes the authority its own server was issued by.
 ///
