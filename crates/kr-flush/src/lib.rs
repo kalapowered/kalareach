@@ -73,8 +73,8 @@ pub const HELD_RENAME_BOUND: std::time::Duration = std::time::Duration::from_sec
 /// as it is written, a scanner above all, holds a new file so for a moment. Those two refusals are
 /// tried again after a pause that doubles from 2 ms up to 200 ms and never runs past the deadline,
 /// until the rename succeeds, fails any other way, or [`HELD_RENAME_BOUND`] has passed since the
-/// first attempt; then the last refusal is returned unchanged, so the caller reports it as it
-/// always did and nothing was renamed. An access-control list that denies the rename answers
+/// first attempt. No attempt starts once it has passed: the last refusal is returned unchanged, so
+/// the caller reports it as it always did and nothing was renamed. An access-control list that denies the rename answers
 /// ERROR_ACCESS_DENIED too, and waiting changes nothing about it: it is reported once the bound has
 /// passed. The bound limits the waiting between attempts, not how long one attempt takes or when
 /// the operating system next runs this thread.
@@ -117,10 +117,13 @@ fn retry_within(
                 answer => return answer,
             };
             let left = bound.saturating_sub(started.elapsed());
-            if left.is_zero() {
+            if !left.is_zero() {
+                std::thread::sleep(pause.min(left));
+            }
+            // A pause cut short at the bound ends past it: no attempt starts once it has passed.
+            if started.elapsed() >= bound {
                 return Err(refused);
             }
-            std::thread::sleep(pause.min(left));
             pause = pause.saturating_mul(2).min(Duration::from_millis(200));
         }
     }
@@ -564,6 +567,38 @@ mod tests {
         assert!(attempts > 1, "tried again: {attempts}");
         assert!(took >= bound, "{took:?}");
         assert!(took < bound + std::time::Duration::from_secs(2), "{took:?}");
+    }
+
+    /// No attempt starts once the bound has passed, although the pause cut short at the bound has
+    /// ended past it and an attempt then would succeed: the refusal made within the bound is the
+    /// answer, and nothing is renamed after the deadline.
+    #[cfg(windows)]
+    #[test]
+    fn no_attempt_starts_once_the_bound_has_passed() {
+        use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
+
+        let bound = std::time::Duration::from_millis(50);
+        let mut attempts = 0;
+        let answer = retry_within(bound, || {
+            attempts += 1;
+            if attempts > 1 {
+                return Ok(());
+            }
+            // The first attempt ends 1.5 ms before the bound, so the pause after it, 2 ms at first,
+            // is cut short at the bound.
+            let first = std::time::Instant::now();
+            while first.elapsed() < bound - std::time::Duration::from_micros(1500) {
+                std::hint::spin_loop();
+            }
+            Err(std::io::Error::from_raw_os_error(
+                ERROR_SHARING_VIOLATION.cast_signed(),
+            ))
+        });
+        assert_eq!(attempts, 1, "an attempt started after the bound");
+        assert_eq!(
+            answer.expect_err("refused within the bound").raw_os_error(),
+            Some(ERROR_SHARING_VIOLATION.cast_signed())
+        );
     }
 
     /// Holds `file` with a handle that shares reading and writing but not its deletion, as a
