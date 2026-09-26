@@ -13,6 +13,7 @@
 //! | Row | What proves it |
 //! | --- | --- |
 //! | KR-REQ-11.26 | `kr_req_11_26_a_local_caller_reads_what_the_decoder_read_and_offered`, `kr_req_11_26_the_record_says_where_the_request_stands_once_answered`, `kr_req_11_26_another_instances_resource_and_one_never_decoded_answer_unknown`, `kr_req_11_26_a_device_reads_the_approval_records_its_grants_scope_reaches` |
+//! | KR-REQ-10.51 | `kr_req_10_51_a_named_approval_is_read_while_current_although_it_predates_the_bound`, `kr_req_10_51_a_named_approval_that_has_ended_answers_as_unknown`, `kr_req_10_51_a_name_excepts_its_own_resource_and_no_other_with_the_same_upstream_identifier` |
 //! | KR-REQ-23.39 | `kr_req_23_39_a_device_reads_the_agent_history_its_grants_scope_reaches` |
 
 use std::sync::Arc;
@@ -1381,6 +1382,265 @@ async fn kr_req_11_26_a_device_reads_the_approval_records_its_grants_scope_reach
                 withheld.message
             );
         }
+    }
+}
+
+/// Records one native request on `connection` and has the package's decoder interpret it.
+fn offer_on(host: &Host, connection: GatewayConnectionId, frame: &[u8]) -> PendingResourceId {
+    let resource_id = host
+        .service
+        .broker()
+        .forward_native(connection, frame, RECORDED_AT)
+        .expect("forwarded")
+        .1
+        .expect("it expects a response")
+        .resource_id;
+    host.service
+        .broker()
+        .interpret(
+            binding(),
+            resource_id,
+            projection(),
+            Some(DEADLINE),
+            DECODED_AT,
+        )
+        .expect("interpreted")
+        .resource_id
+}
+
+/// A person's answer to one approval, as the broker admits it.
+fn answer(host: &Host, resource_id: PendingResourceId) -> AgentApprovalRespondParams {
+    AgentApprovalRespondParams {
+        target: AgentMutationTarget {
+            subject: subject(host.session_id, instance()),
+            binding_revision: AgentBindingRevision::new(1),
+        },
+        resource_id,
+        option_id: "allow".to_owned(),
+    }
+}
+
+/// The actor an answer is admitted for.
+fn answering() -> kr_worker::broker::Caller {
+    kr_worker::broker::Caller {
+        actor_id: ActorId::new("local:a-test-user").expect("an actor"),
+        grant_id: None,
+    }
+}
+
+/// Where a record the grant reaches stands.
+fn state_read(outcome: Outcome) -> PendingState {
+    answered::<AgentApprovalInspectResult>(outcome).state
+}
+
+/// KR-REQ-10.51: a grant names an approval by the resource the broker arbitrates for it, and a
+/// paired device holding that grant reads the record while the approval can still be decided,
+/// pending and then claimed by an answer on its way, although the request arrived before the moment
+/// the grant reaches back to. A grant that keeps no retained history reads it too. The controls are
+/// the same record under the same grants without the name, which is withheld as unknown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_10_51_a_named_approval_is_read_while_current_although_it_predates_the_bound() {
+    let host = host().await;
+    let resource_id = offer(&host, &request_frame(11, 0));
+    let absent = PendingResourceId::new(Uuid::from_bytes([0xab; 16]));
+    let mut daemon = daemon(&host).await;
+    let inspect = |request_id: u64, resource_id: PendingResourceId, history: HistoryScope| {
+        scoped(
+            Method::AgentApprovalInspect,
+            &params(&host, instance(), resource_id),
+            request_id,
+            device(),
+            history,
+        )
+    };
+    let past = Some(RECORDED_AT.get() + 1);
+    let unknown = refusal(exchange(&mut daemon, inspect(100, absent, reach(past, &[]))).await);
+
+    let pending = exchange(
+        &mut daemon,
+        inspect(101, resource_id, reach(past, &[resource_id])),
+    )
+    .await;
+    assert_eq!(state_read(pending), PendingState::Pending);
+    let live_only = exchange(
+        &mut daemon,
+        inspect(102, resource_id, reach(None, &[resource_id])),
+    )
+    .await;
+    assert_eq!(
+        state_read(live_only),
+        PendingState::Pending,
+        "a grant that keeps no retained history reads the current approval it names"
+    );
+    for (request_id, history) in [(103, reach(past, &[])), (104, reach(None, &[]))] {
+        let withheld =
+            refusal(exchange(&mut daemon, inspect(request_id, resource_id, history)).await);
+        assert_eq!(
+            shape(&withheld, resource_id, &host),
+            shape(&unknown, absent, &host),
+            "without the name the record answers as unknown ({request_id})"
+        );
+    }
+
+    let admitted = host
+        .service
+        .broker()
+        .admit_approval(&answering(), &answer(&host, resource_id), DECODED_AT)
+        .expect("an answer claims the approval");
+    let claimed = exchange(
+        &mut daemon,
+        inspect(105, resource_id, reach(past, &[resource_id])),
+    )
+    .await;
+    assert_eq!(
+        state_read(claimed),
+        PendingState::Claimed,
+        "an approval an answer has claimed can still be decided"
+    );
+    drop(admitted);
+}
+
+/// KR-REQ-10.51: the exception is for the exact current decision. Once the approval has ended,
+/// answered, withdrawn by its upstream or left uncertain, the same name no longer reaches past the
+/// bound, and the record answers exactly as one this host does not hold. The control for each is
+/// the same record under a grant whose bound reaches it, which reads it in its ended state.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_10_51_a_named_approval_that_has_ended_answers_as_unknown() {
+    let host = host().await;
+    let broker = host.service.broker();
+    let absent = PendingResourceId::new(Uuid::from_bytes([0xab; 16]));
+
+    let resolved = offer(&host, &request_frame(21, 0));
+    let admitted = broker
+        .admit_approval(&answering(), &answer(&host, resolved), DECODED_AT)
+        .expect("admitted");
+    broker
+        .record_approval(&admitted, DECODED_AT)
+        .expect("carried")
+        .settled(DECODED_AT)
+        .await
+        .expect("answered");
+
+    let withdrawn = offer(&host, &request_frame(22, 0));
+    let request = broker.pending(withdrawn).expect("held").request;
+    broker
+        .upstream_resolved(&request, DECODED_AT)
+        .expect("the upstream withdrew it");
+
+    let uncertain = offer(&host, &request_frame(23, 0));
+    let admitted = broker
+        .admit_approval(&answering(), &answer(&host, uncertain), DECODED_AT)
+        .expect("admitted");
+    // The marker is written and nothing says what became of the bytes.
+    drop(broker.mark_approval(&admitted, DECODED_AT).expect("marked"));
+
+    let mut daemon = daemon(&host).await;
+    let inspect = |request_id: u64, resource_id: PendingResourceId, history: HistoryScope| {
+        scoped(
+            Method::AgentApprovalInspect,
+            &params(&host, instance(), resource_id),
+            request_id,
+            device(),
+            history,
+        )
+    };
+    let past = Some(RECORDED_AT.get() + 1);
+    let unknown = refusal(exchange(&mut daemon, inspect(110, absent, reach(past, &[]))).await);
+    for (request_id, resource_id, ended) in [
+        (111, resolved, PendingState::Resolved),
+        (114, withdrawn, PendingState::Cancelled),
+        (117, uncertain, PendingState::Uncertain),
+    ] {
+        let within = exchange(
+            &mut daemon,
+            inspect(request_id, resource_id, reach(Some(0), &[])),
+        )
+        .await;
+        assert_eq!(
+            state_read(within),
+            ended,
+            "the record exists, and has ended"
+        );
+        for (next, history) in [
+            (1, reach(past, &[resource_id])),
+            (2, reach(None, &[resource_id])),
+        ] {
+            let withheld = refusal(
+                exchange(
+                    &mut daemon,
+                    inspect(request_id + next, resource_id, history),
+                )
+                .await,
+            );
+            assert_eq!(withheld.code, ErrorCode::StaleSession, "{ended:?}");
+            assert_eq!(
+                shape(&withheld, resource_id, &host),
+                shape(&unknown, absent, &host),
+                "an ended approval is an old record like any other: {ended:?}"
+            );
+        }
+    }
+}
+
+/// KR-REQ-10.51: a name picks out one resource. Two native connections of the instance both call
+/// their first request `1`, and a grant naming the resource recorded on one reads that record and
+/// not the other, which answers as unknown; a grant naming a resource this host does not hold
+/// excepts neither.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_10_51_a_name_excepts_its_own_resource_and_no_other_with_the_same_upstream_identifier()
+ {
+    let host = host().await;
+    let broker = host.service.broker();
+    let other_connection = broker
+        .open_native_connection(instance(), &[9; 32], &process(41), &plugin(), "1")
+        .expect("a second native connection of the instance");
+    let named = offer_on(&host, host.connection, &request_frame(1, 0));
+    let unnamed = offer_on(&host, other_connection, &request_frame(1, 0));
+    assert_ne!(named, unnamed);
+    for resource_id in [named, unnamed] {
+        assert_eq!(
+            broker
+                .decoding(resource_id)
+                .expect("the ledger reads")
+                .map(|entry| entry.upstream_request_id),
+            Some(UpstreamRequestId::new("1").expect("an identifier")),
+            "both requests carry the upstream identifier 1"
+        );
+    }
+    let absent = PendingResourceId::new(Uuid::from_bytes([0xab; 16]));
+    let mut daemon = daemon(&host).await;
+    let inspect = |request_id: u64, resource_id: PendingResourceId, history: HistoryScope| {
+        scoped(
+            Method::AgentApprovalInspect,
+            &params(&host, instance(), resource_id),
+            request_id,
+            device(),
+            history,
+        )
+    };
+    let past = Some(RECORDED_AT.get() + 1);
+    let unknown = refusal(exchange(&mut daemon, inspect(120, absent, reach(past, &[]))).await);
+
+    let read: AgentApprovalInspectResult =
+        answered(exchange(&mut daemon, inspect(121, named, reach(past, &[named]))).await);
+    assert_eq!(read.resource_id, named);
+    for (request_id, resource_id, names) in [
+        (122, unnamed, named),
+        (123, named, absent),
+        (124, unnamed, absent),
+    ] {
+        let withheld = refusal(
+            exchange(
+                &mut daemon,
+                inspect(request_id, resource_id, reach(past, &[names])),
+            )
+            .await,
+        );
+        assert_eq!(
+            shape(&withheld, resource_id, &host),
+            shape(&unknown, absent, &host),
+            "a name excepts its own resource only ({request_id})"
+        );
     }
 }
 
