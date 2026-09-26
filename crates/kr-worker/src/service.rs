@@ -2655,7 +2655,7 @@ impl WorkerService {
             return failure(request.request_id, &unlisted());
         }
         let outcome = match method {
-            Method::SessionRead => self.session_read(&request.params),
+            Method::SessionRead => self.session_read(&request.params, caller),
             Method::EventsSnapshot => self.events_snapshot(state, &request.params),
             Method::HistoryPage => self.history_page(state, &request.params, caller),
             Method::EventsSubscribe => self.events_subscribe(state, &request.params),
@@ -4412,16 +4412,36 @@ impl WorkerService {
         }
     }
 
-    fn session_read(&self, params: &ParamsValue) -> Result<ParamsValue> {
+    /// Serves `session.read`: the session's metadata and current state, and its last command to a
+    /// caller whose history reaches it.
+    ///
+    /// The command block is a command line and the directory it ran in, which is what a person
+    /// typed and where: retained history, which the shared filter decides by the moment the command
+    /// started. The local owner reads it; any other caller reads it only when a history scope came
+    /// with the read and reaches back that far, and otherwise the rest of the read, which is
+    /// metadata, is served without it. The daemon narrows a paired device's own read by the same
+    /// rule.
+    fn session_read(&self, params: &ParamsValue, caller: &Caller) -> Result<ParamsValue> {
         let params: SessionReadParams = parse(params)?;
         let session = self.runtime.session();
         Self::check_session(&session, params.session_id)?;
         let running = session.state().is_running();
+        let filter = caller.history_filter(Method::SessionRead.entry());
+        let last_command_block = session.last_command_block().filter(|block| {
+            filter.as_ref().is_some_and(|filter| {
+                filter
+                    .admit_at(
+                        crate::history_filter::Surface::EventPage,
+                        block.started_at_ms.get(),
+                    )
+                    .is_ok()
+            })
+        });
         encode(&SessionReadResult {
             session: session.summary(),
             endpoint: Nullable(running.then(|| self.endpoint.as_text())),
             launch_profile: Nullable(running.then(|| session.config().launch_profile.clone())),
-            last_command_block: Nullable(session.last_command_block()),
+            last_command_block: Nullable(last_command_block),
             outstanding_launches: Nullable(
                 running
                     .then(|| session.outstanding_launches())
