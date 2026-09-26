@@ -167,6 +167,15 @@ const MEASURED: [&str; 11] = [
     "bytes::Bytes",
 ];
 
+/// The standard library's sequences, which hold bytes when their element is a byte.
+const SEQUENCES: [&str; 5] = [
+    "std::vec::Vec",
+    "std::collections::VecDeque",
+    "std::collections::BinaryHeap",
+    "std::collections::HashSet",
+    "std::collections::BTreeSet",
+];
+
 /// The methods that measure one of [`MEASURED`].
 const MEASURES: [&str; 6] = ["len", "is_empty", "is_some", "is_none", "is_ok", "is_err"];
 
@@ -444,6 +453,29 @@ impl Debugs {
     /// and the types and `Debug`s its macros write where they are invoked.
     fn declare(&mut self, index: usize) {
         let tokens = self.sources[index].tokens.clone();
+        // The names the `Debug` trait and the two macros go by in this file, their own and any an
+        // import gives them.
+        let mut debug_words: BTreeSet<String> = BTreeSet::from(["Debug".to_owned()]);
+        let mut macro_words: BTreeMap<String, &'static str> = BTreeMap::from([
+            ("debug_as_name".to_owned(), "debug_as_name"),
+            ("debug_fields".to_owned(), "debug_fields"),
+        ]);
+        for import in &self.sources[index].imports {
+            match import.path.last().map(String::as_str) {
+                Some("Debug") => {
+                    debug_words.insert(import.local.clone());
+                }
+                Some(word @ ("debug_as_name" | "debug_fields")) => {
+                    let word = if word == "debug_as_name" {
+                        "debug_as_name"
+                    } else {
+                        "debug_fields"
+                    };
+                    macro_words.insert(import.local.clone(), word);
+                }
+                _ => {}
+            }
+        }
         let macros = macro_bodies(&tokens);
         let inside_macro = |at: usize| {
             macros
@@ -470,8 +502,10 @@ impl Debugs {
                 {
                     self.declare_alias(index, &tokens, at, scope);
                 }
-                Some("Debug")
-                    if ident(tokens.get(at + 1)) == Some("for") && impl_of(&tokens, at) =>
+                Some(word)
+                    if debug_words.contains(word)
+                        && ident(tokens.get(at + 1)) == Some("for")
+                        && impl_of(&tokens, at) =>
                 {
                     self.declare_by_hand(index, &tokens, at, scope, None);
                 }
@@ -482,10 +516,8 @@ impl Debugs {
         // the `Debug` each writes: the type's name alone, or the type's name and the fields named.
         if index < self.guarded {
             for at in 0..tokens.len() {
-                let which = ident(tokens.get(at));
-                if !matches!(which, Some("debug_as_name" | "debug_fields"))
-                    || !punct(tokens.get(at + 1), '!')
-                {
+                let which = ident(tokens.get(at)).and_then(|word| macro_words.get(word).copied());
+                if which.is_none() || !punct(tokens.get(at + 1), '!') {
                     continue;
                 }
                 let scope = self.sources[index].scope_at(at);
@@ -1043,6 +1075,16 @@ impl Debugs {
         match OUTSIDE.iter().find(|(listed, _)| *listed == path) {
             Some((_, Outside::Text)) => Some(path),
             Some((_, Outside::Nothing)) => None,
+            // A sequence of bytes holds bytes, whatever its own `Debug` does with them. One byte in
+            // an option, a cell or a lock is a number.
+            Some((_, Outside::Holds))
+                if SEQUENCES.contains(&path.as_str())
+                    && arguments
+                    .iter()
+                    .any(|argument| matches!(argument.as_slice(), [one] if ident(Some(one)) == Some("u8"))) =>
+            {
+                Some("bytes".to_owned())
+            }
             Some((_, Outside::Holds)) => arguments_carry(),
             None => Some(format!(
                 "{path}, a type from outside the workspace this reading does not list"
@@ -1943,7 +1985,17 @@ impl Reading<'_> {
                 None => Ok(()),
                 Some(why) => Err(why),
             },
-            Trait::Display | Trait::Text => {
+            // `write_str` writes the text as it is, through no `Display`: only this program's
+            // words may be written so, and a value's type says so only as a `&'static str`.
+            Trait::Text => {
+                if matches!(written.tokens.as_slice(), [and, lifetime, word] if punct(Some(and), '&') && matches!(&lifetime.token, Token::Lifetime(name) if name == "'static") && ident(Some(word)) == Some("str"))
+                {
+                    Ok(())
+                } else {
+                    Err("text written as it is, which only this program's words may be".to_owned())
+                }
+            }
+            Trait::Display => {
                 if matches!(written.tokens.as_slice(), [and, lifetime, word] if punct(Some(and), '&') && matches!(&lifetime.token, Token::Lifetime(name) if name == "'static") && ident(Some(word)) == Some("str"))
                 {
                     return Ok(());
@@ -2317,6 +2369,36 @@ fn each_debug_that_can_print_text_is_named_with_its_place() {
             "formats std::string::String",
         ),
         (
+            "bytes in a vector",
+            "#[derive(Debug)]\npub struct Planted(pub Vec<u8>);\n",
+            1,
+            "bytes",
+        ),
+        (
+            "bytes a Debug written by hand formats",
+            "pub struct Planted {\n    pub bytes: Vec<u8>,\n}\nimpl std::fmt::Debug for Planted {\n    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n        formatter.debug_tuple(\"Planted\").field(&self.bytes).finish()\n    }\n}\n",
+            6,
+            "formats bytes",
+        ),
+        (
+            "the Debug trait under another name",
+            "use std::fmt::Debug as Shows;\npub struct Planted {\n    pub text: String,\n}\nimpl Shows for Planted {\n    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n        formatter.debug_tuple(\"Planted\").field(&self.text).finish()\n    }\n}\n",
+            7,
+            "formats std::string::String",
+        ),
+        (
+            "a Debug macro under another name",
+            "use kr_client::debug_fields as fields;\npub struct Planted {\n    pub text: String,\n}\nfields!(Planted { text });\n",
+            5,
+            "formats std::string::String",
+        ),
+        (
+            "text written as it is from a type of this crate",
+            "pub struct Wrapped(String);\nimpl std::ops::Deref for Wrapped {\n    type Target = str;\n    fn deref(&self) -> &str { &self.0 }\n}\npub struct Planted {\n    pub secret: Wrapped,\n}\nimpl std::fmt::Debug for Planted {\n    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n        formatter.write_str(&self.secret)\n    }\n}\n",
+            11,
+            "text written as it is",
+        ),
+        (
             "a name that is not the program's words",
             "pub struct Planted {\n    pub name: &'static str,\n}\nimpl std::fmt::Debug for Planted {\n    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n        formatter.debug_struct(self.name).finish()\n    }\n}\n",
             6,
@@ -2347,7 +2429,7 @@ fn what_the_debug_rule_allows_is_not_named() {
                 kr_client::debug_as_name!(Store);\n\
                 pub struct Named {\n    pub id: u64,\n    pub text: String,\n}\n\
                 kr_client::debug_fields!(Named { id });\n\
-                #[derive(Debug)]\npub struct Holding {\n    pub store: Store,\n    pub named: Named,\n}\n\
+                #[derive(Debug)]\npub struct Holding {\n    pub store: Store,\n    pub named: Named,\n    pub mode: Option<u8>,\n}\n\
                 impl std::fmt::Debug for Said {\n    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n        match self {\n            Self::Text(text) => write!(formatter, \"Text({} bytes)\", text.len()),\n            Self::Count(count) => write!(formatter, \"Count({count})\"),\n        }\n    }\n}\n";
     let findings = debug_findings_in("debug-allowed", text, OTHER_CONTROL);
     assert!(findings.is_empty(), "{findings:?}");
