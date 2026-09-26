@@ -95,7 +95,11 @@ impl Listener {
 
     /// Accepts one connection and authenticates its caller.
     ///
-    /// A caller that is not the owning user is refused here, before any frame is read.
+    /// On Unix a caller that is not the owning user is refused here, before any frame is read. On
+    /// Windows the platform reads a named-pipe caller's account only once the caller has sent
+    /// something, so the account is proved at the connection's first read instead, before any byte
+    /// is handed to a reader: a caller of another account gets nothing delivered and nothing
+    /// written, and every read and write on its connection fails.
     ///
     /// # Errors
     ///
@@ -108,16 +112,10 @@ impl Listener {
                 Ok(accepted) => accepted,
                 // A caller whose credentials the kernel will not report cannot be authenticated,
                 // whatever is still sitting in its receive buffer. Some platforms report that as
-                // "not connected" the moment the caller closes its end. A caller the platform
-                // accept proved to be another account (the Windows named-pipe check) is refused the
-                // same way. Dropping the connection and waiting for the next caller is the safe
-                // answer; it is not a reason for the listener to stop serving the owner, which is
-                // why none of these failures escapes here.
-                Err(
-                    IpcError::PeerClosed
-                    | IpcError::PeerUnknown { .. }
-                    | IpcError::PeerAccountRejected { .. },
-                ) => continue,
+                // "not connected" the moment the caller closes its end. Dropping the connection
+                // and waiting for the next caller is the safe answer; it is not a reason for the
+                // listener to stop serving the owner, which is why neither failure escapes here.
+                Err(IpcError::PeerClosed | IpcError::PeerUnknown { .. }) => continue,
                 Err(error) => return Err(error),
             };
             match peer.authorise(self.owner_uid) {
@@ -545,17 +543,9 @@ mod platform {
     /// How long a busy connect pauses between attempts.
     const BUSY_RETRY_PAUSE: Duration = Duration::from_millis(20);
 
-    /// How long the listener waits for a caller's opening bytes before it gives up on it.
-    ///
-    /// The caller's account is read from the connection by impersonating it, which the platform
-    /// allows once the caller has sent something the listener has read. Every caller sends its
-    /// opening frame straight away, so this bounds the wait for that frame; a caller that connects
-    /// and says nothing is refused rather than allowed to hold the serial accept loop for ever.
-    const CLIENT_HELLO_WAIT: Duration = Duration::from_secs(30);
-
-    /// The most of a caller's opening bytes the listener reads before authenticating it. The bytes
-    /// are replayed to the reader, so a larger opening simply continues from the stream.
-    const HELLO_PEEK: usize = 8192;
+    /// The most of a caller's opening bytes read before its account is proved. They are handed to
+    /// the reader afterwards, so a longer opening simply continues from the pipe.
+    const OPENING_READ: usize = 8192;
 
     #[derive(Debug)]
     pub(super) struct Listener {
@@ -594,56 +584,23 @@ mod platform {
             Ok(Self { inner })
         }
 
+        /// Accepts one connection.
+        ///
+        /// It returns at once, as on Unix: the caller's account is proved at the connection's first
+        /// read ([`Accepted`]), because the platform reads a named-pipe client's account only once
+        /// the caller has sent something. Waiting for that here would hold the serial accept loop
+        /// on a caller that has not spoken yet.
         pub(super) async fn accept(&self) -> Result<(super::Connection, PeerIdentity)> {
-            use tokio::io::AsyncReadExt as _;
-
-            let mut stream = self
+            let stream = self
                 .inner
                 .accept()
                 .await
                 .map_err(|error| IpcError::socket("accept", error))?;
-            // Read the caller's opening bytes so its account can be read from a connection it has
-            // used: the platform impersonates a named-pipe client only once it has sent something the
-            // server has read. Every caller sends its opening frame first; a caller that connects and
-            // says nothing is refused rather than allowed to hold the serial accept loop. The bytes
-            // are kept and replayed to the reader, so this is still before any frame is parsed.
-            let mut prebuffer = vec![0_u8; HELLO_PEEK];
-            let read =
-                match tokio::time::timeout(CLIENT_HELLO_WAIT, stream.read(&mut prebuffer)).await {
-                    Ok(Ok(read)) => read,
-                    Ok(Err(error)) => return Err(IpcError::socket("accept", error)),
-                    Err(_elapsed) => {
-                        return Err(IpcError::PeerAccountRejected {
-                            detail: "the caller sent nothing to authenticate against".to_owned(),
-                        });
-                    }
-                };
-            if read == 0 {
-                return Err(IpcError::PeerAccountRejected {
-                    detail: "the caller closed before it identified itself".to_owned(),
-                });
-            }
-            prebuffer.truncate(read);
-            // Prove the caller runs as this account, from the connection itself, so a caller whose
-            // process has exited and whose identifier was reused cannot be taken for this account. A
-            // caller of another account is a `PeerRejected`-like refusal the accept loop drops
-            // without ceasing to serve the owner.
-            let this_account = match &stream {
-                PipeServer::NamedPipe(pipe) => {
-                    crate::starter::pipe_client_is_this_user(pipe.as_handle())
-                }
-            }
-            .map_err(|source| IpcError::PeerUnknown { source })?;
-            if !this_account {
-                return Err(IpcError::PeerAccountRejected {
-                    detail: "the caller runs as another account".to_owned(),
-                });
-            }
-            let connection = Connection::Server {
+            let connection = Connection::Server(Accepted {
                 stream,
-                prebuffer,
-                delivered: 0,
-            };
+                caller: Caller::Unproved,
+                waiting_writer: None,
+            });
             let peer = connection.peer()?;
             Ok((super::Connection(connection), peer))
         }
@@ -664,15 +621,127 @@ mod platform {
         /// The connecting side: a client opened for identification only.
         Client(NamedPipeClient),
         /// The accepting side, produced by the listener.
-        Server {
-            /// The accepted pipe stream.
-            stream: PipeServer,
-            /// The opening bytes read to authenticate the caller, replayed to the reader before the
-            /// stream so nothing the caller sent is lost.
-            prebuffer: Vec<u8>,
-            /// How much of `prebuffer` has been handed to the reader.
-            delivered: usize,
-        },
+        Server(Accepted),
+    }
+
+    /// An accepted connection whose caller's account is proved at its first read.
+    ///
+    /// Windows reads a named-pipe client's account only once the client has sent something the
+    /// server has read, so the proof cannot come at accept. It comes at the first read instead:
+    /// the caller's opening bytes are read, its account is read from the connection itself and
+    /// compared with this process's, and only then is anything handed to the reader. The bytes read
+    /// for the proof are handed over first, so the reader sees the caller's opening whole. Until
+    /// the caller is proved, a write waits for the reader to settle it; a caller of another account,
+    /// or one whose account cannot be read, gets no byte delivered and none written, and every read
+    /// and write on its connection then fails.
+    ///
+    /// Only the reader drives the proof. A writer that drove it would register its own wakeup for
+    /// the pipe's read readiness in place of the reader's, and the reader would never be woken.
+    #[derive(Debug)]
+    pub(super) struct Accepted {
+        stream: PipeServer,
+        caller: Caller,
+        /// A writer that found the caller not yet proved, woken once the reader settles it.
+        waiting_writer: Option<std::task::Waker>,
+    }
+
+    /// What is known of an accepted connection's caller.
+    #[derive(Debug)]
+    enum Caller {
+        /// Nothing read yet, so its account is not yet proved.
+        Unproved,
+        /// Proved to be this account. `opening[delivered..]` is still to be handed to the reader.
+        Admitted { opening: Vec<u8>, delivered: usize },
+        /// Another account, or one whose account could not be read; the detail says which.
+        Refused(String),
+    }
+
+    impl Accepted {
+        /// Settles the caller from its opening bytes, and wakes a writer waiting on the outcome.
+        fn settle(&mut self, opening: Vec<u8>) {
+            let PipeServer::NamedPipe(pipe) = &self.stream;
+            self.caller = match crate::starter::pipe_client_is_this_user(pipe.as_handle()) {
+                Ok(true) => Caller::Admitted {
+                    opening,
+                    delivered: 0,
+                },
+                Ok(false) => Caller::Refused("the caller runs as another account".to_owned()),
+                Err(error) => Caller::Refused(format!(
+                    "the caller's account could not be read from the connection: {error}"
+                )),
+            };
+            if let Some(writer) = self.waiting_writer.take() {
+                writer.wake();
+            }
+        }
+
+        fn refusal(detail: &str) -> std::io::Error {
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("the endpoint's account or access policy could not be verified: {detail}"),
+            )
+        }
+
+        fn poll_read(
+            &mut self,
+            context: &mut Context<'_>,
+            buffer: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            loop {
+                match &mut self.caller {
+                    Caller::Admitted { opening, delivered } => {
+                        if *delivered < opening.len() {
+                            let remaining = &opening[*delivered..];
+                            let take = remaining.len().min(buffer.remaining());
+                            buffer.put_slice(&remaining[..take]);
+                            *delivered += take;
+                            return Poll::Ready(Ok(()));
+                        }
+                        return Pin::new(&mut self.stream).poll_read(context, buffer);
+                    }
+                    Caller::Refused(detail) => return Poll::Ready(Err(Self::refusal(detail))),
+                    Caller::Unproved => {
+                        let mut opening = vec![0_u8; OPENING_READ];
+                        let mut read = ReadBuf::new(&mut opening);
+                        match Pin::new(&mut self.stream).poll_read(context, &mut read) {
+                            Poll::Pending => return Poll::Pending,
+                            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                            Poll::Ready(Ok(())) => {
+                                let length = read.filled().len();
+                                if length == 0 {
+                                    // The caller left without saying anything: nothing to hand over
+                                    // and nothing to prove, and nothing may be written to it.
+                                    self.caller = Caller::Refused(
+                                        "the caller closed before it identified itself".to_owned(),
+                                    );
+                                    if let Some(writer) = self.waiting_writer.take() {
+                                        writer.wake();
+                                    }
+                                    return Poll::Ready(Ok(()));
+                                }
+                                opening.truncate(length);
+                                self.settle(opening);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        fn poll_write(
+            &mut self,
+            context: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            match &self.caller {
+                Caller::Admitted { .. } => Pin::new(&mut self.stream).poll_write(context, bytes),
+                Caller::Refused(detail) => Poll::Ready(Err(Self::refusal(detail))),
+                Caller::Unproved => {
+                    self.waiting_writer = Some(context.waker().clone());
+                    Poll::Pending
+                }
+            }
+        }
     }
 
     impl Connection {
@@ -707,11 +776,13 @@ mod platform {
 
         pub(super) fn peer(&self) -> Result<PeerIdentity> {
             match self {
-                // Windows reports the peer's process, not a numeric user. The listener has already
-                // proved the caller is this account, so the identity carried here is that process
-                // and the owning user this endpoint belongs to.
-                Self::Server { stream, .. } => {
-                    let credentials = stream
+                // Windows reports the peer's process, not a numeric user. The caller's account is
+                // proved at the connection's first read, before any byte reaches a reader, so the
+                // identity carried here is that process and the owning user this endpoint belongs
+                // to; a caller of another account never gets a byte through to be acted on.
+                Self::Server(accepted) => {
+                    let credentials = accepted
+                        .stream
                         .peer_creds()
                         .map_err(|source| IpcError::PeerUnknown { source })?;
                     Ok(PeerIdentity {
@@ -740,22 +811,7 @@ mod platform {
         ) -> Poll<std::io::Result<()>> {
             match self.get_mut() {
                 Self::Client(client) => Pin::new(client).poll_read(context, buffer),
-                Self::Server {
-                    stream,
-                    prebuffer,
-                    delivered,
-                } => {
-                    // Hand back the opening bytes read to authenticate the caller before reading on
-                    // from the stream, so the reader sees the caller's whole opening intact.
-                    if *delivered < prebuffer.len() {
-                        let remaining = &prebuffer[*delivered..];
-                        let take = remaining.len().min(buffer.remaining());
-                        buffer.put_slice(&remaining[..take]);
-                        *delivered += take;
-                        return Poll::Ready(Ok(()));
-                    }
-                    Pin::new(stream).poll_read(context, buffer)
-                }
+                Self::Server(accepted) => accepted.poll_read(context, buffer),
             }
         }
     }
@@ -768,7 +824,7 @@ mod platform {
         ) -> Poll<std::io::Result<usize>> {
             match self.get_mut() {
                 Self::Client(client) => Pin::new(client).poll_write(context, bytes),
-                Self::Server { stream, .. } => Pin::new(stream).poll_write(context, bytes),
+                Self::Server(accepted) => accepted.poll_write(context, bytes),
             }
         }
 
@@ -778,7 +834,7 @@ mod platform {
         ) -> Poll<std::io::Result<()>> {
             match self.get_mut() {
                 Self::Client(client) => Pin::new(client).poll_flush(context),
-                Self::Server { stream, .. } => Pin::new(stream).poll_flush(context),
+                Self::Server(accepted) => Pin::new(&mut accepted.stream).poll_flush(context),
             }
         }
 
@@ -788,7 +844,7 @@ mod platform {
         ) -> Poll<std::io::Result<()>> {
             match self.get_mut() {
                 Self::Client(client) => Pin::new(client).poll_shutdown(context),
-                Self::Server { stream, .. } => Pin::new(stream).poll_shutdown(context),
+                Self::Server(accepted) => Pin::new(&mut accepted.stream).poll_shutdown(context),
             }
         }
     }

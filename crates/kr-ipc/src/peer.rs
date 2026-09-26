@@ -9,10 +9,11 @@
 //! contract, because code already running under the user's account can open this socket too.
 //!
 //! Windows has no numeric account, so [`PeerIdentity::uid`] there is a placeholder (`0`) and
-//! [`PeerIdentity::authorise`] is not the account check; the account is proved from the connection
-//! itself in [`crate::endpoint`], the listener reading the connecting client's own token and a
-//! client the owner of the pipe it reached. A returned `PeerIdentity` on Windows therefore already
-//! belongs to this account: `uid: 0` means the verified local owner, not an unchecked default.
+//! [`PeerIdentity::authorise`] is not the account check. The account is proved from the connection
+//! itself in [`crate::endpoint`]: a client checks the owner of the pipe it reached before it writes,
+//! and the listener reads the connecting caller's own token at the connection's first read, before
+//! any byte reaches a reader. A caller of another account therefore never gets a byte through to
+//! be acted on, and `uid: 0` is the owner this endpoint belongs to rather than an unchecked default.
 
 use kr_protocol::local::LocalPeer;
 use kr_protocol::scalars::{Nullable, U64};
