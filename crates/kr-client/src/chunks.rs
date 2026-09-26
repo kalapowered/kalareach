@@ -50,13 +50,13 @@ use crate::error::{ClientError, Result};
 use crate::shown::Shown;
 
 /// Where a transfer's chunks travel.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ChunkRoute {
     form: Form,
 }
 
 /// The ways a route reaches a host.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 enum Form {
     /// The attachment-chunk endpoint of an environment on this machine.
     Local {
@@ -114,14 +114,14 @@ impl ChunkRoute {
 /// Calls on it are answered in turn: a chunk is sent and its answer read before the next one goes.
 /// Once its connection has failed, every later call fails with [`ClientError::ConnectionEnded`]
 /// without sending anything, and the caller opens another lane.
-#[derive(Debug)]
 pub struct ChunkLane {
     transfer_id: TransferId,
     carrier: Carrier,
 }
 
+crate::debug_fields!(ChunkLane { transfer_id });
+
 /// What a lane's frames travel over.
-#[derive(Debug)]
 enum Carrier {
     Local(LocalCarrier),
 }
@@ -248,7 +248,7 @@ impl ChunkLane {
 const ANSWER_DEPTH: usize = 8;
 
 /// A window the host issued on a lane's connection, and when the lane received it.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct Issued {
     window: ActionWindow,
     received_at: tokio::time::Instant,
@@ -284,7 +284,6 @@ impl Issued {
 /// lane reading it, or a suspension this lane's clock does not count, can leave the host holding a
 /// window expired that the lane took for young. The host refuses a chunk under it, and the upload's
 /// driver sends that chunk once more on a new lane ([`crate::uploads::send`]).
-#[derive(Debug)]
 struct LocalCarrier {
     writer: FrameWriter,
     /// The newest window the reader has delivered. Its sender is the reader's, so it also says
