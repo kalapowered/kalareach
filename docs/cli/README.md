@@ -158,7 +158,10 @@ is not this environment's own, that is not the one this installation registers, 
 no longer beside `kr` ends the command with `HOST_NOT_CONFIGURED` and
 `kr host startup --set standalone`, and the task is not run. The Task Scheduler starts the task only
 where you are signed in; if it does not start it within the wait, the command ends with
-`ENVIRONMENT_UNAVAILABLE`, says where you have to sign in, and gives the task's last result.
+`ENVIRONMENT_UNAVAILABLE`, says where you have to sign in, and gives the task's last result. The
+request lapses when `kr new` stops waiting, and `kr new` withdraws it before it says why no daemon
+answered, so no daemon is started for a command that has given up; if the Task Scheduler does not
+run the task, the request is withdrawn at once.
 
 The command waits up to 30 seconds for an answer, then creates the session exactly as it would with
 a daemon that was already running. In text form it first says, on standard error, which daemon it
