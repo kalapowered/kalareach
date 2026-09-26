@@ -21,11 +21,12 @@
 //! checked against anything but the record on disk.
 //!
 //! Every call that holds the record, an open and a step, takes one deadline as it starts,
-//! [`kr_flush::HELD_RENAME_BOUND`] away, and spends it on waiting for the record and on its
-//! publication both. Windows can hold a record a publication replaces for a moment, and the
-//! publication tries its rename again until the deadline; a call queued behind it waits only until
-//! its own deadline, so it answers within one bound however many calls came before it. A call whose
-//! deadline passes before it holds the record writes nothing and says that another change held it.
+//! [`kr_flush::HELD_RENAME_BOUND`] away, and spends it on waiting for the record and on trying its
+//! publication again both. Windows can hold a record a publication replaces for a moment, and the
+//! publication tries its rename again until the deadline; a call queued behind it stops waiting at
+//! its own deadline, so however many calls came before it, its waiting adds up to no more than one
+//! bound, beside what its own reads and writes take. A call whose deadline passes before it holds
+//! the record writes nothing and says that another change held it.
 //!
 //! A new record is written to a temporary file in the same directory, flushed, renamed over the
 //! record, and the directory is flushed after it. The record's name holds a whole record
@@ -540,8 +541,9 @@ impl MachineStore {
     /// holds it, and no longer than until `deadline`.
     ///
     /// The wait sleeps until a call lets a record go or the deadline passes, whichever comes first.
-    /// A call still waiting at its deadline has read and written nothing, and answers a storage
-    /// failure that says another change held the record.
+    /// A call that does not hold the record before its deadline, because another call held it
+    /// until then or let it go only after, holds nothing: it has read and written nothing, and
+    /// answers a storage failure that says another change held the record.
     fn writer(&self, deadline: Instant, operation: &'static str) -> Result<Holding> {
         let writing = WRITING.lock().unwrap_or_else(PoisonError::into_inner);
         // A test learns here that a caller has come to the record, and whether another call holds
@@ -555,7 +557,9 @@ impl MachineStore {
                 |writing| writing.contains(&self.record),
             )
             .unwrap_or_else(PoisonError::into_inner);
-        if writing.contains(&self.record) {
+        // The deadline decides, not only whether the record is free now: one let go after the
+        // deadline, before this call looked again, came too late for it.
+        if writing.contains(&self.record) || Instant::now() >= deadline {
             return Err(storage(
                 operation,
                 &self.record,
