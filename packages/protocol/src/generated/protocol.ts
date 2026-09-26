@@ -4169,6 +4169,10 @@ export interface AgentSnapshotEntry {
    */
   observed_at: string
   /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  omitted_text_bytes: string
+  /**
    * The entry's text, already filtered by the shared host-side history filter.
    */
   text: string

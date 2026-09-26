@@ -191,6 +191,12 @@ pub struct AgentSnapshotEntry {
     pub kind: String,
     /// The entry's text, already filtered by the shared host-side history filter.
     pub text: String,
+    /// How many bytes of the entry's text this answer left out, from its end.
+    ///
+    /// Zero when the text is whole. An entry that does not fit the reader's control frame on its
+    /// own is carried with its text cut at a character boundary, and this says how much of it is
+    /// missing, so a cut text is never read as the whole of what was said.
+    pub omitted_text_bytes: U64,
     /// When it was observed.
     pub observed_at: TimestampMs,
 }

@@ -18,7 +18,7 @@
 
 use kr_protocol::agent::{
     AgentApprovalInspectParams, AgentApprovalInspectResult, AgentApprovalRespondParams,
-    AgentApprovalRespondResult, AgentCancelParams, AgentCapabilitiesParams,
+    AgentApprovalRespondResult, AgentBindingState, AgentCancelParams, AgentCapabilitiesParams,
     AgentCapabilitiesResult, AgentCommand, AgentCommandsParams, AgentCommandsResult,
     AgentMutationResult, AgentMutationTarget, AgentPromptParams, AgentSnapshotParams,
     AgentSnapshotResult, AgentSteerParams, AgentSubject, PluginActionInvokeParams,
@@ -32,6 +32,7 @@ use kr_protocol::ids::{
     SessionId, StreamCursor,
 };
 use kr_protocol::scalars::{Nullable, TimestampMs, U64};
+use kr_protocol::semantic::{SemanticContinuation, SemanticLimit};
 
 use crate::broker::arbitration::Claim;
 use crate::broker::error::{BrokerError, Result};
@@ -903,18 +904,34 @@ impl Broker {
         })
     }
 
-    /// Answers `agent.snapshot`, filtered by the actor's own history filter.
+    /// Answers `agent.snapshot`, filtered by the actor's own history filter, in an answer that
+    /// encodes to at most `max_answer_bytes`.
+    ///
+    /// The answer is measured before its first entry with everything in it that varies at its
+    /// widest, and what is left is the part's allowance, so a part cut to it is an answer inside
+    /// the bound whatever its counters and continuation turn out to be.
     ///
     /// # Errors
     ///
-    /// Returns [`BrokerError::UnknownSubject`] when the instance is not one this worker serves.
+    /// Returns [`BrokerError::UnknownSubject`] when the instance is not one this worker serves,
+    /// and [`BrokerError::InvalidArgument`] when the bound cannot carry the answer with no entry
+    /// in it, or an entry of this history even with no text.
     pub fn agent_snapshot(
         &self,
         params: &AgentSnapshotParams,
         filter: &dyn HistoryFilter,
+        max_answer_bytes: usize,
     ) -> Result<AgentSnapshotResult> {
         self.check_subject(&params.subject)?;
         let binding = self.binding_state(params.subject.application_instance_id)?;
+        let bound = u64::try_from(max_answer_bytes).unwrap_or(u64::MAX);
+        let empty = widest_empty_snapshot(&binding);
+        let allowance = bound.checked_sub(empty).ok_or_else(|| {
+            BrokerError::InvalidArgument(format!(
+                "this snapshot takes {empty} bytes before its first entry, and the answer may \
+                 take {bound}"
+            ))
+        })?;
         // `from_node` names the first node the reader wants, which is what a continuation
         // carries. `replay` starts *after* the cursor it is given, so the cursor is one before.
         let from = params
@@ -922,7 +939,12 @@ impl Broker {
             .as_ref()
             .and_then(|node| node.get().checked_sub(1))
             .map(StreamCursor::new);
-        let replay = self.replay(params.subject.application_instance_id, from, filter)?;
+        let replay = self.replay(
+            params.subject.application_instance_id,
+            from,
+            filter,
+            allowance,
+        )?;
         Ok(AgentSnapshotResult {
             binding,
             entries: replay.entries,
@@ -2176,6 +2198,35 @@ impl crate::broker::BrokerState {
         }
         Ok(admitted)
     }
+}
+
+/// How much a list's encoding can grow past the empty list's beyond its items: its length is
+/// written ahead of it in one byte when it is empty and in at most nine.
+const LIST_LENGTH_GROWTH: u64 = 8;
+
+/// What an `agent.snapshot` answer carrying `binding` encodes to before its first entry, with
+/// everything in it that varies at its widest.
+///
+/// The binding is the one the answer carries, measured as it is. The counters and the
+/// continuation are not known until the part has been read, so they are measured at their
+/// largest, and so is the length the entry list gains as it grows: a part cut against a narrower
+/// measurement would be cut too generously, and the answer it ends up in would be larger than the
+/// bound it was cut for.
+fn widest_empty_snapshot(binding: &AgentBindingState) -> u64 {
+    let widest = AgentSnapshotResult {
+        binding: binding.clone(),
+        entries: Vec::new(),
+        continuation: Nullable::some(SemanticContinuation {
+            limit: SemanticLimit::Bytes,
+            limit_value: U64::new(u64::MAX),
+            from_node: U64::new(u64::MAX),
+            nodes: U64::new(u64::MAX),
+            bytes: U64::new(u64::MAX),
+        }),
+        history_gap: true,
+        withheld_entries: U64::new(u64::MAX),
+    };
+    crate::broker::semantic::encoded_bytes(&widest).saturating_add(LIST_LENGTH_GROWTH)
 }
 
 /// Builds one command an agent advertises.

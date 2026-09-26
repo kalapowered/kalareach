@@ -15,13 +15,20 @@
 //!   what one actor may see. What this returns is the entries it admitted and the count it did
 //!   not, so a reader can tell a short answer from a complete one without being shown what it may
 //!   not see.
+//!
+//! A part of a replay is also bounded by what carries it. Each entry is paid for at what it
+//! encodes to, against the allowance the caller gives, which is at most section 8's 16 MiB: a
+//! part read over a connection is given what is left of that connection's control frame once the
+//! rest of the answer is in it.
 
 use std::collections::VecDeque;
 
 use kr_protocol::agent::AgentSnapshotEntry;
 use kr_protocol::ids::StreamCursor;
 use kr_protocol::scalars::{TimestampMs, U64};
-use kr_protocol::semantic::{SemanticBudget, SemanticContinuation};
+use kr_protocol::semantic::{
+    MAX_SEMANTIC_SNAPSHOT_BYTES, SemanticBudget, SemanticContinuation, SemanticLimit,
+};
 
 /// How many semantic entries one instance's log retains.
 ///
@@ -96,6 +103,86 @@ pub struct Replay {
     pub resume_at: Option<StreamCursor>,
 }
 
+/// An entry that a part cannot carry even on its own and without its text.
+///
+/// What an entry carries besides its text is a few numbers and the name of its kind, so only a
+/// part far smaller than the smallest control frame a peer may declare meets one. Answering it
+/// with an empty part that continues at the same entry would have the reader ask for that part
+/// for ever, so it is a refusal instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Uncarried {
+    /// The entry's position in the log.
+    pub node: u64,
+    /// What the entry encodes to with no text.
+    pub bytes: u64,
+    /// What the part it would have started could carry.
+    pub allowance: u64,
+}
+
+impl std::fmt::Display for Uncarried {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "entry {} of this history takes {} bytes without its text, and a part of this answer \
+             carries {}",
+            self.node, self.bytes, self.allowance
+        )
+    }
+}
+
+/// What `value` encodes to on the wire, in bytes.
+///
+/// A value the codec cannot represent is reported at the largest size there is, so nothing is
+/// ever admitted to a part on the strength of a measurement that failed.
+pub(crate) fn encoded_bytes<T: serde::Serialize + ?Sized>(value: &T) -> u64 {
+    crate::snapshot::wire::measure(value)
+        .and_then(|cost| u64::try_from(cost.bytes).ok())
+        .unwrap_or(u64::MAX)
+}
+
+/// How much a text's encoding can grow past the empty text's beyond the text's own bytes: its
+/// length is written ahead of it in one byte when it is empty and in at most nine.
+const TEXT_LENGTH_GROWTH: u64 = 8;
+
+/// Returns `entry` with its text cut to a start, ending at a character boundary, with which the
+/// entry encodes to at most `allowance` bytes, and saying how many bytes it left out.
+///
+/// The start kept fits whatever length the text's own header takes, so it is short of the longest
+/// that fits exactly by at most [`TEXT_LENGTH_GROWTH`] bytes and the part of the character the cut
+/// would have split.
+///
+/// # Errors
+///
+/// Returns [`Uncarried`] when the entry does not fit even with no text at all.
+fn cut(entry: &AgentSnapshotEntry, allowance: u64) -> Result<AgentSnapshotEntry, Uncarried> {
+    let whole = entry.text.len();
+    // Measured with everything left out, and a count of what was left out encodes no longer when
+    // it is smaller, so what the entry costs beside its text is no less than this.
+    let bare = AgentSnapshotEntry {
+        text: String::new(),
+        omitted_text_bytes: U64::new(u64::try_from(whole).unwrap_or(u64::MAX)),
+        ..entry.clone()
+    };
+    let bytes = encoded_bytes(&bare);
+    let uncarried = Uncarried {
+        node: entry.node.get(),
+        bytes,
+        allowance,
+    };
+    let room = allowance
+        .checked_sub(bytes)
+        .ok_or(uncarried)?
+        .saturating_sub(TEXT_LENGTH_GROWTH);
+    let kept = entry
+        .text
+        .floor_char_boundary(usize::try_from(room).unwrap_or(usize::MAX).min(whole));
+    Ok(AgentSnapshotEntry {
+        text: entry.text[..kept].to_owned(),
+        omitted_text_bytes: U64::new(u64::try_from(whole - kept).unwrap_or(u64::MAX)),
+        ..entry.clone()
+    })
+}
+
 /// One instance's retained semantic entries.
 #[derive(Debug)]
 pub struct SemanticLog {
@@ -136,6 +223,7 @@ impl SemanticLog {
                 node: U64::new(cursor.get()),
                 kind: kind.into(),
                 text: text.into(),
+                omitted_text_bytes: U64::ZERO,
                 observed_at: at,
             },
         ));
@@ -159,17 +247,35 @@ impl SemanticLog {
         StreamCursor::new(self.next)
     }
 
-    /// Replays everything after the cursor an adapter consumed.
+    /// Replays everything after the cursor an adapter consumed, in a part whose entries encode to
+    /// at most `max_bytes`.
     ///
     /// `from` is the last cursor the adapter checkpointed; the replay starts after it. A `from`
     /// this log no longer holds is a gap: the answer starts at what is retained and says so,
     /// because the alternative is a shorter answer that reads as a complete one.
-    pub fn replay(&self, from: Option<StreamCursor>, filter: &dyn HistoryFilter) -> Replay {
+    ///
+    /// Each entry the filter admits is paid for at what it encodes to, and section 8's limit
+    /// bounds the allowance: a caller can ask for less than 16 MiB and never for more. An entry
+    /// that does not fit what is left ends the part, and the continuation names it, so the next
+    /// part starts with it. An entry that does not fit even as the first of its part is carried
+    /// with its text cut at a character boundary, saying how many bytes it left out, so that no
+    /// entry ends every part at itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Uncarried`] when an entry does not fit a part of its own even with no text.
+    pub fn replay(
+        &self,
+        from: Option<StreamCursor>,
+        filter: &dyn HistoryFilter,
+        max_bytes: u64,
+    ) -> Result<Replay, Uncarried> {
         let requested = from.map_or(1, |cursor| cursor.get().saturating_add(1));
         let history_gap = requested < self.first_retained.get();
         let start = requested.max(self.first_retained.get());
 
-        let mut budget = SemanticBudget::new();
+        let allowance = max_bytes.min(MAX_SEMANTIC_SNAPSHOT_BYTES);
+        let mut budget = SemanticBudget::with_max_bytes(allowance);
         let mut entries = Vec::new();
         let mut withheld = 0;
         let mut consumed = from.unwrap_or_else(|| StreamCursor::new(0));
@@ -183,26 +289,37 @@ impl SemanticLog {
                 withheld += 1;
                 continue;
             }
-            match budget.admit(1, u64::try_from(entry.text.len()).unwrap_or(u64::MAX)) {
-                Ok(()) => {
-                    entries.push(entry.clone());
-                    consumed = *cursor;
+            let carried = match budget.admit(1, encoded_bytes(entry)) {
+                Ok(()) => entry.clone(),
+                // The first entry of its part, so nothing has been spent: the whole allowance is
+                // there for it, and it is carried cut rather than left to start the next part too.
+                Err(SemanticLimit::Bytes) if entries.is_empty() => {
+                    let cut = cut(entry, allowance)?;
+                    let bytes = encoded_bytes(&cut);
+                    budget.admit(1, bytes).map_err(|_| Uncarried {
+                        node: entry.node.get(),
+                        bytes,
+                        allowance,
+                    })?;
+                    cut
                 }
                 Err(limit) => {
                     continuation = Some(budget.continuation(limit, cursor.get()));
                     resume_at = Some(*cursor);
                     break;
                 }
-            }
+            };
+            entries.push(carried);
+            consumed = *cursor;
         }
-        Replay {
+        Ok(Replay {
             entries,
             continuation,
             history_gap,
             withheld,
             consumed,
             resume_at,
-        }
+        })
     }
 
     /// Resumes a log at the cursor an adapter had already consumed.
@@ -240,16 +357,105 @@ mod tests {
         }
     }
 
+    /// Replays with section 8's whole allowance, which every entry these tests write fits.
+    fn whole(log: &SemanticLog, from: Option<StreamCursor>, filter: &dyn HistoryFilter) -> Replay {
+        log.replay(from, filter, MAX_SEMANTIC_SNAPSHOT_BYTES)
+            .expect("every entry fits a part of its own")
+    }
+
+    /// An entry is paid for at what it encodes to, not at the length of its text: a part with room
+    /// for the first entry and for the length of the other two texts carries the first entry and
+    /// no more, and its continuation reports the allowance it was given.
+    #[test]
+    fn an_entry_is_paid_for_at_what_it_encodes_to() {
+        let log = log(3);
+        let first = log.entries[0].1.clone();
+        let allowance = encoded_bytes(&first) + ("entry 2".len() + "entry 3".len()) as u64;
+        let part = log
+            .replay(None, &EverythingAdmitted, allowance)
+            .expect("the first entry fits");
+        assert_eq!(part.entries, [first], "the first entry and no more");
+        let continuation = part.continuation.expect("the part says where it stopped");
+        assert_eq!(continuation.limit, SemanticLimit::Bytes);
+        assert_eq!(continuation.limit_value.get(), allowance);
+        assert_eq!(continuation.from_node.get(), 2);
+    }
+
+    /// An entry that does not fit even as the first of its part is carried in a part of its own
+    /// with its text cut at a character boundary, inside the allowance and saying how many bytes
+    /// it left out; the entries on either side of it are carried whole, in the parts before and
+    /// after it, and a reader that follows the continuations reads each once.
+    #[test]
+    fn an_entry_larger_than_its_part_is_carried_cut_at_a_character_boundary() {
+        const ALLOWANCE: u64 = 1_000;
+        let large = "€".repeat(2_000);
+        let mut log = SemanticLog::new();
+        log.append("message", "said before", TimestampMs::new(1));
+        log.append("message", large.clone(), TimestampMs::new(2));
+        log.append("message", "said after", TimestampMs::new(3));
+
+        let before = log
+            .replay(None, &EverythingAdmitted, ALLOWANCE)
+            .expect("a part");
+        assert_eq!(before.entries.len(), 1);
+        assert_eq!(before.entries[0].text, "said before");
+        assert_eq!(before.entries[0].omitted_text_bytes, U64::ZERO);
+        assert_eq!(before.resume_at, Some(StreamCursor::new(2)));
+
+        let cut = log
+            .replay(Some(StreamCursor::new(1)), &EverythingAdmitted, ALLOWANCE)
+            .expect("a part");
+        assert_eq!(cut.entries.len(), 1, "the large entry is a part of its own");
+        let entry = &cut.entries[0];
+        assert!(
+            large.starts_with(entry.text.as_str()),
+            "the start of its text"
+        );
+        assert!(!entry.text.is_empty(), "as much of it as fits");
+        assert_eq!(
+            entry.omitted_text_bytes.get(),
+            (large.len() - entry.text.len()) as u64,
+            "it says how many bytes it left out"
+        );
+        assert!(
+            encoded_bytes(entry) <= ALLOWANCE,
+            "the cut entry is inside the allowance: {}",
+            encoded_bytes(entry)
+        );
+        assert_eq!(cut.consumed, StreamCursor::new(2), "the reader has had it");
+        assert_eq!(cut.resume_at, Some(StreamCursor::new(3)));
+
+        let after = log
+            .replay(Some(cut.consumed), &EverythingAdmitted, ALLOWANCE)
+            .expect("a part");
+        assert_eq!(after.entries.len(), 1);
+        assert_eq!(after.entries[0].text, "said after");
+        assert!(after.continuation.is_none());
+    }
+
+    /// An entry that a part cannot carry even with no text is refused, naming the entry, rather
+    /// than answered with an empty part that continues at the same entry for ever.
+    #[test]
+    fn an_entry_that_does_not_fit_without_its_text_is_refused() {
+        let log = log(1);
+        let refused = log
+            .replay(None, &EverythingAdmitted, 8)
+            .expect_err("no entry fits eight bytes");
+        assert_eq!(refused.node, 1);
+        assert_eq!(refused.allowance, 8);
+        assert!(refused.bytes > 8, "{refused}");
+    }
+
     #[test]
     fn a_replay_starts_after_the_cursor_the_adapter_consumed() {
         let log = log(5);
-        let replay = log.replay(Some(StreamCursor::new(2)), &EverythingAdmitted);
+        let replay = whole(&log, Some(StreamCursor::new(2)), &EverythingAdmitted);
         assert_eq!(replay.entries.len(), 3);
         assert_eq!(replay.entries[0].text, "entry 3");
         assert!(!replay.history_gap);
         assert_eq!(replay.consumed, StreamCursor::new(5));
 
-        let from_nothing = log.replay(None, &EverythingAdmitted);
+        let from_nothing = whole(&log, None, &EverythingAdmitted);
         assert_eq!(from_nothing.entries.len(), 5);
         assert!(!from_nothing.history_gap);
     }
@@ -263,7 +469,7 @@ mod tests {
         assert!(log.first_retained().get() > 1);
 
         // The adapter checkpointed before the eviction.
-        let replay = log.replay(Some(StreamCursor::new(1)), &EverythingAdmitted);
+        let replay = whole(&log, Some(StreamCursor::new(1)), &EverythingAdmitted);
         assert!(
             replay.history_gap,
             "a range this log no longer holds is a gap, not a shorter answer"
@@ -276,7 +482,7 @@ mod tests {
         );
 
         // An adapter that is up to date sees no gap.
-        let current = log.replay(Some(log.first_retained()), &EverythingAdmitted);
+        let current = whole(&log, Some(log.first_retained()), &EverythingAdmitted);
         assert!(!current.history_gap);
     }
 
@@ -322,7 +528,7 @@ mod tests {
         log.append("message", "said before, last", TimestampMs::new(1_200));
         let filter = reaching_back_to(2_000);
 
-        let first = log.replay(None, &filter);
+        let first = whole(&log, None, &filter);
         assert_eq!(nodes(&first), [2]);
         assert_eq!(first.withheld, 2, "the withheld entries this page examined");
         assert_eq!(
@@ -333,12 +539,12 @@ mod tests {
         assert!(first.continuation.is_some());
         assert_eq!(first.resume_at, Some(StreamCursor::new(4)));
 
-        let next = log.replay(Some(StreamCursor::new(3)), &filter);
+        let next = whole(&log, Some(StreamCursor::new(3)), &filter);
         assert_eq!(nodes(&next), [4]);
         assert_eq!(next.withheld, 1);
         assert!(next.continuation.is_none());
 
-        let nothing = log.replay(None, &reaching_back_to(10_000));
+        let nothing = whole(&log, None, &reaching_back_to(10_000));
         assert!(nothing.entries.is_empty());
         assert_eq!(nothing.withheld, 5);
         assert_eq!(nothing.consumed, StreamCursor::new(0));
@@ -351,7 +557,7 @@ mod tests {
         let filter = GrantLowerBound {
             from: StreamCursor::new(4),
         };
-        let replay = log.replay(None, &filter);
+        let replay = whole(&log, None, &filter);
         assert_eq!(replay.entries.len(), 2);
         assert_eq!(
             replay.withheld, 3,

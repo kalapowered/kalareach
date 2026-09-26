@@ -1854,6 +1854,7 @@ fn observed(shell: &Shell, instance: ApplicationInstanceId) -> usize {
             &kr_worker::broker::GrantLowerBound {
                 from: kr_protocol::ids::StreamCursor::new(0),
             },
+            kr_protocol::limits::MAX_CONTROL_FRAME_LEN,
         )
         .map_or(0, |snapshot| snapshot.entries.len())
 }

@@ -2664,7 +2664,7 @@ impl WorkerService {
             Method::QuestionReadOwn => self.question_read_own(state, &request.params),
             Method::QuestionRead => self.question_read(&request.params),
             Method::AgentCapabilities => self.agent_capabilities(&request.params),
-            Method::AgentSnapshot => self.agent_snapshot(&request.params, caller),
+            Method::AgentSnapshot => self.agent_snapshot(state, &request.params, caller),
             Method::AgentCommands => self.agent_commands(&request.params),
             Method::AgentApprovalInspect => {
                 self.agent_approval_inspect(state, &request.params, caller)
@@ -4946,10 +4946,23 @@ impl WorkerService {
     /// the answer says how much was withheld, so a reader can tell a filtered answer from a
     /// complete one either way. The local owner reads the whole retained history, exactly as a
     /// local attachment is drawn the whole screen.
-    fn agent_snapshot(&self, params: &ParamsValue, caller: &Caller) -> Result<ParamsValue> {
+    ///
+    /// One part travels in one control frame, so a part is cut to what this connection said it
+    /// can receive once the rest of the answer is in it, and a continuation says where the next
+    /// part starts. An entry larger than that on its own is carried with its text cut.
+    fn agent_snapshot(
+        &self,
+        state: &ConnectionState,
+        params: &ParamsValue,
+        caller: &Caller,
+    ) -> Result<ParamsValue> {
         let params: kr_protocol::agent::AgentSnapshotParams = parse(params)?;
         let filter = Self::history_of(caller, Method::AgentSnapshot, "an agent snapshot")?;
-        encode(&self.broker.agent_snapshot(&params, &filter)?)
+        encode(
+            &self
+                .broker
+                .agent_snapshot(&params, &filter, Self::frame_bytes(state))?,
+        )
     }
 
     /// Returns the history filter a caller reads `method` through, or the refusal it gets instead.

@@ -1556,6 +1556,10 @@
           "$ref": "#/$defs/TimestampMs",
           "description": "When it was observed."
         },
+        "omitted_text_bytes": {
+          "$ref": "#/$defs/U64",
+          "description": "How many bytes of the entry's text this answer left out, from its end.\n\nZero when the text is whole. An entry that does not fit the reader's control frame on its\nown is carried with its text cut at a character boundary, and this says how much of it is\nmissing, so a cut text is never read as the whole of what was said."
+        },
         "text": {
           "description": "The entry's text, already filtered by the shared host-side history filter.",
           "type": "string"
@@ -1565,6 +1569,7 @@
         "node",
         "kind",
         "text",
+        "omitted_text_bytes",
         "observed_at"
       ],
       "type": "object"

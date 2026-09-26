@@ -4608,6 +4608,7 @@ mod tests {
                 node: U64::new(2),
                 kind: "message".to_owned(),
                 text: "said under the grant".to_owned(),
+                omitted_text_bytes: U64::ZERO,
                 observed_at: TimestampMs::new(2_500),
             }],
             continuation: Nullable::null(),

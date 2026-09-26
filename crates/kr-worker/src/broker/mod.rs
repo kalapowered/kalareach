@@ -3405,23 +3405,30 @@ impl Broker {
         Ok(instance.semantic.append(kind, text, now))
     }
 
-    /// Replays what an adapter has not consumed, through the actor's own history filter.
+    /// Replays what an adapter has not consumed, through the actor's own history filter, in a
+    /// part whose entries encode to at most `max_bytes` ([`SemanticLog::replay`]).
     ///
     /// # Errors
     ///
-    /// Returns [`BrokerError::UnknownSubject`] when this broker holds no such instance.
+    /// Returns [`BrokerError::UnknownSubject`] when this broker holds no such instance, and
+    /// [`BrokerError::InvalidArgument`] when an entry does not fit a part of its own even with no
+    /// text.
     pub fn replay(
         &self,
         application_instance_id: ApplicationInstanceId,
         from: Option<StreamCursor>,
         filter: &dyn crate::broker::semantic::HistoryFilter,
+        max_bytes: u64,
     ) -> Result<crate::broker::semantic::Replay> {
         let state = self.state();
         let instance = state
             .instances
             .get(&application_instance_id)
             .ok_or_else(|| unknown_instance(application_instance_id))?;
-        Ok(instance.semantic.replay(from, filter))
+        instance
+            .semantic
+            .replay(from, filter, max_bytes)
+            .map_err(|uncarried| BrokerError::InvalidArgument(uncarried.to_string()))
     }
 
     /// Records the commands the upstream advertises.

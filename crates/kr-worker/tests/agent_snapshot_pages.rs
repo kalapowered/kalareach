@@ -29,8 +29,8 @@ use kr_protocol::grant::HistoryScope;
 use kr_protocol::hello::{PROTOCOL_VERSION, ReceiveLimits};
 use kr_protocol::identity::{DesktopBinding, WorkerProfile};
 use kr_protocol::ids::{
-    ActorId, ApplicationInstanceId, AuthorityRevision, BuildId, ConnectionId,
-    ControllerGeneration, DeviceId, GrantId, RequestId, SessionEpoch, SessionId,
+    ActorId, ApplicationInstanceId, AuthorityRevision, BuildId, ConnectionId, ControllerGeneration,
+    DeviceId, GrantId, RequestId, SessionEpoch, SessionId,
 };
 use kr_protocol::local::{ForwardedRequest, LocalClientKind};
 use kr_protocol::method::{Method, MethodVersion};
@@ -269,7 +269,11 @@ fn fits_the_frame(answer: &ParamsValue) {
 }
 
 /// Reads one part on the owner's own connection, and holds it to the frame.
-async fn part(client: &mut LocalClient, host: &Host, from_node: Option<u64>) -> AgentSnapshotResult {
+async fn part(
+    client: &mut LocalClient,
+    host: &Host,
+    from_node: Option<u64>,
+) -> AgentSnapshotResult {
     let answer = within(
         "the worker's answer",
         client.request(Method::AgentSnapshot, &params(host, from_node)),
@@ -344,11 +348,18 @@ async fn a_history_larger_than_the_frame_is_read_in_parts_that_each_fit() {
         assert!(!part.history_gap);
         assert_eq!(part.withheld_entries, U64::new(0));
     }
+    assert!(
+        entries(&parts)
+            .iter()
+            .all(|entry| entry.omitted_text_bytes == U64::new(0)),
+        "an entry that fits a part is carried whole"
+    );
 }
 
 /// KR-REQ-08.72: an entry larger than the reader's frame on its own is carried in a part of its
-/// own with its text cut, at a character boundary, rather than ending every part at itself; the
-/// entries on either side of it are read whole, once and in order.
+/// own with its text cut, at a character boundary, and says how many bytes of it were left out,
+/// rather than ending every part at itself; the entries on either side of it are read whole, once
+/// and in order.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_entry_larger_than_the_frame_is_carried_cut() {
     let host = host().await;
@@ -356,7 +367,11 @@ async fn an_entry_larger_than_the_frame_is_carried_cut() {
     let large = "€".repeat(12 * 1024);
     converse(
         &host,
-        &[("said before", 1_000), (large.as_str(), 1_001), ("said after", 1_002)],
+        &[
+            ("said before", 1_000),
+            (large.as_str(), 1_001),
+            ("said after", 1_002),
+        ],
     );
 
     let mut reader = owner(&host, smallest()).await;
@@ -372,6 +387,13 @@ async fn an_entry_larger_than_the_frame_is_carried_cut() {
         cut.len(),
         large.len()
     );
+    assert_eq!(
+        read[1].omitted_text_bytes.get(),
+        (large.len() - cut.len()) as u64,
+        "it says how many bytes of its text it left out"
+    );
+    assert_eq!(read[0].omitted_text_bytes, U64::new(0), "a whole text");
+    assert_eq!(read[2].omitted_text_bytes, U64::new(0), "a whole text");
 }
 
 /// KR-REQ-23.39, the control: a history that fits one frame is answered whole, in one part with no

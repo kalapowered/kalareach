@@ -28,6 +28,7 @@ use kr_protocol::ids::{
 use kr_protocol::method::{Method, MethodVersion, decide};
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{Bytes, Digest256, Nullable, TimestampMs, U64, Uuid};
+use kr_protocol::semantic::MAX_SEMANTIC_SNAPSHOT_BYTES;
 use kr_worker::persistence::JournalHealth;
 
 mod common;
@@ -465,6 +466,7 @@ fn kr_req_23_39_an_agent_read_names_the_instance_carries_its_evidence_and_report
             &GrantLowerBound {
                 from: StreamCursor::new(4),
             },
+            kr_protocol::limits::MAX_CONTROL_FRAME_LEN,
         )
         .expect("the read succeeds");
     assert_eq!(filtered.entries.len(), 2);
@@ -1018,6 +1020,7 @@ fn kr_req_24_24_a_replay_starts_after_the_consumed_cursor_and_an_eviction_shows_
                 &GrantLowerBound {
                     from: StreamCursor::new(1),
                 },
+                MAX_SEMANTIC_SNAPSHOT_BYTES,
             )
             .expect("the replay succeeds");
         assert_eq!(replay.entries.len(), 5);
@@ -1057,6 +1060,7 @@ fn kr_req_24_24_a_replay_starts_after_the_consumed_cursor_and_an_eviction_shows_
             &GrantLowerBound {
                 from: StreamCursor::new(1),
             },
+            MAX_SEMANTIC_SNAPSHOT_BYTES,
         )
         .expect("the replay succeeds");
     assert!(
@@ -1087,6 +1091,7 @@ fn kr_req_24_24_a_replay_starts_after_the_consumed_cursor_and_an_eviction_shows_
             &GrantLowerBound {
                 from: StreamCursor::new(1),
             },
+            MAX_SEMANTIC_SNAPSHOT_BYTES,
         )
         .expect("the replay succeeds");
     assert!(
