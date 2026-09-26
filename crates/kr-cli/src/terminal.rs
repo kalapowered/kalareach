@@ -1038,7 +1038,7 @@ mod unix {
     ///
     /// The four mode words and every control character. The words alone would restore a terminal
     /// whose modes look right and whose interrupt key does nothing.
-    #[derive(Clone, Debug, PartialEq, Eq)]
+    #[derive(Clone, PartialEq, Eq)]
     pub struct SavedModes {
         /// Input modes.
         pub input: u64,
@@ -1051,6 +1051,20 @@ mod unix {
         /// The control characters, including the interrupt, the end of file, and the two that
         /// decide whether a read waits for a line.
         pub special: Vec<u8>,
+    }
+
+    impl std::fmt::Debug for SavedModes {
+        /// The mode flags, and how many special characters there are. Never the characters.
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter
+                .debug_struct("SavedModes")
+                .field("input", &self.input)
+                .field("output", &self.output)
+                .field("control", &self.control)
+                .field("local", &self.local)
+                .field("special", &self.special.len())
+                .finish()
+        }
     }
 
     impl SavedModes {

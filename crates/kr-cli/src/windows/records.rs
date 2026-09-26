@@ -330,13 +330,27 @@ impl RecordReader {
 }
 
 /// One thing to dispatch, in the order the console reported it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum EncodedEvent {
     /// Input to write into the session, already in the encoding the session asked for.
     Input(Vec<u8>),
     /// A record that is its own operation: a resize, a mouse event, or one this command does not
     /// act on.
     Console(ConsoleEvent),
+}
+
+impl std::fmt::Debug for EncodedEvent {
+    /// Which event it is, and how many bytes an input carries. Never the bytes, which a person
+    /// typed.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Input(bytes) => formatter
+                .debug_struct("Input")
+                .field("bytes", &bytes.len())
+                .finish(),
+            Self::Console(event) => formatter.debug_tuple("Console").field(event).finish(),
+        }
+    }
 }
 
 /// One record the console reported.

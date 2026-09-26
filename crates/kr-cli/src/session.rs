@@ -226,7 +226,7 @@ pub fn how_it_closed(record: &ClosureRecord) -> Shown {
 }
 
 /// How an attach presents the session.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct AttachOptions {
     /// Take size ownership for this terminal.
     pub take_geometry: bool,
@@ -246,6 +246,19 @@ pub struct AttachOptions {
     /// attachment that follows delivers it in front of its own handshake's typing, in the order
     /// it was typed.
     pub typed_before: Vec<u8>,
+}
+
+impl std::fmt::Debug for AttachOptions {
+    /// The switches, and how many bytes were typed before. Never those bytes.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AttachOptions")
+            .field("take_geometry", &self.take_geometry)
+            .field("no_probe", &self.no_probe)
+            .field("follow_live", &self.follow_live)
+            .field("typed_before", &self.typed_before.len())
+            .finish()
+    }
 }
 
 /// How far one scroll-back step moves this terminal's window.
@@ -387,14 +400,24 @@ struct PointerReport {
 /// held cannot be a report, which is a few bytes and a moment rather than input held back:
 /// forwarding half a report, or coordinates that describe somebody's history, is a click in a cell
 /// nobody pointed at.
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct PointerReports {
     /// The beginning of a report, waiting for the rest of it.
     held: Vec<u8>,
 }
 
+impl std::fmt::Debug for PointerReports {
+    /// How many bytes it holds back. Never the bytes, which a person typed.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PointerReports")
+            .field("held", &self.held.len())
+            .finish()
+    }
+}
+
 /// What the classifier took out of one batch.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Default, PartialEq, Eq)]
 struct Pointers {
     /// The reports, in the order they arrived.
     reports: Vec<PointerReport>,
@@ -402,6 +425,18 @@ struct Pointers {
     input: Vec<u8>,
     /// Whether the beginning of a report is being held.
     holding: bool,
+}
+
+impl std::fmt::Debug for Pointers {
+    /// How many reports and bytes it holds. Never a report or a byte, which a person typed.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Pointers")
+            .field("reports", &self.reports.len())
+            .field("input", &self.input.len())
+            .field("holding", &self.holding)
+            .finish()
+    }
 }
 
 /// How much of a pointer report a run of bytes is.
