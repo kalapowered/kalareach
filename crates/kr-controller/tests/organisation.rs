@@ -1351,6 +1351,72 @@ async fn a_device_without_an_organisation_grant_cannot_bind() {
     assert!(installed.bound);
 }
 
+/// A lease is judged at a reading no older than the policy's lock its presentation is decided
+/// under. A presentation that read the clock before the lease ran out, and waited for the lock
+/// while it did, is refused as expired. The control: with the clock short of the lease's expiry,
+/// it installs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lease_that_runs_out_while_its_presentation_waits_is_refused() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    for runs_out in [false, true] {
+        let temp = kr_ipc::testing::TempHost::create();
+        let wall = Arc::new(AtomicU64::new(kr_ipc::now_ms().get()));
+        let clocks = kr_controller::service::Clocks {
+            continuous: Arc::new(ManualClock::new()),
+            wall: kr_controller::service::WallClock::from_fn({
+                let wall = Arc::clone(&wall);
+                move || wall.load(Ordering::SeqCst)
+            }),
+        };
+        let controller = start_daemon_on(&temp.environment(), temp.environment_id(), clocks).await;
+        let now = wall.load(Ordering::SeqCst);
+        let mut organisation = Organisation::new(0x35, now - 2 * DAY_MS);
+        organisation.rotate(now - DAY_MS);
+        let revision = controller.policy().authority_revision();
+        controller
+            .update_policy(|policy| organisation.enrol(policy, now))
+            .expect("the enrolment is written down");
+        let phone = device();
+        let key = *phone.public();
+        let paired = member_device(0x4a, key, Some((organisation.organisation_id, revision)));
+        let device_id = paired.device_id;
+        controller.devices().commit(&paired).expect("paired");
+        // Issued fourteen minutes ago, so it runs out a minute from now.
+        let lease = organisation.lease(2, &member("ada"), key, now - 14 * 60 * 1000, VIEW);
+        let expires_at_ms = lease.payload.expires_at_ms.get();
+
+        let (arrived, go) = controller.pause_presentation_before_lock();
+        let presenting = {
+            let controller = Arc::clone(&controller);
+            tokio::task::spawn_blocking(move || {
+                controller
+                    .present_membership_lease(device_id, &key, &lease)
+                    .expect("storage")
+            })
+        };
+        tokio::task::spawn_blocking(move || arrived.recv())
+            .await
+            .expect("the wait ends")
+            .expect("the presentation read the clock and reached the lock");
+        if runs_out {
+            wall.store(expires_at_ms, Ordering::SeqCst);
+        }
+        go.send(()).expect("the presentation waits");
+        let outcome = presenting.await.expect("presented");
+        if runs_out {
+            assert_eq!(
+                outcome,
+                Err(LeaseRefused::Expired),
+                "judged at the reading taken under the lock"
+            );
+            assert!(binding_of(&controller, organisation.organisation_id, device_id).is_none());
+        } else {
+            assert!(outcome.expect("the control: the lease installs").bound);
+        }
+    }
+}
+
 /// A presentation and a revocation of its device cannot interleave so that the revoked device
 /// ends up bound: the presentation decides the device's standing under the policy's lock and
 /// holds it until the binding is published, so a revocation recorded while the presentation waited

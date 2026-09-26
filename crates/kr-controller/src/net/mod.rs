@@ -1633,7 +1633,7 @@ impl Controller {
         &self,
         grant: &kr_protocol::grant::Grant,
         record: &crate::grants::GrantRecord,
-        request: crate::grants::AccessRequest,
+        mut request: crate::grants::AccessRequest,
     ) -> std::result::Result<DeviceDecision, crate::config::ceilings::CeilingRefusal> {
         let ceiling = self
             .rights_ceiling
@@ -1644,6 +1644,11 @@ impl Controller {
             .policy
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // The decision stands on readings no older than the lock it is taken under: the caller's,
+        // raised to what both clocks read once the lock is held, so an end that passed while this
+        // waited for the lock is found.
+        request.now_ms = request.now_ms.max(self.wall_now_ms());
+        request.continuous_now = request.continuous_now.max(self.clock.now());
         // A floor still owed its record is written before anything is decided on it, whoever owed
         // it: an earlier refusal here, or a worker of this host whose copy's deadline passed at a
         // reading nothing had written down. The decision then stands on the record rather than
@@ -2021,6 +2026,43 @@ pub(crate) mod tests {
             .expect("the host has written its policy")
             .utc_floor_ms
             .get()
+    }
+
+    /// A device's request is decided at readings no older than the policy's lock it is decided
+    /// under. A reading its caller took before the grant ran out does not decide it once the wall
+    /// clock has passed the grant's expiry, as when the expiry passes while the decision waits for
+    /// the lock. The control: with the wall clock short of the expiry, it is permitted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_device_decision_reads_the_clocks_once_its_lock_is_held() {
+        for passed in [false, true] {
+            let temp = kr_ipc::testing::TempHost::create();
+            let (_continuous, wall, clocks) = manual_clocks();
+            let controller = daemon_on(&temp, clocks).await;
+            let now = wall.load(std::sync::atomic::Ordering::SeqCst);
+            let expires = now + 60_000;
+            let (expiring, record) = granted(
+                GrantExpiry::At {
+                    expires_at_ms: TimestampMs::new(expires),
+                },
+                controller.policy().authority_revision(),
+            );
+            if passed {
+                wall.store(expires, std::sync::atomic::Ordering::SeqCst);
+            }
+            let decided = controller.decide_for_device(&expiring, &record, listing(&temp, now));
+            if passed {
+                assert!(
+                    matches!(
+                        decided,
+                        Err(CeilingRefusal::Refused(Refusal::Expired { .. }))
+                    ),
+                    "decided at the reading taken under the lock: {decided:?}"
+                );
+            } else {
+                decided.expect("before the expiry the grant stands");
+            }
+            drop(controller);
+        }
     }
 
     /// A refusal the clock decided outlives a failed write of its floor: the next decision writes
@@ -3044,14 +3086,18 @@ pub(crate) mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_offline_bound_runs_from_when_it_was_chosen_and_not_from_its_first_use() {
         let temp = kr_ipc::testing::TempHost::create();
-        let controller = daemon(&temp).await;
+        // On clocks the test moves by hand: the continuous clock passes the bound while the wall
+        // clock stands still, so any moment the floor held past it would be one the continuous
+        // clock implied.
+        let (continuous, wall, clocks) = manual_clocks();
+        let controller = daemon_on(&temp, clocks).await;
         let revision = controller.policy().authority_revision();
-        let synchronised = kr_ipc::now_ms().get();
+        let synchronised = wall.load(std::sync::atomic::Ordering::SeqCst);
         choose_offline_bound(&controller, synchronised, 200);
         let (lasting, lasting_record) = granted(GrantExpiry::Never, revision);
         let floor = controller.policy().utc_floor_ms();
 
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        continuous.advance(std::time::Duration::from_millis(300));
         offline_lapsed(
             controller.decide_for_device(&lasting, &lasting_record, listing(&temp, synchronised)),
             "the bound ran out while nothing asked",

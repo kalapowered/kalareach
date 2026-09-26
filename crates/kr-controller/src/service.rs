@@ -2764,6 +2764,10 @@ impl Controller {
             .policy
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // The lease is judged at a reading no older than the lock it is decided under: a fresh
+        // one, raised into the floor its judgement reads, so a lease that ran out while this
+        // waited is found run out.
+        self.settled_utc_now();
         match self.organisation_standing(device_id, organisation_id)? {
             Standing::Holds => {}
             Standing::Lacks => return Ok(Err(LeaseRefused::NoOrganisationGrant)),

@@ -147,7 +147,18 @@ impl RecipientAuthority for GrantedRecipients {
         // can have run out while this waited for it. The policy is decided at the same readings.
         let now_ms = self.lifetimes.settled_utc_now();
         let continuous_now = self.lifetimes.continuous_now();
-        if record.state(now_ms) != GrantState::Active || !anchored.holds_at(continuous_now) {
+        if record.revoked_at_ms.is_some() || !record.is_active() {
+            return None;
+        }
+        if !anchored.holds_at(continuous_now) || !grant.expiry.is_valid_at(now_ms) {
+            // Run out while this waited. The end is owed its tombstone, as every end this host
+            // finds is, and it is written once the policy's lock is let go: a later boot reads
+            // the tombstone before it derives anything.
+            drop(policy);
+            if anchored != crate::service::net::lifetimes::Anchored::Over {
+                self.lifetimes.owe_stored_expiry(grant.grant_id);
+                self.lifetimes.settle_stored(self.sharing.grants());
+            }
             return None;
         }
         if grant.authority_revision.get() > policy.authority_revision().get()
@@ -281,8 +292,9 @@ mod tests {
     }
 
     /// A grant that runs out while its question waits for the policy's lock admits nothing: both of
-    /// its deadlines are read again once the lock is held, on UTC and on the continuous clock alike.
-    /// The control: with the clocks left where they were, the question admits its recipient.
+    /// its deadlines are read again once the lock is held, on UTC and on the continuous clock alike,
+    /// and the end is written down as its tombstone. The control: with the clocks left where they
+    /// were, the question admits its recipient and nothing is written.
     #[test]
     fn a_grant_that_runs_out_while_its_question_waits_for_the_lock_admits_nothing() {
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -326,6 +338,25 @@ mod tests {
                 runs_out.is_none(),
                 "run out {}",
                 runs_out.unwrap_or("nowhere")
+            );
+            // An end found there is written down as the grant's tombstone, so a host that holds
+            // no anchor for the grant, as after a reboot, finds it ended too.
+            let tombstone = sharing
+                .grants()
+                .grant_expired_at(GrantId::new(uuid(13)))
+                .expect("the store reads");
+            assert_eq!(tombstone.is_some(), runs_out.is_some());
+            let afresh = GrantedRecipients::at(
+                Arc::clone(&sharing),
+                personal(),
+                environment(),
+                Arc::new(kr_transport::clock::ManualClock::new()),
+                move || NOW,
+            );
+            assert_eq!(
+                afresh.scope_for(&rule(Some(13))).is_some(),
+                runs_out.is_none(),
+                "and a host with no anchor for it answers as the record says"
             );
         }
     }
