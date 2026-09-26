@@ -473,9 +473,9 @@ struct Debugs {
     guarded: usize,
     /// The workspace's crates, as code names them.
     crates: BTreeSet<String>,
-    /// Every module of the workspace by its full path, with the source and the scope that give its
-    /// names.
-    modules: BTreeMap<String, (usize, usize)>,
+    /// Every module of the workspace by its full path, with each source and scope that gives its
+    /// names: one for each set of `cfg` conditions that declares it.
+    modules: BTreeMap<String, Vec<(usize, usize)>>,
     /// Every macro a crate of the workspace writes, by full path, and whether it exports it at its
     /// crate's root.
     macros: BTreeMap<String, bool>,
@@ -563,7 +563,8 @@ impl Debugs {
                 if !entry.block {
                     modules
                         .entry(source.module_of(scope).join("::"))
-                        .or_insert((index, scope));
+                        .or_insert_with(Vec::new)
+                        .push((index, scope));
                 }
             }
             let tokens = &source.tokens;
@@ -675,10 +676,10 @@ impl Debugs {
     }
 
     /// Each place a source uses a macro it writes itself: the name's index, its scope, and the
-    /// macro's body with the item's name the use gives it. A name is that macro only where the
-    /// compiler takes it so: after the macro is written, in its scope or one inside it, the latest
-    /// of that name; anywhere else the name is another macro, whose types this reading does not
-    /// know.
+    /// macro's body with the item's name the use gives it. A name is such a macro only where the
+    /// compiler can take it so: after the macro is written, in its scope or one inside it; each
+    /// macro of that name there is read, since `cfg` decides which of them is the latest.
+    /// Anywhere else the name is another macro, whose types this reading does not know.
     fn expansions(
         &self,
         index: usize,
@@ -700,27 +701,20 @@ impl Debugs {
                 continue;
             }
             let scope = source.scope_at(at);
-            // `macro_rules`, `!` and the name come before the body.
-            let written = macros
-                .iter()
-                .filter(|(name, open, close)| {
-                    name == word
-                        && *close < at
-                        && encloses(source, source.scope_at(open - 3), scope)
-                })
-                .max_by_key(|(_, _, close)| *close);
-            let Some((_, open, close)) = written else {
-                continue;
-            };
             let Some(group_close) = closing(tokens, at + 2) else {
                 continue;
             };
             let invoked = first_word(&tokens[at + 3..group_close]);
-            found.push((
-                at,
-                scope,
-                substitute(&tokens[*open + 1..*close], invoked.as_deref()),
-            ));
+            // `macro_rules`, `!` and the name come before the body.
+            for (_, open, close) in macros.iter().filter(|(name, open, close)| {
+                name == word && *close < at && encloses(source, source.scope_at(open - 3), scope)
+            }) {
+                found.push((
+                    at,
+                    scope,
+                    substitute(&tokens[*open + 1..*close], invoked.as_deref()),
+                ));
+            }
         }
         found
     }
@@ -1979,7 +1973,7 @@ impl Debugs {
                 reach: Reach::Unsure,
             }]);
         }
-        let Some(&(index, scope)) = self.modules.get(module) else {
+        let Some(scopes) = self.modules.get(module) else {
             let root = module.split("::").next().unwrap_or_default();
             if !self.crates.contains(root) {
                 let reach = if full == DEBUG_TRAIT || LIBRARY_MACROS.contains(&full.as_str()) {
@@ -2014,13 +2008,23 @@ impl Debugs {
             return Ok(Vec::new());
         }
         visiting.push(key);
-        let given = self.module_member(index, scope, module, name, visiting);
+        // A module declared once for each set of `cfg` conditions gives what any of them gives.
+        let mut given = Vec::new();
+        for &(index, scope) in scopes {
+            match self.module_member(index, scope, module, name, visiting) {
+                Ok(named) => given.extend(named),
+                Err(why) => {
+                    visiting.pop();
+                    return Err(why);
+                }
+            }
+        }
         visiting.pop();
-        given
+        Ok(given)
     }
 
-    /// [`Debugs::member`] for a module of the workspace, whose names `scope` of source `index`
-    /// gives.
+    /// [`Debugs::member`] for one declaration of a module of the workspace, whose names `scope` of
+    /// source `index` gives.
     fn module_member(
         &self,
         index: usize,
@@ -2273,8 +2277,9 @@ impl Debugs {
         if self.decided(&path) {
             return None;
         }
+        // A path defined once for each set of `cfg` conditions, as aliases, types or both, carries
+        // when any definition does.
         if let Some(aliases) = self.type_aliases.get(&path) {
-            // An alias defined once for each set of `cfg` conditions carries when any does.
             for alias in aliases {
                 let Some(expanded) = self.expand_alias(alias, written, &positional) else {
                     return Some(format!("{path}, an alias this reading cannot expand"));
@@ -2285,7 +2290,9 @@ impl Debugs {
                     return why;
                 }
             }
-            return None;
+            if !self.declared.contains_key(&path) {
+                return None;
+            }
         }
         if let Some(definitions) = self.declared.get(&path) {
             if let Some(why) = carrying.get(&path) {
@@ -2847,11 +2854,17 @@ impl Reading<'_> {
                 self.bind_unknown(sub, from, to);
                 continue;
             };
+            // A field defined more than once, once for each set of `cfg` conditions, has no one type.
             let written = member.and_then(|member| {
-                members
+                match members
                     .iter()
-                    .find(|(candidate, _)| *candidate == member)
-                    .map(|(_, written)| written.clone())
+                    .filter(|(candidate, _)| *candidate == member)
+                    .collect::<Vec<_>>()
+                    .as_slice()
+                {
+                    [(_, written)] => Some(written.clone()),
+                    _ => None,
+                }
             });
             self.bindings.push(Binding {
                 name,
@@ -2889,11 +2902,17 @@ impl Reading<'_> {
     /// type.
     fn shape_of(&self, scrutinee: &Written, name: &str) -> Option<Vec<(String, Written)>> {
         let declared = self.declaration(scrutinee)?;
-        let shape = declared
+        // A variant defined more than once, once for each set of `cfg` conditions, has no one shape.
+        let named: Vec<&Shape> = declared
             .shapes
             .iter()
-            .find(|shape| shape.name == name)
-            .or_else(|| (declared.shapes.len() == 1).then(|| &declared.shapes[0]))?;
+            .filter(|shape| shape.name == name)
+            .collect();
+        let shape = match named.as_slice() {
+            [shape] => *shape,
+            [] if declared.shapes.len() == 1 => &declared.shapes[0],
+            _ => return None,
+        };
         Some(
             shape
                 .members
@@ -2908,16 +2927,21 @@ impl Reading<'_> {
         let inner = self.dereferenced(written)?;
         let (segments, _) = spelled_path(&inner.tokens);
         let path = self.debugs.resolve(&inner, &segments).ok()?;
-        // A type with more than one definition, one for each set of `cfg` conditions, is one whose
-        // fields this reading cannot tell apart.
-        if let Some(aliases) = self.debugs.type_aliases.get(&path) {
-            let [alias] = aliases.as_slice() else {
-                return None;
-            };
-            return self.declaration(alias);
-        }
-        match self.debugs.declared.get(&path)?.as_slice() {
-            [declared] => Some(declared),
+        // A type with more than one definition, one for each set of `cfg` conditions, as aliases,
+        // types or both, is one whose fields this reading cannot tell apart.
+        let aliases = self
+            .debugs
+            .type_aliases
+            .get(&path)
+            .map_or(&[][..], Vec::as_slice);
+        let definitions = self
+            .debugs
+            .declared
+            .get(&path)
+            .map_or(&[][..], Vec::as_slice);
+        match (aliases, definitions) {
+            ([alias], []) => self.declaration(alias),
+            ([], [declared]) => Some(declared),
             _ => None,
         }
     }
@@ -2998,13 +3022,27 @@ impl Reading<'_> {
         let declared = self
             .declaration(of)
             .ok_or_else(|| "a field of a type this reading cannot place".to_owned())?;
-        let member = declared
+        let members: Vec<&Member> = declared
             .shapes
             .iter()
             .filter(|shape| shape.name == declared.name)
             .flat_map(|shape| &shape.members)
-            .find(|member| member.name == name)
-            .ok_or_else(|| format!("the field `{name}`, which this reading cannot find"))?;
+            .filter(|member| member.name == name)
+            .collect();
+        let member = match members.as_slice() {
+            [member] => *member,
+            [] => {
+                return Err(format!(
+                    "the field `{name}`, which this reading cannot find"
+                ));
+            }
+            _ => {
+                return Err(format!(
+                    "the field `{name}`, which has more than one definition, one for each set of \
+                     cfg conditions"
+                ));
+            }
+        };
         let (segments, after) = spelled_path(&strip_references(&member.written.tokens));
         if segments.len() == 1
             && member.written.generics.contains(&segments[0])
@@ -4184,6 +4222,48 @@ fn each_name_is_placed_where_the_compiler_places_it() {
             "#[cfg(unix)]\ntype Raw = String;\n#[cfg(not(unix))]\ntype Raw = u64;\n#[derive(Debug)]\npub struct Leak(pub Raw);\n",
             5,
             "std::string::String",
+        ),
+        (
+            "a type another crate declares with a macro written once for each platform",
+            "#[cfg(unix)]\nmacro_rules! declare {\n    ($name:ident) => {\n        #[derive(Debug)]\n        pub struct $name(pub String);\n    };\n}\n#[cfg(not(unix))]\nmacro_rules! declare {\n    ($name:ident) => {\n        #[derive(Debug)]\n        pub struct $name(pub u64);\n    };\n}\ndeclare!(Opaque);\n",
+            "#[derive(Debug)]\npub struct Leak(pub kr_other::Opaque);\n",
+            1,
+            "a derived Debug over text that arrived",
+        ),
+        (
+            "a type another crate defines as a struct on one platform and an alias on another",
+            "#[cfg(unix)]\n#[derive(Debug)]\npub struct Platform(pub String);\n#[cfg(not(unix))]\npub type Platform = u64;\n",
+            "#[derive(Debug)]\npub struct Leak(pub kr_other::Platform);\n",
+            1,
+            "a derived Debug over text that arrived",
+        ),
+        (
+            "a name one module path gives once for each platform",
+            "#[cfg(not(unix))]\npub mod platform {\n    pub use std::time::Duration as Handle;\n}\n#[cfg(unix)]\npub mod platform {\n    pub use std::string::String as Handle;\n}\n",
+            "#[derive(Debug)]\npub struct Leak(pub kr_other::platform::Handle);\n",
+            1,
+            "a derived Debug over text that arrived",
+        ),
+        (
+            "a field defined once for each platform, read by a Debug written by hand",
+            "",
+            "pub struct Leak {\n    #[cfg(not(unix))]\n    pub text: u64,\n    #[cfg(unix)]\n    pub text: String,\n}\nimpl std::fmt::Debug for Leak {\n    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n        formatter.debug_struct(\"Leak\").field(\"text\", &self.text).finish()\n    }\n}\n",
+            9,
+            "more than one definition",
+        ),
+        (
+            "a variant defined once for each platform, matched by a Debug written by hand",
+            "",
+            "pub enum Leak {\n    #[cfg(not(unix))]\n    Said(u64),\n    #[cfg(unix)]\n    Said(String),\n}\nimpl std::fmt::Debug for Leak {\n    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n        match self {\n            Self::Said(said) => formatter.debug_tuple(\"Said\").field(said).finish(),\n        }\n    }\n}\n",
+            10,
+            "a value this reading cannot place",
+        ),
+        (
+            "a trait a glob gives on one platform only, past which the outer name is the Debug trait",
+            "pub mod names {\n    #[cfg(unix)]\n    #[allow(dead_code)]\n    trait Debug {}\n    #[cfg(not(unix))]\n    pub trait Debug {\n        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result;\n    }\n    pub fn open() {}\n}\n",
+            "use std::fmt::Debug;\npub struct Leak(pub String);\nconst _: () = {\n    use kr_other::names::*;\n    impl Debug for Leak {\n        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n            formatter.debug_tuple(\"Leak\").field(&self.0).finish()\n        }\n    }\n};\n",
+            5,
+            "a trait this reading cannot place",
         ),
         (
             "an extern crate",
