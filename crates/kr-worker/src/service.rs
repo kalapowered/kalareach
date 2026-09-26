@@ -4482,6 +4482,11 @@ impl WorkerService {
             state,
             Self::answer_bytes(&session.snapshot(Self::no_resources())),
         )?;
+        // What a fresh snapshot replaces for the subscription this connection is delivering, if it
+        // is held to a scope. It is replaced once the answer is one this connection is sent, still
+        // under this lock: a refused snapshot leaves the subscription's transitions decided by
+        // the snapshot its client holds.
+        let mut replacing = None;
         let page = match params.agent_resources_from.as_ref() {
             None => {
                 let subscribed = session.scoped_subscription(state.connection_id);
@@ -4490,13 +4495,12 @@ impl WorkerService {
                 });
                 let recovered = self.begin_recovery(state, bounds, filter.as_ref());
                 if let (Some(filter), Some((attachment_id, _))) = (filter, subscribed) {
-                    session.hold_resources(
+                    replacing = Some((
                         attachment_id,
-                        state.connection_id,
                         filter,
                         recovered.page.cursor,
                         recovered.shown,
-                    );
+                    ));
                 }
                 recovered.page
             }
@@ -4517,7 +4521,11 @@ impl WorkerService {
         };
         let answer = session.snapshot(Self::agent_resource_snapshot(page));
         Self::within_the_frame(state, &answer)?;
-        encode(&answer)
+        let encoded = encode(&answer)?;
+        if let Some((attachment_id, filter, cursor, shown)) = replacing {
+            session.hold_resources(attachment_id, state.connection_id, filter, cursor, shown);
+        }
+        Ok(encoded)
     }
 
     /// Returns how much of a recovery one page may carry, or refuses the peer outright.
