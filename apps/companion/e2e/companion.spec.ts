@@ -1006,6 +1006,36 @@ test.describe("the phone's room for its terminal", () => {
     })
   }
 
+  /**
+   * How far the focus ring around `locator`'s element runs outside what a person sees of it, on its
+   * most hidden side: outside the screen, or outside any box around it that clips what it holds.
+   * Zero when the whole ring is in view.
+   */
+  async function ringHidden(locator: Locator): Promise<number> {
+    return locator.evaluate((element) => {
+      const style = getComputedStyle(element)
+      const ring = Math.max(0, parseFloat(style.outlineWidth) + parseFloat(style.outlineOffset))
+      const box = element.getBoundingClientRect()
+      const seen = { top: 0, right: window.innerWidth, bottom: window.innerHeight, left: 0 }
+      for (let around = element.parentElement; around !== null; around = around.parentElement) {
+        const clipping = getComputedStyle(around)
+        if (clipping.overflowY === 'visible' && clipping.overflowX === 'visible') continue
+        const clip = around.getBoundingClientRect()
+        seen.top = Math.max(seen.top, clip.top)
+        seen.right = Math.min(seen.right, clip.right)
+        seen.bottom = Math.min(seen.bottom, clip.bottom)
+        seen.left = Math.max(seen.left, clip.left)
+      }
+      return Math.max(
+        0,
+        seen.top - (box.top - ring),
+        box.right + ring - seen.right,
+        box.bottom + ring - seen.bottom,
+        seen.left - (box.left - ring)
+      )
+    })
+  }
+
   /** Waits for the page to tell the host the grid its surface shows, and checks the rows it holds. */
   async function expectRoom(page: Page, rows: number, what: string): Promise<void> {
     await expect
@@ -1057,6 +1087,9 @@ test.describe("the phone's room for its terminal", () => {
           await expect(field).toBeInViewport({ ratio: 1 })
           const box = await field.boundingBox()
           expect(Math.abs((box === null ? 0 : box.y + box.height) - edge)).toBeLessThanOrEqual(1)
+          // The composer scrolls, and cuts what is drawn outside it: the field's focus ring is whole.
+          await field.focus()
+          expect(await ringHidden(field), 'the focus ring is whole in view').toBeLessThanOrEqual(1)
           const keys = page.getByRole('group', { name: 'Terminal keys' })
           await expect(keys).toBeInViewport({ ratio: 1 })
           // The keyboard gone, the bar is back.
@@ -1085,8 +1118,9 @@ test.describe("the phone's room for its terminal", () => {
   }
 
   // A person's own larger text size: every size given in rem grows with it. The field still shows
-  // its whole line at no less than the platform's target, nothing runs past the screen's edge, and
-  // the terminal keeps its four rows of its own, larger, type.
+  // its whole line at no less than the platform's target, it and its focus ring are whole in view,
+  // nothing runs past the screen's edge, and the terminal keeps its four rows of its own, larger,
+  // type.
   for (const surface of ['ios', 'android'] as const) {
     for (const phone of PHONES) {
       for (const scale of ['150%', '200%']) {
@@ -1110,6 +1144,7 @@ test.describe("the phone's room for its terminal", () => {
           expect(fits.height).toBeGreaterThanOrEqual(surface === 'ios' ? 44 : 48)
           // Whole to the pixel: WebKit can leave a scrolled box's last fraction of a pixel out.
           expect(await hiddenPart(field), 'the field is whole in view').toBeLessThanOrEqual(1)
+          expect(await ringHidden(field), 'the focus ring is whole in view').toBeLessThanOrEqual(1)
           const past = await page.evaluate(() =>
             Array.from(document.querySelectorAll<HTMLElement>('.m-composer button, .m-composer textarea'))
               .filter(
@@ -1120,6 +1155,24 @@ test.describe("the phone's room for its terminal", () => {
               .map((element) => element.textContent || element.tagName)
           )
           expect(past).toEqual([])
+          // Nor past the session's own box, whatever the fonts measure: with larger text the view
+          // switch gives each choice a line of its own, and no row widens the session's column.
+          const spill = await page.evaluate(() => {
+            const session = document.querySelector('.m-session')?.getBoundingClientRect()
+            if (session === undefined) return ['no session']
+            return Array.from(
+              document.querySelectorAll<HTMLElement>(
+                '.m-session > *, .m-session .segmented, .m-composer button, .m-composer textarea'
+              )
+            )
+              .filter(
+                (element) =>
+                  element.closest('.m-accessory') === null &&
+                  element.getBoundingClientRect().right > session.right + 0.5
+              )
+              .map((element) => element.textContent?.trim().slice(0, 24) || element.className || element.tagName)
+          })
+          expect(spill, "what reaches past the session's box").toEqual([])
           await expectRoom(page, FLOOR, `text at ${scale}`)
         })
       }
