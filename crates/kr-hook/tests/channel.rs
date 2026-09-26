@@ -374,12 +374,22 @@ async fn a_launch_that_goes_at_once_leaves_nothing_it_started() {
     let forwarder = placed.forwarder.to_string_lossy().into_owned();
 
     drop(launch);
+    // What `pgrep` found: it says no process matched with its status, and anything else it says
+    // fails the case rather than reading as nothing left.
     let listed = |arguments: [&str; 2]| {
         let listed = std::process::Command::new("pgrep")
             .args(arguments)
             .output()
             .expect("pgrep runs");
-        String::from_utf8_lossy(&listed.stdout).trim().to_owned()
+        match listed.status.code() {
+            Some(0) => String::from_utf8_lossy(&listed.stdout).trim().to_owned(),
+            Some(1) => String::new(),
+            _ => panic!(
+                "pgrep {arguments:?} failed ({}): {}",
+                listed.status,
+                String::from_utf8_lossy(&listed.stderr)
+            ),
+        }
     };
     let deadline = std::time::Instant::now() + LIVENESS;
     loop {

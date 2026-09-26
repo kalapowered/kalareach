@@ -138,18 +138,43 @@ impl Application {
     /// Ends the application and everything it started, and collects it.
     ///
     /// The application is ended by its identifier, which is still its own because nothing else
-    /// collects it. Once it has ended, and before it is collected, its group is ended: nothing in
-    /// the group can start anything more, and the group's identifier can name no other group. Then
-    /// the application is collected.
+    /// collects it, and its end is waited for without collecting it. Its group is then ended:
+    /// nothing in the group can start anything more by then, and while the application is not
+    /// collected its group's identifier can name no other group. Then the application is
+    /// collected.
+    ///
+    /// # Panics
+    ///
+    /// When its end cannot be waited for or its group cannot be signalled, unless a panic is
+    /// already unwinding: a cleanup that did not happen fails the test rather than leaving a
+    /// process behind unsaid.
     fn end(&mut self) {
+        use rustix::io::Errno;
+        use rustix::process::{Pid, Signal, WaitId, WaitIdOptions, kill_process_group, waitid};
+
+        let pid = Pid::from_child(&self.child);
         let _ = self.child.kill();
-        if !collected_elsewhere(self.child.id()) {
-            let _ = std::process::Command::new("kill")
-                .args(["-KILL", "--", &format!("-{}", self.child.id())])
-                .stderr(std::process::Stdio::null())
-                .status();
-        }
+        let ended = loop {
+            match waitid(
+                WaitId::Pid(pid),
+                WaitIdOptions::EXITED | WaitIdOptions::NOWAIT,
+            ) {
+                Err(Errno::INTR) => {}
+                ended => break ended,
+            }
+        };
+        let ended = ended.and_then(|_| match kill_process_group(pid, Signal::KILL) {
+            // No group: the application ended before it made one, so it had started nothing. And
+            // a group left holding only processes that have ended, which macOS refuses to signal.
+            Err(Errno::SRCH | Errno::PERM) => Ok(()),
+            signalled => signalled,
+        });
         let _ = self.child.wait();
+        if let Err(error) = ended
+            && !std::thread::panicking()
+        {
+            panic!("the launch could not end what its application started: {error}");
+        }
     }
 }
 
@@ -315,35 +340,6 @@ impl Drop for Launch {
     fn drop(&mut self) {
         self.application.end();
     }
-}
-
-/// Waits, within the liveness bound, until the process `pid` names has ended, and says whether
-/// something other than its parent has collected it since.
-///
-/// One that has ended and waits to be collected has not, and neither, as far as anything here can
-/// tell, has one `ps` cannot read. Only a host that collects every child for its parent could have,
-/// and there the group is left alone: the group's identifier could by then name another group.
-fn collected_elsewhere(pid: u32) -> bool {
-    let pid = pid.to_string();
-    let deadline = std::time::Instant::now() + LIVENESS;
-    while std::time::Instant::now() < deadline {
-        let Ok(listed) = std::process::Command::new("ps")
-            .args(["-o", "stat=", "-p", &pid])
-            .output()
-        else {
-            return false;
-        };
-        match String::from_utf8_lossy(&listed.stdout)
-            .trim_start()
-            .chars()
-            .next()
-        {
-            Some('Z') => return false,
-            None => return true,
-            Some(_) => std::thread::sleep(Duration::from_millis(5)),
-        }
-    }
-    false
 }
 
 /// What one hook the application ran produced, once it has ended.

@@ -44,6 +44,9 @@ kr-ipc = { workspace = true, features = ["testing"] }
 # The launcher is proved against the worker's own command backends, with the connector package
 # fixture and the test-only pauses the feature compiles in.
 kr-worker = { workspace = true, features = ["testing"] }
+# A launch's tests wait for the stand-in application's end without collecting it, and end the
+# process group it leads, through the kernel's own calls rather than by reading what `ps` prints.
+rustix = { workspace = true, features = ["process"] }
 # The bridge files the plugin package installs are pinned here by their SHA-256 digests.
 sha2.workspace = true
 tokio = { workspace = true, features = ["io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
