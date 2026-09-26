@@ -4649,7 +4649,18 @@ dependencies = [
 name = "kr-perf"
 version = "0.1.0"
 dependencies = [
+ "kr-controller",
+ "kr-crypto",
+ "kr-ipc",
+ "kr-plugin-sdk",
+ "kr-plugin-service",
+ "kr-protocol",
+ "kr-worker",
+ "rusqlite",
+ "rustix",
+ "serde_json",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]

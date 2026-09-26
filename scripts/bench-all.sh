@@ -12,6 +12,8 @@
 #   transport     kr-transport's scheduling and reconnect     KR-PERF-005 and KR-PERF-006
 #   reconnect     kr-client's half of a reconnect             KR-PERF-006
 #   companion     the companion's semantic display            KR-PERF-008
+#   stress        section 27's 50-session stress run          KR-PERF-001, KR-PERF-003 and
+#                 (tests/perf)                                KR-PERF-007 under the stress
 #   descriptions  scripts/bench-descriptions.sh               KR-PERF-009, where the host can hold
 #                                                             its budget
 #
@@ -62,7 +64,7 @@ usage() {
   exit 2
 }
 
-all_steps="performance terminal transport reconnect companion descriptions"
+all_steps="performance terminal transport reconnect companion stress descriptions"
 reference=0
 only=""
 while [ "$#" -gt 0 ]; do
@@ -282,6 +284,11 @@ fi
 if selected companion; then
   build pnpm install --frozen-lockfile
 fi
+if selected stress; then
+  build cargo test --locked --release --no-run -p kr-perf --test stress
+  # The fixture package the plugin host serves beside the stress run's sessions.
+  build bash scripts/build-plugin-fixtures.sh
+fi
 if [ "$build_failed" -ne 0 ]; then
   echo "bench-all: the build failed, so nothing was measured"
   exit 1
@@ -495,6 +502,12 @@ if selected companion; then
     add_problem companion KR-PERF-008 "KR-PERF-008 recorded no figure"
   fi
 fi
+if selected stress; then
+  run_step stress \
+    "KR-PERF-001:kr-perf-stress.md KR-PERF-003:kr-perf-stress.md KR-PERF-007:kr-perf-stress.md" \
+    env KR_REQUIRE_PLUGIN_FIXTURES=1 cargo test --locked --release -p kr-perf --test stress -- \
+    --ignored --nocapture
+fi
 if selected descriptions; then
   refusal="$(descriptions_refusal)"
   if [ -n "$refusal" ]; then
@@ -540,6 +553,7 @@ identifiers_of() {
     transport) echo "KR-PERF-005 KR-PERF-006" ;;
     reconnect) echo "KR-PERF-006" ;;
     companion) echo "KR-PERF-008" ;;
+    stress) echo "KR-PERF-001 KR-PERF-003 KR-PERF-007" ;;
     descriptions) echo "KR-PERF-009" ;;
   esac
 }

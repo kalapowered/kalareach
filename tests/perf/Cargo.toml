@@ -1,6 +1,6 @@
 [package]
 name = "kr-perf"
-description = "The performance harness: the record a figure is kept in beside its host's conditions, and the checks on the performance scripts"
+description = "The performance harness: the record a figure is kept in beside its host's conditions, section 27's 50-session stress run, and the checks on the performance scripts"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,9 +8,32 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[[bin]]
+# The program each stress session runs as its shell's foreground command, writing terminal output at
+# a steady rate.
+name = "kr-perf-writer"
+path = "src/bin/kr-perf-writer.rs"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Linux keeps a process's processor time in clock ticks, and this is where their rate is read.
+rustix = { workspace = true, features = ["param"] }
+
 [dev-dependencies]
+# The stress run's host: the daemon in this process, starting real workers, and the plugin host
+# serving a fixture package. The host tree's teardown is the daemon's own suites' module, which reads
+# the daemon's registry and a worker's closing periods.
+kr-controller.workspace = true
+kr-crypto.workspace = true
+kr-ipc = { workspace = true, features = ["testing"] }
+kr-plugin-sdk.workspace = true
+kr-plugin-service.workspace = true
+kr-protocol.workspace = true
+kr-worker.workspace = true
+rusqlite = { workspace = true, features = ["bundled"] }
+serde_json.workspace = true
 # Each check gets a directory of its own on this machine's own disk, gone with the check.
 tempfile.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 
 [lints]
 workspace = true
