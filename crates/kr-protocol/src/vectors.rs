@@ -28,12 +28,16 @@ use crate::archive::{
     BackupWriterRecordPayload, EncryptedObjectRef, KeyWrapContext, KeyWrapFormat, KeyWrapPurpose,
     SealedKeyWrap, TrustedWriter,
 };
+use crate::collection_keys::{
+    COLLECTION_KEY_LEN, CollectionKeyRecord, CollectionKeyRecordPayload, CollectionKeyWrapContext,
+    CollectionKeyWrapFormat, CollectionMember, SealedCollectionKeyWrap, collection_key_wrap_prefix,
+};
 use crate::ids::{
     ArchiveId, BackupGeneration, BackupObjectId, BackupWriterRevision, CollapseId, DeviceId,
     EnvelopeId, EnvironmentId, MailboxThreadId, NotificationId, OrganisationId,
     OrganisationPolicyRevision, PluginId, PolicyKeyRevision, PushRegistrationId,
     PushSenderRecordId, PushSenderRevision, RevocationRequestId, SyncCollectionId, SyncConflictId,
-    SyncObjectId, SyncRevisionId,
+    SyncKeyEpoch, SyncKeyRecordRevision, SyncObjectId, SyncRevisionId,
 };
 use crate::mailbox::{
     EnvelopePlaintext, EnvelopeRouting, EnvelopeVersion, MAX_MAILBOX_BYTES,
@@ -42,8 +46,8 @@ use crate::mailbox::{
 };
 use crate::method::Method;
 use crate::pairing::{
-    AUTHORITY_REVISION_DOMAIN, AuthorityRevisionRecord, REVOCATION_DOMAIN, RevocationRequest,
-    RevocationTarget,
+    AUTHORITY_REVISION_DOMAIN, AuthorityRevisionRecord, KeyPurpose, REVOCATION_DOMAIN,
+    RevocationRequest, RevocationTarget, key_id,
 };
 use crate::push::{
     DELIVERY_CREDENTIAL_LIFETIME_MS, FREE_PUSH_BURST, FREE_PUSH_PER_HOUR,
@@ -66,8 +70,8 @@ use crate::service::{
 };
 use crate::sync::{
     MAX_SEALED_RECOVERY_BUNDLE_BYTES, MAX_SYNC_CONFLICT_COPIES, MAX_SYNC_OBJECT_PLAINTEXT_BYTES,
-    MAX_SYNC_OBJECTS_PER_COLLECTION, MIN_SEALED_RECOVERY_BUNDLE_BYTES, SealedSyncObject,
-    SyncConflictCopy, SyncObjectKind, SyncObjectRecord,
+    MAX_SYNC_OBJECTS_PER_COLLECTION, MIN_SEALED_RECOVERY_BUNDLE_BYTES, SealedRecoveryBundle,
+    SealedSyncObject, SyncConflictCopy, SyncObjectKind, SyncObjectRecord,
 };
 
 /// The service-request credential vectors.
@@ -260,6 +264,20 @@ fn case<T: Serialize + ?Sized>(
         "json": serde_json::to_value(record).expect("the record is serialisable"),
         "sha256": hex(&kr_cbor::sha256(signed)),
         "value": describe(&value),
+    })
+}
+
+/// One request body: the document, the canonical bytes its digest covers, and the digest.
+fn body_case(id: &str, document: Value) -> Value {
+    let encoded = crate::service::canonical_body(&document).expect("a canonical body encoding");
+    json!({
+        "id": id,
+        "json": document,
+        "cbor_hex": hex(&encoded),
+        "sha256": hex(&kr_cbor::sha256(&encoded)),
+        "value": describe(
+            &kr_cbor::decode(&encoded, &kr_cbor::Limits::default()).expect("valid KR-CBOR-1")
+        ),
     })
 }
 
@@ -936,24 +954,15 @@ fn services() -> Value {
             "cases": CANONICAL_BODIES
                 .iter()
                 .map(|(id, json)| {
-                    let document: Value =
-                        serde_json::from_str(json).expect("a canonical body document");
-                    let encoded = crate::service::canonical_body(&document)
-                        .expect("a canonical body encoding");
-                    json!({
-                        "id": id,
-                        "json": document,
-                        "cbor_hex": hex(&encoded),
-                        "sha256": hex(&kr_cbor::sha256(&encoded)),
-                        "value": describe(
-                            &kr_cbor::decode(&encoded, &kr_cbor::Limits::default())
-                                .expect("valid KR-CBOR-1")
-                        ),
-                    })
+                    body_case(
+                        id,
+                        serde_json::from_str(json).expect("a canonical body document"),
+                    )
                 })
                 .collect::<Vec<_>>(),
             "refused": REFUSED_BODIES
         },
+        "sync_requests": sync_requests(),
         "mailbox_claim": {
             "description": "What answers a mailbox claim challenge: SHA256(CBOR([domain, ephemeral key, recipient key, shared secret])). A mailbox is addressed by the identifier of a public key every paired peer knows, so what distinguishes the recipient is the private half, and this is how a service asks for it without holding anything that could open an envelope.",
             "domain": crate::mailbox::MAILBOX_CLAIM_DOMAIN,
@@ -1090,6 +1099,260 @@ fn services() -> Value {
                 &policy_payload.signing_input().expect("a policy signing input"),
             ),
         ],
+    })
+}
+
+/// The whole body a client sends for each request `sync.compare_exchange` takes.
+///
+/// Seven of the eight a collection takes address a shared collection, which is the form that names
+/// the most: its home beside the collection, and an object inside it by the object's own identity.
+/// The eighth, a listing of memberships, names only its cursor. The recovery bundle's four address
+/// the locator its kit prints. The values are fixed test values in the representation this crate's
+/// types give them, and the sealed object, the bundle's stream and the key record's wraps and
+/// signature are fixed bytes of the lengths a service admits.
+fn sync_requests() -> Value {
+    // The collection's home is the installation the test installation key derives, which is also
+    // the member that issues the key record offered below.
+    let issuer = AuthorisationKey::from_bytes(INSTALLATION_KEY);
+    let issuer_envelope = StoredEnvelopeKey::from_bytes([0x12; 32]);
+    let home = installation_id(&issuer);
+    let collection_id = SyncCollectionId::new(Uuid::from_bytes([
+        0x6c, 0x2e, 0x91, 0x0d, 0x3a, 0x57, 0x4b, 0x88, 0x9f, 0x14, 0x02, 0xd6, 0x7b, 0xe3, 0x45,
+        0x19,
+    ]));
+    let object_id = SyncObjectId::new(Uuid::from_bytes([
+        0x0b, 0x7f, 0x33, 0xa2, 0x5e, 0x81, 0x4c, 0x06, 0xb9, 0x4d, 0x2a, 0x70, 0xc5, 0x18, 0xe6,
+        0x3f,
+    ]));
+    let revision = SyncRevisionId::new(Uuid::from_bytes([
+        0xd4, 0x09, 0x6e, 0x52, 0x17, 0xab, 0x4f, 0x30, 0x86, 0xc1, 0x5b, 0x2f, 0x98, 0x0e, 0x74,
+        0xa6,
+    ]));
+    let conflict_id = SyncConflictId::new(Uuid::from_bytes([
+        0x29, 0xf0, 0x4b, 0x8e, 0x61, 0x3c, 0x47, 0xd5, 0xa3, 0x7a, 0x0f, 0x94, 0x26, 0xbd, 0x58,
+        0x01,
+    ]));
+    let write_request = Uuid::from_bytes([
+        0x71, 0x3a, 0x0e, 0xc4, 0x98, 0x25, 0x4d, 0x6b, 0x81, 0xf7, 0x3c, 0x50, 0x2d, 0x9e, 0x46,
+        0xb3,
+    ]);
+    let offer_request = Uuid::from_bytes([
+        0x44, 0xb8, 0x1f, 0x67, 0x0a, 0xd3, 0x4e, 0x29, 0x95, 0x62, 0xcf, 0x0b, 0x7e, 0x31, 0xa8,
+        0x5d,
+    ]);
+    let bundle_request = Uuid::from_bytes([
+        0xe2, 0x57, 0x08, 0x9b, 0x36, 0x4c, 0x41, 0xfa, 0xbd, 0x13, 0x6a, 0x85, 0x0c, 0xf9, 0x27,
+        0x70,
+    ]);
+    let locator = Uuid::from_bytes([
+        0x9c, 0x61, 0xd8, 0x2b, 0x47, 0x05, 0x4a, 0x93, 0xae, 0x3e, 0x17, 0x5c, 0xf0, 0x82, 0x6d,
+        0x34,
+    ]);
+    let key_epoch = SyncKeyEpoch::new(3);
+    // Two attempts under one identity, thirty seconds apart.
+    let first_signed_at_ms = U64::new(NOW_MS);
+    let last_signed_at_ms = U64::new(NOW_MS + 30_000);
+
+    let bucket = mailbox_size_bucket(200);
+    let object = SealedSyncObject {
+        nonce: Nonce192::from_bytes([0x97; 24]),
+        size_bucket_bytes: U64::new(bucket),
+        ciphertext: Bytes::new(vec![
+            0xce;
+            usize::try_from(bucket + SEAL_OVERHEAD_BYTES)
+                .expect("a bucket fits in memory")
+        ]),
+    };
+    object
+        .check_structure()
+        .expect("the published object is one a service admits");
+    let bundle = SealedRecoveryBundle {
+        ciphertext: Bytes::new(vec![0xbe; 64]),
+    };
+    bundle
+        .check_structure()
+        .expect("the published bundle is one a service admits");
+
+    // Revision five of the collection's key record: the issuer adds a second member at an
+    // unchanged epoch, and wraps the epoch's key for both.
+    let member = |authorisation: AuthorisationKey, stored_envelope: StoredEnvelopeKey, fill: u8| {
+        let context = CollectionKeyWrapContext {
+            format: CollectionKeyWrapFormat::V1,
+            collection_id,
+            key_epoch,
+            sender_key_id: key_id(KeyPurpose::StoredEnvelope, issuer_envelope.as_bytes()),
+            recipient_key_id: key_id(KeyPurpose::StoredEnvelope, stored_envelope.as_bytes()),
+        };
+        let wrapped = collection_key_wrap_prefix(&context)
+            .expect("a wrap context")
+            .len()
+            + COLLECTION_KEY_LEN
+            + usize::try_from(SEAL_OVERHEAD_BYTES).expect("a small constant");
+        CollectionMember {
+            authorisation,
+            stored_envelope,
+            wrap: SealedCollectionKeyWrap {
+                context,
+                nonce: Nonce192::from_bytes([fill; 24]),
+                ciphertext: Bytes::new(vec![fill; wrapped]),
+            },
+        }
+    };
+    let record = CollectionKeyRecord {
+        payload: CollectionKeyRecordPayload {
+            collection_id,
+            home,
+            key_epoch,
+            revision: SyncKeyRecordRevision::new(5),
+            previous: Nullable::some(Digest256::from_bytes([0x5e; 32])),
+            issuer_key_id: key_id(KeyPurpose::Authorisation, issuer.as_bytes()),
+            issued_at_ms: TimestampMs::new(NOW_MS),
+            members: vec![
+                member(issuer, issuer_envelope, 0x9a),
+                member(
+                    AuthorisationKey::from_bytes([0x13; 32]),
+                    StoredEnvelopeKey::from_bytes([0x14; 32]),
+                    0x9b,
+                ),
+            ],
+        },
+        signature: Signature64::from_bytes([0x62; 64]),
+    };
+    record
+        .check_structure()
+        .expect("the published key record is one a service admits");
+
+    let cases = [
+        (
+            "exchange",
+            "A write into a shared collection: the collection and its home, the key epoch the object is sealed under, the object by its identity inside the collection, and the revision the write replaces.",
+            json!({ "exchange": {
+                "request_id": write_request,
+                "collection_id": collection_id,
+                "home": home,
+                "key_epoch": key_epoch,
+                "kind": SyncObjectKind::Settings,
+                "object_id": object_id,
+                "expected_revision": revision,
+                "object": object,
+            }}),
+        ),
+        (
+            "compare",
+            "A read of a shared collection that names the one object the reader holds, at the revision it holds, and asks for the copies after the seventh.",
+            json!({ "compare": {
+                "collection_id": collection_id,
+                "home": home,
+                "known": [{ "object_id": object_id, "revision": revision }],
+                "with_conflicts": true,
+                "conflicts_after_sequence": U64::new(7),
+            }}),
+        ),
+        (
+            "resolve",
+            "Drops the copy a refused write left, because the person has chosen.",
+            json!({ "resolve": {
+                "collection_id": collection_id,
+                "home": home,
+                "conflict_ids": [conflict_id],
+            }}),
+        ),
+        (
+            "status",
+            "Asks what the collection recorded about the write's request identity.",
+            json!({ "status": {
+                "collection_id": collection_id,
+                "home": home,
+                "request_id": write_request,
+            }}),
+        ),
+        (
+            "fence",
+            "Ends the write's request identity, naming the earliest and the latest instant an attempt under it was signed at.",
+            json!({ "fence": {
+                "collection_id": collection_id,
+                "home": home,
+                "request_id": write_request,
+                "first_signed_at_ms": first_signed_at_ms,
+                "last_signed_at_ms": last_signed_at_ms,
+            }}),
+        ),
+        (
+            "keys",
+            "Reads the collection's key records after the second.",
+            json!({ "keys": {
+                "collection_id": collection_id,
+                "home": home,
+                "after_revision": SyncKeyRecordRevision::new(2),
+            }}),
+        ),
+        (
+            "rekey",
+            "Offers the key record that follows the collection's newest, under a request identity of its own.",
+            json!({ "rekey": {
+                "request_id": offer_request,
+                "collection_id": collection_id,
+                "home": home,
+                "record": record,
+            }}),
+        ),
+        (
+            "memberships",
+            "Lists the shared collections whose newest key record names the caller, after the cursor the previous page ended at, which names that page's last collection by its home.",
+            json!({ "memberships": {
+                "after": format!("{home}/{collection_id}"),
+            }}),
+        ),
+        (
+            "bundle_exchange",
+            "The first write of the recovery bundle at its locator. It names no collection and no home, and it replaces no revision, so its expected revision is present and null.",
+            json!({ "exchange": {
+                "request_id": bundle_request,
+                "locator": locator,
+                "kind": SyncObjectKind::RecoveryBundle,
+                "expected_revision": Value::Null,
+                "object": bundle,
+            }}),
+        ),
+        (
+            "bundle_compare",
+            "A read of the recovery bundle at its locator.",
+            json!({ "compare": {
+                "locator": locator,
+                "kind": SyncObjectKind::RecoveryBundle,
+            }}),
+        ),
+        (
+            "bundle_status",
+            "Asks what was recorded about a write of the recovery bundle at its locator.",
+            json!({ "status": {
+                "locator": locator,
+                "request_id": bundle_request,
+            }}),
+        ),
+        (
+            "bundle_fence",
+            "Ends the request identity of a write of the recovery bundle at its locator, naming the instants its attempts were signed at.",
+            json!({ "fence": {
+                "locator": locator,
+                "request_id": bundle_request,
+                "first_signed_at_ms": first_signed_at_ms,
+                "last_signed_at_ms": last_signed_at_ms,
+            }}),
+        ),
+    ];
+
+    json!({
+        "description": "The whole body a client sends for each settings-sync request, one case per member: the eight a collection takes, which name it by collection_id with its home where it is shared (a listing of memberships carries only its cursor), and the recovery bundle's exchange, compare, status and fence, which name the locator the recovery kit prints and neither a collection nor a home. cbor_hex is the canonical KR-CBOR-1 encoding of the document and sha256 its digest, which is the body digest the request's signature carries.",
+        "method": Method::SyncCompareExchange.as_str(),
+        "cases": cases
+            .into_iter()
+            .map(|(id, description, document)| {
+                let mut case = body_case(id, document);
+                case["description"] = Value::from(description);
+                case
+            })
+            .collect::<Vec<_>>(),
     })
 }
 
