@@ -51,6 +51,14 @@ pub use kr_sync_integration::{
 /// through the provider. A deployment reached over HTTPS has neither, so that leg is local only.
 pub const STATE_VARIABLE: &str = "KR_PRIVACY_STATE";
 
+/// The variable naming the origin a run is about to use, which
+/// `the_origin_a_run_is_about_to_use_is_one_a_credential_travels_to` holds to the product's own rule.
+///
+/// `scripts/e2e-privacy.sh` runs that check before it starts or sends anything, so the script accepts
+/// exactly the origins a managed-service credential may be bound to and refuses the rest as unusable,
+/// without a second copy of the rule that could drift from the product's.
+pub const CHECK_ORIGIN_VARIABLE: &str = "KR_PRIVACY_CHECK_ORIGIN";
+
 /// Whether this run was promised the services its legs need.
 #[must_use]
 pub fn required() -> bool {
@@ -117,7 +125,21 @@ pub fn not_given_back(what: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use kr_protocol::service::GatewayOrigin;
+
     use super::*;
+
+    /// The check `scripts/e2e-privacy.sh` runs on the origin it was given; it does nothing when no
+    /// origin is named.
+    #[test]
+    fn the_origin_a_run_is_about_to_use_is_one_a_credential_travels_to() {
+        let Ok(origin) = std::env::var(CHECK_ORIGIN_VARIABLE) else {
+            return;
+        };
+        if let Err(error) = GatewayOrigin::new(origin) {
+            panic!("not an origin a service credential travels to: {error}");
+        }
+    }
 
     #[test]
     fn what_a_leg_left_is_one_line_in_the_words_the_script_reads() {
