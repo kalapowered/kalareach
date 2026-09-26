@@ -392,9 +392,11 @@ pub enum PackageCheck {
 /// read back through the copy's own handle.
 #[derive(Debug)]
 pub struct WorkingDatastore {
+    /// The copy, held open. Declared before `_entry`, so it is closed before the copy is removed.
     dir: Area,
-    staging: Area,
-    name: String,
+    /// Where the copy is in staging, held only to remove the copy once the verification it served
+    /// is over.
+    _entry: StagingEntry,
 }
 
 impl WorkingDatastore {
@@ -405,11 +407,55 @@ impl WorkingDatastore {
     }
 }
 
-impl Drop for WorkingDatastore {
-    /// Removes the working copy once the verification it served is over, through the staging
-    /// directory it was made in. A removal that fails leaves a directory nothing reads.
+/// A directory an operation made in staging, removed again when this is dropped, through the
+/// staging directory it was made in, unless it was renamed into place.
+///
+/// The directory is the operation's own and nothing reads it, so an operation that stops part way,
+/// or whose work was refused, leaves nothing behind. A removal that fails leaves a directory no
+/// reader ever looks at, under a name no later operation reuses. Whatever else holds the directory
+/// open declares that handle before its entry, so the handle is closed before the removal: the
+/// store opens a directory without sharing its deletion, and on Windows a directory held that way
+/// can be neither removed nor renamed.
+#[derive(Debug)]
+struct StagingEntry {
+    staging: Area,
+    name: String,
+    /// Whether dropping this removes the directory: it does until the directory has been renamed
+    /// into place, after which nothing of the operation is left under the name.
+    remove: bool,
+}
+
+impl StagingEntry {
+    /// The directory `name`, just made in `staging`.
+    fn made(staging: Area, name: String) -> Self {
+        Self {
+            staging,
+            name,
+            remove: true,
+        }
+    }
+
+    /// Where the directory is.
+    fn path(&self) -> PathBuf {
+        self.staging.path.join(&self.name)
+    }
+
+    /// Opens the directory without following a link.
+    fn open(&self) -> CatalogueResult<Area> {
+        open_child(
+            &self.staging.dir,
+            &self.path(),
+            Path::new(&self.name),
+            false,
+        )
+    }
+}
+
+impl Drop for StagingEntry {
     fn drop(&mut self) {
-        let _ = self.staging.dir.remove_dir_all(&self.name);
+        if self.remove {
+            let _ = self.staging.dir.remove_dir_all(&self.name);
+        }
     }
 }
 
@@ -667,16 +713,11 @@ impl Store {
                 }
             }
         };
-        let dir = open_child(
-            &layout.staging.dir,
-            &layout.staging.path.join(&name),
-            Path::new(&name),
-            false,
-        )?;
+        // From here the copy is removed again when it is dropped, whatever happens next.
+        let entry = StagingEntry::made(layout.staging, name);
         let working = WorkingDatastore {
-            dir,
-            staging: layout.staging,
-            name,
+            dir: entry.open()?,
+            _entry: entry,
         };
         for name in CLIENT_READS {
             let bytes = match read_in(&layout.datastore, Path::new(name)) {
@@ -1315,16 +1356,11 @@ impl Store {
                 Ok(()) => {
                     // From here the directory is removed again unless it is activated, whatever
                     // happens next.
-                    let place = StagedPlace {
-                        staging: layout.staging,
-                        name,
-                        remove: true,
-                    };
-                    let dir = open_child(&place.staging.dir, &path, Path::new(&place.name), false)?;
+                    let entry = StagingEntry::made(layout.staging, name);
                     return Ok(StagedPackage {
                         store: self.clone(),
-                        dir,
-                        place,
+                        dir: entry.open()?,
+                        entry,
                         digest: manifest_digest,
                         written: BTreeMap::new(),
                     });
@@ -1567,41 +1603,14 @@ impl ReclaimPlan {
 pub struct StagedPackage {
     /// The store the package is staged in, whose directories are opened again before each write.
     store: Store,
-    /// The directory the package is staged into, held open while it is staged.
-    ///
-    /// It is declared before `place`, so its handle is closed before the directory is removed: on
-    /// Windows the store opens a directory without sharing its deletion, and a directory held that
-    /// way can be neither removed nor renamed.
+    /// The directory the package is staged into, held open while it is staged. Declared before
+    /// `entry`, so it is closed before the directory is removed.
     dir: Area,
     /// Where the directory is in staging, which removes it unless it is activated.
-    place: StagedPlace,
+    entry: StagingEntry,
     /// The package's hash, which names its directory once it is activated.
     digest: PayloadDigest,
     written: BTreeMap<String, u64>,
-}
-
-/// A staged package's directory, by its name in the staging directory it was made in.
-#[derive(Debug)]
-struct StagedPlace {
-    staging: Area,
-    name: String,
-    /// Whether dropping this removes the directory: it does until the directory has been renamed
-    /// into place, after which nothing of this attempt is left under the name.
-    remove: bool,
-}
-
-impl Drop for StagedPlace {
-    /// Removes a staging directory nothing will activate, through the staging directory it was
-    /// made in.
-    ///
-    /// The directory is this attempt's own and nothing reads it, so an attempt that stops part way,
-    /// or whose activation was refused, leaves nothing behind. A removal that fails leaves a
-    /// directory no reader ever looks at, under a name no later attempt reuses.
-    fn drop(&mut self) {
-        if self.remove {
-            let _ = self.staging.dir.remove_dir_all(&self.name);
-        }
-    }
 }
 
 impl StagedPackage {
@@ -1712,26 +1721,26 @@ impl StagedPackage {
     /// into staging, where taking the store's lock next removes it, and the activation is refused:
     /// a directory put in the staged one's place is never left where readers look.
     fn move_into_place(self, packages: &Area, name: &str) -> CatalogueResult<()> {
-        let Self { dir, mut place, .. } = self;
+        let Self { dir, mut entry, .. } = self;
         let destination = packages.path.join(name);
         let staged = identity(&dir)?;
         let staged_path = dir.path.clone();
         drop(dir);
         #[cfg(test)]
         rename_pause::run();
-        place
+        entry
             .staging
             .dir
-            .rename(&place.name, &packages.dir, name)
+            .rename(&entry.name, &packages.dir, name)
             .map_err(|source| CatalogueError::storage(&destination, &source))?;
-        place.remove = false;
+        entry.remove = false;
         let arrived = open_child(&packages.dir, &destination, Path::new(name), false)
             .and_then(|arrived| identity(&arrived));
         if arrived.as_ref().is_ok_and(|arrived| *arrived == staged) {
             return flushed_after_publication(packages, &destination, NameKind::Directory);
         }
-        let refused = format!("{}.refused", place.name);
-        if let Err(source) = packages.dir.rename(name, &place.staging.dir, &refused) {
+        let refused = format!("{}.refused", entry.name);
+        if let Err(source) = packages.dir.rename(name, &entry.staging.dir, &refused) {
             return Err(CatalogueError::PublicationUncertain {
                 detail: format!(
                     "{} is not the directory that was staged and checked, and it could not be \
@@ -2363,6 +2372,31 @@ mod tests {
                 .count(),
             0,
             "what was moved out is cleared with the lock"
+        );
+    }
+
+    /// A working copy dropped once its verification is over, and a staged package abandoned, each
+    /// leave nothing in staging: each closes its handle on its directory before the directory is
+    /// removed, which on Windows a directory held open refuses.
+    #[test]
+    fn a_working_copy_or_an_abandoned_package_leaves_nothing_in_staging() {
+        let (_directory, store) = store();
+        let working = store.working_datastore(false).expect("a working copy");
+        std::fs::write(working.path().join("root.json"), b"{}").expect("the client writes in it");
+        drop(working);
+        let mut staged = store
+            .stage_package(PayloadDigest::of(b"abandoned"))
+            .expect("a staging directory");
+        staged
+            .write(&path("plugin.json"), b"manifest")
+            .expect("written");
+        staged.abandon();
+        assert_eq!(
+            std::fs::read_dir(store.root.join("staging"))
+                .expect("readable")
+                .count(),
+            0,
+            "nothing is left in staging"
         );
     }
 
@@ -3141,9 +3175,9 @@ mod tests {
     /// staging, since nothing ran to remove it, and every handle it held is closed, as the
     /// operating system closes a stopped process's handles.
     fn stopped(staged: StagedPackage) {
-        let StagedPackage { dir, mut place, .. } = staged;
+        let StagedPackage { dir, mut entry, .. } = staged;
         drop(dir);
-        place.remove = false;
+        entry.remove = false;
     }
 
     #[test]
