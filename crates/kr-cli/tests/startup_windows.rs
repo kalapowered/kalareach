@@ -1280,13 +1280,12 @@ fn refusing_task_scheduler(root: &Path, calls: &Path) -> PathBuf {
         format!(
             r#"class Refusing {{
     static int Main(string[] words) {{
-        System.IO.File.AppendAllText(@"{calls}", "schtasks " + string.Join(" ", words) + "
-");
+        System.IO.File.AppendAllText(@"{calls}", "schtasks " + string.Join(" ", words) + "\n");
         if (System.Array.IndexOf(words, "/Run") >= 0) {{
             return 1;
         }}
         var start = new System.Diagnostics.ProcessStartInfo(@"{real}");
-        start.Arguments = string.Join(" ", System.Array.ConvertAll(words, word => """ + word + """));
+        start.Arguments = string.Join(" ", System.Array.ConvertAll(words, word => "\"" + word + "\""));
         start.UseShellExecute = false;
         start.RedirectStandardOutput = true;
         start.RedirectStandardError = true;
