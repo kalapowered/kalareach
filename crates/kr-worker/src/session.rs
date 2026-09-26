@@ -16,7 +16,7 @@
 //! worker's current in-memory authority and identities, and the reply says `durability=volatile`
 //! rather than pretending it was recorded.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -26,7 +26,8 @@ use kr_protocol::attachment::{
 };
 use kr_protocol::identity::{DesktopBinding, WorkerProfile};
 use kr_protocol::ids::{
-    AttachmentId, ConnectionId, EnvironmentId, SessionEpoch, SessionId, StreamCursor,
+    AttachmentId, ConnectionId, EnvironmentId, PendingResourceId, SessionEpoch, SessionId,
+    StreamCursor,
 };
 use kr_protocol::input::{InputAcquireResult, InputLeaseState};
 use kr_protocol::projection::ProjectionResetReason;
@@ -164,6 +165,74 @@ pub struct Joined {
     pub bytes: Vec<u8>,
 }
 
+/// What a view whose subscription came with a grant's history scope keeps about the broker's
+/// resources, so every transition after its snapshot is decided the way the snapshot was.
+#[derive(Debug)]
+struct ScopedResources {
+    /// The connection whose subscription this is.
+    connection: ConnectionId,
+    /// Whether this is the subscription its connection is delivering now.
+    ///
+    /// A connection delivers one subscription at a time, and a fresh snapshot on it is about that
+    /// one. An earlier subscription of the connection keeps its own decisions until its delivery
+    /// has stopped, because what it still has queued is still judged.
+    current: bool,
+    /// The filter its snapshot was taken through, which decides every later transition too.
+    filter: crate::history_filter::HistoryFilter,
+    /// The run of the broker's stream its snapshot's position belongs to.
+    generation: u64,
+    /// Its snapshot's position. A transition at or below it is already in the snapshot.
+    cursor: u64,
+    /// Every resource it has been shown that has not ended.
+    shown: BTreeSet<PendingResourceId>,
+}
+
+impl ScopedResources {
+    /// Decides whether one transition reaches this view, and keeps what it has been shown current.
+    ///
+    /// A transition the snapshot covers is dropped before anything else is asked, whatever it
+    /// says: judged on its own, the pending state of a named approval that ended before the view
+    /// subscribed would pass. After the snapshot, a transition reaches the view when its resource
+    /// is one the view was shown, so the end of what it was shown reaches it, or when the filter
+    /// admits the resource as the broker holds it now, which adds it to what the view was shown. A
+    /// resource the broker could not read is admitted by nothing but having been shown. A
+    /// transition of another run of the stream cannot be placed against this snapshot at all: the
+    /// filter alone decides it, and what the view was shown is neither consulted nor changed.
+    fn admits(
+        &mut self,
+        event: &kr_protocol::projection::AgentResourceEvent,
+        resource: Option<&kr_protocol::gateway::PendingResource>,
+    ) -> bool {
+        let admitted = |filter: &crate::history_filter::HistoryFilter| {
+            resource.is_some_and(|resource| {
+                filter
+                    .admit_resource(
+                        resource.kind,
+                        event.resource_id,
+                        resource.recorded_at.get(),
+                        event.state,
+                    )
+                    .is_ok()
+            })
+        };
+        if event.stream_generation.get() != self.generation {
+            return admitted(&self.filter);
+        }
+        if event.sequence.get() <= self.cursor {
+            return false;
+        }
+        if !self.shown.contains(&event.resource_id) && !admitted(&self.filter) {
+            return false;
+        }
+        if event.state.is_terminal() {
+            self.shown.remove(&event.resource_id);
+        } else {
+            self.shown.insert(event.resource_id);
+        }
+        true
+    }
+}
+
 /// One live session.
 pub struct Session {
     config: SessionConfig,
@@ -289,6 +358,18 @@ pub struct Session {
     /// buffer alone. It is recorded per attachment because every repaint asks the same question
     /// and the caller is not there to be asked again.
     content_scopes: std::collections::BTreeMap<AttachmentId, crate::render::Scope>,
+    /// What each view held to a grant's history scope has been shown of the broker's resources.
+    ///
+    /// Section 10: without a named scope, a pending-resource snapshot cannot bypass the history
+    /// filter, and neither can the transitions that follow it. A view whose subscription came
+    /// with no scope is not here and is told every transition.
+    resource_views: BTreeMap<AttachmentId, ScopedResources>,
+    /// The moment each attachment's first subscription held to a scope began.
+    ///
+    /// A live view reaches what is recorded from then on, and a later subscription or a fresh
+    /// snapshot of the same attachment keeps that moment, so replacing a subscription never moves
+    /// what the view reaches. It goes with the attachment.
+    live_views: BTreeMap<AttachmentId, u64>,
     /// The attachments the host would serve directly and is holding in projected mode.
     ///
     /// Section 8: a transition into live byte forwarding must use a parser-ground boundary with no
@@ -545,6 +626,8 @@ impl Session {
             owned: None,
             root_exit: None,
             content_scopes: std::collections::BTreeMap::new(),
+            resource_views: BTreeMap::new(),
+            live_views: BTreeMap::new(),
             // Bound before the shell starts, from the desktop the create request recorded, or
             // from the login session this worker is in where the request recorded none. A desktop
             // that has already gone by now is a session that never had one, and the watch says so
@@ -1431,6 +1514,84 @@ impl Session {
             .unwrap_or_default()
     }
 
+    /// Returns the moment this attachment's first subscription held to a history scope began,
+    /// recording `now_ms` as that moment when it has none.
+    ///
+    /// A live view whose grant keeps no retained history reaches what is recorded from that moment
+    /// on, and every later subscription and fresh snapshot of the attachment keeps it.
+    pub fn live_view_began(&mut self, attachment_id: AttachmentId, now_ms: u64) -> u64 {
+        *self.live_views.entry(attachment_id).or_insert(now_ms)
+    }
+
+    /// Returns the attachment whose subscription held to a history scope this connection is
+    /// delivering now, and the moment that attachment's live view began.
+    ///
+    /// A fresh snapshot on the connection is about that subscription, and replaces what its
+    /// transitions are decided by. `None` is a connection delivering no such subscription, whose
+    /// snapshot keeps nothing.
+    #[must_use]
+    pub fn scoped_subscription(&self, connection: ConnectionId) -> Option<(AttachmentId, u64)> {
+        let (attachment_id, _) = self
+            .resource_views
+            .iter()
+            .find(|(_, view)| view.connection == connection && view.current)?;
+        let began = self.live_views.get(attachment_id)?;
+        Some((*attachment_id, *began))
+    }
+
+    /// Holds one subscription's view to the filter its snapshot was taken through.
+    ///
+    /// Called under the lock that snapshot was taken under, so no transition is published between
+    /// the two, and every transition the view is told about after it is decided against exactly
+    /// the position and the resources the snapshot carried: `cursor` is that position and `shown`
+    /// every resource of the whole snapshot, not one page, that has not ended. It replaces
+    /// whatever the attachment's earlier subscription or snapshot was decided by, all of it
+    /// together, and makes this the subscription its connection is delivering now.
+    pub fn hold_resources(
+        &mut self,
+        attachment_id: AttachmentId,
+        connection: ConnectionId,
+        filter: crate::history_filter::HistoryFilter,
+        cursor: crate::broker::ReplayCursor,
+        shown: BTreeSet<PendingResourceId>,
+    ) {
+        self.replace_subscription_of(connection);
+        self.resource_views.insert(
+            attachment_id,
+            ScopedResources {
+                connection,
+                current: true,
+                filter,
+                generation: cursor.generation,
+                cursor: cursor.sequence,
+                shown,
+            },
+        );
+    }
+
+    /// Lets a subscription that came with no history scope be told every transition, as a view
+    /// with no scope always was, whatever an earlier subscription of the attachment was held to.
+    pub fn release_resources(&mut self, attachment_id: AttachmentId, connection: ConnectionId) {
+        self.resource_views.remove(&attachment_id);
+        self.replace_subscription_of(connection);
+    }
+
+    /// Notes that `connection` is starting a subscription that replaces the one it was delivering.
+    ///
+    /// The one it replaces keeps its own decisions for what it still has queued, and a fresh
+    /// snapshot on the connection is no longer about it. A view whose subscription has already
+    /// ended is forgotten here.
+    fn replace_subscription_of(&mut self, connection: ConnectionId) {
+        let hub = &self.hub;
+        self.resource_views
+            .retain(|attachment_id, _| hub.presentation_of(*attachment_id).is_some());
+        for view in self.resource_views.values_mut() {
+            if view.connection == connection {
+                view.current = false;
+            }
+        }
+    }
+
     /// Returns the screen one attachment joins on, in the form that attachment is served in.
     ///
     /// The two forms are not interchangeable. An attachment whose own terminal is the session's
@@ -1744,22 +1905,34 @@ impl Session {
         }
     }
 
-    /// Removes an attachment, releasing whatever it held.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the attachment is unknown.
-    /// Tells every attached view about one committed broker transition.
+    /// Tells every attached view that may see it about one committed broker transition.
     ///
     /// This is the delivery half of section 12's fan-out. The broker decides what happened and in
     /// what order; this hands that to the views attached to the session the instance belongs to,
     /// one event each, in the order it is called. The event is charged against each subscriber's
     /// queue budget so a stalled view resynchronises rather than holding native traffic.
-    pub fn publish_agent_resource(&mut self, event: &kr_protocol::projection::AgentResourceEvent) {
+    ///
+    /// A view held to a grant's history scope is told only what section 10's filter lets it see,
+    /// decided here before anything is queued for it, so what that view is sent is numbered as
+    /// densely as what any other view is sent. `resource` is what the broker holds about the
+    /// resource the event is about, read before this session was locked: what it is now and when
+    /// it was recorded. `None` is a resource the broker could not read, which reaches only the
+    /// views that were already shown it. A view that subscribed with no scope is told every
+    /// transition.
+    pub fn publish_agent_resource(
+        &mut self,
+        event: &kr_protocol::projection::AgentResourceEvent,
+        resource: Option<&kr_protocol::gateway::PendingResource>,
+    ) {
         let cost = crate::snapshot::wire::measure(event).map_or(256, |cost| cost.bytes);
         let oldest = self.history.oldest_retained_cursor();
         let cursor = self.history.next_cursor();
         for attachment_id in self.hub.subscribers() {
+            if let Some(view) = self.resource_views.get_mut(&attachment_id)
+                && !view.admits(event, resource)
+            {
+                continue;
+            }
             if self
                 .hub
                 .publish_agent_resource(attachment_id, cursor, event.clone(), cost, oldest)
@@ -1786,6 +1959,8 @@ impl Session {
     /// Returns an error when the attachment is unknown.
     pub fn detach(&mut self, attachment_id: AttachmentId) -> Result<SessionDetachResult> {
         self.content_scopes.remove(&attachment_id);
+        self.resource_views.remove(&attachment_id);
+        self.live_views.remove(&attachment_id);
         // Undelivered input from the removed attachment goes with it; nothing is replayed. A paste
         // it had open is closed first, so the application is not left inside a bracketed paste
         // whose source has gone.

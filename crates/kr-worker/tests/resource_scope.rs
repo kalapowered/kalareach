@@ -42,8 +42,8 @@ use kr_protocol::envelope::{
 };
 use kr_protocol::error::ProtocolError;
 use kr_protocol::gateway::{
-    DeclarativeEntry, DeclarativeTable, NativeFraming, NativeMethodClass, PendingResource,
-    PendingState, RichMethodTable,
+    DeclarativeEntry, DeclarativeTable, NativeFraming, NativeMethodClass, PendingKind,
+    PendingResource, PendingState, RichMethodTable,
 };
 use kr_protocol::grant::HistoryScope;
 use kr_protocol::hello::PROTOCOL_VERSION;
@@ -61,8 +61,8 @@ use kr_protocol::local::{
 };
 use kr_protocol::method::{Method, MethodVersion};
 use kr_protocol::projection::{
-    AGENT_RESOURCE_EVENT, AgentResourceEvent, AgentResourceSnapshot,
-    AgentResourceSnapshotContinuation,
+    AGENT_RESOURCE_EVENT, AgentResourceCause, AgentResourceContentClass, AgentResourceEvent,
+    AgentResourceSnapshot, AgentResourceSnapshotContinuation,
 };
 use kr_protocol::recovery::{
     EventStream, EventsSnapshotParams, EventsSnapshotResult, EventsSubscribeParams,
@@ -76,6 +76,7 @@ use kr_worker::broker::{
     PendingTransmission, TransportHandle, UpstreamDispatch, UpstreamOutcome, UpstreamRequest,
     subject,
 };
+use kr_worker::history_filter::{HistoryFilter, ViewerScope, WithheldReason};
 use kr_worker::runtime::SessionRuntime;
 use kr_worker::service::{ServiceBinding, WorkerService};
 use kr_worker::session::{Session as TerminalSession, SessionConfig};
@@ -1604,5 +1605,357 @@ async fn kr_req_10_51_a_transition_while_the_journal_is_faulted_is_judged_the_sa
     }
     let unscoped = views.unscoped.told_through(last).await;
     assert_eq!(summary(&unscoped), summary(&owner));
+    host.finish();
+}
+
+// -------------------------------------------------------------------------------------------------
+// The rule, and the session boundary the delivery hands every transition to
+// -------------------------------------------------------------------------------------------------
+
+/// KR-REQ-10.51: one rule for every kind of resource the broker arbitrates. An approval the grant
+/// names is admitted while it can still be decided, and by the bound once it has ended, as the
+/// approval record read decides it; a name is for an approval, so a reverse call and an action this
+/// host prepared against the upstream are decided by the bound, whatever the grant names. A
+/// resource recorded at the bound is inside it, and without `session.view` nothing is admitted.
+#[test]
+fn kr_req_10_51_one_rule_decides_every_kind_of_resource() {
+    let named = PendingResourceId::new(Uuid::from_bytes([0x71; 16]));
+    let unnamed = PendingResourceId::new(Uuid::from_bytes([0x72; 16]));
+    let filter = HistoryFilter::new(ViewerScope::from_history(
+        &reach(Some(BOUND), &[named]),
+        true,
+    ));
+    for state in PendingState::ALL.iter().copied() {
+        assert_eq!(
+            filter.admit_resource(PendingKind::Approval, named, BEFORE, state),
+            if state.is_terminal() {
+                Err(WithheldReason::NotNamedByTheGrant)
+            } else {
+                Ok(())
+            },
+            "a named approval, {state:?}"
+        );
+        for kind in [PendingKind::ReverseRpc, PendingKind::UpstreamAction] {
+            assert_eq!(
+                filter.admit_resource(kind, named, BEFORE, state),
+                Err(WithheldReason::BeforeHistoryBound),
+                "a name is for an approval: {kind:?}, {state:?}"
+            );
+        }
+        for kind in PendingKind::ALL.iter().copied() {
+            assert_eq!(
+                filter.admit_resource(kind, unnamed, BOUND, state),
+                Ok(()),
+                "at the bound: {kind:?}, {state:?}"
+            );
+            assert!(
+                filter
+                    .admit_resource(kind, unnamed, BOUND - 1, state)
+                    .is_err(),
+                "before the bound: {kind:?}, {state:?}"
+            );
+        }
+    }
+    let blind = HistoryFilter::new(ViewerScope::from_history(&reach(Some(0), &[named]), false));
+    for kind in PendingKind::ALL.iter().copied() {
+        assert_eq!(
+            blind.admit_resource(kind, named, AFTER, PendingState::Pending),
+            Err(WithheldReason::NoSessionView),
+            "{kind:?}"
+        );
+    }
+}
+
+/// KR-REQ-10.51: a live view's scope. A grant that keeps no retained history and includes the live
+/// screen reaches what is recorded from the moment the view began, a grant with a bound keeps its
+/// bound, and one without the live screen reaches nothing it does not name.
+#[test]
+fn kr_req_10_51_a_live_view_reaches_what_is_recorded_from_the_moment_it_began() {
+    let began = 7_000;
+    let resource = PendingResourceId::new(Uuid::from_bytes([0x73; 16]));
+    let live = ViewerScope::from_history(&reach(None, &[]), true).live_from(began);
+    assert_eq!(live.lower_bound_ms(), Some(began));
+    let live = HistoryFilter::new(live);
+    assert_eq!(
+        live.admit_resource(
+            PendingKind::ReverseRpc,
+            resource,
+            began,
+            PendingState::Pending
+        ),
+        Ok(())
+    );
+    assert_eq!(
+        live.admit_resource(
+            PendingKind::ReverseRpc,
+            resource,
+            began - 1,
+            PendingState::Pending
+        ),
+        Err(WithheldReason::BeforeHistoryBound)
+    );
+    assert_eq!(
+        ViewerScope::from_history(&reach(Some(BOUND), &[]), true)
+            .live_from(began)
+            .lower_bound_ms(),
+        Some(BOUND),
+        "a bound the grant set stays"
+    );
+    let without_the_screen = HistoryScope {
+        include_live_screen: false,
+        ..reach(None, &[])
+    };
+    assert_eq!(
+        ViewerScope::from_history(&without_the_screen, true)
+            .live_from(began)
+            .lower_bound_ms(),
+        None,
+        "without the live screen there is no view to follow"
+    );
+}
+
+/// The broker's record of one resource, as the delivery reads it before it locks the session.
+fn held(host: &Host, resource_id: PendingResourceId) -> PendingResource {
+    host.service
+        .broker()
+        .pending(resource_id)
+        .expect("the broker holds it")
+}
+
+/// A request the broker would hold as recorded at `at_ms` under `resource_id`, for a transition
+/// handed to the session directly.
+fn request_like(host: &Host, resource_id: PendingResourceId, at_ms: u64) -> PendingResource {
+    let template = held(host, arrive(host, at_ms));
+    PendingResource {
+        resource_id,
+        ..template
+    }
+}
+
+/// One transition of `resource_id` at `sequence` of the stream run `generation`, as the delivery
+/// hands it to the session.
+fn transition(
+    host: &Host,
+    resource_id: PendingResourceId,
+    state: PendingState,
+    generation: u64,
+    sequence: u64,
+) -> AgentResourceEvent {
+    AgentResourceEvent {
+        session_id: host.session_id,
+        application_instance_id: instance(),
+        resource_id,
+        state,
+        content: AgentResourceContentClass::ApplicationNotice,
+        durability: Durability::Durable,
+        cause: AgentResourceCause::Upstream,
+        actor_id: Nullable::null(),
+        causal_root: format!("synthetic:{sequence}"),
+        binding_revision: AgentBindingRevision::new(1),
+        stream_generation: U64::new(generation),
+        sequence: U64::new(sequence),
+        event_id: Uuid::from_bytes(*kr_ipc::new_uuid().as_bytes()),
+        parent_sequence: Nullable::null(),
+    }
+}
+
+/// What a run of events was, one entry per event, for comparing what two views were told.
+fn told_as(events: &[AgentResourceEvent]) -> Vec<(PendingResourceId, PendingState, u64, u64)> {
+    events
+        .iter()
+        .map(|event| {
+            (
+                event.resource_id,
+                event.state,
+                event.stream_generation.get(),
+                event.sequence.get(),
+            )
+        })
+        .collect()
+}
+
+/// KR-REQ-10.51: a transition of another run of the broker's stream cannot be placed against the
+/// view's snapshot, so the filter alone decides it, and what the view was shown is neither
+/// consulted nor changed. The shown approval's transition of another run whose resource cannot be
+/// read, and its end, are withheld, and the approval is still shown afterwards; a recent request's
+/// transition of another run is told and does not make the request shown. A transition of the
+/// snapshot's own run at its position is dropped however shown its resource is. The transitions
+/// are handed to the session as the delivery hands it every one, since this host's broker runs one
+/// stream; the owner and a read without a scope are told every one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_10_51_a_transition_of_another_run_is_decided_by_the_filter_alone() {
+    let host = host().await;
+    let named = offer(&host, BEFORE);
+    let mut views = views(&host, reach(Some(BOUND), &[named])).await;
+    assert_eq!(carried(&views.phone_page.resources), [named]);
+    let generation = views.phone_page.stream_generation.get();
+    let another = generation + 1;
+    let position = views.phone_page.cursor.get();
+    let approval = held(&host, named);
+    let recent = PendingResourceId::new(Uuid::from_bytes([0x74; 16]));
+    let recent_request = request_like(&host, recent, AFTER);
+    let last = PendingResourceId::new(Uuid::from_bytes([0x75; 16]));
+    let last_request = request_like(&host, last, now().get());
+
+    let sent = [
+        (
+            transition(&host, named, PendingState::Claimed, another, position + 1),
+            None,
+        ),
+        (
+            transition(&host, named, PendingState::Resolved, another, position + 2),
+            Some(&approval),
+        ),
+        (
+            transition(
+                &host,
+                named,
+                PendingState::Claimed,
+                generation,
+                position + 3,
+            ),
+            None,
+        ),
+        (
+            transition(&host, recent, PendingState::Pending, another, position + 4),
+            Some(&recent_request),
+        ),
+        (
+            transition(
+                &host,
+                recent,
+                PendingState::Claimed,
+                generation,
+                position + 5,
+            ),
+            None,
+        ),
+        (
+            transition(&host, named, PendingState::Claimed, generation, position),
+            Some(&approval),
+        ),
+        (
+            transition(&host, last, PendingState::Pending, generation, position + 6),
+            Some(&last_request),
+        ),
+    ];
+    for (event, resource) in &sent {
+        host.runtime
+            .session()
+            .publish_agent_resource(event, *resource);
+    }
+
+    let phone = views.phone.told_through(last).await;
+    let expected: Vec<AgentResourceEvent> = [2, 3, 6]
+        .into_iter()
+        .map(|index| sent[index].0.clone())
+        .collect();
+    assert_eq!(
+        told_as(&phone),
+        told_as(&expected),
+        "the device is told the shown approval's own run, and the recent request of another run"
+    );
+    let every: Vec<AgentResourceEvent> = sent.iter().map(|(event, _)| event.clone()).collect();
+    for control in [&mut views.owner, &mut views.unscoped] {
+        assert_eq!(told_as(&control.told_through(last).await), told_as(&every));
+    }
+    host.finish();
+}
+
+/// KR-REQ-10.51: a transition whose resource the broker cannot read reaches only a view that was
+/// already shown that resource, and its end takes the resource out of what the view was shown.
+/// Within one run the broker reads every resource it has recorded, from its arbitration or its
+/// ledger, so these transitions are handed to the session as the delivery hands it one whose
+/// resource it could not read: a resource recorded only in memory by an earlier run is one. The
+/// owner and a read without a scope are told every one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_10_51_a_resource_the_broker_cannot_read_reaches_only_a_view_shown_it() {
+    let host = host().await;
+    let named = offer(&host, BEFORE);
+    let unnamed = offer(&host, BEFORE);
+    let mut views = views(&host, reach(Some(BOUND), &[named])).await;
+    assert_eq!(carried(&views.phone_page.resources), [named]);
+    let generation = views.phone_page.stream_generation.get();
+    let position = views.phone_page.cursor.get();
+    let never_held = PendingResourceId::new(Uuid::from_bytes([0x76; 16]));
+    let last = PendingResourceId::new(Uuid::from_bytes([0x77; 16]));
+    let last_request = request_like(&host, last, now().get());
+
+    let sent = [
+        (
+            transition(
+                &host,
+                named,
+                PendingState::Claimed,
+                generation,
+                position + 1,
+            ),
+            None,
+        ),
+        (
+            transition(
+                &host,
+                unnamed,
+                PendingState::Claimed,
+                generation,
+                position + 2,
+            ),
+            None,
+        ),
+        (
+            transition(
+                &host,
+                never_held,
+                PendingState::Pending,
+                generation,
+                position + 3,
+            ),
+            None,
+        ),
+        (
+            transition(
+                &host,
+                named,
+                PendingState::Resolved,
+                generation,
+                position + 4,
+            ),
+            None,
+        ),
+        (
+            transition(
+                &host,
+                named,
+                PendingState::Pending,
+                generation,
+                position + 5,
+            ),
+            None,
+        ),
+        (
+            transition(&host, last, PendingState::Pending, generation, position + 6),
+            Some(&last_request),
+        ),
+    ];
+    for (event, resource) in &sent {
+        host.runtime
+            .session()
+            .publish_agent_resource(event, *resource);
+    }
+
+    let phone = views.phone.told_through(last).await;
+    let expected: Vec<AgentResourceEvent> = [0, 3, 5]
+        .into_iter()
+        .map(|index| sent[index].0.clone())
+        .collect();
+    assert_eq!(
+        told_as(&phone),
+        told_as(&expected),
+        "the device is told about what it was shown, up to its end, and about nothing it was not"
+    );
+    let every: Vec<AgentResourceEvent> = sent.iter().map(|(event, _)| event.clone()).collect();
+    for control in [&mut views.owner, &mut views.unscoped] {
+        assert_eq!(told_as(&control.told_through(last).await), told_as(&every));
+    }
     host.finish();
 }

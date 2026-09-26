@@ -337,6 +337,22 @@ fn from_transition_event(
     }
 }
 
+/// Reads what the broker holds about the resource one transition is about.
+///
+/// The live arbitration first, then the ledger's record of it. A session's views are shown a
+/// transition by what the resource is now and when it was recorded: a request becomes an approval
+/// when a decoder interprets it, and the moment it was recorded never changes. It is read once for
+/// each transition, before the session is locked, and no lock of the broker's is held once it
+/// returns, since the subscription path holds the session's lock while it reads the broker.
+fn resource_of(
+    broker: &Broker,
+    resource_id: kr_protocol::ids::PendingResourceId,
+) -> Option<kr_protocol::gateway::PendingResource> {
+    broker
+        .pending(resource_id)
+        .or_else(|| broker.recorded(resource_id).ok().flatten())
+}
+
 /// Carries every transition this connection observes to the views attached to a session.
 ///
 /// It is the production consumer of the broker's own published transitions: the broker commits
@@ -369,7 +385,10 @@ pub async fn deliver_to_views(
                 }
                 cursor.sequence = transition.sequence;
                 let event = to_agent_resource_event(session_id, cursor.generation, transition);
-                runtime.session().publish_agent_resource(&event);
+                let resource = resource_of(&broker, event.resource_id);
+                runtime
+                    .session()
+                    .publish_agent_resource(&event, resource.as_ref());
             }
             None => {
                 // The fresh queue is taken before the outbox is read, so a transition committed
@@ -445,7 +464,10 @@ async fn recover_views(
                 continue;
             }
             let event = from_transition_event(session_id, replay.cursor.generation, transition);
-            runtime.session().publish_agent_resource(&event);
+            let resource = resource_of(broker, event.resource_id);
+            runtime
+                .session()
+                .publish_agent_resource(&event, resource.as_ref());
         }
         *cursor = replay.cursor;
         if !replay.more {
