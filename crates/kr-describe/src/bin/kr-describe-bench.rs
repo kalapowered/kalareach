@@ -737,7 +737,8 @@ struct Outcomes {
     past_deadline: u32,
     /// The job ran and its result was refused.
     refused: u32,
-    /// The resource policy admitted no inference.
+    /// The tick ended in the resource pause: before a job ran, or after one when the process had
+    /// passed its memory ceiling and the model was unloaded.
     paused: u32,
     /// Anything else a tick can end in.
     other: u32,
