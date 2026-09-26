@@ -1,14 +1,16 @@
 //! Checks on the reading of other work: that this machine's counts are read in the units they are
-//! kept in, and that `kr-perf-watch` bounds work outside a run, reads a run that has gone as unread,
+//! kept in, thread by thread where the kernel keeps each thread's time, and that `kr-perf-watch`
+//! bounds work outside a run, reads a run that has gone as unread, says how it read the run's time,
 //! and stops when asked.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use kr_perf::machine::Machine;
+use kr_perf::machine::{Machine, Times};
 use kr_perf::other_work::{Process, Reading, Row};
 
 const WATCH: &str = env!("CARGO_BIN_EXE_kr-perf-watch");
@@ -27,14 +29,29 @@ fn burn(stop: &AtomicBool) {
     }
 }
 
-/// Keeps one processor busy in this process for `length`.
-fn burn_for(length: Duration) {
-    let stop = AtomicBool::new(false);
-    std::thread::scope(|scope| {
-        scope.spawn(|| burn(&stop));
-        std::thread::sleep(length);
-        stop.store(true, Ordering::Relaxed);
-    });
+/// Keeps this thread busy for `length`, so that its own time grows as well as its process's.
+fn burn_here(length: Duration) {
+    let until = Instant::now() + length;
+    let mut value: u64 = 1;
+    while Instant::now() < until {
+        for _ in 0..10_000 {
+            value = std::hint::black_box(
+                value
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1),
+            );
+        }
+    }
+}
+
+/// This thread's identifier, where the platform names it in `/proc/thread-self`.
+fn this_thread() -> Option<u32> {
+    std::fs::read_link("/proc/thread-self")
+        .ok()?
+        .file_name()?
+        .to_str()?
+        .parse()
+        .ok()
 }
 
 fn row(reading: &Reading, pid: u32) -> &Process {
@@ -57,35 +74,65 @@ fn stand_in(seconds: &str) -> Child {
         .expect("start a process to stand for the run")
 }
 
-fn summary(output: &str) -> (f64, f64) {
-    let mut numbers = output.split_whitespace().map(str::parse::<f64>);
-    match (
-        numbers.next(),
-        numbers.next(),
-        numbers.next(),
-        numbers.next(),
-    ) {
-        (Some(Ok(bound)), Some(Ok(average)), Some(Ok(allowance)), None)
-            if (0.0..=bound).contains(&allowance) =>
-        {
-            (bound, average)
+/// The bound and the average the watcher printed, and the word it gave for how it read the run.
+fn summary(output: &str) -> (f64, f64, String) {
+    let words: Vec<&str> = output.split_whitespace().collect();
+    let numbers: Vec<f64> = words
+        .iter()
+        .take(3)
+        .filter_map(|word| word.parse().ok())
+        .collect();
+    match (numbers.as_slice(), words.get(3), words.len()) {
+        (&[bound, average, allowance], Some(times), 4) if (0.0..=bound).contains(&allowance) => {
+            (bound, average, (*times).to_owned())
         }
         _ => panic!("the watcher printed `{output}`"),
     }
 }
 
+/// The word the watcher gives for how this machine's readings take a run's time.
+fn this_machines_times() -> &'static str {
+    Machine::open()
+        .expect("open this machine for reading")
+        .times()
+        .word()
+}
+
 #[test]
 fn the_machine_counts_this_processs_work_as_busy_in_seconds() {
     let pid = std::process::id();
+    let this_process = || HashSet::from([pid]);
     let mut machine = Machine::open().expect("open this machine for reading");
-    let before = machine.reading().expect("read this machine");
+    // Where the readings take each thread's time, what this thread used between two of them.
+    let tid = this_thread();
+    let mine = |before: &Reading, after: &Reading| -> Option<f64> {
+        let time = |reading: &Reading| {
+            row(reading, pid)
+                .threads
+                .as_ref()?
+                .each
+                .iter()
+                .find(|thread| Some(thread.tid) == tid)
+                .map(|thread| (thread.start, thread.own))
+        };
+        let ((start, earlier), (again, later)) = (time(before)?, time(after)?);
+        (start == again).then_some(later - earlier)
+    };
+    let before = machine
+        .reading(|_| this_process())
+        .expect("read this machine");
     let mut child = stand_in("30");
-    // Half a second of this process's own time, however long a busy machine takes to give it.
+    // Half a second of this thread's and this process's own time, however long a busy machine
+    // takes to give it.
     let deadline = Instant::now() + Duration::from_secs(30);
     let after = loop {
-        burn_for(Duration::from_millis(500));
-        let after = machine.reading().expect("read this machine");
-        if row(&after, pid).own - row(&before, pid).own >= 0.5 || Instant::now() >= deadline {
+        burn_here(Duration::from_millis(500));
+        let after = machine
+            .reading(|_| this_process())
+            .expect("read this machine");
+        let whole = row(&after, pid).own - row(&before, pid).own;
+        let enough = whole >= 0.5 && mine(&before, &after).is_none_or(|mine| mine >= 0.5);
+        if enough || Instant::now() >= deadline {
             break after;
         }
     };
@@ -127,6 +174,16 @@ fn the_machine_counts_this_processs_work_as_busy_in_seconds() {
         busy >= own,
         "the machine counted {busy} s busy while this process used {own} s"
     );
+    // Where the readings take each thread's time, this thread's is in seconds too: at least the
+    // half second it burned, and no more than its process used, give or take the process's
+    // rounding and the reading's own work.
+    if machine.times() == Times::Threads {
+        let mine = mine(&before, &after).expect("this thread's time at both readings");
+        assert!(
+            (0.5..=own + 0.05).contains(&mine),
+            "this thread was charged {mine} s while its process used {own} s"
+        );
+    }
 }
 
 #[test]
@@ -146,7 +203,12 @@ fn work_outside_the_run_is_read_as_other_work() {
     run.kill().ok();
     run.wait().ok();
     let output = String::from_utf8_lossy(&output.stdout);
-    let (bound, average) = summary(output.trim());
+    let (bound, average, times) = summary(output.trim());
+    assert_eq!(
+        times,
+        this_machines_times(),
+        "the watcher printed `{output}`"
+    );
     // One processor was busy in this process, outside the run, the whole time.
     assert!(
         bound >= 0.9,
@@ -212,7 +274,8 @@ fn the_watcher_is_ready_after_its_first_reading_and_stops_when_asked() {
         stopped < Duration::from_secs(3),
         "the watcher took {stopped:?} to stop"
     );
-    summary(String::from_utf8_lossy(&output.stdout).trim());
+    let (_, _, times) = summary(String::from_utf8_lossy(&output.stdout).trim());
+    assert_eq!(times, this_machines_times());
 }
 
 fn wait_for(file: &Path, longest: Duration) {

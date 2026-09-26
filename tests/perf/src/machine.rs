@@ -2,7 +2,9 @@
 //! on it.
 //!
 //! Linux keeps the processors' idle time on the first line of `/proc/stat` and each process's time
-//! in `/proc/<pid>/stat`; macOS keeps each processor's idle time in its load counters and each
+//! in `/proc/<pid>/stat`, in clock ticks; where the kernel keeps each thread's own time, in
+//! nanoseconds, a reading also takes the threads of the processes that can be the run's
+//! (`crate::procfs` says how). macOS keeps each processor's idle time in its load counters and each
 //! process's time in its task information, which another user's process does not open to this
 //! reader, so that process's row is listed as unread. What this reads rests on four things each
 //! kernel does by design, which hold on the reference hosts. A reference figure rests on them only
@@ -21,8 +23,12 @@
 //!    brings it up to date and a quiet host holds interrupts off for microseconds; this reads the
 //!    clock rate from the kernel's configuration and does not read a kernel with a processor that
 //!    stops the tick while a thread runs (`nohz_full`). On macOS it trails by at most one
-//!    ten-millisecond scheduling quantum. Allowance: for each process, its running threads times one
-//!    tick or one quantum, and on Linux a further two hundredths of a second for rounding.
+//!    ten-millisecond scheduling quantum. Allowance, where Linux keeps each thread's time: for each
+//!    of the run's threads, one tick if its state is running, and otherwise the lesser of one tick
+//!    and how far its time moved in the two ticks after it was read. Where it does not (no
+//!    `schedstat`, or zeros in it): for each process, its running threads times one tick and a
+//!    further two hundredths of a second for rounding. On macOS: for each process, its running
+//!    threads times one quantum.
 //! 3. An idle count, read from more than one field without a lock, is right at least once in three.
 //!    A count taken just as a processor goes idle or wakes can drop that processor's current idle
 //!    stretch (Linux, when a task waiting for a disk is woken elsewhere) or count it twice (macOS);
@@ -30,20 +36,44 @@
 //!    since a count that falls short would add idle time from before it, and the smallest where it
 //!    ends one, since a count that runs over would add idle time that did not happen. Allowance:
 //!    none, and nothing checks that one of the three is right.
-//! 4. A process identifier and start name one process: no identifier is given to a new process
-//!    within the hundredth of a second Linux gives the start in (macOS gives it to the
-//!    microsecond). Both hand identifiers out in turn, Linux up to its `pid_max` and macOS up to
-//!    99,999, so one returns to use only after every other has been used. Allowance: none, and
-//!    nothing checks it.
+//! 4. A process identifier and start name one process, and on Linux a thread identifier and start
+//!    one thread: no identifier is given to a new process or thread within the hundredth of a
+//!    second Linux gives the start in (macOS gives it to the microsecond). Both hand identifiers
+//!    out in turn, Linux up to its `pid_max` and macOS up to 99,999, so one returns to use only
+//!    after every other has been used. Allowance: none, and nothing checks it; where the reader
+//!    reads threads it checks that a process's identifier names the same start after its threads
+//!    are read, and leaves out a thread that is ending, which is how an exec hands another thread's
+//!    identifier to the process's first thread.
 //!
 //! Elsewhere nothing is read and every reading fails.
 
+use std::collections::HashSet;
 use std::time::Instant;
 
 use crate::other_work::{Reading, Row};
 
 /// How many times each idle count is taken.
 const COUNTS: usize = 3;
+
+/// How a reading takes the processor time of the processes it reads closely.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Times {
+    /// Each thread's own time, where the kernel keeps it.
+    Threads,
+    /// Each process's time as a whole.
+    Processes,
+}
+
+impl Times {
+    /// The word a reading's record gives for it.
+    #[must_use]
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::Threads => "threads",
+            Self::Processes => "processes",
+        }
+    }
+}
 
 /// This machine, ready to be read.
 pub struct Machine {
@@ -65,17 +95,28 @@ impl Machine {
         })
     }
 
+    /// How this machine's readings take the time of the processes they read closely, which is the
+    /// same for every reading.
+    #[must_use]
+    pub fn times(&self) -> Times {
+        self.counts.times()
+    }
+
     /// Reads the machine: the idle count, every process, and the idle count again, between two
-    /// moments on a monotonic clock.
+    /// moments on a monotonic clock. `candidates` names, from the process table, the processes
+    /// whose threads the reading takes where it takes threads.
     ///
     /// # Errors
     ///
     /// When a count or the process table cannot be read, reads in a form this does not know, or the
     /// number of processors changes while it is read.
-    pub fn reading(&mut self) -> Result<Reading, String> {
+    pub fn reading(
+        &mut self,
+        candidates: impl FnOnce(&[Row]) -> HashSet<u32>,
+    ) -> Result<Reading, String> {
         let began = self.clock.elapsed().as_secs_f64();
         let (idle_before, processors) = self.idle(f64::max)?;
-        let rows = self.counts.rows(processors)?;
+        let rows = self.counts.rows(processors, candidates)?;
         let (idle_after, processors_after) = self.idle(f64::min)?;
         let ended = self.clock.elapsed().as_secs_f64();
         if processors_after != processors {
@@ -116,8 +157,10 @@ impl Machine {
 
 #[cfg(target_os = "linux")]
 mod platform {
-    use super::Row;
-    use crate::other_work::Process;
+    use std::collections::HashSet;
+
+    use super::{Row, Times};
+    use crate::procfs::Tree;
 
     /// The initial process namespace's identifier, which the kernel fixes.
     const WHOLE_MACHINE: &str = "pid:[4026531836]";
@@ -125,9 +168,11 @@ mod platform {
     pub struct Counts {
         /// The rate `/proc` prints times in.
         ticks_per_second: f64,
-        /// The rate the kernel's clock ticks at, which is how often a running thread's time is
-        /// brought up to date.
-        clock_rate: f64,
+        /// The process table.
+        tree: Tree,
+        /// Whether the kernel keeps each thread's own time, which the readings then take for the
+        /// processes that can be the run's.
+        threads: bool,
     }
 
     impl Counts {
@@ -193,15 +238,27 @@ mod platform {
                 .and_then(|rate| rate.parse::<u32>().ok())
                 .filter(|rate| *rate > 0)
                 .ok_or("the kernel's configuration names no clock rate")?;
+            let ticks = rustix::param::clock_ticks_per_second();
+            let tree = Tree::new("/proc", ticks, f64::from(clock_rate));
+            let threads = tree.keeps_thread_times();
             #[expect(
                 clippy::cast_precision_loss,
                 reason = "a clock rate is a small integer"
             )]
-            let ticks_per_second = rustix::param::clock_ticks_per_second() as f64;
+            let ticks_per_second = ticks as f64;
             Ok(Self {
                 ticks_per_second,
-                clock_rate: f64::from(clock_rate),
+                tree,
+                threads,
             })
+        }
+
+        pub fn times(&self) -> Times {
+            if self.threads {
+                Times::Threads
+            } else {
+                Times::Processes
+            }
         }
 
         /// The idle and waiting counts are each rounded down.
@@ -250,72 +307,18 @@ mod platform {
             Ok((seconds, processors))
         }
 
-        pub fn rows(&self, processors: u32) -> Result<Vec<Row>, String> {
-            let entries = std::fs::read_dir("/proc")
-                .map_err(|error| format!("list the process table: {error}"))?;
-            let mut rows = Vec::new();
-            for entry in entries {
-                let entry = entry.map_err(|error| format!("list the process table: {error}"))?;
-                let Some(pid) = entry
-                    .file_name()
-                    .to_str()
-                    .and_then(|name| name.parse::<u32>().ok())
-                else {
-                    continue;
-                };
-                let status = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
-                    Ok(status) => status,
-                    // The process ended and was collected after the table was listed.
-                    Err(error)
-                        if error.kind() == std::io::ErrorKind::NotFound
-                            || error.raw_os_error()
-                                == Some(rustix::io::Errno::SRCH.raw_os_error()) =>
-                    {
-                        continue;
-                    }
-                    Err(error) => return Err(format!("read process {pid}'s status: {error}")),
-                };
-                rows.push(self.status(pid, &status, processors)?);
+        pub fn rows(
+            &self,
+            processors: u32,
+            candidates: impl FnOnce(&[Row]) -> HashSet<u32>,
+        ) -> Result<Vec<Row>, String> {
+            let (mut rows, counts) = self.tree.processes(processors)?;
+            if self.threads {
+                let chosen = candidates(&rows);
+                self.tree
+                    .threads(&mut rows, &counts, &chosen, &mut std::thread::sleep)?;
             }
             Ok(rows)
-        }
-
-        /// A process's status line. The command name is the second field and may hold spaces and
-        /// parentheses, so the fields are counted from after the last parenthesis, which ends it:
-        /// the state is field 3, the parent 4, the process's user and system ticks 14 and 15, its
-        /// threads 20, and its start, in ticks since the machine started, 22. A process that has
-        /// ended and waits to be collected is listed as unread, as on macOS.
-        fn status(&self, pid: u32, status: &str, processors: u32) -> Result<Row, String> {
-            let unread = || format!("process {pid}'s status reads `{}`", status.trim_end());
-            let fields: Vec<&str> = status
-                .rsplit_once(')')
-                .ok_or_else(unread)?
-                .1
-                .split_whitespace()
-                .collect();
-            if matches!(fields.first(), Some(&("Z" | "X" | "x"))) {
-                return Ok(Row::Unread { pid });
-            }
-            let count = |number: usize| -> Result<u64, String> {
-                fields
-                    .get(number - 3)
-                    .and_then(|field| field.parse().ok())
-                    .ok_or_else(unread)
-            };
-            let parent = u32::try_from(count(4)?).map_err(|_| unread())?;
-            let threads = u32::try_from(count(20)?).unwrap_or(u32::MAX);
-            #[expect(
-                clippy::cast_precision_loss,
-                reason = "a tick count is far inside f64's exact range"
-            )]
-            let own = (count(14)? + count(15)?) as f64 / self.ticks_per_second;
-            Ok(Row::Read(Process {
-                pid,
-                parent,
-                start: count(22)?,
-                own,
-                lag: f64::from(threads.min(processors)) / self.clock_rate,
-            }))
         }
     }
 
@@ -348,11 +351,13 @@ mod platform {
 mod platform {
     use std::process::Command;
 
+    use std::collections::HashSet;
+
     use libproc::libproc::proc_pid::pidinfo;
     use libproc::libproc::task_info::TaskAllInfo;
     use libproc::processes::{ProcFilter, pids_by_type};
 
-    use super::Row;
+    use super::{Row, Times};
     use crate::other_work::Process;
 
     /// The load counters' idle state, by position among user, system, idle and nice.
@@ -391,6 +396,11 @@ mod platform {
             })
         }
 
+        /// Each process's time is read as a whole.
+        pub fn times(&self) -> Times {
+            Times::Processes
+        }
+
         /// Each processor's idle time is rounded down to a tick, and can trail by one quantum.
         pub fn idle_resolution(&self, processors: u32) -> f64 {
             f64::from(processors) * (self.seconds_per_tick + QUANTUM)
@@ -426,7 +436,11 @@ mod platform {
 
         /// Every process the kernel lists, read one at a time. A process whose task information
         /// cannot be read, another user's or one that has ended, is listed as unread.
-        pub fn rows(&self, processors: u32) -> Result<Vec<Row>, String> {
+        pub fn rows(
+            &self,
+            processors: u32,
+            _candidates: impl FnOnce(&[Row]) -> HashSet<u32>,
+        ) -> Result<Vec<Row>, String> {
             let mut pids = pids_by_type(ProcFilter::All)
                 .map_err(|error| format!("list the process table: {error}"))?;
             // In identifier order, as Linux lists them, so that a parent older than its children
@@ -454,6 +468,7 @@ mod platform {
                                 + info.pbsd.pbi_start_tvusec,
                             own,
                             lag: f64::from(running.min(processors)) * QUANTUM,
+                            threads: None,
                         })
                     }
                     Ok(_) | Err(_) => Row::Unread { pid },
@@ -596,7 +611,9 @@ mod platform {
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 mod platform {
-    use super::Row;
+    use std::collections::HashSet;
+
+    use super::{Row, Times};
 
     pub struct Counts;
 
@@ -605,6 +622,10 @@ mod platform {
     impl Counts {
         pub fn open() -> Result<Self, String> {
             Err(NOT_READ.to_owned())
+        }
+
+        pub fn times(&self) -> Times {
+            Times::Processes
         }
 
         pub fn idle_resolution(&self, _processors: u32) -> f64 {
@@ -619,7 +640,11 @@ mod platform {
             Err(NOT_READ.to_owned())
         }
 
-        pub fn rows(&self, _processors: u32) -> Result<Vec<Row>, String> {
+        pub fn rows(
+            &self,
+            _processors: u32,
+            _candidates: impl FnOnce(&[Row]) -> HashSet<u32>,
+        ) -> Result<Vec<Row>, String> {
             Err(NOT_READ.to_owned())
         }
     }
