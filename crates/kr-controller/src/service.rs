@@ -7537,26 +7537,38 @@ impl Controller {
             crate::config::InForce::of(&resolver);
         // The enrolment budgets the catalogue acts on, by the session number's rule: this reading
         // decides them when it loaded a document, and leaves them as they are when it did not.
+        let mut budget_failure = None;
         let budgets = match crate::config::catalogue::budgets_in_force(&resolver) {
-            Some(budgets) => {
-                // Package limits that moved move what the admissions carry with no record
-                // changing: the revision rises, so every snapshot under the new limits is above
-                // every one under the old, and every worker is sent a round.
-                if self.catalogue.put_budgets_in_force(budgets) {
-                    match self.catalogue.raise_for_moved_limits().await {
-                        Ok(_) => self.admissions_due(),
-                        Err(error) => self.note_admissions(format!(
-                            "the package limits moved and the admission revision could not be \
-                             raised for them: {}",
-                            error.message
-                        )),
+            Some(budgets) => match self.catalogue.put_budgets_in_force(budgets).await {
+                // Package limits that moved raised the admission revision with them, in one step:
+                // every worker is sent a round.
+                Ok(moved) => {
+                    if moved {
+                        self.admissions_due();
+                    }
+                    crate::config::EnforcedBudgets {
+                        value: budgets,
+                        from_document: true,
                     }
                 }
-                crate::config::EnforcedBudgets {
-                    value: budgets,
-                    from_document: true,
+                // Budgets whose package limits moved do not move when the revision cannot be
+                // raised for them: the acceptance reports that, and the next one tries again,
+                // since the budgets in force still differ from this document's.
+                Err(error) => {
+                    budget_failure = Some(
+                        Sentence::new()
+                            .stated(
+                                "the enrolment budgets did not change, because the admission \
+                                 revision their package limits move could not be written: ",
+                            )
+                            .withheld(ContentClass::Message, &error.message),
+                    );
+                    crate::config::EnforcedBudgets {
+                        value: self.catalogue.budgets_in_force(),
+                        from_document: false,
+                    }
                 }
-            }
+            },
             None => crate::config::EnforcedBudgets {
                 value: self.catalogue.budgets_in_force(),
                 from_document: false,
@@ -7639,7 +7651,7 @@ impl Controller {
         owed.fences_dispatch = owes_own || owed_elsewhere;
         let fence_now = owed.fences_dispatch;
         let (sessions, mut failure) = self.apply_session_limit(&resolver, &state).await;
-        if let Some(problem) = ceiling_failure {
+        for problem in [ceiling_failure, budget_failure].into_iter().flatten() {
             failure = Some(match failure {
                 Some(earlier) => earlier.stated("; ").sentence(&problem),
                 None => problem,

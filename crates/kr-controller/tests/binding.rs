@@ -868,3 +868,150 @@ async fn a_lowered_package_limit_moves_the_admissions_to_a_new_revision() {
     );
     assert!(hosted.pending().await.is_empty());
 }
+
+/// A lowered package limit whose admission revision cannot be raised does not come into force:
+/// the acceptance says so, and the budgets and the admissions stay as they were. Another acceptance
+/// of the same configuration, once the store answers, raises the revision and leaves the package
+/// out by the limit's name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_package_limit_whose_revision_cannot_be_raised_stays_out_of_force_until_an_acceptance_raises_it()
+ {
+    use kr_protocol::hostinfo::configuration::{Change, ConfiguredEnrolmentBudgets};
+    let hosted = Hosted::start().await;
+    let catalogue = hosted.controller().catalogue();
+    let snapshot = || async {
+        catalogue
+            .snapshot_within(&[], tokio::time::Instant::now() + PATIENCE)
+            .await
+            .expect("computed")
+    };
+    let admitted = |snapshot: &kr_controller::catalogue::admissions::Snapshot| {
+        snapshot
+            .packages
+            .iter()
+            .any(|package| package.plugin_id == plugin())
+    };
+    let before = snapshot().await;
+    assert!(admitted(&before));
+    let in_force = catalogue.budgets_in_force();
+    let lowered = Change::Enrolment(ConfiguredEnrolmentBudgets {
+        package_bytes: Nullable::some(1),
+        ..ConfiguredEnrolmentBudgets::default()
+    });
+
+    catalogue.fail_next_revision_raise();
+    let refused = hosted
+        .controller()
+        .apply_configuration(&lowered)
+        .await
+        .expect_err("the acceptance says the budgets are not in force");
+    assert!(
+        refused.to_string().contains("enrolment budgets"),
+        "{refused}"
+    );
+    assert_eq!(catalogue.budgets_in_force(), in_force, "nothing moved");
+    let during = snapshot().await;
+    assert_eq!(during.revision, before.revision);
+    assert!(admitted(&during), "the admissions are as they were");
+
+    hosted
+        .controller()
+        .apply_configuration(&lowered)
+        .await
+        .expect("the same configuration accepted again");
+    assert_eq!(catalogue.budgets_in_force().package_bytes, 1);
+    let after = snapshot().await;
+    assert!(after.revision > before.revision);
+    assert!(!admitted(&after));
+    assert!(
+        after
+            .left_out
+            .iter()
+            .any(|(plugin_id, why)| *plugin_id == plugin() && why.contains("package_bytes")),
+        "{:?}",
+        after.left_out
+    );
+}
+
+/// The budgets and their admission revision move in one step with every read of the catalogue: an
+/// acceptance that lowers a package limit while a read holds the catalogue puts nothing in force
+/// until that read is done, so no snapshot pairs the old revision with the new limits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_lowered_package_limit_comes_into_force_with_its_revision_in_one_step() {
+    use kr_controller::catalogue::TestingPoint;
+    use kr_protocol::hostinfo::configuration::{Change, ConfiguredEnrolmentBudgets};
+    let hosted = Hosted::start().await;
+    let catalogue = hosted.controller().catalogue();
+    let before = catalogue
+        .snapshot_within(&[], tokio::time::Instant::now() + PATIENCE)
+        .await
+        .expect("computed");
+    let in_force = catalogue.budgets_in_force();
+
+    // A read that holds the catalogue until the test lets it go.
+    let (held, holding) = std::sync::mpsc::channel::<()>();
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let (held, released) = (Mutex::new(held), Mutex::new(released));
+    catalogue.at_testing_point(move |point| {
+        if point == TestingPoint::Records {
+            let _ = held.lock().expect("the channel").send(());
+            let _ = released.lock().expect("the channel").recv_timeout(PATIENCE);
+        }
+    });
+    let reading = {
+        let controller = Arc::clone(hosted.controller());
+        tokio::spawn(async move {
+            controller
+                .catalogue()
+                .installed_within(tokio::time::Instant::now() + PATIENCE)
+                .await
+                .map(|_| ())
+        })
+    };
+    tokio::task::spawn_blocking(move || holding.recv_timeout(PATIENCE))
+        .await
+        .expect("the wait ends")
+        .expect("the read holds the catalogue");
+
+    let accepting = {
+        let controller = Arc::clone(hosted.controller());
+        tokio::spawn(async move {
+            controller
+                .apply_configuration(&Change::Enrolment(ConfiguredEnrolmentBudgets {
+                    package_bytes: Nullable::some(1),
+                    ..ConfiguredEnrolmentBudgets::default()
+                }))
+                .await
+                .map(|_| ())
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        catalogue.budgets_in_force(),
+        in_force,
+        "nothing is put in force while a read holds the catalogue"
+    );
+    assert!(!accepting.is_finished());
+
+    release.send(()).expect("the read goes on");
+    reading
+        .await
+        .expect("the read ends")
+        .expect("the read answers");
+    accepting
+        .await
+        .expect("the acceptance ends")
+        .expect("the limit is in force");
+    assert_eq!(catalogue.budgets_in_force().package_bytes, 1);
+    let after = catalogue
+        .snapshot_within(&[], tokio::time::Instant::now() + PATIENCE)
+        .await
+        .expect("computed");
+    assert!(after.revision > before.revision);
+    assert!(
+        after
+            .packages
+            .iter()
+            .all(|package| package.plugin_id != plugin())
+    );
+}

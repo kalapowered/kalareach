@@ -220,6 +220,11 @@ pub struct CatalogueModule {
     /// Run at each [`TestingPoint`], for tests that hold a computation there.
     #[cfg(feature = "testing")]
     testing_hook: Arc<std::sync::Mutex<Option<TestingHook>>>,
+    /// Set by this host's own tests to make the next raise of the admission revision for moved
+    /// package limits fail as a store that does not answer would. Compiled away in every shipped
+    /// build.
+    #[cfg(feature = "testing")]
+    raise_fault: std::sync::atomic::AtomicBool,
 }
 
 /// Where a test may hold a computation of this module.
@@ -327,6 +332,8 @@ impl CatalogueModule {
             limits,
             #[cfg(feature = "testing")]
             testing_hook: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(feature = "testing")]
+            raise_fault: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -425,6 +432,14 @@ impl CatalogueModule {
             .map_err(|error| ProtocolError::new(ErrorCode::StorageUnavailable, error.to_string()))?
     }
 
+    /// Makes the next raise of the admission revision for moved package limits fail, as a store
+    /// that does not answer would, for this host's own tests.
+    #[cfg(feature = "testing")]
+    pub fn fail_next_revision_raise(&self) {
+        self.raise_fault
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// Runs `hook` at each [`TestingPoint`] a computation of this module reaches.
     #[cfg(feature = "testing")]
     pub fn at_testing_point(&self, hook: impl Fn(TestingPoint) + Send + Sync + 'static) {
@@ -458,35 +473,46 @@ impl CatalogueModule {
     /// Puts the enrolment budgets this host's configuration holds in force for the changes that
     /// follow, and the limits they set in force for every check the catalogue makes from now on.
     ///
-    /// Returns true when the package limits moved. That moves what the admissions carry without
-    /// any record changing, so the caller raises the admission revision for it
-    /// ([`Self::raise_for_moved_limits`]).
-    pub fn put_budgets_in_force(
+    /// Package limits that move move what the admissions carry with no record changing, so the
+    /// admission revision rises with them, in one step under the catalogue's own lock: the
+    /// revision is raised first and the budgets are put in force once it is written. No read of
+    /// the catalogue sees the old revision with the new limits or the new revision with the old
+    /// ones, and every snapshot under the new limits is above every one under the old. Returns true
+    /// when the package limits moved, so the caller sends every worker a round.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal the catalogue gave when the revision could not be raised, and then
+    /// nothing is put in force: the budgets and limits in force still differ from `budgets`, so
+    /// the next acceptance of the same configuration tries again.
+    pub async fn put_budgets_in_force(
         &self,
         budgets: kr_protocol::hostinfo::configuration::EnrolmentBudgets,
-    ) -> bool {
+    ) -> Answer<bool> {
+        let mut catalogue = self.catalogue.lock().await;
+        let limits = limits_of(&budgets);
+        let moved = self.limits.get().package != limits.package;
+        if moved {
+            #[cfg(feature = "testing")]
+            if self
+                .raise_fault
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(ProtocolError::new(
+                    ErrorCode::StorageUnavailable,
+                    "the admission revision could not be written",
+                ));
+            }
+            catalogue
+                .raise_admission_revision(&Owner::acting())
+                .map_err(ProtocolError::from)?;
+        }
         *self
             .budgets
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = budgets;
-        let limits = limits_of(&budgets);
-        let moved = self.limits.get().package != limits.package;
         self.limits.put(limits);
-        moved
-    }
-
-    /// Raises the admission revision under this host's own authority, for package limits that
-    /// moved: every snapshot of the admissions computed under the old limits is then below every
-    /// one computed under the new ones, and every worker is sent a round.
-    ///
-    /// # Errors
-    ///
-    /// Returns the refusal the catalogue gave when the revision could not be written.
-    pub async fn raise_for_moved_limits(&self) -> Answer<u64> {
-        let mut catalogue = self.catalogue.lock().await;
-        catalogue
-            .raise_admission_revision(&Owner::acting())
-            .map_err(ProtocolError::from)
+        Ok(moved)
     }
 
     /// Returns the enrolment budgets in force.

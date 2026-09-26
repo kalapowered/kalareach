@@ -98,7 +98,7 @@ impl Controller {
     }
 
     /// Records why admissions could not be handed over, for the doctor's catalogue check.
-    pub(super) fn note_admissions(&self, why: String) {
+    fn note_admissions(&self, why: String) {
         let mut notes = self
             .admission_notes
             .lock()

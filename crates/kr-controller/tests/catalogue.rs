@@ -1748,19 +1748,25 @@ async fn the_configured_budgets_bound_what_an_enrolment_may_ask_for() {
         listed.catalogues.len()
     };
 
-    host.module.put_budgets_in_force(EnrolmentBudgets {
-        metadata_bytes: MIB,
-        ..defaults
-    });
+    host.module
+        .put_budgets_in_force(EnrolmentBudgets {
+            metadata_bytes: MIB,
+            ..defaults
+        })
+        .await
+        .expect("in force");
     let refused = refusal(add(add_params(&host)).await);
     assert_eq!(refused.code, ErrorCode::QuotaExceeded, "{refused:?}");
     assert!(refused.message.contains("metadata_bytes"), "{refused:?}");
     assert_eq!(listed().await, 0, "nothing enrolled");
 
-    host.module.put_budgets_in_force(EnrolmentBudgets {
-        full_offline_mirror: false,
-        ..defaults
-    });
+    host.module
+        .put_budgets_in_force(EnrolmentBudgets {
+            full_offline_mirror: false,
+            ..defaults
+        })
+        .await
+        .expect("in force");
     let mut mirror = add_params(&host);
     mirror.budgets.full_offline_mirror = true;
     let refused = refusal(add(mirror).await);
@@ -1770,12 +1776,15 @@ async fn the_configured_budgets_bound_what_an_enrolment_may_ask_for() {
     );
     assert_eq!(listed().await, 0, "nothing enrolled");
 
-    host.module.put_budgets_in_force(EnrolmentBudgets {
-        metadata_bytes: 128 * MIB,
-        retained_metadata_bytes: 256 * MIB,
-        full_offline_mirror: true,
-        ..defaults
-    });
+    host.module
+        .put_budgets_in_force(EnrolmentBudgets {
+            metadata_bytes: 128 * MIB,
+            retained_metadata_bytes: 256 * MIB,
+            full_offline_mirror: true,
+            ..defaults
+        })
+        .await
+        .expect("in force");
     let mut wide = add_params(&host);
     wide.budgets.metadata_bytes = U64::new(100 * MIB);
     wide.budgets.retained_metadata_bytes = U64::new(200 * MIB);
@@ -1833,7 +1842,10 @@ async fn a_package_past_a_configured_package_limit_is_refused_by_name() {
             },
         ),
     ] {
-        host.module.put_budgets_in_force(budgets);
+        host.module
+            .put_budgets_in_force(budgets)
+            .await
+            .expect("in force");
         let refused = refusal(install().await);
         assert!(
             matches!(
@@ -1852,7 +1864,10 @@ async fn a_package_past_a_configured_package_limit_is_refused_by_name() {
             "{name}: nothing installed"
         );
     }
-    host.module.put_budgets_in_force(defaults);
+    host.module
+        .put_budgets_in_force(defaults)
+        .await
+        .expect("in force");
     let _: wire::PluginInstallResult = ok(install().await);
 }
 
@@ -1902,7 +1917,10 @@ async fn a_package_kept_in_the_store_is_held_to_the_limits_in_force() {
                 Some(host.confirmations()),
             )
             .await);
-        host.module.put_budgets_in_force(budgets);
+        host.module
+            .put_budgets_in_force(budgets)
+            .await
+            .expect("in force");
         let refused = refusal(
             host.module
                 .write_frame_admitted(
@@ -1936,11 +1954,14 @@ async fn a_synchronisation_holds_each_entry_to_the_extracted_limit() {
     use kr_protocol::hostinfo::configuration::EnrolmentBudgets;
     for mirror in [false, true] {
         let host = host();
-        host.module.put_budgets_in_force(EnrolmentBudgets {
-            expanded_pack_bytes: 1,
-            full_offline_mirror: mirror,
-            ..EnrolmentBudgets::default()
-        });
+        host.module
+            .put_budgets_in_force(EnrolmentBudgets {
+                expanded_pack_bytes: 1,
+                full_offline_mirror: mirror,
+                ..EnrolmentBudgets::default()
+            })
+            .await
+            .expect("in force");
         let mut params = add_params(&host);
         params.budgets.full_offline_mirror = mirror;
         let _: wire::CatalogueAddResult = ok(host
@@ -2049,10 +2070,13 @@ async fn a_synchronisation_is_held_to_the_configured_transfer_limit() {
         }
     };
 
-    host.module.put_budgets_in_force(EnrolmentBudgets {
-        transfer_bytes: 1,
-        ..EnrolmentBudgets::default()
-    });
+    host.module
+        .put_budgets_in_force(EnrolmentBudgets {
+            transfer_bytes: 1,
+            ..EnrolmentBudgets::default()
+        })
+        .await
+        .expect("in force");
     let refused = refusal(sync().await);
     assert_eq!(refused.code, ErrorCode::QuotaExceeded, "{refused:?}");
     assert!(refused.message.contains("transfer_bytes"), "{refused:?}");
@@ -2063,7 +2087,9 @@ async fn a_synchronisation_is_held_to_the_configured_transfer_limit() {
     );
 
     host.module
-        .put_budgets_in_force(EnrolmentBudgets::default());
+        .put_budgets_in_force(EnrolmentBudgets::default())
+        .await
+        .expect("in force");
     let _: wire::CatalogueSyncResult = ok(sync().await);
     assert_ne!(
         generation().await,
