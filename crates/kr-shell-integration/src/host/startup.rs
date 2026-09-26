@@ -1293,33 +1293,19 @@ mod tests {
     }
 
     /// Writes a program that prints one line, which is all this host asks PowerShell for.
+    ///
+    /// Its text is written beside it and placed by a process of its own, so this process never
+    /// holds the program open for writing, and a child another test starts is never handed a
+    /// descriptor that would keep the program from starting.
     #[cfg(unix)]
     fn fake_powershell(root: &Path, says: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt as _;
-
         let path = root.join(format!("pwsh-{}", says.len()));
-        std::fs::write(&path, format!("#!/bin/sh\nprintf '%s\\n' '{says}'\n"))
-            .expect("writes a program");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
-            .expect("makes it runnable");
-        // A file this thread has just written is briefly unrunnable: another thread's fork still
-        // holds the descriptor it was written through, and the kernel refuses to run it until that
-        // fork reaches its own program. Run it here until it runs, so the test measures the code
-        // under test rather than that window.
-        let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        loop {
-            match std::process::Command::new(&path)
-                .stdout(std::process::Stdio::null())
-                .status()
-            {
-                Ok(_) => break path,
-                Err(error) => assert!(
-                    std::time::Instant::now() < until,
-                    "the written program never ran: {error}"
-                ),
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+        let text = root.join(format!("pwsh-{}.text", says.len()));
+        std::fs::write(&text, format!("#!/bin/sh\nprintf '%s\\n' '{says}'\n"))
+            .expect("writes the program's text");
+        kr_ipc::testing::place_program(&text, &path);
+        std::fs::remove_file(&text).expect("the program's text goes once it is in place");
+        path
     }
 
     #[test]

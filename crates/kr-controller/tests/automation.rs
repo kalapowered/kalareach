@@ -2717,42 +2717,32 @@ struct DaemonProcess(Option<std::process::Child>);
 
 #[cfg(unix)]
 impl DaemonProcess {
-    /// Starts the copied daemon on this test's own directories, with no worker program.
+    /// Starts the placed daemon on this test's own directories, with no worker program.
+    ///
+    /// The copy was placed by a process of its own, so no child another test starts holds it open
+    /// for writing, and the first start is the only one.
     fn start(program: &Path, temp: &kr_ipc::testing::TempHost) -> Self {
-        // A bounded retry for one race only: a child another test in this binary forks holds a
-        // copy of the descriptor this copy of the daemon was written through, and the platform
-        // refuses to execute a file open for writing until that child reaches its own exec.
-        for attempt in 1..=100 {
-            let log = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(temp.root().join("daemon.log"))
-                .expect("opens the daemon's log");
-            let started = std::process::Command::new(program)
-                .current_dir(temp.root())
-                .arg("--runtime-dir")
-                .arg(temp.root().join("r"))
-                .arg("--state-dir")
-                .arg(temp.root().join("s"))
-                .arg("--worker")
-                .arg(temp.root().join("no-such-worker"))
-                .arg("--secret-store")
-                .arg("file")
-                .stdin(std::process::Stdio::null())
-                .stdout(log.try_clone().expect("duplicates the log"))
-                .stderr(log)
-                .spawn();
-            match started {
-                Ok(child) => return Self(Some(child)),
-                Err(error)
-                    if error.kind() == std::io::ErrorKind::ExecutableFileBusy && attempt < 100 =>
-                {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
-                Err(error) => panic!("the daemon starts: {error:?}"),
-            }
-        }
-        unreachable!("the loop returns or panics")
+        let log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(temp.root().join("daemon.log"))
+            .expect("opens the daemon's log");
+        let child = std::process::Command::new(program)
+            .current_dir(temp.root())
+            .arg("--runtime-dir")
+            .arg(temp.root().join("r"))
+            .arg("--state-dir")
+            .arg(temp.root().join("s"))
+            .arg("--worker")
+            .arg(temp.root().join("no-such-worker"))
+            .arg("--secret-store")
+            .arg("file")
+            .stdin(std::process::Stdio::null())
+            .stdout(log.try_clone().expect("duplicates the log"))
+            .stderr(log)
+            .spawn()
+            .unwrap_or_else(|error| panic!("the daemon starts: {error:?}"));
+        Self(Some(child))
     }
 
     /// Ends it now, as a crash or a power cut would, without giving it a chance to tidy up.

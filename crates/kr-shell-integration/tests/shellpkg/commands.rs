@@ -9,7 +9,6 @@
 //! silence.
 
 use std::collections::BTreeMap;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -54,6 +53,20 @@ impl ProbeRun {
     }
 }
 
+/// Places a program whose contents are `bytes` at `path`.
+///
+/// The bytes are written beside it and placed by a process of its own, so this process never holds
+/// the program open for writing, and a child another test starts is never handed a descriptor that
+/// would keep the program from starting.
+fn place(path: &Path, bytes: &[u8]) {
+    let mut name = path.file_name().expect("a program has a name").to_owned();
+    name.push(".text");
+    let text = path.with_file_name(name);
+    std::fs::write(&text, bytes).unwrap_or_else(|error| panic!("{}: {error}", text.display()));
+    kr_ipc::testing::place_program(&text, path);
+    std::fs::remove_file(&text).unwrap_or_else(|error| panic!("{}: {error}", text.display()));
+}
+
 /// Writes a program that records its arguments and every reserved variable it was started with,
 /// then prints a word it puts together from two pieces.
 fn write_recorder(path: &Path, record: &Path, head: &str, tail: &str) {
@@ -70,43 +83,21 @@ fn write_recorder(path: &Path, record: &Path, head: &str, tail: &str) {
          printf '%s%s\\n' '{head}' '{tail}'\n",
         record = told(record)
     );
-    std::fs::write(path, script).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
-        .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+    place(path, script.as_bytes());
     run_once(path, record);
 }
 
-/// Starts a program that has just been written once, here, and forgets what it recorded.
+/// Starts a program that has just been placed once, here, and forgets what it recorded.
 ///
 /// Some systems check a program the first time anything starts it, and on a busy machine that
 /// check can outlast a reply window. It is paid here, outside every timed wait, rather than by the
 /// shell a case is timing.
-///
-/// A process another test starts while the program is being written keeps a copy of the written
-/// file's descriptor until it starts its own program, and until then Linux refuses to start this
-/// one as busy. That lasts as long as the other start takes, so this one is tried again. Once it
-/// has started, nothing can hold the file open for writing any more, so every later start is clear.
 pub fn run_once(path: &Path, record: &Path) {
-    let mut attempted = 0;
-    let status = loop {
-        attempted += 1;
-        match std::process::Command::new(path)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-        {
-            Ok(status) => break status,
-            Err(error)
-                if error.kind() == std::io::ErrorKind::ExecutableFileBusy && attempted < 100 =>
-            {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            Err(error) => panic!(
-                "{} does not start, after {attempted} attempts: {error}",
-                path.display()
-            ),
-        }
-    };
+    let status = std::process::Command::new(path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap_or_else(|error| panic!("{} does not start: {error}", path.display()));
     assert!(
         status.success(),
         "{} failed its first start",
@@ -190,10 +181,7 @@ impl Probes {
             "ran",
         );
         // A launcher that is an executable file the system cannot start.
-        let broken = root.join("launcher").join("kr-hook-broken");
-        std::fs::write(&broken, [0u8, 1, 2, 3]).expect("a launcher that cannot start");
-        std::fs::set_permissions(&broken, std::fs::Permissions::from_mode(0o755))
-            .expect("an executable file");
+        place(&root.join("launcher").join("kr-hook-broken"), &[0, 1, 2, 3]);
         std::fs::write(root.join("script.sh"), "kr-probe from-a-script\n").expect("a script");
         Self {
             _directory: directory,

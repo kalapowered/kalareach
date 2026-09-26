@@ -30,6 +30,9 @@ rustix = { workspace = true, features = ["fs"] }
 # The package tests drive a built shell in a real pseudo-terminal and check its proof against the
 # transcript this contract defines.
 hmac.workspace = true
+# A program a test writes is placed by a process of its own, so that no child another test starts
+# holds it open for writing when it is started.
+kr-ipc = { workspace = true, features = ["testing"] }
 portable-pty.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
