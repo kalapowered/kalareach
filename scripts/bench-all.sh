@@ -157,7 +157,8 @@ fi
 # The aggregate processor line's total and stolen ticks.
 cpu_ticks() {
   awk '$1 == "cpu" {
-    print $2 + $3 + $4 + $5 + $6 + $7 + $8 + $9, $9
+    # Whole numbers, written out: some awks print a large number in exponent form.
+    printf "%.0f %.0f\n", $2 + $3 + $4 + $5 + $6 + $7 + $8 + $9, $9
     found = 1
     exit
   }
