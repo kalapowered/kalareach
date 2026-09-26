@@ -14,6 +14,9 @@
 //!
 //! The environment identity's list and the profile it is kept in, KR-REQ-03.08, are checked by
 //! this crate's own tests in `src/paths.rs`, which run on this platform too.
+//!
+//! The boot identity every recorded worker, startup claim and owner confirmation is bound to is
+//! read here thousands of times over several seconds, and one boot gives one value.
 
 #![cfg(windows)]
 
@@ -792,6 +795,41 @@ fn a_process_this_account_may_only_ask_about_is_identified() {
          privilege left enabled would allow)"
     );
     assert_eq!(waited, Some(kr_ipc::identity::ProcessState::Running));
+}
+
+/// How many times the boot identity is read, at the least, in the test that one boot has one
+/// identity.
+const BOOT_READS: usize = 5_000;
+
+/// How long, at the least, those reads go on for: several seconds of the wall clock, and of the
+/// time since the boot, so that the reads fall on both sides of several of each clock's seconds.
+const BOOT_SPAN: Duration = Duration::from_secs(3);
+
+/// Every read of the boot identity in one boot gives one value. A host reads it when it records a
+/// worker's boot, when it compares a worker's claim with that record, and when it checks an owner's
+/// confirmation against the boot it was given in, seconds or hours apart; a value that moved
+/// between two of those reads would read as another boot to the comparison between them.
+#[test]
+fn every_read_of_the_boot_identity_in_one_boot_gives_one_value() {
+    let started = Instant::now();
+    let mut identities = std::collections::BTreeSet::new();
+    let mut seconds = std::collections::BTreeSet::new();
+    let mut reads = 0_usize;
+    while reads < BOOT_READS || started.elapsed() < BOOT_SPAN {
+        identities.insert(kr_ipc::identity::boot_identity().expect("the kernel names this boot"));
+        if let Ok(since) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            seconds.insert(since.as_secs());
+        }
+        reads += 1;
+    }
+    assert_eq!(
+        identities.len(),
+        1,
+        "{reads} reads over {:?}, in {} seconds of the wall clock, gave these boot identities: \
+         {identities:?}",
+        started.elapsed(),
+        seconds.len()
+    );
 }
 
 /// A descriptor for `session` in `host`'s environment, naming `endpoint`.
