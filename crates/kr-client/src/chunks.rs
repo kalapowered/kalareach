@@ -26,7 +26,6 @@
 use kr_ipc::endpoint::Connection;
 use kr_ipc::framed::{FrameReader, FrameWriter, split};
 use kr_ipc::paths::{Endpoint, EnvironmentPaths};
-use kr_protocol::authority::FreshnessRequirement;
 use kr_protocol::envelope::{
     ActionTarget, ControlEvent, ControlFrame, MutationRequest, Outcome, ParamsValue, Request,
 };
@@ -40,6 +39,10 @@ use kr_protocol::scalars::{Bytes, CanonicalSet, Digest256, DurationMs, Nullable}
 use kr_protocol::transfer::{
     ChunkDescriptor, DownloadChunkParams, DownloadChunkResult, UploadChunkParams, UploadChunkResult,
 };
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use tokio::sync::{mpsc, watch};
 
@@ -157,11 +160,8 @@ impl ChunkLane {
         }
         let Carrier::Local(carrier) = &mut self.carrier;
         carrier.usable()?;
-        let window = carrier.window();
         let entry = Method::UploadChunk.entry();
-        if entry.freshness == FreshnessRequirement::ActionWindow && window.valid_for_ms.get() == 0 {
-            return Err(ClientError::NoActionWindow);
-        }
+        let window = carrier.window().await?;
         let request_id = carrier.next_request_id();
         let mutation = MutationRequest {
             request_id,
@@ -247,22 +247,51 @@ impl ChunkLane {
 /// caller abandoned before its answer came.
 const ANSWER_DEPTH: usize = 8;
 
+/// A window the host issued on a lane's connection, and when the lane received it.
+#[derive(Clone, Debug)]
+struct Issued {
+    window: ActionWindow,
+    received_at: tokio::time::Instant,
+}
+
+impl Issued {
+    fn now(window: ActionWindow) -> Self {
+        Self {
+            window,
+            received_at: tokio::time::Instant::now(),
+        }
+    }
+
+    /// How long the host said the window stands, from when it was issued.
+    fn validity(&self) -> Duration {
+        Duration::from_millis(self.window.valid_for_ms.get())
+    }
+}
+
 /// A connection to an environment's attachment-chunk endpoint.
 ///
 /// One task reads the connection for as long as the lane lives, as a session's reader reads its
-/// control connection: it applies each window the host renews as the renewal arrives and hands
-/// every answer to the call waiting for it. So a call is always built with the newest window the
-/// host has issued on this connection, however long the lane sat idle and however many keepalives
-/// came first, and no call has to read the host's backlog before it can start.
+/// control connection: it applies each window the host renews as the renewal arrives, and hands
+/// every answer to the call waiting for it, after checking the answer is to a call this lane made.
+///
+/// Which window a call carries is decided by time rather than by how far the reader has got. The
+/// host issues a window for a stated validity and renews it when half of that has passed, so a
+/// window this lane received less than half its validity ago cannot have expired, and a call
+/// carries it. An older one is due for renewal, and a call waits for the reader to deliver the
+/// renewal, until the window it holds would have expired; a lane whose window runs out
+/// unrenewed has lost its connection.
 #[derive(Debug)]
 struct LocalCarrier {
     writer: FrameWriter,
-    /// The window the host last issued on this connection, as the reader last saw it.
-    window: watch::Receiver<ActionWindow>,
-    /// The answers the reader hands over, and the failure that ended it.
+    /// The newest window the reader has delivered. Its sender is the reader's, so it also says
+    /// when the reader has stopped.
+    window: watch::Receiver<Issued>,
+    /// The answers the reader hands over, and the failure that stopped it.
     answers: mpsc::Receiver<Result<ControlFrame>>,
+    /// The newest request identifier this lane has issued, which the reader checks every answer
+    /// against.
+    issued: Arc<AtomicU64>,
     reader: tokio::task::JoinHandle<()>,
-    next_request: u64,
     /// Set once the connection has failed. Nothing is sent on it again: a frame read or written in
     /// part leaves nothing a later call could trust.
     ended: bool,
@@ -330,46 +359,78 @@ impl LocalCarrier {
                  environment's controller",
             ));
         }
-        let (renewals, window) = watch::channel(acknowledgement.action_window);
+        let (renewals, window) = watch::channel(Issued::now(acknowledgement.action_window));
         let (answering, answers) = mpsc::channel(ANSWER_DEPTH);
+        let issued = Arc::new(AtomicU64::new(0));
         Ok(Self {
             writer,
             window,
             answers,
-            reader: tokio::spawn(read_lane(reader, renewals, answering)),
-            next_request: 0,
+            reader: tokio::spawn(read_lane(reader, renewals, answering, Arc::clone(&issued))),
+            issued,
             ended: false,
         })
     }
 
-    /// The newest window the host has issued on this connection.
-    fn window(&self) -> ActionWindow {
-        self.window.borrow().clone()
-    }
-
     /// Says whether this lane can still carry a call, before one is built.
     ///
-    /// The reader stops when the connection ends or the host sends what this lane cannot read, and
-    /// a call built after that would go out on a connection nobody reads. What the reader said as
-    /// it stopped is the answer.
+    /// The reader stops when the connection ends or the host sends what this lane cannot take, and
+    /// a call built after that would go out on a connection nobody reads.
     fn usable(&mut self) -> Result<()> {
-        if !self.ended && !self.reader.is_finished() {
-            return Ok(());
+        if self.ended || self.reader.is_finished() {
+            return Err(self.stopped());
         }
+        Ok(())
+    }
+
+    /// Ends this lane and says why: what the reader said as it stopped, if it said anything.
+    fn stopped(&mut self) -> ClientError {
         self.ended = true;
         loop {
             match self.answers.try_recv() {
-                Ok(Err(error)) => return Err(error),
+                Ok(Err(error)) => return error,
                 // An answer to a call its caller abandoned.
                 Ok(Ok(_)) => {}
-                Err(_) => return Err(ClientError::ConnectionEnded),
+                Err(_) => return ClientError::ConnectionEnded,
+            }
+        }
+    }
+
+    /// The window a call carries: one this lane received less than half its validity ago.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::NoActionWindow`] when the host issued a window that admits nothing,
+    /// the reader's failure when it stopped while this waited, and
+    /// [`ClientError::ConnectionEnded`] when the window this lane holds would have expired before
+    /// a renewal came.
+    async fn window(&mut self) -> Result<ActionWindow> {
+        loop {
+            let issued = self.window.borrow_and_update().clone();
+            if issued.window.valid_for_ms.get() == 0 {
+                return Err(ClientError::NoActionWindow);
+            }
+            let validity = issued.validity();
+            if issued.received_at.elapsed() < validity / 2 {
+                return Ok(issued.window);
+            }
+            // The renewal is due. The reader delivers it as soon as it arrives.
+            let expiry = issued.received_at + validity;
+            match tokio::time::timeout_at(expiry, self.window.changed()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => return Err(self.stopped()),
+                Err(_) => {
+                    self.ended = true;
+                    return Err(ClientError::ConnectionEnded);
+                }
             }
         }
     }
 
     fn next_request_id(&mut self) -> RequestId {
-        self.next_request = self.next_request.saturating_add(1);
-        RequestId::new(self.next_request)
+        // Recorded before the request can leave, so the reader never takes the answer to it for
+        // one to a call this lane did not make.
+        RequestId::new(self.issued.fetch_add(1, Ordering::AcqRel).saturating_add(1))
     }
 
     /// Sends one frame and waits for the reader to hand over its answer.
@@ -381,13 +442,35 @@ impl LocalCarrier {
         if self.ended {
             return Err(ClientError::ConnectionEnded);
         }
-        if let Err(error) = self.writer.write_message(frame).await {
+        // The write is abandoned if the reader stops while it waits: a host that stopped reading
+        // and said something this lane cannot take would otherwise hold the write for ever.
+        let mut reading = self.window.clone();
+        let written = {
+            let write = self.writer.write_message(frame);
+            tokio::pin!(write);
+            loop {
+                tokio::select! {
+                    written = &mut write => break Some(written),
+                    changed = reading.changed() => {
+                        if changed.is_err() {
+                            break None;
+                        }
+                    }
+                }
+            }
+        };
+        match written {
+            Some(Ok(())) => {}
             // A frame that could not be encoded never reached the socket, so the connection is
             // still whole; anything else may have left part of a frame on it.
-            if matches!(error, kr_ipc::IpcError::Frame(_)) {
+            Some(Err(error)) if matches!(error, kr_ipc::IpcError::Frame(_)) => {
                 return Err(ClientError::Ipc(error));
             }
-            return Err(self.failed(error));
+            Some(Err(error)) => {
+                self.ended = true;
+                return Err(failure_of(error));
+            }
+            None => return Err(self.stopped()),
         }
         loop {
             let answer = match self.answers.recv().await {
@@ -416,40 +499,21 @@ impl LocalCarrier {
                         "the host settled the call with a receipt and no result",
                     ));
                 }
-                // The answer to an earlier call, which its caller abandoned before it came.
-                ControlFrame::Response(kr_protocol::envelope::Response {
-                    request_id: earlier,
-                    ..
-                }) if earlier < request_id => {}
-                ControlFrame::Receipt(receipt) if receipt.request_id < request_id => {}
-                _ => {
-                    self.ended = true;
-                    return Err(refusal(
-                        ErrorCode::InvalidArgument,
-                        "the host answered a call this lane did not make",
-                    ));
-                }
+                // The answer to an earlier call, which its caller abandoned before it came. The
+                // reader has already refused any answer to a call this lane never made.
+                _ => {}
             }
         }
-    }
-
-    /// Ends this connection after a failure and says what the failure means to the caller.
-    ///
-    /// A socket that closed or failed is a lost connection, which a caller recovers from by asking
-    /// the host what arrived. A frame the host sent that could not be read is not: the connection
-    /// still ends, and the failure is reported as it is.
-    fn failed(&mut self, error: kr_ipc::IpcError) -> ClientError {
-        self.ended = true;
-        failure_of(error)
     }
 }
 
 /// Reads a lane's connection until it ends: each renewed window goes to the lane at once, and
-/// each answer to the call waiting for it.
+/// each answer to a call the lane made goes to the call waiting for it.
 async fn read_lane(
     mut reader: FrameReader,
-    renewals: watch::Sender<ActionWindow>,
+    renewals: watch::Sender<Issued>,
     answering: mpsc::Sender<Result<ControlFrame>>,
+    issued: Arc<AtomicU64>,
 ) {
     loop {
         let frame = match reader.read_message::<ControlFrame>().await {
@@ -459,18 +523,16 @@ async fn read_lane(
                 return;
             }
         };
-        match frame {
+        let answered = match &frame {
             ControlFrame::Event(ControlEvent::ActionWindowRenewed(window)) => {
-                renewals.send_replace(window);
+                renewals.send_replace(Issued::now(window.clone()));
+                continue;
             }
-            ControlFrame::Event(ControlEvent::Keepalive) | ControlFrame::Notification(_) => {}
-            answer @ (ControlFrame::Response(_) | ControlFrame::Receipt(_)) => {
-                // A lane waits for one answer at a time. A host that fills this with answers
-                // nobody is waiting for is not answering this lane, and the lane ends.
-                if answering.try_send(Ok(answer)).is_err() {
-                    return;
-                }
+            ControlFrame::Event(ControlEvent::Keepalive) | ControlFrame::Notification(_) => {
+                continue;
             }
+            ControlFrame::Response(response) => response.request_id,
+            ControlFrame::Receipt(receipt) => receipt.request_id,
             _ => {
                 let _ = answering.try_send(Err(refusal(
                     ErrorCode::InvalidArgument,
@@ -478,6 +540,19 @@ async fn read_lane(
                 )));
                 return;
             }
+        };
+        // An answer to a request this lane has not issued answers nothing it asked, whatever the
+        // host meant by it. A lane waits for one answer at a time, so a host that fills the queue
+        // with answers nobody is waiting for is not answering this lane either.
+        if answered.get() > issued.load(Ordering::Acquire) {
+            let _ = answering.try_send(Err(refusal(
+                ErrorCode::InvalidArgument,
+                "the host answered a call this lane did not make",
+            )));
+            return;
+        }
+        if answering.try_send(Ok(frame)).is_err() {
+            return;
         }
     }
 }

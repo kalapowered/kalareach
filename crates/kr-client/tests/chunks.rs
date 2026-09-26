@@ -83,6 +83,18 @@ struct Script {
     expire_first_window: bool,
     /// How many keepalives the attachment-chunk endpoint sends before it renews the window.
     keepalives_before_renewal: usize,
+    /// When set, the attachment-chunk endpoint renews the window only when this is notified,
+    /// rather than as soon as it has acknowledged the hello.
+    renewal_trigger: Option<Arc<tokio::sync::Notify>>,
+    /// The validity of the window the attachment-chunk endpoint issues in its acknowledgement, in
+    /// milliseconds, when not a minute.
+    chunk_window_ms: Option<u64>,
+    /// The attachment-chunk endpoint stops reading once it has acknowledged the hello, and after
+    /// this long sends a frame a lane does not carry, keeping the connection open.
+    stop_reading_after: Option<std::time::Duration>,
+    /// After answering the first chunk, the attachment-chunk endpoint also answers the next
+    /// request identifier, which the lane has not issued.
+    unsolicited_answer: bool,
     /// The control endpoint issues a window that admits nothing.
     no_control_window: bool,
     /// The attachment-chunk endpoint follows its acknowledgement with a frame a lane does not
@@ -442,6 +454,27 @@ async fn serve(host: std::sync::Weak<Host>, listener: Listener, chunks: bool) {
     }
 }
 
+/// Sends the script's keepalives and then the renewal, and records it.
+async fn renew(host: &Host, writer: &mut FrameWriter, renewal: &ActionWindowId) -> bool {
+    for _ in 0..host.script.keepalives_before_renewal {
+        if writer
+            .write_message(&ControlFrame::Event(ControlEvent::Keepalive))
+            .await
+            .is_err()
+        {
+            return false;
+        }
+    }
+    let renewed = ControlFrame::Event(ControlEvent::ActionWindowRenewed(action_window(
+        renewal.clone(),
+    )));
+    if writer.write_message(&renewed).await.is_err() {
+        return false;
+    }
+    host.seen.lock().expect("what the host saw").renewals += 1;
+    true
+}
+
 /// Answers one connection until it ends, or until the script ends it.
 async fn converse(
     host: Arc<Host>,
@@ -464,13 +497,16 @@ async fn converse(
             .unwrap_or_else(|| host.environment_id()),
         None => host.environment_id(),
     };
-    let issued = if leg.is_none() && host.script.no_control_window {
-        ActionWindow {
+    let issued = match (leg, host.script.chunk_window_ms) {
+        (None, _) if host.script.no_control_window => ActionWindow {
             valid_for_ms: DurationMs::new(0),
             ..action_window(window("window-1"))
-        }
-    } else {
-        action_window(window("window-1"))
+        },
+        (Some(_), Some(validity)) => ActionWindow {
+            valid_for_ms: DurationMs::new(validity),
+            ..action_window(window("window-1"))
+        },
+        _ => action_window(window("window-1")),
     };
     if writer
         .write_message(&host.acknowledgement(&peer, environment_id, issued))
@@ -486,28 +522,40 @@ async fn converse(
         }
     }
     let mut current = window("window-1");
-    if let (Some(_), Some(renewal)) = (leg, host.script.renewal.clone()) {
-        for _ in 0..host.script.keepalives_before_renewal {
-            if writer
-                .write_message(&ControlFrame::Event(ControlEvent::Keepalive))
-                .await
-                .is_err()
-            {
-                return;
-            }
-        }
-        let renewed = ControlFrame::Event(ControlEvent::ActionWindowRenewed(action_window(
-            renewal.clone(),
-        )));
-        if writer.write_message(&renewed).await.is_err() {
+    let mut due = leg.and(host.script.renewal.clone());
+    if host.script.renewal_trigger.is_none()
+        && let Some(renewal) = due.take()
+    {
+        if !renew(&host, &mut writer, &renewal).await {
             return;
         }
-        host.seen.lock().expect("what the host saw").renewals += 1;
         current = renewal;
     }
+    if let (Some(_), Some(after)) = (leg, host.script.stop_reading_after) {
+        tokio::time::sleep(after).await;
+        let stray = host.acknowledgement(&peer, environment_id, action_window(window("window-9")));
+        let _ = writer.write_message(&stray).await;
+        // Never reads again, and keeps the connection open.
+        std::future::pending::<()>().await;
+    }
     let mut carried = 0_usize;
+    let mut unsolicited = host.script.unsolicited_answer;
     loop {
-        let Ok(frame) = reader.read_message::<ControlFrame>().await else {
+        let frame = match (due.clone(), host.script.renewal_trigger.clone()) {
+            (Some(renewal), Some(trigger)) => tokio::select! {
+                frame = reader.read_message::<ControlFrame>() => frame,
+                () = trigger.notified() => {
+                    if !renew(&host, &mut writer, &renewal).await {
+                        return;
+                    }
+                    current = renewal;
+                    due = None;
+                    continue;
+                }
+            },
+            _ => reader.read_message::<ControlFrame>().await,
+        };
+        let Ok(frame) = frame else {
             return;
         };
         let reply = match frame {
@@ -534,7 +582,15 @@ async fn converse(
                         )
                     }
                     (Some(Method::UploadChunk), Some(leg)) => {
-                        let outcome = parameters::<UploadChunkParams>(&params).and_then(|chunk| {
+                        let parsed = parameters::<UploadChunkParams>(&params);
+                        let next = parsed.as_ref().ok().map(|chunk| UploadChunkResult {
+                            transfer_id: chunk.transfer_id,
+                            index: U64::new(chunk.chunk.index.get() + 1),
+                            duplicate: false,
+                            received_chunks: Bytes::new(Vec::new()),
+                            received_byte_len: U64::new(0),
+                        });
+                        let outcome = parsed.and_then(|chunk| {
                             let index = chunk.chunk.index.get();
                             let outcome = host.chunk(chunk);
                             let mut seen = host.seen.lock().expect("what the host saw");
@@ -547,7 +603,21 @@ async fn converse(
                             // Stored, and never answered: the connection ends here.
                             return;
                         }
-                        answer(request_id, outcome)
+                        if unsolicited && let Some(next) = next {
+                            unsolicited = false;
+                            // The answer to this chunk, and then one to the request after it,
+                            // which the lane has not made.
+                            if writer
+                                .write_message(&answer(request_id, outcome))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                            answer(RequestId::new(request_id.get() + 1), typed(&next))
+                        } else {
+                            answer(request_id, outcome)
+                        }
                     }
                     (Some(Method::UploadBegin), None) => {
                         host.seen.lock().expect("what the host saw").reservations += 1;
@@ -575,7 +645,14 @@ async fn converse(
                                         reason: Nullable::null(),
                                         payload_digest: Digest256::from_bytes([0; 32]),
                                         accepted_deadline_ms: Nullable::null(),
-                                        error: Nullable::null(),
+                                        error: if state == ReceiptState::Refused {
+                                            Nullable::some(ProtocolError::new(
+                                                ErrorCode::QuotaExceeded,
+                                                "the environment's budget is spent",
+                                            ))
+                                        } else {
+                                            Nullable::null()
+                                        },
                                         updated_at_ms: TimestampMs::new(0),
                                     },
                                 }))
@@ -1013,7 +1090,13 @@ async fn a_reservation_whose_receipt_says_it_never_took_effect_may_be_asked_for_
         let refused = uploads::send(&session, &host.route(), &host.target(), &mut plan, TTL)
             .await
             .expect_err("the host's receipt refuses the reservation");
-        assert_ne!(refused.code(), ErrorCode::OutcomeUnknown, "{state:?}");
+        // The receipt's own error when it carries one, and a refusal otherwise.
+        let expected = if state == ReceiptState::Refused {
+            ErrorCode::QuotaExceeded
+        } else {
+            ErrorCode::PermissionDenied
+        };
+        assert_eq!(refused.code(), expected, "{state:?}");
         assert!(
             matches!(plan.next(), Ok(uploads::Step::Begin(_))),
             "{state:?}: the plan may ask again"
@@ -1106,84 +1189,6 @@ async fn a_refused_reservation_may_be_asked_for_again() {
     assert!(matches!(plan.next(), Ok(uploads::Step::Begin(_))));
 }
 
-/// A lane that sat idle while its window expired sends its next chunk under the window the host
-/// renewed meanwhile, not the one it opened with.
-#[tokio::test]
-async fn an_idle_lane_sends_under_the_window_the_host_renewed_while_it_waited() {
-    let host = Host::start(Script {
-        renewal: Some(window("window-2")),
-        expire_first_window: true,
-        ..Script::default()
-    });
-    let session = host.session().await;
-    let bytes = pattern(4096);
-    let reserved = reserve(&host, &session, &bytes).await;
-    let mut lane = host
-        .route()
-        .open(reserved.transfer_id)
-        .await
-        .expect("a lane");
-    // The lane waits, and the host renews its window and lets the first one expire meanwhile.
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-    while host.seen().renewals == 0 {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the host never renewed"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-    let accepted = lane
-        .send_chunk(
-            &host.target(),
-            &chunk_of(reserved.transfer_id, &bytes, 0),
-            TTL,
-        )
-        .await
-        .expect("the chunk goes under the renewed window");
-    assert_eq!(accepted.index, U64::new(0));
-    assert_eq!(host.seen().windows, vec!["window-2"]);
-}
-
-/// A lane that sat idle under a backlog of keepalives still sends under the window the host
-/// renewed after them: the lane keeps up with its connection while nothing is being sent.
-#[tokio::test]
-async fn a_lane_behind_a_backlog_of_keepalives_sends_under_the_window_renewed_after_them() {
-    let host = Host::start(Script {
-        renewal: Some(window("window-2")),
-        expire_first_window: true,
-        keepalives_before_renewal: 300,
-        ..Script::default()
-    });
-    let session = host.session().await;
-    let bytes = pattern(4096);
-    let reserved = reserve(&host, &session, &bytes).await;
-    let mut lane = host
-        .route()
-        .open(reserved.transfer_id)
-        .await
-        .expect("a lane");
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-    while host.seen().renewals == 0 {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the host never renewed"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-    lane.send_chunk(
-        &host.target(),
-        &chunk_of(reserved.transfer_id, &bytes, 0),
-        TTL,
-    )
-    .await
-    .expect("the chunk goes under the renewed window");
-    assert_eq!(host.seen().windows, vec!["window-2"]);
-}
-
 /// A lane whose reader stopped at a frame it cannot carry sends nothing more, even though the
 /// connection is still open: the next call fails with what the reader said.
 #[tokio::test]
@@ -1226,5 +1231,167 @@ async fn a_lane_whose_reader_stopped_sends_nothing_more() {
         host.seen().legs,
         vec![Vec::<u64>::new()],
         "no chunk went out"
+    );
+}
+
+/// A call on a lane whose window is due for renewal waits for the renewal, even when the host sends
+/// it behind a backlog the reader has not read yet, and goes out under it.
+///
+/// The window here stands for two seconds, so its renewal is due after one. The call starts after
+/// that and before the host has sent anything; the host then sends three hundred keepalives and the
+/// renewal, and from then on refuses the first window.
+#[tokio::test]
+async fn a_call_waits_for_the_renewal_its_window_is_due_for() {
+    let trigger = Arc::new(tokio::sync::Notify::new());
+    let host = Host::start(Script {
+        renewal: Some(window("window-2")),
+        renewal_trigger: Some(Arc::clone(&trigger)),
+        chunk_window_ms: Some(2_000),
+        keepalives_before_renewal: 300,
+        expire_first_window: true,
+        ..Script::default()
+    });
+    let session = host.session().await;
+    let bytes = pattern(4096);
+    let reserved = reserve(&host, &session, &bytes).await;
+    let mut lane = host
+        .route()
+        .open(reserved.transfer_id)
+        .await
+        .expect("a lane");
+    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+
+    let target = host.target();
+    let chunk = chunk_of(reserved.transfer_id, &bytes, 0);
+    let call = tokio::spawn(async move { lane.send_chunk(&target, &chunk, TTL).await });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(
+        host.seen().windows.is_empty(),
+        "the lane sends nothing under a window due for renewal"
+    );
+    trigger.notify_one();
+    let accepted = tokio::time::timeout(std::time::Duration::from_secs(10), call)
+        .await
+        .expect("the call ends")
+        .expect("the call's task")
+        .expect("the chunk goes under the renewed window");
+    assert_eq!(accepted.index, U64::new(0));
+    assert_eq!(host.seen().windows, vec!["window-2"]);
+}
+
+/// A lane whose window runs out with no renewal has lost its connection, and sends nothing under
+/// the window that ran out.
+#[tokio::test]
+async fn a_lane_whose_window_runs_out_unrenewed_has_lost_its_connection() {
+    let host = Host::start(Script {
+        chunk_window_ms: Some(600),
+        ..Script::default()
+    });
+    let session = host.session().await;
+    let bytes = pattern(4096);
+    let reserved = reserve(&host, &session, &bytes).await;
+    let mut lane = host
+        .route()
+        .open(reserved.transfer_id)
+        .await
+        .expect("a lane");
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+    let lost = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        lane.send_chunk(
+            &host.target(),
+            &chunk_of(reserved.transfer_id, &bytes, 0),
+            TTL,
+        ),
+    )
+    .await
+    .expect("the call ends when the window does")
+    .expect_err("no renewal came");
+    assert!(matches!(lost, ClientError::ConnectionEnded), "{lost}");
+    assert!(host.seen().windows.is_empty(), "nothing went out");
+}
+
+/// A write that the host stopped reading ends when the lane's reader does, with what the reader
+/// said, rather than waiting for a host that will never read it.
+#[tokio::test]
+async fn a_write_the_host_stopped_reading_ends_when_the_reader_does() {
+    let host = Host::start(Script {
+        stop_reading_after: Some(std::time::Duration::from_millis(300)),
+        ..Script::default()
+    });
+    let session = host.session().await;
+    let bytes = pattern(2 * UPLOAD_CHUNK_LEN);
+    let reserved = reserve(&host, &session, &bytes).await;
+    let mut lane = host
+        .route()
+        .open(reserved.transfer_id)
+        .await
+        .expect("a lane");
+
+    // A whole chunk: more than the socket holds, so the write waits for the host to read.
+    let refused = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        lane.send_chunk(
+            &host.target(),
+            &chunk_of(reserved.transfer_id, &bytes, 0),
+            TTL,
+        ),
+    )
+    .await
+    .expect("the call ends when the reader does")
+    .expect_err("the host stopped reading");
+    assert_eq!(refused.code(), ErrorCode::InvalidArgument, "{refused}");
+    let again = lane
+        .send_chunk(
+            &host.target(),
+            &chunk_of(reserved.transfer_id, &bytes, 1),
+            TTL,
+        )
+        .await
+        .expect_err("the lane has ended");
+    assert!(matches!(again, ClientError::ConnectionEnded), "{again}");
+}
+
+/// An answer to a request the lane has not issued ends the lane, so it can never be taken for the
+/// answer to the call the lane makes next.
+#[tokio::test]
+async fn an_answer_to_a_call_the_lane_never_made_ends_the_lane() {
+    let host = Host::start(Script {
+        unsolicited_answer: true,
+        ..Script::default()
+    });
+    let session = host.session().await;
+    let bytes = pattern(UPLOAD_CHUNK_LEN + 10);
+    let reserved = reserve(&host, &session, &bytes).await;
+    let mut lane = host
+        .route()
+        .open(reserved.transfer_id)
+        .await
+        .expect("a lane");
+
+    lane.send_chunk(
+        &host.target(),
+        &chunk_of(reserved.transfer_id, &bytes, 0),
+        TTL,
+    )
+    .await
+    .expect("the first chunk is answered");
+    // Time for the host's second answer, to a request the lane has not issued, to reach it.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let refused = lane
+        .send_chunk(
+            &host.target(),
+            &chunk_of(reserved.transfer_id, &bytes, 1),
+            TTL,
+        )
+        .await
+        .expect_err("the lane ended at the answer nobody asked for");
+    assert_eq!(refused.code(), ErrorCode::InvalidArgument, "{refused}");
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(
+        host.seen().legs,
+        vec![vec![0]],
+        "the second chunk never went out"
     );
 }
