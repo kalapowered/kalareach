@@ -445,15 +445,15 @@ const FORWARDER: &str = "kr-hook";
 /// The forwarder may appear in a flag in one form only, the one the host applies to a native
 /// bridge's files: a JSON object whose `command` is exactly `kr-hook` and whose `args` are the
 /// application and `hook`. A launch's flags register only a hook, and only for `own`, the package's
-/// own name. Any other mention of the forwarder, a shell command that runs it, a path to it, an
-/// argument naming it or a flag that is not JSON, is refused, so no flag starts it in a way the
-/// launch's bridge does not account for.
+/// own name. Any other mention of the forwarder, in any letter case, a shell command that runs it,
+/// a path to it, an argument naming it or a flag that is not JSON, is refused, so no flag starts it
+/// in a way the launch's bridge does not account for.
 fn registered_hook(flags: &[String], own: &str) -> Result<Option<String>, String> {
     let mut applications = BTreeSet::new();
     for flag in flags {
         match serde_json::from_str::<serde_json::Value>(flag) {
             Ok(document) => forwarder_invocations(&document, &mut applications)?,
-            Err(_) if flag.contains(FORWARDER) => {
+            Err(_) if names_forwarder(flag) => {
                 return Err(format!(
                     "names {FORWARDER} in {flag:?}, and a launch starts it only as a hook's own \
                      command with its arguments"
@@ -468,6 +468,12 @@ fn registered_hook(flags: &[String], own: &str) -> Result<Option<String>, String
         ));
     }
     Ok(applications.into_iter().next())
+}
+
+/// Returns true when text names the forwarder, whatever the letter case: a file system that ignores
+/// case finds the forwarder under any spelling.
+fn names_forwarder(text: &str) -> bool {
+    text.to_ascii_lowercase().contains(FORWARDER)
 }
 
 fn forwarder_invocations(
@@ -512,7 +518,7 @@ fn forwarder_invocations(
                 forwarder_invocations(item, applications)?;
             }
         }
-        serde_json::Value::String(text) if text.contains(FORWARDER) => {
+        serde_json::Value::String(text) if names_forwarder(text) => {
             return Err(format!(
                 "names {FORWARDER} in {text:?}, and a launch starts it only as a hook's own \
                  command with its arguments"

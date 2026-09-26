@@ -331,6 +331,9 @@ fn flags_that_start_the_forwarder_for_another_application_a_channel_or_a_second_
     let path_form = hooks_running(&serde_json::json!({
         "type": "command", "command": "/opt/kalareach/bin/kr-hook", "args": ["qoder-cli", "hook"]
     }));
+    let other_case = hooks_running(&serde_json::json!({
+        "type": "command", "command": "KR-Hook", "args": ["qoder-cli", "hook"]
+    }));
     let qoder_flags = |flags: &[&str]| fixture::Shape {
         integration: Some(fixture::declaration("qodercli", flags, &[])),
         ..fixture::Shape::qoder_cli()
@@ -343,6 +346,10 @@ fn flags_that_start_the_forwarder_for_another_application_a_channel_or_a_second_
         (
             qoder_flags(&["--settings", &path_form]),
             "a path to the forwarder",
+        ),
+        (
+            qoder_flags(&["--settings", &other_case]),
+            "the forwarder spelt in another letter case",
         ),
         (
             qoder_flags(&["--hook-command=kr-hook qoder-cli hook"]),
