@@ -85,6 +85,14 @@ pub fn check_declared(entry: &IndexEntry, ledger: &BudgetLedger) -> CatalogueRes
         Stage::Declared,
         &subject,
     )?;
+    // What the entry says about the builds it is qualified against is a signed statement a host
+    // takes an executable's version from, so one that breaks the index's rules refuses the
+    // generation rather than being read part way.
+    entry
+        .check_builds()
+        .map_err(|source| CatalogueError::Untrusted {
+            detail: format!("{subject}: {source}"),
+        })?;
     Ok(())
 }
 

@@ -238,6 +238,9 @@
     "integration_without_capability",
     "integration_invalid"
   ],
+  "index_bounds": {
+    "max_qualified_builds": 256
+  },
   "index_version": 1,
   "instance_limits": {
     "fault_window_ms": "60000",

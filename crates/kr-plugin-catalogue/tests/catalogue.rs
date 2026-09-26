@@ -21,13 +21,14 @@ use kr_plugin_catalogue::{
     Authority, BudgetLedger, CapabilityCeiling, Catalogue, CatalogueError, CatalogueResult, Change,
     Claimed, Committed, DisablePolicy, Effect, Enrolment, FetchReason, Installation,
     InstallationGrant, MatchIndex, Observation, Owner, ReceiptClaim, ReceiptKey, Recording,
-    RepositoryId, RepositoryKind, Resolution, Transition, capability_from_str,
+    RepositoryId, RepositoryKind, Transition, capability_from_str,
 };
 use kr_plugin_sdk::capability::{CapabilityState, EvidenceSource, PluginCapability};
 use kr_plugin_sdk::catalogue::{QualificationResult, RevocationReason, RevocationRecord};
 use kr_plugin_sdk::digest::PayloadDigest;
 use kr_plugin_sdk::ids::PluginId;
 use kr_plugin_sdk::limits::RepositoryBudgets;
+use kr_plugin_sdk::matching::Resolution;
 use kr_plugin_sdk::text::{Label, Summary};
 use kr_plugin_sdk::version::PackageVersion;
 use kr_protocol::error::ErrorCode;
@@ -4077,11 +4078,11 @@ fn an_explicit_selection_wins_a_conflict() {
     });
     assert_eq!(found.len(), 2);
     assert!(matches!(
-        kr_plugin_catalogue::search::resolve(found.clone(), None),
+        kr_plugin_sdk::matching::resolve(found.clone(), None),
         Resolution::Conflict(_)
     ));
     let chosen = index.entries[1].plugin_id.clone();
-    match kr_plugin_catalogue::search::resolve(found, Some(&chosen)) {
+    match kr_plugin_sdk::matching::resolve(found, Some(&chosen)) {
         Resolution::Selected(candidate) => assert_eq!(candidate.plugin_id, chosen),
         other => panic!("the selection should win: {other:?}"),
     }

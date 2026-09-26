@@ -1964,6 +1964,13 @@
       "additionalProperties": false,
       "description": "One entry in the catalogue index.",
       "properties": {
+        "builds": {
+          "description": "The executable builds of the application this release is qualified against, each with the\ndigest of its executable and the version it is.\n\nAbsent from the document when there are none, so every index written before the member\nexisted reads, verifies and is written again exactly as it was: none has to be signed again.",
+          "items": {
+            "$ref": "#/$defs/QualifiedBuild"
+          },
+          "type": "array"
+        },
         "capabilities": {
           "description": "What it asks to be permitted.",
           "items": {
@@ -3614,6 +3621,45 @@
         "source",
         "profile_digest",
         "statement"
+      ],
+      "type": "object"
+    },
+    "QualifiedBuild": {
+      "additionalProperties": false,
+      "description": "One executable build of the application a release is qualified against, as the signed index\nnames it: which application it is, where it was distributed from, the upstream version it is,\nthe platform it runs on, and the digest of the executable itself.\n\nIt is signed with the index and kept apart from the package's bytes, so a generation can add or\nwithdraw a build for a release without a new package. A host takes an executable's version from\nhere and nowhere else: a record that names the digest of the exact bytes says what those bytes\nare. Like a qualification result, it is not permission, and a later record cannot change the\nversion a live binding was bound with.",
+      "properties": {
+        "application": {
+          "$ref": "#/$defs/Label",
+          "description": "The application the build is."
+        },
+        "architecture": {
+          "$ref": "#/$defs/Architecture",
+          "description": "The architecture it runs on."
+        },
+        "distribution": {
+          "$ref": "#/$defs/Label",
+          "description": "Where the build was distributed from: a registry and its package, or the vendor's archive."
+        },
+        "executable_digest": {
+          "$ref": "#/$defs/PayloadDigest",
+          "description": "The SHA-256 digest of the executable."
+        },
+        "os": {
+          "$ref": "#/$defs/OperatingSystem",
+          "description": "The operating system it runs on."
+        },
+        "version": {
+          "$ref": "#/$defs/PackageVersion",
+          "description": "The upstream version the build is."
+        }
+      },
+      "required": [
+        "application",
+        "distribution",
+        "version",
+        "os",
+        "architecture",
+        "executable_digest"
       ],
       "type": "object"
     },

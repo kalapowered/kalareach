@@ -13,7 +13,7 @@ use kr_protocol::scalars::Nullable;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::ids::PluginName;
+use crate::ids::{PluginId, PluginName};
 use crate::version::VersionRange;
 
 /// Maximum length of a match token, such as a file stem or a package name.
@@ -34,6 +34,16 @@ pub enum OperatingSystem {
 impl OperatingSystem {
     /// Every supported operating system.
     pub const ALL: &'static [Self] = &[Self::Linux, Self::MacOs, Self::Windows];
+
+    /// Returns the stable wire string.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Linux => "linux",
+            Self::MacOs => "mac_os",
+            Self::Windows => "windows",
+        }
+    }
 }
 
 impl JsonSchema for OperatingSystem {
@@ -67,6 +77,15 @@ pub enum Architecture {
 impl Architecture {
     /// Every supported architecture.
     pub const ALL: &'static [Self] = &[Self::X86_64, Self::Aarch64];
+
+    /// Returns the stable wire string.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::X86_64 => "x86_64",
+            Self::Aarch64 => "aarch64",
+        }
+    }
 }
 
 impl JsonSchema for Architecture {
@@ -266,9 +285,113 @@ pub struct MatchRule {
     pub confidence: MatchConfidence,
 }
 
+/// One package whose rules recognise what is running.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Candidate {
+    /// The package.
+    pub plugin_id: PluginId,
+    /// Which of its rules recognised the application.
+    pub rule_id: String,
+    /// How certain that rule is.
+    pub confidence: MatchConfidence,
+    /// Whether the distribution was compared as well as the executable.
+    pub distribution_matched: bool,
+}
+
+/// What matching decided.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Resolution {
+    /// Nothing recognised the application.
+    None,
+    /// One package recognised it.
+    Selected(Candidate),
+    /// Several packages recognised it, and the person decides.
+    ///
+    /// A host does not pick one on the package's behalf. An exact rule beats every inferred one,
+    /// so an inferred match reaches this only where nothing matched exactly and more than one
+    /// package guessed from a name on disk.
+    Conflict(Vec<Candidate>),
+}
+
+/// Decides which candidate wins, given the selection the person made.
+///
+/// An explicit selection wins outright. That is the rule section 11 states, and it is why the
+/// selection is compared before confidence: a person who chose a package is not overruled by a
+/// rule that calls itself exact. The catalogue's search and the worker's binder both decide with
+/// this, so there is one rule wherever a running application meets the packages that recognise it.
+#[must_use]
+pub fn resolve(candidates: Vec<Candidate>, selected: Option<&PluginId>) -> Resolution {
+    if candidates.is_empty() {
+        return Resolution::None;
+    }
+    if let Some(selected) = selected
+        && let Some(chosen) = candidates
+            .iter()
+            .find(|candidate| &candidate.plugin_id == selected)
+    {
+        return Resolution::Selected(chosen.clone());
+    }
+    let exact: Vec<Candidate> = candidates
+        .iter()
+        .filter(|candidate| candidate.confidence == MatchConfidence::Exact)
+        .cloned()
+        .collect();
+    let considered = if exact.is_empty() { candidates } else { exact };
+
+    let mut distinct: Vec<&Candidate> = Vec::new();
+    for candidate in &considered {
+        if !distinct
+            .iter()
+            .any(|seen| seen.plugin_id == candidate.plugin_id)
+        {
+            distinct.push(candidate);
+        }
+    }
+    match distinct.as_slice() {
+        [] => Resolution::None,
+        [one] => Resolution::Selected((*one).clone()),
+        _ => Resolution::Conflict(considered),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn candidate(plugin: &str, confidence: MatchConfidence) -> Candidate {
+        Candidate {
+            plugin_id: PluginId::new(plugin).expect("a plugin identifier"),
+            rule_id: "executable".to_owned(),
+            confidence,
+            distribution_matched: false,
+        }
+    }
+
+    #[test]
+    fn an_explicit_selection_wins_and_an_exact_rule_beats_an_inferred_one() {
+        let one = candidate("kalareach/one", MatchConfidence::Exact);
+        let two = candidate("kalareach/two", MatchConfidence::Exact);
+        let guess = candidate("kalareach/guess", MatchConfidence::Inferred);
+        assert_eq!(resolve(Vec::new(), None), Resolution::None);
+        assert!(matches!(
+            resolve(vec![one.clone(), two.clone()], None),
+            Resolution::Conflict(_)
+        ));
+        assert_eq!(
+            resolve(vec![one.clone(), two.clone()], Some(&two.plugin_id)),
+            Resolution::Selected(two)
+        );
+        assert_eq!(
+            resolve(vec![guess.clone(), one.clone()], None),
+            Resolution::Selected(one)
+        );
+        // Two guesses with nothing exact are for the person to decide between.
+        let other = candidate("kalareach/other-guess", MatchConfidence::Inferred);
+        assert!(matches!(
+            resolve(vec![guess, other], None),
+            Resolution::Conflict(_)
+        ));
+    }
 
     fn rule(file_stem: &str, path_suffix: &[&str]) -> ExecutableMatch {
         ExecutableMatch {

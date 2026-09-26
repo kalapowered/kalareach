@@ -18,8 +18,7 @@
 use std::collections::BTreeMap;
 
 use kr_plugin_sdk::catalogue::{CatalogueIndex, IndexEntry};
-use kr_plugin_sdk::ids::PluginId;
-use kr_plugin_sdk::matching::{DistributionMatch, MatchConfidence};
+use kr_plugin_sdk::matching::{Candidate, DistributionMatch};
 
 /// What the host observed about a running application.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -28,34 +27,6 @@ pub struct Observation {
     pub executable_path: String,
     /// Where the application was installed from, where the host knows.
     pub distribution: Option<DistributionMatch>,
-}
-
-/// One entry whose rules recognise an observation.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Candidate {
-    /// The package.
-    pub plugin_id: PluginId,
-    /// Which of its rules recognised the application.
-    pub rule_id: String,
-    /// How certain that rule is.
-    pub confidence: MatchConfidence,
-    /// Whether the distribution was compared as well as the executable.
-    pub distribution_matched: bool,
-}
-
-/// What matching decided.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Resolution {
-    /// Nothing recognised the application.
-    None,
-    /// One package recognised it.
-    Selected(Candidate),
-    /// Several packages recognised it, and the person decides.
-    ///
-    /// A host does not pick one on the package's behalf. An exact rule beats every inferred one,
-    /// so an inferred match reaches this only where nothing matched exactly and more than one
-    /// package guessed from a name on disk.
-    Conflict(Vec<Candidate>),
 }
 
 /// The match rules of one index, indexed for lookup.
@@ -180,46 +151,6 @@ impl<'a> MatchIndex<'a> {
     }
 }
 
-/// Decides which candidate wins, given the selection the person made.
-///
-/// An explicit selection wins outright. That is the rule section 11 states, and it is why the
-/// selection is compared before confidence: a person who chose a package is not overruled by a
-/// rule that calls itself exact.
-#[must_use]
-pub fn resolve(candidates: Vec<Candidate>, selected: Option<&PluginId>) -> Resolution {
-    if candidates.is_empty() {
-        return Resolution::None;
-    }
-    if let Some(selected) = selected
-        && let Some(chosen) = candidates
-            .iter()
-            .find(|candidate| &candidate.plugin_id == selected)
-    {
-        return Resolution::Selected(chosen.clone());
-    }
-    let exact: Vec<Candidate> = candidates
-        .iter()
-        .filter(|candidate| candidate.confidence == MatchConfidence::Exact)
-        .cloned()
-        .collect();
-    let considered = if exact.is_empty() { candidates } else { exact };
-
-    let mut distinct: Vec<&Candidate> = Vec::new();
-    for candidate in &considered {
-        if !distinct
-            .iter()
-            .any(|seen| seen.plugin_id == candidate.plugin_id)
-        {
-            distinct.push(candidate);
-        }
-    }
-    match distinct.as_slice() {
-        [] => Resolution::None,
-        [one] => Resolution::Selected((*one).clone()),
-        _ => Resolution::Conflict(considered),
-    }
-}
-
 /// Searches the whole index offline.
 ///
 /// The comparison folds ASCII case and is a substring over the fields a person would type: the
@@ -289,7 +220,9 @@ mod tests {
     use kr_plugin_sdk::digest::PayloadDigest;
     use kr_plugin_sdk::example::example_manifest;
     use kr_plugin_sdk::ids::PluginName;
-    use kr_plugin_sdk::matching::{ExecutableMatch, MatchRule};
+    use kr_plugin_sdk::matching::{
+        ExecutableMatch, MatchConfidence, MatchRule, Resolution, resolve,
+    };
     use kr_plugin_sdk::version::PackageVersion;
     use kr_protocol::ids::RepositoryGeneration;
     use kr_protocol::scalars::{Nullable, TimestampMs};

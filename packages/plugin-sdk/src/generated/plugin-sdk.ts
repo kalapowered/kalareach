@@ -965,6 +965,14 @@ export interface CatalogueIndex {
  */
 export interface IndexEntry {
   /**
+   * The executable builds of the application this release is qualified against, each with the
+   * digest of its executable and the version it is.
+   *
+   * Absent from the document when there are none, so every index written before the member
+   * existed reads, verifies and is written again exactly as it was: none has to be signed again.
+   */
+  builds?: QualifiedBuild[]
+  /**
    * What it asks to be permitted.
    */
   capabilities: CapabilityRequest[]
@@ -1040,6 +1048,43 @@ export interface IndexEntry {
    * A semantic version range, such as '>=0.1, <0.2'. An unbounded range is rejected.
    */
   wit_range: string
+}
+/**
+ * One executable build of the application a release is qualified against, as the signed index
+ * names it: which application it is, where it was distributed from, the upstream version it is,
+ * the platform it runs on, and the digest of the executable itself.
+ *
+ * It is signed with the index and kept apart from the package's bytes, so a generation can add or
+ * withdraw a build for a release without a new package. A host takes an executable's version from
+ * here and nowhere else: a record that names the digest of the exact bytes says what those bytes
+ * are. Like a qualification result, it is not permission, and a later record cannot change the
+ * version a live binding was bound with.
+ */
+export interface QualifiedBuild {
+  /**
+   * A short display name. One line, no control or bidirectional characters.
+   */
+  application: string
+  /**
+   * The architecture it runs on.
+   */
+  architecture: 'x86_64' | 'aarch64'
+  /**
+   * A short display name. One line, no control or bidirectional characters.
+   */
+  distribution: string
+  /**
+   * A SHA-256 digest as 64 lower-case hexadecimal characters.
+   */
+  executable_digest: string
+  /**
+   * The operating system it runs on.
+   */
+  os: 'linux' | 'mac_os' | 'windows'
+  /**
+   * An exact semantic version, such as 1.4.0 or 2.0.0-rc.1.
+   */
+  version: string
 }
 /**
  * A capability a package asks for, with the reason a reviewer and a user read.

@@ -233,6 +233,9 @@ pub fn package_contract() -> Value {
                 }))
                 .collect::<Vec<_>>(),
         },
+        "index_bounds": {
+            "max_qualified_builds": crate::catalogue::MAX_QUALIFIED_BUILDS,
+        },
         "package_bounds": {
             "max_files": crate::package::MAX_PACKAGE_FILES,
             "max_bytes": crate::package::MAX_PACKAGE_BYTES,

@@ -24,7 +24,7 @@ use crate::capability::{CapabilityRequest, CapabilityState, EvidenceSource};
 use crate::digest::{ByteSize, PayloadDigest};
 use crate::ids::CapabilityId;
 use crate::ids::{PluginId, PluginName, PublisherId};
-use crate::matching::{MatchRule, PlatformSupport};
+use crate::matching::{Architecture, MatchRule, OperatingSystem, PlatformSupport};
 use crate::plugin::{PayloadRef, PayloadRole, PluginManifest, SourcePin};
 use crate::text::{CompactDescription, Label, Summary};
 use crate::version::{PackageVersion, VersionRange};
@@ -144,6 +144,72 @@ impl QualificationResult {
     }
 }
 
+/// The most executable builds one index entry names.
+///
+/// A host hands each release it admits to its workers with the builds for its own platform, one
+/// whole record at a time, so what one entry can name is bounded: a release is qualified against a
+/// few builds per platform, not against thousands.
+pub const MAX_QUALIFIED_BUILDS: usize = 256;
+
+/// One executable build of the application a release is qualified against, as the signed index
+/// names it: which application it is, where it was distributed from, the upstream version it is,
+/// the platform it runs on, and the digest of the executable itself.
+///
+/// It is signed with the index and kept apart from the package's bytes, so a generation can add or
+/// withdraw a build for a release without a new package. A host takes an executable's version from
+/// here and nowhere else: a record that names the digest of the exact bytes says what those bytes
+/// are. Like a qualification result, it is not permission, and a later record cannot change the
+/// version a live binding was bound with.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct QualifiedBuild {
+    /// The application the build is.
+    pub application: Label,
+    /// Where the build was distributed from: a registry and its package, or the vendor's archive.
+    pub distribution: Label,
+    /// The upstream version the build is.
+    pub version: PackageVersion,
+    /// The operating system it runs on.
+    pub os: OperatingSystem,
+    /// The architecture it runs on.
+    pub architecture: Architecture,
+    /// The SHA-256 digest of the executable.
+    pub executable_digest: PayloadDigest,
+}
+
+/// Why an entry's builds may not appear in a catalogue index.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum BuildsError {
+    /// The entry names more builds than one entry may.
+    #[error("the entry names {count} builds, and one entry names at most {MAX_QUALIFIED_BUILDS}")]
+    TooMany {
+        /// How many it names.
+        count: usize,
+    },
+    /// A build runs on a platform the release does not support.
+    #[error(
+        "a build runs on {} {}, which the entry does not list among its platforms",
+        os.as_str(),
+        architecture.as_str()
+    )]
+    UnlistedPlatform {
+        /// The build's operating system.
+        os: OperatingSystem,
+        /// The build's architecture.
+        architecture: Architecture,
+    },
+    /// One executable is named as two versions.
+    #[error("the executable {digest} is named as version {first} and as version {second}")]
+    TwoVersions {
+        /// The executable's digest.
+        digest: PayloadDigest,
+        /// The version it was named as first.
+        first: PackageVersion,
+        /// The other version it was named as.
+        second: PackageVersion,
+    },
+}
+
 /// One entry in the catalogue index.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -185,6 +251,13 @@ pub struct IndexEntry {
     pub total_size_bytes: ByteSize,
     /// What the publisher qualified this release against.
     pub qualification: Vec<QualificationResult>,
+    /// The executable builds of the application this release is qualified against, each with the
+    /// digest of its executable and the version it is.
+    ///
+    /// Absent from the document when there are none, so every index written before the member
+    /// existed reads, verifies and is written again exactly as it was: none has to be signed again.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub builds: Vec<QualifiedBuild>,
     /// Whether the package ships a Wasm component.
     pub has_component: bool,
     /// The revocation record, where this release has one.
@@ -222,6 +295,7 @@ impl IndexEntry {
             ),
             has_component: manifest.has_component(),
             qualification: Vec::new(),
+            builds: Vec::new(),
             revocation: Nullable(None),
         }
     }
@@ -230,6 +304,59 @@ impl IndexEntry {
     #[must_use]
     pub fn accepts_new_bindings(&self) -> bool {
         self.revocation.0.is_none()
+    }
+
+    /// Checks what an index may say about this release's builds: no more than
+    /// [`MAX_QUALIFIED_BUILDS`], each on a platform the release supports, and one version for each
+    /// executable.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first [`BuildsError`] the builds break.
+    pub fn check_builds(&self) -> Result<(), BuildsError> {
+        if self.builds.len() > MAX_QUALIFIED_BUILDS {
+            return Err(BuildsError::TooMany {
+                count: self.builds.len(),
+            });
+        }
+        let mut versions: std::collections::BTreeMap<PayloadDigest, &PackageVersion> =
+            std::collections::BTreeMap::new();
+        for build in &self.builds {
+            let listed = self.platforms.iter().any(|platform| {
+                platform.os == build.os && platform.architectures.contains(&build.architecture)
+            });
+            if !listed {
+                return Err(BuildsError::UnlistedPlatform {
+                    os: build.os,
+                    architecture: build.architecture,
+                });
+            }
+            match versions.get(&build.executable_digest) {
+                Some(first) if **first != build.version => {
+                    return Err(BuildsError::TwoVersions {
+                        digest: build.executable_digest,
+                        first: (*first).clone(),
+                        second: build.version.clone(),
+                    });
+                }
+                Some(_) => {}
+                None => {
+                    versions.insert(build.executable_digest, &build.version);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns the builds that run on one operating system and architecture.
+    pub fn builds_for(
+        &self,
+        os: OperatingSystem,
+        architecture: Architecture,
+    ) -> impl Iterator<Item = &QualifiedBuild> {
+        self.builds
+            .iter()
+            .filter(move |build| build.os == os && build.architecture == architecture)
     }
 
     /// Returns the payload with the given role, where the package has one.
@@ -447,6 +574,108 @@ mod tests {
             declared.validate(),
             Err(QualificationError::WrongSource { .. })
         ));
+    }
+
+    fn build(version: &str, os: OperatingSystem, architecture: Architecture) -> QualifiedBuild {
+        QualifiedBuild {
+            application: Label::new("example-agent").expect("valid label"),
+            distribution: Label::new("npm @example/agent").expect("valid label"),
+            version: PackageVersion::parse(version).expect("valid version"),
+            os,
+            architecture,
+            executable_digest: PayloadDigest::of(version.as_bytes()),
+        }
+    }
+
+    /// An entry with no builds is written exactly as an entry was before the member existed, so
+    /// no index already signed has to be signed again, and one written without the member reads
+    /// with none; an entry with builds writes and reads them.
+    #[test]
+    fn builds_are_absent_from_an_entry_that_has_none() {
+        let mut index = index();
+        let rendered = index.canonical_json().expect("serialisable");
+        assert!(!rendered.contains("builds"), "{rendered}");
+        let read: CatalogueIndex = serde_json::from_str(&rendered).expect("readable");
+        assert!(read.entries[0].builds.is_empty());
+        assert_eq!(read.canonical_json().expect("serialisable"), rendered);
+
+        index.entries[0].builds = vec![build(
+            "1.4.0",
+            OperatingSystem::Linux,
+            Architecture::X86_64,
+        )];
+        let rendered = index.canonical_json().expect("serialisable");
+        assert!(rendered.contains("\"builds\""), "{rendered}");
+        let read: CatalogueIndex = serde_json::from_str(&rendered).expect("readable");
+        assert_eq!(read.entries[0].builds, index.entries[0].builds);
+    }
+
+    /// An index names a build only on a platform the release lists, one version for each
+    /// executable, and no more than the bound; and a host asks for the builds of its own platform.
+    #[test]
+    fn builds_stay_on_listed_platforms_with_one_version_each_within_the_bound() {
+        let mut entry = index().entries.remove(0);
+        entry.platforms = vec![PlatformSupport {
+            os: OperatingSystem::Linux,
+            architectures: vec![Architecture::X86_64, Architecture::Aarch64],
+        }];
+        entry.builds = vec![
+            build("1.4.0", OperatingSystem::Linux, Architecture::X86_64),
+            build("1.4.0", OperatingSystem::Linux, Architecture::Aarch64),
+        ];
+        assert_eq!(entry.check_builds(), Ok(()));
+        assert_eq!(
+            entry
+                .builds_for(OperatingSystem::Linux, Architecture::Aarch64)
+                .count(),
+            1
+        );
+        assert_eq!(
+            entry
+                .builds_for(OperatingSystem::MacOs, Architecture::Aarch64)
+                .count(),
+            0
+        );
+
+        let mut unlisted = entry.clone();
+        unlisted
+            .builds
+            .push(build("1.4.1", OperatingSystem::MacOs, Architecture::Aarch64));
+        assert_eq!(
+            unlisted.check_builds(),
+            Err(BuildsError::UnlistedPlatform {
+                os: OperatingSystem::MacOs,
+                architecture: Architecture::Aarch64,
+            })
+        );
+
+        let mut two_versions = entry.clone();
+        let mut again = build("1.4.0", OperatingSystem::Linux, Architecture::X86_64);
+        again.version = PackageVersion::parse("1.5.0").expect("valid version");
+        two_versions.builds.push(again);
+        assert!(matches!(
+            two_versions.check_builds(),
+            Err(BuildsError::TwoVersions { .. })
+        ));
+
+        let mut at_bound = entry.clone();
+        at_bound.builds = (0..MAX_QUALIFIED_BUILDS)
+            .map(|n| {
+                let mut one = build("1.4.0", OperatingSystem::Linux, Architecture::X86_64);
+                one.executable_digest = PayloadDigest::of(&n.to_le_bytes());
+                one
+            })
+            .collect();
+        assert_eq!(at_bound.check_builds(), Ok(()));
+        at_bound
+            .builds
+            .push(build("1.4.0", OperatingSystem::Linux, Architecture::X86_64));
+        assert_eq!(
+            at_bound.check_builds(),
+            Err(BuildsError::TooMany {
+                count: MAX_QUALIFIED_BUILDS + 1
+            })
+        );
     }
 
     #[test]
