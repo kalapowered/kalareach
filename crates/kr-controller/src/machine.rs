@@ -561,10 +561,11 @@ impl MachineStore {
                 .wait_timeout(writing, left)
                 .unwrap_or_else(PoisonError::into_inner)
                 .0;
-            // A test lets the record go here, after this call's deadline and before it looks.
-            #[cfg(test)]
-            seam::woke(&self.record, deadline, &mut writing);
         }
+        // Every way out of the wait passes here. A test lets the record go here, once this call's
+        // deadline has passed and before the call looks.
+        #[cfg(test)]
+        seam::looking(&self.record, deadline, &mut writing);
         // The deadline decides, not only whether the record is free now: one let go after the
         // deadline, before this call looked again, came too late for it.
         if writing.contains(&self.record) || Instant::now() >= deadline {
@@ -673,20 +674,29 @@ mod seam {
     }
 
     /// Records whose holder a test lets go once, just after the deadline of a call waiting for the
-    /// record has passed, before that call looks again.
+    /// record has passed, before that call looks.
     static LATE: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
-    /// Lets `record` go the next time a call waiting for it wakes after its deadline, as a holder
-    /// that let go just too late would.
+    /// Lets `record` go when a call that waited for it comes to look after its deadline, as a
+    /// holder that let go just too late would.
     pub(super) fn let_go_late(record: &Path) {
         LATE.lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push(record.to_path_buf());
     }
 
-    /// Called by a waiting call each time it wakes, with the list of held records: lets `record` go
-    /// if a test asked for that and the call's deadline has passed.
-    pub(super) fn woke(record: &Path, deadline: std::time::Instant, writing: &mut Vec<PathBuf>) {
+    /// Whether a release [`let_go_late`] asked for for `record` has not been made yet.
+    pub(super) fn late_pending(record: &Path) -> bool {
+        LATE.lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .any(|path| path == record)
+    }
+
+    /// Called once by every call that waited or looked, however its wait ended, with the list of
+    /// held records, just before it looks: lets `record` go if a test asked for that and the
+    /// call's deadline has passed.
+    pub(super) fn looking(record: &Path, deadline: std::time::Instant, writing: &mut Vec<PathBuf>) {
         if std::time::Instant::now() < deadline {
             return;
         }
@@ -1733,8 +1743,9 @@ mod tests {
     }
 
     /// A call whose record is let go only after the call's deadline has passed, before the call
-    /// looks again, holds nothing: it waited past its deadline. The holder is another call on this
-    /// thread, and the record goes when the waiting call wakes after its deadline.
+    /// looks, holds nothing: it waited past its deadline. The holder is another call on this
+    /// thread, and the record goes when the waiting call comes to look after its deadline, which
+    /// every way out of its wait passes.
     #[test]
     fn a_call_whose_record_is_let_go_after_its_deadline_holds_nothing() {
         let environment = Environment::create();
@@ -1752,6 +1763,11 @@ mod tests {
             .map(drop)
             .expect_err("the waiting call holds nothing once its deadline has passed");
         assert_eq!(refused.code(), ErrorCode::StorageUnavailable, "{refused}");
+        // The record was let go before the call looked, so only the deadline refused it.
+        assert!(
+            !seam::late_pending(&record),
+            "the record was let go after the deadline"
+        );
         drop(held);
         drop(
             store
