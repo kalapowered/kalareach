@@ -158,6 +158,11 @@ if ! env KR_PRIVACY_CHECK_ORIGIN="$origin" cargo test --locked --quiet -p "$suit
   echo "the origin could not be checked; see $evidence/origin.log" >&2
   exit 1
 fi
+# A check that ran nothing passes nothing: an origin is accepted only on the check's own pass.
+if ! grep -q 'test result: ok\. 1 passed' "$evidence/origin.log"; then
+  echo "the origin check ran no test, so the origin was not checked; see $evidence/origin.log" >&2
+  exit 1
+fi
 
 passed=0
 failed=0
