@@ -4527,6 +4527,20 @@ fn each_name_is_placed_where_the_compiler_places_it() {
             "a derived Debug over text that arrived",
         ),
         (
+            "an alias a cfg(test) under cfg_attr leaves out on one platform, past which a glob gives text",
+            "pub mod values {\n    pub type Handle = String;\n}\npub mod names {\n    pub use super::values::*;\n    #[cfg_attr(unix, cfg(test))]\n    pub type Handle = u64;\n}\n",
+            "#[derive(Debug)]\npub struct Leak(pub kr_other::names::Handle);\n",
+            1,
+            "a derived Debug over text that arrived",
+        ),
+        (
+            "a module a cfg inside it leaves out, past which the outer name is the Debug trait",
+            "pub mod names {\n    #![cfg(not(unix))]\n    pub trait Shows {\n        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result;\n    }\n}\n",
+            "mod names {\n    pub use std::fmt::Debug as Shows;\n}\npub struct Leak(pub String);\nconst _: () = {\n    use kr_other::*;\n    impl names::Shows for Leak {\n        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n            formatter.debug_tuple(\"Leak\").field(&self.0).finish()\n        }\n    }\n};\n",
+            7,
+            "a trait this reading cannot place",
+        ),
+        (
             "an extern crate",
             "",
             "extern crate kr_other;\n",

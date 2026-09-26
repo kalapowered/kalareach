@@ -476,19 +476,44 @@ fn attribute_conditional(contents: &[Located]) -> bool {
             let mut at = 2;
             without_test(contents, &mut at) == Truth::Unknown
         }
-        // `cfg_attr(predicate, attribute, …)`: a `cfg` among the attributes it gives, unless the
-        // predicate cannot hold without `test`.
-        Some("cfg_attr") => {
-            let parts = arguments(contents, 1).unwrap_or_default();
-            let Some((predicate, given)) = parts.split_first() else {
-                return false;
-            };
-            let mut at = 0;
-            without_test(predicate, &mut at) != Truth::False
-                && given.iter().any(|part| attribute_conditional(part))
-        }
+        Some("cfg_attr") => gives_removal(contents),
         _ => false,
     }
+}
+
+/// Whether the `cfg_attr` whose contents are `contents` can leave its item out: its predicate can
+/// hold without `test`, and it gives a `cfg` that need not hold, or such a `cfg_attr` in turn.
+fn gives_removal(contents: &[Located]) -> bool {
+    let parts = arguments(contents, 1).unwrap_or_default();
+    let Some((predicate, given)) = parts.split_first() else {
+        return false;
+    };
+    let mut at = 0;
+    without_test(predicate, &mut at) != Truth::False
+        && given.iter().any(|part| {
+            punct(part.get(1), '(')
+                && match ident(part.first()) {
+                    Some("cfg") => {
+                        let mut at = 2;
+                        without_test(part, &mut at) != Truth::True
+                    }
+                    Some("cfg_attr") => gives_removal(part),
+                    _ => false,
+                }
+        })
+}
+
+/// Whether the inline module whose `{` is at `open` has a `cfg` this reading cannot decide among
+/// the inner attributes that open it, which can leave the whole module out.
+fn opens_conditionally(tokens: &[Located], open: usize) -> bool {
+    let mut at = open + 1;
+    while punct(tokens.get(at), '#') && punct(tokens.get(at + 1), '!') {
+        if cfg_is_conditional(tokens, at + 2) {
+            return true;
+        }
+        at = attribute_end(tokens, at).unwrap_or(tokens.len());
+    }
+    false
 }
 
 /// Whether the item whose keyword is at `at` names its module's file with `#[path]`, directly or
@@ -1202,7 +1227,7 @@ fn read_source(
             Some("mod") if punct(tokens.get(at + 2), ';') || punct(tokens.get(at + 2), '{') => {
                 if let Some(declared) = ident(tokens.get(at + 1)) {
                     source.declare_visibility(scope, declared, visibility_before(&tokens, at));
-                    if !item_conditional(&tokens, at) {
+                    if !item_conditional(&tokens, at) && !opens_conditionally(&tokens, at + 2) {
                         source.always.insert((scope, declared.to_owned()));
                     }
                 }
