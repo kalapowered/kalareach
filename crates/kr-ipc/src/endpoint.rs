@@ -46,6 +46,28 @@ impl Listener {
         })
     }
 
+    /// Binds the endpoint with an explicit access-control list, for this repository's own tests.
+    ///
+    /// The list is the SDDL a Windows named pipe is created with, in place of the owner-only one
+    /// [`Listener::bind`] uses. A test gives a list that admits every account so that a caller of a
+    /// second account can reach the pipe, and then relies on the listener's own account check to
+    /// refuse it: the operating system's access-control list and the listener's check are two
+    /// separate lines, and this proves the second one on its own. Compiled away outside this
+    /// repository's own tests.
+    ///
+    /// # Errors
+    ///
+    /// As [`Listener::bind`].
+    #[cfg(all(windows, feature = "testing"))]
+    pub fn bind_with_access_list(endpoint: &Endpoint, descriptor: &str) -> Result<Self> {
+        let inner = platform::Listener::bind_with_descriptor(endpoint, descriptor)?;
+        Ok(Self {
+            inner,
+            endpoint: endpoint.clone(),
+            owner_uid: crate::paths::current_uid(),
+        })
+    }
+
     /// Binds the endpoint as [`Listener::bind`] does, and gives every connection it accepts a send
     /// buffer of `bytes`, for this repository's own tests.
     ///
@@ -508,12 +530,21 @@ mod platform {
 
     impl Listener {
         pub(super) fn bind(endpoint: &Endpoint) -> Result<Self> {
+            Self::bind_with_descriptor(endpoint, OWNER_ONLY_DESCRIPTOR)
+        }
+
+        /// Binds the pipe with an explicit access-control list in place of the owner-only one.
+        ///
+        /// [`Listener::bind`] uses it with the owner-only list; this repository's own tests use it
+        /// through [`super::Listener::bind_with_access_list`] with a widened list, to prove the
+        /// listener's account check independently of the list the operating system enforces.
+        pub(super) fn bind_with_descriptor(endpoint: &Endpoint, descriptor: &str) -> Result<Self> {
             let name = endpoint
                 .as_text()
                 .to_ns_name::<GenericNamespaced>()
                 .map_err(|error| IpcError::socket("bind", error))?;
             let descriptor = SecurityDescriptor::deserialize(
-                &widestring::U16CString::from_str(OWNER_ONLY_DESCRIPTOR).map_err(|_| {
+                &widestring::U16CString::from_str(descriptor).map_err(|_| {
                     IpcError::socket(
                         "bind",
                         std::io::Error::other("the access-control list is not valid text"),
