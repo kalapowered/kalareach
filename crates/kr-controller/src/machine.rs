@@ -378,10 +378,12 @@ impl MachineStore {
 
     /// Publishes the first record of a first start.
     ///
-    /// The record is complete and flushed before its name exists, and a link gives it the name.
-    /// Unlike a rename, a link never replaces a name that exists, so a first start that finds a
-    /// record published meanwhile keeps that one. A first start that stopped before the link left
-    /// only a temporary file, which the next open removes before it mints again.
+    /// The record is complete and flushed before its name exists, and it is given the name without
+    /// replacing one: a first start that finds a record published meanwhile keeps that one. On
+    /// Windows that is a rename, not a link, because a record given its name by a link can be held
+    /// by the system for a minute and more, and the first step's rename over it refused all that
+    /// time. A first start that stopped before the name was given left only a temporary file, which
+    /// the next open removes before it mints again.
     fn mint(&self, now_ms: u64) -> Result<()> {
         let record = MachineGroup {
             environment_id: self.environment_id,
@@ -394,7 +396,12 @@ impl MachineStore {
         let linked = self
             .stage(&temporary, &bytes)
             .and_then(|()| self.passed(Boundary::Flushed))
-            .and_then(|()| std::fs::hard_link(&temporary, &self.record));
+            .and_then(|()| {
+                kr_flush::retry_while_held(|| {
+                    kr_flush::publish_without_replacing(&temporary, &self.record)
+                })
+            });
+        // Where the name was given by a link, or not at all, the temporary name goes.
         let _ = std::fs::remove_file(&temporary);
         match linked {
             Ok(()) => {}
