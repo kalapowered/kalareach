@@ -1051,7 +1051,7 @@ mod platform {
             windows_boot::read_process_list(boot_records::query_process_list).map_err(|why| {
                 unavailable("boot identity", format!("the kernel's process list: {why}"))
             })?;
-        let created = windows_boot::system_process_created(&list.bytes(), list.base())?;
+        let created = windows_boot::system_process_created(list.bytes(), list.base())?;
         let value = windows_boot::value(boot_records::boot_count(), created);
         Ok(BootIdentity {
             source: BootIdentitySource::BootTime,
@@ -1275,15 +1275,15 @@ mod boot_records {
     /// `MM_SHARED_USER_DATA_VA`, one address in every process on every Windows.
     const SHARED_USER_DATA: usize = 0x7FFE_0000;
 
-    /// Asks the kernel for its process list in `buffer`, and returns its status and the length it
-    /// wrote, or needed.
-    pub(super) fn query_process_list(buffer: &mut [u64]) -> (i32, u32) {
-        let capacity = u32::try_from(size_of_val(buffer)).unwrap_or(u32::MAX);
+    /// Asks the kernel for its process list in `buffer`, which the caller aligns to eight bytes,
+    /// and returns its status and the length it wrote, or needed.
+    pub(super) fn query_process_list(buffer: &mut [u8]) -> (i32, u32) {
+        let capacity = u32::try_from(buffer.len()).unwrap_or(u32::MAX);
         let mut returned = 0_u32;
-        // SAFETY: `buffer` is at least `capacity` bytes of initialised, eight-byte-aligned memory
-        // that this call borrows mutably, and `returned` is a live local; the kernel writes at
-        // most `capacity` bytes into the one and a length into the other, and keeps neither
-        // pointer.
+        // SAFETY: `buffer` is at least `capacity` bytes of initialised memory that this call
+        // borrows mutably, and `returned` is a live local; the kernel writes at most `capacity`
+        // bytes into the one and a length into the other, and keeps neither pointer. A buffer it
+        // finds misaligned it refuses with a status rather than writes.
         let status = unsafe {
             NtQuerySystemInformation(
                 SystemProcessInformation,
@@ -1456,49 +1456,52 @@ mod windows_boot {
 
     /// The kernel's process list as one call wrote it.
     pub(super) struct ProcessList {
-        /// The buffer the kernel wrote into: eight-byte aligned, and kept where it is for as long
-        /// as this is, since the addresses inside the list point into it.
-        words: Vec<u64>,
-        /// How many of its bytes the kernel wrote.
+        /// The allocation the kernel wrote into, kept where it is for as long as this is, since
+        /// the addresses inside the list point into it.
+        buffer: Vec<u8>,
+        /// Where in it the eight-byte-aligned part the kernel was given begins.
+        start: usize,
+        /// How many bytes the kernel wrote there.
         written: usize,
     }
 
     impl ProcessList {
         /// The bytes the kernel wrote, and none of the rest of the buffer.
-        pub(super) fn bytes(&self) -> Vec<u8> {
-            self.words
-                .iter()
-                .flat_map(|word| word.to_ne_bytes())
-                .take(self.written)
-                .collect()
+        pub(super) fn bytes(&self) -> &[u8] {
+            &self.buffer[self.start..self.start + self.written]
         }
 
         /// The address the kernel wrote the list at, which the addresses inside it count from.
         pub(super) fn base(&self) -> usize {
-            self.words.as_ptr().addr()
+            self.bytes().as_ptr().addr()
         }
     }
 
-    /// Reads the kernel's process list through `query`, which fills the buffer it is given and
-    /// returns the kernel's status and the length it wrote, or needed.
+    /// Reads the kernel's process list through `query`, which fills the eight-byte-aligned
+    /// buffer it is given and returns the kernel's status and the length it wrote, or needed.
     ///
     /// The list changes between two calls, so a call the kernel says was too short is followed by
     /// one with room for what it said it needed and half as much again, for at most
     /// [`LIST_CALLS`] calls and a buffer of at most [`LIST_MOST`] bytes. Only a call the kernel
     /// says succeeded is read, and only as far as the length it says it wrote.
     pub(super) fn read_process_list(
-        mut query: impl FnMut(&mut [u64]) -> (i32, u32),
+        mut query: impl FnMut(&mut [u8]) -> (i32, u32),
     ) -> std::result::Result<ProcessList, String> {
         let mut length = LIST_FIRST;
         for _ in 0..LIST_CALLS {
-            let mut words = vec![0_u64; length.div_ceil(8)];
-            let capacity = words.len() * 8;
-            let (status, reported) = query(&mut words);
+            // Seven bytes more than the kernel is given, so that what it is given can begin on an
+            // eight-byte boundary wherever the allocation begins.
+            let mut buffer = vec![0_u8; length + 7];
+            let start = buffer.as_ptr().align_offset(8);
+            let Some(given) = buffer.get_mut(start..start + length) else {
+                return Err("no eight-byte boundary in the buffer".to_owned());
+            };
+            let (status, reported) = query(given);
             let reported = usize::try_from(reported).unwrap_or(usize::MAX);
             if status == LIST_TOO_SHORT {
                 length = reported
                     .saturating_add(reported / 2)
-                    .max(capacity.saturating_mul(2))
+                    .max(length.saturating_mul(2))
                     .min(LIST_MOST);
                 continue;
             }
@@ -1507,13 +1510,14 @@ mod windows_boot {
                     "the kernel would not list the processes: status {status:#010x}"
                 ));
             }
-            if reported > capacity {
+            if reported > length {
                 return Err(format!(
-                    "the kernel said it wrote {reported} bytes into a buffer of {capacity}"
+                    "the kernel said it wrote {reported} bytes into a buffer of {length}"
                 ));
             }
             return Ok(ProcessList {
-                words,
+                buffer,
+                start,
                 written: reported,
             });
         }
@@ -2280,15 +2284,11 @@ mod tests {
         let needed = LIST_FIRST + 100_000;
         let mut offered = Vec::new();
         let read = windows_boot::read_process_list(|buffer| {
-            offered.push(size_of_val(buffer));
-            if size_of_val(buffer) < needed {
+            offered.push(buffer.len());
+            if buffer.len() < needed {
                 return (LIST_TOO_SHORT, u32::try_from(needed).expect("a length"));
             }
-            for (word, chunk) in buffer.iter_mut().zip(list.chunks(8)) {
-                let mut bytes = [0_u8; 8];
-                bytes[..chunk.len()].copy_from_slice(chunk);
-                *word = u64::from_ne_bytes(bytes);
-            }
+            buffer[..list.len()].copy_from_slice(&list);
             (0, u32::try_from(list.len()).expect("a length"))
         })
         .expect("the list, on the second call");
@@ -2303,7 +2303,7 @@ mod tests {
         );
         assert_eq!(
             read.bytes(),
-            list,
+            list.as_slice(),
             "only the bytes the kernel wrote are read"
         );
         assert_eq!(
@@ -2326,7 +2326,7 @@ mod tests {
         let mut largest = 0;
         let outgrown = windows_boot::read_process_list(|buffer| {
             calls += 1;
-            largest = largest.max(size_of_val(buffer));
+            largest = largest.max(buffer.len());
             (LIST_TOO_SHORT, u32::MAX)
         });
         assert!(outgrown.is_err());
@@ -2334,7 +2334,7 @@ mod tests {
         assert!(largest <= LIST_MOST, "{largest} bytes");
         // A length longer than the buffer is not a length the kernel wrote into it.
         let overlong = windows_boot::read_process_list(|buffer| {
-            (0, u32::try_from(size_of_val(buffer) + 8).expect("a length"))
+            (0, u32::try_from(buffer.len() + 8).expect("a length"))
         });
         assert!(overlong.is_err());
     }
