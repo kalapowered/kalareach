@@ -21,12 +21,14 @@
 //! checked against anything but the record on disk.
 //!
 //! Every call that holds the record, an open and a step, takes one deadline as it starts,
-//! [`kr_flush::HELD_RENAME_BOUND`] away, and spends it on waiting for the record and on trying its
-//! publication again both. Windows can hold a record a publication replaces for a moment, and the
-//! publication tries its rename again until the deadline; a call queued behind it stops waiting at
-//! its own deadline, so however many calls came before it, its waiting adds up to no more than one
-//! bound, beside what its own reads and writes take. A call whose deadline passes before it holds
-//! the record writes nothing and says that another change held it.
+//! [`kr_flush::HELD_RENAME_BOUND`] away. The deadline decides two things: whether the call may
+//! still take the record, and whether its publication may try its rename again. Windows can hold a
+//! record a publication replaces for a moment, and the publication tries its rename again until its
+//! deadline. A call queued behind it takes the record only before its own deadline, so the calls
+//! queued behind one publication do not each wait out a bound of their own after it. A call that
+//! has not taken the record by its deadline writes nothing and says that another change held it.
+//! The deadline promises nothing about elapsed time: the operating system's scheduling, taking the
+//! list of held records back after a wait, and the call's own reads and writes take what they take.
 //!
 //! A new record is written to a temporary file in the same directory, flushed, renamed over the
 //! record, and the directory is flushed after it. The record's name holds a whole record
@@ -545,18 +547,24 @@ impl MachineStore {
     /// until then or let it go only after, holds nothing: it has read and written nothing, and
     /// answers a storage failure that says another change held the record.
     fn writer(&self, deadline: Instant, operation: &'static str) -> Result<Holding> {
-        let writing = WRITING.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut writing = WRITING.lock().unwrap_or_else(PoisonError::into_inner);
         // A test learns here that a caller has come to the record, and whether another call holds
         // it.
         #[cfg(test)]
         seam::locking(&self.record, writing.contains(&self.record));
-        let (mut writing, _) = LET_GO
-            .wait_timeout_while(
-                writing,
-                deadline.saturating_duration_since(Instant::now()),
-                |writing| writing.contains(&self.record),
-            )
-            .unwrap_or_else(PoisonError::into_inner);
+        while writing.contains(&self.record) {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            writing = LET_GO
+                .wait_timeout(writing, left)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+            // A test lets the record go here, after this call's deadline and before it looks.
+            #[cfg(test)]
+            seam::woke(&self.record, deadline, &mut writing);
+        }
         // The deadline decides, not only whether the record is free now: one let go after the
         // deadline, before this call looked again, came too late for it.
         if writing.contains(&self.record) || Instant::now() >= deadline {
@@ -662,6 +670,35 @@ mod seam {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push((record.to_path_buf(), told));
+    }
+
+    /// Records whose holder a test lets go once, just after the deadline of a call waiting for the
+    /// record has passed, before that call looks again.
+    static LATE: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+    /// Lets `record` go the next time a call waiting for it wakes after its deadline, as a holder
+    /// that let go just too late would.
+    pub(super) fn let_go_late(record: &Path) {
+        LATE.lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(record.to_path_buf());
+    }
+
+    /// Called by a waiting call each time it wakes, with the list of held records: lets `record` go
+    /// if a test asked for that and the call's deadline has passed.
+    pub(super) fn woke(record: &Path, deadline: std::time::Instant, writing: &mut Vec<PathBuf>) {
+        if std::time::Instant::now() < deadline {
+            return;
+        }
+        let asked = {
+            let mut late = LATE.lock().unwrap_or_else(PoisonError::into_inner);
+            late.iter()
+                .position(|path| path == record)
+                .map(|index| late.remove(index))
+        };
+        if asked.is_some() {
+            writing.retain(|held| held != record);
+        }
     }
 
     /// Tells whoever asked that a store of `record` has come to the writer lock, and whether it
@@ -1696,7 +1733,8 @@ mod tests {
     }
 
     /// A call whose record is let go only after the call's deadline has passed, before the call
-    /// looks again, holds nothing: it waited past its deadline.
+    /// looks again, holds nothing: it waited past its deadline. The holder is another call on this
+    /// thread, and the record goes when the waiting call wakes after its deadline.
     #[test]
     fn a_call_whose_record_is_let_go_after_its_deadline_holds_nothing() {
         let environment = Environment::create();
@@ -1705,38 +1743,24 @@ mod tests {
         let held = store
             .writer(std::time::Instant::now() + WAIT, "hold the record")
             .expect("holds the record");
-        let (told, locking) = mpsc::channel();
-        seam::watch_lock(&record, told);
-        let bound = Duration::from_millis(200);
-        std::thread::scope(|scope| {
-            let waiter = scope.spawn(|| {
-                store
-                    .writer(
-                        std::time::Instant::now() + bound,
-                        "write the machine group record",
-                    )
-                    .map(drop)
-            });
-            assert!(
-                locking
-                    .recv_timeout(WAIT)
-                    .expect("the waiter came to the record"),
-                "the waiter found the record free"
-            );
-            // Taken once the waiter waits, and kept past its deadline, with the record let go
-            // under it: the waiter looks again only after its deadline has passed.
-            let mut writing = WRITING.lock().unwrap_or_else(PoisonError::into_inner);
-            std::thread::sleep(bound * 3);
-            writing.retain(|holding| *holding != record);
-            drop(writing);
-            LET_GO.notify_all();
-            let refused = waiter
-                .join()
-                .expect("the waiter ran")
-                .expect_err("the waiter holds nothing once its deadline has passed");
-            assert_eq!(refused.code(), ErrorCode::StorageUnavailable, "{refused}");
-        });
+        seam::let_go_late(&record);
+        let refused = store
+            .writer(
+                std::time::Instant::now() + Duration::from_millis(200),
+                "write the machine group record",
+            )
+            .map(drop)
+            .expect_err("the waiting call holds nothing once its deadline has passed");
+        assert_eq!(refused.code(), ErrorCode::StorageUnavailable, "{refused}");
         drop(held);
+        drop(
+            store
+                .writer(
+                    std::time::Instant::now() + WAIT,
+                    "write the machine group record",
+                )
+                .expect("the record is free once its holder has gone"),
+        );
     }
 
     /// KR-REQ-03.07: a first start interrupted after any point of its publication, by a failure
