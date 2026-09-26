@@ -37,18 +37,21 @@ four processors, the 8 GiB and the 1% are the figures that
 `crates/kr-transport/tests/support/conditions.rs` holds, and every measurement's record reads its
 host against them, so a record can name a shortfall of its own.
 
-The reading rests on the operating system's own counts, as the kernels keep them. Linux counts idle
-time exactly on a kernel that stops the clock tick on an idle processor, and brings a running
-thread's time up to date at every clock tick; the reader checks the kernel's configuration and does
-not read a kernel that does neither. macOS keeps each processor's idle time in its load counters and
-each process's time in its task information, and brings a running thread's time up to date at least
-once in each scheduling quantum. The reader allows for each count's rounding and for how far a
-running thread's time can trail. What it bounds is all the processor time the operating system does
-not charge to the run's processes, so the kernel's own work counts as other work, even what the
-kernel does on the run's behalf, which can only make a host read busier. A zero stolen share means
-the hypervisor reported no loss, and a platform that keeps no such count leaves the condition
-unverified. And memory as the operating system reports it is a little less than the memory
-installed, so a machine with exactly 8 GiB installed reads as short of the reference host.
+The reading rests on how the kernels keep their counts. Linux counts idle time as it passes on a
+kernel that stops the clock tick on an idle processor, which needs a kernel built for it and a timer
+that can fire once, as x86-64 and ARM64 machines have; the reader checks the kernel's configuration
+and command line and does not read a kernel that fails them. It takes a running thread's time to
+trail by at most one clock tick, and does not read a kernel whose processors can stop the tick while
+a thread runs. macOS keeps each processor's idle time in its load counters, and brings a running
+thread's time up to date at least once in each scheduling quantum. Both kernels can misread an idle
+count taken just as a processor goes idle or wakes, so the reader takes each count three times and
+keeps the one that can only make the host read busier. It allows for each count's rounding and for
+how far a running thread's time can trail. What it bounds is all the processor time the operating
+system does not charge to the run's processes, so the kernel's own work counts as other work, even
+what the kernel does on the run's behalf, which can only make a host read busier. A zero stolen
+share means the hypervisor reported no loss, and a platform that keeps no such count leaves the
+condition unverified. And memory as the operating system reports it is a little less than the
+memory installed, so a machine with exactly 8 GiB installed reads as short of the reference host.
 
 ## The two configurations
 
@@ -144,7 +147,9 @@ exit status, the load average at both edges, the other work over the ten seconds
 through it (the bound on its busiest five seconds, and its average) and the stolen share over it,
 then the outcome, and whether the figures are reference figures. Figures are reference figures only
 when the run was asked for them, the host met every condition it read, every reading could be taken,
-and no record of the step names a shortfall.
+no record of the step names a shortfall, and the run kept all of its evidence. The conditions
+sections are the last thing a run writes, and are published together in one step, so a run that
+could not keep its evidence leaves none that calls its figures reference figures.
 
 ## Where release figures come from
 

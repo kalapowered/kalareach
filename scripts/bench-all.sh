@@ -113,17 +113,24 @@ count_or_empty() {
     *) [ "$1" -gt 0 ] && printf '%s' "$1" ;;
   esac
 }
+# A count from a command, `$@`, taken only when the command succeeded.
+count_from() {
+  local text
+  text="$("$@" 2>/dev/null)" && count_or_empty "$text"
+}
 case "$os_name" in
   Darwin)
-    processors="$(count_or_empty "$(sysctl -n hw.logicalcpu 2>/dev/null)")"
-    memory_bytes="$(count_or_empty "$(sysctl -n hw.memsize 2>/dev/null)")"
+    processors="$(count_from sysctl -n hw.logicalcpu)"
+    memory_bytes="$(count_from sysctl -n hw.memsize)"
     memory_mib="$(count_or_empty "${memory_bytes:+$((memory_bytes / 1048576))}")"
     processor_name="$(sysctl -n machdep.cpu.brand_string 2>/dev/null || echo 'not reported here')"
     os_release="macOS $(sw_vers -productVersion 2>/dev/null || uname -r)"
     ;;
   *)
-    processors="$(count_or_empty "$(nproc 2>/dev/null)")"
-    memory_mib="$(count_or_empty "$(awk '/^MemTotal:/ { printf "%d\n", $2 / 1024 }' /proc/meminfo 2>/dev/null)")"
+    processors="$(count_from nproc)"
+    # shellcheck disable=SC2016 # an awk program, which awk expands
+    memory_mib="$(count_from awk '/^MemTotal:/ { printf "%d\n", $2 / 1024; found = 1 }
+      END { exit !found }' /proc/meminfo)"
     processor_name="$(sed -n 's/^model name[[:space:]]*: //p' /proc/cpuinfo 2>/dev/null | head -1)"
     processor_name="${processor_name:-not reported here}"
     # shellcheck disable=SC1091 # the host's own description, read where it has one
@@ -378,12 +385,37 @@ quiet() {
   esac
 }
 
-# Other work over the next ten seconds, checked.
+# Waits for reader `$1` to end, for at most `$2` seconds, and then stops it. Sets `reader_status` to
+# its exit status, or leaves it empty when the reader had not ended; a reader that does not end even
+# once stopped, as a process held in the kernel can, is left behind rather than waited for.
+reader_status=""
+finish_reader() {
+  local waited=0
+  reader_status=""
+  while kill -0 "$1" 2>/dev/null && [ "$waited" -lt $(($2 * 20)) ]; do
+    sleep 0.05
+    waited=$((waited + 1))
+  done
+  if kill -0 "$1" 2>/dev/null; then
+    kill -9 "$1" 2>/dev/null
+    return
+  fi
+  wait "$1"
+  reader_status=$?
+}
+
+# Other work over the next ten seconds, checked. The reader has a minute beyond its ten seconds.
 other_work() {
-  local text status
-  text="$("$watcher" --run "$$" --for 10 2>&1)"
-  status=$?
-  checked_reading "$status" "$text"
+  local text
+  "$watcher" --run "$$" --for 10 > "$work/settle.out" 2>&1 &
+  finish_reader "$!" 70
+  if [ -z "$reader_status" ]; then
+    echo "unread: the reader of other work had not ended a minute after its reading"
+  elif ! text="$(cat "$work/settle.out")"; then
+    echo "unread: what the reader of other work printed could not be read back"
+  else
+    checked_reading "$reader_status" "$text"
+  fi
 }
 
 # Reads other work over the ten seconds before a step and, with --reference-host, reads again until
@@ -430,8 +462,7 @@ verdicts() {
 # the record file its figures land in.
 run_step() {
   local step="$1" expected="$2" status logged load_in load_out other_in during ticks_in="" ticks_out
-  local pair identifier file name gained found line watch reader waited began_read reader_status
-  local text
+  local pair identifier file name gained found line watch reader waited began_read text
   shift 2
   echo
   echo "== $(date '+%T') step $step: $*"
@@ -461,25 +492,15 @@ run_step() {
   # The reader takes its last reading and prints within a second of being asked; one that has not
   # ended within a minute is stopped, and its reading is unread.
   : > "$watch.stop" || lost "$watch.stop"
-  waited=0
-  while kill -0 "$reader" 2>/dev/null && [ "$waited" -lt 1200 ]; do
-    sleep 0.05
-    waited=$((waited + 1))
-  done
-  if kill -0 "$reader" 2>/dev/null; then
-    kill -9 "$reader" 2>/dev/null
-    wait "$reader" 2>/dev/null
+  finish_reader "$reader" 60
+  if [ -z "$reader_status" ]; then
     during="unread: the reader of other work had not ended a minute after it was asked to"
+  elif [ "$began_read" -eq 0 ]; then
+    during="unread: the reader of other work had not read the machine when the step began"
+  elif ! text="$(cat "$watch.out")"; then
+    during="unread: what the reader of other work printed could not be read back"
   else
-    wait "$reader"
-    reader_status=$?
-    if [ "$began_read" -eq 0 ]; then
-      during="unread: the reader of other work had not read the machine when the step began"
-    elif ! text="$(cat "$watch.out")"; then
-      during="unread: what the reader of other work printed could not be read back"
-    else
-      during="$(checked_reading "$reader_status" "$text")"
-    fi
+    during="$(checked_reading "$reader_status" "$text")"
   fi
   load_out="$(load_average)"
   ran="${ran:+$ran }$step"
@@ -527,16 +548,36 @@ run_step() {
   done
 }
 
+# Puts one section of this run's own record together in `composed`: the heading, and each further
+# argument as a line of its own.
+compose() {
+  local line
+  composed="## $1"$'\n\n'
+  shift
+  for line in "$@"; do
+    composed="$composed  $line"$'\n'
+  done
+  composed="$composed"$'\n'
+}
+
 # Appends one section to this run's own record, or says the run could not keep it. The section is
 # put together first and written in one go, so that no part of it can fail unseen.
 section() {
-  local heading="$1" line text
-  shift
-  text="## $heading"$'\n\n'
-  for line in "$@"; do
-    text="$text  $line"$'\n'
-  done
-  printf '%s\n' "$text" >> "$record" || lost "$record"
+  compose "$@"
+  printf '%s' "$composed" >> "$record" || lost "$record"
+}
+
+# Replaces this run's own record with what it held and `$1` after it, in one rename, so that anyone
+# reading the record sees all of `$1` or none of it.
+publish() {
+  local next="$record.next.$$"
+  if { [ ! -e "$record" ] || cat "$record"; } > "$next" && printf '%s' "$1" >> "$next" &&
+    mv -f "$next" "$record"; then
+    return 0
+  fi
+  rm -f "$next"
+  lost "$record"
+  return 1
 }
 
 outcome_of() {
@@ -573,9 +614,13 @@ descriptions_refusal() {
         NR == 1 { for (i = 1; i <= NF; i++) if ($i ~ /^[0-9]+$/) page = $i }
         /^Pages (free|inactive|speculative|purgeable):/ { gsub(/\./, "", $NF); pages += $NF }
         /^Pages occupied by compressor:/ { gsub(/\./, "", $NF); pages -= $NF }
-        END { if (pages < 0) pages = 0; printf "%d\n", pages * page / 1048576 }')"
+        END { if (pages < 0) pages = 0; printf "%d\n", pages * page / 1048576 }')" ||
+        available_mib=""
       ;;
-    *) available_mib="$(awk '/^MemAvailable:/ { printf "%d\n", $2 / 1024 }' /proc/meminfo)" ;;
+    *)
+      available_mib="$(awk '/^MemAvailable:/ { printf "%d\n", $2 / 1024; found = 1 }
+        END { exit !found }' /proc/meminfo)" || available_mib=""
+      ;;
   esac
   available_mib="$(count_or_empty "$available_mib")"
   reserve_mib=$((memory_mib / 5))
@@ -758,7 +803,29 @@ for step in $ran; do
   fi
 done
 
+# Everything this run added to the records, so that a log of the run carries its evidence even
+# where the directory does not outlive it. It is read back before any figure is called a reference
+# figure, since a record that cannot be read back is evidence the run did not keep.
+echo
+echo "== the records this run added under $evidence"
+for file in "$evidence"/*.md; do
+  [ -f "$file" ] || continue
+  from="$(started_at "$(basename "$file")")"
+  if ! size="$(size_of "$file")" || [ -z "$(count_or_empty "$size")" ]; then
+    lost "$file"
+    continue
+  fi
+  [ "$size" -gt "$from" ] || continue
+  echo
+  echo "--- $(basename "$file")"
+  tail -c +"$((from + 1))" "$file" || lost "$file"
+done
+
+# Each identifier's conditions section, which says whether its figures are reference figures. They
+# are the last evidence the run writes, and are published together in one rename once everything
+# else is kept, so no later failure can leave a reference figure standing in the record.
 short=0
+conditions=""
 for identifier in $measured; do
   lines=(
     "commit            $commit"
@@ -801,25 +868,18 @@ for identifier in $measured; do
   else
     lines+=("reference figure  yes: the host met every condition this run read")
   fi
-  section "$identifier conditions of this run" "${lines[@]}"
+  compose "$identifier conditions of this run" "${lines[@]}"
+  conditions="$conditions$composed"
 done
-
-# Everything this run added to the records, so that a log of the run carries its evidence even
-# where the directory does not outlive it.
-echo
-echo "== the records this run added under $evidence"
-for file in "$evidence"/*.md; do
-  [ -f "$file" ] || continue
-  from="$(started_at "$(basename "$file")")"
-  if ! size="$(size_of "$file")" || [ -z "$(count_or_empty "$size")" ]; then
-    lost "$file"
-    continue
-  fi
-  [ "$size" -gt "$from" ] || continue
+if [ -n "$conditions" ]; then
   echo
-  echo "--- $(basename "$file")"
-  tail -c +"$((from + 1))" "$file" || lost "$file"
-done
+  if publish "$conditions"; then
+    echo "--- bench-all.md, this run's conditions"
+  else
+    echo "--- this run's conditions, which its record could not keep, so none of them stands"
+  fi
+  printf '%s' "$conditions"
+fi
 
 echo
 if [ "$reference" -eq 1 ] && [ "$short" -ne 0 ]; then
