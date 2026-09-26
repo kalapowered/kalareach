@@ -214,6 +214,9 @@ pub struct CatalogueModule {
     /// follows (`config::catalogue::budgets_in_force`), and read by each enrolment and each
     /// synchronisation, never cached at open.
     budgets: std::sync::Mutex<kr_protocol::hostinfo::configuration::EnrolmentBudgets>,
+    /// The limits those budgets set, which the catalogue reads at every use: every package's, and
+    /// what one synchronisation may transfer.
+    limits: kr_plugin_catalogue::LimitsInForce,
     /// Run at each [`TestingPoint`], for tests that hold a computation there.
     #[cfg(feature = "testing")]
     testing_hook: Arc<std::sync::Mutex<Option<TestingHook>>>,
@@ -268,21 +271,24 @@ impl CatalogueModule {
         paths: &kr_ipc::paths::EnvironmentPaths,
         proxy: Option<&kr_transport::config::ProxyUrl>,
         broker: Arc<dyn kr_plugin_catalogue::BrokerBridge>,
+        budgets: kr_protocol::hostinfo::configuration::EnrolmentBudgets,
     ) -> crate::Result<Self> {
         Self::open_with(
             paths,
             proxy,
             native_bridge::BridgeHost::discover(paths.state_dir()),
             broker,
+            budgets,
         )
     }
 
     /// Opens the environment's catalogue, applying native bridges where `bridges` says, and asking
     /// `broker` what the workers hold live whenever a reclaim needs room.
     ///
-    /// Before this daemon serves anything, every package's bridge is brought to what its
-    /// installation wants: a recipe an earlier daemon left part way is finished or undone, and one
-    /// whose package is no longer installed is taken out.
+    /// `budgets` are the enrolment budgets in force when the daemon starts, and the limits they set
+    /// hold every package from the first check on. Before this daemon serves anything, every
+    /// package's bridge is brought to what its installation wants: a recipe an earlier daemon left
+    /// part way is finished or undone, and one whose package is no longer installed is taken out.
     ///
     /// # Errors
     ///
@@ -292,6 +298,7 @@ impl CatalogueModule {
         proxy: Option<&kr_transport::config::ProxyUrl>,
         bridges: native_bridge::BridgeHost,
         broker: Arc<dyn kr_plugin_catalogue::BrokerBridge>,
+        budgets: kr_protocol::hostinfo::configuration::EnrolmentBudgets,
     ) -> crate::Result<Self> {
         let root = paths.state_dir().join("catalogue");
         let unavailable = |error: CatalogueError| crate::ControllerError::RegistryUnavailable {
@@ -303,6 +310,9 @@ impl CatalogueModule {
         catalogue
             .recover_interrupted(kr_ipc::now_ms().get())
             .map_err(unavailable)?;
+        let limits = kr_plugin_catalogue::LimitsInForce::default();
+        limits.put(limits_of(&budgets));
+        catalogue.read_limits_from(limits.clone());
         let bridges = Arc::new(native_bridge::NativeBridges::new(bridges));
         let environment_id = paths.environment_id();
         for plugin_id in bridge_subjects(&catalogue, &bridges, environment_id) {
@@ -313,9 +323,8 @@ impl CatalogueModule {
             environment_id,
             bridges,
             snapshots: Arc::new(std::sync::Mutex::new(None)),
-            budgets: std::sync::Mutex::new(
-                kr_protocol::hostinfo::configuration::EnrolmentBudgets::default(),
-            ),
+            budgets: std::sync::Mutex::new(budgets),
+            limits,
             #[cfg(feature = "testing")]
             testing_hook: Arc::new(std::sync::Mutex::new(None)),
         })
@@ -447,15 +456,37 @@ impl CatalogueModule {
     }
 
     /// Puts the enrolment budgets this host's configuration holds in force for the changes that
-    /// follow.
+    /// follow, and the limits they set in force for every check the catalogue makes from now on.
+    ///
+    /// Returns true when the package limits moved. That moves what the admissions carry without
+    /// any record changing, so the caller raises the admission revision for it
+    /// ([`Self::raise_for_moved_limits`]).
     pub fn put_budgets_in_force(
         &self,
         budgets: kr_protocol::hostinfo::configuration::EnrolmentBudgets,
-    ) {
+    ) -> bool {
         *self
             .budgets
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = budgets;
+        let limits = limits_of(&budgets);
+        let moved = self.limits.get().package != limits.package;
+        self.limits.put(limits);
+        moved
+    }
+
+    /// Raises the admission revision under this host's own authority, for package limits that
+    /// moved: every snapshot of the admissions computed under the old limits is then below every
+    /// one computed under the new ones, and every worker is sent a round.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal the catalogue gave when the revision could not be written.
+    pub async fn raise_for_moved_limits(&self) -> Answer<u64> {
+        let mut catalogue = self.catalogue.lock().await;
+        catalogue
+            .raise_admission_revision(&Owner::acting())
+            .map_err(ProtocolError::from)
     }
 
     /// Returns the enrolment budgets in force.
@@ -917,16 +948,6 @@ impl CatalogueModule {
     ) -> Answer<ParamsValue> {
         let mut catalogue = self.catalogue.lock().await;
         admission.check().map_err(ProtocolError::from)?;
-        // Every package this change checks is held to the package limits in force: the
-        // configuration's values, each no larger than the package format's own maximum. A
-        // synchronisation it makes is held to the transfer limit in force.
-        let budgets = self.budgets_in_force();
-        catalogue.set_package_limits(kr_plugin_catalogue::PackageLimits::configured(
-            budgets.package_bytes,
-            budgets.object_count,
-            budgets.expanded_pack_bytes,
-        ));
-        catalogue.set_transfer_limit(budgets.transfer_bytes);
         let digest = kr_protocol::digest::mutation_digest(mutation, actor_id)
             .map_err(|error| ProtocolError::new(ErrorCode::InvalidArgument, error.to_string()))?;
         let key = receipt_key(actor_id, mutation.action_id);
@@ -1496,9 +1517,24 @@ enum WantedBridge {
     Nothing,
     /// One release's recipe.
     Release(Box<native_bridge::BridgeTarget>),
-    /// The installed package is not whole here, so what it wants cannot be read, and its bridge
-    /// is left as it is.
+    /// The installed package is not whole here, or is past a package limit in force and so not
+    /// used, so what it wants is not read, and its bridge is left as it is.
     Unknown,
+}
+
+/// The limits a set of enrolment budgets puts in force: each package limit no larger than the
+/// package format's own maximum, and what one synchronisation may transfer.
+fn limits_of(
+    budgets: &kr_protocol::hostinfo::configuration::EnrolmentBudgets,
+) -> kr_plugin_catalogue::Limits {
+    kr_plugin_catalogue::Limits {
+        package: kr_plugin_catalogue::PackageLimits::configured(
+            budgets.package_bytes,
+            budgets.object_count,
+            budgets.expanded_pack_bytes,
+        ),
+        transfer_bytes: budgets.transfer_bytes,
+    }
 }
 
 /// What one package's installation wants of its bridge.
@@ -1519,9 +1555,13 @@ fn wanted_bridge(
         return Ok(WantedBridge::Nothing);
     }
     let store = catalogue.store_of(&installation);
-    let package = match store.check_package(installation.package_digest)? {
+    let package = match store.check_package(
+        installation.package_digest,
+        catalogue.limits_in_force().get().package,
+    )? {
         kr_plugin_catalogue::PackageCheck::Complete(package) => package,
-        kr_plugin_catalogue::PackageCheck::Missing { .. }
+        kr_plugin_catalogue::PackageCheck::PastALimit(_)
+        | kr_plugin_catalogue::PackageCheck::Missing { .. }
         | kr_plugin_catalogue::PackageCheck::Corrupt { .. } => return Ok(WantedBridge::Unknown),
     };
     let manifest = package.manifest();

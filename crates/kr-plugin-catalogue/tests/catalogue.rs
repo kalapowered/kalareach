@@ -20,7 +20,7 @@ use kr_plugin_catalogue::transport::RepositoryTransport;
 use kr_plugin_catalogue::{
     Authority, BrokerBridge, BudgetLedger, CapabilityCeiling, Catalogue, CatalogueError,
     CatalogueResult, Change, Claimed, Committed, DisablePolicy, Effect, Enrolment, FetchReason,
-    HostPlatform, Installation, InstallationGrant, LivePackages, LiveRelease, MatchIndex,
+    HostPlatform, Installation, InstallationGrant, Limits, LivePackages, LiveRelease, MatchIndex,
     NotAdmittedReason, Observation, Owner, PackageLimits, ReceiptClaim, ReceiptKey, Recording,
     ReleaseOrigin, RepositoryId, RepositoryKind, Transition, capability_from_str, this_host,
 };
@@ -65,7 +65,9 @@ fn repository() -> RepositoryId {
 /// Returns true when the package is here and every file its manifest declares checks out.
 fn complete(store: &kr_plugin_catalogue::Store, digest: PayloadDigest) -> bool {
     matches!(
-        store.check_package(digest).expect("a readable store"),
+        store
+            .check_package(digest, PackageLimits::format())
+            .expect("a readable store"),
         kr_plugin_catalogue::PackageCheck::Complete(_)
     )
 }
@@ -73,7 +75,9 @@ fn complete(store: &kr_plugin_catalogue::Store, digest: PayloadDigest) -> bool {
 /// Returns true when nothing of the package was activated here.
 fn absent(store: &kr_plugin_catalogue::Store, digest: PayloadDigest) -> bool {
     matches!(
-        store.check_package(digest).expect("a readable store"),
+        store
+            .check_package(digest, PackageLimits::format())
+            .expect("a readable store"),
         kr_plugin_catalogue::PackageCheck::Missing { .. }
     )
 }
@@ -2362,7 +2366,10 @@ async fn a_synchronisation_past_the_transfer_limit_is_refused_by_name_and_the_ge
             .generation
     };
 
-    catalogue.set_transfer_limit(1);
+    catalogue.limits_in_force().put(Limits {
+        transfer_bytes: 1,
+        ..Limits::default()
+    });
     let refusal = catalogue
         .sync(&repository())
         .await
@@ -2382,7 +2389,10 @@ async fn a_synchronisation_past_the_transfer_limit_is_refused_by_name_and_the_ge
     );
     assert_eq!(generation_in_use(&catalogue), 1);
 
-    catalogue.set_transfer_limit(u64::MAX);
+    catalogue.limits_in_force().put(Limits {
+        transfer_bytes: u64::MAX,
+        ..Limits::default()
+    });
     catalogue
         .sync(&repository())
         .await
@@ -2434,7 +2444,10 @@ async fn the_transfer_limit_refuses_the_index_and_a_mirror_by_their_signed_sizes
         )
         .await;
         catalogue.set_transport(Arc::new(watched.clone()));
-        catalogue.set_transfer_limit(whole - 1);
+        catalogue.limits_in_force().put(Limits {
+            transfer_bytes: whole - 1,
+            ..Limits::default()
+        });
         let refusal = catalogue
             .sync(&repository())
             .await
@@ -2459,7 +2472,10 @@ async fn the_transfer_limit_refuses_the_index_and_a_mirror_by_their_signed_sizes
             "mirror {mirror}: no generation was activated"
         );
 
-        catalogue.set_transfer_limit(whole);
+        catalogue.limits_in_force().put(Limits {
+            transfer_bytes: whole,
+            ..Limits::default()
+        });
         catalogue
             .sync(&repository())
             .await
@@ -2514,7 +2530,10 @@ async fn a_mirror_counts_a_corrupt_copy_it_holds_toward_the_transfer_limit() {
     .expect("writable");
     assert!(!store.holds_payload(digest, size).expect("readable"));
 
-    catalogue.set_transfer_limit(again + size - 1);
+    catalogue.limits_in_force().put(Limits {
+        transfer_bytes: again + size - 1,
+        ..Limits::default()
+    });
     let refusal = catalogue
         .sync(&repository())
         .await
@@ -2531,7 +2550,10 @@ async fn a_mirror_counts_a_corrupt_copy_it_holds_toward_the_transfer_limit() {
     assert_eq!(limit.requested, again + size);
     assert_eq!(metered.fetches("/packages/"), fetches, "no payload fetched");
 
-    catalogue.set_transfer_limit(u64::MAX);
+    catalogue.limits_in_force().put(Limits {
+        transfer_bytes: u64::MAX,
+        ..Limits::default()
+    });
     catalogue
         .sync(&repository())
         .await
@@ -6276,6 +6298,58 @@ async fn a_package_that_lost_or_changed_a_file_is_repaired_before_it_is_enabled(
     );
 }
 
+/// Admissions hold every package to the package limits in force: an enabled installation whose
+/// package is past one is left out of what new bindings may use, named by that limit, and admitted
+/// again within the limits.
+#[tokio::test]
+async fn a_package_past_a_limit_in_force_is_not_admitted_and_is_named_by_it() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let generation = Generation::build(home.path(), GenerationSpec::default()).await;
+    let mut catalogue = installed_catalogue(home.path(), &generation).await;
+    catalogue
+        .set_enabled(environment(), &plugin(), true)
+        .await
+        .expect("enabled");
+    let admitted = |catalogue: &Catalogue| {
+        catalogue
+            .admissions(environment(), &[], &this_host())
+            .expect("readable")
+    };
+    assert!(
+        admitted(&catalogue)
+            .packages
+            .iter()
+            .any(|package| package.plugin_id == plugin())
+    );
+
+    catalogue.limits_in_force().put(Limits {
+        package: PackageLimits {
+            package_bytes: 1,
+            ..PackageLimits::format()
+        },
+        ..Limits::default()
+    });
+    let admissions = admitted(&catalogue);
+    assert!(admissions.packages.is_empty(), "{admissions:?}");
+    let left = admissions
+        .not_admitted
+        .iter()
+        .find(|left| left.plugin_id == plugin())
+        .expect("left out with its reason");
+    assert!(left.detail().contains("package_bytes"), "{}", left.detail());
+
+    catalogue.limits_in_force().put(Limits {
+        package: PackageLimits::format(),
+        ..Limits::default()
+    });
+    assert!(
+        admitted(&catalogue)
+            .packages
+            .iter()
+            .any(|package| package.plugin_id == plugin())
+    );
+}
+
 /// A package whose repository was removed is held to the package limits in force when it is
 /// enabled, as a package enabled through its repository is: past `package_bytes`, `object_count`
 /// or `expanded_pack_bytes` it is refused by that name and stays disabled, and within the limits
@@ -6312,7 +6386,10 @@ async fn a_package_whose_repository_was_removed_is_held_to_the_limits_in_force_w
         catalogue
             .remove_repository(&repository())
             .expect("the owner stopped trusting this root");
-        catalogue.set_package_limits(limits);
+        catalogue.limits_in_force().put(Limits {
+            package: limits,
+            ..Limits::default()
+        });
         let refusal = catalogue
             .set_enabled(environment(), &plugin(), true)
             .await
@@ -6334,7 +6411,10 @@ async fn a_package_whose_repository_was_removed_is_held_to_the_limits_in_force_w
             "{resource}: still disabled"
         );
 
-        catalogue.set_package_limits(format);
+        catalogue.limits_in_force().put(Limits {
+            package: format,
+            ..Limits::default()
+        });
         let enabled = catalogue
             .set_enabled(environment(), &plugin(), true)
             .await

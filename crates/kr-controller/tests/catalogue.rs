@@ -187,6 +187,7 @@ fn host() -> Host {
         &environment,
         None,
         Arc::new(kr_plugin_catalogue::UnboundBroker),
+        kr_protocol::hostinfo::configuration::EnrolmentBudgets::default(),
     )
     .expect("an openable catalogue");
     let working_temp = tempfile::tempdir().expect("a temporary directory");
@@ -1199,6 +1200,7 @@ async fn both_groups_reach_the_catalogue_through_the_daemon() {
         &environment,
         None,
         Arc::new(kr_plugin_catalogue::UnboundBroker),
+        kr_protocol::hostinfo::configuration::EnrolmentBudgets::default(),
     )
     .expect("the catalogue reopens");
     let restarted = reopened
@@ -3116,6 +3118,7 @@ mod native_bridges {
             None,
             site.bridges(&environment),
             Arc::new(kr_plugin_catalogue::UnboundBroker),
+            kr_protocol::hostinfo::configuration::EnrolmentBudgets::default(),
         )
         .expect("an openable catalogue");
         let working_temp = tempfile::tempdir().expect("a temporary directory");
@@ -3139,6 +3142,7 @@ mod native_bridges {
             None,
             site.bridges(&environment),
             Arc::new(kr_plugin_catalogue::UnboundBroker),
+            kr_protocol::hostinfo::configuration::EnrolmentBudgets::default(),
         )
         .expect("an openable catalogue");
     }

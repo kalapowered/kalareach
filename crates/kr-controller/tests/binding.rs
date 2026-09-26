@@ -811,3 +811,60 @@ async fn a_fenced_worker_is_a_member_again_after_a_restart_until_its_process_end
     );
     assert!(hosted.pending().await.is_empty());
 }
+
+/// A configuration that lowers a package limit below an admitted package moves the admissions with
+/// no catalogue change: the admission revision rises, the package is left out by the limit's name,
+/// and the hosted worker is reconciled again at the new revision.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_lowered_package_limit_moves_the_admissions_to_a_new_revision() {
+    use kr_protocol::hostinfo::configuration::{Change, ConfiguredEnrolmentBudgets};
+    let hosted = Hosted::start().await;
+    let _session = hosted.session().await;
+    assert!(hosted.counted_once_known().await.is_present());
+    let snapshot = || async {
+        hosted
+            .controller()
+            .catalogue()
+            .snapshot_within(&[], tokio::time::Instant::now() + PATIENCE)
+            .await
+            .expect("computed")
+    };
+    let before = snapshot().await;
+    assert!(
+        before
+            .packages
+            .iter()
+            .any(|package| package.plugin_id == plugin())
+    );
+
+    hosted
+        .controller()
+        .apply_configuration(&Change::Enrolment(ConfiguredEnrolmentBudgets {
+            package_bytes: Nullable::some(1),
+            ..ConfiguredEnrolmentBudgets::default()
+        }))
+        .await
+        .expect("the owner's limit");
+    let after = snapshot().await;
+    assert!(
+        after.revision > before.revision,
+        "{} {}",
+        after.revision,
+        before.revision
+    );
+    assert!(after.packages.is_empty(), "{:?}", after.packages);
+    assert!(
+        after
+            .left_out
+            .iter()
+            .any(|(plugin_id, why)| *plugin_id == plugin() && why.contains("package_bytes")),
+        "{:?}",
+        after.left_out
+    );
+    assert_eq!(
+        hosted.counted_once_known().await,
+        Nullable::some(U64::new(0)),
+        "the worker answers at the new revision"
+    );
+    assert!(hosted.pending().await.is_empty());
+}

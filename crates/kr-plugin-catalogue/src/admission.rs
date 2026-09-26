@@ -28,6 +28,7 @@ use kr_plugin_sdk::plugin::PayloadRole;
 use kr_plugin_sdk::version::PackageVersion;
 use kr_protocol::ids::EnvironmentId;
 
+use crate::budget::{PackageLimits, ResourceLimit};
 use crate::ceiling;
 use crate::db::{Enrolled, Records, RetiredRelease};
 use crate::error::CatalogueResult;
@@ -173,6 +174,8 @@ pub enum NotAdmittedReason {
     },
     /// Its package is not whole in the store.
     Incomplete(String),
+    /// Its package is past one of the package limits in force, which this names.
+    PastALimit(ResourceLimit),
 }
 
 /// One installation that is not admitted, and why.
@@ -208,6 +211,9 @@ impl NotAdmitted {
             NotAdmittedReason::Incomplete(detail) => {
                 format!("{subject} is not whole in this host's store: {detail}")
             }
+            NotAdmittedReason::PastALimit(limit) => {
+                format!("{subject} is past a package limit in force: {limit}")
+            }
         }
     }
 }
@@ -237,6 +243,9 @@ pub struct Admissions {
 pub struct AdmissionPlan {
     root: PathBuf,
     host: HostPlatform,
+    /// The package limits in force when the records were read, which every package check holds
+    /// its package to.
+    limits: PackageLimits,
     revision: u64,
     policy: DisablePolicy,
     pending: Vec<Pending>,
@@ -300,8 +309,12 @@ impl AdmissionPlan {
             // Platforms and the component are the package's own, read from the manifest its hash
             // names in its checked copy, never from an index entry.
             let store = Store::at(&self.root, &installation.enrolment);
-            let package = match store.check_package(installation.package_digest)? {
+            let package = match store.check_package(installation.package_digest, self.limits)? {
                 PackageCheck::Complete(package) => package,
+                PackageCheck::PastALimit(limit) => {
+                    not_admitted.push(refuse(NotAdmittedReason::PastALimit(limit)));
+                    continue;
+                }
                 PackageCheck::Missing { detail } | PackageCheck::Corrupt { detail } => {
                     not_admitted.push(refuse(NotAdmittedReason::Incomplete(detail)));
                     continue;
@@ -362,6 +375,7 @@ pub(crate) fn plan(
     environment_id: EnvironmentId,
     live: &[LiveRelease],
     host: &HostPlatform,
+    limits: PackageLimits,
 ) -> CatalogueResult<AdmissionPlan> {
     let revision = records.admission_revision()?;
     let policy = records.disable_policy()?;
@@ -475,6 +489,7 @@ pub(crate) fn plan(
     Ok(AdmissionPlan {
         root: root.to_path_buf(),
         host: *host,
+        limits,
         revision,
         policy,
         pending,

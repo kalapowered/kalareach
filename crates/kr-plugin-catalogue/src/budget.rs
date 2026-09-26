@@ -164,6 +164,53 @@ impl PackageLimits {
     }
 }
 
+/// The limits this host holds its catalogue to: every package's, and what one synchronisation may
+/// transfer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Limits {
+    /// The limits every package is held to.
+    pub package: PackageLimits,
+    /// The bytes one synchronisation may transfer: its metadata, its index and a full mirror's
+    /// payloads together.
+    pub transfer_bytes: u64,
+}
+
+impl Default for Limits {
+    /// The package format's own maxima, and no transfer limit of the host's own: what a catalogue
+    /// whose host has put none in force is held to.
+    fn default() -> Self {
+        Self {
+            package: PackageLimits::format(),
+            transfer_bytes: u64::MAX,
+        }
+    }
+}
+
+/// The limits in force, shared by the catalogue and whoever puts them in force, and read at every
+/// use: a change reaches the next check without the catalogue being told, and no check holds a
+/// copy of its own.
+#[derive(Clone, Debug, Default)]
+pub struct LimitsInForce(std::sync::Arc<std::sync::Mutex<Limits>>);
+
+impl LimitsInForce {
+    /// Puts `limits` in force for every check from now on.
+    pub fn put(&self, limits: Limits) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = limits;
+    }
+
+    /// Returns the limits in force now.
+    #[must_use]
+    pub fn get(&self) -> Limits {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
 /// When the allowance was found to be exhausted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Stage {

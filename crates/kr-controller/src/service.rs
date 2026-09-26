@@ -1062,14 +1062,14 @@ impl Controller {
         // The catalogue fetches through the proxy this daemon started with, the endpoint's own,
         // and asks this generation's member set what the workers hold before it makes room.
         let plugin_bridge = Arc::new(crate::catalogue::bridge::WorkerBridge::new(generation));
+        // The budgets in force from the start, so the limits they set hold every package from
+        // the catalogue's first check on.
         let catalogue = Arc::new(crate::catalogue::CatalogueModule::open(
             &setup.paths,
             Self::proxy_of(&started)?.as_ref(),
             Arc::clone(&plugin_bridge) as Arc<dyn kr_plugin_catalogue::BrokerBridge>,
+            startup_budgets.or(accepted_budgets).unwrap_or_default(),
         )?);
-        if let Some(budgets) = startup_budgets.or(accepted_budgets) {
-            catalogue.put_budgets_in_force(budgets);
-        }
         // The change-set service reads every repository through the project service's own opened
         // handles and restricted execution profile, so it takes that service rather than opening
         // a second one.
@@ -7539,7 +7539,19 @@ impl Controller {
         // decides them when it loaded a document, and leaves them as they are when it did not.
         let budgets = match crate::config::catalogue::budgets_in_force(&resolver) {
             Some(budgets) => {
-                self.catalogue.put_budgets_in_force(budgets);
+                // Package limits that moved move what the admissions carry with no record
+                // changing: the revision rises, so every snapshot under the new limits is above
+                // every one under the old, and every worker is sent a round.
+                if self.catalogue.put_budgets_in_force(budgets) {
+                    match self.catalogue.raise_for_moved_limits().await {
+                        Ok(_) => self.admissions_due(),
+                        Err(error) => self.note_admissions(format!(
+                            "the package limits moved and the admission revision could not be \
+                             raised for them: {}",
+                            error.message
+                        )),
+                    }
+                }
                 crate::config::EnforcedBudgets {
                     value: budgets,
                     from_document: true,

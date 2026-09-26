@@ -56,7 +56,7 @@ use cap_std::fs::{Dir, OpenOptions};
 use kr_flush::{NameKind, flush_held_directory};
 
 use crate::authority::Permit;
-use crate::budget::{BudgetLedger, Resource, ResourceLimit, Stage};
+use crate::budget::{BudgetLedger, PackageLimits, Resource, ResourceLimit, Stage};
 use crate::db::ActiveGeneration;
 use crate::error::{CatalogueError, CatalogueResult};
 use crate::repository::EnrolmentKey;
@@ -474,11 +474,15 @@ fn clear_staging(staging: &Area) -> CatalogueResult<()> {
     Ok(())
 }
 
-/// What an activated package's directory holds, measured against its own manifest.
+/// What an activated package's directory holds, measured against its own manifest and the package
+/// limits in force.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PackageCheck {
-    /// The manifest and every file it declares are here, in the bytes declared.
+    /// The manifest and every file it declares are here, in the bytes declared, within the limits.
     Complete(Box<ReadyPackage>),
+    /// The package is whole here and past one of the package limits in force, which it names. It
+    /// is not used: not installed, enabled or admitted, until the limit allows it again.
+    PastALimit(ResourceLimit),
     /// The package, or a file it declares, is not here.
     Missing {
         /// What is missing.
@@ -1224,7 +1228,8 @@ impl Store {
         ))
     }
 
-    /// Checks an activated package against the manifest its digest names, file by file.
+    /// Checks an activated package against the manifest its digest names, file by file, and a
+    /// whole one against the package limits in force.
     ///
     /// The directory alone says a package was activated here once. The package hash *is* the
     /// manifest's hash and the manifest names every other file with its length and digest, so the
@@ -1233,10 +1238,18 @@ impl Store {
     /// cannot read is a failure of its own disk, and is returned as one rather than as a package
     /// that is not here.
     ///
+    /// This is the one way to a ready package, so every use of one (installing, enabling,
+    /// admitting it) holds it to `limits`: a limit lowered since it was extracted makes it
+    /// [`PackageCheck::PastALimit`], by name, rather than letting a kept copy through.
+    ///
     /// # Errors
     ///
     /// Returns [`CatalogueError::StorageUnavailable`] when a file is there and cannot be read.
-    pub fn check_package(&self, manifest_digest: PayloadDigest) -> CatalogueResult<PackageCheck> {
+    pub fn check_package(
+        &self,
+        manifest_digest: PayloadDigest,
+        limits: PackageLimits,
+    ) -> CatalogueResult<PackageCheck> {
         let directory = self.package_dir(manifest_digest);
         let manifest_path = directory.join(kr_plugin_sdk::package::MANIFEST_FILE);
         let bytes = match std::fs::read(&manifest_path) {
@@ -1301,6 +1314,21 @@ impl Store {
                     ),
                 });
             }
+        }
+        // Whole, and held to the limits in force by what its copy holds: the bytes its tree takes
+        // (and at least what its manifest declares) and its files, the manifest among them. This
+        // format stores every file as it is, so the declared stage's check holds both byte limits.
+        let declared = manifest.payloads.iter().fold(0u64, |total, payload| {
+            total.saturating_add(payload.size_bytes.get())
+        });
+        let extracted = bytes_under(&directory)?;
+        let files = u64::try_from(manifest.payloads.len())
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
+        let subject = format!("{} {}", manifest.plugin_id(), manifest.version);
+        if let Err(limit) = limits.check(extracted.max(declared), files, Stage::Declared, &subject)
+        {
+            return Ok(PackageCheck::PastALimit(limit));
         }
         Ok(PackageCheck::Complete(Box::new(ReadyPackage {
             digest: manifest_digest,
@@ -2735,7 +2763,10 @@ mod tests {
     fn a_package_check_tells_absence_corruption_and_a_complete_package_apart() {
         let (_directory, store) = store();
         let (digest, directory) = activated_example(&store);
-        let PackageCheck::Complete(ready) = store.check_package(digest).expect("readable") else {
+        let PackageCheck::Complete(ready) = store
+            .check_package(digest, PackageLimits::format())
+            .expect("readable")
+        else {
             panic!("the activated package is complete");
         };
         assert_eq!(ready.digest(), digest);
@@ -2746,7 +2777,10 @@ mod tests {
         );
         assert!(matches!(
             store
-                .check_package(PayloadDigest::of(b"never activated"))
+                .check_package(
+                    PayloadDigest::of(b"never activated"),
+                    PackageLimits::format()
+                )
                 .expect("readable"),
             PackageCheck::Missing { .. }
         ));
@@ -2755,7 +2789,9 @@ mod tests {
         let original = std::fs::read(&presentation).expect("readable");
         std::fs::remove_file(&presentation).expect("removable");
         assert!(matches!(
-            store.check_package(digest).expect("readable"),
+            store
+                .check_package(digest, PackageLimits::format())
+                .expect("readable"),
             PackageCheck::Missing { .. }
         ));
 
@@ -2763,13 +2799,17 @@ mod tests {
         altered[0] ^= 0x01;
         std::fs::write(&presentation, &altered).expect("writable");
         assert!(matches!(
-            store.check_package(digest).expect("readable"),
+            store
+                .check_package(digest, PackageLimits::format())
+                .expect("readable"),
             PackageCheck::Corrupt { .. }
         ));
 
         std::fs::write(&presentation, &original[..original.len() - 1]).expect("writable");
         assert!(matches!(
-            store.check_package(digest).expect("readable"),
+            store
+                .check_package(digest, PackageLimits::format())
+                .expect("readable"),
             PackageCheck::Corrupt { .. }
         ));
 
@@ -2777,7 +2817,9 @@ mod tests {
         std::fs::write(directory.join(kr_plugin_sdk::package::MANIFEST_FILE), b"{}")
             .expect("writable");
         assert!(matches!(
-            store.check_package(digest).expect("readable"),
+            store
+                .check_package(digest, PackageLimits::format())
+                .expect("readable"),
             PackageCheck::Corrupt { .. }
         ));
     }
@@ -2791,7 +2833,7 @@ mod tests {
         let presentation = directory.join(kr_plugin_sdk::package::PRESENTATION_FILE);
         std::fs::set_permissions(&presentation, std::fs::Permissions::from_mode(0o000))
             .expect("the file can be made unreadable");
-        let outcome = store.check_package(digest);
+        let outcome = store.check_package(digest, PackageLimits::format());
         std::fs::set_permissions(&presentation, std::fs::Permissions::from_mode(0o600))
             .expect("readable again");
         assert!(
@@ -2951,7 +2993,9 @@ mod tests {
         );
         assert!(
             matches!(
-                store.check_package(package).expect("readable"),
+                store
+                    .check_package(package, PackageLimits::format())
+                    .expect("readable"),
                 PackageCheck::Complete(_)
             ),
             "the package is in place"
@@ -2980,7 +3024,9 @@ mod tests {
         let presentation = directory.join(kr_plugin_sdk::package::PRESENTATION_FILE);
         std::fs::write(&presentation, b"altered").expect("writable");
         assert!(matches!(
-            store.check_package(digest).expect("readable"),
+            store
+                .check_package(digest, PackageLimits::format())
+                .expect("readable"),
             PackageCheck::Corrupt { .. }
         ));
 
@@ -2989,7 +3035,9 @@ mod tests {
         let (again, _) = activated_example(&store);
         assert_eq!(again, digest);
         assert!(matches!(
-            store.check_package(digest).expect("readable"),
+            store
+                .check_package(digest, PackageLimits::format())
+                .expect("readable"),
             PackageCheck::Complete(_)
         ));
         let staging = store.root.join("staging");
@@ -3021,7 +3069,9 @@ mod tests {
         let (again, repaired) = activated_example(&store);
         assert_eq!((again, &repaired), (digest, &directory));
         assert!(matches!(
-            store.check_package(digest).expect("readable"),
+            store
+                .check_package(digest, PackageLimits::format())
+                .expect("readable"),
             PackageCheck::Complete(_)
         ));
         #[cfg(unix)]
@@ -3073,7 +3123,9 @@ mod tests {
         let (_, outcome) = activate_example(&store);
         outcome.expect("repaired");
         assert!(matches!(
-            store.check_package(digest).expect("readable"),
+            store
+                .check_package(digest, PackageLimits::format())
+                .expect("readable"),
             PackageCheck::Complete(_)
         ));
         assert_eq!(

@@ -89,7 +89,9 @@ pub use crate::admission::{
 };
 pub use crate::authority::{Authority, Committed, Effect, Failure, Owner, Recording};
 pub use crate::broker::{BrokerBridge, LivePackages, UnboundBroker};
-pub use crate::budget::{BudgetLedger, PackageLimits, Resource, ResourceLimit, Retained, Stage};
+pub use crate::budget::{
+    BudgetLedger, Limits, LimitsInForce, PackageLimits, Resource, ResourceLimit, Retained, Stage,
+};
 pub use crate::ceiling::{
     CapabilityDecision, GrantRequirement, InstallationGrant, capability_from_str,
 };
@@ -319,10 +321,9 @@ pub struct Catalogue {
     fetches_network: bool,
     broker: Arc<dyn BrokerBridge>,
     transport: Arc<dyn tough::Transport + Send + Sync>,
-    /// The limits each package is held to, as its host put them in force for the change at hand.
-    package_limits: PackageLimits,
-    /// The bytes one synchronisation may transfer.
-    transfer_limit: u64,
+    /// The limits in force, read at every use: every package's, and what one synchronisation may
+    /// transfer.
+    limits: LimitsInForce,
 }
 
 impl Catalogue {
@@ -370,8 +371,7 @@ impl Catalogue {
             fetches_network: true,
             broker,
             transport,
-            package_limits: PackageLimits::format(),
-            transfer_limit: u64::MAX,
+            limits: LimitsInForce::default(),
         })
     }
 
@@ -755,16 +755,17 @@ impl Catalogue {
         self.admission_plan(environment_id, live, host)?.complete()
     }
 
-    /// Holds every package the changes that follow check to `limits`.
-    pub fn set_package_limits(&mut self, limits: PackageLimits) {
-        self.package_limits = limits;
+    /// Reads the limits in force from `limits` from now on, at every use: whoever holds the same
+    /// handle puts limits in force for every check that follows, a package's and a
+    /// synchronisation's alike. A catalogue given none is held to [`Limits::default`].
+    pub fn read_limits_from(&mut self, limits: LimitsInForce) {
+        self.limits = limits;
     }
 
-    /// Holds every synchronisation that follows to `bytes` transferred: its metadata, its index
-    /// and a full mirror's payloads together. A catalogue whose host sets none transfers what its
-    /// other budgets allow.
-    pub fn set_transfer_limit(&mut self, bytes: u64) {
-        self.transfer_limit = bytes;
+    /// Returns the limits in force this catalogue reads.
+    #[must_use]
+    pub const fn limits_in_force(&self) -> &LimitsInForce {
+        &self.limits
     }
 
     /// Raises the admission revision under `authority`, for something the admissions carry that
@@ -795,7 +796,10 @@ impl Catalogue {
         live: &[LiveRelease],
         host: &HostPlatform,
     ) -> CatalogueResult<AdmissionPlan> {
-        self.read_kept(|records| admission::plan(&self.root, records, environment_id, live, host))
+        let limits = self.limits.get().package;
+        self.read_kept(|records| {
+            admission::plan(&self.root, records, environment_id, live, host, limits)
+        })
     }
 
     /// Returns the builds the current generation of an installation's origin names for its exact
@@ -1154,7 +1158,10 @@ impl Catalogue {
         // that a newer root withdrew is not where a load starts.
         let (store, _lock, enrolled) = self.locked(&enrolled)?;
         self.check_reachable(&enrolled.enrolment)?;
-        let ledger = ledger_of(&store, &enrolled, self.package_limits)?;
+        // The limits in force are read once, so every check this synchronisation makes is held to
+        // the same ones.
+        let limits = self.limits.get();
+        let ledger = ledger_of(&store, &enrolled, limits.package)?;
 
         let transport = Arc::clone(&self.transport);
         // The client works in a private copy of the accepted trust checkpoint, never in the
@@ -1173,7 +1180,7 @@ impl Catalogue {
                 &enrolled.enrolment,
                 working.path(),
                 &ledger,
-                self.transfer_limit,
+                limits.transfer_bytes,
                 &transport,
                 &mut |new_root| {
                     // A rotation is kept the moment verification arrives at it, before anything
@@ -1258,7 +1265,9 @@ impl Catalogue {
         // previous generation in place rather than activating a new index it has no payloads for.
         let mut mirrored = 0usize;
         if enrolled.enrolment.budgets.full_offline_mirror {
-            let fetched = self.mirror(&enrolled, &store, &verified, authority).await;
+            let fetched = self
+                .mirror(&enrolled, &store, &verified, limits.package, authority)
+                .await;
             // The client moved its time checkpoint on while it fetched. That is kept whatever the
             // mirror did, so a clock later set back to a time in between is refused.
             let kept = committed(authority, &Effect::Checkpoint(id.clone()), |permit| {
@@ -1453,6 +1462,7 @@ impl Catalogue {
         enrolled: &Enrolled,
         store: &Store,
         verified: &VerifiedGeneration,
+        limits: PackageLimits,
         authority: &dyn Authority,
     ) -> CatalogueResult<usize> {
         let mut wanted: BTreeMap<PayloadDigest, (String, u64)> = BTreeMap::new();
@@ -1515,7 +1525,7 @@ impl Catalogue {
             if verified_here.contains(digest) {
                 continue;
             }
-            let ledger = ledger_of(store, enrolled, self.package_limits)?;
+            let ledger = ledger_of(store, enrolled, limits)?;
             let bytes = verified
                 .read_target(
                     target,
@@ -1667,21 +1677,20 @@ impl Catalogue {
             package_hash,
             reason,
         )?;
+        // The limits in force are read once, so every check this activation makes is held to the
+        // same ones.
+        let limits = self.limits.get().package;
         // A package already here is used only after every file its manifest declares is checked
         // where it lies. Its name is not the package: one that is incomplete or altered is fetched
-        // again and replaced, and one this host cannot read is its disk's failure.
-        // The limits in force hold it as they hold a fetched one: a limit lowered since it was
-        // extracted refuses it here rather than letting a kept copy through.
-        if let Some(hash) = package_hash
-            && let PackageCheck::Complete(package) = store.check_package(hash)?
-        {
-            within_limits(
-                store,
-                &package,
-                self.package_limits,
-                &format!("{plugin_id} {version}"),
-            )?;
-            return Ok(*package);
+        // again and replaced, and one this host cannot read is its disk's failure. The same check
+        // holds it to the limits in force: a limit lowered since it was extracted refuses it here
+        // rather than letting a kept copy through.
+        if let Some(hash) = package_hash {
+            match store.check_package(hash, limits)? {
+                PackageCheck::Complete(package) => return Ok(*package),
+                PackageCheck::PastALimit(limit) => return Err(limit.into()),
+                PackageCheck::Missing { .. } | PackageCheck::Corrupt { .. } => {}
+            }
         }
         let active = enrolled.active.ok_or_else(|| CatalogueError::NotFound {
             detail: format!("{} has no activated generation yet", enrolled.enrolment.id),
@@ -1708,12 +1717,15 @@ impl Catalogue {
         let subject = format!("{} {}", entry.plugin_id, entry.version);
         // The same package reached through the entry: the entry is a signed statement about this
         // hash, and it has to agree with the manifest the hash names before anything relies on it.
-        let limits = ledger_of(store, enrolled, self.package_limits)?;
-        extract::check_declared(&entry, &limits)?;
-        if let PackageCheck::Complete(package) = store.check_package(entry.manifest_digest)? {
-            extract::reconcile(&entry, package.manifest(), &subject)?;
-            within_limits(store, &package, self.package_limits, &subject)?;
-            return Ok(*package);
+        let ledger = ledger_of(store, enrolled, limits)?;
+        extract::check_declared(&entry, &ledger)?;
+        match store.check_package(entry.manifest_digest, limits)? {
+            PackageCheck::Complete(package) => {
+                extract::reconcile(&entry, package.manifest(), &subject)?;
+                return Ok(*package);
+            }
+            PackageCheck::PastALimit(limit) => return Err(limit.into()),
+            PackageCheck::Missing { .. } | PackageCheck::Corrupt { .. } => {}
         }
 
         // The package is staged whole, beside everything the cache and the packages already here
@@ -1802,7 +1814,7 @@ impl Catalogue {
             &checked,
             staged_bytes,
             staged_files,
-            &ledger_of(store, enrolled, self.package_limits)?,
+            &ledger_of(store, enrolled, limits)?,
         )?;
         committed(
             authority,
@@ -1811,8 +1823,9 @@ impl Catalogue {
         )?;
         // What was moved into place is read back and checked like any package already here, so
         // the only way to a ready package is through that check.
-        match store.check_package(entry.manifest_digest)? {
+        match store.check_package(entry.manifest_digest, limits)? {
             PackageCheck::Complete(package) => Ok(*package),
+            PackageCheck::PastALimit(limit) => Err(limit.into()),
             PackageCheck::Missing { detail } | PackageCheck::Corrupt { detail } => {
                 Err(CatalogueError::PublicationUncertain {
                     detail: format!(
@@ -1893,7 +1906,7 @@ impl Catalogue {
         let bytes = trust::fetch_accepted(
             &self.transport,
             &accepted_target,
-            &ledger_of(store, enrolled, self.package_limits)?,
+            &ledger_of(store, enrolled, self.limits.get().package)?,
         )
         .await?;
         committed(authority, &Effect::Payload(digest), |permit| {
@@ -2223,18 +2236,16 @@ impl Catalogue {
                     // every file the package declares is checked where it lies: one that is gone
                     // or altered is section 11's own answer, because nothing can fetch it again,
                     // and one this host cannot read is its disk's failure.
-                    // A complete one is held to the package limits in force, as one enabled
-                    // through its repository is: a limit lowered since it was extracted refuses
-                    // it here.
+                    // The same check holds a complete one to the package limits in force, as one
+                    // enabled through its repository is: a limit lowered since it was extracted
+                    // refuses it here.
                     let store = self.store_of(&installation);
                     let _lock = store.lock()?;
-                    match store.check_package(installation.package_digest)? {
-                        PackageCheck::Complete(package) => within_limits(
-                            &store,
-                            &package,
-                            self.package_limits,
-                            &format!("{plugin_id} {}", installation.version),
-                        )?,
+                    match store
+                        .check_package(installation.package_digest, self.limits.get().package)?
+                    {
+                        PackageCheck::Complete(_) => {}
+                        PackageCheck::PastALimit(limit) => return Err(limit.into()),
                         PackageCheck::Missing { detail } | PackageCheck::Corrupt { detail } => {
                             return Err(CatalogueError::UnavailableOffline {
                                 detail: format!(
@@ -2730,31 +2741,6 @@ fn check_decided_under(
         }),
         _ => Ok(()),
     }
-}
-
-/// Holds a package already extracted to the package limits in force, by what its checked copy
-/// holds: the bytes its tree takes (and at least what its manifest declares) and its files, the
-/// manifest among them.
-fn within_limits(
-    store: &Store,
-    package: &ReadyPackage,
-    limits: PackageLimits,
-    subject: &str,
-) -> CatalogueResult<()> {
-    let payloads = &package.manifest().payloads;
-    let declared = payloads.iter().fold(0u64, |total, payload| {
-        total.saturating_add(payload.size_bytes.get())
-    });
-    let extracted = store
-        .package_trees()?
-        .get(&package.digest())
-        .copied()
-        .unwrap_or(declared);
-    let files = u64::try_from(payloads.len())
-        .unwrap_or(u64::MAX)
-        .saturating_add(1);
-    limits.check(extracted.max(declared), files, Stage::Declared, subject)?;
-    Ok(())
 }
 
 /// Returns what a sync or a fetch measures against: the enrolment's budgets and what its
@@ -4138,7 +4124,7 @@ mod tests {
         assert!(
             matches!(
                 store
-                    .check_package(entry.manifest_digest)
+                    .check_package(entry.manifest_digest, PackageLimits::format())
                     .expect("readable"),
                 PackageCheck::Complete(_)
             ),
@@ -4164,7 +4150,7 @@ mod tests {
         uncertain_receipt(&mut reopened, "install", install_failure.answer());
         assert!(matches!(
             store
-                .check_package(entry.manifest_digest)
+                .check_package(entry.manifest_digest, PackageLimits::format())
                 .expect("readable"),
             PackageCheck::Complete(_)
         ));
