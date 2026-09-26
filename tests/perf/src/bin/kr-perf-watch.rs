@@ -6,11 +6,13 @@
 //!
 //! It reads the whole machine, creates the `--ready` file, and reads the machine again every
 //! `--every` seconds, two by default, until `--for` seconds have passed or the `--until` file
-//! exists, and then once more. It then prints `<bound> <average>`: the most processors' worth of
-//! processor time the machine can have spent on anything but the run in any five seconds from the
-//! first reading to the last, and over all of that time. Where the readings cannot show that, it
-//! prints `unread: <why>` instead. The run is process `--run` and every process descended from it;
-//! a run whose process has gone is unread, so a watcher whose run was stopped stops too.
+//! exists, and then once more. It then prints `<bound> <average> <allowance>`: the most
+//! processors' worth of processor time the machine can have spent on anything but the run in any
+//! five seconds from the first reading to the last, the same over all of that time, and how much of
+//! the bound the counts' allowances for rounding and trailing make up. Where the readings cannot
+//! show that, it prints `unread: <why>` instead. The run is process `--run` and every process
+//! descended from it; a run whose process has gone is unread, so a watcher whose run was stopped
+//! stops too.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -46,7 +48,10 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     };
     match watch(&options) {
-        Ok(summary) => println!("{:.2} {:.2}", summary.bound, summary.average),
+        Ok(summary) => println!(
+            "{:.2} {:.2} {:.2}",
+            summary.bound, summary.average, summary.allowance
+        ),
         Err(why) => println!("unread: {why}"),
     }
     ExitCode::SUCCESS

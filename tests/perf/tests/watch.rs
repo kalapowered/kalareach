@@ -59,8 +59,17 @@ fn stand_in(seconds: &str) -> Child {
 
 fn summary(output: &str) -> (f64, f64) {
     let mut numbers = output.split_whitespace().map(str::parse::<f64>);
-    match (numbers.next(), numbers.next(), numbers.next()) {
-        (Some(Ok(bound)), Some(Ok(average)), None) => (bound, average),
+    match (
+        numbers.next(),
+        numbers.next(),
+        numbers.next(),
+        numbers.next(),
+    ) {
+        (Some(Ok(bound)), Some(Ok(average)), Some(Ok(allowance)), None)
+            if (0.0..=bound).contains(&allowance) =>
+        {
+            (bound, average)
+        }
         _ => panic!("the watcher printed `{output}`"),
     }
 }

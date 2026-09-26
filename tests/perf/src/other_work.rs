@@ -102,6 +102,10 @@ pub struct Process {
 pub struct Summary {
     /// The most processors' worth of other work any window of the step can have held.
     pub bound: f64,
+    /// Of `bound`, the processors' worth that the counts' allowances add to it: their rounding, and
+    /// how far a running thread's time can trail. Other work in that window was at least `bound`
+    /// less this, and a quiet machine reads busier by at most this.
+    pub allowance: f64,
     /// The most processors' worth of other work over the whole run of readings.
     pub average: f64,
     /// How many readings were taken.
@@ -367,7 +371,7 @@ impl Tally {
         // No stretch can hold more than every processor's time, however far a run of readings
         // reaches past the window it covers.
         let processors = f64::from(self.processors.unwrap_or(0));
-        let mut bound: f64 = 0.0;
+        let (mut bound, mut allowance): (f64, f64) = (0.0, 0.0);
         // The windows that start after reading `start - 1` ended and before reading `start` ended
         // are covered from reading `start - 1` to the first reading that begins at least a window
         // after reading `start` ended.
@@ -376,20 +380,27 @@ impl Tally {
             let end = (start..=last)
                 .find(|&end| self.readings[end].began >= reach)
                 .unwrap_or(last);
-            bound = bound.max((self.other(start - 1, end)? / window).min(processors));
+            let (other, allowed) = self.other(start - 1, end)?;
+            let covered = (other / window).min(processors);
+            if covered > bound {
+                bound = covered;
+                allowance = (allowed / window).min(covered);
+            }
         }
-        let average = (self.other(0, last)? / (self.readings[last].ended - self.readings[0].began))
+        let average = (self.other(0, last)?.0
+            / (self.readings[last].ended - self.readings[0].began))
             .min(processors);
         Ok(Summary {
             bound,
+            allowance,
             average,
             readings: self.readings.len(),
         })
     }
 
     /// The most processor time the machine can have spent on anything but the run from reading
-    /// `from` to reading `to`.
-    fn other(&self, from: usize, to: usize) -> Result<f64, String> {
+    /// `from` to reading `to`, and how much of it the counts' allowances add.
+    fn other(&self, from: usize, to: usize) -> Result<(f64, f64), String> {
         let (first, last) = (&self.readings[from], &self.readings[to]);
         let processors = f64::from(self.processors.unwrap_or(0));
         let resolution = self.readings[from..=to]
@@ -398,7 +409,8 @@ impl Tally {
             .fold(0.0, f64::max);
         let busy = processors * (last.ended - first.began) - (last.idle_after - first.idle_before)
             + resolution;
-        let other = busy - self.run_least(from, to);
+        let (least, set_aside) = self.run_least(from, to);
+        let other = busy - least;
         // Rounding in the arithmetic, and no more.
         if other < -1e-6 {
             return Err(format!(
@@ -407,13 +419,14 @@ impl Tally {
                 -other
             ));
         }
-        Ok(other.max(0.0))
+        Ok((other.max(0.0), resolution + set_aside))
     }
 
-    /// The least the run's processes can have used from reading `from` to reading `to`.
-    fn run_least(&self, from: usize, to: usize) -> f64 {
+    /// The least the run's processes can have used from reading `from` to reading `to`, and how
+    /// much of what their times show was set aside for rounding and trailing.
+    fn run_least(&self, from: usize, to: usize) -> (f64, f64) {
         let rounding = self.readings[from].time_resolution;
-        let mut least = 0.0;
+        let (mut least, mut set_aside) = (0.0, 0.0);
         for (key, times) in &self.times {
             let Some(latest) = times
                 .iter()
@@ -423,7 +436,10 @@ impl Tally {
                 continue;
             };
             if let Some(first) = times.iter().find(|time| time.reading == from) {
-                least += (latest.own - first.own - first.lag - rounding).max(0.0);
+                let shown = latest.own - first.own;
+                let kept = (shown - first.lag - rounding).max(0.0);
+                least += kept;
+                set_aside += shown - kept;
             } else if self
                 .appeared
                 .get(key)
@@ -432,7 +448,7 @@ impl Tally {
                 least += latest.own;
             }
         }
-        least
+        (least, set_aside)
     }
 }
 
@@ -535,6 +551,7 @@ mod tests {
         ])
         .unwrap();
         assert!(close(summary.bound, 2.0), "{summary:?}");
+        assert!(close(summary.allowance, 0.0), "{summary:?}");
     }
 
     #[test]
@@ -563,8 +580,9 @@ mod tests {
         }
         let summary = tally(&readings).unwrap();
         // Each delta of 0.01 is worth nothing after its rounding, so the machine's 0.05 seconds are
-        // all counted as other work.
+        // all counted as other work, and all of it is the allowance.
         assert!(close(summary.bound, 0.025), "{summary:?}");
+        assert!(close(summary.allowance, 0.025), "{summary:?}");
     }
 
     #[test]
@@ -575,6 +593,7 @@ mod tests {
         }
         let summary = tally(&readings).unwrap();
         assert!(close(summary.bound, 0.25), "{summary:?}");
+        assert!(close(summary.allowance, 0.25), "{summary:?}");
     }
 
     #[test]

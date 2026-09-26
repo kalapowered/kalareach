@@ -336,10 +336,11 @@ fi
 
 # The reader of other work, which the build above made: tests/perf's kr-perf-watch. It reads the
 # whole machine every two seconds, all processors' idle time and every process with the processor
-# time charged to it, and prints "<bound> <average>": the most processors' worth of processor time
-# the machine can have spent on anything but this run in any five seconds it read, and over all of
-# them. Where its readings cannot show that, it prints "unread: <why>". This run is this script and
-# every process descended from it, and a process once of it stays of it.
+# time charged to it, and prints "<bound> <average> <allowance>": the most processors' worth of
+# processor time the machine can have spent on anything but this run in any five seconds it read,
+# the same over all of them, and how much of the bound the counts' allowances for rounding and
+# trailing make up. Where its readings cannot show that, it prints "unread: <why>". This run is
+# this script and every process descended from it, and a process once of it stays of it.
 watcher="$(cargo build --locked --release -p kr-perf --bin kr-perf-watch --message-format=json \
   2>/dev/null | sed -n 's/.*"executable":"\([^"]*kr-perf-watch\)".*/\1/p' | tail -1)"
 if [ -z "$watcher" ] || [ ! -x "$watcher" ]; then
@@ -348,10 +349,10 @@ if [ -z "$watcher" ] || [ ! -x "$watcher" ]; then
 fi
 
 # A reading of other work as the reader printed it, checked: from a reader that ended well, one line
-# of two numbers or one that says why it is unread. Anything else is unread, with what the reader
+# of three numbers or one that says why it is unread. Anything else is unread, with what the reader
 # did. `$1` is the reader's exit status and `$2` what it printed.
 checked_reading() {
-  local form='^([0-9]+\.[0-9][0-9] [0-9]+\.[0-9][0-9]|unread: .+)$'
+  local form='^([0-9]+\.[0-9][0-9] [0-9]+\.[0-9][0-9] [0-9]+\.[0-9][0-9]|unread: .+)$'
   if [ "$1" -ne 0 ]; then
     printf 'unread: the reader of other work ended with status %s' "$1"
     return
@@ -370,10 +371,15 @@ checked_reading() {
 
 # A checked reading of other work in words.
 other_words() {
+  local rest
   case "$1" in
     "") printf 'unread' ;;
     unread*) printf '%s' "$1" ;;
-    *) printf '%s in the busiest five seconds and %s on average' "${1%% *}" "${1#* }" ;;
+    *)
+      rest="${1#* }"
+      printf '%s in the busiest five seconds, up to %s of it the counts'"'"' allowance, and %s on average' \
+        "${1%% *}" "${rest#* }" "${rest%% *}"
+      ;;
   esac
 }
 

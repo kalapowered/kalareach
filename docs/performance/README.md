@@ -144,12 +144,13 @@ the processor, the processors and the memory against the reference host's, the l
 and leaving, the stolen share, and which of those fall short. For each identifier the run measured,
 `bench-all.md` adds a conditions section. It gives each step that measured the identifier, with its
 exit status, the load average at both edges, the other work over the ten seconds before the step and
-through it (the bound on its busiest five seconds, and its average) and the stolen share over it,
-then the outcome, and whether the figures are reference figures. Figures are reference figures only
-when the run was asked for them, the host met every condition it read, every reading could be taken,
-no record of the step names a shortfall, and the run kept all of its evidence. The conditions
-sections are the last thing a run writes, and are published together in one step, so a run that
-could not keep its evidence leaves none that calls its figures reference figures.
+through it (the bound on its busiest five seconds, how much of that the allowances make up, and its
+average) and the stolen share over it, then the outcome, and whether the figures are reference
+figures. Figures are reference figures only when the run was asked for them, the host met every
+condition it read, every reading could be taken, no record of the step names a shortfall, and the
+run kept all of its evidence. The conditions sections are the last thing a run writes, and are
+published together in one step, so a run that could not keep its evidence leaves none that calls its
+figures reference figures.
 
 ## Where release figures come from
 
