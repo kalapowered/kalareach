@@ -4314,7 +4314,8 @@ impl WorkerService {
     ///
     /// The caller's own first: the de-duplication key is the actor and the action together, so
     /// that lookup can only ever find the caller's own action. Anything else is another actor's,
-    /// which section 23's row permits only under host-owner authority.
+    /// which section 23's row permits only under host-owner authority, and at a worker that is the
+    /// local owner's alone.
     fn cancellation_target(
         journal: &crate::journal::Journal,
         caller: &Caller,
@@ -4330,7 +4331,7 @@ impl WorkerService {
         };
         crate::action::cancel::check(
             crate::action::cancel::Subject::OtherActor,
-            caller.ingress,
+            caller.is_local_owner(),
             &caller.actor_id,
             action_id,
         )?;
@@ -5373,10 +5374,10 @@ impl WorkerService {
                         })?;
                 // Who the cancellation may reach was decided before the dispatch marker; this
                 // resolves the same target again under the session lock, because the receipt it
-                // acts on is what may have moved in between. A caller the daemon forwarded reaches
-                // its own action and no other: the journal is keyed by the verified actor and the
-                // action together, and host-management authority over somebody else's intent is
-                // the local operating-system caller's alone.
+                // acts on is what may have moved in between. A caller acting under a grant reaches
+                // its own action and no other, whichever socket it came in on: the journal is
+                // keyed by the verified actor and the action together, and host-owner authority
+                // over somebody else's intent is the local owner's alone.
                 let target = Self::cancellation_target(journal, caller, params.action_id)?;
                 let receipt = journal.cancel(target, params.action_id, kr_ipc::now_ms())?;
                 Ok((
