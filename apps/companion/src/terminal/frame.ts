@@ -88,6 +88,29 @@ export function placedPieces(screen: TerminalScreen): PlacedPiece[] {
   return placed
 }
 
+/**
+ * The text of `pieces` as a copy of the grid gives it: a line for each line from the first piece's
+ * to the last's, each piece's text at its column with a space for every cell before it that no
+ * piece covers, and no spaces after a line's last piece. The boxes a person selects are placed
+ * apart from each other, so the browser's own copy of them would run the lines and pieces together.
+ */
+export function copiedText(pieces: readonly PlacedPiece[]): string {
+  if (pieces.length === 0) return ''
+  const lines = new Map<number, string>()
+  const reached = new Map<number, number>()
+  for (const piece of pieces) {
+    const gap = Math.max(0, piece.column - (reached.get(piece.line) ?? 0))
+    lines.set(piece.line, `${lines.get(piece.line) ?? ''}${' '.repeat(gap)}${piece.text}`)
+    reached.set(piece.line, piece.column + piece.cells)
+  }
+  const numbers = [...lines.keys()]
+  const first = Math.min(...numbers)
+  const last = Math.max(...numbers)
+  return Array.from({ length: last - first + 1 }, (_, index) =>
+    (lines.get(first + index) ?? '').trimEnd()
+  ).join('\n')
+}
+
 /** The shapes the session's cursor is drawn in, each steady: a cursor never blinks. */
 export type CursorShape = 'block' | 'underline' | 'bar'
 

@@ -45,7 +45,7 @@ import {
 } from '../src/model/receipts'
 import { emptyControlState, evaluate, isRendered, visibilityOf } from '../src/model/controls'
 import { leftBlankOnPhone, stretchesOf, styleOf } from '../src/terminal/cells'
-import { drawableText, placedCursor, placedPieces, REPLACEMENT } from '../src/terminal/frame'
+import { copiedText, drawableText, placedCursor, placedPieces, REPLACEMENT } from '../src/terminal/frame'
 import {
   clipping,
   describeProvenance,
@@ -450,6 +450,26 @@ describe('the raw terminal', () => {
       [0, 6, 2, 'long'],
       [1, 0, 2, '\u{4e2d}']
     ])
+  })
+
+  it('copies the pieces a selection touches as lines laid out by their cells', () => {
+    const whole = terminalScreen('8a7b6c50-22bb-4c3d-8e4f-000000000101', { columns: 80, rows: 8 })
+    const pieces = placedPieces(whole)
+    expect(copiedText(pieces)).toBe(
+      [
+        '$ cargo test -p kr-client',
+        '   Compiling kr-client v0.1.0',
+        '    Finished test profile in 12.4s',
+        'ok    done',
+        'test result: ok. 143 passed',
+        '$'
+      ].join('\n')
+    )
+    // A selection of the first and fourth lines' pieces keeps the lines between them, empty.
+    expect(copiedText(pieces.filter((piece) => piece.line === 0 || piece.line === 3))).toBe(
+      '$ cargo test -p kr-client\n\n\nok    done'
+    )
+    expect(copiedText([])).toBe('')
   })
 
   it('draws the cursor in its steady shape at its cell, and not when it is hidden or outside', () => {

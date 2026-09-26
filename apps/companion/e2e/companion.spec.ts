@@ -545,6 +545,32 @@ test.describe('the raw terminal', () => {
     expect(misplaced).toEqual([])
   })
 
+  test('copies a selection of the screen as its lines, laid out by their cells', async ({ page }) => {
+    await openSession(page)
+    await page.getByRole('tab', { name: 'Terminal' }).click()
+    await expect(page.getByTestId('terminal-surface')).toContainText('cargo test -p kr-client')
+    const copied = await page.evaluate(() => {
+      const grid = document.querySelector('[data-testid="terminal-grid"]')
+      if (grid === null) return null
+      const range = document.createRange()
+      range.selectNodeContents(grid)
+      const selection = window.getSelection()
+      selection?.removeAllRanges()
+      selection?.addRange(range)
+      const data = new DataTransfer()
+      grid.dispatchEvent(new ClipboardEvent('copy', { clipboardData: data, bubbles: true, cancelable: true }))
+      return data.getData('text/plain')
+    })
+    expect(copied?.split('\n')).toEqual([
+      '$ cargo test -p kr-client',
+      '   Compiling kr-client v0.1.0',
+      '    Finished test profile in 12.4s',
+      'ok    done',
+      'test result: ok. 143 passed',
+      '$'
+    ])
+  })
+
   test('reports the same columns when only the height of its surface changes', async ({ page }) => {
     await openSession(page)
     await page.getByRole('tab', { name: 'Terminal' }).click()

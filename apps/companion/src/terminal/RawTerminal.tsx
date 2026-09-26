@@ -34,6 +34,7 @@ import type { TerminalGrid, TerminalScreen } from '../host/port'
 import { styleOf } from './cells'
 import {
   backgroundOf,
+  copiedText,
   count,
   cursorColourOf,
   foregroundOf,
@@ -109,17 +110,33 @@ function cursorStyle(cursor: PlacedCursor, cell: Cell, palette: PaletteState): C
   }
 }
 
-/** The screen as the view draws it: each piece a box of its own at its cells, and the cursor. */
+/**
+ * The screen as the view draws it: each piece a box of its own at its cells, and the cursor. A copy
+ * of a selection gives the pieces it touches as lines of text laid out by their cells.
+ */
 function Grid({ screen, cell }: { readonly screen: TerminalScreen; readonly cell: Cell }): ReactNode {
   const palette = screen.palette
   const cursor = placedCursor(screen)
   const columns = count(screen.window.columns)
   const rows = count(screen.window.rows)
+  const pieces = placedPieces(screen)
   return (
     <div
       data-testid="terminal-grid"
       data-columns={columns}
       data-rows={rows}
+      onCopy={(event) => {
+        const selection = window.getSelection()
+        if (selection === null || selection.isCollapsed) return
+        const boxes = event.currentTarget.querySelectorAll('[data-testid="terminal-piece"]')
+        const selected = pieces.filter((_, index) => {
+          const box = boxes[index]
+          return box !== undefined && selection.containsNode(box, true)
+        })
+        if (selected.length === 0) return
+        event.clipboardData.setData('text/plain', copiedText(selected))
+        event.preventDefault()
+      }}
       style={{
         position: 'relative',
         width: columns * cell.width,
@@ -128,7 +145,7 @@ function Grid({ screen, cell }: { readonly screen: TerminalScreen; readonly cell
         color: foregroundOf(palette)
       }}
     >
-      {placedPieces(screen).map((piece) => (
+      {pieces.map((piece) => (
         <span
           key={`${piece.line}:${piece.column}`}
           data-testid="terminal-piece"
