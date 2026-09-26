@@ -105,14 +105,25 @@ mod macos {
                 test = true
             ))
             .expect("the check's application builds");
+        // The checks' own verdict. The window loop's return value is not it: on macOS the loop
+        // returns 0 whatever code the application exits with, so a failed check would pass.
+        let verdict = Arc::new(std::sync::atomic::AtomicI32::new(1));
+        let recorded = Arc::clone(&verdict);
         let mut started = false;
-        app.run_return(move |handle, event| {
+        let returned = app.run_return(move |handle, event| {
             if matches!(event, tauri::RunEvent::Ready) && !started {
                 started = true;
                 let handle = handle.clone();
                 let messages = messages.clone();
+                let recorded = Arc::clone(&recorded);
                 std::thread::spawn(move || {
-                    let code = match check(&handle, &messages) {
+                    // A check that panics is a failed check like any other, and must not leave
+                    // the window loop running.
+                    let checked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        check(&handle, &messages)
+                    }))
+                    .unwrap_or_else(|_| Err("a check panicked".to_owned()));
+                    let code = match checked {
                         Ok(()) => {
                             println!("navigation: every check held");
                             0
@@ -122,10 +133,12 @@ mod macos {
                             1
                         }
                     };
+                    recorded.store(code, std::sync::atomic::Ordering::SeqCst);
                     handle.exit(code);
                 });
             }
-        })
+        });
+        returned.max(verdict.load(std::sync::atomic::Ordering::SeqCst))
     }
 
     fn wait_for(what: &str, limit: Duration, done: impl Fn() -> bool) -> Result<(), String> {
