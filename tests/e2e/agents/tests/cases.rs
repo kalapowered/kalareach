@@ -506,10 +506,10 @@ fn runs_its_build(identity: &ProcessStartIdentity, file: &Path, inode: u64) -> R
 
 /// KR-REQ-12.32, case 2, part 2b: an agent on its terminal route is advertised no typed capability,
 /// and every typed action a device sends for it is refused while nothing it carried reaches the
-/// agent: the agent mutations and the package's actions with the code for an application instance
-/// the host does not hold, the reads as ones a device is not served, and the attachment request
-/// before any instance is looked at, which says nothing about the route. The control, which does
-/// not break the property, is terminal input under the input lease, which the same device's
+/// agent: the agent mutations, the package's actions and the agent reads a device is served under
+/// its grant with the code for an application instance the host does not hold, and the attachment
+/// request before any instance is looked at, which says nothing about the route. The control, which
+/// does not break the property, is terminal input under the input lease, which the same device's
 /// connection delivers.
 #[test]
 fn an_agent_on_its_terminal_route_is_advertised_no_typed_capability_and_every_typed_action_is_refused()
@@ -554,15 +554,12 @@ fn an_agent_on_its_terminal_route_is_advertised_no_typed_capability_and_every_ty
         );
         assert_eq!(bindings, 0, "no live binding holds the installed package");
         for answer in &answers {
-            // A device is not served the agent reads on this host; a mutation and a plugin action
-            // name an instance the host does not hold. The attachment request is refused before
-            // any instance is looked at: the method's selectors name an application instance and
-            // its parameters carry none, so no device request for it passes on this host.
-            let (wanted, because) = if answer.call.starts_with("agent.capabilities")
-                || answer.call.starts_with("agent.commands")
-            {
-                (ErrorCode::InvalidArgument.as_str(), "")
-            } else if answer.call == Method::AgentDraftAddAttachment.as_str() {
+            // A mutation, a plugin action and an agent read, which a device is served under its
+            // grant, each name an instance the host does not hold. The attachment request is
+            // refused before any instance is looked at: the method's selectors name an application
+            // instance and its parameters carry none, so no device request for it passes on this
+            // host.
+            let (wanted, because) = if answer.call == Method::AgentDraftAddAttachment.as_str() {
                 (
                     ErrorCode::InvalidArgument.as_str(),
                     "names no application instance in its parameters",
