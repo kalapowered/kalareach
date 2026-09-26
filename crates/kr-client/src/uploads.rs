@@ -29,6 +29,7 @@ use kr_protocol::envelope::ActionTarget;
 use kr_protocol::ids::{ActionId, DeviceId, EnvironmentId, SessionId};
 use kr_protocol::limits::UPLOAD_CHUNK_LEN;
 use kr_protocol::method::Method;
+use kr_protocol::receipt::ReceiptState;
 use kr_protocol::scalars::{Bytes, Digest256, DurationMs, Nullable, U64};
 use kr_protocol::transfer::{
     AttachmentHandle, ChunkBitmap, ChunkDescriptor, ChunkLayout, UploadBeginParams,
@@ -647,6 +648,28 @@ pub async fn send(
                     .await;
                 let begun = match answered {
                     Ok(Settled::Result(value)) => value.to_typed()?,
+                    // A receipt that says the action never took effect is as definite as a
+                    // refusal: nothing was reserved.
+                    Ok(Settled::Receipt(receipt))
+                        if matches!(
+                            receipt.state,
+                            ReceiptState::Refused | ReceiptState::Rejected
+                        ) =>
+                    {
+                        plan.reservation_refused();
+                        return Err(receipt.error.0.map_or_else(
+                            || {
+                                ClientError::refusal(
+                                    kr_protocol::error::ErrorCode::PermissionDenied,
+                                    crate::shown::Shown::said(
+                                        "the host's receipt says the reservation never took effect",
+                                    ),
+                                )
+                            },
+                            ClientError::from,
+                        ));
+                    }
+                    // Any other receipt names the action and says nothing of the reservation.
                     Ok(Settled::Receipt(receipt)) => {
                         plan.reservation_unknown(receipt.action_id);
                         return Err(ClientError::refusal(

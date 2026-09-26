@@ -83,6 +83,8 @@ struct Script {
     expire_first_window: bool,
     /// How many keepalives the attachment-chunk endpoint sends before it renews the window.
     keepalives_before_renewal: usize,
+    /// The control endpoint issues a window that admits nothing.
+    no_control_window: bool,
     /// The attachment-chunk endpoint ends the connection instead of acknowledging the hello.
     drop_hello: bool,
     /// What the host answers `download.chunk` with, by index: the descriptor and the bytes.
@@ -113,10 +115,12 @@ enum Reply {
     Drop,
     /// With `OUTCOME_UNKNOWN`, as a host that could not learn what its own work did.
     Unknown,
-    /// With a receipt and no result.
-    ReceiptOnly,
+    /// With a receipt in this state and no result.
+    Receipt(ReceiptState),
     /// Not yet: the host keeps the reservation and the connection, and never answers.
     Hold,
+    /// With a result that is not a reservation.
+    Unreadable,
 }
 
 /// One upload the host holds.
@@ -205,7 +209,12 @@ impl Host {
         }
     }
 
-    fn acknowledgement(&self, peer: &PeerIdentity, environment_id: EnvironmentId) -> ControlFrame {
+    fn acknowledgement(
+        &self,
+        peer: &PeerIdentity,
+        environment_id: EnvironmentId,
+        window: ActionWindow,
+    ) -> ControlFrame {
         let connection_id = ConnectionId::new(Uuid::from_bytes([42; 16]));
         ControlFrame::HelloAck(Box::new(LocalHelloAck {
             selected_version: PROTOCOL_VERSION,
@@ -221,7 +230,7 @@ impl Host {
                 gid: U64::new(u64::from(peer.gid)),
                 pid: Nullable::null(),
             },
-            action_window: action_window(window("window-1")),
+            action_window: window,
             capabilities: CanonicalSet::new(),
             max_receive: kr_protocol::hello::ReceiveLimits::default(),
         }))
@@ -452,8 +461,16 @@ async fn converse(
             .unwrap_or_else(|| host.environment_id()),
         None => host.environment_id(),
     };
+    let issued = if leg.is_none() && host.script.no_control_window {
+        ActionWindow {
+            valid_for_ms: DurationMs::new(0),
+            ..action_window(window("window-1"))
+        }
+    } else {
+        action_window(window("window-1"))
+    };
     if writer
-        .write_message(&host.acknowledgement(&peer, environment_id))
+        .write_message(&host.acknowledgement(&peer, environment_id, issued))
         .await
         .is_err()
     {
@@ -536,7 +553,7 @@ async fn converse(
                                     "the host could not report what became of the reservation",
                                 )),
                             ),
-                            Reply::ReceiptOnly => {
+                            Reply::Receipt(state) => {
                                 ControlFrame::Receipt(Box::new(ReceiptResponse {
                                     request_id,
                                     receipt: Receipt {
@@ -545,7 +562,7 @@ async fn converse(
                                         method,
                                         method_version,
                                         revision: U64::new(1),
-                                        state: ReceiptState::Accepted,
+                                        state,
                                         reason: Nullable::null(),
                                         payload_digest: Digest256::from_bytes([0; 32]),
                                         accepted_deadline_ms: Nullable::null(),
@@ -558,6 +575,7 @@ async fn converse(
                                 std::future::pending::<()>().await;
                                 return;
                             }
+                            Reply::Unreadable => answer(request_id, typed(&serde_json::json!({}))),
                         }
                     }
                     (Some(Method::UploadFinish), None) => answer(
@@ -967,8 +985,33 @@ async fn a_reservation_the_host_could_not_report_is_never_reserved_again() {
 /// A receipt without the reservation's result names the action, and nothing more.
 #[tokio::test]
 async fn a_reservation_settled_by_a_receipt_alone_is_never_reserved_again() {
-    let first = never_reserved_twice(Reply::ReceiptOnly).await;
+    let first = never_reserved_twice(Reply::Receipt(ReceiptState::Accepted)).await;
     assert_eq!(first.code(), ErrorCode::OutcomeUnknown);
+}
+
+/// A receipt that says the reservation never took effect is as definite as a refusal, so the plan
+/// may ask again.
+#[tokio::test]
+async fn a_reservation_whose_receipt_says_it_never_took_effect_may_be_asked_for_again() {
+    for state in [ReceiptState::Refused, ReceiptState::Rejected] {
+        let host = Host::start(Script {
+            reservation: Reply::Receipt(state),
+            ..Script::default()
+        });
+        let session = host.session().await;
+        let mut plan = Upload::new(host.subject(), Box::new(Held::new(pattern(4096))));
+
+        let refused = uploads::send(&session, &host.route(), &host.target(), &mut plan, TTL)
+            .await
+            .expect_err("the host's receipt refuses the reservation");
+        assert_ne!(refused.code(), ErrorCode::OutcomeUnknown, "{state:?}");
+        assert!(
+            matches!(plan.next(), Ok(uploads::Step::Begin(_))),
+            "{state:?}: the plan may ask again"
+        );
+        let _ = uploads::send(&session, &host.route(), &host.target(), &mut plan, TTL).await;
+        assert_eq!(host.seen().reservations, 2, "{state:?}: it asked again");
+    }
 }
 
 /// A caller that abandons the call after the host has taken the reservation leaves a plan that
@@ -1008,6 +1051,30 @@ async fn a_reservation_abandoned_in_flight_is_never_reserved_again() {
         .expect_err("the plan does not reserve again");
     assert_eq!(refused.code(), ErrorCode::OutcomeUnknown);
     assert_eq!(host.seen().reservations, 1);
+}
+
+/// A result that is not a reservation says nothing of whether one was made.
+#[tokio::test]
+async fn a_reservation_answered_with_an_unreadable_result_is_never_reserved_again() {
+    never_reserved_twice(Reply::Unreadable).await;
+}
+
+/// A reservation that never left this client reserved nothing, so the plan may ask again.
+#[tokio::test]
+async fn a_reservation_that_never_left_the_client_may_be_asked_for_again() {
+    let host = Host::start(Script {
+        no_control_window: true,
+        ..Script::default()
+    });
+    let session = host.session().await;
+    let mut plan = Upload::new(host.subject(), Box::new(Held::new(pattern(4096))));
+
+    let refused = uploads::send(&session, &host.route(), &host.target(), &mut plan, TTL)
+        .await
+        .expect_err("a session with no window sends no reservation");
+    assert!(matches!(refused, ClientError::NoActionWindow), "{refused}");
+    assert!(matches!(plan.next(), Ok(uploads::Step::Begin(_))));
+    assert_eq!(host.seen().reservations, 0);
 }
 
 /// A refusal the host decided leaves nothing reserved, so the plan may ask again.
