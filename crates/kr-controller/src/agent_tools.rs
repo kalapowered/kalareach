@@ -3398,6 +3398,100 @@ mod tests {
         }
     }
 
+    /// KR-REQ-11.50: a configuration document that names a member twice, at its root and inside
+    /// its servers, is refused before anything is written, naming the member and the document,
+    /// and the document keeps every byte. Which of the two a reader keeps is the reader's choice,
+    /// so a rewrite would keep one of the person's settings and lose the other.
+    #[test]
+    fn a_document_that_names_a_member_twice_is_refused_before_anything_is_written() {
+        let tree = Tree::create();
+        let installer = tree.installer();
+        let document = tree.home().join(".claude.json");
+        let text = "{\"theme\": \"dark\", \"theme\": \"light\", \"mcpServers\": {\"theirs\": \
+                    {\"command\": \"a\"}, \"theirs\": {\"command\": \"b\"}}}\n";
+        std::fs::write(&document, text).expect("writes");
+        let before = files_under(&tree.root);
+        let refused = match installer.install(&params(AgentTarget::ClaudeCode, InstallScope::User))
+        {
+            Ok(_) => panic!(
+                "installed, and the document is now {:?}",
+                std::fs::read_to_string(&document).expect("reads")
+            ),
+            Err(refused) => refused,
+        };
+        let said = refused.to_string();
+        assert!(
+            said.contains("\"theme\"") && said.contains(&display(&document)),
+            "names the member and the document: {said}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&document).expect("reads"),
+            text,
+            "the document keeps every byte"
+        );
+        assert_eq!(files_under(&tree.root), before, "nothing is written");
+    }
+
+    /// KR-REQ-11.50: a removal whose document came to name a member twice after the installation
+    /// is refused before anything is removed, so the agent is not left with an entry for a skill
+    /// that is gone, and the document keeps every byte.
+    #[test]
+    fn a_removal_is_refused_before_anything_is_removed_when_its_document_names_a_member_twice() {
+        let tree = Tree::create();
+        let installer = tree.installer();
+        let params = params(AgentTarget::ClaudeCode, InstallScope::User);
+        installer.install(&params).expect("installs");
+        let document = tree.home().join(".claude.json");
+        let installed = std::fs::read_to_string(&document).expect("reads");
+        let repeated = installed.replacen('{', "{\"theme\": \"dark\", \"theme\": \"light\", ", 1);
+        std::fs::write(&document, &repeated).expect("writes");
+        let before = files_under(&tree.root);
+        let refused = installer.remove(&params).expect_err("refuses");
+        assert!(
+            refused.to_string().contains("\"theme\""),
+            "names the member: {refused}"
+        );
+        assert_eq!(files_under(&tree.root), before, "nothing is removed");
+    }
+
+    /// KR-REQ-11.50, the control: a document in the person's own layout, indented with tabs and
+    /// its members in their own order, keeps every byte of it through an installation, and is
+    /// byte for byte what it was after the removal, whether it held a server container before or
+    /// the installation made one.
+    #[test]
+    fn a_document_in_the_persons_own_layout_survives_an_installation_and_its_removal() {
+        for original in [
+            "{\n\t\"theme\": \"dark\",\n\t\"mcpServers\": {\n\t\t\"theirs\": {\"command\": \
+             \"their-server\"}\n\t},\n\t\"autoUpdates\": false\n}\n",
+            "{\n\t\"theme\": \"dark\",\n\t\"autoUpdates\": false\n}\n",
+        ] {
+            let tree = Tree::create();
+            let installer = tree.installer();
+            let params = params(AgentTarget::ClaudeCode, InstallScope::User);
+            let document = tree.home().join(".claude.json");
+            std::fs::write(&document, original).expect("writes");
+            installer.install(&params).expect("installs");
+            let installed = std::fs::read_to_string(&document).expect("reads");
+            for line in original.lines() {
+                assert!(
+                    installed.contains(line),
+                    "{line:?} is still there: {installed}"
+                );
+            }
+            let written: Value = serde_json::from_str(&installed).expect("json");
+            assert_eq!(
+                written["mcpServers"]["kalareach"],
+                installer.entry_value(Format::JsonCommandArgs, Some(AgentTarget::ClaudeCode))
+            );
+            installer.remove(&params).expect("removes");
+            assert_eq!(
+                std::fs::read_to_string(&document).expect("reads"),
+                original,
+                "the document is byte for byte what it was"
+            );
+        }
+    }
+
     /// Where each agent's skills and configuration live under a user's home, name by name.
     fn user_layout(agent: AgentTarget) -> (&'static [&'static str], &'static [&'static str]) {
         match agent {
