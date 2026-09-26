@@ -25,7 +25,13 @@ of the same length; the whole identity is in the descriptor either way.
 
 On Windows it is a named pipe, `\\.\pipe\kalareach-<uid>-<session>-shell-bridge`. The pipe namespace
 has no directory permissions to inherit, so the pipe carries an owner-only access-control list
-instead.
+instead. The namespace is also shared by every account, so another account could create that name
+first. The shell's client therefore opens the pipe for identification only and, before its hello,
+reads the pipe's security descriptor as the kernel stores it: the owner has to be the shell's own
+user or the owner its new objects receive, the list has to be protected, and every entry that grants
+access has to name one of those two or an account that already holds the machine. Any other pipe
+gets nothing from the client, and the shell carries on without integration, as it does when the
+connect fails.
 
 The shell is told where it is through two reserved variables, and only those two:
 

@@ -29,7 +29,12 @@ scenarios drive it with numbers.
 The worker listens on one endpoint per session inside its own owner-only runtime directory. On Unix
 that is a socket with mode 0600 in a directory with mode 0700; on Windows it is a named pipe whose
 security descriptor admits the owning user alone. Peer credentials are checked before a frame is
-read, so the endpoint serves the session owner or nobody.
+read, so the endpoint serves the session owner or nobody. On Windows the pipe namespace is shared
+by every account, so the shell checks the other end too: it opens the pipe for identification only,
+which lets the server read which account it is and never act as it, and before it writes its hello
+it requires the pipe to be owned by its own user, or by the owner its new objects receive, with a
+protected list that grants no other account. A pipe that fails the check gets nothing, and the
+shell starts without integration.
 
 Peer credentials are not the whole check. The worker also asks the platform which process is on the
 other end and compares that, not what the first frame says, against the root shell it launched. A
