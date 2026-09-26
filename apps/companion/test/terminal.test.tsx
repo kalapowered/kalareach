@@ -209,6 +209,38 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
     opened.mockRestore()
   })
 
+  it("keeps a glyph too wide for the window's last column off the piece before it", async () => {
+    const opened = vi.spyOn(Terminal.prototype, 'open')
+    const { port, controls } = fakeHost()
+    controls.holdTerminalViews()
+    open(port)
+    await waitFor(() => {
+      expect(controls.terminalViews).toHaveLength(1)
+    })
+    const edge: TerminalScreen = {
+      ...terminalScreen(SESSION_MAIN, { columns: 2, rows: 1 }),
+      window: { columns: 2, rows: 1 },
+      lines: [
+        {
+          row: '1',
+          soft_wrapped: false,
+          truncated: false,
+          // The pinned model gives U+3248 one cell and this renderer two; the mark after it joins
+          // whatever cell the renderer last drew into.
+          pieces: [piece(0, 'x'), { ...piece(1, '\u{3248}\u{301}'), cells: 1 }]
+        }
+      ],
+      cursor: null
+    }
+    act(() => {
+      controls.terminalViews[0]?.attach()
+      controls.terminalViews[0]?.show(edge)
+    })
+    // The x keeps its cell to itself, and the glyph that cannot be drawn in its one cell is not.
+    expect((await drawn(renderer(opened)))[0]).toBe('x')
+    opened.mockRestore()
+  })
+
   it('leaves out a piece that starts inside the one before it, and keeps that one whole', async () => {
     const opened = vi.spyOn(Terminal.prototype, 'open')
     const { port, controls } = fakeHost()

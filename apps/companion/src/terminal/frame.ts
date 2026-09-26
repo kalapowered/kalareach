@@ -38,8 +38,11 @@ const AUTOWRAP_OFF = `${ESC}[?7l`
 
 const CURSOR_HIDDEN = `${ESC}[?25l`
 
-/** The fewest columns xterm.js keeps, whatever size it is given. */
-const RENDERER_MINIMUM_COLUMNS = 2
+/**
+ * The columns the renderer holds past the window's right edge: as many as the widest cell it
+ * draws, so the first character of a piece at the window's last column always fits.
+ */
+const RENDERER_MARGIN = 2
 const CURSOR_SHOWN = `${ESC}[?25h`
 
 /**
@@ -154,16 +157,28 @@ function steadyCursor(style: number): number {
  * One write, so a screen still waiting in the renderer can never be drawn over this one: the reset
  * clears whatever an earlier write left, in the order the writes were made.
  *
- * A piece never shows past its cells. The renderer measures text by its own width rules, which can
- * give a cluster more cells than the pinned width model native code placed it by: a mark the model
- * joins to its letter can take a cell of its own. So after a piece that is not printable ASCII,
- * everything from the end of its cells to the end of the renderer's line is erased, in this same
- * write and before anything is shown. `columns` is the renderer's own width, which can be more
- * than the window's. Pieces are drawn left to right and a piece that starts inside the one before
- * it is left out, as native code never sends one, so every erase starts in cells no earlier piece
- * owns: each later piece draws its own cells after it, and a cell no piece covers stays blank. What
- * the renderer drew wider than the piece's cells is cut at its edge, and a wide glyph cut there is
- * erased whole.
+ * A piece never shows past its cells, whatever widths the renderer gives its text. The renderer
+ * measures text by its own rules, which can give a cluster more cells than the pinned width model
+ * native code placed it by (a mark the model joins to its letter can take a cell of its own, and a
+ * character the model gives one cell can take two), and it can leak into another piece's cells in
+ * only three ways. Each is closed here by construction:
+ *
+ * - To the left, by joining a mark to the cell before the one it is writing. It joins only to a
+ *   character written in the same run of text, because its parser forgets the last character at
+ *   every control sequence, and each piece is written after its own cursor placement and
+ *   rendition. So a mark joins only to a character of its own piece.
+ * - To the left, by dropping a character too wide for the last column and then joining the marks
+ *   after it to the cell before. The renderer holds `RENDERER_MARGIN` columns past the window, the
+ *   widest cell it draws, so the first character of a piece always fits and is never dropped.
+ * - To the right, by drawing past the piece's last cell. After a piece that is not printable ASCII,
+ *   everything from the end of its cells to the end of the renderer's line is erased, in this same
+ *   write and before anything is shown; `columns` is the renderer's own width. Printable ASCII is
+ *   a cell a character in every table.
+ *
+ * Pieces are drawn left to right, and a piece that starts inside the one before it is left out, as
+ * native code never sends one, so every erase starts in cells no earlier piece owns: each later
+ * piece draws its own cells after it, and a cell no piece covers stays blank. What the renderer
+ * drew wider than a piece's cells is cut at its edge, and a wide glyph cut there is erased whole.
  */
 export function frameOf(screen: TerminalScreen, columns: number): string {
   let out = FULL_RESET + NORMAL_BUFFER + AUTOWRAP_OFF + CURSOR_HIDDEN
@@ -197,9 +212,9 @@ export function frameOf(screen: TerminalScreen, columns: number): string {
  * Replaces what `terminal` shows with `screen`, at the size of the screen's window, or clears it
  * when there is no screen.
  *
- * The renderer takes the window's size, so every piece lands inside it; the surface around it clips
- * a window larger than itself at its right and bottom edges. A window one column wide is drawn in a
- * renderer two columns wide, the fewest it keeps, and its second column stays blank.
+ * The renderer takes the window's rows and its columns with `RENDERER_MARGIN` more, which stay blank,
+ * so every piece lands inside it; the surface around it clips a renderer larger than itself at its
+ * right and bottom edges.
  */
 export function paint(terminal: Terminal, screen: TerminalScreen | null): void {
   if (screen === null) {
@@ -207,7 +222,7 @@ export function paint(terminal: Terminal, screen: TerminalScreen | null): void {
     terminal.write(FULL_RESET + CURSOR_HIDDEN)
     return
   }
-  const columns = Math.max(RENDERER_MINIMUM_COLUMNS, count(screen.window.columns))
+  const columns = Math.max(1, count(screen.window.columns)) + RENDERER_MARGIN
   const rows = Math.max(1, count(screen.window.rows))
   if (terminal.cols !== columns || terminal.rows !== rows) terminal.resize(columns, rows)
   terminal.write(frameOf(screen, terminal.cols))
