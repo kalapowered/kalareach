@@ -13,12 +13,11 @@
 //!   entry it did not write. That is what keeps an unrelated `kalareach` entry somebody else
 //!   created from being overwritten and then removed.
 //! * **The agent's file keeps what is not this host's.** A TOML configuration is edited in place
-//!   with a format-preserving editor, so ordering and comments survive. A JSON configuration is read
-//!   with the place of every member, and the entry is spliced into it and out of it with every
-//!   other byte kept ([`json`]), along with the server container when the installation made it. A
-//!   JSON document that names a member twice in any object is refused before anything is written:
-//!   which of the two a reader keeps is the reader's choice, and a rewrite would keep one of the
-//!   person's settings and lose the other.
+//!   with a format-preserving editor, so ordering and comments survive. A JSON configuration is
+//!   read with the place of every member, and the entry is spliced into it and out of it with every
+//!   byte that was there kept ([`json`]). A JSON document that names a member twice in any object
+//!   is refused before anything is written: which of the two a reader keeps is the reader's choice,
+//!   and a rewrite would keep one of the person's settings and lose the other.
 //!
 //! The skill files are compiled into this binary, so an installation needs nothing else on disk
 //! and the digests it records are build-time facts.
@@ -182,7 +181,7 @@ impl Installer {
         // What this host already did keeps its place. An installation that repairs one file must
         // not drop the claim it holds on the others or on its configuration entry, because a claim
         // it drops is a claim it will later refuse to replace and will not remove.
-        let (previous, carried, containers) = existing.map_or_else(
+        let (previous, carried) = existing.map_or_else(
             || {
                 (
                     ChangeManifest {
@@ -194,20 +193,18 @@ impl Installer {
                         operations: Vec::new(),
                     },
                     Vec::new(),
-                    Vec::new(),
                 )
             },
             // Whatever an earlier attempt was in the middle of stays unresolved until something
             // resolves it. A repair that quietly dropped the note would leave a change nobody can
             // account for and a record that says everything is accounted for.
-            |existing| (existing.manifest, existing.pending, existing.containers),
+            |existing| (existing.manifest, existing.pending),
         );
         let mut record = InstallationRecord {
             version: InstallationRecord::VERSION,
             state: InstallationRecord::INSTALLING.to_owned(),
             manifest: previous,
             pending: carried,
-            containers,
         };
         record.manifest.skill_version = SKILL_VERSION.to_owned();
         record.manifest.root = display(&root);
@@ -266,9 +263,8 @@ impl Installer {
             };
             self.confirm_existing(params, &mut record, &planned)?;
             self.begin(params, &mut record, planned)?;
-            let (written, created) = self.write_entry(configuration, params.agent)?;
+            let written = self.write_entry(configuration, params.agent)?;
             let written = self.keep_provenance(&record, written, &configuration.path);
-            record.note_containers(&written, created);
             self.finish(params, &mut record, written)?;
         }
         // What this run could not account for. Every change it made resolved its own note, and a
@@ -595,7 +591,6 @@ impl Installer {
                         entry_key(entry),
                         *digest,
                         *created_document,
-                        record.containers_created(operation),
                         params,
                     )? {
                         Removal::Removed => removed.push(operation.clone()),
@@ -681,13 +676,12 @@ impl Installer {
         entry
     }
 
-    /// Adds the server entry to an agent's configuration, leaving its other settings alone, and
-    /// returns how many objects on the way to it the edit created.
+    /// Adds the server entry to an agent's configuration, leaving its other settings alone.
     fn write_entry(
         &self,
         configuration: &Configuration,
         agent: AgentTarget,
-    ) -> Result<(ChangeOperation, usize)> {
+    ) -> Result<ChangeOperation> {
         let created_document = !configuration.path.exists();
         if let Some(parent) = configuration.path.parent()
             && !parent.exists()
@@ -697,19 +691,16 @@ impl Installer {
         // A shared document gets the same entry whichever agent's installation writes it, so the
         // deadline an individual agent would declare is left out of one.
         let declaring = (!configuration.shared).then_some(agent);
-        let (digest, created) = match configuration.format {
-            Format::CodexToml => (self.write_toml_entry(&configuration.path, declaring)?, 0),
+        let digest = match configuration.format {
+            Format::CodexToml => self.write_toml_entry(&configuration.path, declaring)?,
             format => self.write_json_entry(&configuration.path, format, declaring)?,
         };
-        Ok((
-            ChangeOperation::AddConfigurationEntry {
-                path: display(&configuration.path),
-                entry: format!("{}.{SERVER_NAME}", configuration.format.key()),
-                digest,
-                created_document,
-            },
-            created,
-        ))
+        Ok(ChangeOperation::AddConfigurationEntry {
+            path: display(&configuration.path),
+            entry: format!("{}.{SERVER_NAME}", configuration.format.key()),
+            digest,
+            created_document,
+        })
     }
 
     fn write_toml_entry(&self, path: &Path, agent: Option<AgentTarget>) -> Result<Digest256> {
@@ -759,7 +750,7 @@ impl Installer {
     }
 
     /// Adds the server entry to a JSON document, one member spliced in and every other byte kept,
-    /// and returns its digest and how many objects on the way to it the edit created.
+    /// and returns its digest.
     ///
     /// An entry this host wrote that is already there is replaced in its place, and left alone
     /// when it already says what this installation would write.
@@ -768,37 +759,36 @@ impl Installer {
         path: &Path,
         format: Format,
         agent: Option<AgentTarget>,
-    ) -> Result<(Digest256, usize)> {
+    ) -> Result<Digest256> {
         let key = format.key();
         let members = [key, SERVER_NAME];
         let value = self.entry_value(format, agent);
         let entry = value.to_string();
-        let (edited, created) = match read_exact(path)? {
+        let edited = match read_exact(path)? {
             // A document this host creates holds the entry and the container on the way to it.
             None => {
                 let text = serde_json::to_string_pretty(&json!({ key: { SERVER_NAME: value } }))
                     .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
-                (Some(format!("{text}\n")), members.len() - 1)
+                Some(format!("{text}\n"))
             }
             Some((text, document)) => {
                 let present = document
                     .value_at(&text, &members)
                     .map_err(|_| not_servers(key, path))?;
                 match present {
-                    None => {
-                        let inserted = json::insert(&text, &members, &entry)
-                            .map_err(|reason| not_exact(path, &reason))?;
-                        (Some(inserted.text), inserted.created)
-                    }
+                    None => Some(
+                        json::insert(&text, &members, &entry)
+                            .map_err(|reason| not_exact(path, &reason))?
+                            .text,
+                    ),
                     Some(present) => {
                         self.guard_existing(path, format)?;
                         let unchanged = serde_json::from_str::<Value>(present)
                             .is_ok_and(|present| present == value);
-                        let replaced = (!unchanged)
+                        (!unchanged)
                             .then(|| json::replace(&text, &members, &entry))
                             .transpose()
-                            .map_err(|reason| not_exact(path, &reason))?;
-                        (replaced, 0)
+                            .map_err(|reason| not_exact(path, &reason))?
                     }
                 }
             }
@@ -806,10 +796,9 @@ impl Installer {
         if let Some(edited) = edited {
             write_atomically(path, edited.as_bytes(), PRIVATE)?;
         }
-        let digest = self.entry_digest_under(path, key)?.ok_or_else(|| {
+        self.entry_digest_under(path, key)?.ok_or_else(|| {
             ControllerError::InvalidArgument(format!("{} did not keep the entry", display(path)))
-        })?;
-        Ok((digest, created))
+        })
     }
 
     /// Refuses a removal that cannot be carried out, without carrying any of it out.
@@ -1091,7 +1080,6 @@ impl Installer {
         key: &str,
         digest: Digest256,
         created_document: bool,
-        containers: usize,
         params: &AgentToolsParams,
     ) -> Result<Removal> {
         let Some(present) = self.entry_digest_under(path, key)? else {
@@ -1138,18 +1126,19 @@ impl Installer {
             write_atomically(path, document.to_string().as_bytes(), PRIVATE)?;
         } else {
             let text = read_to_string(path)?.unwrap_or_default();
-            // Only the entry the record names, and the container on the way to it when this
-            // installation made that and nothing else is left in it. A document this host created
-            // had nothing on the way to the entry before it. A document that holds both shapes
-            // keeps whichever this installation did not write.
+            // Only the entry the record names, the one member it spliced in. In a document this
+            // host created, whose container it made too, the container goes with the entry when
+            // nothing else is left in it; in anybody else's the container stays, as the TOML table
+            // does. A document that holds both shapes keeps whichever this installation did not
+            // write.
             let members = [key, SERVER_NAME];
-            let created = if created_document {
+            let made = if created_document {
                 members.len() - 1
             } else {
-                containers
+                0
             };
-            let edited = json::remove(&text, &members, created)
-                .map_err(|reason| not_exact(path, &reason))?;
+            let edited =
+                json::remove(&text, &members, made).map_err(|reason| not_exact(path, &reason))?;
             let empty = json::Document::read(&edited).is_ok_and(|document| document.is_empty());
             if created_document && empty {
                 // This host created the document and nothing else was ever added to it.
@@ -1466,24 +1455,6 @@ struct InstallationRecord {
     /// never have written would delete somebody else's. It is reported instead.
     #[serde(default)]
     pending: Vec<ChangeOperation>,
-    /// The containers this installation made on the way to the configuration entries it added.
-    ///
-    /// A removal takes each out with its entry when nothing else is left in it, so a document is
-    /// left as the installation found it. A record an earlier build wrote names none, and its
-    /// removal takes the entry alone.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    containers: Vec<Containers>,
-}
-
-/// The containers one installation made on the way to one configuration entry.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-struct Containers {
-    /// The document, as the entry's operation names it.
-    path: String,
-    /// The entry, as its operation names it.
-    entry: String,
-    /// How many objects on the way to the entry the installation made, counted back from it.
-    made: usize,
 }
 
 impl InstallationRecord {
@@ -1499,43 +1470,6 @@ impl InstallationRecord {
     /// Returns true when the installation finished.
     fn is_complete(&self) -> bool {
         self.state == Self::INSTALLED && self.pending.is_empty()
-    }
-
-    /// Notes that writing `written` made `made` containers on the way to it.
-    ///
-    /// A repair that finds a container there made none, and the one an earlier write made is
-    /// still this installation's, so the larger count is kept.
-    fn note_containers(&mut self, written: &ChangeOperation, made: usize) {
-        let ChangeOperation::AddConfigurationEntry { path, entry, .. } = written else {
-            return;
-        };
-        match self
-            .containers
-            .iter_mut()
-            .find(|noted| noted.entry == *entry && names_path(&noted.path, Path::new(path)))
-        {
-            Some(noted) => {
-                noted.made = noted.made.max(made);
-                noted.path.clone_from(path);
-            }
-            None if made > 0 => self.containers.push(Containers {
-                path: path.clone(),
-                entry: entry.clone(),
-                made,
-            }),
-            None => {}
-        }
-    }
-
-    /// Returns how many containers this installation made on the way to a configuration entry.
-    fn containers_created(&self, operation: &ChangeOperation) -> usize {
-        let ChangeOperation::AddConfigurationEntry { path, entry, .. } = operation else {
-            return 0;
-        };
-        self.containers
-            .iter()
-            .find(|noted| noted.entry == *entry && names_path(&noted.path, Path::new(path)))
-            .map_or(0, |noted| noted.made)
     }
 }
 
@@ -1735,7 +1669,6 @@ fn read_record(text: &str) -> std::result::Result<InstallationRecord, String> {
             state: InstallationRecord::INSTALLING.to_owned(),
             manifest,
             pending: Vec::new(),
-            containers: Vec::new(),
         });
     };
     // An unversioned record is one of two shapes, and only the record itself can say which: the
@@ -3555,14 +3488,22 @@ mod tests {
 
     /// KR-REQ-11.50, the control: a document in the person's own layout, indented with tabs and
     /// its members in their own order, keeps every byte of it through an installation, and is
-    /// byte for byte what it was after the removal, whether it held a server container before or
-    /// the installation made one.
+    /// byte for byte what it was after the removal. Where it had no server container, the one the
+    /// installation added stays behind, empty, and nothing else changes.
     #[test]
     fn a_document_in_the_persons_own_layout_survives_an_installation_and_its_removal() {
-        for original in [
-            "{\n\t\"theme\": \"dark\",\n\t\"mcpServers\": {\n\t\t\"theirs\": {\"command\": \
-             \"their-server\"}\n\t},\n\t\"autoUpdates\": false\n}\n",
-            "{\n\t\"theme\": \"dark\",\n\t\"autoUpdates\": false\n}\n",
+        for (original, removed) in [
+            (
+                "{\n\t\"theme\": \"dark\",\n\t\"mcpServers\": {\n\t\t\"theirs\": {\"command\": \
+                 \"their-server\"}\n\t},\n\t\"autoUpdates\": false\n}\n",
+                None,
+            ),
+            (
+                "{\n\t\"theme\": \"dark\",\n\t\"autoUpdates\": false\n}\n",
+                Some(
+                    "{\n\t\"theme\": \"dark\",\n\t\"autoUpdates\": false,\n\t\"mcpServers\": {}\n}\n",
+                ),
+            ),
         ] {
             let tree = Tree::create();
             let installer = tree.installer();
@@ -3585,8 +3526,77 @@ mod tests {
             installer.remove(&params).expect("removes");
             assert_eq!(
                 std::fs::read_to_string(&document).expect("reads"),
-                original,
-                "the document is byte for byte what it was"
+                removed.unwrap_or(original),
+                "the document is byte for byte what it was, and an added container stays empty"
+            );
+        }
+    }
+
+    /// KR-REQ-11.50: a project's `.mcp.json` two installations share, in either removal order. The
+    /// entry goes only with the last of them. A document this host created goes with it when the
+    /// installation that created it is the last one removed; otherwise, as with a document that was
+    /// somebody's to begin with, the server container stays behind, empty, and the person's own
+    /// settings are byte for byte what they were.
+    #[test]
+    fn a_shared_document_ends_the_same_in_either_removal_order() {
+        let with_project = |project: &Path, agent| AgentToolsParams {
+            agent,
+            scope: InstallScope::Project,
+            project_dir: Nullable::some(display(project)),
+        };
+        for (original, first, last, expected) in [
+            (
+                Some("{\n  \"theirs\": true\n}\n"),
+                AgentTarget::ClaudeCode,
+                AgentTarget::QoderCli,
+                Some("{\n  \"theirs\": true,\n  \"mcpServers\": {}\n}\n"),
+            ),
+            (
+                Some("{\n  \"theirs\": true\n}\n"),
+                AgentTarget::QoderCli,
+                AgentTarget::ClaudeCode,
+                Some("{\n  \"theirs\": true,\n  \"mcpServers\": {}\n}\n"),
+            ),
+            (None, AgentTarget::QoderCli, AgentTarget::ClaudeCode, None),
+            (
+                None,
+                AgentTarget::ClaudeCode,
+                AgentTarget::QoderCli,
+                Some("{\n  \"mcpServers\": {\n  }\n}\n"),
+            ),
+        ] {
+            let tree = Tree::create();
+            let installer = tree.installer();
+            let project = tree.root.join("project");
+            std::fs::create_dir_all(&project).expect("a project");
+            let shared = project.join(".mcp.json");
+            if let Some(original) = original {
+                std::fs::write(&shared, original).expect("writes");
+            }
+            // Claude Code's installation comes first, so it is the one that creates a document
+            // that was not there.
+            for agent in [AgentTarget::ClaudeCode, AgentTarget::QoderCli] {
+                installer
+                    .install(&with_project(&project, agent))
+                    .expect("installs");
+            }
+            installer
+                .remove(&with_project(&project, first))
+                .expect("removes");
+            let kept: Value =
+                serde_json::from_str(&std::fs::read_to_string(&shared).expect("the file"))
+                    .expect("json");
+            assert!(
+                kept["mcpServers"].get("kalareach").is_some(),
+                "{first} goes first and the entry stays"
+            );
+            installer
+                .remove(&with_project(&project, last))
+                .expect("removes");
+            assert_eq!(
+                std::fs::read_to_string(&shared).ok().as_deref(),
+                expected,
+                "{first} then {last}"
             );
         }
     }
