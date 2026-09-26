@@ -350,6 +350,7 @@ impl WorkerProxy {
             request: forwarded,
             actor: actor.clone(),
             authority_deadline_boot_ms,
+            history: None,
         }));
         // A read is a read whichever way the worker answered it, so the marker means nothing here.
         Ok(self.call(request_id, &frame).await?.response)

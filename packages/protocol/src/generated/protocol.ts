@@ -490,6 +490,14 @@ export type ActionRight =
   | 'host.manage'
   | 'voice.use'
 /**
+ * An upstream approval request identifier. Opaque to KalaReach.
+ */
+export type ApprovalRequestId = string
+/**
+ * One agent-to-user question.
+ */
+export type QuestionId = string
+/**
  * One submitted intent and its receipt, generated as a UUIDv4.
  */
 export type ActionId = string
@@ -724,14 +732,6 @@ export type ForwardedAuthority =
   | {
       authority_revision: AuthorityRevisionRecord
     }
-/**
- * An upstream approval request identifier. Opaque to KalaReach.
- */
-export type ApprovalRequestId = string
-/**
- * One agent-to-user question.
- */
-export type QuestionId = string
 /**
  * One consequence of a grant that the issuer is shown before the grant exists.
  *
@@ -6966,6 +6966,21 @@ export interface ForwardedRequest {
    * authenticated caller's operating-system identity is.
    */
   authority_deadline_boot_ms: U64 | null
+  /**
+   * The history scope of the grant the host decided this read under.
+   *
+   * Section 10 narrows a grant's history in one place, the shared host-side filter, and the
+   * worker applies that filter to what it retains: an agent's semantic history and an
+   * approval's record. The worker holds no grants, so the scope travels with the read. It is
+   * absent for a caller acting under no grant. Absence never widens what a caller reads: a
+   * worker serves retained history without a scope only to a caller it can see is the local
+   * owner, and refuses anybody else.
+   *
+   * It is absent from the wire when it is absent, so a read without one is byte for byte what a
+   * worker built before scopes travelled reads. A daemon sends one only to a worker that states
+   * [`FORWARDED_HISTORY_SCOPE`].
+   */
+  history?: HistoryScope | null
   request: Request1
 }
 /**
@@ -7003,6 +7018,33 @@ export interface ActorEnvelope2 {
    */
   ingress:
     'local_ipc' | 'paired_device' | 'unpaired_peer' | 'workflow' | 'plugin' | 'service_client'
+}
+/**
+ * How far back a grant may see, and which current resources it names explicitly.
+ *
+ * The lower bound is enforced once, in shared host-side filtering used by event pages, snapshots,
+ * loaded conversations, attachment references, exports, summaries, changed-since-last-visit and
+ * voice context. A later snapshot or a freshly generated summary never makes older underlying
+ * content newly authorised.
+ */
+export interface HistoryScope {
+  /**
+   * Whether the currently visible screen is included. This exception never grants inactive
+   * screen buffers, scrollback or the backing transcript.
+   */
+  include_live_screen: boolean
+  /**
+   * The earliest content this grant may see. Null means no retained history at all.
+   */
+  lower_bound_ms: TimestampMs | null
+  /**
+   * Current approval requests named explicitly, on the same terms.
+   */
+  named_approvals: ApprovalRequestId[]
+  /**
+   * Current questions named explicitly, even when they were created before the lower bound.
+   */
+  named_questions: QuestionId[]
 }
 /**
  * A read request.
@@ -12507,7 +12549,7 @@ export interface Grant {
    * One host-issued authority object.
    */
   grant_id: string
-  history: HistoryScope
+  history: HistoryScope1
   /**
    * One paired device.
    */
@@ -12540,9 +12582,14 @@ export interface Grant {
     | 'none'
 }
 /**
- * How far back it may see.
+ * How far back a grant may see, and which current resources it names explicitly.
+ *
+ * The lower bound is enforced once, in shared host-side filtering used by event pages, snapshots,
+ * loaded conversations, attachment references, exports, summaries, changed-since-last-visit and
+ * voice context. A later snapshot or a freshly generated summary never makes older underlying
+ * content newly authorised.
  */
-export interface HistoryScope {
+export interface HistoryScope1 {
   /**
    * Whether the currently visible screen is included. This exception never grants inactive
    * screen buffers, scrollback or the backing transcript.
@@ -12728,7 +12775,7 @@ export interface Grant1 {
    * One host-issued authority object.
    */
   grant_id: string
-  history: HistoryScope
+  history: HistoryScope1
   /**
    * One paired device.
    */
@@ -12780,7 +12827,7 @@ export interface InvitationPreview {
    * Always false. A new recipient receives no historical attachment keys.
    */
   historical_attachment_keys: boolean
-  history: HistoryScope1
+  history: HistoryScope2
   /**
    * The invitation this preview belongs to.
    */
@@ -12815,9 +12862,14 @@ export interface InvitationPreview {
   single_use: boolean
 }
 /**
- * The history the recipient will reach.
+ * How far back a grant may see, and which current resources it names explicitly.
+ *
+ * The lower bound is enforced once, in shared host-side filtering used by event pages, snapshots,
+ * loaded conversations, attachment references, exports, summaries, changed-since-last-visit and
+ * voice context. A later snapshot or a freshly generated summary never makes older underlying
+ * content newly authorised.
  */
-export interface HistoryScope1 {
+export interface HistoryScope2 {
   /**
    * Whether the currently visible screen is included. This exception never grants inactive
    * screen buffers, scrollback or the backing transcript.
@@ -12972,7 +13024,7 @@ export interface Grant2 {
    * One host-issued authority object.
    */
   grant_id: string
-  history: HistoryScope
+  history: HistoryScope1
   /**
    * One paired device.
    */
@@ -13739,7 +13791,7 @@ export interface InvitationPreview1 {
    * Always false. A new recipient receives no historical attachment keys.
    */
   historical_attachment_keys: boolean
-  history: HistoryScope1
+  history: HistoryScope2
   /**
    * The invitation this preview belongs to.
    */
@@ -14751,7 +14803,7 @@ export interface ProposedGrant {
           expires_at_ms: string
         }
       }
-  history: HistoryScope2
+  history: HistoryScope3
   /**
    * An optional organisation membership requirement.
    */
@@ -14776,9 +14828,14 @@ export interface ProposedGrant {
     | 'none'
 }
 /**
- * How far back it may see.
+ * How far back a grant may see, and which current resources it names explicitly.
+ *
+ * The lower bound is enforced once, in shared host-side filtering used by event pages, snapshots,
+ * loaded conversations, attachment references, exports, summaries, changed-since-last-visit and
+ * voice context. A later snapshot or a freshly generated summary never makes older underlying
+ * content newly authorised.
  */
-export interface HistoryScope2 {
+export interface HistoryScope3 {
   /**
    * Whether the currently visible screen is included. This exception never grants inactive
    * screen buffers, scrollback or the backing transcript.
@@ -14873,7 +14930,7 @@ export interface ProposedGrant1 {
           expires_at_ms: string
         }
       }
-  history: HistoryScope2
+  history: HistoryScope3
   /**
    * An optional organisation membership requirement.
    */
@@ -15092,7 +15149,7 @@ export interface ProposedGrant2 {
           expires_at_ms: string
         }
       }
-  history: HistoryScope2
+  history: HistoryScope3
   /**
    * An optional organisation membership requirement.
    */
@@ -15414,7 +15471,7 @@ export interface ProposedGrant3 {
           expires_at_ms: string
         }
       }
-  history: HistoryScope2
+  history: HistoryScope3
   /**
    * An optional organisation membership requirement.
    */
@@ -15724,7 +15781,7 @@ export interface ProposedGrant4 {
           expires_at_ms: string
         }
       }
-  history: HistoryScope2
+  history: HistoryScope3
   /**
    * An optional organisation membership requirement.
    */
@@ -19056,7 +19113,7 @@ export interface ProposedGrant5 {
           expires_at_ms: string
         }
       }
-  history: HistoryScope2
+  history: HistoryScope3
   /**
    * An optional organisation membership requirement.
    */
@@ -23408,7 +23465,7 @@ export interface ProposedGrant6 {
           expires_at_ms: string
         }
       }
-  history: HistoryScope2
+  history: HistoryScope3
   /**
    * An optional organisation membership requirement.
    */

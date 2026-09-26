@@ -560,6 +560,7 @@ fn forwarded<T: serde::Serialize>(
             Nullable::null()
         },
         actor,
+        history: None,
     }))
 }
 
