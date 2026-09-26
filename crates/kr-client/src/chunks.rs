@@ -259,6 +259,8 @@ impl LocalCarrier {
         let connection = Connection::connect(endpoint).await?;
         // The frame bound is the whole difference between this connection and a control one.
         let (mut reader, mut writer) = split(connection, StreamKind::AttachmentChunks);
+        // A connection lost during the hello is lost like one lost later, so the caller recovers
+        // from both the same way.
         writer
             .write_message(&ControlFrame::Hello(LocalHello {
                 offered_versions: vec![PROTOCOL_VERSION],
@@ -267,8 +269,13 @@ impl LocalCarrier {
                 capabilities: CanonicalSet::new(),
                 max_receive: ReceiveLimits::default(),
             }))
-            .await?;
-        let acknowledgement = match reader.read_message::<ControlFrame>().await? {
+            .await
+            .map_err(failure_of)?;
+        let acknowledgement = match reader
+            .read_message::<ControlFrame>()
+            .await
+            .map_err(failure_of)?
+        {
             ControlFrame::HelloAck(acknowledgement) => *acknowledgement,
             ControlFrame::Response(kr_protocol::envelope::Response {
                 outcome: Outcome::Error(error),

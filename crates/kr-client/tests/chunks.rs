@@ -78,6 +78,8 @@ struct Script {
     drop_after_chunks: Option<usize>,
     /// The control endpoint ends the connection instead of answering a reservation.
     drop_reservation: bool,
+    /// The attachment-chunk endpoint ends the connection instead of acknowledging the hello.
+    drop_hello: bool,
     /// What the host answers `download.chunk` with, by index: the descriptor and the bytes.
     download: BTreeMap<u64, (ChunkDescriptor, Vec<u8>)>,
 }
@@ -411,6 +413,9 @@ async fn converse(
     let Ok(ControlFrame::Hello(_)) = reader.read_message::<ControlFrame>().await else {
         return;
     };
+    if leg.is_some() && host.script.drop_hello {
+        return;
+    }
     let environment_id = match leg {
         Some(_) => host
             .script
@@ -696,6 +701,21 @@ async fn a_chunk_endpoint_answered_for_another_environment_is_refused() {
         .await
         .expect_err("the lane is refused");
     assert_eq!(refused.code(), ErrorCode::PermissionDenied);
+}
+
+/// A lane whose hello goes unanswered is a lost connection, as one lost later is.
+#[tokio::test]
+async fn a_hello_the_host_never_answers_is_a_lost_connection() {
+    let host = Host::start(Script {
+        drop_hello: true,
+        ..Script::default()
+    });
+    let lost = host
+        .route()
+        .open(TransferId::new(Uuid::from_bytes([7; 16])))
+        .await
+        .expect_err("the lane is not opened");
+    assert!(matches!(lost, ClientError::ConnectionEnded), "{lost}");
 }
 
 /// A lane whose connection ended says so, and sends nothing on it again.
