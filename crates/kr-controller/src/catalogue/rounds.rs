@@ -387,6 +387,37 @@ impl Controller {
         self.admissions_due.notify_one();
     }
 
+    /// Returns the members a reclaim that needs room would wait for now: every one not reconciled
+    /// at the current admission revision, as the catalogue's reclaim is told. For this host's own
+    /// tests.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal the catalogue gave when its revision could not be read.
+    #[cfg(feature = "testing")]
+    pub async fn pending_admissions(
+        &self,
+    ) -> std::result::Result<Vec<String>, kr_protocol::error::ProtocolError> {
+        use kr_plugin_catalogue::BrokerBridge as _;
+        let revision = self.catalogue.admission_revision().await?;
+        Ok(self.plugin_bridge.live_packages(revision).pending)
+    }
+
+    /// Refreshes every recorded member's report as `plugin.list` does, and says whether the counts
+    /// are known. For this host's own tests, which stop waiting for it part way as a caller that
+    /// goes away does.
+    #[cfg(feature = "testing")]
+    pub async fn refresh_admissions(&self) -> bool {
+        self.refreshed_view().await.counts.is_some()
+    }
+
+    /// Returns true while a round to the member for `session_id` is out. For this host's own tests.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn admission_round_out(&self, session_id: SessionId) -> bool {
+        self.plugin_bridge.in_flight(session_id)
+    }
+
     /// Serves one catalogue or plugin read: `plugin.list` counts from a fresh round of every
     /// worker's report, and every other read asks none.
     pub(crate) async fn catalogue_read_frame(

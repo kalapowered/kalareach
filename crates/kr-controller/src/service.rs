@@ -567,13 +567,13 @@ async fn while_held<T>(
     }
 }
 
-/// A point in a read that this host's own tests can stop it at: the read says it has arrived and
-/// waits there until the test lets it go. Armed once, it fires once.
-#[cfg(test)]
+/// A point in a read, or in a worker's rendezvous, that this host's own tests can stop it at: it
+/// says it has arrived and waits there until the test lets it go. Armed once, it fires once.
+#[cfg(any(test, feature = "testing"))]
 #[derive(Debug, Default)]
 struct ReadPause(std::sync::Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>);
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 impl ReadPause {
     /// Arms the pause. Returns the end that says the read has arrived, and the end that lets it
     /// go.
@@ -721,6 +721,10 @@ pub struct Controller {
     /// waits for the policy's lock. Compiled away in every shipped build.
     #[cfg(feature = "testing")]
     before_presentation_lock: crate::attention::Pause,
+    /// Where this host's own tests stop a worker's rendezvous once its claim is committed, before
+    /// its specification is made. Compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    after_the_claim: ReadPause,
     /// Where this host's own tests stop a read whose worker has stopped answering, once it has
     /// asked the kernel and before it looks at what this daemon holds of the session. Compiled
     /// away in every shipped build.
@@ -1286,6 +1290,8 @@ impl Controller {
             debt_pass: Arc::new(tokio::sync::Notify::new()),
             #[cfg(feature = "testing")]
             before_presentation_lock: crate::attention::Pause::default(),
+            #[cfg(feature = "testing")]
+            after_the_claim: ReadPause::default(),
             #[cfg(test)]
             before_the_record: ReadPause::default(),
             #[cfg(test)]
@@ -2715,6 +2721,14 @@ impl Controller {
         std::sync::mpsc::SyncSender<()>,
     ) {
         self.before_presentation_lock.arm()
+    }
+
+    /// Arms the pause a worker's rendezvous stops at once its claim is committed, before its
+    /// specification and first admissions are made. Returns the end that says the rendezvous has
+    /// arrived, and the end that lets it go. The pause fires once.
+    #[cfg(feature = "testing")]
+    pub fn pause_rendezvous_after_claim(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        self.after_the_claim.arm()
     }
 
     /// Decides a membership lease a device presents to this host, and installs it when it is new.
@@ -4168,6 +4182,8 @@ impl Controller {
                 }
             }
         };
+        #[cfg(feature = "testing")]
+        self.after_the_claim.wait().await;
         let recorded = reservation.create_intent.as_deref().ok_or_else(|| {
             ControllerError::rendezvous(
                 "this reservation has no recorded create request, so nothing can be launched from it",
