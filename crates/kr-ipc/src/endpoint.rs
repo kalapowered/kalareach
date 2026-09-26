@@ -98,8 +98,8 @@ impl Listener {
     /// On Unix a caller that is not the owning user is refused here, before any frame is read. On
     /// Windows the platform reads a named-pipe caller's account only once the caller has sent
     /// something, so the account is proved at the connection's first read instead, before any byte
-    /// is handed to a reader: a caller of another account gets nothing delivered and nothing
-    /// written, and every read and write on its connection fails.
+    /// is handed to a reader: nothing a caller of another account sends is delivered, and from then
+    /// on every read and write on its connection fails.
     ///
     /// # Errors
     ///
@@ -613,7 +613,6 @@ mod platform {
             let connection = Connection::Server(Accepted {
                 stream,
                 caller: Caller::Unproved,
-                waiting_writer: None,
             });
             let peer = connection.peer()?;
             Ok((super::Connection(connection), peer))
@@ -641,22 +640,22 @@ mod platform {
     /// An accepted connection whose caller's account is proved at its first read.
     ///
     /// Windows reads a named-pipe client's account only once the client has sent something the
-    /// server has read, so the proof cannot come at accept. It comes at the first read instead:
-    /// the caller's opening bytes are read, its account is read from the connection itself and
-    /// compared with this process's, and only then is anything handed to the reader. The bytes read
-    /// for the proof are handed over first, so the reader sees the caller's opening whole. Until
-    /// the caller is proved, a write waits for the reader to settle it; a caller of another account,
-    /// or one whose account cannot be read, gets no byte delivered and none written, and every read
-    /// and write on its connection then fails.
+    /// server has read, so the proof cannot come at accept. It comes at the first read instead: the
+    /// caller's opening bytes are read, its account is read from the connection itself and compared
+    /// with this process's, and only then is anything handed to the reader. The bytes read for the
+    /// proof are handed over first, so the reader sees the caller's opening whole. A caller of
+    /// another account, or one whose account cannot be read, gets no byte of its own delivered, and
+    /// from then on every read and write on its connection fails.
     ///
-    /// Only the reader drives the proof. A writer that drove it would register its own wakeup for
-    /// the pipe's read readiness in place of the reader's, and the reader would never be woken.
+    /// A write before the caller has spoken goes through: a caller that has sent nothing cannot be
+    /// identified from the connection, and the owner-only list is what decides who can be connected
+    /// at that point. What a caller sends is never read before its account is proved.
+    ///
+    /// Only the reader drives the proof, so only the reader waits on the pipe's read readiness.
     #[derive(Debug)]
     pub(super) struct Accepted {
         stream: PipeServer,
         caller: Caller,
-        /// A writer that found the caller not yet proved, woken once the reader settles it.
-        waiting_writer: Option<std::task::Waker>,
     }
 
     /// What is known of an accepted connection's caller.
@@ -671,7 +670,7 @@ mod platform {
     }
 
     impl Accepted {
-        /// Settles the caller from its opening bytes, and wakes a writer waiting on the outcome.
+        /// Settles the caller from its opening bytes.
         fn settle(&mut self, opening: Vec<u8>) {
             let PipeServer::NamedPipe(pipe) = &self.stream;
             self.caller = match crate::starter::pipe_client_is_this_user(pipe.as_handle()) {
@@ -684,9 +683,6 @@ mod platform {
                     "the caller's account could not be read from the connection: {error}"
                 )),
             };
-            if let Some(writer) = self.waiting_writer.take() {
-                writer.wake();
-            }
         }
 
         fn refusal(detail: &str) -> std::io::Error {
@@ -723,14 +719,8 @@ mod platform {
                             Poll::Ready(Ok(())) => {
                                 let length = read.filled().len();
                                 if length == 0 {
-                                    // The caller left without saying anything: nothing to hand over
-                                    // and nothing to prove, and nothing may be written to it.
-                                    self.caller = Caller::Refused(
-                                        "the caller closed before it identified itself".to_owned(),
-                                    );
-                                    if let Some(writer) = self.waiting_writer.take() {
-                                        writer.wake();
-                                    }
+                                    // The caller left without saying anything: there is nothing to
+                                    // hand over and nothing to prove.
                                     return Poll::Ready(Ok(()));
                                 }
                                 opening.truncate(length);
@@ -748,11 +738,9 @@ mod platform {
             bytes: &[u8],
         ) -> Poll<std::io::Result<usize>> {
             match &self.caller {
-                Caller::Admitted { .. } => Pin::new(&mut self.stream).poll_write(context, bytes),
                 Caller::Refused(detail) => Poll::Ready(Err(Self::refusal(detail))),
-                Caller::Unproved => {
-                    self.waiting_writer = Some(context.waker().clone());
-                    Poll::Pending
+                Caller::Unproved | Caller::Admitted { .. } => {
+                    Pin::new(&mut self.stream).poll_write(context, bytes)
                 }
             }
         }
