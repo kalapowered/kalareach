@@ -298,43 +298,51 @@ impl OwnedProcesses {
     /// session, with everything below that.
     ///
     /// Only a worker that is the child subreaper holds a process whose parent exits, and only a
-    /// kernel that lists each process's children can be read this way; without either this is
-    /// none, and the caller reads the terminal instead. A child of this worker's that is in
-    /// another session is not this session's: it is one of the worker's own, or of another
-    /// session this process hosts, or a process that called `setsid` after its parent exited,
-    /// which nothing ties to this session any more.
+    /// kernel that lists each process's children can be read this way; without either, or when a
+    /// list could not be read, this is none, and the caller reads the terminal instead. A child of
+    /// this worker's that is in another session is not this session's: it is one of the worker's
+    /// own, or of another session this process hosts, or a process that called `setsid` after its
+    /// parent exited, which nothing ties to this session any more.
+    ///
+    /// The worker's own children are read after everything below the root shell, and again until
+    /// they hold nothing new: a process whose parent exits while the tree is being read is the
+    /// worker's child by then, so it is in one reading or the other.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     fn tree(&self) -> Option<Vec<u32>> {
         if !matches!(rustix::process::child_subreaper(), Ok(Some(_))) {
             return None;
         }
         let root = u32::try_from(self.root.pid.get()).ok()?;
-        let session_of = |pid: u32| {
+        // The root shell leads its session, so the session keeps the root shell's identifier
+        // after the root shell has gone, and so do the processes still in it.
+        let session = rustix::process::Pid::from_raw(i32::try_from(root).ok()?)?;
+        let in_session = |pid: u32| {
             i32::try_from(pid)
                 .ok()
                 .and_then(rustix::process::Pid::from_raw)
                 .and_then(|pid| rustix::process::getsid(Some(pid)).ok())
+                == Some(session)
         };
-        let session = session_of(root)?;
-        let mut pending = vec![root];
-        for child in kr_ipc::identity::children_of(std::process::id()).ok()? {
-            if child != root && session_of(child) == Some(session) {
-                pending.push(child);
-            }
-        }
         let mut members = Vec::new();
         let mut walked = std::collections::BTreeSet::new();
-        while let Some(pid) = pending.pop() {
-            if !walked.insert(pid) {
-                continue;
+        let mut pending = vec![root];
+        loop {
+            while let Some(pid) = pending.pop() {
+                if !walked.insert(pid) {
+                    continue;
+                }
+                members.push(pid);
+                pending.extend(kr_ipc::identity::children_of(pid).ok()?);
             }
-            members.push(pid);
-            // A process that ended meanwhile has nothing below it to walk.
-            if let Ok(children) = kr_ipc::identity::children_of(pid) {
-                pending.extend(children);
+            pending = kr_ipc::identity::children_of(std::process::id())
+                .ok()?
+                .into_iter()
+                .filter(|child| !walked.contains(child) && in_session(*child))
+                .collect();
+            if pending.is_empty() {
+                return Some(members);
             }
         }
-        Some(members)
     }
 
     /// Records every process the session's job object currently holds.

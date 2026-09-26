@@ -6,18 +6,36 @@
 //! parent exits so that the worker adopts it. The root shell writes where each one is to a file,
 //! because the terminal is the session's own.
 //!
+//! The cases take turns: each is a tree this process is the root of, and one case's processes are
+//! easier to tell from the next case's when only one tree is growing at a time.
+//!
 //! | Row | What proves it |
 //! | --- | --- |
-//! | KR-REQ-07.60 | the observation records the root shell, a job, a job that called `setsid`, and a process the worker adopted when its parent exited, and not a process of the worker's own |
+//! | KR-REQ-07.60 | the observation records the root shell, a job, a job that called `setsid`, and a process the worker adopted when its parent exited, and not a process of the worker's own; a process adopted while the observation runs, and one left in the session after the root shell has gone, are found too |
 //! | KR-PERF-003 | an idle session's observation reads no process outside the worker's own tree, so what it costs does not grow with the processes on the host |
 
 #![cfg(any(target_os = "linux", target_os = "android"))]
 
 use std::path::Path;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 /// How long a test waits for something that should happen promptly, before it calls it a failure.
 const LIVENESS: Duration = Duration::from_secs(60);
+
+/// Held by each case for as long as its tree lives.
+static TURN: Mutex<()> = Mutex::new(());
+
+/// Waits for this case's turn.
+fn turn() -> MutexGuard<'static, ()> {
+    TURN.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The script of the tree most cases use: a job, a job that leaves with `setsid`, and a process its
+/// parent leaves behind.
+const KINDS: &str = "sleep 60 & echo \"a job $!\" >> \"$KR_TREE\"; \
+                     setsid sleep 60 & echo \"a job that left with setsid $!\" >> \"$KR_TREE\"; \
+                     (sleep 60 & echo \"a process the worker adopted $!\" >> \"$KR_TREE\")";
 
 /// A session whose root shell has started one process of each kind, and where each one is.
 struct Tree {
@@ -28,20 +46,13 @@ struct Tree {
 }
 
 impl Tree {
-    /// Opens a session whose root shell starts a job, a job that leaves with `setsid`, and a
-    /// process that its parent leaves behind, and then keeps the terminal.
-    fn start() -> Self {
+    /// Opens a session whose root shell runs `script`, which writes one line to `$KR_TREE` for each
+    /// of the `count` processes it starts, and then keeps the terminal.
+    fn start(script: &str, count: usize) -> Self {
         let host = kr_ipc::testing::TempHost::create();
         let written = host.root().join("started");
-        // A moment first, so that the session is established before anything is started: a
-        // process orphaned before the worker is the child subreaper would be the first
-        // process's to collect, not the worker's.
-        let mut shell = kr_worker::testing::posix_script(
-            "sleep 1; sleep 60 & echo \"a job $!\" >> \"$KR_TREE\"; \
-             setsid sleep 60 & echo \"a job that left with setsid $!\" >> \"$KR_TREE\"; \
-             (sleep 60 & echo \"a process the worker adopted $!\" >> \"$KR_TREE\"); \
-             exec cat",
-        );
+        // A moment first, so that the session is established before anything is started.
+        let mut shell = kr_worker::testing::posix_script(&format!("sleep 1\n{script}\nexec cat"));
         shell
             .environment
             .push(("KR_TREE".to_owned(), written.display().to_string()));
@@ -66,22 +77,22 @@ impl Tree {
         };
         let mut session = kr_worker::session::Session::open(config).expect("opens");
         session.launch().expect("launches");
-        let started = Self::wait_for(&written, 3);
-        // The adopted process's parent has exited by the time it was written down only if the
-        // subshell has; wait for the worker to be its parent.
+        let started = Self::wait_for(&written, count);
+        // A process is written down before the subshell that started it exits, so the worker is
+        // waited for as the parent of each one it is to adopt.
         let me = std::process::id();
-        let (_, adopted) = started
-            .iter()
-            .find(|(kind, _)| kind == "a process the worker adopted")
-            .cloned()
-            .expect("the adopted process");
-        let deadline = Instant::now() + LIVENESS;
-        while parent_of(adopted) != Some(me) {
-            assert!(
-                Instant::now() < deadline,
-                "the worker adopts the process {adopted} whose parent exited"
-            );
-            std::thread::sleep(Duration::from_millis(20));
+        for (kind, adopted) in &started {
+            if !kind.starts_with("a process the worker adopted") {
+                continue;
+            }
+            let deadline = Instant::now() + LIVENESS;
+            while parent_of(*adopted) != Some(me) {
+                assert!(
+                    Instant::now() < deadline,
+                    "the worker adopts {kind}, {adopted}, whose parent exited"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
         }
         Self {
             session,
@@ -113,6 +124,44 @@ impl Tree {
         }
     }
 
+    /// Returns the process the root shell wrote down as `kind`.
+    fn pid(&self, kind: &str) -> u32 {
+        self.started
+            .iter()
+            .find(|(written, _)| written == kind)
+            .map(|(_, pid)| *pid)
+            .unwrap_or_else(|| panic!("the root shell wrote down {kind}: {:?}", self.started))
+    }
+
+    /// Returns the root shell's process identifier.
+    fn root(&self) -> u32 {
+        u32::try_from(
+            self.session
+                .root_identity()
+                .expect("the root shell")
+                .pid
+                .get(),
+        )
+        .expect("a process identifier")
+    }
+
+    /// Observes the session's processes and returns the identifiers of those it records.
+    fn seen(&mut self) -> Vec<u32> {
+        self.session.observe_owned();
+        self.recorded()
+    }
+
+    /// Returns the identifiers of the processes the session has recorded that are still running.
+    fn recorded(&self) -> Vec<u32> {
+        self.session
+            .owned()
+            .expect("a launched session owns its processes")
+            .surviving()
+            .into_iter()
+            .filter_map(|identity| u32::try_from(identity.pid.get()).ok())
+            .collect()
+    }
+
     /// Stops every process this test started, the root shell included, so that none outlives it.
     fn end(self) {
         if let Some(owned) = self.session.owned() {
@@ -136,58 +185,30 @@ fn parent_of(pid: u32) -> Option<u32> {
     rest.split_whitespace().nth(1)?.parse().ok()
 }
 
-/// Returns whether `pid` is `ancestor` or one of its descendants, following the parents the
-/// kernel reports now; `None` when a process on the way can no longer be read.
-fn descends_from(mut pid: u32, ancestor: u32) -> Option<bool> {
-    for _ in 0..4096 {
-        if pid == ancestor {
-            return Some(true);
-        }
-        if pid <= 1 {
-            return Some(false);
-        }
-        pid = parent_of(pid)?;
-    }
-    Some(false)
-}
-
 /// KR-REQ-07.60: the observation records every process the session started, whatever became of
 /// it: the root shell, a job, a job that left the session and its terminal with `setsid`, and a
 /// process whose parent exited and which the worker, as the child subreaper, adopted. It records no
 /// process of the worker's own.
 #[test]
 fn kr_req_07_60_the_observation_finds_every_process_the_session_started() {
-    let mut tree = Tree::start();
+    let _turn = turn();
+    let mut tree = Tree::start(KINDS, 3);
     // One of the worker's own, beside the session: it is the worker's child, and not the session's.
     let mut own = std::process::Command::new("sleep")
         .arg("60")
         .spawn()
         .expect("a process of the worker's own");
 
-    tree.session.observe_owned();
-    let seen: Vec<u64> = tree
-        .session
-        .owned()
-        .expect("a launched session owns its processes")
-        .surviving()
-        .into_iter()
-        .map(|identity| identity.pid.get())
-        .collect();
-    let root = tree
-        .session
-        .root_identity()
-        .expect("the root shell")
-        .pid
-        .get();
-    assert!(seen.contains(&root), "the root shell is found: {seen:?}");
+    let seen = tree.seen();
+    assert!(
+        seen.contains(&tree.root()),
+        "the root shell is found: {seen:?}"
+    );
     for (kind, pid) in &tree.started {
-        assert!(
-            seen.contains(&u64::from(*pid)),
-            "{kind}, {pid}, is found: {seen:?}"
-        );
+        assert!(seen.contains(pid), "{kind}, {pid}, is found: {seen:?}");
     }
     assert!(
-        !seen.contains(&u64::from(own.id())),
+        !seen.contains(&own.id()),
         "a process of the worker's own is not the session's: {seen:?}"
     );
 
@@ -201,14 +222,19 @@ fn kr_req_07_60_the_observation_finds_every_process_the_session_started() {
 /// on the host would cost each session as much as the host had processes.
 #[test]
 fn kr_perf_003_an_idle_sessions_observation_reads_no_process_outside_its_own_tree() {
-    let mut tree = Tree::start();
-    let me = std::process::id();
+    let _turn = turn();
+    let mut tree = Tree::start(KINDS, 3);
+    // The worker, the root shell and what the root shell started are this worker's tree; nothing
+    // else is growing while this case has its turn.
+    let mut tree_members: Vec<u32> = tree.started.iter().map(|(_, pid)| *pid).collect();
+    tree_members.extend([std::process::id(), tree.root()]);
 
     let ((), read) = kr_ipc::identity::processes_read_during(|| tree.session.observe_owned());
+    assert!(!read.is_empty(), "the observation's reads are counted");
     let outside: Vec<u32> = read
         .iter()
         .copied()
-        .filter(|pid| descends_from(*pid, me) == Some(false))
+        .filter(|pid| !tree_members.contains(pid))
         .collect();
     assert!(
         outside.is_empty(),
@@ -217,7 +243,96 @@ fn kr_perf_003_an_idle_sessions_observation_reads_no_process_outside_its_own_tre
         outside.len(),
         &outside[..outside.len().min(16)]
     );
-    assert!(!read.contains(&1), "the first process is nobody's session");
+
+    tree.end();
+}
+
+/// KR-REQ-07.60: a process whose parent exits while the observation is reading the tree is found.
+/// It is the worker's child by then rather than its parent's, and the worker's own children are
+/// read after the rest.
+#[test]
+fn kr_req_07_60_a_process_adopted_while_the_observation_runs_is_found() {
+    let _turn = turn();
+    let mut tree = Tree::start(
+        "sh -c 'sleep 60 & echo \"a process below a parent $!\" >> \"$KR_TREE\"; \
+         echo \"its parent $$\" >> \"$KR_TREE\"; exec sleep 60' &",
+        2,
+    );
+    let child = tree.pid("a process below a parent");
+    let parent = tree.pid("its parent");
+    let root = tree.root();
+    let me = std::process::id();
+
+    // The parent exits just after the root shell's children are read, which named it.
+    let mut exited = false;
+    kr_ipc::identity::after_each_read(
+        move |pid, file| {
+            if exited || pid != root || !file.ends_with("/children") {
+                return;
+            }
+            exited = true;
+            if let Some(parent) = i32::try_from(parent)
+                .ok()
+                .and_then(rustix::process::Pid::from_raw)
+            {
+                let _ = rustix::process::kill_process(parent, rustix::process::Signal::KILL);
+            }
+            let deadline = Instant::now() + LIVENESS;
+            while parent_of(child) != Some(me) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        },
+        || tree.session.observe_owned(),
+    );
+    assert_eq!(
+        parent_of(child),
+        Some(me),
+        "the worker adopted the process during the observation"
+    );
+    let recorded = tree.recorded();
+    assert!(
+        recorded.contains(&child),
+        "the process adopted while the observation ran, {child}, is found: {recorded:?}"
+    );
+
+    tree.end();
+}
+
+/// KR-REQ-07.60: a process left in the session after the root shell has ended and been collected
+/// is still found. The session keeps the root shell's identifier while anything is in it, and the
+/// terminal no longer names the session once the root shell has gone.
+#[test]
+fn kr_req_07_60_a_process_left_after_the_root_shell_has_gone_is_found() {
+    let _turn = turn();
+    let mut tree = Tree::start(
+        "(trap '' HUP; sleep 60 & echo \"a process the worker adopted, deaf to a hangup $!\" \
+         >> \"$KR_TREE\")",
+        1,
+    );
+    let left = tree.pid("a process the worker adopted, deaf to a hangup");
+    let root = tree.root();
+    if let Some(pid) = i32::try_from(root)
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+    {
+        let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+    }
+    // Collected as the session's supervision collects it.
+    let deadline = Instant::now() + LIVENESS;
+    while Path::new(&format!("/proc/{root}")).exists() {
+        let _ = tree.session.poll_root_exit();
+        assert!(
+            Instant::now() < deadline,
+            "the root shell's exit is collected"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let seen = tree.seen();
+    assert!(
+        seen.contains(&left),
+        "the process left in the session, {left}, is found: {seen:?}"
+    );
 
     tree.end();
 }
