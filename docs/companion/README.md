@@ -52,13 +52,16 @@ worker reported no reason says so, and is never shown as direct.
 
 In view mode a raw view moves its window over the session: up into the history, down the live
 screen, and across a session wider than the view. On the desktop the wheel does it (Shift turns a
-vertical wheel sideways) and so does a drag; on the phone, a one-finger drag. In control mode the
-wheel and a drag are the program's and move nothing, and switching to control mode brings a window
-in the history back to the live screen. The page never decides where the window is. Native code
-sends one viewport report at a time, settles each move on the screen the host names for it, and
-tells the page a move is settled only with a screen that holds it. Until then the page draws its
-last screen shifted to where the waiting moves will put the window, so a move shows at once, and a
-drag follows the pointer to the pixel. The footer says where the window is.
+vertical wheel sideways) and so does a drag; on the phone, a one-finger drag. Four buttons, Up,
+Down, Left and Right, move it a page at a time for a keyboard or a screen reader, and each is
+disabled where the window can go no further. In control mode the wheel and a drag are the program's
+and move nothing, and switching to control mode brings a window in the history back to the live
+screen. A drag belongs to the view it began in: taking control, the view ending or the session
+changing ends it without sending what it had not sent. The page never decides where the window is.
+Native code sends one viewport report at a time, settles each move on the screen the host names for
+it, and tells the page a move is settled only with a screen that holds it. Until then the page draws
+its last screen shifted to where the waiting moves will put the window, so a move shows at once, and
+a drag follows the pointer to the pixel. The footer says where the window is.
 
 A session fits a window as narrow as 320 px. Its actions move below its title, in the same order
 and at the same size, a long name or directory wraps whole, and the terminal's badges and footer
