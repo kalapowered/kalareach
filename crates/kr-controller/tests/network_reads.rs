@@ -1,13 +1,13 @@
 //! The reads a paired device makes that the daemon decides itself, over a real paired connection.
 //!
 //! What these demonstrate, for the paired-device ingress: KR-REQ-23.49 for `grant.list`, and
-//! KR-REQ-23.34, KR-REQ-23.39 and KR-REQ-23.41 for the reads this host refuses a device. The method
-//! table admits a paired device to `grant.list`, `session.describe`, `agent.snapshot`,
-//! `upload.status`, `download.begin` and `download.chunk`.
+//! KR-REQ-23.34 and KR-REQ-23.41 for the reads this host refuses a device. The method table admits
+//! a paired device to `grant.list`, `session.describe`, `upload.status`, `download.begin` and
+//! `download.chunk`.
 //!
 //! A device lists the grants it issued and everything delegated from them, which is what the
 //! sharing service shows any issuer other than this host itself, and it needs `session.share` to
-//! ask. The other five are refused by name, each with the reason this host does not serve it to a
+//! ask. The other four are refused by name, each with the reason this host does not serve it to a
 //! device: a refusal a device can act on rather than one that names no reason. Before either, a
 //! device whose grant does not reach what it asks about is refused as it always was.
 //!
@@ -20,11 +20,10 @@ use std::collections::BTreeSet;
 use kr_client::session::Session;
 use kr_controller::grants::GrantRecord;
 use kr_crypto::keys::DeviceKeys;
-use kr_protocol::agent::{AgentSnapshotParams, AgentSnapshotResult, AgentSubject};
 use kr_protocol::describe::{SessionDescribeParams, SessionDescribeResult};
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::grant::{Grant, GrantExpiry, SessionSelector};
-use kr_protocol::ids::{ApplicationInstanceId, DeviceId, GrantId, SessionId, TransferId};
+use kr_protocol::ids::{DeviceId, GrantId, SessionId, TransferId};
 use kr_protocol::method::Method;
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{Nullable, U64};
@@ -195,7 +194,7 @@ async fn a_device_lists_the_grants_it_issued_and_what_was_delegated_from_them() 
     host.stop().await;
 }
 
-/// The five reads the method table admits for a paired device that this host does not serve one
+/// The four reads the method table admits for a paired device that this host does not serve one
 /// are each refused by name, as `UNSUPPORTED_CAPABILITY` with the method and the reason in the
 /// message. A device whose grant does not reach the subject or carry the right is refused first,
 /// as it always was.
@@ -218,10 +217,6 @@ async fn a_read_this_host_does_not_serve_a_device_is_refused_by_name() {
     let session = connect(&host, &device, &record).await;
     let session_id = SessionId::new(kr_ipc::new_uuid());
     let transfer_id = TransferId::new(kr_ipc::new_uuid());
-    let subject = AgentSubject {
-        session_id,
-        application_instance_id: ApplicationInstanceId::new(kr_ipc::new_uuid()),
-    };
     let begin = DownloadBeginParams {
         environment_id: host.environment_id,
         resume_transfer_id: Nullable::null(),
@@ -234,15 +229,6 @@ async fn a_read_this_host_does_not_serve_a_device_is_refused_by_name() {
             &session,
             Method::SessionDescribe,
             &SessionDescribeParams { session_id },
-        )
-        .await,
-        refused::<_, AgentSnapshotResult>(
-            &session,
-            Method::AgentSnapshot,
-            &AgentSnapshotParams {
-                subject,
-                from_node: Nullable::null(),
-            },
         )
         .await,
         refused::<_, UploadStatusResult>(
@@ -264,7 +250,6 @@ async fn a_read_this_host_does_not_serve_a_device_is_refused_by_name() {
     ];
     for (method, refusal) in [
         Method::SessionDescribe,
-        Method::AgentSnapshot,
         Method::UploadStatus,
         Method::DownloadBegin,
         Method::DownloadChunk,

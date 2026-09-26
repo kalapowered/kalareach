@@ -3811,9 +3811,9 @@ async fn a_question_is_answered_only_with_the_respond_right_for_its_session_and_
 /// at the revision the worker holds it at. The second, whose grant retains no history and names
 /// no question, reads none: what a question carries is session content, and the grant's history
 /// scope decides it. The third, whose grant sees another session, is refused, as it always was.
-/// An agent read naming an instance the session does not hold is answered by the session's worker
-/// the way it answers the owner's own client, as a subject that has gone; the third device is
-/// refused it before anything reaches the worker.
+/// An agent read naming an instance the session does not hold, the snapshot and the approval
+/// record included, is answered by the session's worker the way it answers the owner's own client,
+/// as a subject that has gone; the third device is refused it before anything reaches the worker.
 #[ignore = "launches a worker process; run through scripts/end-to-end.sh"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_device_reads_the_questions_and_agent_state_of_a_session_its_grant_reaches() {
@@ -3856,7 +3856,8 @@ async fn a_device_reads_the_questions_and_agent_state_of_a_session_its_grant_rea
             .collect::<Vec<_>>(),
         vec![(asked.question_id, asked.revision)]
     );
-    // The agent reads reach the session's worker, whose broker holds no such instance.
+    // The agent reads reach the session's worker, whose broker holds no such instance. The two
+    // that carry history go there with the grant's scope rather than being refused on the way.
     for refusal in [
         session
             .read::<_, kr_protocol::agent::AgentCapabilitiesResult>(
@@ -3869,6 +3870,26 @@ async fn a_device_reads_the_questions_and_agent_state_of_a_session_its_grant_rea
             .read::<_, kr_protocol::agent::AgentCommandsResult>(
                 Method::AgentCommands,
                 &kr_protocol::agent::AgentCommandsParams { subject },
+            )
+            .await
+            .expect_err("the session holds no such instance"),
+        session
+            .read::<_, kr_protocol::agent::AgentSnapshotResult>(
+                Method::AgentSnapshot,
+                &kr_protocol::agent::AgentSnapshotParams {
+                    subject,
+                    from_node: Nullable::null(),
+                },
+            )
+            .await
+            .expect_err("the session holds no such instance"),
+        session
+            .read::<_, kr_protocol::agent::AgentApprovalInspectResult>(
+                Method::AgentApprovalInspect,
+                &kr_protocol::agent::AgentApprovalInspectParams {
+                    subject,
+                    resource_id: kr_protocol::ids::PendingResourceId::new(kr_ipc::new_uuid()),
+                },
             )
             .await
             .expect_err("the session holds no such instance"),

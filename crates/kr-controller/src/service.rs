@@ -12844,8 +12844,14 @@ mod a_close_a_worker_never_answers {
                     let (mut reader, mut writer) = split(connection, StreamKind::Control);
                     let connection_id = ConnectionId::new(kr_ipc::new_uuid());
                     while let Ok(frame) = reader.read_message::<ControlFrame>().await {
-                        let handshake =
-                            handshake(&frame, &identity, &endpoint_text, connection_id, &peer);
+                        let handshake = handshake(
+                            &frame,
+                            &identity,
+                            &endpoint_text,
+                            connection_id,
+                            &peer,
+                            &CanonicalSet::new(),
+                        );
                         let answers = match (handshake, frame) {
                             (Some(answers), _) => answers,
                             // A recording worker installs the revision announced to it, with
@@ -12886,15 +12892,16 @@ mod a_close_a_worker_never_answers {
     }
 
     /// What a fake worker answers the handshake with that the daemon makes before it will speak
-    /// to a worker at all: the version exchange, the challenge over the descriptor's key, the
-    /// controller generation and the role a link says it is for. Any other frame is `None`, and the
-    /// fake worker answers it in its own way.
+    /// to a worker at all: the version exchange, stating `stated` about itself, the challenge over
+    /// the descriptor's key, the controller generation and the role a link says it is for. Any
+    /// other frame is `None`, and the fake worker answers it in its own way.
     pub(super) fn handshake(
         frame: &ControlFrame,
         identity: &WorkerIdentity,
         endpoint_text: &str,
         connection_id: ConnectionId,
         peer: &kr_ipc::peer::PeerIdentity,
+        stated: &CanonicalSet<kr_protocol::ids::CapabilityId>,
     ) -> Option<Vec<ControlFrame>> {
         match frame {
             ControlFrame::Hello(_) => Some(vec![
@@ -12912,7 +12919,7 @@ mod a_close_a_worker_never_answers {
                         issued_at_ms: kr_ipc::now_ms(),
                         valid_for_ms: DurationMs::new(60_000),
                     },
-                    capabilities: CanonicalSet::new(),
+                    capabilities: stated.clone(),
                     max_receive: ReceiveLimits::default(),
                 })),
                 ControlFrame::GenerationChallenge(GenerationChallenge {
@@ -13631,6 +13638,7 @@ mod a_read_that_meets_a_worker_on_its_way_out {
                             &endpoint_text,
                             connection_id,
                             &peer,
+                            &kr_protocol::scalars::CanonicalSet::new(),
                         );
                         let answers = match (handshake, frame) {
                             (Some(answers), _) => answers,

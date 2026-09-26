@@ -481,8 +481,8 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
     // state, and asks for the publisher and the original request details to be open to inspection.
     // Section 23's agent-state row names no read that answers that, so this build adds one. It reads
     // the session under `session.view` like the rest of the row, meets the history filter as a
-    // named current resource, and is served on the local socket only: this host applies no grant's
-    // history scope to its answer.
+    // named current resource, and is served on the local socket and to a paired device, whose
+    // grant's history scope travels with the read to the worker that narrows the answer.
     let inspection = [("agent.approval.inspect", EffectClass::Read)];
     for (name, effect) in inspection {
         let entry = lookup(name).unwrap_or_else(|| panic!("{name} is missing from the registry"));
@@ -504,8 +504,8 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
         );
         assert_eq!(
             entry.ingress,
-            &[ActorIngress::LocalIpc],
-            "{name} is served on the local socket only"
+            &[ActorIngress::LocalIpc, ActorIngress::PairedDevice],
+            "{name} is served on the local socket and to a paired device"
         );
     }
 
