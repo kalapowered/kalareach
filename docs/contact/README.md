@@ -234,12 +234,16 @@ Three properties make an installation safe to undo:
   server entry that is already there and that this host did not write, and it refuses before its
   first write, so a refusal leaves the agent's tree exactly as it found it.
 * **Other settings survive.** A TOML configuration is edited in place with a format-preserving
-  editor, so ordering and comments are untouched. A JSON configuration is reparsed and rewritten:
-  every setting survives, and the document's key order and indentation are normalised. On macOS and
-  Linux the replacement keeps the permission bits of the document it replaces, because an agent's
-  configuration can hold a credential. What it cannot keep, it will not take: a document protected
-  by an access-control list beyond those bits is refused, by both installation and removal, before
-  anything is written, with the advice to add or remove the server with the agent's own command.
+  editor, so ordering and comments are untouched. A JSON configuration is read with the place of
+  every member: the server entry is spliced in, the removal takes it out again with the server
+  container the installation made, and every other byte stays as it was. A JSON document that names
+  a member twice in one object is refused before anything is written, because which of the two a
+  reader keeps is the reader's choice. On macOS and Linux the replacement keeps the permission bits
+  of the document it replaces, because an agent's configuration can hold a credential. What it
+  cannot keep, it will not take: a document protected by an access-control list beyond those bits,
+  or whose owner or group is not the one the replacement would get, is refused, by both installation
+  and removal, before anything is written, with the advice to add or remove the server with the
+  agent's own command.
   Reapplying such a list needs calls this host does not make, and somebody who restricted a file
   meant it. The same refusal covers a document whose directory hands out access to whatever is
   created in it, because the replacement is a new file in that directory and would be given what the
