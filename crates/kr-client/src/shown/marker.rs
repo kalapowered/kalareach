@@ -935,10 +935,12 @@ mod cases {
         };
         renders_only(&delivery, "Bytes{cursor:9,bytes:14}");
 
+        #[cfg(feature = "terminal")]
         let painted = crate::projection::paint::Painted {
             bytes: MARKER.as_bytes().to_vec(),
             comparison: crate::projection::paint::Comparison::default(),
         };
+        #[cfg(feature = "terminal")]
         assert_unmarked("painted bytes", &debug_renderings(&painted));
 
         let subject = crate::uploads::Subject {
@@ -999,6 +1001,7 @@ mod cases {
             &access,
             "ServiceAccess{policy:Account,service_origin:\"<notprinted>\",..}",
         );
+        #[cfg(feature = "terminal")]
         renders_only(
             &painted,
             "Painted{bytes:14,comparison:Comparison{runs_replaced:0,cells_clipped:0,\

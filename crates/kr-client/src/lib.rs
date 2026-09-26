@@ -54,11 +54,12 @@ pub mod encoder;
 pub mod error;
 pub mod ipc;
 pub mod pairing;
-/// The projected screen a client paints, and the pinned Unicode width model it measures with.
+/// The projected screen a client holds, and the renderer that paints it into a terminal.
 ///
-/// Present when the `terminal` feature is on, which is the default. A client on a system with no
-/// local terminal takes this library without it; nothing else in the library changes.
-#[cfg(feature = "terminal")]
+/// The screen is held the same way on every system. Painting it, which measures text with the
+/// pinned Unicode width model, is present when the `terminal` feature is on, which is the default;
+/// a client on a system with no local terminal takes this library without it and draws the held
+/// screen itself.
 pub mod projection;
 pub mod reconnect;
 pub mod recovery;
@@ -74,3 +75,33 @@ pub mod viewport;
 pub use error::{ClientError, Result};
 pub use session::{Session, Settled};
 pub use shown::{IoFault, Plain, Said, Shown};
+
+#[cfg(test)]
+mod tests {
+    use kr_protocol::projection::{ProjectionEvent, ProjectionReset, ProjectionResetReason};
+    use kr_protocol::scalars::U64;
+
+    /// KR-REQ-13.08: a client with no local terminal holds a host's projection with the same code
+    /// as every other client. Only painting a screen into a terminal needs the terminal feature.
+    #[test]
+    fn a_client_without_a_local_terminal_holds_a_projected_screen() {
+        let mut projection = crate::projection::Projection::new();
+        assert!(
+            projection.screen().is_none(),
+            "nothing is held before a snapshot"
+        );
+        let applied = projection.apply(ProjectionEvent::Reset(ProjectionReset {
+            projection_generation: U64::new(3),
+            cursor: U64::new(0),
+            reason: ProjectionResetReason::Attached,
+        }));
+        assert_eq!(
+            applied,
+            crate::projection::Applied::Reset(ProjectionResetReason::Attached)
+        );
+        assert!(
+            projection.screen().is_none(),
+            "a reset waits for its snapshot"
+        );
+    }
+}

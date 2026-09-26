@@ -58,14 +58,14 @@ zeroize.workspace = true
 [features]
 # Everything a client with a terminal on the same machine needs, which is everything.
 default = ["terminal"]
-# The projected screen and the pinned Unicode width model it measures runs with.
+# The projection's painter and the pinned Unicode width model it measures runs with.
 #
 # It is a feature rather than always present because the width model is measured by a terminal
 # state library whose own dependency does not build for Apple's mobile systems, and because a
-# phone has no local terminal to paint: it reads a host's projection as protocol values and draws
-# them itself. A mobile client therefore takes this library without this feature, and everything
-# else in it -- sessions, cursors, drafts, controls, the encoder, transports and uploads -- is the
-# same code on every platform.
+# phone has no local terminal to paint. A phone still holds a host's projection with the same
+# code as every other client, since a screen and its updates are protocol values, and draws the
+# held screen itself. A mobile client therefore takes this library without this feature, and
+# everything else in it, the held screen included, is the same code on every platform.
 terminal = ["dep:kr-term"]
 
 [dev-dependencies]

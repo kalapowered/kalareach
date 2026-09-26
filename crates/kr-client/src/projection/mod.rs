@@ -9,7 +9,11 @@
 //! | Module | What it owns |
 //! | --- | --- |
 //! | [`self`] | The screen a client holds, and what it does with each event |
-//! | [`paint`] | Turning that screen into bytes for a destination terminal |
+//! | `paint` | Turning that screen into bytes for a destination terminal, with the `terminal` feature |
+//!
+//! Holding a screen needs nothing but the protocol, so every client holds it with this module,
+//! including one on a system where the terminal state library that measures text does not build.
+//! Only painting measures text, so only `paint` needs that library.
 //!
 //! # What holding a screen means
 //!
@@ -25,6 +29,7 @@
 //! byte arriving. An update that does not match both is refused, and the client asks for a fresh
 //! snapshot rather than applying a change to a screen it never had.
 
+#[cfg(feature = "terminal")]
 pub mod paint;
 
 use std::collections::BTreeMap;
