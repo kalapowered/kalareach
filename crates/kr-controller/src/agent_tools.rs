@@ -390,7 +390,6 @@ impl Installer {
 
     /// Returns whether a recorded entry says this host created the document it is in.
     fn created_document(&self, record: &InstallationRecord, path: &Path) -> bool {
-        let wanted = display(path);
         record.manifest.operations.iter().any(|operation| {
             matches!(
                 operation,
@@ -398,7 +397,7 @@ impl Installer {
                     path: recorded,
                     created_document: true,
                     ..
-                } if *recorded == wanted
+                } if names_path(recorded, path)
             )
         })
     }
@@ -846,7 +845,6 @@ impl Installer {
             let Some(present) = read_digest(&path)? else {
                 continue;
             };
-            let wanted = display(&path);
             // A file this host wrote, or one it was in the middle of writing when an installation
             // stopped, holding exactly the content that record names. The in-flight note counts
             // because the content is evidence for the note: this host was writing those bytes to
@@ -866,7 +864,7 @@ impl Installer {
                         matches!(
                             operation,
                             ChangeOperation::WriteFile { path: recorded_path, digest, .. }
-                                if *recorded_path == wanted && *digest == present
+                                if names_path(recorded_path, &path) && *digest == present
                         )
                     })
             });
@@ -982,7 +980,6 @@ impl Installer {
         except: Option<&Path>,
     ) -> Result<Vec<PathBuf>> {
         let entry_name = format!("{key}.{SERVER_NAME}");
-        let wanted = display(path);
         let listing = match std::fs::read_dir(&self.records) {
             Ok(listing) => listing,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -1024,7 +1021,7 @@ impl Installer {
                             entry: recorded_entry,
                             digest: recorded,
                             ..
-                        } if recorded_path == &wanted
+                        } if names_path(recorded_path, path)
                             && recorded_entry == &entry_name
                             && recorded == digest
                     )
@@ -1206,97 +1203,97 @@ impl Installer {
             // Codex reads repository and user skills from `.agents/skills`, and scopes servers to
             // a project with `.codex/config.toml`.
             (AgentTarget::Codex, User) => Layout {
-                skills: home.join(".agents/skills").join(SKILL_NAME),
+                skills: under(home, &[".agents", "skills", SKILL_NAME]),
                 configuration: Some(Configuration {
-                    path: home.join(".codex/config.toml"),
+                    path: under(home, &[".codex", "config.toml"]),
                     format: Format::CodexToml,
                     shared: false,
                 }),
             },
             (AgentTarget::Codex, Project) => Layout {
-                skills: project()?.join(".agents/skills").join(SKILL_NAME),
+                skills: under(&project()?, &[".agents", "skills", SKILL_NAME]),
                 configuration: Some(Configuration {
-                    path: project()?.join(".codex/config.toml"),
+                    path: under(&project()?, &[".codex", "config.toml"]),
                     format: Format::CodexToml,
                     shared: false,
                 }),
             },
             (AgentTarget::ClaudeCode, User) => Layout {
-                skills: home.join(".claude/skills").join(SKILL_NAME),
+                skills: under(home, &[".claude", "skills", SKILL_NAME]),
                 configuration: Some(Configuration {
-                    path: home.join(".claude.json"),
+                    path: under(home, &[".claude.json"]),
                     format: Format::JsonCommandArgs,
                     shared: false,
                 }),
             },
             (AgentTarget::ClaudeCode, Project) => Layout {
-                skills: project()?.join(".claude/skills").join(SKILL_NAME),
+                skills: under(&project()?, &[".claude", "skills", SKILL_NAME]),
                 configuration: Some(Configuration {
-                    path: project()?.join(".mcp.json"),
+                    path: under(&project()?, &[".mcp.json"]),
                     format: Format::JsonCommandArgs,
                     shared: true,
                 }),
             },
             (AgentTarget::Opencode, User) => Layout {
-                skills: home.join(".config/opencode/skills").join(SKILL_NAME),
+                skills: under(home, &[".config", "opencode", "skills", SKILL_NAME]),
                 configuration: Some(Configuration {
-                    path: home.join(".config/opencode/opencode.json"),
+                    path: under(home, &[".config", "opencode", "opencode.json"]),
                     format: Format::JsonLocalCommandList,
                     shared: false,
                 }),
             },
             (AgentTarget::Opencode, Project) => Layout {
-                skills: project()?.join(".opencode/skills").join(SKILL_NAME),
+                skills: under(&project()?, &[".opencode", "skills", SKILL_NAME]),
                 configuration: Some(Configuration {
-                    path: project()?.join("opencode.json"),
+                    path: under(&project()?, &["opencode.json"]),
                     format: Format::JsonLocalCommandList,
                     shared: false,
                 }),
             },
             (AgentTarget::GeminiCli, User) => Layout {
-                skills: home.join(".gemini/skills").join(SKILL_NAME),
+                skills: under(home, &[".gemini", "skills", SKILL_NAME]),
                 configuration: Some(Configuration {
-                    path: home.join(".gemini/settings.json"),
+                    path: under(home, &[".gemini", "settings.json"]),
                     format: Format::JsonCommandArgs,
                     shared: false,
                 }),
             },
             (AgentTarget::GeminiCli, Project) => Layout {
-                skills: project()?.join(".gemini/skills").join(SKILL_NAME),
+                skills: under(&project()?, &[".gemini", "skills", SKILL_NAME]),
                 configuration: Some(Configuration {
-                    path: project()?.join(".gemini/settings.json"),
+                    path: under(&project()?, &[".gemini", "settings.json"]),
                     format: Format::JsonCommandArgs,
                     shared: false,
                 }),
             },
             (AgentTarget::KimiCodeCli, User) => Layout {
-                skills: home.join(".kimi-code/skills").join(SKILL_NAME),
+                skills: under(home, &[".kimi-code", "skills", SKILL_NAME]),
                 configuration: Some(Configuration {
-                    path: home.join(".kimi-code/mcp.json"),
+                    path: under(home, &[".kimi-code", "mcp.json"]),
                     format: Format::JsonCommandArgs,
                     shared: false,
                 }),
             },
             (AgentTarget::KimiCodeCli, Project) => Layout {
-                skills: project()?.join(".kimi/skills").join(SKILL_NAME),
+                skills: under(&project()?, &[".kimi", "skills", SKILL_NAME]),
                 configuration: Some(Configuration {
-                    path: project()?.join(".mcp.json"),
+                    path: under(&project()?, &[".mcp.json"]),
                     format: Format::JsonCommandArgs,
                     shared: true,
                 }),
             },
             (AgentTarget::QoderCli, User) => Layout {
-                skills: home.join(".qoder/skills").join(SKILL_NAME),
+                skills: under(home, &[".qoder", "skills", SKILL_NAME]),
                 configuration: Some(Configuration {
-                    path: home.join(".qoder/settings.json"),
+                    path: under(home, &[".qoder", "settings.json"]),
                     format: Format::JsonCommandArgs,
                     shared: false,
                 }),
             },
             (AgentTarget::QoderCli, Project) => Layout {
-                skills: project()?.join(".qoder/skills").join(SKILL_NAME),
+                skills: under(&project()?, &[".qoder", "skills", SKILL_NAME]),
                 configuration: Some(Configuration {
-                    path: project()?.join(".mcp.json"),
+                    path: under(&project()?, &[".mcp.json"]),
                     format: Format::JsonCommandArgs,
                     shared: true,
                 }),
@@ -1761,10 +1758,10 @@ fn same_target(left: &ChangeOperation, right: &ChangeOperation) -> bool {
                 entry: right_entry,
                 ..
             },
-        ) => left_path == right_path && left_entry == right_entry,
+        ) => names_path(left_path, Path::new(right_path)) && left_entry == right_entry,
         (left, right) => {
             std::mem::discriminant(left) == std::mem::discriminant(right)
-                && left.path() == right.path()
+                && names_path(left.path(), Path::new(right.path()))
         }
     }
 }
@@ -1824,6 +1821,24 @@ fn deadline_field(agent: AgentTarget) -> Option<(&'static str, Value)> {
 /// nobody agreed to.
 fn deadline_milliseconds(agent: AgentTarget) -> Option<i64> {
     deadline_field(agent).map(|_| QUALIFIED_DEADLINE_SECONDS * 1_000)
+}
+
+/// Returns `base` with `names` joined onto it one at a time.
+///
+/// A name that held a separator would keep it as written, and on Windows a path whose names were
+/// joined two at a time would then be printed and recorded with both separators.
+fn under(base: &Path, names: &[&str]) -> PathBuf {
+    names
+        .iter()
+        .fold(base.to_path_buf(), |path, name| path.join(name))
+}
+
+/// Returns true when a recorded path names `path`.
+///
+/// Compared as paths, not as text: an earlier build joined two names at a time, so on Windows the
+/// records it wrote spell some paths with both separators.
+fn names_path(recorded: &str, path: &Path) -> bool {
+    Path::new(recorded) == path
 }
 
 /// The files an installation writes, in the order it writes them.
@@ -1903,7 +1918,7 @@ mod tests {
         fn installer(&self) -> Installer {
             Installer::new(
                 self.root.join("home"),
-                self.root.join("state/agent-tools"),
+                self.root.join("state").join("agent-tools"),
                 "/opt/kalareach/kr".to_owned(),
             )
         }
