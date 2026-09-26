@@ -1708,6 +1708,80 @@ async fn the_doctor_evidence_names_each_enrolled_repository() {
     assert!(!repository.degraded, "{repository:?}");
 }
 
+/// The configured enrolment budgets bound what `catalogue.add` may ask for: a request above one is
+/// refused by name and enrols nothing, and an allowance configured above an SDK default (metadata
+/// above 64 MiB, a full mirror) admits a request within it.
+#[tokio::test]
+async fn the_configured_budgets_bound_what_an_enrolment_may_ask_for() {
+    use kr_protocol::hostinfo::configuration::EnrolmentBudgets;
+    const MIB: u64 = 1024 * 1024;
+    let host = host();
+    let defaults = EnrolmentBudgets::default();
+    let add = |params: wire::CatalogueAddParams| {
+        let host = &host;
+        async move {
+            host.module
+                .write_frame_admitted(
+                    &mutation(Method::CatalogueAdd, host.environment_id, &params),
+                    Method::CatalogueAdd,
+                    Some(host.confirmations()),
+                )
+                .await
+        }
+    };
+    let listed = || async {
+        let listed: wire::CatalogueListResult = ok(host
+            .module
+            .read_frame(
+                ActorIngress::LocalIpc,
+                &request(
+                    Method::CatalogueList,
+                    &wire::CatalogueListParams {
+                        environment_id: host.environment_id,
+                    },
+                ),
+                None,
+            )
+            .await);
+        listed.catalogues.len()
+    };
+
+    host.module.put_budgets_in_force(EnrolmentBudgets {
+        metadata_bytes: MIB,
+        ..defaults
+    });
+    let refused = refusal(add(add_params(&host)).await);
+    assert_eq!(refused.code, ErrorCode::QuotaExceeded, "{refused:?}");
+    assert!(refused.message.contains("metadata_bytes"), "{refused:?}");
+    assert_eq!(listed().await, 0, "nothing enrolled");
+
+    host.module.put_budgets_in_force(EnrolmentBudgets {
+        full_offline_mirror: false,
+        ..defaults
+    });
+    let mut mirror = add_params(&host);
+    mirror.budgets.full_offline_mirror = true;
+    let refused = refusal(add(mirror).await);
+    assert!(
+        refused.message.contains("full_offline_mirror"),
+        "{refused:?}"
+    );
+    assert_eq!(listed().await, 0, "nothing enrolled");
+
+    host.module.put_budgets_in_force(EnrolmentBudgets {
+        metadata_bytes: 128 * MIB,
+        retained_metadata_bytes: 256 * MIB,
+        full_offline_mirror: true,
+        ..defaults
+    });
+    let mut wide = add_params(&host);
+    wide.budgets.metadata_bytes = U64::new(100 * MIB);
+    wide.budgets.retained_metadata_bytes = U64::new(200 * MIB);
+    wide.budgets.full_offline_mirror = true;
+    let _: wire::CatalogueAddResult = ok(add(wide).await);
+    assert_eq!(listed().await, 1);
+}
+
 /// Counts the workers gave at one admission revision are shown only while that is the revision
 /// the answer renders: a change committed after the workers answered leaves them unknown.
 #[tokio::test]

@@ -417,6 +417,9 @@ impl Controller {
         confirmations: Option<&dyn crate::sharing::OwnerConfirmations>,
         admission: Arc<dyn crate::catalogue::Admission>,
     ) -> crate::catalogue::Answer<kr_protocol::envelope::ParamsValue> {
+        // The configuration's enrolment budgets as the document says them now, for this change.
+        let budgets = crate::config::catalogue::budgets(&self.configuration().ceilings());
+        self.catalogue.put_budgets_in_force(budgets);
         let before = self.catalogue.admission_revision().await.ok();
         let removal = if method == kr_protocol::method::Method::PluginRemove {
             let plugin = crate::catalogue::plugin_named(method, &mutation.params);

@@ -209,6 +209,10 @@ pub struct CatalogueModule {
     /// computed for: rounds at an unchanged revision reuse it. Nothing a snapshot carries moves
     /// without the revision moving, the bridges included (see [`Self::write`]).
     snapshots: Arc<std::sync::Mutex<Option<CachedSnapshot>>>,
+    /// The enrolment budgets this host's configuration puts in force, as the daemon last read
+    /// them: before every catalogue change, so each enrolment and each synchronisation acts on the
+    /// configuration as it is then, never on one read at open.
+    budgets: std::sync::Mutex<kr_protocol::hostinfo::configuration::EnrolmentBudgets>,
     /// Run at each [`TestingPoint`], for tests that hold a computation there.
     #[cfg(feature = "testing")]
     testing_hook: Arc<std::sync::Mutex<Option<TestingHook>>>,
@@ -308,6 +312,9 @@ impl CatalogueModule {
             environment_id,
             bridges,
             snapshots: Arc::new(std::sync::Mutex::new(None)),
+            budgets: std::sync::Mutex::new(
+                kr_protocol::hostinfo::configuration::EnrolmentBudgets::default(),
+            ),
             #[cfg(feature = "testing")]
             testing_hook: Arc::new(std::sync::Mutex::new(None)),
         })
@@ -436,6 +443,26 @@ impl CatalogueModule {
             catalogue.admission_revision().map_err(ProtocolError::from)
         })
         .await
+    }
+
+    /// Puts the enrolment budgets this host's configuration holds in force for the changes that
+    /// follow.
+    pub fn put_budgets_in_force(
+        &self,
+        budgets: kr_protocol::hostinfo::configuration::EnrolmentBudgets,
+    ) {
+        *self
+            .budgets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = budgets;
+    }
+
+    /// Returns the enrolment budgets in force.
+    fn budgets_in_force(&self) -> kr_protocol::hostinfo::configuration::EnrolmentBudgets {
+        *self
+            .budgets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Returns one evidence record per enrolled repository, for the doctor, waiting no later than
@@ -1003,6 +1030,7 @@ impl CatalogueModule {
             Method::CatalogueAdd => {
                 let params: wire::CatalogueAddParams = typed(&mutation.params)?;
                 self.check_environment(params.environment_id)?;
+                within_budgets(&params.budgets, &self.budgets_in_force())?;
                 let enrolment = enrolment_from(&params)?;
                 // Adopting a root is the owner's act. The confirmation names this repository, this
                 // root and this ceiling, so one obtained for a narrower enrolment does not adopt a
@@ -1991,6 +2019,64 @@ fn confirm<'a>(
         .accept(action, action_digest, proof)
         .map_err(|error| error.to_protocol_error())?;
     Ok((confirmations, confirmed))
+}
+
+/// Refuses, by name, an enrolment that asks for more than this host's configuration allows.
+///
+/// The configured budgets bound what a repository may cost here, whatever the SDK's defaults are:
+/// an allowance configured above a default admits a request within it, and one configured below
+/// refuses a request above it.
+fn within_budgets(
+    requested: &wire::CatalogueBudgets,
+    in_force: &kr_protocol::hostinfo::configuration::EnrolmentBudgets,
+) -> Answer<()> {
+    for (name, asked, allowed) in [
+        (
+            "metadata_bytes",
+            requested.metadata_bytes.get(),
+            in_force.metadata_bytes,
+        ),
+        (
+            "metadata_entries",
+            requested.metadata_entries.get(),
+            in_force.metadata_entries,
+        ),
+        (
+            "retained_generations",
+            requested.retained_generations.get(),
+            in_force.retained_generations,
+        ),
+        (
+            "retained_metadata_bytes",
+            requested.retained_metadata_bytes.get(),
+            in_force.retained_metadata_bytes,
+        ),
+        (
+            "cached_payload_bytes",
+            requested.payload_cache_bytes.get(),
+            in_force.cached_payload_bytes,
+        ),
+    ] {
+        if asked > allowed {
+            return Err(ProtocolError::new(
+                ErrorCode::QuotaExceeded,
+                format!(
+                    "the enrolment asks for {asked} of {name}, and this host's configuration \
+                     allows {allowed}; ask for less, or raise {name} in the configuration's \
+                     enrolment budgets"
+                ),
+            ));
+        }
+    }
+    if requested.full_offline_mirror && !in_force.full_offline_mirror {
+        return Err(ProtocolError::new(
+            ErrorCode::QuotaExceeded,
+            "the enrolment asks for a full offline mirror, and this host's configuration does \
+             not allow one; ask for none, or set full_offline_mirror in the configuration's \
+             enrolment budgets",
+        ));
+    }
+    Ok(())
 }
 
 fn enrolment_from(params: &wire::CatalogueAddParams) -> Answer<Enrolment> {
