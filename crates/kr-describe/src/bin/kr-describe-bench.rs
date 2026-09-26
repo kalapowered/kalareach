@@ -438,7 +438,7 @@ fn run(profile: &ModelProfile, cache: &Path) -> Result<(), String> {
 
     let conditions = platform::read_conditions();
     let mut ledger = LatencyLedger::new();
-    let mut published = BTreeMap::new();
+    let mut outcomes = BTreeMap::new();
 
     let stop_workload = Arc::new(AtomicBool::new(false));
     let stop_clone = stop_workload.clone();
@@ -513,9 +513,7 @@ fn run(profile: &ModelProfile, cache: &Path) -> Result<(), String> {
         if sessions > MAX_SESSIONS {
             continue;
         }
-        let mut described = 0_u32;
-        let mut deadline_exceeded = 0_u32;
-        let mut rejected = 0_u32;
+        let mut ended = Outcomes::default();
         let mut session_ids = Vec::with_capacity(sessions as usize);
         for seed in 0..sessions {
             let session_id = SessionId::new(Uuid::from_bytes([
@@ -566,27 +564,31 @@ fn run(profile: &ModelProfile, cache: &Path) -> Result<(), String> {
             let elapsed_ms = started.elapsed().as_millis() as u64;
             match tick {
                 Tick::Published { queue_wait_ms, .. } => {
-                    described += 1;
+                    ended.described += 1;
                     ledger.record(sessions, queue_wait_ms, elapsed_ms);
                 }
-                Tick::DeadlineExceeded { .. } => deadline_exceeded += 1,
+                Tick::DeadlineExceeded { .. } => ended.past_deadline += 1,
                 Tick::Rejected { rejection, .. } => {
-                    rejected += 1;
+                    ended.refused += 1;
                     eprintln!("rejected at {sessions} sessions: {}", rejection.as_str());
                 }
                 Tick::ResourcePaused { reason, .. } => {
+                    ended.paused += 1;
                     println!(
                         "resource_paused at {sessions} sessions: {} [{machine}]",
                         reason.as_str()
                     );
                 }
-                other => eprintln!("unexpected tick at {sessions} sessions: {other:?}"),
+                other => {
+                    ended.other += 1;
+                    eprintln!("unexpected tick at {sessions} sessions: {other:?}");
+                }
             }
         }
         for session_id in &session_ids {
             service.session_closed(session_id, reading_now());
         }
-        published.insert(sessions, (described, deadline_exceeded, rejected));
+        outcomes.insert(sessions, ended);
     }
 
     bench_sampling.store(false, Ordering::Release);
@@ -630,25 +632,8 @@ fn run(profile: &ModelProfile, cache: &Path) -> Result<(), String> {
         &mut unmet,
     );
 
-    for reading in ledger.published() {
-        report(
-            "queue_wait",
-            reading.sessions,
-            &reading.queue_wait,
-            &machine,
-        );
-        report("execution", reading.sessions, &reading.execution, &machine);
-        let (described, deadline_exceeded, rejected) = published
-            .get(&reading.sessions)
-            .copied()
-            .unwrap_or((0, 0, 0));
-        println!(
-            "sessions {}: described {described}, past the deadline {deadline_exceeded}, refused {rejected} [{machine}]",
-            reading.sessions
-        );
-    }
-    for unmeasured in ledger.unmeasured() {
-        println!("sessions {unmeasured}: not measured on this run [{machine}]");
+    for line in session_lines(&ledger, &outcomes, &machine) {
+        println!("{line}");
     }
 
     // The honest resource-paused case, on the same host that has just been publishing: an owner
@@ -715,7 +700,7 @@ fn run(profile: &ModelProfile, cache: &Path) -> Result<(), String> {
         unmet.push(format!("the resource-pause case did not pause: {paused:?}"));
     }
 
-    let total: u32 = published.values().map(|(described, _, _)| described).sum();
+    let total: u32 = outcomes.values().map(|ended| ended.described).sum();
     if total == 0 {
         unmet.push("no description was produced, so nothing here is a measurement".to_owned());
     } else {
@@ -743,15 +728,81 @@ fn verify(asset: &Asset, path: &Path) -> Result<(), String> {
     })
 }
 
-fn report(kind: &str, sessions: u32, distribution: &Distribution, machine: &str) {
-    println!(
+/// How the ticks of one session count's pass ended.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Outcomes {
+    /// A description was produced and published.
+    described: u32,
+    /// The job passed its deadline.
+    past_deadline: u32,
+    /// The job ran and its result was refused.
+    refused: u32,
+    /// The resource policy admitted no inference.
+    paused: u32,
+    /// Anything else a tick can end in.
+    other: u32,
+}
+
+impl std::fmt::Display for Outcomes {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "described {}, past the deadline {}, refused {}, paused {}, other {}",
+            self.described, self.past_deadline, self.refused, self.paused, self.other
+        )
+    }
+}
+
+/// What each of section 22's session counts did, in the order it names them: the two latencies
+/// where a description was published, and in every case how its ticks ended. A count that
+/// published nothing says so with those counts beside it, so a record of it says why nothing was
+/// measured: every job past its deadline, refused, or held by the resource pause.
+fn session_lines(
+    ledger: &LatencyLedger,
+    outcomes: &BTreeMap<u32, Outcomes>,
+    machine: &str,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    for sessions in PUBLISHED_SESSION_COUNTS {
+        let ended = outcomes.get(&sessions).copied().unwrap_or_default();
+        match ledger.reading(sessions) {
+            Some(reading) => {
+                lines.push(distribution_line(
+                    "queue_wait",
+                    sessions,
+                    &reading.queue_wait,
+                    machine,
+                ));
+                lines.push(distribution_line(
+                    "execution",
+                    sessions,
+                    &reading.execution,
+                    machine,
+                ));
+                lines.push(format!("sessions {sessions}: {ended} [{machine}]"));
+            }
+            None => lines.push(format!(
+                "sessions {sessions}: not measured on this run: {ended} [{machine}]"
+            )),
+        }
+    }
+    lines
+}
+
+fn distribution_line(
+    kind: &str,
+    sessions: u32,
+    distribution: &Distribution,
+    machine: &str,
+) -> String {
+    format!(
         "{kind}_ms at {sessions} sessions: p50 {} p95 {} p99 {} max {} over {} samples [{machine}]",
         distribution.p50_ms,
         distribution.p95_ms,
         distribution.p99_ms,
         distribution.max_ms,
         distribution.samples
-    );
+    )
 }
 
 /// The target triple this build runs on, which a profile has to list.
@@ -766,5 +817,77 @@ const fn current_target() -> &'static str {
         "x86_64-unknown-linux-gnu"
     } else {
         "x86_64-pc-windows-msvc"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use kr_describe::metrics::LatencyLedger;
+
+    use super::{Outcomes, session_lines};
+
+    #[test]
+    fn a_count_that_published_nothing_says_how_its_jobs_ended() {
+        let outcomes = BTreeMap::from([(
+            1,
+            Outcomes {
+                past_deadline: 1,
+                ..Outcomes::default()
+            },
+        )]);
+        let lines = session_lines(&LatencyLedger::new(), &outcomes, "a host");
+        assert!(
+            lines.contains(
+                &"sessions 1: not measured on this run: described 0, past the deadline 1, refused \
+                  0, paused 0, other 0 [a host]"
+                    .to_owned()
+            ),
+            "{lines:#?}"
+        );
+    }
+
+    #[test]
+    fn a_count_that_published_prints_its_latencies_as_before() {
+        let mut ledger = LatencyLedger::new();
+        ledger.record(5, 12, 340);
+        let outcomes = BTreeMap::from([(
+            5,
+            Outcomes {
+                described: 1,
+                paused: 2,
+                ..Outcomes::default()
+            },
+        )]);
+        let lines = session_lines(&ledger, &outcomes, "a host");
+        let at_five: Vec<&str> = lines
+            .iter()
+            .map(String::as_str)
+            .filter(|line| line.contains(" 5 sessions") || line.starts_with("sessions 5:"))
+            .collect();
+        assert_eq!(
+            at_five,
+            [
+                "queue_wait_ms at 5 sessions: p50 12 p95 12 p99 12 max 12 over 1 samples [a host]",
+                "execution_ms at 5 sessions: p50 340 p95 340 p99 340 max 340 over 1 samples \
+                 [a host]",
+                "sessions 5: described 1, past the deadline 0, refused 0, paused 2, other 0 [a host]",
+            ],
+        );
+    }
+
+    #[test]
+    fn every_published_count_has_a_line_in_order() {
+        let lines = session_lines(&LatencyLedger::new(), &BTreeMap::new(), "a host");
+        assert_eq!(
+            lines,
+            [1, 5, 20, 50]
+                .map(|sessions| format!(
+                    "sessions {sessions}: not measured on this run: described 0, past the \
+                     deadline 0, refused 0, paused 0, other 0 [a host]"
+                ))
+                .to_vec(),
+        );
     }
 }
