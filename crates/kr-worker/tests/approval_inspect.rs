@@ -57,6 +57,10 @@ use kr_worker::runtime::SessionRuntime;
 use kr_worker::service::{ServiceBinding, WorkerService};
 use kr_worker::session::{Session as TerminalSession, SessionConfig};
 
+mod common;
+
+use common::LIVENESS_DEADLINE;
+
 /// When the upstream's request arrived, which is when the broker recorded its source frame.
 const RECORDED_AT: TimestampMs = TimestampMs::new(2);
 
@@ -244,7 +248,9 @@ async fn host() -> Host {
         session_epoch: SessionEpoch::V1,
         environment_id,
         display_number: DisplayNumber::new(1),
-        shell: kr_worker::testing::posix_script("sleep 30"),
+        // A shell that lasts as long as the session does: it ends when the session closes its
+        // terminal, not at a time of its own.
+        shell: kr_worker::testing::posix_script("exec cat"),
         shell_mode: ShellMode::NativeCompat,
         worker_profile: WorkerProfile::HeadlessUser,
         desktop: DesktopBinding::none(),
@@ -419,11 +425,22 @@ fn params(
     }
 }
 
+/// Waits for one exchange with the worker, and fails the test naming what it waited for rather
+/// than hanging when a handler stops answering.
+async fn within<T>(what: &str, work: impl std::future::Future<Output = T>) -> T {
+    tokio::time::timeout(LIVENESS_DEADLINE, work)
+        .await
+        .unwrap_or_else(|_| panic!("{what} within {LIVENESS_DEADLINE:?}"))
+}
+
 /// The client library a person's client uses, on this worker's own socket.
 async fn client(host: &Host) -> kr_client::Session {
-    let transport = IpcTransport::connect(&host.endpoint, build())
-        .await
-        .expect("a local connection");
+    let transport = within(
+        "a local connection",
+        IpcTransport::connect(&host.endpoint, build()),
+    )
+    .await
+    .expect("a local connection");
     kr_client::Session::start(transport.shared()).expect("a session")
 }
 
@@ -432,7 +449,7 @@ async fn inspect(
     client: &kr_client::Session,
     params: &AgentApprovalInspectParams,
 ) -> Result<AgentApprovalInspectResult, ProtocolError> {
-    match client.inspect_approval(params).await {
+    match within("the worker's answer", client.inspect_approval(params)).await {
         Ok(record) => Ok(record),
         Err(kr_client::ClientError::Host(error)) => Err(error),
         Err(other) => panic!("the host answers the read: {other}"),
@@ -441,36 +458,44 @@ async fn inspect(
 
 /// Connects as the control daemon and proves the generation this worker accepts.
 async fn daemon(host: &Host) -> LocalClient {
-    let mut daemon = LocalClient::connect(&host.endpoint, LocalClientKind::Controller, build())
-        .await
-        .expect("connects as the daemon");
+    let mut daemon = within(
+        "the daemon's connection",
+        LocalClient::connect(&host.endpoint, LocalClientKind::Controller, build()),
+    )
+    .await
+    .expect("connects as the daemon");
     let identity = Arc::clone(&host.controller);
     let boot = host.boot.clone();
-    daemon
-        .present_generation(move |nonce| {
+    within(
+        "the worker's acceptance of the generation",
+        daemon.present_generation(move |nonce| {
             identity
                 .generation_token(ControllerGeneration::new(1), &boot, nonce)
                 .map_err(kr_ipc::IpcError::from)
-        })
-        .await
-        .expect("the worker accepts the generation");
+        }),
+    )
+    .await
+    .expect("the worker accepts the generation");
     daemon
 }
 
 /// Writes one frame and returns the worker's answer to it.
 async fn exchange(client: &mut LocalClient, frame: ControlFrame) -> Outcome {
-    client
-        .writer()
-        .write_message(&frame)
-        .await
-        .expect("writes the frame");
-    loop {
-        match client.recv().await.expect("the worker answers") {
-            ControlFrame::Response(response) => return response.outcome,
-            ControlFrame::Notification(_) | ControlFrame::Event(_) => {}
-            other => panic!("the worker answered {other:?}"),
+    within("the worker's answer", async {
+        client
+            .writer()
+            .write_message(&frame)
+            .await
+            .expect("writes the frame");
+        loop {
+            match client.recv().await.expect("the worker answers") {
+                ControlFrame::Response(response) => return response.outcome,
+                ControlFrame::Notification(_) | ControlFrame::Event(_) => {}
+                other => panic!("the worker answered {other:?}"),
+            }
         }
-    }
+    })
+    .await
 }
 
 /// The envelope the control daemon vouches for a paired device acting under a grant.
@@ -679,9 +704,12 @@ async fn kr_req_11_26_the_record_says_where_the_request_stands_once_answered() {
         .expect("the record before the answer");
     assert_eq!(before.state, PendingState::Pending);
 
-    let mut owner = LocalClient::connect(&host.endpoint, LocalClientKind::Cli, build())
-        .await
-        .expect("connects");
+    let mut owner = within(
+        "a local connection",
+        LocalClient::connect(&host.endpoint, LocalClientKind::Cli, build()),
+    )
+    .await
+    .expect("connects");
     let answer = MutationRequest {
         request_id: RequestId::new(21),
         method: Method::AgentApprovalRespond.into(),
@@ -915,34 +943,57 @@ async fn a_record_larger_than_the_peers_frame_is_refused_with_its_size() {
         max_control_frame_len: U64::new(64 * 1024),
         ..kr_protocol::hello::ReceiveLimits::default()
     };
-    let mut peer =
-        LocalClient::connect_receiving(&host.endpoint, LocalClientKind::Cli, build(), limits)
-            .await
-            .expect("connects");
+    let mut peer = within(
+        "a local connection",
+        LocalClient::connect_receiving(&host.endpoint, LocalClientKind::Cli, build(), limits),
+    )
+    .await
+    .expect("connects");
+    // What the record costs in canonical bytes, which is what the refusal has to name beside what
+    // the peer can receive.
+    let required = kr_cbor::to_canonical_vec(
+        &host
+            .service
+            .broker()
+            .inspect_approval(&params(&host, instance(), large))
+            .expect("the broker reads the record"),
+    )
+    .expect("the record encodes")
+    .len();
+    assert!(required > 64 * 1024, "the record is past the peer's frame");
 
-    let refused = peer
-        .request(
+    let refused = within(
+        "the worker's answer",
+        peer.request(
             Method::AgentApprovalInspect,
             &params(&host, instance(), large),
-        )
-        .await
-        .expect("the worker answers");
+        ),
+    )
+    .await
+    .expect("the worker answers");
     let error = refused.expect_err("a record past the peer's frame is refused");
     assert_eq!(error.code, ErrorCode::InvalidArgument);
+    assert!(
+        error.message.contains(&required.to_string()),
+        "the refusal says what the record needs: {}",
+        error.message
+    );
     assert!(
         error.message.contains(&(64 * 1024).to_string()),
         "the refusal says what the peer can receive: {}",
         error.message
     );
 
-    let read = peer
-        .request(
+    let read = within(
+        "the worker's answer",
+        peer.request(
             Method::AgentApprovalInspect,
             &params(&host, instance(), small),
-        )
-        .await
-        .expect("the worker answers")
-        .expect("a record that fits is read on the same connection");
+        ),
+    )
+    .await
+    .expect("the worker answers")
+    .expect("a record that fits is read on the same connection");
     let record: AgentApprovalInspectResult = read.to_typed().expect("the record decodes");
     assert_eq!(record.resource_id, small);
 }
