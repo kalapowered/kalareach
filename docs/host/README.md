@@ -4442,12 +4442,13 @@ were answered at, and a snapshot says how many entries the history filter withhe
 range the reader asked for had been evicted. A gap is reported, never filled: nothing reconstructs an
 unobserved pending approval from a transcript or a screen.
 
-A local caller reads the whole retained agent history, because its authority is the
-operating-system identity the listener authenticated and there is no grant to narrow — the same
-rule that draws a local attachment the whole screen. A *forwarded* read is refused rather than
+The local owner reads the whole retained agent history, because its authority is the
+operating-system identity the listener authenticated and there is no grant to narrow: the same rule
+that draws a local attachment the whole screen. Every other caller acts under a grant, whichever
+socket the daemon heard it on, and its read is refused as `UNSUPPORTED_CAPABILITY` rather than
 answered. Section 10 narrows a grant's history in one place, the shared host-side filter, and the
-broker's retained agent history is not one of the surfaces that filter admits, so answering a
-forwarded read would give a device more than its grant covers.
+grant's history scope does not reach the worker with a forwarded read, so an answer could give the
+caller more than its grant covers.
 
 `agent.approval.inspect` reads what the approval ledger keeps for one pending resource of the
 instance it names: whose decoder read the request (the plugin, its publisher and the installed
