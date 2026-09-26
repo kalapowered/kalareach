@@ -170,35 +170,23 @@ fn start_daemon(
         .append(true)
         .open(host.root().join("daemon.log"))
         .expect("opens the daemon's log");
-    let mut attempted = 0;
-    loop {
-        attempted += 1;
-        let started = std::process::Command::new(program)
-            .args([
-                "--exact",
-                DAEMON_HALF,
-                "--include-ignored",
-                "--nocapture",
-                "--test-threads",
-                "1",
-            ])
-            .env(ROOT, host.root())
-            .env(WORKER, worker)
-            .current_dir(host.root())
-            .stdin(std::process::Stdio::null())
-            .stdout(log.try_clone().expect("duplicates the log"))
-            .stderr(log.try_clone().expect("duplicates the log"))
-            .spawn();
-        match started {
-            Ok(child) => return child,
-            Err(error)
-                if error.kind() == std::io::ErrorKind::ExecutableFileBusy && attempted < 100 =>
-            {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            Err(error) => panic!("the daemon starts, after {attempted} attempts: {error:?}"),
-        }
-    }
+    std::process::Command::new(program)
+        .args([
+            "--exact",
+            DAEMON_HALF,
+            "--include-ignored",
+            "--nocapture",
+            "--test-threads",
+            "1",
+        ])
+        .env(ROOT, host.root())
+        .env(WORKER, worker)
+        .current_dir(host.root())
+        .stdin(std::process::Stdio::null())
+        .stdout(log.try_clone().expect("duplicates the log"))
+        .stderr(log)
+        .spawn()
+        .unwrap_or_else(|error| panic!("the daemon starts: {error:?}"))
 }
 
 /// Connects to the daemon once it answers.
@@ -431,12 +419,13 @@ async fn a_daemon_killed_during_output_leaves_local_work_running_and_a_reconnect
         &worker,
         &["--version"],
     );
+    // Placed by a process of its own, so no child this test starts is handed a descriptor that
+    // holds the copy open for writing when the copy is started.
     let program = host.root().join("kill-test-daemon");
-    std::fs::copy(
-        std::env::current_exe().expect("this test's own executable"),
+    kr_ipc::testing::place_program(
+        &std::env::current_exe().expect("this test's own executable"),
         &program,
-    )
-    .expect("copies the daemon half");
+    );
     let mut started = Started {
         daemon: Some(start_daemon(&program, &host, &worker)),
         tree: host.holder(),
