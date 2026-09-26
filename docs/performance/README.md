@@ -30,8 +30,9 @@ reading that could not be taken, a count that went backwards, and a process tabl
 show the whole machine.
 
 On Linux, where the kernel keeps each thread's own time (`/proc/<pid>/task/<tid>/schedstat`, in
-nanoseconds), the reader takes the run's processes' time thread by thread rather than from each
-process's clock ticks, which are the same counts rounded down. It reads each thread's time twice,
+nanoseconds), the reader also takes the run's processes' time thread by thread, beside each
+process's clock ticks, which are the same counts summed and rounded down. It reads each thread's
+time twice,
 at least two clock ticks apart, and then its state and start. A thread counts over a stretch when it
 was read at both ends of it, known by its identifier and start: one that ends inside the stretch
 loses its time since the first reading, and one first read inside it counts nothing, so the sum can

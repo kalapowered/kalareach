@@ -108,8 +108,8 @@ pub struct Process {
     /// The most `own` can trail the time charged to the process when its row was read: what its
     /// running threads can have used since the kernel last brought their time up to date.
     pub lag: f64,
-    /// Its threads, where the reading took the time of each; the tally then counts them rather than
-    /// `own`.
+    /// Its threads, where the reading took the time of each; the tally then counts the larger of the
+    /// least their times give and the least `own` gives.
     pub threads: Option<Threads>,
 }
 
