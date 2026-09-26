@@ -11,4 +11,6 @@
 pub mod machine;
 pub mod other_work;
 pub mod process;
+#[cfg(any(target_os = "linux", test))]
+mod procfs;
 pub mod record;

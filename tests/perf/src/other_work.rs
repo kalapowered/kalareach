@@ -18,12 +18,24 @@
 //!   run's stays the run's whatever it is reparented to. A process is known by its identifier and
 //!   when it started, so an identifier the system reuses names a new process, and a parent counts as
 //!   one only when the process holding its identifier was read both before and after the child's
-//!   row, so that it held the identifier when that row was read. The least a run process used over a stretch
-//!   is its time at the last reading in the stretch less its time at the first, less the rounding
-//!   of the two (`time_resolution`) and less what its time can have trailed at the first reading
-//!   (`lag`), and never less than nothing. A process that first appears inside the stretch started
-//!   after the reading before it began, so all of its time is inside the stretch. Anything else, a
-//!   process whose row could not be read among it, counts as nothing.
+//!   row, so that it held the identifier when that row was read. The least a run process used over a
+//!   stretch is its time at the last reading in the stretch less its time at the first, less the
+//!   rounding of the two (`time_resolution`) and less what its time can have trailed at the first
+//!   reading (`lag`), and never less than nothing. A process that first appears inside the stretch
+//!   started after the reading before it began, so all of its time is inside the stretch. Anything
+//!   else, a process whose row could not be read among it, counts as nothing.
+//! * Where a reading took a process's time thread by thread ([`Threads`]), the least is the same
+//!   difference taken for each thread read at both ends, a thread known by its identifier and start.
+//!   A thread that ends inside the stretch loses its time since the first reading, and one first
+//!   read inside it counts nothing, since a listing of a process's threads can miss one; either way
+//!   the least falls short of what the run used, never beyond it. One match needs more: a thread
+//!   other than the first that execs takes the first thread's identifier and start with its own,
+//!   older time. So the first thread counts only where the process's row at the stretch's first
+//!   reading gave it one thread, so that any later taker was created after that row, or where
+//!   another thread matched at the end had started before the first thread was read at the first
+//!   reading, since an exec after that read would have ended it before the end reading read it, and
+//!   the end reading reads the first thread first. A process read as a whole at one end and by
+//!   threads at the other counts nothing.
 //!
 //! A window of five seconds can start anywhere between two readings, so the bound for the windows
 //! that start between two readings is the bound over the shortest run of readings that covers every
@@ -90,11 +102,41 @@ pub struct Process {
     /// When it started, in units that order the processes of one machine. With the identifier it
     /// names the process.
     pub start: u64,
-    /// The processor time the operating system charges to the process, in seconds.
+    /// The processor time the operating system charges to the process as a whole, in seconds.
     pub own: f64,
     /// The most `own` can trail the time charged to the process when its row was read: what its
     /// running threads can have used since the kernel last brought their time up to date.
     pub lag: f64,
+    /// Its threads, where the reading took the time of each; the tally then counts them rather than
+    /// `own`.
+    pub threads: Option<Threads>,
+}
+
+/// A process's threads, as one reading took them.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Threads {
+    /// Whether the process's row, read before its threads, gave it one thread.
+    pub alone: bool,
+    /// Each thread whose time could be read, the process's first thread first where it could.
+    pub each: Vec<Thread>,
+}
+
+/// One thread's time.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Thread {
+    /// Its identifier, which for the process's first thread is the process's own.
+    pub tid: u32,
+    /// When it started, in the units of a process's start. With the identifier it names the thread,
+    /// except where another thread of the process execs and takes the first thread's place.
+    pub start: u64,
+    /// The processor time the kernel charges to the thread, in seconds, to the nanosecond.
+    pub own: f64,
+    /// The most `own` can trail the thread's real time when it was read: one clock tick for a thread
+    /// that was running, and for any other what it ran in the two ticks after, up to a tick.
+    pub lag: f64,
+    /// Whether it started before the reading read the process's first thread, so that an exec after
+    /// that read would have ended it.
+    pub older: bool,
 }
 
 /// What a run of readings shows.
@@ -125,12 +167,14 @@ struct Kept {
     time_resolution: f64,
 }
 
-/// A run process's time at one reading, with how far it can trail.
-#[derive(Clone, Copy)]
+/// A run process's time at one reading, with how far it can trail, and its threads where the
+/// reading took them.
+#[derive(Clone)]
 struct Time {
     reading: usize,
     own: f64,
     lag: f64,
+    threads: Option<Threads>,
 }
 
 /// The readings of one run, taken in order.
@@ -169,6 +213,36 @@ impl Tally {
             times: HashMap::new(),
             readings: Vec::new(),
         }
+    }
+
+    /// The processes in `rows`, a reading's process table, that can be the run's: its own process,
+    /// every process known as the run's that holds the same identifier and start, and every process
+    /// below one of those through the rows' parent identifiers. A reading takes their threads' times,
+    /// and no other process's time is ever counted, so it need take no other's.
+    #[must_use]
+    pub fn candidates(&self, rows: &[Row]) -> HashSet<u32> {
+        let mut candidates = HashSet::new();
+        let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+        for row in rows {
+            if let Row::Read(process) = row {
+                if process.pid == self.run || self.ours.contains(&(process.pid, process.start)) {
+                    candidates.insert(process.pid);
+                }
+                children
+                    .entry(process.parent)
+                    .or_default()
+                    .push(process.pid);
+            }
+        }
+        let mut below: Vec<u32> = candidates.iter().copied().collect();
+        while let Some(parent) = below.pop() {
+            for child in children.get(&parent).into_iter().flatten() {
+                if candidates.insert(*child) {
+                    below.push(*child);
+                }
+            }
+        }
+        candidates
     }
 
     /// Takes the next reading.
@@ -318,7 +392,7 @@ impl Tally {
         // work that was not done.
         for key in &joined_now {
             if let Some(time) = self.previous_times.get(key) {
-                self.times.entry(*key).or_default().push(*time);
+                self.times.entry(*key).or_default().push(time.clone());
             }
         }
         let mut current_times: HashMap<Key, Time> = HashMap::with_capacity(processes.len());
@@ -328,16 +402,15 @@ impl Tally {
                 reading: number,
                 own: process.own,
                 lag: process.lag,
+                threads: process.threads.clone(),
             };
+            if self.ours.contains(&key) {
+                let times = self.times.entry(key).or_default();
+                if !times.last().is_some_and(|last| process.own < last.own) {
+                    times.push(time.clone());
+                }
+            }
             current_times.insert(key, time);
-            if !self.ours.contains(&key) {
-                continue;
-            }
-            let times = self.times.entry(key).or_default();
-            if times.last().is_some_and(|last| process.own < last.own) {
-                continue;
-            }
-            times.push(time);
         }
         self.previous_times = current_times;
 
@@ -437,25 +510,74 @@ impl Tally {
                 continue;
             };
             if let Some(first) = times.iter().find(|time| time.reading == from) {
-                let shown = latest.own - first.own;
-                let kept = (shown - first.lag - rounding).max(0.0);
-                least += kept;
-                set_aside += shown - kept;
+                match (&first.threads, &latest.threads) {
+                    (None, None) => {
+                        let shown = latest.own - first.own;
+                        let kept = (shown - first.lag - rounding).max(0.0);
+                        least += kept;
+                        set_aside += shown - kept;
+                    }
+                    (Some(before), Some(after)) => {
+                        let (kept, aside) = threads_least(key.0, before, after);
+                        least += kept;
+                        set_aside += aside;
+                    }
+                    // Read as a whole at one end and by threads at the other: the two are not the
+                    // same count, so neither end says what was used between them.
+                    _ => {}
+                }
             } else if self
                 .appeared
                 .get(key)
                 .is_some_and(|&appeared| appeared > from && appeared <= latest.reading)
             {
-                least += latest.own;
+                least += match &latest.threads {
+                    Some(threads) => threads.each.iter().map(|thread| thread.own).sum(),
+                    None => latest.own,
+                };
             }
         }
         (least, set_aside)
     }
 }
 
+/// The least process `pid`'s threads can have used between two readings that took them, and how
+/// much of what their times show was set aside for trailing. Each thread read at both ends, known by
+/// its identifier and start, counts its difference less its allowance at the first, never less than
+/// nothing; the process's first thread counts only on the conditions the module comment gives.
+fn threads_least(pid: u32, before: &Threads, after: &Threads) -> (f64, f64) {
+    let at_first: HashMap<(u32, u64), &Thread> = before
+        .each
+        .iter()
+        .map(|thread| ((thread.tid, thread.start), thread))
+        .collect();
+    let first_counts = before.alone
+        || after.each.iter().any(|thread| {
+            thread.tid != pid
+                && at_first
+                    .get(&(thread.tid, thread.start))
+                    .is_some_and(|earlier| earlier.older)
+        });
+    let (mut least, mut set_aside) = (0.0, 0.0);
+    for thread in &after.each {
+        if thread.tid == pid && !first_counts {
+            continue;
+        }
+        let Some(earlier) = at_first.get(&(thread.tid, thread.start)) else {
+            continue;
+        };
+        let shown = thread.own - earlier.own;
+        least += (shown - earlier.lag).max(0.0);
+        set_aside += shown.clamp(0.0, earlier.lag);
+    }
+    (least, set_aside)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Process, Reading, Row, Tally};
+    use std::collections::HashSet;
+
+    use super::{Process, Reading, Row, Tally, Thread, Threads};
 
     const RUN: u32 = 500;
     const PROCESSORS: u32 = 4;
@@ -467,6 +589,7 @@ mod tests {
             start,
             own,
             lag: 0.0,
+            threads: None,
         })
     }
 
@@ -811,6 +934,101 @@ mod tests {
         ])
         .unwrap();
         assert!(close(summary.bound, 4.0), "{summary:?}");
+    }
+
+    /// A row whose time was taken thread by thread: `threads` as (identifier, own), each started
+    /// long before the reading and read asleep.
+    fn threaded(pid: u32, parent: u32, start: u64, threads: &[(u32, f64)]) -> Row {
+        Row::Read(Process {
+            pid,
+            parent,
+            start,
+            own: 0.0,
+            lag: 0.0,
+            threads: Some(Threads {
+                alone: threads.len() == 1,
+                each: threads
+                    .iter()
+                    .map(|&(tid, own)| Thread {
+                        tid,
+                        start,
+                        own,
+                        lag: 0.0,
+                        older: true,
+                    })
+                    .collect(),
+            }),
+        })
+    }
+
+    #[test]
+    fn the_candidates_are_the_run_and_everything_below_it() {
+        let mut tally = Tally::new(RUN);
+        let first = reading(
+            0.0,
+            0.0,
+            &[
+                process(600, RUN, 20, 0.0),
+                process(601, 600, 21, 0.0),
+                process(700, 1, 30, 0.0),
+            ],
+        );
+        assert_eq!(
+            tally.candidates(&first.rows),
+            HashSet::from([RUN, 600, 601])
+        );
+        tally.add(&first).unwrap();
+        tally
+            .add(&reading(
+                2.0,
+                0.0,
+                &[process(600, RUN, 20, 0.0), process(601, 600, 21, 0.0)],
+            ))
+            .unwrap();
+        // Once the run's, still the run's when reparented; an identifier that passes to a process
+        // outside the run is not the run's, and a new child of a run process is.
+        let later = reading(
+            4.0,
+            0.0,
+            &[
+                process(600, 1, 20, 0.0),
+                process(601, 1, 99, 0.0),
+                process(602, 600, 100, 0.0),
+            ],
+        );
+        assert_eq!(
+            tally.candidates(&later.rows),
+            HashSet::from([RUN, 600, 602])
+        );
+    }
+
+    #[test]
+    fn a_process_read_whole_at_one_end_and_by_threads_at_the_other_counts_nothing() {
+        let summary = tally(&[
+            busy(0.0, 0.0, &[process(600, RUN, 20, 1.0)]),
+            busy(2.0, 2.0, &[threaded(600, RUN, 20, &[(600, 3.0)])]),
+        ])
+        .unwrap();
+        assert!(close(summary.bound, 1.0), "{summary:?}");
+    }
+
+    #[test]
+    fn a_process_that_appears_counts_all_its_threads_time() {
+        let summary = tally(&[
+            busy(0.0, 0.0, &[]),
+            busy(
+                2.0,
+                3.0,
+                &[threaded(600, RUN, 20, &[(600, 1.0), (601, 2.0)])],
+            ),
+            busy(
+                4.0,
+                3.0,
+                &[threaded(600, RUN, 20, &[(600, 1.0), (601, 2.0)])],
+            ),
+        ])
+        .unwrap();
+        assert!(close(summary.bound, 0.0), "{summary:?}");
     }
 
     #[test]
