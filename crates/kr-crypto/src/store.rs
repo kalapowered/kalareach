@@ -305,20 +305,21 @@ impl FileStore {
         path
     }
 
-    /// Flushes each directory from the store's own down to `scope` into the one above it, so that
-    /// each of their names survives a crash.
-    fn flush_scope(&self, scope: &Path) -> Result<()> {
+    /// The directories from the one below the store's own down to `scope`, in that order.
+    fn scope_chain(&self, scope: &Path) -> Result<Vec<PathBuf>> {
         let below = scope
             .strip_prefix(&self.directory)
             .map_err(|_| CryptoError::SecretStore {
                 message: format!("{} is outside the store", scope.display()),
             })?;
-        let mut above = self.directory.clone();
-        for part in below.components() {
-            flush(&above, kr_flush::NameKind::Directory)?;
-            above.push(part);
-        }
-        Ok(())
+        let mut directory = self.directory.clone();
+        Ok(below
+            .components()
+            .map(|part| {
+                directory.push(part);
+                directory.clone()
+            })
+            .collect())
     }
 
     /// Rejects a path whose own entry or any directory below the store root is a link.
@@ -362,16 +363,12 @@ impl SecretStore for FileStore {
         // Nothing is created until the path is known to be inside the store: a link left where a
         // scope directory would go must not cause a directory to appear on the other side of it.
         self.reject_links(&path)?;
-        std::fs::create_dir_all(parent).map_err(|error| CryptoError::SecretStore {
-            message: format!("create {}: {error}", parent.display()),
-        })?;
+        // A directory's name is an entry in the one above it, and a crash can undo a directory made
+        // just now as it can undo a file's name. Every directory this store makes for a scope is
+        // confirmed in the one above it before a secret is written into it.
+        confirm_directories(&self.scope_chain(parent)?)?;
         self.reject_links(&path)?;
         set_mode(parent, 0o700)?;
-        // A directory's name is an entry in the one above it, and a crash can undo a directory
-        // made just now as it can undo a file's name. Every directory between the store's own and
-        // the secret's is flushed into the one above it before the secret is written: the ones
-        // this write made, and any an earlier write made and could not flush.
-        self.flush_scope(parent)?;
 
         // The staging name starts with a dot, which no valid secret name can produce, and carries
         // the process and a counter, so two concurrent writes never share a file and a write never
@@ -487,9 +484,13 @@ fn prepare_private_directory(directory: &Path) -> Result<()> {
     reject_ancestor_links(directory)?;
     if directory.exists() {
         check_path_is_unresolved(directory)?;
-        check_owner_only(directory)?;
+        // One this store made and did not finish is finished below, its mode set before its owner
+        // is checked.
+        if !marked_unconfirmed(directory) {
+            check_owner_only(directory)?;
+        }
     }
-    make_directories(directory)?;
+    confirm_directories(&chain_to(directory)?)?;
     check_path_is_unresolved(directory)?;
     set_mode(directory, 0o700)?;
     check_owner_only(directory)
@@ -516,10 +517,12 @@ fn prepare_private_directory(directory: &Path) -> Result<()> {
 fn prepare_named_directory(directory: &Path) -> Result<PathBuf> {
     let directory: PathBuf = directory.components().collect();
     reject_link(&directory)?;
-    if directory.exists() {
+    // One this store made and did not finish is finished below, its mode set before its owner is
+    // checked.
+    if directory.exists() && !marked_unconfirmed(&directory) {
         check_owner_only(&directory)?;
     }
-    make_directories(&directory)?;
+    confirm_directories(&chain_to(&directory)?)?;
     // Again after the creation: what exists now is what the mode below is set on.
     reject_link(&directory)?;
     set_mode(&directory, 0o700)?;
@@ -527,20 +530,25 @@ fn prepare_named_directory(directory: &Path) -> Result<PathBuf> {
     Ok(directory)
 }
 
-/// Makes `directory` and every missing directory above it, and flushes each one it made into the
-/// directory above it, so that none of them is lost to a crash.
-///
-/// A directory that was already there is not flushed: the directory above the store's own is not
-/// the store's, and this account may not be able to open it for a flush. So a flush that is refused
-/// removes again every directory this call made, and a later call makes and flushes them afresh.
-fn make_directories(directory: &Path) -> Result<()> {
-    let mut missing = Vec::new();
-    let mut next = Some(directory);
+/// The file a directory this store made holds until its name is confirmed in the directory above
+/// it. It starts with a dot, which no secret's name can, and it holds nothing.
+const UNCONFIRMED: &str = ".unconfirmed";
+
+/// Whether `directory` holds the [`UNCONFIRMED`] marker of a directory this store made and has not
+/// confirmed yet.
+fn marked_unconfirmed(directory: &Path) -> bool {
+    std::fs::symlink_metadata(directory.join(UNCONFIRMED)).is_ok()
+}
+
+/// `directory`, and every missing directory above it, from the highest down.
+fn chain_to(directory: &Path) -> Result<Vec<PathBuf>> {
+    let mut chain = vec![directory.to_path_buf()];
+    let mut next = directory.parent();
     while let Some(path) = next.filter(|path| !path.as_os_str().is_empty()) {
         match std::fs::symlink_metadata(path) {
             Ok(_) => break,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                missing.push(path);
+                chain.push(path.to_path_buf());
                 next = path.parent();
             }
             Err(error) => {
@@ -550,30 +558,110 @@ fn make_directories(directory: &Path) -> Result<()> {
             }
         }
     }
-    let mut made: Vec<&Path> = Vec::new();
-    for path in missing.into_iter().rev() {
-        match std::fs::create_dir(path) {
-            Ok(()) => made.push(path),
-            // Another writer made it meanwhile, and its own flush is that writer's to report.
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+    chain.reverse();
+    Ok(chain)
+}
+
+/// Makes each directory of `chain` that is missing, from the first down, and confirms in the
+/// directory above it the name of each one this store made and has not confirmed yet, so that
+/// nothing the store then reports stored is lost to a crash with a directory it is in.
+///
+/// A directory this store makes holds an [`UNCONFIRMED`] marker from just after it is made until
+/// the directory above it has been flushed. A flush that is refused, or a writer that stops, leaves
+/// the marker behind, and the next call confirms the name before anything relies on the directory.
+/// One another writer made between this call's look and its own making is confirmed here as well,
+/// since its maker may not have confirmed it yet. A directory without the marker was confirmed when
+/// it was made, or was made before this store marked its directories, and is not flushed again: the
+/// directory above it need not let this account add to it any more.
+fn confirm_directories(chain: &[PathBuf]) -> Result<()> {
+    for directory in chain {
+        let marker = directory.join(UNCONFIRMED);
+        let made = match std::fs::symlink_metadata(directory) {
+            Ok(_) => false,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
             Err(error) => {
                 return Err(CryptoError::SecretStore {
-                    message: format!("create {}: {error}", path.display()),
+                    message: format!("read {}: {error}", directory.display()),
                 });
             }
+        };
+        if made {
+            #[cfg(test)]
+            made_meanwhile::run(directory);
+            match std::fs::create_dir(directory) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => {
+                    return Err(CryptoError::SecretStore {
+                        message: format!("create {}: {error}", directory.display()),
+                    });
+                }
+            }
+            reject_link(directory)?;
+            mark_unconfirmed(&marker)?;
+        } else {
+            match std::fs::symlink_metadata(&marker) {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(CryptoError::SecretStore {
+                        message: format!("read {}: {error}", marker.display()),
+                    });
+                }
+            }
         }
-        let above = path
+        let above = directory
             .parent()
             .filter(|above| !above.as_os_str().is_empty())
             .unwrap_or(Path::new("."));
-        if let Err(refused) = flush(above, kr_flush::NameKind::Directory) {
-            for path in made.iter().rev() {
-                let _ = std::fs::remove_dir(path);
-            }
-            return Err(refused);
-        }
+        flush(above, kr_flush::NameKind::Directory)?;
+        // Confirmed. A marker that stays only has the next call flush the directory above again.
+        let _ = std::fs::remove_file(&marker);
     }
     Ok(())
+}
+
+/// Leaves the [`UNCONFIRMED`] marker at `marker`, owner-only, whether or not another writer left it
+/// there already.
+fn mark_unconfirmed(marker: &Path) -> Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    options
+        .open(marker)
+        .map(drop)
+        .map_err(|error| CryptoError::SecretStore {
+            message: format!("create {}: {error}", marker.display()),
+        })
+}
+
+/// What the unit tests run just before this store makes a directory it found missing, to make it
+/// first, as another writer does between this store's look and its own making.
+#[cfg(test)]
+pub(crate) mod made_meanwhile {
+    use std::cell::RefCell;
+    use std::path::Path;
+
+    type Then = Box<dyn FnOnce(&Path)>;
+
+    thread_local! {
+        static BEFORE: RefCell<Option<Then>> = const { RefCell::new(None) };
+    }
+
+    /// Runs `then` once, the next time this thread's store is about to make a directory.
+    pub(crate) fn once(then: impl FnOnce(&Path) + 'static) {
+        BEFORE.with(|before| *before.borrow_mut() = Some(Box::new(then)));
+    }
+
+    pub(crate) fn run(directory: &Path) {
+        if let Some(then) = BEFORE.with(|before| before.borrow_mut().take()) {
+            then(directory);
+        }
+    }
 }
 
 /// Rejects one path that is a symbolic link.
@@ -1553,34 +1641,46 @@ mod tests {
         matches!(error, CryptoError::SecretStore { message } if message.starts_with("sync "))
     }
 
+    /// Whether `directory` holds the marker of a name not yet confirmed in the directory above it.
+    fn unconfirmed(directory: &Path) -> bool {
+        directory.join(UNCONFIRMED).exists()
+    }
+
     /// KR-REQ-10.47: a secret set in a scope that has no directory yet makes that directory, and
-    /// each directory made for it is flushed into the one above it before the secret is written. A
-    /// flush that is refused is reported, where a store that never flushed a directory it made would
-    /// report the secret stored while a crash could take the directory, and the secret in it, away.
-    /// With nothing held, the same writes succeed and read back.
+    /// each directory made for it is confirmed, flushed into the one above it, before the secret is
+    /// written. A flush that is refused is reported and leaves the directory marked as not yet
+    /// confirmed, so that the next write into it is refused too while that flush still is, where a
+    /// store that never flushed a directory it made would report the secret stored while a crash
+    /// could take the directory, and the secret in it, away. With nothing held, the same writes
+    /// confirm the directories, store the secrets and leave no marker.
     #[test]
-    fn each_directory_made_for_a_secret_is_flushed_into_the_one_above_it() {
+    fn each_directory_made_for_a_secret_is_confirmed_in_the_one_above_it() {
         let base = scratch_directory("made");
         let opened = open_store_in(&base).expect("a store in the named directory");
 
-        // A scope of one directory, made in the store's own.
+        // A scope of one directory, made in the store's own; the second write finds it made and
+        // not confirmed.
         let first = SecretName::new("host/x").expect("a name");
-        let refused = {
-            let _refused = FlushRefused::on(&base);
-            opened
-                .store
-                .set(&first, b"seed")
-                .expect_err("the directory made in the store's own is not flushed into it")
-        };
-        assert!(is_refused_flush(&refused), "{refused}");
-        assert!(
-            opened.store.get(&first).expect("a read").is_none(),
-            "nothing is stored in a directory that is not flushed"
-        );
+        for attempt in [
+            "the directory it makes",
+            "the directory made before and not confirmed",
+        ] {
+            let refused = {
+                let _refused = FlushRefused::on(&base);
+                opened.store.set(&first, b"seed").expect_err(attempt)
+            };
+            assert!(is_refused_flush(&refused), "{attempt}: {refused}");
+            assert!(
+                opened.store.get(&first).expect("a read").is_none(),
+                "{attempt}: nothing is stored in a directory that is not confirmed"
+            );
+            assert!(unconfirmed(&base.join("host")), "{attempt}: marked");
+        }
         opened
             .store
             .set(&first, b"seed")
             .expect("with nothing held, the same secret is stored");
+        assert!(!unconfirmed(&base.join("host")), "confirmed");
 
         // A scope two deep whose first directory is there already: the second is made in it.
         let nested = SecretName::new("host/device-key/transport").expect("a name");
@@ -1589,17 +1689,22 @@ mod tests {
             opened
                 .store
                 .set(&nested, b"key")
-                .expect_err("the directory made in the scope's is not flushed into it")
+                .expect_err("the directory made in the scope's is not confirmed in it")
         };
         assert!(is_refused_flush(&refused), "{refused}");
         assert!(
             opened.store.get(&nested).expect("a read").is_none(),
-            "nothing is stored in a directory that is not flushed"
+            "nothing is stored in a directory that is not confirmed"
         );
+        assert!(unconfirmed(&base.join("host").join("device-key")), "marked");
         opened
             .store
             .set(&nested, b"key")
             .expect("with nothing held, the nested secret is stored");
+        assert!(
+            !unconfirmed(&base.join("host").join("device-key")),
+            "confirmed"
+        );
         for (name, secret) in [(&first, &b"seed"[..]), (&nested, &b"key"[..])] {
             assert_eq!(
                 opened
@@ -1614,43 +1719,187 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// KR-REQ-10.47: the store's own directory, made when the store is opened, is flushed into the
-    /// directory above it before the store is used. A flush that is refused is reported and the
-    /// directory it could not flush is removed again, so that the next opening makes and flushes it;
-    /// with nothing held, the store opens. The same holds for the owner-only fallback where section
-    /// 10 offers it.
+    /// KR-REQ-10.47: a directory another writer made between this store's look and its own making
+    /// is confirmed as well, since its maker may not have confirmed it yet: while that flush is
+    /// refused the write is too, and the directory stays marked.
     #[test]
-    fn a_store_directory_made_when_the_store_opens_is_flushed_into_the_one_above_it() {
+    fn a_directory_another_writer_made_meanwhile_is_confirmed_as_well() {
+        let base = scratch_directory("meanwhile");
+        let opened = open_store_in(&base).expect("a store in the named directory");
+        let name = SecretName::new("host/x").expect("a name");
+        made_meanwhile::once(|directory: &Path| {
+            std::fs::create_dir(directory).expect("another writer makes it first");
+        });
+        let refused = {
+            let _refused = FlushRefused::on(&base);
+            opened
+                .store
+                .set(&name, b"seed")
+                .expect_err("the directory another writer made is not confirmed")
+        };
+        assert!(is_refused_flush(&refused), "{refused}");
+        assert!(unconfirmed(&base.join("host")), "marked");
+        opened
+            .store
+            .set(&name, b"seed")
+            .expect("with nothing held, the secret is stored");
+        assert!(!unconfirmed(&base.join("host")), "confirmed");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// KR-REQ-10.47: a scope whose directory is confirmed takes more secrets without anything more
+    /// asked of the directory above it, which is flushed only for a name this store makes or has
+    /// not confirmed in it: one that refuses a flush now, or on Windows one this account may no
+    /// longer add a directory to, leaves writes into a scope already there as they were.
+    #[test]
+    fn a_confirmed_scope_takes_secrets_without_a_flush_of_the_directory_above_it() {
+        let base = scratch_directory("confirmed");
+        let opened = open_store_in(&base).expect("a store in the named directory");
+        let named = |name: &str| SecretName::new(format!("host/{name}")).expect("a name");
+        opened.store.set(&named("x"), b"seed").expect("a write");
+        {
+            let _refused = FlushRefused::on(&base);
+            opened
+                .store
+                .set(&named("y"), b"more")
+                .expect("a write into the confirmed scope");
+        }
+        #[cfg(windows)]
+        {
+            let _refused = DirectoriesRefused::on(&base);
+            opened
+                .store
+                .set(&named("z"), b"more")
+                .expect("a write into the confirmed scope");
+        }
+        assert_eq!(
+            opened
+                .store
+                .get(&named("y"))
+                .expect("a read")
+                .expect("a value")
+                .expose(),
+            b"more"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Refuses this account the right to add a directory to `directory`, and nothing else, until
+    /// it is dropped.
+    #[cfg(windows)]
+    struct DirectoriesRefused {
+        directory: PathBuf,
+        account: String,
+    }
+
+    #[cfg(windows)]
+    impl DirectoriesRefused {
+        fn on(directory: &Path) -> Self {
+            use std::os::windows::fs::OpenOptionsExt as _;
+
+            /// The right to add a directory to one.
+            const FILE_ADD_SUBDIRECTORY: u32 = 0x0004;
+            /// The right to add a file to one.
+            const FILE_ADD_FILE: u32 = 0x0002;
+            /// What lets a program open a directory at all.
+            const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+
+            let printed = std::process::Command::new("whoami.exe")
+                .args(["/user", "/fo", "csv", "/nh"])
+                .output()
+                .expect("whoami runs");
+            let printed = String::from_utf8_lossy(&printed.stdout).into_owned();
+            let account = printed
+                .trim()
+                .rsplit(',')
+                .next()
+                .unwrap_or_default()
+                .trim_matches('"')
+                .to_owned();
+            assert!(account.starts_with("S-1-"), "this account: {printed}");
+            // An entry for this directory alone, which nothing inside it inherits.
+            let denied = std::process::Command::new("icacls.exe")
+                .arg(directory)
+                .arg("/deny")
+                .arg(format!("*{account}:(AD)"))
+                .output()
+                .expect("icacls runs");
+            assert!(denied.status.success(), "icacls refused: {denied:?}");
+            let refused = Self {
+                directory: directory.to_path_buf(),
+                account,
+            };
+            let open = |right: u32| {
+                std::fs::OpenOptions::new()
+                    .access_mode(right)
+                    .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                    .open(directory)
+            };
+            // The list is what refuses it: an account holding a privilege that overrides lists
+            // would be let through, and for it this arrangement cannot be made.
+            assert_eq!(
+                open(FILE_ADD_SUBDIRECTORY)
+                    .expect_err("adding a directory is refused")
+                    .kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+            open(FILE_ADD_FILE).expect("and adding a file is not");
+            refused
+        }
+    }
+
+    #[cfg(windows)]
+    impl Drop for DirectoriesRefused {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("icacls.exe")
+                .arg(&self.directory)
+                .arg("/remove:d")
+                .arg(format!("*{}", self.account))
+                .output();
+        }
+    }
+
+    /// KR-REQ-10.47: the store's own directory, made when the store is opened, is confirmed in the
+    /// directory above it before the store is used. A flush that is refused is reported and leaves
+    /// the directory marked, so that the next opening is refused too while that flush still is, and
+    /// confirms it once it is not; with nothing held, the store opens and leaves no marker. The same
+    /// holds for the owner-only fallback where section 10 offers it.
+    #[test]
+    fn a_store_directory_made_when_the_store_opens_is_confirmed_in_the_one_above_it() {
         let above = scratch_directory("above");
         std::fs::create_dir(&above).expect("the directory above the store's");
         let base = above.join("store");
-        let refused = {
-            let _refused = FlushRefused::on(&above);
-            open_store_in(&base)
-                .expect_err("the store's directory is not flushed into the one above it")
-        };
-        assert!(is_refused_flush(&refused), "{refused}");
-        assert!(
-            !base.exists(),
-            "the directory it could not flush is removed again"
-        );
+        for attempt in [
+            "the directory it makes",
+            "the directory made before and not confirmed",
+        ] {
+            let refused = {
+                let _refused = FlushRefused::on(&above);
+                open_store_in(&base).expect_err(attempt)
+            };
+            assert!(is_refused_flush(&refused), "{attempt}: {refused}");
+            assert!(unconfirmed(&base), "{attempt}: marked");
+        }
         let opened = open_store_in(&base).expect("with nothing held, the store opens");
+        assert!(!unconfirmed(&base), "confirmed");
         let name = SecretName::new("host/x").expect("a name");
         opened.store.set(&name, b"seed").expect("a write");
 
         if FILE_FALLBACK_SUPPORTED {
             let fallback = above.join("fallback");
-            let refused = {
-                let _refused = FlushRefused::on(&above);
-                FileStore::open(&fallback)
-                    .expect_err("the fallback's directory is not flushed into the one above it")
-            };
-            assert!(is_refused_flush(&refused), "{refused}");
-            assert!(
-                !fallback.exists(),
-                "the directory it could not flush is removed again"
-            );
+            for attempt in [
+                "the directory it makes",
+                "the directory made before and not confirmed",
+            ] {
+                let refused = {
+                    let _refused = FlushRefused::on(&above);
+                    FileStore::open(&fallback).expect_err(attempt)
+                };
+                assert!(is_refused_flush(&refused), "{attempt}: {refused}");
+                assert!(unconfirmed(&fallback), "{attempt}: marked");
+            }
             FileStore::open(&fallback).expect("with nothing held, the fallback opens");
+            assert!(!unconfirmed(&fallback), "confirmed");
         }
         let _ = std::fs::remove_dir_all(&above);
     }
