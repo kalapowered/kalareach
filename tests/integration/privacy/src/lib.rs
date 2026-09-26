@@ -37,6 +37,8 @@
 
 pub mod giveback;
 pub mod held;
+pub mod local;
+pub mod push;
 
 pub use kr_sync_integration::{
     Deployment, GIVE_BACK, ORIGIN_VARIABLE, REQUIRE_VARIABLE, RunKey, fresh_uuid, now_ms, proved,
