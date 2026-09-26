@@ -145,11 +145,15 @@ fn retry_within(
 /// scanner such as Defender reads it, for a minute and more (see [`HELD_RENAME_BOUND`]), and a
 /// rename over it is refused all that time. Elsewhere it is a link, and `from` keeps its name too
 /// until the caller removes it; on Windows `from` no longer names anything once this succeeds.
+/// Windows is given each name as the standard library's own file calls give it: a name that holds
+/// a NUL is refused, and one past the old limit of 260 characters is made absolute and given the
+/// prefix that lifts the limit.
 ///
 /// # Errors
 ///
 /// Returns an error of kind [`std::io::ErrorKind::AlreadyExists`] when something is named `to`,
-/// and the operating system's error when the name cannot be given otherwise.
+/// of kind [`std::io::ErrorKind::InvalidInput`] when a name holds a NUL, and the operating
+/// system's error when the name cannot be given otherwise.
 pub fn publish_without_replacing(from: &Path, to: &Path) -> std::io::Result<()> {
     #[cfg(windows)]
     {
@@ -349,23 +353,81 @@ mod windows {
         from: &std::path::Path,
         to: &std::path::Path,
     ) -> std::io::Result<()> {
-        use std::os::windows::ffi::OsStrExt as _;
         use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
 
-        let wide = |path: &std::path::Path| {
-            path.as_os_str()
-                .encode_wide()
-                .chain(std::iter::once(0))
-                .collect::<Vec<u16>>()
-        };
-        let (from, to) = (wide(from), wide(to));
-        // SAFETY: both names are NUL-terminated wide strings that live past the call, which reads
-        // them and keeps neither. With no flags the call moves a name on one volume and never
-        // replaces one.
+        let (from, to) = (native_name(from)?, native_name(to)?);
+        // SAFETY: both names are NUL-terminated wide strings with no NUL before their end, and they
+        // live past the call, which reads them and keeps neither. With no flags the call moves a
+        // name on one volume and never replaces one.
         if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), 0) } == 0 {
             return Err(std::io::Error::last_os_error());
         }
         Ok(())
+    }
+
+    /// `path` as a native call reads a name: wide and NUL-terminated, the way the standard library
+    /// gives a name to its own file calls.
+    ///
+    /// A name that holds a NUL is refused, because the call would read it only as far as the NUL,
+    /// which can name another file. A name already verbatim (`\\?\` or `\??\`) goes as it is.
+    /// Any other name is made absolute; one that reaches the old limit is then given the verbatim
+    /// prefix that lifts it: `C:\` becomes `\\?\C:\`, `\\server\share` becomes
+    /// `\\?\UNC\server\share`, and a device name `\\.\` becomes `\\?\`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error of kind [`std::io::ErrorKind::InvalidInput`] for a name that holds a NUL
+    /// or is empty.
+    fn native_name(path: &std::path::Path) -> std::io::Result<Vec<u16>> {
+        use std::os::windows::ffi::OsStrExt as _;
+
+        /// The length from which the standard library prefixes a name: some calls stop at 248
+        /// characters, short of the 260 of the old limit.
+        const LEGACY_MAX_PATH: usize = 248;
+        /// `\`, `?`, `.`, `:`, and the letters of `UNC`, as UTF-16.
+        const SEP: u16 = 0x5C;
+        const QUERY: u16 = 0x3F;
+        const DOT: u16 = 0x2E;
+        const COLON: u16 = 0x3A;
+        const UNC: [u16; 3] = [0x55, 0x4E, 0x43];
+
+        let wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+        if wide.contains(&0) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("{} holds a NUL", path.display()),
+            ));
+        }
+        let verbatim = |name: &[u16]| {
+            name.starts_with(&[SEP, SEP, QUERY, SEP]) || name.starts_with(&[SEP, QUERY, QUERY, SEP])
+        };
+        let mut native = if verbatim(&wide) {
+            wide
+        } else {
+            let absolute: Vec<u16> = std::path::absolute(path)?
+                .as_os_str()
+                .encode_wide()
+                .collect();
+            if absolute.len() + 1 < LEGACY_MAX_PATH || verbatim(&absolute) {
+                absolute
+            } else {
+                let prefix = [SEP, SEP, QUERY, SEP];
+                match absolute.as_slice() {
+                    [_, COLON, SEP, ..] => prefix.iter().chain(&absolute).copied().collect(),
+                    [SEP, SEP, DOT, SEP, rest @ ..] => prefix.iter().chain(rest).copied().collect(),
+                    [SEP, SEP, rest @ ..] => prefix
+                        .iter()
+                        .chain(&UNC)
+                        .chain(&[SEP])
+                        .chain(rest)
+                        .copied()
+                        .collect(),
+                    _ => absolute,
+                }
+            }
+        };
+        native.push(0);
+        Ok(native)
     }
 }
 
@@ -566,6 +628,58 @@ mod tests {
         assert_eq!(taken.kind(), std::io::ErrorKind::AlreadyExists, "{taken}");
         assert_eq!(std::fs::read(&name).expect("readable"), b"first");
         assert_eq!(std::fs::read(&second).expect("readable"), b"second");
+    }
+
+    /// A name that holds a NUL is refused before anything is given a name, on every platform: a
+    /// native call reads a name only as far as its first NUL, which can name another file.
+    #[test]
+    fn a_name_holding_a_nul_is_refused_and_nothing_moves() {
+        let root = Scratch::new("nul");
+        let (first, name) = (root.0.join("first"), root.0.join("name"));
+        std::fs::write(&first, b"first").expect("the file");
+        let with_nul = |path: &Path| {
+            let mut held = path.as_os_str().to_owned();
+            held.push("\0suffix");
+            PathBuf::from(held)
+        };
+        for (from, to) in [
+            (with_nul(&first), name.clone()),
+            (first.clone(), with_nul(&name)),
+        ] {
+            let refused = publish_without_replacing(&from, &to).expect_err("a NUL in a name");
+            assert_eq!(
+                refused.kind(),
+                std::io::ErrorKind::InvalidInput,
+                "{refused}"
+            );
+        }
+        assert_eq!(std::fs::read(&first).expect("readable"), b"first");
+        assert!(!name.exists(), "nothing was given the name");
+    }
+
+    /// On Windows a file is given its name where the names run past the old limit of 260
+    /// characters, as the standard library's own file calls manage, and where they are verbatim.
+    #[cfg(windows)]
+    #[test]
+    fn a_name_past_the_old_path_limit_is_given() {
+        let root = Scratch::new("long");
+        let mut directory = root.0.clone();
+        while directory.as_os_str().len() < 300 {
+            directory.push("a-directory-of-a-long-name");
+        }
+        std::fs::create_dir_all(&directory).expect("a deep directory");
+        let (first, name) = (directory.join("first"), directory.join("name"));
+        std::fs::write(&first, b"first").expect("the file");
+        publish_without_replacing(&first, &name).expect("given past the old limit");
+        assert_eq!(std::fs::read(&name).expect("readable"), b"first");
+        assert!(!first.exists(), "moved");
+
+        let verbatim = |path: &Path| PathBuf::from(format!(r"\\?\{}", path.display()));
+        let (second, other) = (root.0.join("second"), root.0.join("other"));
+        std::fs::write(&second, b"second").expect("the file");
+        publish_without_replacing(&verbatim(&second), &verbatim(&other))
+            .expect("given by verbatim names");
+        assert_eq!(std::fs::read(&other).expect("readable"), b"second");
     }
 
     /// A rename that fails any other way than a hold is answered at once, after one attempt, on
