@@ -592,7 +592,8 @@ fn chain_to(directory: &Path) -> Result<Vec<PathBuf>> {
 /// directory. A marker that cannot be made stops the call before the directory is made. A directory
 /// with no marker beside it was confirmed when it was made, or was made before this store marked
 /// its directories, and is not flushed again: the directory above it need not let this account add
-/// to it any more.
+/// to it any more. Whatever stands at a directory's name is checked for a link before anything is
+/// made in it, so a link another writer puts there is never followed.
 fn confirm_directories(chain: &[PathBuf]) -> Result<()> {
     for directory in chain {
         let marker = marker_of(directory);
@@ -619,7 +620,11 @@ fn confirm_directories(chain: &[PathBuf]) -> Result<()> {
                     });
                 }
             }
-        } else {
+        }
+        // What stands at the name now, made here or by another writer meanwhile, is used as a
+        // directory, and the next one made in it, only if it is not a link.
+        reject_link(directory)?;
+        if !missing {
             match std::fs::symlink_metadata(&marker) {
                 Ok(_) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -1970,6 +1975,35 @@ mod tests {
             .expect("with the marker made, the secret is stored");
         assert!(!marked_unconfirmed(&scope), "confirmed");
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// KR-REQ-10.47: a link another writer puts where a directory this store is about to make would
+    /// go is refused before anything is made in it: the tree the link leads to stays as it was.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_put_where_a_directory_is_being_made_is_not_followed() {
+        let base = scratch_directory("linked-meanwhile");
+        let outside = scratch_directory("linked-meanwhile-outside");
+        std::fs::create_dir(&outside).expect("a directory outside the store");
+        let opened = open_store_in(&base).expect("a store in the named directory");
+        let target = outside.clone();
+        made_meanwhile::once(move |directory: &Path| {
+            std::os::unix::fs::symlink(&target, directory)
+                .expect("another writer puts a link there");
+        });
+        let name = SecretName::new("host/nested/key").expect("a name");
+        let refused = opened
+            .store
+            .set(&name, b"seed")
+            .expect_err("the link is refused");
+        assert!(refused.to_string().contains("symbolic link"), "{refused}");
+        assert_eq!(
+            std::fs::read_dir(&outside).expect("readable").count(),
+            0,
+            "nothing was made through the link"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&outside);
     }
 
     /// KR-REQ-10.47: a deleted secret's name is flushed out of its directory before the deletion is
