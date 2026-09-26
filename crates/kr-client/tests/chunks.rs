@@ -95,6 +95,11 @@ struct Script {
     /// After answering the first chunk, the attachment-chunk endpoint also answers the next
     /// request identifier, which the lane has not issued.
     unsolicited_answer: bool,
+    /// The first attachment-chunk connection refuses every chunk as a host refuses one whose window
+    /// has expired.
+    expired_on_first: bool,
+    /// Every attachment-chunk connection refuses every chunk that way.
+    expired_on_every: bool,
     /// The control endpoint issues a window that admits nothing.
     no_control_window: bool,
     /// The attachment-chunk endpoint follows its acknowledgement with a frame a lane does not
@@ -571,7 +576,9 @@ async fn converse(
                 } = *mutation;
                 match (method.method(), leg) {
                     (Some(Method::UploadChunk), Some(_))
-                        if host.script.expire_first_window && action_window_id != current =>
+                        if (host.script.expire_first_window && action_window_id != current)
+                            || (first && host.script.expired_on_first)
+                            || host.script.expired_on_every =>
                     {
                         answer(
                             request_id,
@@ -1393,5 +1400,53 @@ async fn an_answer_to_a_call_the_lane_never_made_ends_the_lane() {
         host.seen().legs,
         vec![vec![0]],
         "the second chunk never went out"
+    );
+}
+
+/// A chunk the host refuses as it refuses one whose window has expired goes once more on a new
+/// lane, whose window the host has just issued, and the upload goes on from the host's status.
+///
+/// A lane cannot see the host's clock, so a pause or a suspension can leave it holding a window
+/// the host has let expire; this host behaves as one that did, on the lane's first connection.
+#[tokio::test]
+async fn a_chunk_refused_for_its_window_goes_once_more_on_a_new_lane() {
+    let host = Host::start(Script {
+        expired_on_first: true,
+        ..Script::default()
+    });
+    let session = host.session().await;
+    let bytes = pattern(UPLOAD_CHUNK_LEN + 10);
+    let mut plan = Upload::new(host.subject(), Box::new(Held::new(bytes.clone())));
+
+    let handle = uploads::send(&session, &host.route(), &host.target(), &mut plan, TTL)
+        .await
+        .expect("the upload goes on over a new lane");
+    assert_eq!(handle.content_digest, digest(&bytes));
+    assert_eq!(
+        host.seen().legs,
+        vec![vec![], vec![0, 1]],
+        "nothing went in on the first lane, and every chunk on the second"
+    );
+}
+
+/// A second refusal in a row, on a lane whose window the host has just issued, is the host's
+/// answer, and the upload ends with it.
+#[tokio::test]
+async fn a_chunk_refused_on_the_new_lane_too_ends_the_upload() {
+    let host = Host::start(Script {
+        expired_on_every: true,
+        ..Script::default()
+    });
+    let session = host.session().await;
+    let mut plan = Upload::new(host.subject(), Box::new(Held::new(pattern(4096))));
+
+    let refused = uploads::send(&session, &host.route(), &host.target(), &mut plan, TTL)
+        .await
+        .expect_err("the host refuses every chunk");
+    assert_eq!(refused.code(), ErrorCode::PermissionDenied, "{refused}");
+    assert_eq!(
+        host.seen().legs,
+        vec![Vec::<u64>::new(), Vec::new()],
+        "one new lane and no more"
     );
 }

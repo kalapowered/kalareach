@@ -25,6 +25,8 @@
 //!   └── status ┴── a lost reply resumes from the bitmap ────┘
 //! ```
 
+use std::time::Duration;
+
 use kr_protocol::envelope::ActionTarget;
 use kr_protocol::ids::{ActionId, DeviceId, EnvironmentId, SessionId};
 use kr_protocol::limits::UPLOAD_CHUNK_LEN;
@@ -605,6 +607,9 @@ struct Unconditional {}
 ///   let go, the driver waits the backoff, reads `upload.status` and hands the plan the host's
 ///   bitmap before it sends again. Progress the host has confirmed, by acknowledging a chunk or in
 ///   its bitmap, restores the budget; failures in a row spend it.
+/// * A chunk refused `PERMISSION_DENIED`, which is how a host refuses a window that has expired, goes
+///   once more on a new lane, whose window the host has just issued, after the same status read. A
+///   second such refusal in a row is the host's answer and ends the upload.
 /// * The plan records a reservation as asked for before `upload.begin` leaves
 ///   ([`Upload::reserving`]), and only a definite answer clears that: the host's result, or its
 ///   refusal. A reply that was lost, a refusal saying the outcome is unknown, a receipt with no
@@ -630,6 +635,7 @@ pub async fn send(
     }
     let mut lane: Option<ChunkLane> = None;
     let mut attempts = Attempts::new();
+    let mut new_window = true;
     loop {
         match plan.next()? {
             Step::Begin(params) => {
@@ -700,10 +706,25 @@ pub async fn send(
                 match send_chunk(&mut lane, route, target, &params, requested_ttl).await {
                     Ok(accepted) => plan.accept(Answer::Chunked(Box::new(accepted)))?,
                     Err(error) => {
-                        let decision = attempts
-                            .decide(Failure::new(error.code()), RequestClass::TransferChunk);
-                        let Recovery::Retry { delay } = decision.recovery else {
-                            return Err(error);
+                        let delay = if error.code()
+                            == kr_protocol::error::ErrorCode::PermissionDenied
+                            && new_window
+                        {
+                            // A host refuses a chunk whose window has expired with
+                            // PERMISSION_DENIED, and a lane cannot see the host's clock to rule
+                            // that out: a pause or a suspension can outlast a window the lane
+                            // took for young. A new lane carries the window the host issues it
+                            // on arrival, so the chunk goes once more on one, and a second
+                            // refusal is the host's answer.
+                            new_window = false;
+                            Duration::ZERO
+                        } else {
+                            let decision = attempts
+                                .decide(Failure::new(error.code()), RequestClass::TransferChunk);
+                            let Recovery::Retry { delay } = decision.recovery else {
+                                return Err(error);
+                            };
+                            delay
                         };
                         // Whatever failed, the host's record decides what is sent next: the answer
                         // to the chunk in flight may have been lost with the connection, and a
@@ -718,6 +739,7 @@ pub async fn send(
                 }
                 if plan.acknowledged_chunks() > confirmed {
                     attempts = Attempts::new();
+                    new_window = true;
                 }
             }
             Step::Finish(params) => {
