@@ -16,26 +16,36 @@ A reference host has:
 * its operating system and architecture recorded beside every figure taken on it;
 * nothing else running while a figure is taken.
 
-`scripts/bench-all.sh` checks the last condition for the whole of every measurement. Before each one
-it reads how much of the machine was in use over ten seconds, in processors' worth. Through each
-one, every five seconds from its start to its end, it reads the processor time of every process
-outside the run: the run is the script and everything descended from it, the workers a
-measurement's daemon starts included, since they are the daemon's children while it runs. One
-processor's worth or more as the measurement begins, or in any five seconds of it, makes the host
-busy. Over each measurement it also reads the share of the machine's time a hypervisor took, where
-the platform keeps that count (the `steal` counter in Linux's `/proc/stat`), and a measurement that
-lost more than 1% of its time falls short. It records the load average at both edges as well, and
-decides nothing by it, because a one-minute average still carries the measurement before. The four
-processors, the 8 GiB and the 1% are the figures that
+`scripts/bench-all.sh` checks the last condition from ten seconds before each measurement until it
+ends. Its reader of other work, `kr-perf-watch` in `tests/perf`, reads the whole machine every two
+seconds: the machine's own count of its processors' busy time, and every process with the processor
+time it has used. The run is the script and every process descended from it, which includes the
+workers a measurement's daemon starts, and a process that was once the run's stays the run's after
+it is reparented. Other work between two readings is the larger of two amounts: what the processes
+outside the run used, and what the machine counted beyond the least the run's processes can have
+used. A five-second window can start anywhere between two readings, so the reader bounds each window
+by the other work over the shortest run of readings that covers it, and work that falls across a
+reading is counted whole. One processor's worth or more in any five seconds makes the host busy, and
+so do a reading that could not be taken, a count that went backwards, and a process table that does
+not show the whole machine.
+
+Over each measurement the script also reads the share of the machine's time a hypervisor took,
+where the platform keeps that count (the `steal` counter in Linux's `/proc/stat`), and a measurement
+that lost more than 1% of its time falls short. It records the load average at both edges as well,
+and decides nothing by it, because a one-minute average still carries the measurement before. The
+four processors, the 8 GiB and the 1% are the figures that
 `crates/kr-transport/tests/support/conditions.rs` holds, and every measurement's record reads its
 host against them, so a record can name a shortfall of its own.
 
-A reading can show that a host fell short. It cannot show that the host met the definition in full.
-A process that starts and ends between two readings is counted through the parent that collects it,
-and not at all if no such parent is still running. A zero stolen share means the hypervisor
-reported no loss, and a platform that keeps no such count leaves the condition unverified. And
-memory as the operating system reports it is a little less than the memory installed, so a machine
-with exactly 8 GiB installed reads as short of the reference host.
+The reading rests on the operating system's own counts. The machine's count takes in everything that
+ran, the kernel's own work and processes that start and end between two readings among it, in
+hundredths of a second per counter, and the reader adds that resolution back. Linux keeps that count
+by sampling each processor at every clock tick, which is why the processes are counted as well: a
+process's own time is exact, and one that starts and ends between two readings is counted through
+the parent that collects it. A zero stolen share means the hypervisor reported no loss, and a
+platform that keeps no such count leaves the condition unverified. And memory as the operating
+system reports it is a little less than the memory installed, so a machine with exactly 8 GiB
+installed reads as short of the reference host.
 
 ## The two configurations
 
@@ -127,11 +137,11 @@ A measurement's own section starts with its host: the build, the operating syste
 the processor, the processors and the memory against the reference host's, the load average entering
 and leaving, the stolen share, and which of those fall short. For each identifier the run measured,
 `bench-all.md` adds a conditions section. It gives each step that measured the identifier, with its
-exit status, the load average at both edges, the machine's use as the step began, the other work
-through the step (its busiest five seconds and its average) and the stolen share over it, then the
-outcome, and whether the figures are reference figures. Figures are reference figures only when the
-run was asked for them, the host met every condition it read, every reading could be taken, and no
-record of the step names a shortfall.
+exit status, the load average at both edges, the other work over the ten seconds before the step and
+through it (the bound on its busiest five seconds, and its average) and the stolen share over it,
+then the outcome, and whether the figures are reference figures. Figures are reference figures only
+when the run was asked for them, the host met every condition it read, every reading could be taken,
+and no record of the step names a shortfall.
 
 ## Where release figures come from
 
