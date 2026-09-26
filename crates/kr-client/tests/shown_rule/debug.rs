@@ -246,8 +246,20 @@ const QUIET_MACROS: [&str; 4] = [
     "tokio::select",
 ];
 
-/// The standard library's `write!` and `writeln!`, which a `Debug` written by hand may use.
-const WRITE_MACROS: [&str; 2] = ["std::write", "std::writeln"];
+/// The standard library's macros that a file names through a module: `std::pin::pin!`.
+const STD_MODULE_MACROS: [&str; 5] = ["addr_of", "addr_of_mut", "offset_of", "pin", "ready"];
+
+/// Traits from outside the workspace that the two crates implement, each read in its source for
+/// being its crate's own trait and not the `Debug` trait under another name.
+const QUIET_TRAITS: [&str; 7] = [
+    "rmcp::ServerHandler",
+    "rmcp::transport::Transport",
+    "serde::Deserialize",
+    "serde::de::DeserializeSeed",
+    "serde::de::Visitor",
+    "tokio::io::AsyncRead",
+    "tokio::io::AsyncWrite",
+];
 
 /// The derives the prelude gives every file.
 const PRELUDE_DERIVES: [&str; 9] = [
@@ -416,10 +428,14 @@ struct Shape {
     members: Vec<Member>,
 }
 
-/// One struct, enum or union some crate declares.
+/// One struct, enum or union some crate declares. A path can have several, one for each set of
+/// `cfg` conditions; each is read.
 struct Declared {
     /// The file, as an index into the sources.
     source: usize,
+    /// The index of its `struct`, `enum` or `union` in the source's tokens; none for one a macro
+    /// declares.
+    keyword: Option<usize>,
     /// The name it is declared with.
     name: String,
     /// The line of its `derive` that names `Debug`, when it derives one.
@@ -466,8 +482,10 @@ struct Debugs {
     /// The crates that take macros from another crate with `#[macro_use]`, where a macro's single
     /// name can be one this reading does not list.
     macro_use: BTreeSet<String>,
-    declared: BTreeMap<String, Declared>,
-    type_aliases: BTreeMap<String, Written>,
+    /// Each type by full path, with every definition it has.
+    declared: BTreeMap<String, Vec<Declared>>,
+    /// Each type alias by full path, with every definition it has.
+    type_aliases: BTreeMap<String, Vec<Written>>,
     by_hand: Vec<ByHand>,
     known: Known,
     plain: BTreeSet<String>,
@@ -657,34 +675,52 @@ impl Debugs {
     }
 
     /// Each place a source uses a macro it writes itself: the name's index, its scope, and the
-    /// macro's body with the item's name the use gives it.
+    /// macro's body with the item's name the use gives it. A name is that macro only where the
+    /// compiler takes it so: after the macro is written, in its scope or one inside it, the latest
+    /// of that name; anywhere else the name is another macro, whose types this reading does not
+    /// know.
     fn expansions(
         &self,
         index: usize,
         tokens: &[Located],
         macros: &[(String, usize, usize)],
     ) -> Vec<(usize, usize, Vec<Located>)> {
+        let source = &self.sources[index];
         let mut found = Vec::new();
-        for (name, open, close) in macros {
-            let body = &tokens[*open + 1..*close];
-            for at in 0..tokens.len() {
-                if ident(tokens.get(at)) != Some(name.as_str())
-                    || !punct(tokens.get(at + 1), '!')
-                    || in_macro_body(macros, at)
-                    || (at > 0 && ident(tokens.get(at - 1)) == Some("macro_rules"))
-                {
-                    continue;
-                }
-                let Some(group_close) = closing(tokens, at + 2) else {
-                    continue;
-                };
-                let invoked = first_word(&tokens[at + 3..group_close]);
-                found.push((
-                    at,
-                    self.sources[index].scope_at(at),
-                    substitute(body, invoked.as_deref()),
-                ));
+        for at in 0..tokens.len() {
+            let Some(word) = ident(tokens.get(at)) else {
+                continue;
+            };
+            if !punct(tokens.get(at + 1), '!')
+                || in_macro_body(macros, at)
+                || (at > 0
+                    && (ident(tokens.get(at - 1)) == Some("macro_rules")
+                        || punct(tokens.get(at - 1), ':')))
+            {
+                continue;
             }
+            let scope = source.scope_at(at);
+            // `macro_rules`, `!` and the name come before the body.
+            let written = macros
+                .iter()
+                .filter(|(name, open, close)| {
+                    name == word
+                        && *close < at
+                        && encloses(source, source.scope_at(open - 3), scope)
+                })
+                .max_by_key(|(_, _, close)| *close);
+            let Some((_, open, close)) = written else {
+                continue;
+            };
+            let Some(group_close) = closing(tokens, at + 2) else {
+                continue;
+            };
+            let invoked = first_word(&tokens[at + 3..group_close]);
+            found.push((
+                at,
+                scope,
+                substitute(&tokens[*open + 1..*close], invoked.as_deref()),
+            ));
         }
         found
     }
@@ -702,21 +738,30 @@ impl Debugs {
                 continue;
             }
             let scope = self.sources[index].scope_at(at);
+            let item = format!("impl {}", spelled(&tokens[start..at_for]));
             match self.trait_named(index, scope, &tokens[start..at_for]) {
                 Ok(path) if self.is_debug_trait(&path) => {
                     self.declare_by_hand(index, &tokens, at, at_for, scope, None);
                 }
-                Ok(_) => {}
-                Err(why) => {
-                    if let Some(file) = &file {
-                        self.unplaced.push(Finding {
-                            file: file.clone(),
-                            line: tokens[at].line,
-                            item: format!("impl {}", spelled(&tokens[start..at_for])),
-                            what: format!("a trait this reading cannot place: {why}"),
-                        });
-                    }
+                // A trait from outside is known only from the list: under another name, it can be
+                // the `Debug` trait.
+                Ok(path) if self.outside(&path) && !QUIET_TRAITS.contains(&path.as_str()) => {
+                    self.record(
+                        file.as_deref(),
+                        tokens[at].line,
+                        item,
+                        format!(
+                            "a trait from outside the workspace this reading does not list: {path}"
+                        ),
+                    );
                 }
+                Ok(_) => {}
+                Err(why) => self.record(
+                    file.as_deref(),
+                    tokens[at].line,
+                    item,
+                    format!("a trait this reading cannot place: {why}"),
+                ),
             }
         }
         for (invoked, scope, expanded) in self.expansions(index, &tokens, &macros) {
@@ -853,9 +898,6 @@ impl Debugs {
     ) {
         let line = tokens[at].line;
         let (segments, after) = spelled_path(attribute);
-        if segments.len() > 1 && TOOL_ATTRIBUTES.contains(&segments[0].as_str()) {
-            return;
-        }
         let item = format!("#[{}]", segments.join("::"));
         let placed = match self.place(index, scope, &segments, Kind::Attribute) {
             Ok(placed) => placed,
@@ -868,10 +910,21 @@ impl Debugs {
                 );
             }
         };
-        match placed
+        // A tool's attribute, `#[rustfmt::skip]`, where no scope gives the tool's name another
+        // meaning: then the path is placed as it is written.
+        if segments.len() > 1
+            && TOOL_ATTRIBUTES.contains(&segments[0].as_str())
+            && placed == segments.join("::")
+        {
+            return;
+        }
+        // An attribute the compiler reads itself, by the name it has under the standard library
+        // too: `#[std::prelude::v1::derive(…)]` is `derive`.
+        let builtin = placed
             .strip_prefix(INERT)
             .and_then(|rest| rest.strip_prefix("::"))
-        {
+            .or_else(|| std_item(&placed).filter(|name| INERT_ATTRIBUTES.contains(name)));
+        match builtin {
             // `cfg_attr(predicate, attribute, …)`: each attribute after the predicate.
             Some("cfg_attr") => {
                 for part in arguments(attribute, after)
@@ -924,30 +977,42 @@ impl Debugs {
                 "a derive this reading cannot read".to_owned(),
             );
         }
-        match self.place(index, scope, &segments, Kind::Derive) {
-            Ok(placed) if placed == DEBUG_TRAIT || placed == "std::prelude::Debug" => {
-                if let Some(name) = defined_after(tokens, at) {
-                    let path = self.sources[index].defined_path(scope, &name);
-                    if let Some(declared) = self.declared.get_mut(&path)
+        let placed = match self.place(index, scope, &segments, Kind::Derive) {
+            Ok(placed) => placed,
+            Err(why) => {
+                return self.record(
+                    file,
+                    line,
+                    item,
+                    format!("a derive this reading cannot place: {why}"),
+                );
+            }
+        };
+        match std_item(&placed) {
+            Some("Debug") => {
+                if let Some(keyword) = item_keyword_after(tokens, at)
+                    && let Some(name) = ident(tokens.get(keyword + 1))
+                {
+                    let path = self.sources[index].defined_path(scope, name);
+                    let definition = self.declared.get_mut(&path).and_then(|definitions| {
+                        definitions.iter_mut().find(|declared| {
+                            declared.source == index && declared.keyword == Some(keyword)
+                        })
+                    });
+                    if let Some(declared) = definition
                         && declared.derived.is_none()
                     {
                         declared.derived = Some(line);
                     }
                 }
             }
-            Ok(placed)
-                if placed.starts_with("std::") || QUIET_DERIVES.contains(&placed.as_str()) => {}
-            Ok(placed) => self.record(
+            Some(name) if PRELUDE_DERIVES.contains(&name) => {}
+            None if QUIET_DERIVES.contains(&placed.as_str()) => {}
+            _ => self.record(
                 file,
                 line,
                 item,
                 format!("a derive this reading does not read, which can write a Debug: {placed}"),
-            ),
-            Err(why) => self.record(
-                file,
-                line,
-                item,
-                format!("a derive this reading cannot place: {why}"),
             ),
         }
     }
@@ -1036,15 +1101,21 @@ impl Debugs {
         self.place(index, scope, &segments, Kind::Trait)
     }
 
-    /// Whether the trait at `path` is the `Debug` trait: that trait's own path, or a path outside
-    /// the workspace and the standard library whose name is `Debug`, since such a crate can give
-    /// the trait a path of its own.
+    /// Whether the trait at `path` is the `Debug` trait: a path into the standard library whose
+    /// item is `Debug`, or a path outside the workspace and the standard library whose name is
+    /// `Debug`, since such a crate can give the trait a path of its own.
     fn is_debug_trait(&self, path: &str) -> bool {
+        match std_item(path) {
+            Some(name) => name == "Debug",
+            None => self.outside(path) && path.rsplit("::").next() == Some("Debug"),
+        }
+    }
+
+    /// Whether `path` leads outside the workspace and the standard library, where this reading
+    /// knows an item only from a list.
+    fn outside(&self, path: &str) -> bool {
         let root = path.split("::").next().unwrap_or_default();
-        path == DEBUG_TRAIT
-            || (!self.crates.contains(root)
-                && !matches!(root, "std" | "prim")
-                && path.rsplit("::").next() == Some("Debug"))
+        !self.crates.contains(root) && !matches!(root, "std" | "prim")
     }
 
     /// Reads the struct, enum or union whose keyword is at `at`.
@@ -1140,8 +1211,9 @@ impl Debugs {
                 });
             }
         }
-        self.declared.entry(path).or_insert(Declared {
+        self.declared.entry(path).or_default().push(Declared {
             source: index,
+            keyword: invoked.is_none().then_some(at),
             name,
             derived,
             shapes,
@@ -1162,15 +1234,12 @@ impl Debugs {
             .find(|&end| punct(tokens.get(end), ';') && depth_between(tokens, cursor, end) == 0)
             .unwrap_or(tokens.len());
         let path = self.sources[index].defined_path(scope, &name);
-        self.type_aliases.insert(
-            path,
-            Written {
-                source: index,
-                scope,
-                generics,
-                tokens: tokens[cursor + 1..end].to_vec(),
-            },
-        );
+        self.type_aliases.entry(path).or_default().push(Written {
+            source: index,
+            scope,
+            generics,
+            tokens: tokens[cursor + 1..end].to_vec(),
+        });
     }
 
     /// Reads the `impl Debug for` whose `impl` is at `at` and whose `for` is at `at_for`. `invoked`
@@ -1221,6 +1290,42 @@ impl Debugs {
             origin: invoked.is_none().then_some(open),
         });
     }
+}
+
+/// The index of the `struct`, `enum` or `union` that the attributes around `at` belong to.
+fn item_keyword_after(tokens: &[Located], at: usize) -> Option<usize> {
+    (at..tokens.len())
+        .find(|&index| {
+            matches!(
+                ident(tokens.get(index)),
+                Some(
+                    "struct"
+                        | "enum"
+                        | "union"
+                        | "fn"
+                        | "impl"
+                        | "mod"
+                        | "trait"
+                        | "type"
+                        | "use"
+                        | "const"
+                        | "static"
+                )
+            )
+        })
+        .filter(|&index| matches!(ident(tokens.get(index)), Some("struct" | "enum" | "union")))
+}
+
+/// Whether the scope `inner` of `source` is the scope `outer` or one inside it.
+fn encloses(source: &Source, outer: usize, inner: usize) -> bool {
+    let mut current = Some(inner);
+    while let Some(scope) = current {
+        if scope == outer {
+            return true;
+        }
+        current = source.scopes[scope].parent;
+    }
+    false
 }
 
 /// Whether the token at `at` is inside the body of one of `macros`.
@@ -1329,11 +1434,14 @@ fn trait_impls(tokens: &[Located]) -> Vec<(usize, usize, usize)> {
 
 /// Whether this reading knows what the macro at `path` writes where it is used: the library's,
 /// which it reads or which the files that define what may be shown decide, the standard library's
-/// but `include!`, and those from outside the workspace it lists.
+/// it names but `include!`, and those from outside the workspace it lists.
 fn macro_read(path: &str) -> bool {
-    LIBRARY_MACROS.contains(&path)
-        || QUIET_MACROS.contains(&path)
-        || (path.starts_with("std::") && path != "std::include")
+    match std_item(path) {
+        Some(name) => {
+            name != "include" && (STD_MACROS.contains(&name) || STD_MODULE_MACROS.contains(&name))
+        }
+        None => LIBRARY_MACROS.contains(&path) || QUIET_MACROS.contains(&path),
+    }
 }
 
 /// Each `macro_rules!` in `tokens`: its name and its body's braces.
@@ -1559,6 +1667,14 @@ fn one_of(given: &[Named], name: &str) -> Result<String, Why> {
     }
 }
 
+/// The name of the item a full path into the standard library names, which is that item's
+/// identity: the standard library gives an item it re-exports its own name wherever it does, so
+/// `std::prelude::v1::Debug` is `Debug`. `None` for a path outside the standard library.
+fn std_item(path: &str) -> Option<&str> {
+    path.strip_prefix("std::")
+        .map(|rest| rest.rsplit("::").next().unwrap_or(rest))
+}
+
 /// A full path with the standard library spelled `std::`, as `core::` and `alloc::` are re-exported
 /// there.
 fn std_spelled(path: &str) -> String {
@@ -1770,7 +1886,7 @@ impl Debugs {
                 continue;
             }
             visiting.push(key);
-            let target = self.target(index, scope, &import.path, import.global, visiting);
+            let target = self.target(index, scope, &import.written, import.global, visiting);
             visiting.pop();
             given.push(Named {
                 path: target?,
@@ -1839,7 +1955,7 @@ impl Debugs {
         visiting.push(key);
         let glob = &self.sources[index].globs[position];
         let given = self
-            .target(index, glob.scope, &glob.path, glob.global, visiting)
+            .target(index, glob.scope, &glob.written, glob.global, visiting)
             .and_then(|module| self.member(&module, name, visiting));
         visiting.pop();
         given
@@ -1875,14 +1991,19 @@ impl Debugs {
             }
             // A type of the workspace, whose variants an import can name.
             return match self.declared.get(module) {
-                Some(declared) => Ok(declared
-                    .shapes
+                Some(definitions) => Ok(definitions
                     .iter()
-                    .filter(|shape| shape.name == name && shape.name != declared.name)
-                    .map(|_| Named {
+                    .any(|declared| {
+                        declared
+                            .shapes
+                            .iter()
+                            .any(|shape| shape.name == name && shape.name != declared.name)
+                    })
+                    .then(|| Named {
                         path: full.clone(),
                         reach: Reach::Everywhere,
                     })
+                    .into_iter()
                     .collect()),
                 None => Err(format!("{module}, a module this reading cannot find")),
             };
@@ -1937,9 +2058,8 @@ impl Debugs {
         one_of(&given, &format!("{module}::{name}"))
     }
 
-    /// The item an import's or a glob's path leads to: from the crate it names when it is written
-    /// from the crates' root, from its crate's root when this reading made it full, and otherwise
-    /// read where it is written.
+    /// The item an import's or a glob's path, exactly as written, leads to: from the crate it
+    /// names when it is written from the crates' root, and otherwise read where it is written.
     fn target(
         &self,
         index: usize,
@@ -1948,11 +2068,11 @@ impl Debugs {
         global: bool,
         visiting: &mut Vec<String>,
     ) -> Result<String, Why> {
-        let Some((first, rest)) = path.split_first() else {
-            return Err("an import this reading cannot read".to_owned());
-        };
-        if global || *first == self.sources[index].crate_name {
-            let mut placed = first.clone();
+        if global {
+            let Some((krate, rest)) = path.split_first() else {
+                return Err("an import this reading cannot read".to_owned());
+            };
+            let mut placed = krate.clone();
             for name in rest {
                 placed = self.one(&placed, name, visiting)?;
             }
@@ -2153,32 +2273,46 @@ impl Debugs {
         if self.decided(&path) {
             return None;
         }
-        if let Some(alias) = self.type_aliases.get(&path) {
-            let Some(expanded) = self.expand_alias(alias, written, &positional) else {
-                return Some(format!("{path}, an alias this reading cannot expand"));
-            };
-            let why = self.carries(&expanded, carrying);
-            self.expanding.set(self.expanding.get().saturating_sub(1));
-            return why;
-        }
-        if let Some(declared) = self.declared.get(&path) {
-            if let Some(why) = carrying.get(&path) {
-                return Some(format!("{path}, which carries {why}"));
-            }
-            if positional.is_empty() || declared.derived.is_none() {
-                return arguments_carry();
-            }
-            // A generic type with a derived `Debug` is read with its arguments in place of its
-            // parameters, since an argument that is safe alone can be bytes in a sequence.
-            for member in declared.shapes.iter().flat_map(|shape| &shape.members) {
-                let Some(expanded) = self.expand_alias(&member.written, written, &positional)
-                else {
-                    return Some(format!("{path}, a generic type this reading cannot expand"));
+        if let Some(aliases) = self.type_aliases.get(&path) {
+            // An alias defined once for each set of `cfg` conditions carries when any does.
+            for alias in aliases {
+                let Some(expanded) = self.expand_alias(alias, written, &positional) else {
+                    return Some(format!("{path}, an alias this reading cannot expand"));
                 };
                 let why = self.carries(&expanded, carrying);
                 self.expanding.set(self.expanding.get().saturating_sub(1));
-                if let Some(why) = why {
-                    return Some(format!("{path}, which with its arguments carries {why}"));
+                if why.is_some() {
+                    return why;
+                }
+            }
+            return None;
+        }
+        if let Some(definitions) = self.declared.get(&path) {
+            if let Some(why) = carrying.get(&path) {
+                return Some(format!("{path}, which carries {why}"));
+            }
+            if positional.is_empty() {
+                return arguments_carry();
+            }
+            for declared in definitions {
+                if declared.derived.is_none() {
+                    if let Some(why) = arguments_carry() {
+                        return Some(why);
+                    }
+                    continue;
+                }
+                // A generic type with a derived `Debug` is read with its arguments in place of its
+                // parameters, since an argument that is safe alone can be bytes in a sequence.
+                for member in declared.shapes.iter().flat_map(|shape| &shape.members) {
+                    let Some(expanded) = self.expand_alias(&member.written, written, &positional)
+                    else {
+                        return Some(format!("{path}, a generic type this reading cannot expand"));
+                    };
+                    let why = self.carries(&expanded, carrying);
+                    self.expanding.set(self.expanding.get().saturating_sub(1));
+                    if let Some(why) = why {
+                        return Some(format!("{path}, which with its arguments carries {why}"));
+                    }
                 }
             }
             return None;
@@ -2325,13 +2459,15 @@ impl Debugs {
         };
         match self.resolve(written, &segments).ok().as_deref() {
             Some("prim::u8") => true,
-            Some(path) => self.type_aliases.get(path).is_some_and(|alias| {
-                self.expand_alias(alias, written, &arguments)
-                    .is_some_and(|expanded| {
-                        let byte = self.is_byte(&expanded, &expanded.tokens);
-                        self.expanding.set(self.expanding.get().saturating_sub(1));
-                        byte
-                    })
+            Some(path) => self.type_aliases.get(path).is_some_and(|aliases| {
+                aliases.iter().any(|alias| {
+                    self.expand_alias(alias, written, &arguments)
+                        .is_some_and(|expanded| {
+                            let byte = self.is_byte(&expanded, &expanded.tokens);
+                            self.expanding.set(self.expanding.get().saturating_sub(1));
+                            byte
+                        })
+                })
             }),
             None => false,
         }
@@ -2357,7 +2493,7 @@ impl Debugs {
         let mut carrying = Carrying::new();
         loop {
             let mut changed = false;
-            for (path, declared) in &self.declared {
+            for (path, definitions) in &self.declared {
                 if carrying.contains_key(path) || self.decided(path) {
                     continue;
                 }
@@ -2366,18 +2502,22 @@ impl Debugs {
                     .iter()
                     .filter(|hand| hand.target == *path)
                     .collect();
-                let why = match declared.derived {
-                    Some(_) => self.derived_carries(declared, &carrying),
-                    // A type formatted somewhere has a `Debug`: one this reading cannot find is
-                    // one it cannot hold.
-                    None if hands.is_empty() => {
-                        Some("a type whose Debug this reading cannot find".to_owned())
-                    }
-                    None => hands
-                        .iter()
-                        .find_map(|hand| self.read_by_hand(hand, &carrying).err())
-                        .map(|(_, why)| why),
-                };
+                // A type defined once for each set of `cfg` conditions carries when any definition
+                // does.
+                let why = definitions
+                    .iter()
+                    .find_map(|declared| match declared.derived {
+                        Some(_) => self.derived_carries(declared, &carrying),
+                        // A type formatted somewhere has a `Debug`: one this reading cannot find is
+                        // one it cannot hold.
+                        None if hands.is_empty() => {
+                            Some("a type whose Debug this reading cannot find".to_owned())
+                        }
+                        None => hands
+                            .iter()
+                            .find_map(|hand| self.read_by_hand(hand, &carrying).err())
+                            .map(|(_, why)| why),
+                    });
                 if let Some(why) = why {
                     carrying.insert(path.clone(), why);
                     changed = true;
@@ -2393,7 +2533,7 @@ impl Debugs {
     fn findings(&self) -> Vec<Finding> {
         let carrying = self.fixpoint();
         let mut findings = BTreeSet::new();
-        for declared in self.declared.values() {
+        for declared in self.declared.values().flatten() {
             let (Some(file), Some(line)) = (self.guarded_file(declared.source), declared.derived)
             else {
                 continue;
@@ -2768,10 +2908,18 @@ impl Reading<'_> {
         let inner = self.dereferenced(written)?;
         let (segments, _) = spelled_path(&inner.tokens);
         let path = self.debugs.resolve(&inner, &segments).ok()?;
-        if let Some(alias) = self.debugs.type_aliases.get(&path) {
+        // A type with more than one definition, one for each set of `cfg` conditions, is one whose
+        // fields this reading cannot tell apart.
+        if let Some(aliases) = self.debugs.type_aliases.get(&path) {
+            let [alias] = aliases.as_slice() else {
+                return None;
+            };
             return self.declaration(alias);
         }
-        self.debugs.declared.get(&path)
+        match self.debugs.declared.get(&path)?.as_slice() {
+            [declared] => Some(declared),
+            _ => None,
+        }
     }
 
     /// The type `written` names once references, `Box`, `Arc` and `Rc` are looked through.
@@ -2888,7 +3036,7 @@ impl Reading<'_> {
                 && punct(body.get(at + 1), '!')
                 && self
                     .placed_at(at, &path_ending_at(body, at), Kind::Macro)
-                    .is_ok_and(|path| WRITE_MACROS.contains(&path.as_str()))
+                    .is_ok_and(|path| matches!(std_item(&path), Some("write" | "writeln")))
             {
                 let parts = arguments(body, at + 2).unwrap_or_default();
                 if matches!(parts.first().map(Vec::as_slice), Some([one]) if ident(Some(one)) == Some(self.formatter.as_str()))
@@ -2909,10 +3057,26 @@ impl Reading<'_> {
                 let parts = arguments(body, at + 1).unwrap_or_default();
                 if matches!(parts.get(1).map(Vec::as_slice), Some([one]) if ident(Some(one)) == Some(self.formatter.as_str()))
                 {
-                    let named = match ident(body.get(at - 3)) {
+                    // The trait whose `fmt` this is, placed where it is written: only the standard
+                    // library's formatting traits are read, by what they are, not by their name.
+                    let path = path_ending_at(body, at);
+                    let owner = &path[..path.len() - 1];
+                    let placed = self.placed_at(at, owner, Kind::Trait).ok();
+                    let named = match placed.as_deref().and_then(std_item) {
                         Some("Debug") => Trait::Debug,
                         Some("Display") => Trait::Display,
-                        _ => Trait::Number,
+                        Some(
+                            "Binary" | "LowerExp" | "LowerHex" | "Octal" | "UpperExp" | "UpperHex",
+                        ) => Trait::Number,
+                        _ => {
+                            return Err(self.refuse(
+                                at,
+                                format!(
+                                    "the fmt of {}, a trait this reading does not read",
+                                    owner.join("::")
+                                ),
+                            ));
+                        }
                     };
                     self.value(&parts[0], at, named)?;
                     if let Some(position) = (at..body.len()).find(|&position| {
@@ -3784,6 +3948,34 @@ fn what_the_debug_rule_allows_is_not_named() {
 fn each_name_is_placed_where_the_compiler_places_it() {
     let cases: &[(&str, &str, &str, usize, &str)] = &[
         (
+            "the Debug trait under an import named like its own crate",
+            "pub trait Debug {}\npub mod exports {\n    use std::fmt as kr_other;\n    pub use kr_other::Debug;\n}\n",
+            "pub struct Leak(pub String);\nimpl kr_other::exports::Debug for Leak {\n    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n        formatter.debug_tuple(\"Leak\").field(&self.0).finish()\n    }\n}\n",
+            4,
+            "formats std::string::String",
+        ),
+        (
+            "the standard library's Debug derive under the name of another derive of its prelude",
+            "pub use std::prelude::v1::Debug as Clone;\n",
+            "use kr_other::Clone;\n#[derive(Clone)]\npub struct Leak(pub String);\n",
+            2,
+            "a derived Debug over text that arrived",
+        ),
+        (
+            "the standard library's include! under another name",
+            "pub use std::prelude::v1::include as load;\n",
+            "kr_other::load!(\"leak.rs\");\n",
+            1,
+            "a macro this reading does not read",
+        ),
+        (
+            "a trait from outside the workspace this reading does not list",
+            "",
+            "pub struct Leak(pub String);\nimpl somewhere::names::Shows for Leak {\n    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n        formatter.debug_tuple(\"Leak\").field(&self.0).finish()\n    }\n}\n",
+            2,
+            "a trait from outside the workspace this reading does not list",
+        ),
+        (
             "a Debug macro imported by name beside a glob that gives the name another item",
             "pub use std::fmt::Debug as debug_fields;\npub const TAG: u64 = 0;\n",
             "use kr_client::debug_fields;\nuse kr_other::*;\npub const USED_TAG: u64 = TAG;\npub struct Leak {\n    pub text: String,\n}\ndebug_fields!(Leak { text });\n",
@@ -3952,6 +4144,48 @@ fn each_name_is_placed_where_the_compiler_places_it() {
             "a derived Debug over text that arrived",
         ),
         (
+            "the Display trait under the name Debug, whose fmt a Debug written by hand calls",
+            "pub struct Secret(pub String);\nimpl std::fmt::Debug for Secret {\n    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n        formatter.write_str(\"Secret\")\n    }\n}\nimpl std::fmt::Display for Secret {\n    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n        formatter.write_str(&self.0)\n    }\n}\npub use std::fmt::Display as Debug;\n",
+            "use kr_other::Debug;\npub struct Leak(pub kr_other::Secret);\nimpl std::fmt::Debug for Leak {\n    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n        Debug::fmt(&self.0, formatter)\n    }\n}\n",
+            5,
+            "the Display of kr_other::Secret",
+        ),
+        (
+            "an attribute macro under a module named like a tool",
+            "",
+            "mod rustfmt {\n    pub use attr_debug::add_debug as skip;\n}\n#[rustfmt::skip]\npub struct Leak(pub String);\n",
+            4,
+            "an attribute this reading does not read",
+        ),
+        (
+            "a type another crate declares with a macro its module's own macro does not stand for",
+            "mod quiet {\n    #[allow(unused_macros)]\n    macro_rules! declare {\n        ($name:ident) => {\n            #[derive(Debug)]\n            pub struct $name(pub u64);\n        };\n    }\n}\nuse somewhere::declare;\ndeclare!(Opaque);\n",
+            "#[derive(Debug)]\npub struct Leak(pub kr_other::Opaque);\n",
+            1,
+            "a derived Debug over text that arrived",
+        ),
+        (
+            "a type another crate declares with a macro before its own macro of that name is written",
+            "use somewhere::declare;\ndeclare!(Opaque);\n#[allow(unused_macros)]\nmacro_rules! declare {\n    ($name:ident) => {\n        #[derive(Debug)]\n        pub struct $name(pub u64);\n    };\n}\n",
+            "#[derive(Debug)]\npub struct Leak(pub kr_other::Opaque);\n",
+            1,
+            "a derived Debug over text that arrived",
+        ),
+        (
+            "a type defined once for each platform, the second of which holds text",
+            "",
+            "#[cfg(not(unix))]\n#[derive(Debug)]\npub struct Leak(pub u64);\n#[cfg(unix)]\n#[derive(Debug)]\npub struct Leak(pub String);\n",
+            5,
+            "std::string::String",
+        ),
+        (
+            "an alias defined once for each platform, the first of which is text",
+            "",
+            "#[cfg(unix)]\ntype Raw = String;\n#[cfg(not(unix))]\ntype Raw = u64;\n#[derive(Debug)]\npub struct Leak(pub Raw);\n",
+            5,
+            "std::string::String",
+        ),
+        (
             "an extern crate",
             "",
             "extern crate kr_other;\n",
@@ -4006,6 +4240,11 @@ fn names_the_compiler_places_elsewhere_are_not_named() {
             "the attributes and derives the two crates use",
             "",
             "#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, PartialOrd, Ord)]\n#[must_use]\n#[non_exhaustive]\npub struct Counted {\n    #[doc = \"a count\"]\n    pub count: u64,\n}\n#[derive(serde::Serialize, serde::Deserialize)]\n#[serde(rename_all = \"snake_case\")]\npub struct Wire {\n    #[serde(default)]\n    pub count: u64,\n}\n#[cfg_attr(unix, must_use)]\n#[rustfmt::skip]\npub struct Kept(pub u64);\n",
+        ),
+        (
+            "a trait from outside the workspace this reading lists",
+            "",
+            "pub struct Service;\nimpl rmcp::ServerHandler for Service {}\n",
         ),
         (
             "the macros the two crates use from outside the library",

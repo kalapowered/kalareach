@@ -629,6 +629,8 @@ struct Import {
     /// The full path it names, or the path as written when it starts with a name the scope
     /// resolves.
     path: Vec<String>,
+    /// The path exactly as written, without a `::` in front.
+    written: Vec<String>,
     /// Whether the path is written from the crates' root, `::name`.
     global: bool,
     /// Where the imported name may be seen from.
@@ -640,8 +642,8 @@ struct Import {
 struct Glob {
     /// The scope the import is written in, as an index into [`Source::scopes`].
     scope: usize,
-    /// The module's full path, or its path as written, as for an [`Import`].
-    path: Vec<String>,
+    /// The module's path exactly as written, without a `::` in front.
+    written: Vec<String>,
     /// Whether the path is written from the crates' root.
     global: bool,
     /// Where the names it imports may be seen from, at most.
@@ -1145,6 +1147,15 @@ fn read_source(
     }
     source.tokens = tokens;
     for (scope, segments, renamed, global, visibility) in found {
+        if renamed.as_deref() == Some("*") {
+            source.globs.push(Glob {
+                scope,
+                written: segments,
+                global,
+                visibility,
+            });
+            continue;
+        }
         // A path from the crates' root names a crate first, whatever the scope declares.
         let path = if global {
             segments.clone()
@@ -1153,15 +1164,6 @@ fn read_source(
                 .relative(&segments, scope)
                 .unwrap_or_else(|| segments.clone())
         };
-        if renamed.as_deref() == Some("*") {
-            source.globs.push(Glob {
-                scope,
-                path,
-                global,
-                visibility,
-            });
-            continue;
-        }
         let local = match renamed {
             Some(renamed) => renamed,
             None if segments.last().is_some_and(|last| last == "self") => {
@@ -1169,16 +1171,19 @@ fn read_source(
             }
             None => segments.last().cloned().unwrap_or_default(),
         };
-        let path = if path.last().is_some_and(|last| last == "self") {
-            path[..path.len() - 1].to_vec()
-        } else {
-            path
+        let without_self = |path: Vec<String>| {
+            if path.last().is_some_and(|last| last == "self") {
+                path[..path.len() - 1].to_vec()
+            } else {
+                path
+            }
         };
         if local != "_" {
             source.imports.push(Import {
                 scope,
                 local,
-                path,
+                path: without_self(path),
+                written: without_self(segments),
                 global,
                 visibility,
             });
