@@ -7,14 +7,15 @@
 //!
 //! | Row | What proves it |
 //! | --- | --- |
-//! | KR-REQ-12.07 | an integrated command resolves to the connector its installed package carries, and to nothing else |
+//! | KR-REQ-12.07 | an integrated command resolves to the connector its installed package carries, and to nothing else; its command, flags and variables are the verified manifest's, and apply only while `command_integration.launch` is granted |
 //! | KR-REQ-11.34 | the table a channel is served with is the installed package's own |
+//! | KR-REQ-12.22 | Qoder CLI's launch flags give its launch a hook bridge on this installation's own forwarder, for Qoder CLI and nothing else |
 
 use std::path::{Path, PathBuf};
 
 use kr_plugin_sdk::capability::PluginCapability;
 use kr_protocol::scalars::Digest256;
-use kr_worker::broker::bridge::BridgeSurface;
+use kr_worker::broker::bridge::{BridgeDeclaration, BridgeSurface, InstalledBridge};
 use kr_worker::broker::connectors::{
     ConnectorSource, ConnectorSources, InstalledConnector, fixture,
 };
@@ -35,6 +36,19 @@ impl Store {
     fn package(&self) -> ConnectorSource {
         fixture::claude_code_package(&self.root, Path::new("/opt/kalareach/bin/kr-hook"))
             .expect("the package is written")
+    }
+
+    fn shaped(&self, shape: &fixture::Shape) -> ConnectorSource {
+        fixture::package(&self.root, Path::new("/opt/kalareach/bin/kr-hook"), shape)
+            .expect("the package is written")
+    }
+
+    /// A file standing in for an installation's forwarder, at `relative` inside the store.
+    fn forwarder(&self, relative: &str) -> PathBuf {
+        let path = self.root.join(relative);
+        std::fs::create_dir_all(path.parent().expect("a directory")).expect("the directory");
+        std::fs::write(&path, b"forwarder").expect("the forwarder stands in");
+        path
     }
 }
 
@@ -233,4 +247,251 @@ fn a_command_the_package_does_not_recognise_is_refused() {
         assert_eq!(sources.replace(vec![source]).len(), 1, "{command:?}");
         assert!(sources.for_command(command).is_none(), "{command:?}");
     }
+}
+
+/// The inline hooks of a `--settings` flag that start the forwarder with `arguments`.
+fn hooks_starting(arguments: &[&str]) -> String {
+    serde_json::json!({
+        "hooks": {
+            "SessionStart": [{
+                "hooks": [{ "type": "command", "command": "kr-hook", "args": arguments, "timeout": 5 }]
+            }]
+        }
+    })
+    .to_string()
+}
+
+/// KR-REQ-12.22: Qoder CLI's launch flags register the forwarder's hook for Qoder CLI, so the
+/// launch admits a hook that says it is Qoder CLI's and runs this installation's own forwarder,
+/// and refuses one that says it is another application's, a channel, or that runs another copy.
+#[test]
+fn kr_req_12_22_qoder_cli_s_flags_give_its_launch_a_hook_bridge_on_this_installation_s_forwarder() {
+    let store = Store::new("qoder");
+    let launcher = store.forwarder("bin/kr-hook");
+    let connector = InstalledConnector::read(store.shaped(&fixture::Shape::qoder_cli()))
+        .expect("the installed package is read");
+    assert!(
+        connector.installed_bridge().is_none(),
+        "the installation put no bridge in place"
+    );
+    let integration = connector
+        .integration()
+        .expect("the manifest declares the integration");
+    assert_eq!(integration.command, "qodercli");
+    assert_eq!(integration.flags, fixture::qoder_flags());
+    let bridge = connector
+        .launch_bridge(&launcher)
+        .expect("the flags register the forwarder's hook");
+    assert_eq!(
+        bridge,
+        InstalledBridge {
+            plugin_id: connector.plugin_id(),
+            application: "qoder-cli".to_owned(),
+            surfaces: [BridgeSurface::Hook].into_iter().collect(),
+            forwarder: launcher.clone(),
+        }
+    );
+    let declared = |application: &str, surface: BridgeSurface| BridgeDeclaration {
+        application: application.to_owned(),
+        surface,
+    };
+    bridge
+        .validate(&declared("qoder-cli", BridgeSurface::Hook), Some(&launcher))
+        .expect("Qoder CLI's hook, running this installation's forwarder");
+    bridge
+        .validate(
+            &declared("claude-code", BridgeSurface::Hook),
+            Some(&launcher),
+        )
+        .expect_err("another application's hook");
+    bridge
+        .validate(
+            &declared("qoder-cli", BridgeSurface::Channel),
+            Some(&launcher),
+        )
+        .expect_err("a channel the flags do not register");
+    let other = store.forwarder("elsewhere/kr-hook");
+    bridge
+        .validate(&declared("qoder-cli", BridgeSurface::Hook), Some(&other))
+        .expect_err("another copy of the forwarder");
+}
+
+/// A launch's bridge is the package's own and comes from one place: flags that start the forwarder
+/// for another application, for a channel or with other arguments are refused, and so are flags
+/// that start it beside the native bridge the package installs.
+#[test]
+fn flags_that_start_the_forwarder_for_another_application_a_channel_or_a_second_bridge_are_refused()
+{
+    let store = Store::new("flags");
+    for (shape, what) in [
+        (
+            fixture::Shape {
+                integration: Some(fixture::declaration(
+                    "qodercli",
+                    &["--settings", &hooks_starting(&["claude-code", "hook"])],
+                    &[],
+                )),
+                ..fixture::Shape::qoder_cli()
+            },
+            "another application's hook",
+        ),
+        (
+            fixture::Shape {
+                integration: Some(fixture::declaration(
+                    "qodercli",
+                    &["--settings", &hooks_starting(&["qoder-cli", "channel"])],
+                    &[],
+                )),
+                ..fixture::Shape::qoder_cli()
+            },
+            "a channel",
+        ),
+        (
+            fixture::Shape {
+                integration: Some(fixture::declaration(
+                    "qodercli",
+                    &[
+                        "--settings",
+                        &hooks_starting(&["qoder-cli", "hook", "extra"]),
+                    ],
+                    &[],
+                )),
+                ..fixture::Shape::qoder_cli()
+            },
+            "arguments the forwarder does not take from a bridge",
+        ),
+        (
+            fixture::Shape {
+                integration: Some(fixture::declaration(
+                    "claude",
+                    &["--settings", &hooks_starting(&["claude-code", "hook"])],
+                    &[],
+                )),
+                ..fixture::Shape::claude_code()
+            },
+            "a hook beside the native bridge the package installs",
+        ),
+    ] {
+        let source = store.shaped(&shape);
+        let refusal = InstalledConnector::read(source.clone())
+            .map(|connector| connector.plugin_id())
+            .expect_err(what);
+        assert!(
+            refusal.detail.contains("kr-hook"),
+            "{what}: {}",
+            refusal.detail
+        );
+        let sources = ConnectorSources::new();
+        assert_eq!(sources.replace(vec![source]).len(), 1, "{what}");
+        assert!(sources.is_empty(), "{what}");
+    }
+}
+
+/// A native bridge the installation put in place for another application than the package's own is
+/// refused.
+#[test]
+fn an_installed_bridge_for_another_application_is_refused() {
+    let store = Store::new("elsewhere");
+    let mut source = store.package();
+    source
+        .bridge
+        .as_mut()
+        .expect("the installation put the bridge in place")
+        .application = "gemini-cli".to_owned();
+    let refusal = InstalledConnector::read(source)
+        .map(|connector| connector.plugin_id())
+        .expect_err("another application's bridge");
+    assert!(refusal.detail.contains("gemini-cli"), "{}", refusal.detail);
+}
+
+/// A native bridge the package declares and the installation did not put in place leaves its
+/// launch with no bridge, so none is admitted.
+#[test]
+fn a_declared_bridge_the_installation_did_not_apply_leaves_the_launch_with_none() {
+    let store = Store::new("unapplied");
+    let launcher = store.forwarder("bin/kr-hook");
+    let mut source = store.package();
+    source.bridge = None;
+    let connector = InstalledConnector::read(source).expect("the installed package is read");
+    assert!(connector.integration().is_some());
+    assert!(connector.launch_bridge(&launcher).is_none());
+}
+
+/// KR-REQ-12.07: an integration applies only while the installation holds
+/// `command_integration.launch`. Without it the connector is still read and matched, and resolves
+/// no command.
+#[test]
+fn kr_req_12_07_a_withdrawn_integration_grant_keeps_the_connector_and_integrates_nothing() {
+    let store = Store::new("withdrawn");
+    let mut source = store.package();
+    source
+        .granted
+        .remove(&PluginCapability::CommandIntegrationLaunch);
+    let connector =
+        InstalledConnector::read(source.clone()).expect("the installed package is read");
+    assert!(connector.integration().is_none());
+    let sources = ConnectorSources::new();
+    assert!(sources.replace(vec![source]).is_empty());
+    assert!(sources.for_command(fixture::COMMAND).is_none());
+    assert!(sources.matching("/usr/local/bin/claude").is_some());
+}
+
+/// Connectors that declare no command integration are held for matching, however many there are,
+/// and resolve no command.
+#[test]
+fn connectors_that_declare_no_integration_are_held_for_matching() {
+    let store = Store::new("undeclared");
+    let claude = store.shaped(&fixture::Shape {
+        integration: None,
+        ..fixture::Shape::claude_code()
+    });
+    let codex = store.shaped(&fixture::Shape {
+        plugin_name: "codex",
+        display_name: "Codex CLI",
+        executable: "codex",
+        integration: None,
+        native_bridge: false,
+        ..fixture::Shape::claude_code()
+    });
+    let sources = ConnectorSources::new();
+    assert!(sources.replace(vec![claude, codex]).is_empty());
+    assert!(!sources.is_empty());
+    assert!(sources.for_command("claude").is_none());
+    assert!(sources.for_command("codex").is_none());
+    assert_eq!(
+        sources
+            .matching("/usr/local/bin/claude")
+            .map(|connector| connector.plugin_id().to_string()),
+        Some("kalareach/claude-code".to_owned())
+    );
+    assert_eq!(
+        sources
+            .matching("/usr/local/bin/codex")
+            .map(|connector| connector.plugin_id().to_string()),
+        Some("kalareach/codex".to_owned())
+    );
+}
+
+/// KR-REQ-12.07: a manifest altered to declare other flags is not the installed package, whatever
+/// its flags say, and nothing is integrated from it.
+#[test]
+fn kr_req_12_07_a_manifest_altered_to_declare_other_flags_is_refused() {
+    let store = Store::new("altered");
+    let source = store.package();
+    let manifest = source.package_dir.join("plugin.json");
+    let text = std::fs::read_to_string(&manifest)
+        .expect("the manifest is read")
+        .replace(fixture::FLAGS[1], "plugin:elsewhere@skills-dir");
+    std::fs::write(&manifest, text).expect("the manifest is changed");
+    let refusal = InstalledConnector::read(source.clone())
+        .map(|connector| connector.plugin_id())
+        .expect_err("an altered manifest");
+    assert!(
+        refusal.detail.contains("not the installed one"),
+        "{}",
+        refusal.detail
+    );
+    let sources = ConnectorSources::new();
+    assert_eq!(sources.replace(vec![source]).len(), 1);
+    assert!(sources.for_command(fixture::COMMAND).is_none());
 }

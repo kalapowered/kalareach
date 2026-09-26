@@ -8,7 +8,7 @@
 //!
 //! | Row | What proves it |
 //! | --- | --- |
-//! | KR-REQ-12.07 | a backend's endpoint, credential and launch record exist before the answer; a bypass creates nothing; one line runs one integrated invocation; each session has a root of its own |
+//! | KR-REQ-12.07 | a backend's endpoint, credential and launch record exist before the answer; a bypass creates nothing; one line runs one integrated invocation; each session has a root of its own; a declared package establishes with its flags and variables; a session entry whose flags are not the package's, a run that splits the flags and an executable no match rule recognises establish nothing; a bypassed invocation exports nothing |
 
 #![cfg(unix)]
 
@@ -63,17 +63,31 @@ impl Setup {
     }
 
     fn with(adjust: impl FnOnce(CommandBackendsConfig) -> CommandBackendsConfig) -> Self {
+        Self::shaped(&fixture::Shape::claude_code(), &["bin", "claude"], adjust)
+    }
+
+    /// A store with a package of `shape` installed, and its executable at `executable` inside the
+    /// case's own directory.
+    fn shaped(
+        shape: &fixture::Shape,
+        executable: &[&str],
+        adjust: impl FnOnce(CommandBackendsConfig) -> CommandBackendsConfig,
+    ) -> Self {
         let directory = private_directory("kcb");
         let bin = directory.join("bin");
         std::fs::create_dir_all(&bin).expect("a bin directory");
         let launcher = bin.join("kr-hook");
-        let executable = bin.join("claude");
+        let executable = executable
+            .iter()
+            .fold(directory.clone(), |path, part| path.join(part));
+        std::fs::create_dir_all(executable.parent().expect("a directory"))
+            .expect("the executable's directory");
         std::fs::copy("/bin/sleep", &launcher).expect("a launcher stands in");
         std::fs::copy("/bin/sleep", &executable).expect("an executable stands in");
         let sources = Arc::new(ConnectorSources::new());
         let store = directory.join("store");
         std::fs::create_dir_all(&store).expect("a store");
-        let source = fixture::claude_code_package(&store, &launcher).expect("the package");
+        let source = fixture::package(&store, &launcher, shape).expect("the package");
         assert!(
             sources.replace(vec![source]).is_empty(),
             "the connector is installed"
@@ -153,7 +167,12 @@ struct Invocation {
 }
 
 fn invocation(typed: &[&str]) -> Invocation {
-    let added = words(&fixture::FLAGS);
+    invocation_adding(typed, &fixture::FLAGS)
+}
+
+/// An invocation the shell answered by adding `added` after what was typed.
+fn invocation_adding(typed: &[&str], added: &[&str]) -> Invocation {
+    let added = words(added);
     let mut arguments = words(typed);
     arguments.extend(added.iter().cloned());
     Invocation {
@@ -161,6 +180,22 @@ fn invocation(typed: &[&str]) -> Invocation {
         arguments,
         added,
     }
+}
+
+fn gemini(flags: &[&str]) -> CommandIntegration {
+    CommandIntegration {
+        command: "gemini".to_owned(),
+        flags: words(flags),
+        enabled: true,
+    }
+}
+
+fn registration_name(answer: &kr_protocol::root::CommandBackend) -> String {
+    PathBuf::from(&answer.environment[0].value)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("a registration's name")
+        .to_owned()
 }
 
 fn request<'a>(
@@ -447,4 +482,187 @@ async fn kr_req_12_07_each_session_has_a_root_of_its_own() {
         "and removes its own"
     );
     let _ = neighbour.close();
+}
+
+/// KR-REQ-12.07: a package that declares flags and a variable establishes with both: the flags
+/// stand where the shell added them, and the answer exports the variable beside the registration,
+/// in the order the package declares. Gemini CLI's own declaration adds no flag and exports its
+/// variable all the same.
+#[tokio::test]
+async fn kr_req_12_07_a_declared_package_establishes_with_its_flags_and_variables() {
+    let setup = Setup::shaped(
+        &fixture::Shape::gemini_cli(&["--kalareach-probe"]),
+        &["bin", "gemini"],
+        |config| config,
+    );
+    let integration = gemini(&["--kalareach-probe"]);
+    let resumed = invocation_adding(&["gemini", "--resume"], &["--kalareach-probe"]);
+    let answer = setup
+        .backends
+        .establish(&request(&setup, &resumed, &integration, 3))
+        .expect("a backend is established");
+    let exported: Vec<(&str, &str)> = answer
+        .environment
+        .iter()
+        .map(|variable| (variable.name.as_str(), variable.value.as_str()))
+        .collect();
+    assert_eq!(exported.len(), 2, "{exported:?}");
+    assert_eq!(exported[0].0, "KR_REGISTRATION");
+    assert_eq!(exported[1], ("GEMINI_CLI_NO_RELAUNCH", "true"));
+    assert_eq!(registration_name(&answer), "registration.2.1");
+
+    let only = Setup::shaped(
+        &fixture::Shape::gemini_cli(&[]),
+        &["bin", "gemini"],
+        |config| config,
+    );
+    let plain = invocation_adding(&["gemini"], &[]);
+    let answer = only
+        .backends
+        .establish(&request(&only, &plain, &gemini(&[]), 1))
+        .expect("a backend is established");
+    let names: Vec<&str> = answer
+        .environment
+        .iter()
+        .map(|variable| variable.name.as_str())
+        .collect();
+    assert_eq!(names, ["KR_REGISTRATION", "GEMINI_CLI_NO_RELAUNCH"]);
+    assert_eq!(registration_name(&answer), "registration.0.0");
+}
+
+/// KR-REQ-12.07: the session's entry is checked against the package the installation verified:
+/// flags other than the declared ones, or the declared ones in another order, establish nothing.
+#[tokio::test]
+async fn kr_req_12_07_a_session_entry_whose_flags_are_not_the_package_s_establishes_nothing() {
+    let setup = Setup::new();
+    let claude = invocation(&["claude"]);
+    for flags in [
+        vec![fixture::FLAGS[0]],
+        vec![fixture::FLAGS[1], fixture::FLAGS[0]],
+        vec![fixture::FLAGS[0], fixture::FLAGS[1], "--more"],
+    ] {
+        let entry = CommandIntegration {
+            flags: words(&flags),
+            ..Setup::integration()
+        };
+        setup
+            .backends
+            .establish(&request(&setup, &claude, &entry, 1))
+            .expect_err("flags the installed package does not declare");
+    }
+    assert!(setup.backends.root().is_none(), "nothing was created");
+}
+
+/// KR-REQ-12.07: the integration's flags are added whole or not at all. A run that leaves one out,
+/// as the shell's answer does when the person typed that one, establishes nothing, so the command
+/// runs as typed; one the person typed whole establishes with nothing added.
+#[tokio::test]
+async fn kr_req_12_07_the_flags_are_added_whole_or_not_at_all() {
+    let setup = Setup::new();
+    let integration = Setup::integration();
+    let split = invocation_adding(&["claude", fixture::FLAGS[0]], &[fixture::FLAGS[1]]);
+    setup
+        .backends
+        .establish(&request(&setup, &split, &integration, 1))
+        .expect_err("a value added without its flag");
+    assert!(setup.backends.root().is_none(), "nothing was created");
+    let typed = invocation_adding(&["claude", fixture::FLAGS[0], fixture::FLAGS[1]], &[]);
+    let answer = setup
+        .backends
+        .establish(&request(&setup, &typed, &integration, 2))
+        .expect("the person typed the flags themselves");
+    assert_eq!(registration_name(&answer), "registration.0.0");
+}
+
+/// A match rule that names the directory an executable is in holds the resolved executable to
+/// it: the same name anywhere else establishes nothing.
+#[tokio::test]
+async fn an_executable_outside_the_directory_its_match_rule_names_establishes_nothing() {
+    let shape = fixture::Shape {
+        directory: &[".claude-local", "bin"],
+        ..fixture::Shape::claude_code()
+    };
+    let integration = Setup::integration();
+    let claude = invocation(&["claude"]);
+    let inside = Setup::shaped(&shape, &[".claude-local", "bin", "claude"], |config| config);
+    inside
+        .backends
+        .establish(&request(&inside, &claude, &integration, 1))
+        .expect("the executable where the rule names it");
+    let outside = Setup::shaped(&shape, &["bin", "claude"], |config| config);
+    outside
+        .backends
+        .establish(&request(&outside, &claude, &integration, 1))
+        .expect_err("the executable in a directory the rule does not name");
+    assert!(outside.backends.root().is_none(), "nothing was created");
+}
+
+/// KR-REQ-12.07: a bypassed invocation exports nothing. The answer for an absolute path, a
+/// disabled integration or an unmanaged shell names no backend, and so no variable, whatever the
+/// worker established for the same words; an invocation the worker refuses gets no answer to
+/// export from.
+#[tokio::test]
+async fn kr_req_12_07_a_bypassed_invocation_exports_nothing() {
+    use kr_shell_integration::host::command::{InvocationContext, resolve};
+
+    let setup = Setup::shaped(
+        &fixture::Shape::gemini_cli(&["--kalareach-probe"]),
+        &["bin", "gemini"],
+        |config| config,
+    );
+    let integration = gemini(&["--kalareach-probe"]);
+    let established = setup
+        .backends
+        .establish(&request(
+            &setup,
+            &invocation_adding(&["gemini"], &["--kalareach-probe"]),
+            &integration,
+            1,
+        ))
+        .expect("a backend is established");
+    assert!(
+        established
+            .environment
+            .iter()
+            .any(|variable| variable.name == "GEMINI_CLI_NO_RELAUNCH")
+    );
+    let managed = InvocationContext {
+        managed_root_shell: true,
+        interactive: true,
+    };
+    let disabled = CommandIntegration {
+        enabled: false,
+        ..integration.clone()
+    };
+    for (entry, context, argv) in [
+        (&integration, managed, words(&["/usr/local/bin/gemini"])),
+        (&disabled, managed, words(&["gemini"])),
+        (
+            &integration,
+            InvocationContext {
+                managed_root_shell: false,
+                interactive: true,
+            },
+            words(&["gemini"]),
+        ),
+    ] {
+        let resolution = resolve(std::slice::from_ref(entry), context, &argv);
+        assert!(!resolution.establishes_backend(), "{argv:?}");
+        let answer = resolution.to_answer(Some(established.clone()));
+        assert!(
+            answer.backend.0.is_none(),
+            "{argv:?}: no backend, so no variable"
+        );
+        assert!(answer.added.is_empty(), "{argv:?}");
+        assert!(answer.bypass.0.is_some(), "{argv:?}");
+    }
+    setup
+        .backends
+        .establish(&request(
+            &setup,
+            &invocation_adding(&["gemini"], &["--other"]),
+            &gemini(&["--other"]),
+            2,
+        ))
+        .expect_err("an invocation the worker refuses has nothing to export");
 }

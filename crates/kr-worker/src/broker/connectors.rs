@@ -627,6 +627,8 @@ pub mod fixture {
         pub display_name: &'static str,
         /// The executable name the package's one match rule recognises.
         pub executable: &'static str,
+        /// The directories that rule requires the executable to be in, innermost last.
+        pub directory: &'static [&'static str],
         /// The manifest's `command_integration` member, where it carries one.
         pub integration: Option<serde_json::Value>,
         /// Whether the package installs Claude Code's native bridge and the installation put it
@@ -644,6 +646,7 @@ pub mod fixture {
                 plugin_name: "claude-code",
                 display_name: "Claude Code",
                 executable: COMMAND,
+                directory: &[],
                 integration: Some(declaration(COMMAND, &FLAGS, &[])),
                 native_bridge: true,
                 component: false,
@@ -658,6 +661,7 @@ pub mod fixture {
                 plugin_name: "gemini-cli",
                 display_name: "Gemini CLI",
                 executable: "gemini",
+                directory: &[],
                 integration: Some(declaration(
                     "gemini",
                     flags,
@@ -678,6 +682,7 @@ pub mod fixture {
                 plugin_name: "qoder-cli",
                 display_name: "Qoder CLI",
                 executable: "qodercli",
+                directory: &[],
                 integration: Some(declaration("qodercli", &flags, &[])),
                 native_bridge: false,
                 component: false,
@@ -847,7 +852,7 @@ pub mod fixture {
             },
             "match_rules": [{
                 "id": format!("{}-executable", shape.plugin_name),
-                "executable": { "file_stem": shape.executable, "path_suffix": [], "version_range": null },
+                "executable": { "file_stem": shape.executable, "path_suffix": shape.directory, "version_range": null },
                 "distribution": null,
                 "confidence": "inferred"
             }],
