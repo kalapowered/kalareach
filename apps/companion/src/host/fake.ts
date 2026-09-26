@@ -304,6 +304,11 @@ export interface FakeHostControls {
   presentTerminal(presentation: TerminalPresentationMode | null, reason?: PresentationReason): void
   /** Holds every raw terminal view opened from now on: nothing is published until the test says. */
   holdTerminalViews(): void
+  /**
+   * Holds the answer to every raw terminal view opened from now on until the returned function is
+   * called, so the page holds no handle for a view that is still opening.
+   */
+  holdTerminalOpens(): () => void
   /** The raw terminal views the page has opened, oldest first. */
   readonly terminalViews: readonly FakeTerminalView[]
 }
@@ -421,6 +426,7 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
   /** The raw terminal views the page has opened, oldest first. */
   const terminalViews: FakeTerminalView[] = []
   let holdingTerminalViews = false
+  let terminalOpensAnswer: Promise<void> = Promise.resolve()
   let terminalPresentation: {
     readonly presentation: TerminalPresentationMode | null
     readonly reason: PresentationReason | undefined
@@ -810,7 +816,7 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
           }, 0)
         }, 0)
       }
-      return Promise.resolve(view.handle)
+      return terminalOpensAnswer.then(() => view.handle)
     },
     terminalInput: (params) => {
       requireConnection()
@@ -1285,6 +1291,16 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
     },
     holdTerminalViews() {
       holdingTerminalViews = true
+    },
+    holdTerminalOpens() {
+      let answer = () => {}
+      terminalOpensAnswer = new Promise((resolve) => {
+        answer = resolve
+      })
+      return () => {
+        answer()
+        terminalOpensAnswer = Promise.resolve()
+      }
     },
     terminalViews
   }

@@ -8,7 +8,7 @@
  */
 
 import { Profiler, type ReactNode } from 'react'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { act, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 
@@ -18,6 +18,7 @@ import { AppProvider } from '../../src/app/state'
 import { fakeHost, terminalScreen, type HeldReads } from '../../src/host/fake'
 import { MobileSession } from '../../src/mobile/views/MobileSession'
 import { useLifecycle } from '../../src/mobile/useLifecycle'
+import { SLOW_MS, WAITING } from '../../src/terminal/modes'
 
 const SESSION_MAIN = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
 const SESSION_BUILD = '8a7b6c50-22bb-4c3d-8e4f-000000000102'
@@ -247,6 +248,126 @@ describe("the phone's raw terminal view (KR-REQ-08.02, 13.18)", () => {
     expect(screen.getByTestId('substituted-count').textContent).toBe('3 left blank')
     expect(screen.getByTestId('rows-truncated').textContent).toBe('Rows cut short')
     expect(screen.getByTestId('screen-degraded').textContent).toBe('Shortened by the session')
+  })
+
+  it('keeps the last frame while it waits, busy at once and saying so only after a moment', async () => {
+    const { port, controls } = fakeHost()
+    await onTerminal(port)
+    await waitFor(() => {
+      expect(screen.getAllByTestId('mobile-terminal-line')).toHaveLength(8)
+    })
+    act(() => {
+      controls.terminalViews[0]?.wait()
+    })
+    expect(screen.getByTestId('mobile-terminal')).toHaveAttribute('aria-busy', 'true')
+    expect(screen.queryByTestId('terminal-position')?.textContent ?? '').not.toBe(WAITING)
+    await waitFor(
+      () => {
+        expect(screen.getByTestId('terminal-position').textContent).toBe(WAITING)
+      },
+      { timeout: SLOW_MS * 20 }
+    )
+    expect(screen.getAllByTestId('mobile-terminal-line')[0]?.textContent).toBe(
+      '$ cargo test -p kr-client\n'
+    )
+    act(() => {
+      controls.terminalViews[0]?.show()
+    })
+    expect(screen.queryByTestId('terminal-position')).toBeNull()
+    expect(screen.getByTestId('mobile-terminal')).toHaveAttribute('aria-busy', 'false')
+  })
+
+  it('opens again when the host connection comes back after an open was refused', async () => {
+    const { port, controls } = fakeHost()
+    controls.setConnected(false)
+    await onTerminal(port)
+    expect(await screen.findByText(/This session could not be reached/)).toBeInTheDocument()
+    act(() => {
+      controls.setConnected(true)
+    })
+    await waitFor(() => {
+      expect(controls.terminalViews).toHaveLength(2)
+    })
+    await waitFor(() => {
+      expect(screen.getAllByTestId('mobile-terminal-line')).toHaveLength(8)
+    })
+    expect(screen.queryByText(/This session could not be reached/)).toBeNull()
+  })
+
+  it('reports the grid a pinch leaves it with', async () => {
+    // jsdom lays nothing out, so the few measurements the view takes are given here: a surface
+    // 336 pixels wide in a pane 420 high, 8 pixels of padding around the grid, and cells of 8 by 16
+    // pixels at the unscaled size, which grow with the zoom as the font does.
+    const ownStyle = window.getComputedStyle.bind(window)
+    const zoomOf = (element: Element) =>
+      Number(
+        element.closest<HTMLElement>('[data-testid="mobile-terminal"]')?.style.getPropertyValue('--zoom') ||
+          1
+      )
+    // Every other element measures nothing, as jsdom's own answer is.
+    const rects = vi.spyOn(Element.prototype, 'getBoundingClientRect').mockImplementation(function (
+      this: Element
+    ) {
+      const text = this.textContent ?? ''
+      if (this.getAttribute('aria-hidden') !== 'true' || !/^M+$/.test(text)) return new DOMRect()
+      const zoom = zoomOf(this)
+      return DOMRect.fromRect({ x: 0, y: 0, width: text.length * 8 * zoom, height: 16 * zoom })
+    })
+    const widths = vi.spyOn(Element.prototype, 'clientWidth', 'get').mockImplementation(function (
+      this: Element
+    ) {
+      return this.getAttribute('data-testid') === 'mobile-terminal' ? 336 : 0
+    })
+    const heights = vi.spyOn(Element.prototype, 'clientHeight', 'get').mockImplementation(function (
+      this: Element
+    ) {
+      return this.classList.contains('m-pane') ? 420 : 0
+    })
+    const styles = vi.spyOn(window, 'getComputedStyle').mockImplementation((element, pseudo) =>
+      element.classList.contains('m-terminal-grid')
+        ? ({
+            paddingLeft: '8px',
+            paddingRight: '8px',
+            paddingTop: '8px',
+            paddingBottom: '8px'
+          } as CSSStyleDeclaration)
+        : ownStyle(element, pseudo)
+    )
+    try {
+      const { port, controls } = fakeHost()
+      await onTerminal(port)
+      await waitFor(() => {
+        expect(screen.getAllByTestId('mobile-terminal-line').length).toBeGreaterThan(0)
+      })
+      // 320 pixels across and 404 down, in cells of 8 by 16.
+      expect(controls.terminalViews[0]?.grids.at(-1)).toEqual({ columns: 40, rows: 25 })
+
+      const surface = screen.getByTestId('mobile-terminal')
+      const finger = (type: string, pointerId: number, clientX: number) => {
+        act(() => {
+          surface.dispatchEvent(
+            new PointerEvent(type, { bubbles: true, pointerId, pointerType: 'touch', clientX, clientY: 100 })
+          )
+        })
+      }
+      // Two fingers 100 pixels apart move to 160: a pinch outwards, one step larger.
+      finger('pointerdown', 1, 100)
+      finger('pointerdown', 2, 200)
+      finger('pointermove', 2, 260)
+      finger('pointerup', 2, 260)
+      finger('pointerup', 1, 100)
+      expect(await screen.findByText('Zoom 113%')).toBeInTheDocument()
+      // Cells of 9 by 18 now: 35 across and 22 down.
+      await waitFor(() => {
+        expect(controls.terminalViews[0]?.grids.at(-1)).toEqual({ columns: 35, rows: 22 })
+      })
+      expect(controls.terminalViews).toHaveLength(1)
+    } finally {
+      rects.mockRestore()
+      widths.mockRestore()
+      heights.mockRestore()
+      styles.mockRestore()
+    }
   })
 
   it('ends with the host words and attaches again when asked', async () => {

@@ -572,6 +572,35 @@ test.describe('how the host presents a raw view', () => {
         fullPage: true
       })
     })
+
+    // KR-REQ-08.02: on a phone with room for the terminal, the session's screen is in view in the
+    // terminal pane, with the host's words and the cells left blank counted.
+    test(`the phone's raw view draws the session's screen in its pane, ${theme}, at 390 px`, async ({
+      page
+    }) => {
+      await inTheme(page, theme)
+      await page.setViewportSize({ width: 390, height: 844 })
+      await page.goto(`/harness.html?surface=ios&session=${SESSION_MAIN}`)
+      await page.getByRole('tab', { name: 'Terminal' }).click()
+
+      const first = page.getByTestId('mobile-terminal-line').first()
+      await expect(first).toContainText('$ cargo test -p kr-client')
+      const line = await first.boundingBox()
+      const pane = await page.locator('.m-pane').boundingBox()
+      if (line === null || pane === null) throw new Error('the terminal pane is not laid out')
+      expect(line.height).toBeGreaterThan(0)
+      expect(line.y).toBeGreaterThanOrEqual(pane.y)
+      expect(line.y + line.height).toBeLessThanOrEqual(pane.y + pane.height)
+      await expect(page.getByTestId('terminal-presentation')).toContainText(
+        'its client declared no terminal profile'
+      )
+      await expect(page.getByTestId('substituted-count')).toHaveText('1 left blank')
+      await expect(page.locator('html')).toHaveAttribute('data-theme', theme)
+      await page.screenshot({
+        path: shotFor(`terminal-08.02-phone-390-${theme}`),
+        fullPage: true
+      })
+    })
   }
 
   // KR-REQ-13.18: a zoom step answers at once. The last frame is drawn again at the new cell size

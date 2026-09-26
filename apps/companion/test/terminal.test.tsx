@@ -22,8 +22,11 @@ import { ATTACHING, SLOW_MS, WAITING } from '../src/terminal/modes'
 const SESSION_MAIN = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
 const SESSION_BUILD = '8a7b6c50-22bb-4c3d-8e4f-000000000102'
 
-function open(port: HostPort, place: Place = { view: 'session', sessionId: SESSION_MAIN, pane: 'terminal' }): void {
-  render(
+function open(
+  port: HostPort,
+  place: Place = { view: 'session', sessionId: SESSION_MAIN, pane: 'terminal' }
+): ReturnType<typeof render> {
+  return render(
     <AppProvider port={port} initialPlace={place}>
       <App />
     </AppProvider>
@@ -304,6 +307,32 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
       expect(controls.terminalViews[0]?.closed).toBe(true)
     })
     expect(document.body.textContent).not.toContain('size claim')
+  })
+
+  it('closes its view when the page goes, and a view still opening once its open answers', async () => {
+    const { port, controls } = fakeHost()
+    const shown = open(port)
+    await screen.findByTestId('palette-provenance')
+    shown.unmount()
+    await waitFor(() => {
+      expect(controls.terminalViews[0]?.closed).toBe(true)
+    })
+
+    const answer = controls.holdTerminalOpens()
+    const opening = open(port)
+    await waitFor(() => {
+      expect(controls.terminalViews).toHaveLength(2)
+    })
+    opening.unmount()
+    // The page holds no handle yet, so there is nothing it can close.
+    expect(controls.terminalViews[1]?.closed).toBe(false)
+    await act(async () => {
+      answer()
+      await new Promise((resolve) => {
+        setTimeout(resolve, 0)
+      })
+    })
+    expect(controls.terminalViews[1]?.closed).toBe(true)
   })
 
   it("never draws a late state of one session in another session's view", async () => {
