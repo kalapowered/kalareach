@@ -77,7 +77,13 @@ run_root="$(mktemp -d "${TMPDIR:-/tmp}/kalareach-run.XXXXXX")"
 export TMPDIR="$run_root"
 
 survivors() {
-  pgrep -u "$(id -u)" -f "$run_root" 2>/dev/null | grep -v "^$$\$" || true
+  # By the root's own name, which mktemp made unique to this run, rather than by its whole path.
+  # Where TMPDIR ends in a slash, as it does on macOS, the path mktemp returns holds `//`, while a
+  # process that resolved its paths carries the physical path (/private/var/... on macOS) with
+  # single slashes, and neither form contains the other.
+  local name
+  name="$(basename "$run_root")"
+  pgrep -u "$(id -u)" -f "${name//./\\.}" 2>/dev/null | grep -v "^$$\$" || true
 }
 
 check_no_survivors() {
