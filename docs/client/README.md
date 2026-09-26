@@ -1099,7 +1099,12 @@ sign-in was not granted `backup.write`: its token source refuses, and nothing le
 enrolment and a fetch spend nothing and carry no token.
 
 - Backup storage is off until `set_retention` turns it on, decided against the revision a status read
-  names, and turning it off deletes nothing.
+  names, and turning it off deletes nothing. A change decided against a revision the record has left
+  changes nothing, and its answer is `RetentionAnswer::Stale`, carrying the retention as it stands,
+  which a caller shows and decides again against; a change sent again after its answer was lost
+  learns that way what the first one made. A `CONFLICT` that does not carry the retention as the
+  contract states it, and one from any other method, reaches a caller as `DRAFT_CONFLICT`, a view to
+  refresh.
 - An upload is created before any content leaves, and it is answered with its part table: every part
   8 MiB but the last, one table for one total, which this client holds to its own arithmetic. A part's
   body is its ciphertext, and its signed request travels in the `kr-service-request` header beside

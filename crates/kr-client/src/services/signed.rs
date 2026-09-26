@@ -836,6 +836,12 @@ fn content_of(answer: ServiceHttpAnswer) -> Result<Content> {
 /// An upload that spends an account's storage without the account's proof is answered
 /// `QUOTA_EXHAUSTED`, the same code an exhausted allowance is, with a message that says where
 /// backup storage comes from. The ledger's own `PAYMENT_REQUIRED` never reaches this client.
+///
+/// `CONFLICT` is a request made against something that changed after the caller read it. Nothing
+/// was done, and the request was not wrong when it was sent, so it is the subject changing under
+/// the request, and refreshing the view is what a person does. A storage retention change reads
+/// its conflict as an answer carrying the retention as it stands; one whose members that adapter
+/// cannot read, and a conflict from any other method, reach a caller as this.
 fn classify(code: &str, status: u16) -> (ErrorCode, UserAction) {
     match code {
         "UNAUTHENTICATED" => (ErrorCode::PermissionDenied, UserAction::FixConfiguration),
@@ -849,6 +855,7 @@ fn classify(code: &str, status: u16) -> (ErrorCode, UserAction) {
             (ErrorCode::InvalidArgument, UserAction::Update)
         }
         "ID_CONFLICT" => (ErrorCode::IdConflict, UserAction::Update),
+        "CONFLICT" => (ErrorCode::DraftConflict, UserAction::Resync),
         "REQUEST_FENCED" => (ErrorCode::PermissionDenied, UserAction::Nothing),
         "COLLECTION_ABSENT" => (ErrorCode::UnknownSession, UserAction::Nothing),
         "KEY_EPOCH_RETIRED" => (ErrorCode::ResyncRequired, UserAction::Resync),

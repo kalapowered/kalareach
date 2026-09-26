@@ -8,7 +8,9 @@
 //! refusals are the service's codes, at the service's statuses, for the service's reasons.
 //!
 //! A test can also make the transport fail, before the service sees a request or after it acted
-//! on one, which is how an interrupted transfer and a lost answer are made.
+//! on one, which is how an interrupted transfer and a lost answer are made, and it can have a stale
+//! retention change refused as a service that did not yet answer it as a conflict did
+//! ([`StaleRefusal`]).
 
 #![allow(
     dead_code,
@@ -45,6 +47,17 @@ pub enum Moment {
     ProofUnread,
     /// The request's body arrives cut short, so the service reads less than was sent.
     BodyCut,
+}
+
+/// How a retention change decided against a revision the record has left is refused.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum StaleRefusal {
+    /// `CONFLICT`, with the reason `retention_changed` and the retention as it stands, as the
+    /// service refuses it.
+    #[default]
+    Conflict,
+    /// `INVALID_REQUEST`, as a service that refused it as a request it does not read did.
+    InvalidRequest,
 }
 
 /// One fault a test arranged: the `nth` request to `path` from now on, counting from one, fails.
@@ -120,6 +133,7 @@ struct State {
     backup_on: bool,
     revision: u64,
     daily_snapshots: u32,
+    stale_refusal: StaleRefusal,
     archives: BTreeMap<String, String>,
     deleted: BTreeSet<String>,
     objects: BTreeMap<(String, String), Object>,
@@ -241,6 +255,12 @@ impl StorageWeb {
         let mut state = self.state.lock().expect("the state");
         state.backup_on = on;
         state.revision += 1;
+    }
+
+    /// A retention change decided against a revision the record has left is refused as `refusal`
+    /// from now on.
+    pub fn refuse_stale_changes_as(&self, refusal: StaleRefusal) {
+        self.state.lock().expect("the state").stale_refusal = refusal;
     }
 
     /// Answers one request as the service does, or fails as a test arranged.
@@ -566,11 +586,7 @@ fn retention(state: &mut State, body: &serde_json::Value, funded: bool) -> Servi
         );
     }
     if expected != state.revision {
-        return refusal(
-            400,
-            "INVALID_REQUEST",
-            "That change was decided against another revision. Read it again and decide against that.",
-        );
+        return stale(state, expected);
     }
     let changed =
         asked != state.backup_on || snapshots.is_some_and(|kept| kept != state.daily_snapshots);
@@ -585,6 +601,40 @@ fn retention(state: &mut State, body: &serde_json::Value, funded: bool) -> Servi
         "retention": retention_policy(state.daily_snapshots),
         "revision": state.revision,
     }))
+}
+
+/// The refusal of a retention change decided against `expected`, a revision the record has left.
+fn stale(state: &State, expected: u64) -> ServiceHttpAnswer {
+    let message = format!(
+        "That change was decided against revision {expected} and this retention is at {}, so \
+         nothing was changed. Show the retention this answer carries and decide again against its \
+         revision.",
+        state.revision
+    );
+    match state.stale_refusal {
+        StaleRefusal::Conflict => ServiceHttpAnswer {
+            status: 409,
+            body: serde_json::to_vec(&serde_json::json!({
+                "ok": false,
+                "error": {
+                    "code": "CONFLICT",
+                    "reason": "retention_changed",
+                    "message": message,
+                    "current": {
+                        "backup": if state.backup_on { "on" } else { "off" },
+                        "retention": retention_policy(state.daily_snapshots),
+                        "revision": state.revision.to_string(),
+                    },
+                },
+            }))
+            .expect("a refusal"),
+        },
+        StaleRefusal::InvalidRequest => refusal(
+            400,
+            "INVALID_REQUEST",
+            "That change was decided against another revision. Read it again and decide against that.",
+        ),
+    }
 }
 
 fn create(

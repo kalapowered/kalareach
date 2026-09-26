@@ -155,9 +155,10 @@ pub use relay::{
 };
 pub use storage::{
     ArchiveAnswer, BackupState, ManagedStorageService, NewUpload, ObjectDeleted, ObjectRange,
-    PartStored, PartTable, RetentionChange, RetentionPolicy, RetentionSet, StorageLimits,
-    StoragePrincipal, StorageStatus, StorageUsage, StoredObject, UploadAborted, UploadCompleted,
-    UploadCreated, UploadId, UploadPart, UploadProgress, upload_parts,
+    PartStored, PartTable, RetentionAnswer, RetentionChange, RetentionPolicy, RetentionSet,
+    RetentionState, StorageLimits, StoragePrincipal, StorageStatus, StorageUsage, StoredObject,
+    UploadAborted, UploadCompleted, UploadCreated, UploadId, UploadPart, UploadProgress,
+    upload_parts,
 };
 pub use sync::{
     Inventory, InventoryCopy, InventoryObject, ManagedSyncService, MembershipListing,
@@ -1064,6 +1065,9 @@ pub trait SyncBackupService: Send + Sync + std::fmt::Debug {
 ///    asking the service to abandon it, whose answer says it is over.
 /// 5. **Nothing is sent without the account's proof.** An installation alone holds no backup
 ///    storage, so an implementation given no account sends no request.
+/// 6. **A stale retention change is answered.** A change decided against a revision the record
+///    has left is [`storage::RetentionAnswer::Stale`], carrying the retention as it stands, and
+///    never an error that asks for an update.
 pub trait StorageService: Send + Sync + std::fmt::Debug {
     /// What managed storage the caller's principal holds, whether backup storage is on, and the
     /// revision a change of that is decided against.
@@ -1072,11 +1076,13 @@ pub trait StorageService: Send + Sync + std::fmt::Debug {
     /// Turns backup storage on or off, against the revision the change was decided at.
     ///
     /// Backup storage is off until this turns it on, and turning it off stops new uploads and
-    /// deletes nothing.
+    /// deletes nothing. A change decided against a revision the record has left changes nothing,
+    /// and its answer is the retention as it stands, [`storage::RetentionAnswer::Stale`], which a
+    /// caller shows and decides again against.
     fn set_retention<'a>(
         &'a self,
         change: &'a storage::RetentionChange,
-    ) -> ServiceFuture<'a, storage::RetentionSet>;
+    ) -> ServiceFuture<'a, storage::RetentionAnswer>;
 
     /// Creates one object's upload: its reservation, its identity and its part table.
     fn create_upload<'a>(
@@ -1459,7 +1465,7 @@ impl StorageService for NullService {
     fn set_retention<'a>(
         &'a self,
         _change: &'a storage::RetentionChange,
-    ) -> ServiceFuture<'a, storage::RetentionSet> {
+    ) -> ServiceFuture<'a, storage::RetentionAnswer> {
         unconfigured(ManagedService::SyncBackup.as_str())
     }
 

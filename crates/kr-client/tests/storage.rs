@@ -15,8 +15,9 @@ use kr_client::retry::UserAction;
 use kr_client::services::account::{AccountToken, AccountTokenSource};
 use kr_client::services::backup::ManagedBackupManifestService;
 use kr_client::services::storage::{
-    ArchiveAnswer, BackupState, ManagedStorageService, NewUpload, PartTable, RetentionChange,
-    STORAGE_PART_SIZE_BYTES, StoragePrincipal, UploadPart, UploadProgress, upload_parts,
+    ArchiveAnswer, BackupState, ManagedStorageService, NewUpload, PartTable, RetentionAnswer,
+    RetentionChange, RetentionPolicy, RetentionState, STORAGE_PART_SIZE_BYTES, StoragePrincipal,
+    UploadPart, UploadProgress, upload_parts,
 };
 use kr_client::services::{
     BackupManifestService, Dispatched, NullService, ServiceFuture, ServiceSigner, StorageService,
@@ -36,7 +37,7 @@ use kr_protocol::ids::{
 };
 use kr_protocol::scalars::{AuthorisationKey, Digest256, Signature64, TimestampMs, Uuid};
 use kr_protocol::service::{GatewayOrigin, ServiceRequestSigner};
-use storage_web::{ACCOUNT, Moment, StorageWeb, TOKEN};
+use storage_web::{ACCOUNT, Moment, StaleRefusal, StorageWeb, TOKEN};
 
 /* -------------------------------------------------------------------------- */
 /* A device, its account, and its two clients                                  */
@@ -188,14 +189,27 @@ fn new_upload(object: u8, bytes: &[u8]) -> NewUpload {
 /// Turns backup storage on for the account, from wherever it is.
 async fn backup_on(client: &ManagedStorageService) {
     let status = client.status().await.expect("a status");
-    client
+    let answer = client
         .set_retention(&RetentionChange {
             backup: BackupState::On,
             daily_snapshots: None,
             expected_revision: status.retention_revision,
         })
         .await
-        .expect("backup storage turned on");
+        .expect("an answer");
+    assert!(
+        matches!(answer, RetentionAnswer::Done(set) if set.backup == BackupState::On),
+        "backup storage turned on: {answer:?}"
+    );
+}
+
+/// The retention the stand-in applies, keeping `daily_snapshots`.
+const fn policy(daily_snapshots: u32) -> RetentionPolicy {
+    RetentionPolicy {
+        daily_snapshots,
+        tombstone_days: 7,
+        provider_recovery_days: 30,
+    }
 }
 
 /// Creates the upload of `bytes` as `object`, which the service answers with a new upload.
@@ -247,14 +261,17 @@ async fn each_storage_method_is_answered_as_the_service_answers_it() {
     assert_eq!(status.retention.tombstone_days, 7);
     assert_eq!(status.limits.part_size_bytes, STORAGE_PART_SIZE_BYTES);
 
-    let set = client
+    let RetentionAnswer::Done(set) = client
         .set_retention(&RetentionChange {
             backup: BackupState::On,
             daily_snapshots: Some(14),
             expected_revision: status.retention_revision,
         })
         .await
-        .expect("a change");
+        .expect("an answer")
+    else {
+        panic!("a change");
+    };
     assert!(set.changed);
     assert_eq!(set.backup, BackupState::On);
     assert_eq!(set.retention.daily_snapshots, 14);
@@ -425,14 +442,13 @@ async fn a_part_travels_as_its_ciphertext_beside_its_signed_request() {
 /* -------------------------------------------------------------------------- */
 
 /// KR-REQ-20.22: one refusal each method meets, as the service sends it, with what a person does
-/// about it. An upload into storage that is off is the permission the person turns on; a stale
-/// retention change is the service's generic refusal, which says to read the revision again; a part
-/// and a completion of an upload that expired are the service's own `FORBIDDEN`, which also answers
-/// other things, so the upload keeps its identity and its abandonment is what ends it; the
-/// abandonment of an upload the service never made is an upload it holds none of; a completion whose
-/// parts do not add up is the service's `INVALID_REQUEST`; a service with no room for a part is
-/// capacity to wait for; a read and a deletion of nothing stored are an object the service holds
-/// none of.
+/// about it. An upload into storage that is off is the permission the person turns on; a part and a
+/// completion of an upload that expired are the service's own `FORBIDDEN`, which also answers other
+/// things, so the upload keeps its identity and its abandonment is what ends it; the abandonment of
+/// an upload the service never made is an upload it holds none of; a completion whose parts do not
+/// add up is the service's `INVALID_REQUEST`; a service with no room for a part is capacity to wait
+/// for; a read and a deletion of nothing stored are an object the service holds none of. A retention
+/// change decided against a revision the record has left is answered rather than refused, below.
 #[tokio::test]
 async fn each_storage_method_meets_a_refusal_the_service_sends() {
     let web = Arc::new(StorageWeb::new());
@@ -450,16 +466,6 @@ async fn each_storage_method_meets_a_refusal_the_service_sends() {
         UserAction::FixConfiguration,
     );
     assert!(off.to_string().contains("Turn it on"), "{off}");
-
-    let stale = client
-        .set_retention(&RetentionChange {
-            backup: BackupState::On,
-            daily_snapshots: None,
-            expected_revision: 7,
-        })
-        .await
-        .expect_err("a revision the record has left");
-    refused(&stale, ErrorCode::InvalidArgument, UserAction::Update);
 
     backup_on(&client).await;
     let progress = created(&client, 1, &bytes).await;
@@ -607,6 +613,205 @@ impl kr_client::services::ServiceHttp for BusyWeb {
                 .expect("a refusal"),
             })
         })
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/* A stale retention change                                                    */
+/* -------------------------------------------------------------------------- */
+
+/// KR-REQ-20.22 and KR-REQ-23.57: a retention change decided against a revision the record has left
+/// changes nothing, and it is answered with the retention as it stands, which is what a status read
+/// reports, rather than with an error that asks for an update. The same change decided again
+/// against the revision it carries is made.
+#[tokio::test]
+async fn a_stale_retention_change_is_answered_with_the_retention_as_it_stands() {
+    let web = Arc::new(StorageWeb::new());
+    let device = Device::generate();
+    let client = storage(&web, &device, Some(&Tokens::signed_in()));
+    // Another client turns backup storage on after this one read the record at revision nought.
+    web.set_backup(true);
+
+    let change = RetentionChange {
+        backup: BackupState::Off,
+        daily_snapshots: Some(7),
+        expected_revision: 0,
+    };
+    let current = RetentionState {
+        backup: BackupState::On,
+        retention: policy(30),
+        revision: 1,
+    };
+    assert_eq!(
+        client.set_retention(&change).await.expect("an answer"),
+        RetentionAnswer::Stale { current }
+    );
+
+    // Nothing was changed, and what the answer carries is what a status read reports.
+    let status = client.status().await.expect("a status");
+    assert_eq!(
+        (status.backup, status.retention, status.retention_revision),
+        (current.backup, current.retention, current.revision)
+    );
+
+    let answer = client
+        .set_retention(&RetentionChange {
+            expected_revision: current.revision,
+            ..change
+        })
+        .await
+        .expect("an answer");
+    let RetentionAnswer::Done(set) = answer else {
+        panic!("the change decided again: {answer:?}");
+    };
+    assert!(set.changed);
+    assert_eq!(set.backup, BackupState::Off);
+    assert_eq!(set.retention, policy(7));
+    assert_eq!(set.revision, 2);
+}
+
+/// KR-REQ-23.57: a retention change whose answer was lost may be sent again, because the revision
+/// it names answers a repeat. The repeat names the revision the first one moved the record from, so
+/// it meets the conflict, and the retention the conflict carries is the change the first one made:
+/// the caller learns its change is in effect, and it was made once.
+#[tokio::test]
+async fn a_retention_change_sent_again_after_its_answer_was_lost_learns_the_change_it_made() {
+    let web = Arc::new(StorageWeb::new());
+    let device = Device::generate();
+    let client = storage(&web, &device, Some(&Tokens::signed_in()));
+    let change = RetentionChange {
+        backup: BackupState::On,
+        daily_snapshots: Some(14),
+        expected_revision: 0,
+    };
+
+    web.fail("/api/storage/retention", 1, Moment::After);
+    client
+        .set_retention(&change)
+        .await
+        .expect_err("the answer was lost");
+
+    assert_eq!(
+        client.set_retention(&change).await.expect("an answer"),
+        RetentionAnswer::Stale {
+            current: RetentionState {
+                backup: BackupState::On,
+                retention: policy(14),
+                revision: 1,
+            },
+        }
+    );
+    assert_eq!(web.requests_to("/api/storage/retention"), 2);
+}
+
+/// The control: a conflict this client cannot read as the retention as it stands, whether it
+/// carries nothing beside its code, names another reason or carries the retention in another
+/// shape, still says nothing was changed. So it is the subject changing under the request, a view
+/// to refresh, and so is a conflict from any other method: never an unknown outcome, and never an
+/// update.
+#[tokio::test]
+async fn a_conflict_this_client_cannot_read_is_a_view_to_refresh() {
+    let current = serde_json::json!({
+        "backup": "on",
+        "retention": { "daily_snapshots": 30, "tombstone_days": 7, "provider_recovery_days": 30 },
+        "revision": "2",
+    });
+    let change = RetentionChange {
+        backup: BackupState::Off,
+        daily_snapshots: None,
+        expected_revision: 1,
+    };
+    for (what, error) in [
+        (
+            "nothing beside its code",
+            serde_json::json!({ "code": "CONFLICT", "message": "That changed under the change." }),
+        ),
+        (
+            "another reason",
+            serde_json::json!({
+                "code": "CONFLICT",
+                "reason": "rate_changed",
+                "message": "That changed under the change.",
+                "current": current,
+            }),
+        ),
+        (
+            "the retention in another shape",
+            serde_json::json!({
+                "code": "CONFLICT",
+                "reason": "retention_changed",
+                "message": "That changed under the change.",
+                "current": { "backup": "on", "revision": "2" },
+            }),
+        ),
+    ] {
+        let client = answered_by(error);
+        let conflict = client.set_retention(&change).await.expect_err(what);
+        refused(&conflict, ErrorCode::DraftConflict, UserAction::Resync);
+        assert!(
+            conflict
+                .to_string()
+                .contains("That changed under the change."),
+            "{what}: {conflict}"
+        );
+    }
+
+    let client = answered_by(serde_json::json!({ "code": "CONFLICT", "message": "That changed." }));
+    let status = client.status().await.expect_err("a conflict");
+    refused(&status, ErrorCode::DraftConflict, UserAction::Resync);
+    let created = client
+        .create_upload(&new_upload(1, &ciphertext(8)))
+        .await
+        .expect_err("a conflict");
+    refused(&created, ErrorCode::DraftConflict, UserAction::Resync);
+}
+
+/// The control: a service that refuses a stale change as a request it does not read, as the service
+/// did before it answered with the retention as it stands, is read as it always was. So this client
+/// reads either service.
+#[tokio::test]
+async fn a_stale_change_refused_as_a_request_the_service_does_not_read_is_read_as_before() {
+    let web = Arc::new(StorageWeb::new());
+    web.refuse_stale_changes_as(StaleRefusal::InvalidRequest);
+    let device = Device::generate();
+    let client = storage(&web, &device, Some(&Tokens::signed_in()));
+    web.set_backup(true);
+
+    let stale = client
+        .set_retention(&RetentionChange {
+            backup: BackupState::Off,
+            daily_snapshots: None,
+            expected_revision: 0,
+        })
+        .await
+        .expect_err("a revision the record has left");
+    refused(&stale, ErrorCode::InvalidArgument, UserAction::Update);
+}
+
+/// A storage client whose service answers every request with the refusal `error`, under 409.
+fn answered_by(error: serde_json::Value) -> ManagedStorageService {
+    let web = Arc::new(Answering(kr_client::services::ServiceHttpAnswer {
+        status: 409,
+        body: serde_json::to_vec(&serde_json::json!({ "ok": false, "error": error }))
+            .expect("a refusal"),
+    }));
+    ManagedStorageService::new(origin(), web as Arc<_>, Device::generate())
+        .presenting(Tokens::signed_in() as Arc<dyn AccountTokenSource>)
+}
+
+/// A service that answers every document it is sent with one answer.
+#[derive(Debug)]
+struct Answering(kr_client::services::ServiceHttpAnswer);
+
+impl kr_client::services::ServiceHttp for Answering {
+    fn post_json<'a>(
+        &'a self,
+        _url: &'a str,
+        _body: &'a [u8],
+        _headers: &'a [(&'a str, &'a str)],
+    ) -> ServiceFuture<'a, kr_client::services::ServiceHttpAnswer> {
+        let answer = self.0.clone();
+        Box::pin(async move { Ok(answer) })
     }
 }
 
