@@ -5,7 +5,10 @@
 //! in: the host's conditions at the edges of what was timed, and one Markdown section per figure
 //! under `KR_TEST_ARTIFACTS_DIR`, headed by the identifier it measures. [`process`] reads what the
 //! measured processes use. `scripts/bench-all.sh` runs every measurement, section 27's stress run in
-//! this crate's `tests/stress.rs` among them, and reads those sections back.
+//! this crate's `tests/stress.rs` among them, and reads those sections back. Through each one it
+//! runs `kr-perf-watch`, which reads the whole [`machine`] and bounds the [`other_work`] it did.
 
+pub mod machine;
+pub mod other_work;
 pub mod process;
 pub mod record;

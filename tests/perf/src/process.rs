@@ -116,7 +116,7 @@ fn linux_processor_seconds(pid: u32) -> Result<f64, String> {
     target_os = "linux",
     allow(dead_code, reason = "Linux reads /proc instead")
 )]
-fn processor_time(text: &str) -> Option<f64> {
+pub(crate) fn processor_time(text: &str) -> Option<f64> {
     let (days, clock) = match text.split_once('-') {
         Some((days, clock)) => (days.parse::<f64>().ok()?, clock),
         None => (0.0, text),

@@ -4656,6 +4656,7 @@ dependencies = [
  "kr-plugin-service",
  "kr-protocol",
  "kr-worker",
+ "libc",
  "rusqlite",
  "rustix",
  "serde_json",

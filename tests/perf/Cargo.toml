@@ -1,6 +1,6 @@
 [package]
 name = "kr-perf"
-description = "The performance harness: the record a figure is kept in beside its host's conditions, section 27's 50-session stress run, and the checks on the performance scripts"
+description = "The performance harness: the record a figure is kept in beside its host's conditions, section 27's 50-session stress run, the reading of other work through each measurement, and the checks on the performance scripts"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -14,9 +14,19 @@ publish.workspace = true
 name = "kr-perf-writer"
 path = "src/bin/kr-perf-writer.rs"
 
+[[bin]]
+# Reads the whole machine through a step of scripts/bench-all.sh and bounds the work done outside the
+# run.
+name = "kr-perf-watch"
+path = "src/bin/kr-perf-watch.rs"
+
 [target.'cfg(target_os = "linux")'.dependencies]
 # Linux keeps a process's processor time in clock ticks, and this is where their rate is read.
 rustix = { workspace = true, features = ["param"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# macOS gives each processor's busy time only through the kernel's host interface.
+libc.workspace = true
 
 [dev-dependencies]
 # The stress run's host: the daemon in this process, starting real workers, and the plugin host
@@ -35,5 +45,12 @@ serde_json.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 
-[lints]
-workspace = true
+# The workspace forbids unsafe code, which the one reading of macOS's processor load counters cannot
+# honour. This crate denies it instead and allows it in exactly one module, `machine`'s `load`, which
+# makes that call. Nothing else in this crate may relax the rule.
+[lints.rust]
+missing_docs = "warn"
+unsafe_code = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
