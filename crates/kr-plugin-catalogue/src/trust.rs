@@ -178,6 +178,8 @@ pub struct VerifiedGeneration {
     pub root: Vec<u8>,
     /// The loaded client, for reading payloads out of this same generation.
     repository: Repository,
+    /// The transport this synchronisation fetches through, which counts what it transferred.
+    sync: SyncTransport,
 }
 
 impl VerifiedGeneration {
@@ -205,6 +207,16 @@ impl VerifiedGeneration {
     #[must_use]
     pub fn target(&self, name: &str) -> Option<TargetRecord> {
         self.targets.get(name).copied()
+    }
+
+    /// Checks that `bytes` more, by their signed sizes, fit this synchronisation's transfer limit
+    /// beside what it has already transferred, before any of them is fetched.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogueError::ResourceLimit`] naming `transfer_bytes` when they do not.
+    pub fn check_transfer(&self, bytes: u64, subject: &str) -> CatalogueResult<()> {
+        self.sync.check_transfer(bytes, subject)
     }
 
     /// Reads one target through the client, checking it against what the index declares.
@@ -390,12 +402,14 @@ pub async fn fetch_accepted(
 /// Returns [`CatalogueError::Untrusted`] when the metadata does not verify against the enrolled
 /// root or a delegation is outside its publisher's scope,
 /// [`CatalogueError::MetadataExpired`] when a role's metadata has expired,
-/// [`CatalogueError::ResourceLimit`] when the index is larger than the metadata budget, and
-/// [`CatalogueError::Integrity`] when the index is not the document the metadata pins.
+/// [`CatalogueError::ResourceLimit`] when the index is larger than the metadata budget or the
+/// synchronisation transfers more than `transfer_limit`, and [`CatalogueError::Integrity`] when
+/// the index is not the document the metadata pins.
 pub async fn verify(
     enrolment: &Enrolment,
     datastore: &Path,
     ledger: &BudgetLedger,
+    transfer_limit: u64,
     transport: &std::sync::Arc<dyn tough::Transport + Send + Sync>,
     on_root_rotated: &mut (dyn FnMut(Vec<u8>) -> CatalogueResult<()> + Send),
 ) -> CatalogueResult<VerifiedGeneration> {
@@ -410,10 +424,12 @@ pub async fn verify(
     // so the allowance is enforced on the bytes instead: every document this load fetches is
     // counted against the repository's approved metadata allowance, whatever the metadata says
     // about its own size. The same transport refuses a delegated role past the depth bound before
-    // the client asks for its document.
+    // the client asks for its document, and holds everything this synchronisation fetches, the
+    // payloads a mirror reads through it included, to the transfer limit.
     let sync = SyncTransport::new(
         std::sync::Arc::clone(transport),
         enrolment.budgets.metadata_bytes.get(),
+        transfer_limit,
         accepted.signed.consistent_snapshot,
     );
     let loader = RepositoryLoader::new(
@@ -499,6 +515,7 @@ pub async fn verify(
         Stage::Declared,
         INDEX_TARGET,
     )?;
+    sync.check_transfer(index_record.length, INDEX_TARGET)?;
     let index_name =
         TargetName::new(INDEX_TARGET).map_err(|source| CatalogueError::InvalidArgument {
             detail: format!("{INDEX_TARGET} is not a target name: {source}"),
@@ -561,6 +578,7 @@ pub async fn verify(
         versions,
         root,
         repository,
+        sync,
     })
 }
 
@@ -904,7 +922,8 @@ fn classify_transport(error: &tough::TransportError) -> CatalogueError {
             return classify(inner);
         }
         // This host's own refusals, which the sync's transport stops a fetch or a stream with:
-        // the metadata allowance, and a delegation past the depth bound or named twice.
+        // the metadata allowance, the transfer limit, and a delegation past the depth bound or
+        // named twice.
         if let Some(refusal) = cause.downcast_ref::<Refusal>() {
             return match refusal {
                 Refusal::Allowance(limit) => CatalogueError::ResourceLimit(limit.clone()),
@@ -951,7 +970,7 @@ fn past_a_length(max_size: u64, specifier: &str) -> CatalogueError {
 /// Why this host's transport stopped a document, carried as the transport error's cause.
 #[derive(Debug)]
 enum Refusal {
-    /// The repository's metadata allowance ran out.
+    /// An allowance ran out: the repository's metadata allowance, or this host's transfer limit.
     Allowance(crate::budget::ResourceLimit),
     /// The document belongs to a delegation this host does not follow.
     Delegation(String),
@@ -1146,7 +1165,29 @@ struct Load {
     budget: u64,
     /// The bytes of metadata and index fetched so far.
     spent: u64,
+    /// The bytes this synchronisation may transfer.
+    transfer_limit: u64,
+    /// The bytes of everything fetched so far: metadata, index and payloads.
+    transferred: u64,
     tree: DelegationTree,
+}
+
+impl Load {
+    /// Returns the refusal for `requested` bytes transferred, at `stage`, past the limit.
+    fn past_the_transfer_limit(
+        &self,
+        requested: u64,
+        stage: Stage,
+        subject: &str,
+    ) -> crate::budget::ResourceLimit {
+        crate::budget::ResourceLimit {
+            resource: crate::budget::Resource::TransferBytes,
+            limit: self.transfer_limit,
+            requested,
+            stage,
+            subject: subject.to_owned(),
+        }
+    }
 }
 
 /// The transport one sync fetches through.
@@ -1154,6 +1195,7 @@ struct Load {
 /// It holds the metadata and the index inside the repository's allowance, counting the bytes as
 /// they arrive: the client's own per-document ceilings apply only where the metadata declares no
 /// length, so a snapshot inside the allowance could otherwise name a targets document of any size.
+/// It holds everything the sync fetches, payloads included, to the transfer limit the same way.
 /// And it holds the delegation traversal to its bound, refusing a role past it before the client
 /// asks for that role's document.
 #[derive(Clone, Debug)]
@@ -1166,6 +1208,7 @@ impl SyncTransport {
     fn new(
         inner: std::sync::Arc<dyn tough::Transport + Send + Sync>,
         budget: u64,
+        transfer_limit: u64,
         consistent_snapshot: bool,
     ) -> Self {
         Self {
@@ -1174,6 +1217,8 @@ impl SyncTransport {
                 operation: Operation::Metadata,
                 budget,
                 spent: 0,
+                transfer_limit,
+                transferred: 0,
                 tree: DelegationTree {
                     consistent_snapshot,
                     ..DelegationTree::default()
@@ -1194,6 +1239,21 @@ impl SyncTransport {
     /// Returns the bytes of metadata and index fetched so far.
     fn spent(&self) -> u64 {
         self.state().spent
+    }
+
+    /// Checks that `bytes` more, declared before they are fetched, fit the transfer limit beside
+    /// everything fetched so far.
+    fn check_transfer(&self, bytes: u64, subject: &str) -> CatalogueResult<()> {
+        let load = self.state();
+        let requested = load.transferred.saturating_add(bytes);
+        if requested > load.transfer_limit {
+            return Err(CatalogueError::ResourceLimit(load.past_the_transfer_limit(
+                requested,
+                Stage::Declared,
+                subject,
+            )));
+        }
+        Ok(())
     }
 
     /// Returns true once the top-level targets document has arrived and been read.
@@ -1230,9 +1290,6 @@ impl tough::Transport for SyncTransport {
             }
         };
         let stream = self.inner.fetch(url.clone()).await?;
-        let Some(document) = document else {
-            return Ok(stream);
-        };
         Ok(Box::pin(Counted {
             inner: stream,
             load: std::sync::Arc::clone(&self.load),
@@ -1244,13 +1301,14 @@ impl tough::Transport for SyncTransport {
     }
 }
 
-/// One document's bytes on their way to the client, counted against the allowance as they arrive
-/// and read once the last of them has.
+/// One fetch's bytes on their way to the client, counted against the transfer limit as they
+/// arrive; a document's also against the allowance, and read once the last of them has. A
+/// payload's (no document) are counted against the transfer limit alone.
 struct Counted {
     inner: tough::TransportStream,
     load: std::sync::Arc<std::sync::Mutex<Load>>,
     url: url::Url,
-    document: Document,
+    document: Option<Document>,
     held: Vec<u8>,
     done: bool,
 }
@@ -1275,23 +1333,39 @@ impl futures::Stream for Counted {
         let mut load = lock(&this.load);
         match next {
             Some(Ok(chunk)) => {
-                load.spent = load.spent.saturating_add(chunk.len() as u64);
-                if load.spent > load.budget {
-                    // The refusal is the error's cause, so whoever classifies the failure reads the
-                    // allowance it names rather than a transport failure.
-                    let limit = crate::budget::ResourceLimit {
-                        resource: crate::budget::Resource::MetadataBytes,
-                        limit: load.budget,
-                        requested: load.spent,
-                        stage: Stage::Actual,
-                        subject: "this repository's metadata".to_owned(),
-                    };
+                let arrived = chunk.len() as u64;
+                if this.document.is_some() {
+                    load.spent = load.spent.saturating_add(arrived);
+                    if load.spent > load.budget {
+                        // The refusal is the error's cause, so whoever classifies the failure reads
+                        // the allowance it names rather than a transport failure.
+                        let limit = crate::budget::ResourceLimit {
+                            resource: crate::budget::Resource::MetadataBytes,
+                            limit: load.budget,
+                            requested: load.spent,
+                            stage: Stage::Actual,
+                            subject: "this repository's metadata".to_owned(),
+                        };
+                        this.done = true;
+                        return Poll::Ready(Some(Err(refused(
+                            &this.url,
+                            Refusal::Allowance(limit),
+                        ))));
+                    }
+                }
+                load.transferred = load.transferred.saturating_add(arrived);
+                if load.transferred > load.transfer_limit {
+                    let limit = load.past_the_transfer_limit(
+                        load.transferred,
+                        Stage::Actual,
+                        "this synchronisation",
+                    );
                     this.done = true;
                     return Poll::Ready(Some(Err(refused(&this.url, Refusal::Allowance(limit)))));
                 }
-                if !matches!(
+                if matches!(
                     this.document,
-                    Document::Timestamp | Document::Snapshot | Document::Index
+                    Some(Document::Root | Document::Targets | Document::Delegated { .. })
                 ) {
                     this.held.extend_from_slice(&chunk);
                 }
@@ -1303,8 +1377,11 @@ impl futures::Stream for Counted {
             }
             None => {
                 this.done = true;
+                let Some(document) = &this.document else {
+                    return Poll::Ready(None);
+                };
                 let held = std::mem::take(&mut this.held);
-                match load.tree.arrived(&this.document, &held) {
+                match load.tree.arrived(document, &held) {
                     Ok(()) => Poll::Ready(None),
                     Err(detail) => {
                         Poll::Ready(Some(Err(refused(&this.url, Refusal::Delegation(detail)))))

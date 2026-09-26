@@ -37,6 +37,9 @@ pub enum Resource {
     PackageFiles,
     /// Bytes one package takes once extracted.
     ExpandedPackBytes,
+    /// Bytes one synchronisation transfers: the metadata, the index and a full mirror's payloads
+    /// together.
+    TransferBytes,
 }
 
 impl Resource {
@@ -52,6 +55,7 @@ impl Resource {
             Self::PackageBytes => "package_bytes",
             Self::PackageFiles => "object_count",
             Self::ExpandedPackBytes => "expanded_pack_bytes",
+            Self::TransferBytes => "transfer_bytes",
         }
     }
 
@@ -67,6 +71,7 @@ impl Resource {
             Self::PackageBytes | Self::PackageFiles | Self::ExpandedPackBytes => {
                 "this host's package limits, which the package format's own maxima cap"
             }
+            Self::TransferBytes => "this host's transfer limit",
         }
     }
 }

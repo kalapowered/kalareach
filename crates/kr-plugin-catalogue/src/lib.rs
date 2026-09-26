@@ -321,6 +321,8 @@ pub struct Catalogue {
     transport: Arc<dyn tough::Transport + Send + Sync>,
     /// The limits each package is held to, as its host put them in force for the change at hand.
     package_limits: PackageLimits,
+    /// The bytes one synchronisation may transfer.
+    transfer_limit: u64,
 }
 
 impl Catalogue {
@@ -369,6 +371,7 @@ impl Catalogue {
             broker,
             transport,
             package_limits: PackageLimits::format(),
+            transfer_limit: u64::MAX,
         })
     }
 
@@ -755,6 +758,13 @@ impl Catalogue {
     /// Holds every package the changes that follow check to `limits`.
     pub fn set_package_limits(&mut self, limits: PackageLimits) {
         self.package_limits = limits;
+    }
+
+    /// Holds every synchronisation that follows to `bytes` transferred: its metadata, its index
+    /// and a full mirror's payloads together. A catalogue whose host sets none transfers what its
+    /// other budgets allow.
+    pub fn set_transfer_limit(&mut self, bytes: u64) {
+        self.transfer_limit = bytes;
     }
 
     /// Raises the admission revision under `authority`, for something the admissions carry that
@@ -1163,6 +1173,7 @@ impl Catalogue {
                 &enrolled.enrolment,
                 working.path(),
                 &ledger,
+                self.transfer_limit,
                 &transport,
                 &mut |new_root| {
                     // A rotation is kept the moment verification arrives at it, before anything
@@ -1474,6 +1485,9 @@ impl Catalogue {
             .iter()
             .filter(|(digest, _)| !held.contains_key(*digest))
             .fold(0u64, |total, (_, (_, size))| total.saturating_add(*size));
+        // What it still has to fetch, by the sizes the generation signs, against what this
+        // synchronisation may still transfer, before anything is removed to make room for it.
+        verified.check_transfer(needed, "the full offline mirror")?;
         let mirror_set: BTreeSet<PayloadDigest> = wanted.keys().copied().collect();
         reclaim(
             &mut self.db,

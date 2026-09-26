@@ -1990,6 +1990,86 @@ async fn a_synchronisation_holds_each_entry_to_the_extracted_limit() {
     }
 }
 
+/// The configured `transfer_bytes` holds every synchronisation: one that transfers more is refused
+/// by that name and activates no generation, and within it the same synchronisation activates one.
+#[tokio::test]
+async fn a_synchronisation_is_held_to_the_configured_transfer_limit() {
+    use kr_protocol::hostinfo::configuration::EnrolmentBudgets;
+    let host = host();
+    let _: wire::CatalogueAddResult = ok(host
+        .module
+        .write_frame_admitted(
+            &mutation(
+                Method::CatalogueAdd,
+                host.environment_id,
+                &add_params(&host),
+            ),
+            Method::CatalogueAdd,
+            Some(host.confirmations()),
+        )
+        .await);
+    let sync = || {
+        let host = &host;
+        async move {
+            host.module
+                .write_frame_admitted(
+                    &mutation(
+                        Method::CatalogueSync,
+                        host.environment_id,
+                        &wire::CatalogueSyncParams {
+                            environment_id: host.environment_id,
+                            catalogue_id: "development".to_owned(),
+                        },
+                    ),
+                    Method::CatalogueSync,
+                    Some(host.confirmations()),
+                )
+                .await
+        }
+    };
+    let generation = || {
+        let host = &host;
+        async move {
+            let listed: wire::CatalogueListResult = ok(host
+                .module
+                .read_frame(
+                    ActorIngress::LocalIpc,
+                    &request(
+                        Method::CatalogueList,
+                        &wire::CatalogueListParams {
+                            environment_id: host.environment_id,
+                        },
+                    ),
+                    None,
+                )
+                .await);
+            listed.catalogues[0].generation
+        }
+    };
+
+    host.module.put_budgets_in_force(EnrolmentBudgets {
+        transfer_bytes: 1,
+        ..EnrolmentBudgets::default()
+    });
+    let refused = refusal(sync().await);
+    assert_eq!(refused.code, ErrorCode::QuotaExceeded, "{refused:?}");
+    assert!(refused.message.contains("transfer_bytes"), "{refused:?}");
+    assert_eq!(
+        generation().await,
+        Nullable::null(),
+        "no generation activated"
+    );
+
+    host.module
+        .put_budgets_in_force(EnrolmentBudgets::default());
+    let _: wire::CatalogueSyncResult = ok(sync().await);
+    assert_ne!(
+        generation().await,
+        Nullable::null(),
+        "a generation activated"
+    );
+}
+
 /// Counts the workers gave at one admission revision are shown only while that is the revision
 /// the answer renders: a change committed after the workers answered leaves them unknown.
 #[tokio::test]

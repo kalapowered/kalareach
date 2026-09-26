@@ -2324,6 +2324,201 @@ async fn kr_req_11_12_an_entry_budget_names_its_own_resource() {
     );
 }
 
+/// A synchronisation is held to the transfer limit by the bytes that arrive: one that passes it
+/// is refused by the limit's name, the generation in use stays, and within the limit the next
+/// synchronisation moves on.
+#[tokio::test]
+async fn a_synchronisation_past_the_transfer_limit_is_refused_by_name_and_the_generation_in_use_stays()
+ {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let first = Generation::build(home.path(), GenerationSpec::default()).await;
+    let second = Generation::build(
+        &home.path().join("second"),
+        GenerationSpec {
+            generation: 2,
+            package_version: "0.2.0".to_owned(),
+            keys: Some(first.keys()),
+            ..GenerationSpec::default()
+        },
+    )
+    .await;
+    let mut catalogue = enrolled(
+        home.path(),
+        &first,
+        RepositoryBudgets::defaults(),
+        CapabilityCeiling::default_ceiling(),
+    )
+    .await;
+    catalogue
+        .sync(&repository())
+        .await
+        .expect("the first generation");
+    first.replace_with(&second);
+    let generation_in_use = |catalogue: &Catalogue| {
+        catalogue
+            .active(&repository())
+            .expect("enrolled")
+            .expect("a generation")
+            .generation
+    };
+
+    catalogue.set_transfer_limit(1);
+    let refusal = catalogue
+        .sync(&repository())
+        .await
+        .expect_err("past the transfer limit");
+    let CatalogueError::ResourceLimit(limit) = &refusal else {
+        panic!("{refusal:?}");
+    };
+    assert_eq!(limit.resource, Resource::TransferBytes);
+    assert_eq!(limit.stage, Stage::Actual);
+    assert_eq!(limit.limit, 1);
+    assert_eq!(refusal.code(), ErrorCode::QuotaExceeded);
+    let message = refusal.to_string();
+    assert!(message.contains("transfer_bytes"), "{message}");
+    assert!(
+        message.contains("last generation stays usable"),
+        "{message}"
+    );
+    assert_eq!(generation_in_use(&catalogue), 1);
+
+    catalogue.set_transfer_limit(u64::MAX);
+    catalogue
+        .sync(&repository())
+        .await
+        .expect("within the transfer limit");
+    assert_eq!(generation_in_use(&catalogue), 2);
+}
+
+/// The transfer limit refuses the index, and a full mirror's payloads, by their signed sizes
+/// before a byte of them is fetched: the index when the metadata already fetched and the index's
+/// signed length together pass it, and the mirror when everything the synchronisation fetched and
+/// the payloads it still needs together pass it. At exactly what it transfers, it completes.
+#[tokio::test]
+async fn the_transfer_limit_refuses_the_index_and_a_mirror_by_their_signed_sizes_before_fetching_them()
+ {
+    for mirror in [false, true] {
+        let home = tempfile::tempdir().expect("a temporary directory");
+        let generation = Generation::build(home.path(), GenerationSpec::default()).await;
+        let mut budgets = RepositoryBudgets::defaults();
+        budgets.full_offline_mirror = mirror;
+
+        // What one synchronisation of this generation transfers, on a catalogue of its own.
+        let measuring = tempfile::tempdir().expect("a temporary directory");
+        let measured = Metered::default();
+        let mut catalogue = enrolled(
+            measuring.path(),
+            &generation,
+            budgets,
+            CapabilityCeiling::default_ceiling(),
+        )
+        .await;
+        catalogue.set_transport(Arc::new(measured.clone()));
+        catalogue
+            .sync(&repository())
+            .await
+            .expect("a whole synchronisation");
+        let whole = measured.total();
+        assert_eq!(
+            measured.fetched("/packages/"),
+            mirror,
+            "mirror {mirror}: only a mirror fetches payloads"
+        );
+
+        let watched = Metered::default();
+        let mut catalogue = enrolled(
+            home.path(),
+            &generation,
+            budgets,
+            CapabilityCeiling::default_ceiling(),
+        )
+        .await;
+        catalogue.set_transport(Arc::new(watched.clone()));
+        catalogue.set_transfer_limit(whole - 1);
+        let refusal = catalogue
+            .sync(&repository())
+            .await
+            .expect_err("one byte past the transfer limit");
+        let CatalogueError::ResourceLimit(limit) = &refusal else {
+            panic!("mirror {mirror}: {refusal:?}");
+        };
+        assert_eq!(limit.resource, Resource::TransferBytes, "mirror {mirror}");
+        assert_eq!(limit.stage, Stage::Declared, "mirror {mirror}");
+        assert_eq!(limit.requested, whole, "mirror {mirror}");
+        assert!(
+            !watched.fetched("/packages/"),
+            "mirror {mirror}: no payload was fetched"
+        );
+        assert_eq!(
+            watched.fetched("index.json"),
+            mirror,
+            "mirror {mirror}: the index is fetched only when it fits"
+        );
+        assert!(
+            catalogue.active(&repository()).expect("enrolled").is_none(),
+            "mirror {mirror}: no generation was activated"
+        );
+
+        catalogue.set_transfer_limit(whole);
+        catalogue
+            .sync(&repository())
+            .await
+            .expect("at exactly what it transfers");
+        assert!(
+            catalogue.active(&repository()).expect("enrolled").is_some(),
+            "mirror {mirror}"
+        );
+    }
+}
+
+/// Reads the local repository, and records every address fetched with the bytes its answer
+/// delivered.
+#[derive(Clone, Debug, Default)]
+struct Metered {
+    delivered: Arc<std::sync::Mutex<Vec<(url::Url, u64)>>>,
+}
+
+impl Metered {
+    /// Returns the bytes every fetch delivered, together.
+    fn total(&self) -> u64 {
+        self.delivered
+            .lock()
+            .expect("the list")
+            .iter()
+            .map(|(_, bytes)| bytes)
+            .sum()
+    }
+
+    /// Returns true when an address whose path holds `part` was fetched.
+    fn fetched(&self, part: &str) -> bool {
+        self.delivered
+            .lock()
+            .expect("the list")
+            .iter()
+            .any(|(url, _)| url.path().contains(part))
+    }
+}
+
+#[tough::async_trait]
+impl tough::Transport for Metered {
+    async fn fetch(&self, url: url::Url) -> Result<tough::TransportStream, tough::TransportError> {
+        use futures::StreamExt as _;
+
+        let stream = tough::FilesystemTransport.fetch(url.clone()).await?;
+        let delivered = Arc::clone(&self.delivered);
+        let at = {
+            let mut list = delivered.lock().expect("the list");
+            list.push((url, 0));
+            list.len() - 1
+        };
+        Ok(Box::pin(stream.inspect(move |chunk| {
+            if let Ok(bytes) = chunk {
+                delivered.lock().expect("the list")[at].1 += bytes.len() as u64;
+            }
+        })))
+    }
+}
+
 #[test]
 fn kr_req_11_12_the_defaults_are_sixty_four_mebibytes_a_hundred_thousand_entries_and_a_gibibyte() {
     let ledger = BudgetLedger::new(RepositoryBudgets::defaults());
