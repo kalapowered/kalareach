@@ -4731,7 +4731,6 @@ async fn a_key_update_that_stopped_between_its_stores_is_finished_at_the_next_st
         .expect("the record");
     assert_eq!(stored.notification_preview, Some(*initial.public()));
     drop(controller);
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     let controller = start_controller_in(&temp).await;
     let stored = controller
