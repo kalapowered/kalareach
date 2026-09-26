@@ -1386,16 +1386,6 @@ async fn a_client_refuses_a_server_of_another_account_and_the_host_bind_fails() 
     let _helper = start_as_second(&host, "server", &endpoint.as_text(), &status);
     waited_for(&status, "ready").await;
 
-    // The host cannot take a name another account already holds, so it does not start on it, and it
-    // says the name is held rather than giving a bare access denial.
-    let refused = Listener::bind(&endpoint)
-        .expect_err("the host does not bind a name another account holds")
-        .to_string();
-    assert!(
-        refused.contains("the name is held by another pipe"),
-        "the host says the name is held: {refused}"
-    );
-
     // The client reads the pipe's owner and refuses it before it writes a frame, naming that owner.
     let second = kr_ipc::starter::account_sid(&user).expect("the second account's identifier");
     match Connection::connect(&endpoint).await {
@@ -1405,6 +1395,16 @@ async fn a_client_refuses_a_server_of_another_account_and_the_host_bind_fails() 
         ),
         other => panic!("the client refuses a server of another account: {other:?}"),
     }
+
+    // The host cannot take a name another account already holds, so it does not start on it, and it
+    // says the name is held rather than giving a bare access denial.
+    let refused = Listener::bind(&endpoint)
+        .expect_err("the host does not bind a name another account holds")
+        .to_string();
+    assert!(
+        refused.contains("the name is held by another pipe"),
+        "the host says the name is held: {refused}"
+    );
 
     // Nothing the client would have sent the host reached the other account.
     waited_for(&status, "received=0").await;
