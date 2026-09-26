@@ -242,10 +242,9 @@ impl Controller {
         // The kernel first: letting go of an ended member waits for nothing else.
         self.check_unconfirmed_members();
         let deadline = tokio::time::Instant::now() + WORKER_EXCHANGE;
-        let Ok(revision) = self.catalogue.admission_revision_within(deadline).await else {
+        let Ok((revision, installed)) = self.catalogue.installed_within(deadline).await else {
             return;
         };
-        let installed = self.catalogue.installed_releases().await;
         let due: Vec<SessionId> = self
             .plugin_bridge
             .recorded_members()

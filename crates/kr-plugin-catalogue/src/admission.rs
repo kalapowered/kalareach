@@ -227,19 +227,142 @@ pub struct Admissions {
     pub not_admitted: Vec<NotAdmitted>,
 }
 
-/// Computes one environment's admissions from the records as they are in `records`.
+/// The first part of an admission computation: everything the records and the current indexes
+/// say, read while the caller holds the catalogue.
+///
+/// What is left, each package's check, reads only a package's own copy, which its hash names and
+/// nothing rewrites, so [`AdmissionPlan::complete`] runs it without the catalogue: a package whose
+/// files are slow to read holds that computation and no other catalogue work.
+#[derive(Clone, Debug)]
+pub struct AdmissionPlan {
+    root: PathBuf,
+    host: HostPlatform,
+    revision: u64,
+    policy: DisablePolicy,
+    pending: Vec<Pending>,
+    not_admitted: Vec<NotAdmitted>,
+    releases: Vec<ReleaseState>,
+}
+
+/// One installation the records admit, waiting for its package check.
+#[derive(Clone, Debug)]
+struct Pending {
+    installation: Installation,
+    origin: ReleaseOrigin,
+    grants: BTreeSet<PluginCapability>,
+    builds: Vec<QualifiedBuild>,
+}
+
+impl AdmissionPlan {
+    /// Returns the admission revision the records were read at.
+    #[must_use]
+    pub const fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// Returns the state of every installed release and of every release reported live, which
+    /// the records alone decide.
+    #[must_use]
+    pub fn releases(&self) -> &[ReleaseState] {
+        &self.releases
+    }
+
+    /// Returns each package the records admit, waiting for its package check.
+    pub fn pending(&self) -> impl Iterator<Item = (&PluginId, PayloadDigest)> {
+        self.pending.iter().map(|pending| {
+            (
+                &pending.installation.plugin_id,
+                pending.installation.package_digest,
+            )
+        })
+    }
+
+    /// Checks each admitted package's copy and completes the admissions.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::CatalogueError::StorageUnavailable`] when a package cannot be read.
+    pub fn complete(self) -> CatalogueResult<Admissions> {
+        let mut packages = Vec::new();
+        let mut not_admitted = self.not_admitted;
+        for Pending {
+            installation,
+            origin,
+            grants,
+            builds,
+        } in self.pending
+        {
+            let refuse = |reason| NotAdmitted {
+                plugin_id: installation.plugin_id.clone(),
+                package_digest: installation.package_digest,
+                reason,
+            };
+            // Platforms and the component are the package's own, read from the manifest its hash
+            // names in its checked copy, never from an index entry.
+            let store = Store::at(&self.root, &installation.enrolment);
+            let package = match store.check_package(installation.package_digest)? {
+                PackageCheck::Complete(package) => package,
+                PackageCheck::Missing { detail } | PackageCheck::Corrupt { detail } => {
+                    not_admitted.push(refuse(NotAdmittedReason::Incomplete(detail)));
+                    continue;
+                }
+            };
+            let manifest = package.manifest();
+            if let Err(what) = self.host.check(&manifest.platforms) {
+                not_admitted.push(refuse(NotAdmittedReason::Unsupported {
+                    what,
+                    host: self.host.name(),
+                }));
+                continue;
+            }
+            let component =
+                manifest
+                    .payload(PayloadRole::Component)
+                    .map(|payload| AdmittedComponent {
+                        path: format!(
+                            "{}/packages/{}/{}",
+                            installation.enrolment.as_str(),
+                            installation.package_digest,
+                            payload.path.as_str()
+                        ),
+                        digest: payload.digest,
+                        bytes: payload.size_bytes.get(),
+                    });
+            packages.push(AdmittedPackage {
+                plugin_id: installation.plugin_id.clone(),
+                publisher_id: installation.publisher_id.clone(),
+                version: installation.version.clone(),
+                package_digest: installation.package_digest,
+                origin,
+                package_dir: store.package_dir(installation.package_digest),
+                grants,
+                builds,
+                component,
+            });
+        }
+        Ok(Admissions {
+            revision: self.revision,
+            policy: self.policy,
+            packages,
+            releases: self.releases,
+            not_admitted,
+        })
+    }
+}
+
+/// Reads what the records and the current indexes say about one environment's admissions.
 ///
 /// # Errors
 ///
-/// Returns [`crate::CatalogueError::StorageUnavailable`] when a record, an index or a package
-/// cannot be read.
-pub(crate) fn admit(
+/// Returns [`crate::CatalogueError::StorageUnavailable`] when a record or an index cannot be read,
+/// and [`crate::CatalogueError::Integrity`] when an index is not the one its generation names.
+pub(crate) fn plan(
     root: &Path,
     records: &Records<'_>,
     environment_id: EnvironmentId,
     live: &[LiveRelease],
     host: &HostPlatform,
-) -> CatalogueResult<Admissions> {
+) -> CatalogueResult<AdmissionPlan> {
     let revision = records.admission_revision()?;
     let policy = records.disable_policy()?;
     let installations: Vec<Installation> = records
@@ -254,7 +377,7 @@ pub(crate) fn admit(
         .collect();
     let mut indexes = Indexes::new(root);
 
-    let mut packages = Vec::new();
+    let mut pending = Vec::new();
     let mut not_admitted = Vec::new();
     let mut states: BTreeMap<(PluginId, PayloadDigest, ReleaseOrigin), ReleaseState> =
         BTreeMap::new();
@@ -300,52 +423,17 @@ pub(crate) fn admit(
             not_admitted.push(refuse(NotAdmittedReason::Revoked(record)));
             continue;
         }
-        // Platforms and the component are the package's own, read from the manifest its hash
-        // names in its checked copy, never from an index entry.
-        let store = Store::at(root, &installation.enrolment);
-        let package = match store.check_package(installation.package_digest)? {
-            PackageCheck::Complete(package) => package,
-            PackageCheck::Missing { detail } | PackageCheck::Corrupt { detail } => {
-                not_admitted.push(refuse(NotAdmittedReason::Incomplete(detail)));
-                continue;
-            }
-        };
-        let manifest = package.manifest();
-        if let Err(what) = host.check(&manifest.platforms) {
-            not_admitted.push(refuse(NotAdmittedReason::Unsupported {
-                what,
-                host: host.name(),
-            }));
-            continue;
-        }
         let builds = match (entry.as_ref(), host.os, host.architecture) {
             (Some(entry), Some(os), Some(architecture)) => {
                 entry.builds_for(os, architecture).cloned().collect()
             }
             _ => Vec::new(),
         };
-        let component = manifest
-            .payload(PayloadRole::Component)
-            .map(|payload| AdmittedComponent {
-                path: format!(
-                    "{}/packages/{}/{}",
-                    installation.enrolment.as_str(),
-                    installation.package_digest,
-                    payload.path.as_str()
-                ),
-                digest: payload.digest,
-                bytes: payload.size_bytes.get(),
-            });
-        packages.push(AdmittedPackage {
-            plugin_id: installation.plugin_id.clone(),
-            publisher_id: installation.publisher_id.clone(),
-            version: installation.version.clone(),
-            package_digest: installation.package_digest,
+        pending.push(Pending {
+            installation: installation.clone(),
             origin,
-            package_dir: store.package_dir(installation.package_digest),
             grants,
             builds,
-            component,
         });
     }
 
@@ -384,12 +472,14 @@ pub(crate) fn admit(
             },
         );
     }
-    Ok(Admissions {
+    Ok(AdmissionPlan {
+        root: root.to_path_buf(),
+        host: *host,
         revision,
         policy,
-        packages,
-        releases: states.into_values().collect(),
+        pending,
         not_admitted,
+        releases: states.into_values().collect(),
     })
 }
 

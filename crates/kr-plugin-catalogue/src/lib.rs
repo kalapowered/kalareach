@@ -84,8 +84,8 @@ use kr_plugin_sdk::version::PackageVersion;
 use kr_protocol::ids::{EnvironmentId, RepositoryGeneration};
 
 pub use crate::admission::{
-    Admissions, AdmittedComponent, AdmittedPackage, LiveRelease, NotAdmitted, NotAdmittedReason,
-    PACKAGES_ROOT, ReleaseOrigin, ReleaseState,
+    AdmissionPlan, Admissions, AdmittedComponent, AdmittedPackage, LiveRelease, NotAdmitted,
+    NotAdmittedReason, PACKAGES_ROOT, ReleaseOrigin, ReleaseState,
 };
 pub use crate::authority::{Authority, Committed, Effect, Failure, Owner, Recording};
 pub use crate::broker::{BrokerBridge, LivePackages, UnboundBroker};
@@ -746,7 +746,22 @@ impl Catalogue {
         live: &[LiveRelease],
         host: &HostPlatform,
     ) -> CatalogueResult<Admissions> {
-        self.read_kept(|records| admission::admit(&self.root, records, environment_id, live, host))
+        self.admission_plan(environment_id, live, host)?.complete()
+    }
+
+    /// Reads what the records and the current indexes say about one environment's admissions on
+    /// `host`, leaving the package checks to [`AdmissionPlan::complete`], which needs no catalogue.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogueError::StorageUnavailable`] when a record or an index cannot be read.
+    pub fn admission_plan(
+        &self,
+        environment_id: EnvironmentId,
+        live: &[LiveRelease],
+        host: &HostPlatform,
+    ) -> CatalogueResult<AdmissionPlan> {
+        self.read_kept(|records| admission::plan(&self.root, records, environment_id, live, host))
     }
 
     /// Returns the builds the current generation of an installation's origin names for its exact

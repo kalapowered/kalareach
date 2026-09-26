@@ -6,10 +6,13 @@
 //! than an entry may name) is left out of the packages with its reason, and the snapshot goes on
 //! without it. A snapshot that needs more than [`MAX_ADMISSION_PARTS`] parts is refused by name.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
-use kr_plugin_catalogue::{Admissions, Catalogue, CatalogueResult, DisablePolicy, HostPlatform};
+use kr_plugin_catalogue::{
+    AdmissionPlan, Admissions, Catalogue, CatalogueResult, DisablePolicy, HostPlatform,
+};
 use kr_plugin_sdk::catalogue::MAX_QUALIFIED_BUILDS;
+use kr_plugin_sdk::digest::PayloadDigest;
 use kr_protocol::admission::{
     AdmissionRevocation, AdmittedBridge, AdmittedBuild, AdmittedComponent, AdmittedPackage,
     FrameId, LiveRelease, PluginAdmissions, ReleaseOrigin, ReleaseState, RevocationPolicy,
@@ -20,6 +23,7 @@ use kr_protocol::limits::{
     MAX_ADMISSION_PARTS, MAX_ADMISSION_RECORD_BYTES, MAX_ADMITTED_PATH_BYTES, MAX_CONTROL_FRAME_LEN,
 };
 use kr_protocol::scalars::{Digest256, Nullable, U64};
+use kr_worker::broker::connectors::BridgeFacts;
 
 use super::bridge::{ReleaseKey, key_of};
 use super::native_bridge::NativeBridges;
@@ -153,17 +157,111 @@ pub fn snapshot(
     live: &[LiveRelease],
     host: &HostPlatform,
 ) -> CatalogueResult<Snapshot> {
+    plan(catalogue, bridges, environment_id, live, host)?.complete()
+}
+
+/// What a bridge lookup says about one admitted package: the facts of the bridge applied for
+/// it, none, or why its journal cannot be read.
+type BridgeLookup = Result<Option<BridgeFacts>, String>;
+
+/// What the catalogue's records say, read while the catalogue is held, with the native bridge
+/// applied for each package they admit: everything a snapshot needs but the package checks.
+#[derive(Clone, Debug)]
+pub struct Planned {
+    plan: AdmissionPlan,
+    bridges: BTreeMap<(PluginId, PayloadDigest), BridgeLookup>,
+}
+
+impl Planned {
+    /// Returns the admission revision the records were read at.
+    #[must_use]
+    pub const fn revision(&self) -> u64 {
+        self.plan.revision()
+    }
+
+    /// Checks each admitted package's copy, which needs no catalogue, and makes the records.
+    ///
+    /// # Errors
+    ///
+    /// Returns what the catalogue returned when a package cannot be read.
+    pub fn complete(self) -> CatalogueResult<Snapshot> {
+        let admissions = self.plan.complete()?;
+        let bridges = self.bridges;
+        Ok(wire(&admissions, &|plugin_id, package_digest| {
+            bridges
+                .get(&(plugin_id.clone(), package_digest))
+                .cloned()
+                .unwrap_or(Ok(None))
+        }))
+    }
+}
+
+/// Reads what the records say about one environment's admissions on this host, and the native
+/// bridge applied for each package they admit, while the caller holds the catalogue.
+///
+/// # Errors
+///
+/// Returns what the catalogue returned when a record or an index cannot be read.
+pub fn plan(
+    catalogue: &Catalogue,
+    bridges: &NativeBridges,
+    environment_id: EnvironmentId,
+    live: &[LiveRelease],
+    host: &HostPlatform,
+) -> CatalogueResult<Planned> {
     let reported: Vec<kr_plugin_catalogue::LiveRelease> = live
         .iter()
         .filter_map(super::bridge::catalogue_release)
         .collect();
-    let admissions = catalogue.admissions(environment_id, &reported, host)?;
-    Ok(wire(&admissions, bridges))
+    let plan = catalogue.admission_plan(environment_id, &reported, host)?;
+    let facts = plan
+        .pending()
+        .map(|(plugin_id, package_digest)| {
+            (
+                (plugin_id.clone(), package_digest),
+                bridges
+                    .facts(plugin_id, package_digest)
+                    .map_err(|error| error.to_string()),
+            )
+        })
+        .collect();
+    Ok(Planned {
+        plan,
+        bridges: facts,
+    })
+}
+
+/// Returns the state of each release in `live` and of every installed one, which the records
+/// alone decide: no package is checked.
+///
+/// # Errors
+///
+/// Returns what the catalogue returned when a record or an index cannot be read.
+pub fn release_states(
+    catalogue: &Catalogue,
+    environment_id: EnvironmentId,
+    live: &[LiveRelease],
+    host: &HostPlatform,
+) -> CatalogueResult<Vec<ReleaseState>> {
+    let reported: Vec<kr_plugin_catalogue::LiveRelease> = live
+        .iter()
+        .filter_map(super::bridge::catalogue_release)
+        .collect();
+    Ok(catalogue
+        .admission_plan(environment_id, &reported, host)?
+        .releases()
+        .iter()
+        .map(state)
+        .collect())
 }
 
 /// Turns the catalogue's admissions into records on the wire, leaving out what breaks a bound.
+/// `bridge` says which native bridge is applied for a package.
 #[must_use]
-pub fn wire(admissions: &Admissions, bridges: &NativeBridges) -> Snapshot {
+pub fn wire(
+    admissions: &Admissions,
+    bridge: &dyn Fn(&PluginId, PayloadDigest) -> BridgeLookup,
+) -> Snapshot {
     let mut left_out: Vec<(PluginId, String)> = admissions
         .not_admitted
         .iter()
@@ -171,7 +269,7 @@ pub fn wire(admissions: &Admissions, bridges: &NativeBridges) -> Snapshot {
         .collect();
     let mut packages = Vec::new();
     for package in &admissions.packages {
-        match admitted(package, bridges) {
+        match admitted(package, bridge(&package.plugin_id, package.package_digest)) {
             Ok(record) => packages.push(record),
             Err(why) => left_out.push((package.plugin_id.clone(), why)),
         }
@@ -232,7 +330,7 @@ fn bounded_path(path: &std::path::Path, what: &str) -> Result<String, String> {
 /// One admitted package as a record on the wire, or why it cannot be one.
 fn admitted(
     package: &kr_plugin_catalogue::AdmittedPackage,
-    bridges: &NativeBridges,
+    bridge: BridgeLookup,
 ) -> Result<AdmittedPackage, String> {
     let publisher_id = PublisherId::new(package.publisher_id.as_str())
         .map_err(|error| format!("its publisher cannot be named here: {error}"))?;
@@ -244,7 +342,7 @@ fn admitted(
             package.builds.len()
         ));
     }
-    let bridge = match bridges.facts(&package.plugin_id, package.package_digest) {
+    let bridge = match bridge {
         Ok(Some(facts)) => Some(AdmittedBridge {
             application: facts.application,
             surfaces: facts

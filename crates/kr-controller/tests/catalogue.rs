@@ -1604,6 +1604,51 @@ async fn catalogue_mutations_are_retained_and_prevent_duplicate_execution() {
 // A disk error is a disk error in every answer
 // ---------------------------------------------------------------------------------------------
 
+/// A package check that stalls holds its snapshot to the bound and nothing else: the snapshot is
+/// refused as busy by then, and the catalogue answers other work while the check is still held.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stalled_package_check_holds_its_snapshot_and_not_the_catalogue() {
+    let host = host();
+    let _ = installed(&host).await;
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let released = std::sync::Mutex::new(released);
+    host.module.before_package_checks(move || {
+        let _ = released
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .recv_timeout(std::time::Duration::from_secs(60));
+    });
+    let bound = std::time::Duration::from_millis(300);
+    let started = tokio::time::Instant::now();
+    let stalled = host.module.snapshot_within(&[], started + bound).await;
+    let waited = started.elapsed();
+    assert_eq!(
+        stalled.map(|_| ()).map_err(|error| error.code),
+        Err(ErrorCode::ResourceUnavailable)
+    );
+    assert!(waited < bound * 4, "{waited:?}");
+    let revision = host
+        .module
+        .admission_revision_within(tokio::time::Instant::now() + bound)
+        .await;
+    assert!(revision.is_ok(), "the catalogue answers: {revision:?}");
+    let listed: wire::PluginListResult = ok(host
+        .module
+        .read_frame(
+            ActorIngress::LocalIpc,
+            &request(
+                Method::PluginList,
+                &wire::PluginListParams {
+                    environment_id: host.environment_id,
+                },
+            ),
+            None,
+        )
+        .await);
+    assert_eq!(listed.plugins.len(), 1);
+    drop(release);
+}
+
 /// Counts the workers gave at one admission revision are shown only while that is the revision
 /// the answer renders: a change committed after the workers answered leaves them unknown.
 #[tokio::test]
@@ -3004,6 +3049,75 @@ mod native_bridges {
             refused_on_windows(&host, &digest);
         }
         assert_eq!(site.tree(), after, "nothing was written again");
+    }
+
+    /// A change that moves a bridge without moving the admission revision (here, a refused pin
+    /// whose bridge follow-up finishes an application stopped part way) is not hidden by a
+    /// snapshot computed before it.
+    #[tokio::test]
+    async fn a_bridge_moved_without_a_revision_change_is_not_hidden_by_an_earlier_snapshot() {
+        let site = Site::new();
+        let host = host(&site);
+        let digest = synchronised(&host).await;
+        host.module.native_bridges().stop_before(20);
+        let _: wire::PluginInstallResult = ok(install(&host, &digest, true).await);
+        let _: wire::PluginEnableResult = ok(plugin_change(&host, Method::PluginEnable).await);
+        assert!(bridge_facts(&host, &digest).is_none(), "stopped part way");
+        let later = || tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        let bridged = |snapshot: &kr_controller::catalogue::admissions::Snapshot| {
+            snapshot
+                .packages
+                .iter()
+                .any(|package| package.bridge.is_present())
+        };
+        let before = host
+            .module
+            .snapshot_within(&[], later())
+            .await
+            .expect("computed");
+        assert!(
+            !before.packages.is_empty() && !bridged(&before),
+            "{:?} {:?}",
+            before.packages,
+            before.left_out
+        );
+        let revision = host.module.admission_revision().await.expect("readable");
+
+        host.module.native_bridges().stop_before(0);
+        let mut wrong = digest.clone();
+        let last = wrong.pop().expect("a hash");
+        wrong.push(if last == '0' { '1' } else { '0' });
+        let _ = refusal(
+            host.module
+                .write_frame_admitted(
+                    &mutation(
+                        Method::PluginPin,
+                        host.environment_id,
+                        &wire::PluginPinParams {
+                            environment_id: host.environment_id,
+                            plugin_id: claude_code(),
+                            package_digest: Nullable(Some(wrong)),
+                        },
+                    ),
+                    Method::PluginPin,
+                    Some(host.confirmations()),
+                )
+                .await,
+        );
+        assert!(
+            bridge_facts(&host, &digest).is_some(),
+            "the follow-up finished it"
+        );
+        assert_eq!(
+            host.module.admission_revision().await.expect("readable"),
+            revision
+        );
+        let after = host
+            .module
+            .snapshot_within(&[], later())
+            .await
+            .expect("computed");
+        assert!(bridged(&after));
     }
 
     /// A change that holds the catalogue (here, one whose bridge is being placed) holds a round's
