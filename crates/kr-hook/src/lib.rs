@@ -153,25 +153,38 @@ impl Reports {
         let _ = std::thread::Builder::new()
             .name("kr-hook reports".to_owned())
             .spawn(move || {
-                // Until every sender is gone and the queue is empty.
-                for Queued {
-                    dropped_before,
-                    line,
-                } in queued
-                {
-                    if dropped_before > 0 {
-                        write(dropped_notice(dropped_before).as_bytes());
+                // Every line the queue took is written by now, so every line dropped since came
+                // after it, and saying how many keeps the order. A line queued meanwhile carries
+                // the count itself, and this finds nothing to say.
+                let say_dropped = |write: &mut dyn FnMut(&[u8])| {
+                    let dropped = std::mem::take(
+                        &mut *counted
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner),
+                    );
+                    if dropped > 0 {
+                        write(dropped_notice(dropped).as_bytes());
                     }
-                    write(line.as_bytes());
+                };
+                loop {
+                    let next = match queued.try_recv() {
+                        Ok(next) => next,
+                        Err(std::sync::mpsc::TryRecvError::Empty) => {
+                            say_dropped(&mut write);
+                            match queued.recv() {
+                                Ok(next) => next,
+                                Err(std::sync::mpsc::RecvError) => break,
+                            }
+                        }
+                        // Every sender is gone and the queue is empty.
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                    };
+                    if next.dropped_before > 0 {
+                        write(dropped_notice(next.dropped_before).as_bytes());
+                    }
+                    write(next.line.as_bytes());
                 }
-                let after = std::mem::take(
-                    &mut *counted
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner),
-                );
-                if after > 0 {
-                    write(dropped_notice(after).as_bytes());
-                }
+                say_dropped(&mut write);
                 let _ = finished.send(());
             });
         (Self { queue, dropped }, ReportWriter { done })
@@ -329,6 +342,56 @@ mod tests {
         ));
         expected.push("kr-hook: after\n".to_owned());
         assert_eq!(*written.lock().expect("the lines"), expected);
+    }
+
+    /// The count is said as soon as the writer has caught up with the queue, while whatever
+    /// reports is still there and has nothing more to say.
+    #[test]
+    fn a_writer_that_catches_up_says_what_it_dropped_without_waiting_for_another_line() {
+        const DROPPED: usize = 3;
+        let written = Arc::new(Mutex::new(Vec::<String>::new()));
+        let into = Arc::clone(&written);
+        let (stalling, stalled) = std::sync::mpsc::channel::<()>();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let mut first = true;
+        let (reports, writer) = Reports::start(move |bytes| {
+            if first {
+                first = false;
+                let _ = stalling.send(());
+                let _ = released.recv_timeout(Duration::from_secs(30));
+            }
+            into.lock()
+                .expect("the lines")
+                .push(String::from_utf8_lossy(bytes).into_owned());
+        });
+        reports.report("line 0");
+        stalled
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the writer is writing the first line");
+        for index in 1..=QUEUED_REPORTS + DROPPED {
+            reports.report(&format!("line {index}"));
+        }
+        drop(release);
+        let notice = format!(
+            "kr-hook: {DROPPED} reports were dropped because standard error was not being read\n"
+        );
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while written.lock().expect("the lines").last() != Some(&notice) {
+            assert!(
+                Instant::now() < deadline,
+                "the count was said while nothing more was reported: {:?}",
+                written.lock().expect("the lines").last()
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(written.lock().expect("the lines").len(), QUEUED_REPORTS + 2);
+        drop(reports);
+        writer.finish(Instant::now() + Duration::from_secs(60));
+        assert_eq!(
+            written.lock().expect("the lines").len(),
+            QUEUED_REPORTS + 2,
+            "and nothing more when the writer ends"
+        );
     }
 
     /// Lines dropped after the last one queued are counted when the writer ends.
