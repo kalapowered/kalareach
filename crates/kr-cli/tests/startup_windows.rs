@@ -1331,7 +1331,9 @@ fn refusing_task_scheduler(root: &Path, calls: &Path) -> PathBuf {
 /// KR-REQ-07.12: `kr new` has one deadline. However long it waited for the environment's lock, the
 /// request it leaves for the task's starter lapses no later than it stops waiting, and it is
 /// withdrawn before `kr new` says why no daemon answered, so none can be started for it once the
-/// command has given up. The task here runs a program that is not a daemon, so none is.
+/// command has given up. The task here runs a program that is not a daemon, so no starter takes the
+/// request, and the failure is the one a task the Task Scheduler does not start ends with: where to
+/// sign in.
 #[test]
 fn a_request_lapses_when_kr_new_stops_waiting_however_long_the_lock_held_it() {
     let host = Host::create();
@@ -1368,7 +1370,8 @@ fn a_request_lapses_when_kr_new_stops_waiting_however_long_the_lock_held_it() {
     let message = failed["message"].as_str().unwrap_or_default();
     assert!(
         message.contains("its starter did not take the request")
-            && message.contains("so the request was withdrawn and no daemon was started for it"),
+            && message.contains("so the request was withdrawn and no daemon was started for it")
+            && message.contains("sign in to this computer"),
         "{message}"
     );
     let requests = host.requests();
