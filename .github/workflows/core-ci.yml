@@ -587,6 +587,13 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo test --locked -p kr-client --lib
 
+      # The rule a rendering follows, read from the sources as this platform names their files: a
+      # file is named by its path's components, so the files the rule allows are the same files here
+      # as on a platform whose separator is `/`.
+      - name: Hold the client and the command line to the rendering rule
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p kr-client --test shown_rule
+
       # The root editor's own transport on this platform. The bridge endpoint is a named pipe
       # rather than a socket, so the client keeps one asynchronous read in flight and collects it
       # between the reader's operations; a client that never reads cannot complete a handshake at
