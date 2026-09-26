@@ -35,17 +35,17 @@
 # The conditions read for each step are the other work on the machine over the ten seconds before
 # it began and through the whole of it, the share of the step the hypervisor took from this machine
 # (where the platform accounts for it), and the load average at both edges. Other work is read by
-# tests/perf's kr-perf-watch, which reads the whole machine every two seconds: the machine's own
-# count of its processors' busy time, and every process with the processor time it has used. This
-# run is this script and every process descended from it, which includes the workers a
-# measurement's daemon starts, and a process once of the run stays of it. The reader bounds the
-# processor time spent outside the run in any five seconds, from the larger of what the processes
-# outside the run used and what the machine counted beyond the least the run's processes used. A
-# figure is a reference figure only when the host has the reference host's processors and memory,
-# that bound stayed under one processor's worth before and through each step, no step lost more
-# than one part in a hundred of its time to a hypervisor, and no measurement's own record names a
-# shortfall; where a reading could not be taken, the figure is not a reference figure. The load
-# average is recorded rather than judged: its one-minute average still carries the step before.
+# tests/perf's kr-perf-watch, which reads the whole machine every two seconds: all processors' idle
+# time, and every process with the processor time charged to it. This run is this script and every
+# process descended from it, which includes the workers a measurement's daemon starts, and a
+# process once of the run stays of it. The reader bounds the processor time the machine spent on
+# anything but the run in any five seconds: the processors' time less their idle time, less the
+# least the run's processes can have used. A figure is a reference figure only when the host has the
+# reference host's processors and memory, that bound stayed under one processor's worth before and
+# through each step, no step lost more than one part in a hundred of its time to a hypervisor, no
+# measurement's own record names a shortfall, and the run kept all of its evidence; where a reading
+# could not be taken, the figure is not a reference figure. The load average is recorded rather
+# than judged: its one-minute average still carries the step before.
 #
 # Usage:
 #   scripts/bench-all.sh [--reference-host] [--only <step>[,<step>...]]
@@ -106,16 +106,24 @@ quiet_processors=1.0
 # host is held to.
 os_name="$(uname -s)"
 arch="$(uname -m)"
+# A count that could not be read is left empty, and is a shortfall rather than a number.
+count_or_empty() {
+  case "$1" in
+    "" | *[!0-9]*) ;;
+    *) [ "$1" -gt 0 ] && printf '%s' "$1" ;;
+  esac
+}
 case "$os_name" in
   Darwin)
-    processors="$(sysctl -n hw.logicalcpu)"
-    memory_mib="$(($(sysctl -n hw.memsize) / 1048576))"
+    processors="$(count_or_empty "$(sysctl -n hw.logicalcpu 2>/dev/null)")"
+    memory_bytes="$(count_or_empty "$(sysctl -n hw.memsize 2>/dev/null)")"
+    memory_mib="$(count_or_empty "${memory_bytes:+$((memory_bytes / 1048576))}")"
     processor_name="$(sysctl -n machdep.cpu.brand_string 2>/dev/null || echo 'not reported here')"
     os_release="macOS $(sw_vers -productVersion 2>/dev/null || uname -r)"
     ;;
   *)
-    processors="$(nproc)"
-    memory_mib="$(awk '/^MemTotal:/ { printf "%d\n", $2 / 1024 }' /proc/meminfo)"
+    processors="$(count_or_empty "$(nproc 2>/dev/null)")"
+    memory_mib="$(count_or_empty "$(awk '/^MemTotal:/ { printf "%d\n", $2 / 1024 }' /proc/meminfo 2>/dev/null)")"
     processor_name="$(sed -n 's/^model name[[:space:]]*: //p' /proc/cpuinfo 2>/dev/null | head -1)"
     processor_name="${processor_name:-not reported here}"
     # shellcheck disable=SC1091 # the host's own description, read where it has one
@@ -257,8 +265,8 @@ echo "kalareach performance figures"
 echo "  commit: $commit"
 echo "  host: $os_release, $os_name $arch"
 echo "  processor: $processor_name"
-echo "  processors: $processors logical, against the reference host's $reference_processors"
-echo "  memory: $memory_mib MiB, against the reference host's $reference_memory_mib MiB"
+echo "  processors: ${processors:-unread} logical, against the reference host's $reference_processors"
+echo "  memory: ${memory_mib:-unread} MiB, against the reference host's $reference_memory_mib MiB"
 if [ "$reference" -eq 1 ]; then
   echo "  reference figures: asked for"
 else
@@ -270,10 +278,14 @@ echo "  taken at: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 
 # The host's own shortfalls, which hold for every step.
 host_shortfalls=""
-if [ "$processors" -lt "$reference_processors" ]; then
+if [ -z "$processors" ]; then
+  host_shortfalls="the number of processors could not be read"
+elif [ "$processors" -lt "$reference_processors" ]; then
   host_shortfalls="$processors processors, below the reference host's $reference_processors"
 fi
-if [ "$memory_mib" -lt "$reference_memory_mib" ]; then
+if [ -z "$memory_mib" ]; then
+  host_shortfalls="${host_shortfalls:+$host_shortfalls; }the memory could not be read"
+elif [ "$memory_mib" -lt "$reference_memory_mib" ]; then
   host_shortfalls="${host_shortfalls:+$host_shortfalls; }$memory_mib MiB of memory, below the reference host's $reference_memory_mib MiB"
 fi
 
@@ -316,11 +328,11 @@ if [ "$build_failed" -ne 0 ]; then
 fi
 
 # The reader of other work, which the build above made: tests/perf's kr-perf-watch. It reads the
-# whole machine every two seconds, the machine's own count of its processors' busy time and every
-# process with the time it has used, and prints "<bound> <average>": the most processors' worth of
-# work anything outside this run can have done in any five seconds it read, and the average. This
-# run is this script and every process descended from it, and a process once of it stays of it.
-# Where its readings cannot show that, it prints "unread: <why>".
+# whole machine every two seconds, all processors' idle time and every process with the processor
+# time charged to it, and prints "<bound> <average>": the most processors' worth of processor time
+# the machine can have spent on anything but this run in any five seconds it read, and over all of
+# them. Where its readings cannot show that, it prints "unread: <why>". This run is this script and
+# every process descended from it, and a process once of it stays of it.
 watcher="$(cargo build --locked --release -p kr-perf --bin kr-perf-watch --message-format=json \
   2>/dev/null | sed -n 's/.*"executable":"\([^"]*kr-perf-watch\)".*/\1/p' | tail -1)"
 if [ -z "$watcher" ] || [ ! -x "$watcher" ]; then
@@ -328,7 +340,28 @@ if [ -z "$watcher" ] || [ ! -x "$watcher" ]; then
   exit 1
 fi
 
-# A reading of other work in words.
+# A reading of other work as the reader printed it, checked: from a reader that ended well, one line
+# of two numbers or one that says why it is unread. Anything else is unread, with what the reader
+# did. `$1` is the reader's exit status and `$2` what it printed.
+checked_reading() {
+  local form='^([0-9]+\.[0-9][0-9] [0-9]+\.[0-9][0-9]|unread: .+)$'
+  if [ "$1" -ne 0 ]; then
+    printf 'unread: the reader of other work ended with status %s' "$1"
+    return
+  fi
+  case "$2" in
+    *$'\n'*) ;;
+    *)
+      if [[ $2 =~ $form ]]; then
+        printf '%s' "$2"
+        return
+      fi
+      ;;
+  esac
+  printf 'unread: the reader of other work printed "%s"' "$(printf '%s' "$2" | tr '\n' ' ')"
+}
+
+# A checked reading of other work in words.
 other_words() {
   case "$1" in
     "") printf 'unread' ;;
@@ -337,7 +370,7 @@ other_words() {
   esac
 }
 
-# Whether a reading of other work stayed under one processor's worth in every five seconds.
+# Whether a checked reading of other work stayed under one processor's worth in every five seconds.
 quiet() {
   case "$1" in
     "" | unread*) return 1 ;;
@@ -345,11 +378,12 @@ quiet() {
   esac
 }
 
-# Other work over the next ten seconds.
+# Other work over the next ten seconds, checked.
 other_work() {
-  local reading
-  reading="$("$watcher" --run "$$" --for 10)"
-  echo "${reading:-unread: the reader of other work printed nothing}"
+  local text status
+  text="$("$watcher" --run "$$" --for 10 2>&1)"
+  status=$?
+  checked_reading "$status" "$text"
 }
 
 # Reads other work over the ten seconds before a step and, with --reference-host, reads again until
@@ -396,7 +430,8 @@ verdicts() {
 # the record file its figures land in.
 run_step() {
   local step="$1" expected="$2" status logged load_in load_out other_in during ticks_in="" ticks_out
-  local pair identifier file name gained found line watch reader waited began_read
+  local pair identifier file name gained found line watch reader waited began_read reader_status
+  local text
   shift 2
   echo
   echo "== $(date '+%T') step $step: $*"
@@ -424,20 +459,27 @@ run_step() {
   # Both statuses in one statement: the next command replaces them.
   status=${PIPESTATUS[0]} logged=${PIPESTATUS[1]}
   # The reader takes its last reading and prints within a second of being asked; one that has not
-  # ended within a minute is stopped, and leaves nothing to read.
+  # ended within a minute is stopped, and its reading is unread.
   : > "$watch.stop" || lost "$watch.stop"
   waited=0
   while kill -0 "$reader" 2>/dev/null && [ "$waited" -lt 1200 ]; do
     sleep 0.05
     waited=$((waited + 1))
   done
-  kill "$reader" 2>/dev/null
-  wait "$reader" 2>/dev/null
-  during="$(cat "$watch.out" 2>/dev/null)"
-  if [ "$began_read" -eq 0 ]; then
-    during="unread: the reader of other work had not read the machine when the step began"
-  elif [ -z "$during" ] || [ "$(printf '%s\n' "$during" | wc -l | tr -d ' ')" != 1 ]; then
-    during="unread: the reader of other work printed \`$(printf '%s' "$during" | tr '\n' ' ')\`"
+  if kill -0 "$reader" 2>/dev/null; then
+    kill -9 "$reader" 2>/dev/null
+    wait "$reader" 2>/dev/null
+    during="unread: the reader of other work had not ended a minute after it was asked to"
+  else
+    wait "$reader"
+    reader_status=$?
+    if [ "$began_read" -eq 0 ]; then
+      during="unread: the reader of other work had not read the machine when the step began"
+    elif ! text="$(cat "$watch.out")"; then
+      during="unread: what the reader of other work printed could not be read back"
+    else
+      during="$(checked_reading "$reader_status" "$text")"
+    fi
   fi
   load_out="$(load_average)"
   ran="${ran:+$ran }$step"
@@ -485,20 +527,16 @@ run_step() {
   done
 }
 
-# Appends one section to this run's own record, or says the run could not keep it.
-#
-# A redirection that fails is caught with `||`: bash does not apply `!` to a compound command whose
-# redirection failed.
+# Appends one section to this run's own record, or says the run could not keep it. The section is
+# put together first and written in one go, so that no part of it can fail unseen.
 section() {
-  local heading="$1" line
+  local heading="$1" line text
   shift
-  {
-    printf '## %s\n\n' "$heading"
-    for line in "$@"; do
-      printf '  %s\n' "$line"
-    done
-    printf '\n'
-  } >> "$record" || lost "$record"
+  text="## $heading"$'\n\n'
+  for line in "$@"; do
+    text="$text  $line"$'\n'
+  done
+  printf '%s\n' "$text" >> "$record" || lost "$record"
 }
 
 outcome_of() {
@@ -514,6 +552,10 @@ outcome_of() {
 # larger of 1 GiB and a fifth of the memory). Prints why not, when it cannot.
 descriptions_refusal() {
   local available_mib reserve_mib need_mib
+  if [ -z "$processors" ] || [ -z "$memory_mib" ]; then
+    echo "the host's processors or memory could not be read"
+    return
+  fi
   if [ "$processors" -lt 4 ]; then
     echo "$processors processors, below the four the description budget runs on"
     return
@@ -535,10 +577,11 @@ descriptions_refusal() {
       ;;
     *) available_mib="$(awk '/^MemAvailable:/ { printf "%d\n", $2 / 1024 }' /proc/meminfo)" ;;
   esac
+  available_mib="$(count_or_empty "$available_mib")"
   reserve_mib=$((memory_mib / 5))
   [ "$reserve_mib" -lt 1024 ] && reserve_mib=1024
   need_mib=$((4096 + reserve_mib))
-  if [ "${available_mib:-0}" -lt "$need_mib" ]; then
+  if [ -z "$available_mib" ] || [ "$available_mib" -lt "$need_mib" ]; then
     echo "${available_mib:-no} MiB available, below the $need_mib MiB that the 4 GiB ceiling and the $reserve_mib MiB reserve need"
   fi
 }
@@ -574,14 +617,15 @@ if selected companion; then
   # The test prints each figure on a line of its own; any colour the runner still adds is taken off
   # before the line is read.
   escape="$(printf '\033')"
-  figures="$(sed "s/${escape}\[[0-9;]*[A-Za-z]//g" "$evidence/companion.log" |
-    sed -n 's/^KR-PERF-008 //p')"
+  if ! figures="$(sed "s/${escape}\[[0-9;]*[A-Za-z]//g" "$evidence/companion.log" |
+    sed -n 's/^KR-PERF-008 //p')"; then
+    lost "$evidence/companion.log"
+    figures=""
+  fi
   if [ -n "$figures" ]; then
-    {
-      printf '## %s\n\n' "KR-PERF-008 the companion's semantic display"
-      printf '%s\n' "$figures" | sed 's/^/  /'
-      printf '  outcome           %s\n\n' "$(outcome_of companion)"
-    } >> "$record" || lost "$record"
+    split_lines "$figures"
+    section "KR-PERF-008 the companion's semantic display" ${found_lines[@]+"${found_lines[@]}"} \
+      "outcome           $(outcome_of companion)"
     # Each figure line ends with its own verdict, "(met)" or "(missed)". grep exits with 1 when
     # every line met its target, and with more when it could not read or write.
     found="$(printf '%s\n' "$figures" | grep -v '(met)$')"
@@ -610,18 +654,20 @@ if selected descriptions; then
     run_step descriptions "" bash scripts/bench-descriptions.sh
     # The benchmark's own lines, which end with the hardware they were taken on, and not what the
     # model's runtime logs beside them; a line repeated for every job is given once, with a count.
-    machine="$(sed -n 's/^hardware: //p' "$evidence/descriptions.log" | head -1)"
-    figures="$(sed -n '/^# KR-PERF-009/,$ p' "$evidence/descriptions.log" | sed '1d' |
-      awk -v tag="[$machine]" '
-        /^(hardware|profile|runtime|gpu_layers): / || /^--- / ||
-          (length($0) >= length(tag) && substr($0, length($0) - length(tag) + 1) == tag)' |
-      uniq -c | awk '{ count = $1; sub(/^ *[0-9]+ /, ""); print (count > 1 ? count " times: " : "") $0 }')"
+    if ! machine="$(awk '/^hardware: / { sub(/^hardware: /, ""); print; exit }' \
+      "$evidence/descriptions.log")" ||
+      ! figures="$(sed -n '/^# KR-PERF-009/,$ p' "$evidence/descriptions.log" | sed '1d' |
+        awk -v tag="[$machine]" '
+          /^(hardware|profile|runtime|gpu_layers): / || /^--- / ||
+            (length($0) >= length(tag) && substr($0, length($0) - length(tag) + 1) == tag)' |
+        uniq -c | awk '{ count = $1; sub(/^ *[0-9]+ /, ""); print (count > 1 ? count " times: " : "") $0 }')"; then
+      lost "$evidence/descriptions.log"
+      figures=""
+    fi
     if [ -n "$figures" ]; then
-      {
-        printf '## KR-PERF-009 local session descriptions\n\n'
-        printf '%s\n' "$figures" | sed 's/^/  /'
-        printf '  outcome           %s\n\n' "$(outcome_of descriptions)"
-      } >> "$record" || lost "$record"
+      split_lines "$figures"
+      section "KR-PERF-009 local session descriptions" ${found_lines[@]+"${found_lines[@]}"} \
+        "outcome           $(outcome_of descriptions)"
       # The benchmark names each qualification target it did not meet on a line of its own.
       found="$(printf '%s\n' "$figures" | grep 'qualification_target_not_met')"
       case $? in 0 | 1) ;; *) lost "the verdicts of $evidence/descriptions.log" ;; esac
@@ -717,8 +763,8 @@ for identifier in $measured; do
   lines=(
     "commit            $commit"
     "host              $os_release, $os_name $arch, $processor_name"
-    "processors        $processors against the reference host's $reference_processors"
-    "memory            $memory_mib MiB against the reference host's $reference_memory_mib MiB"
+    "processors        ${processors:-unread} against the reference host's $reference_processors"
+    "memory            ${memory_mib:-unread} MiB against the reference host's $reference_memory_mib MiB"
   )
   outcome="every step that measured it met its target and recorded its figures"
   shortfalls=""
@@ -742,6 +788,11 @@ for identifier in $measured; do
   lines+=("outcome           $outcome")
   if [ "$reference" -ne 1 ]; then
     lines+=("reference figure  no: the run was not asked for reference figures${shortfalls:+; it would not have met: $shortfalls}")
+  elif [ "$evidence_lost" -ne 0 ]; then
+    lines+=("reference figure  no: the run could not keep or read back all of its evidence, at $lost_places${shortfalls:+; and $shortfalls}")
+    short=1
+    reasons="$reasons
+  $identifier is not a reference figure: the run could not keep or read back all of its evidence"
   elif [ -n "$shortfalls" ]; then
     lines+=("reference figure  no: $shortfalls")
     short=1
@@ -760,10 +811,14 @@ echo "== the records this run added under $evidence"
 for file in "$evidence"/*.md; do
   [ -f "$file" ] || continue
   from="$(started_at "$(basename "$file")")"
-  [ "$(size_of "$file")" -gt "$from" ] || continue
+  if ! size="$(size_of "$file")" || [ -z "$(count_or_empty "$size")" ]; then
+    lost "$file"
+    continue
+  fi
+  [ "$size" -gt "$from" ] || continue
   echo
   echo "--- $(basename "$file")"
-  tail -c +"$((from + 1))" "$file"
+  tail -c +"$((from + 1))" "$file" || lost "$file"
 done
 
 echo
