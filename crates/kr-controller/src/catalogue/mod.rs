@@ -889,7 +889,6 @@ impl CatalogueModule {
             Claimed::Retained(record) => return answered(&record, &digest, mutation.action_id),
             Claimed::Fresh => {}
         }
-        let revision = catalogue.admission_revision().ok();
         // Every change the action makes commits through this recording, so what it left behind
         // when it stops is known rather than guessed.
         let recording = Recording::new(&*admission);
@@ -936,12 +935,12 @@ impl CatalogueModule {
             None => Vec::new(),
         };
         // A bridge the admissions carry may move here, whether or not the change committed, so the
-        // admission revision rises first, under the change's own authority, unless the change
-        // already raised it: every snapshot computed before this write is below every one after
-        // it, and every worker is sent the bridges as they are now. Where the revision cannot
-        // rise, no bridge moves; the daemon's next start or the next change follows them.
+        // admission revision rises first, under the change's own authority, every time: every
+        // snapshot computed before this write is below every one after it, and every worker is
+        // sent the bridges as they are now. A change that raised it already raises it once more,
+        // which costs nothing a round does not. Where the revision cannot rise, no bridge moves;
+        // the daemon's next start or the next change follows them.
         let raised = subjects.is_empty()
-            || catalogue.admission_revision().ok() != revision
             || match catalogue.raise_admission_revision(&*admission) {
                 Ok(_) => true,
                 Err(error) => {
