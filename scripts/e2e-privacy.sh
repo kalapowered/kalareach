@@ -39,9 +39,6 @@ export LC_ALL=C
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root"
 
-# shellcheck source=scripts/lib/owned-processes.sh
-. "$root/scripts/lib/owned-processes.sh"
-
 suite=kr-privacy-integration
 
 origin="${1:-${KR_PRIVACY_ORIGIN:-}}"
@@ -149,6 +146,19 @@ if ! cargo test --locked --quiet -p "$suite" --no-run >"$evidence/build.log" 2>&
   exit 1
 fi
 
+# The product's own rule decides whether the origin is one a service credential travels to, so the
+# script accepts exactly what the legs will, and refuses the rest before starting or sending anything.
+if ! env KR_PRIVACY_CHECK_ORIGIN="$origin" cargo test --locked --quiet -p "$suite" --lib -- \
+  --exact tests::the_origin_a_run_is_about_to_use_is_one_a_credential_travels_to \
+  >"$evidence/origin.log" 2>&1; then
+  if grep -q 'not an origin a service credential travels to' "$evidence/origin.log"; then
+    echo "$origin is not an origin a service credential travels to; see $evidence/origin.log" >&2
+    exit 2
+  fi
+  echo "the origin could not be checked; see $evidence/origin.log" >&2
+  exit 1
+fi
+
 passed=0
 failed=0
 missed=0
@@ -245,16 +255,19 @@ later_legs() {
 }
 
 # The local deployment: its run directory, and every process this run started for it.
+#
+# A process is known by its number and the instant the kernel says it started, and the two are only
+# ever read together, in one look at the process table. The deployment's leader is the process this
+# shell forked for `wrangler dev`; the group's number is the leader's. A member of the group is
+# recorded only from a look in which the leader is still this shell's own child and still started
+# when it was recorded: until the leader ends, no other group can have its number, so every member in
+# that look is this run's. Nothing is signalled by the group's number, and a recorded process is
+# signalled only while a fresh read of its number gives the start it was recorded with.
 run=""
 state=""
-# The deployment's process group. Its leader is the process this run forked for `wrangler dev`, the
-# group's number is the leader's, and `leader_started` is when the kernel says the leader started.
 group=""
 leader_started=""
-# Every process of the deployment, as "<number>|<started>". A member is recorded only while the
-# leader is still the process this run forked: until the leader ends, no other group can take its
-# number, so every member of the group then is this run's. A process is signalled only while its
-# number still names the process that was recorded, never by the group's number alone.
+# Every process of the deployment, as "<number>|<started>".
 deployment=()
 stub=""
 stub_started=""
@@ -265,34 +278,55 @@ local_complete=0
 removed=0
 finished=0
 
+# One look at the process table: "<number>|<parent>|<group>|<started>" for every process, each line
+# describing one process.
+process_table() {
+  LC_ALL=C ps -axo pid=,ppid=,pgid=,lstart= |
+    awk '{ started = $4; for (i = 5; i <= NF; i++) started = started " " $i; print $1 "|" $2 "|" $3 "|" started }'
+}
+
+# When the kernel says process $1 started, spelt as process_table spells it, or nothing.
+started_of() {
+  LC_ALL=C ps -o lstart= -p "$1" 2>/dev/null |
+    awk '{ started = $1; for (i = 2; i <= NF; i++) started = started " " $i; print started }'
+}
+
+# When one of this shell's own children started, from a look in which it is still this shell's
+# child, or nothing when it is not.
+child_started() {
+  local pid parent member started
+  while IFS='|' read -r pid parent member started; do
+    if [ "$pid" = "$1" ] && [ "$parent" = "$$" ]; then
+      printf '%s\n' "$started"
+      return 0
+    fi
+  done < <(process_table)
+  return 0
+}
+
 # Whether a recorded process is still the one recorded.
 still_there() {
-  [ -n "$2" ] && [ "$(process_started "$1")" = "$2" ]
+  [ -n "$2" ] && [ "$(started_of "$1")" = "$2" ]
 }
 
-# Whether the deployment's leader is still the process this run forked.
+# Whether the deployment's leader is still the child this shell forked.
 leader_alive() {
-  [ -n "$group" ] && still_there "$group" "$leader_started"
+  [ -n "$group" ] && [ -n "$leader_started" ] && [ "$(child_started "$group")" = "$leader_started" ]
 }
 
-# The numbers of the processes in the deployment's group now, whoever they are.
-group_now() {
-  ps -axo pid=,pgid= | awk -v group="$group" '$2 == group { print $1 }'
-}
-
-# Records every member of the deployment's group, while its leader is still this run's.
+# Records every member of the deployment's group, from one look in which its leader is unchanged.
 record_members() {
-  leader_alive || return 0
-  local pid started
-  for pid in $(group_now); do
+  [ -n "$group" ] && [ -n "$leader_started" ] || return 0
+  local table pid parent member started
+  table="$(process_table)"
+  grep -qxF "$group|$$|$group|$leader_started" <<<"$table" || return 0
+  while IFS='|' read -r pid parent member started; do
+    [ "$member" = "$group" ] || continue
     case " ${deployment[*]:-} " in
       *" $pid|"*) continue ;;
     esac
-    started="$(process_started "$pid")"
-    if [ -n "$started" ]; then
-      deployment+=("$pid|$started")
-    fi
-  done
+    deployment+=("$pid|$started")
+  done <<<"$table"
   return 0
 }
 
@@ -307,6 +341,11 @@ deployment_running() {
     fi
   done
   echo "$count"
+}
+
+# The numbers of the processes in the deployment's group now, whoever they are.
+group_now() {
+  ps -axo pid=,pgid= | awk -v group="$group" '$2 == group { print $1 }'
 }
 
 # Asks the deployment to stop, then makes it, and says whether any of it is left.
@@ -331,7 +370,7 @@ stop_deployment() {
   if [ "$(deployment_running)" -ne 0 ]; then
     stopped=0
   fi
-  # Anything still in the group was not recorded, so it is left alone, and reported.
+  # Anything still in the group was never recorded, so it is left alone, and reported.
   if [ -n "$(group_now)" ]; then
     stopped=0
   fi
@@ -341,15 +380,17 @@ stop_deployment() {
 # Stops the provider stub, and says whether it has gone.
 stop_stub() {
   [ -n "$stub" ] || return 0
-  end_owned_processes
-  for _ in $(seq 1 40); do
+  local signal
+  for signal in TERM KILL; do
+    if still_there "$stub" "$stub_started"; then
+      kill "-$signal" "$stub" 2>/dev/null || true
+    fi
+    for _ in $(seq 1 40); do
+      still_there "$stub" "$stub_started" || break
+      sleep 0.25
+    done
     still_there "$stub" "$stub_started" || break
-    sleep 0.25
   done
-  if still_there "$stub" "$stub_started"; then
-    kill -KILL "$stub" 2>/dev/null || true
-    sleep 0.25
-  fi
   if still_there "$stub" "$stub_started"; then
     stopped=0
   fi
@@ -382,6 +423,10 @@ cleanup() {
   fi
 }
 trap cleanup EXIT
+# A signal ends the run through `exit`, so the cleanup above runs for it as well.
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # The values a local deployment starts with, and the databases its migrations go to, from the web
 # tree's own configuration. A value is written single-quoted, which the values file keeps exactly
@@ -463,8 +508,8 @@ STUB
   "$node" "$run/provider.mjs" "$run/provider.port" "$evidence/provider.log" \
     >>"$evidence/deployment.log" 2>&1 &
   stub=$!
-  stub_started="$(process_started "$stub")"
-  record_process "$stub" "$stub_started" "$node"
+  stub_started="$(child_started "$stub")"
+  [ -n "$stub_started" ] || return 1
   for _ in $(seq 1 100); do
     [ -s "$run/provider.port" ] && break
     sleep 0.1
@@ -507,10 +552,9 @@ start_deployment() {
     --var "BUILD_VERSION:$version" --test-scheduled --log-level warn) \
     >>"$evidence/deployment.log" 2>&1 &
   group=$!
-  # Read at once: the leader is this shell's own child, so its number names it until it has ended
-  # and been collected here.
-  leader_started="$(process_started "$group")"
   set +m
+  leader_started="$(child_started "$group")"
+  [ -n "$leader_started" ] || { why="the deployment stopped as it started"; return 1; }
   # Only an answer carrying this start's own version counts: another Worker serving on the port
   # could otherwise be taken for this one.
   for _ in $(seq 1 480); do
