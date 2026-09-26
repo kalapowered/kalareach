@@ -2319,11 +2319,14 @@ impl Debugs {
         let alike = each
             .windows(2)
             .all(|pair| signature(&pair[0]) == signature(&pair[1]));
+        // A crate whose root a `cfg` can empty is there with nothing in it, so what its root gives
+        // is there only under some conditions.
+        let certain = alike && !(!module.contains("::") && self.emptied(module));
         Ok(each
             .into_iter()
             .flatten()
             .map(|named| {
-                if alike {
+                if certain {
                     named
                 } else {
                     Named {
@@ -2419,12 +2422,13 @@ impl Debugs {
             .unwrap_or_else(|_| path.to_owned())
     }
 
-    /// Whether the module at the full path `module` is there under every set of conditions: a
-    /// crate's root, or a module one declaration of which no `cfg` this reading cannot decide can
-    /// leave out, in a module that is there too.
+    /// Whether the module at the full path `module` is there with what it declares under every set
+    /// of conditions: a crate's root that no `cfg` at its top can empty, or a module one
+    /// declaration of which no `cfg` this reading cannot decide can leave out, in a module that is
+    /// there too.
     fn present_module(&self, module: &str) -> bool {
         let Some((parent, name)) = module.rsplit_once("::") else {
-            return true;
+            return !self.emptied(module);
         };
         let Some(scopes) = self.modules.get(module) else {
             return false;
@@ -2450,6 +2454,17 @@ impl Debugs {
                     }
                 }
             })
+    }
+
+    /// Whether a `#![cfg(…)]` at the top of the root of the workspace's crate `krate` that this
+    /// reading cannot decide can leave out everything the crate declares: the crate is then there
+    /// with nothing in it, and a glob of it gives nothing.
+    fn emptied(&self, krate: &str) -> bool {
+        self.modules.get(krate).is_some_and(|scopes| {
+            scopes
+                .iter()
+                .any(|&(index, scope)| scope == 0 && self.sources[index].conditional)
+        })
     }
 
     /// The exported macros that are at their crate's root under every set of conditions: each
@@ -5022,4 +5037,41 @@ fn a_module_a_path_moves_is_not_read_at_its_default_place() {
                 .contains("a derived Debug over text that arrived")),
         "{findings:?}"
     );
+}
+
+/// A crate whose root a `cfg` this reading cannot decide can leave empty is there with nothing in
+/// it, so a glob of it gives no name for certain: where the scopes around the glob give the name
+/// another item, the name is not placed. A crate no such `cfg` can empty gives its names as ever.
+#[test]
+fn a_glob_of_a_crate_a_cfg_can_empty_decides_no_name() {
+    fn library(root: &str) -> [(&'static str, &str); 2] {
+        [
+            (
+                "crates/kr-client/Cargo.toml",
+                "[package]\nname = \"kr-client\"\n",
+            ),
+            ("crates/kr-client/src/lib.rs", root),
+        ]
+    }
+    let shown =
+        "#[macro_export]\nmacro_rules! shown {\n    ($($any:tt)*) => {\n        ()\n    };\n}\n";
+    let emptied = format!("#![cfg(not(unix))]\n{shown}");
+    let findings = debug_findings_among(
+        "debug-emptied",
+        "use kr_other::shown;\npub struct Leak(pub String);\nconst _: () = {\n    use kr_client::*;\n    shown!(\"leak.rs\")\n};\n",
+        "pub use std::include as shown;\n",
+        &library(&emptied),
+    );
+    assert!(
+        findings.iter().any(|finding| finding.line == 5
+            && finding.what.contains("a macro this reading cannot place")),
+        "{findings:?}"
+    );
+    let findings = debug_findings_among(
+        "debug-certain",
+        "pub struct Held(pub u64);\nconst _: () = {\n    use kr_client::*;\n    shown!(\"leak.rs\")\n};\n",
+        "",
+        &library(shown),
+    );
+    assert!(findings.is_empty(), "{findings:?}");
 }
