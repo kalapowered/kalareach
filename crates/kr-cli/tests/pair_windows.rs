@@ -647,7 +647,8 @@ impl WorkerTerminal {
         }
     }
 
-    /// Types one line into the session's root shell.
+    /// Types one line into the session's root shell, ending it with the carriage return the Enter
+    /// key sends, which is what the pseudo-console takes as the end of a line.
     async fn type_line(&mut self, line: &str) {
         let _: kr_protocol::input::InputWriteResult = self
             .client
@@ -658,7 +659,7 @@ impl WorkerTerminal {
                     attachment_id: self.attachment_id,
                     epoch: self.epoch,
                     sequence: kr_protocol::ids::InputSequence::new(self.sequence),
-                    bytes: kr_protocol::scalars::Bytes::new(format!("{line}\n").into_bytes()),
+                    bytes: kr_protocol::scalars::Bytes::new(format!("{line}\r").into_bytes()),
                 },
             )
             .await
