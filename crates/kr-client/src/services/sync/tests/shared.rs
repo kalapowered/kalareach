@@ -954,6 +954,178 @@ async fn a_key_record_travels_in_the_json_form_the_vectors_publish() {
     }
 }
 
+/// The collection a published request names: its home and its identifier.
+fn collection_of(case: &serde_json::Value) -> CollectionRef {
+    CollectionRef {
+        home: published_field(case, "home"),
+        collection_id: published_field(case, "collection_id"),
+    }
+}
+
+/// KR-REQ-20.13 and KR-REQ-04.19: each request this client sends about a collection is the one the
+/// vectors publish for its member, field for field and value for value, and its signature carries
+/// the published digest. A service's contract reads the same cases, so the two cannot come to name
+/// a field differently.
+#[tokio::test]
+async fn every_request_about_a_collection_is_the_one_the_vectors_publish() {
+    let cases = published_requests();
+    let (client, recorder) = sync_client();
+    let head = KeyHead {
+        epoch: 3,
+        revision: 4,
+        recovery: None,
+    };
+
+    let case = &cases["exchange"];
+    let collection = collection_of(case);
+    let kind: SyncObjectKind = published_field(case, "kind");
+    let object_id: SyncObjectId = published_field(case, "object_id");
+    let epoch: U64 = published_field(case, "key_epoch");
+    let object: SealedSyncObject = published_field(case, "object");
+    let mut written = exchanged(
+        "written",
+        summary(object_id.get(), revision(0x39), "5"),
+        Some(revision(0x39)),
+        "5",
+        serde_json::Value::Null,
+    );
+    written["key_epoch"] = serde_json::Value::String(epoch.to_string());
+    written["key_revision"] = serde_json::Value::String("4".to_owned());
+    recorder.answering(vec![written]);
+    client
+        .exchange_shared(
+            &collection,
+            &crate::sync::sync_collection(kind, object_id),
+            epoch.get(),
+            published_field(case, "request_id"),
+            now_ms(),
+            Some(SyncPosition::at(
+                4,
+                published_field(case, "expected_revision"),
+                None,
+            )),
+            &published(&object),
+        )
+        .await
+        .expect("applied");
+    sent_as_published(&recorder, case);
+
+    let case = &cases["compare"];
+    let known: Vec<KnownRevision> = published_field::<Vec<BTreeMap<String, Uuid>>>(case, "known")
+        .into_iter()
+        .map(|held| KnownRevision {
+            object_id: SyncObjectId::new(held["object_id"]),
+            revision: SyncRevision::new(held["revision"]),
+        })
+        .collect();
+    let after: U64 = published_field(case, "conflicts_after_sequence");
+    recorder.answering(vec![compared_shared(
+        &known
+            .iter()
+            .map(|held| (held.object_id.get(), held.revision, 4, 3))
+            .collect::<Vec<_>>(),
+        &[],
+        false,
+        after.get(),
+        head,
+    )]);
+    client
+        .compare_shared(
+            &collection_of(case),
+            &known,
+            published_field(case, "with_conflicts"),
+            Some(after.get()),
+        )
+        .await
+        .expect("an answer")
+        .expect("a member");
+    sent_as_published(&recorder, case);
+
+    let case = &cases["resolve"];
+    let chosen: Vec<SyncConflictId> = published_field(case, "conflict_ids");
+    recorder.answering(vec![
+        serde_json::json!({ "resolved": "1", "stored": usage() }),
+    ]);
+    client
+        .resolve_shared(&collection_of(case), chosen[0])
+        .await
+        .expect("an answer")
+        .expect("a member");
+    sent_as_published(&recorder, case);
+
+    let case = &cases["status"];
+    let request: Uuid = published_field(case, "request_id");
+    recorder.answering(vec![status(request, "unknown", false)]);
+    client
+        .status_shared(&collection_of(case), request)
+        .await
+        .expect("an answer");
+    sent_as_published(&recorder, case);
+
+    let case = &cases["fence"];
+    let request: Uuid = published_field(case, "request_id");
+    let first: U64 = published_field(case, "first_signed_at_ms");
+    let last: U64 = published_field(case, "last_signed_at_ms");
+    recorder.answering(vec![receipt_status(
+        request, "fenced", "fenced", None, true,
+    )]);
+    client
+        .fence_shared(&collection_of(case), request, first.get(), last.get())
+        .await
+        .expect("an answer");
+    sent_as_published(&recorder, case);
+
+    let case = &cases["keys"];
+    let after: U64 = published_field(case, "after_revision");
+    recorder.answering(vec![keys_page(&[], false, head)]);
+    client
+        .records_after(&collection_of(case), after.get())
+        .await
+        .expect("an answer");
+    sent_as_published(&recorder, case);
+
+    let case = &cases["rekey"];
+    let offered: CollectionKeyRecord = published_field(case, "record");
+    recorder.answering(vec![serde_json::json!({
+        "state": "applied",
+        "key_revision": offered.payload.revision.to_string(),
+        "key_epoch": offered.payload.key_epoch.to_string(),
+        "recovery_id": null,
+    })]);
+    client
+        .rekey(
+            &collection_of(case),
+            published_field(case, "request_id"),
+            now_ms(),
+            &offered,
+        )
+        .await
+        .expect("an answer");
+    sent_as_published(&recorder, case);
+
+    // The cursor is the service's: the first page ends at it, and the second asks after it.
+    let case = &cases["memberships"];
+    let cursor: String = published_field(case, "after");
+    recorder.answering(vec![
+        serde_json::json!({
+            "memberships": [{
+                "home": collection.home.to_string(),
+                "collection_id": collection.collection_id.to_string(),
+                "key_revision": "4",
+                "key_epoch": "3",
+                "recovery_id": null,
+            }],
+            "more": true,
+            "next_after": cursor,
+        }),
+        serde_json::json!({ "memberships": [], "more": false, "next_after": null }),
+    ]);
+    let before = recorder.requests();
+    client.memberships().await.expect("the listing");
+    assert_eq!(recorder.requests(), before + 2);
+    sent_as_published(&recorder, case);
+}
+
 #[tokio::test]
 async fn a_key_record_the_service_would_refuse_never_leaves_this_device() {
     let (client, recorder) = sync_client();

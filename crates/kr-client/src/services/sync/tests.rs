@@ -12,7 +12,9 @@ use crate::services::rendering::{NEVER_RENDERED, renders_only};
 use kr_crypto::secret::Secret;
 use kr_protocol::mailbox::{SEAL_OVERHEAD_BYTES, mailbox_size_bucket};
 use kr_protocol::scalars::{AuthorisationKey, Bytes, Nonce192, Signature64, TimestampMs};
-use kr_protocol::service::{SERVICE_REQUEST_FRESHNESS_MS, ServiceRequestSigner};
+use kr_protocol::service::{
+    SERVICE_REQUEST_FRESHNESS_MS, ServiceRequestSignature, ServiceRequestSigner,
+};
 use kr_protocol::sync::MAX_SYNC_OBJECT_PLAINTEXT_BYTES;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -24,6 +26,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 struct Recorder {
     sent: Mutex<Vec<(String, Vec<u8>)>>,
     answers: Mutex<Vec<ServiceHttpAnswer>>,
+    /// The `authorization` header every request carries: the account token its client presents,
+    /// or none.
+    authorization: Option<String>,
 }
 
 impl fmt::Debug for Recorder {
@@ -38,9 +43,20 @@ impl fmt::Debug for Recorder {
 
 impl Recorder {
     fn new() -> Arc<Self> {
+        Self::carrying(None)
+    }
+
+    /// A service every request reaches with `token` beside its signature, as a request about a
+    /// recovery bundle reaches one.
+    fn presented(token: &str) -> Arc<Self> {
+        Self::carrying(Some(format!("Bearer {token}")))
+    }
+
+    fn carrying(authorization: Option<String>) -> Arc<Self> {
         Arc::new(Self {
             sent: Mutex::new(Vec::new()),
             answers: Mutex::new(Vec::new()),
+            authorization,
         })
     }
 
@@ -92,9 +108,14 @@ impl ServiceHttp for Recorder {
         body: &'a [u8],
         headers: &'a [(&'a str, &'a str)],
     ) -> ServiceFuture<'a, ServiceHttpAnswer> {
+        let presented: Vec<(&str, &str)> = self
+            .authorization
+            .iter()
+            .map(|value| ("authorization", value.as_str()))
+            .collect();
         assert!(
-            headers.is_empty(),
-            "a signed request sends no extra headers"
+            headers == presented.as_slice(),
+            "a signed request sends no header but the account token its client presents"
         );
         self.sent
             .lock()
@@ -260,6 +281,108 @@ fn refusal(status: u16, code: &str, message: &str) -> ServiceHttpAnswer {
         }))
         .expect("a refusal"),
     }
+}
+
+/// The settings-sync requests the protocol's vectors publish, by case: the `sync_requests` group of
+/// `fixtures/service/services.json`, which a service's contract reads too.
+fn published_requests() -> BTreeMap<String, serde_json::Value> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/service/services.json");
+    let text = std::fs::read_to_string(&path).expect("the service vectors");
+    let document: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
+    document["sync_requests"]["cases"]
+        .as_array()
+        .expect("the settings-sync requests")
+        .iter()
+        .map(|case| {
+            (
+                case["id"].as_str().expect("a case identifier").to_owned(),
+                case.clone(),
+            )
+        })
+        .collect()
+}
+
+/// The one member a request body names, and its fields.
+fn one_member(body: &serde_json::Value) -> (&String, &serde_json::Map<String, serde_json::Value>) {
+    let members = body.as_object().expect("a request body is an object");
+    assert_eq!(members.len(), 1, "a request asks for exactly one member");
+    let (member, fields) = members.iter().next().expect("one member");
+    (
+        member,
+        fields.as_object().expect("a member carries its fields"),
+    )
+}
+
+/// One field of a published request, read as the value a caller hands this client.
+fn published_field<T: serde::de::DeserializeOwned>(case: &serde_json::Value, field: &str) -> T {
+    let (_, fields) = one_member(&case["json"]);
+    let value = fields
+        .get(field)
+        .unwrap_or_else(|| panic!("{}: the published request names no {field}", case["id"]));
+    serde_json::from_value(value.clone())
+        .unwrap_or_else(|error| panic!("{}: {field}: {error}", case["id"]))
+}
+
+/// Holds the last request `recorder` took to the published `case`: the member it names, every field
+/// and every value, and the digest its signature carries.
+///
+/// Every value in these bodies is one the caller handed over, or, for a listing's cursor, one the
+/// service answered. This client makes none of its own, so each is compared as it is.
+fn sent_as_published(recorder: &Recorder, case: &serde_json::Value) {
+    let id = case["id"].as_str().expect("a case identifier");
+    let sent = recorder.last();
+    let (member, fields) = one_member(&sent["body"]);
+    let (published, published_fields) = one_member(&case["json"]);
+    assert_eq!(member, published, "{id}: the member");
+    assert_eq!(
+        fields.keys().collect::<Vec<_>>(),
+        published_fields.keys().collect::<Vec<_>>(),
+        "{id}: the fields this client sends, and the fields the published request names"
+    );
+    for (field, value) in published_fields {
+        assert_eq!(&fields[field], value, "{id}: {field}");
+    }
+    let signature: ServiceRequestSignature =
+        serde_json::from_value(sent["signature"].clone()).expect("a credential");
+    let digest: String = signature
+        .payload
+        .body_digest
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    assert_eq!(
+        digest, case["sha256"],
+        "{id}: the digest the signature carries"
+    );
+}
+
+/// The vectors publish one request for each member this client sends: the eight a collection takes
+/// and the recovery bundle's four. The tests that hold each to its case sit beside the calls that
+/// send it, in the `shared` and `bundle` modules.
+#[test]
+fn the_vectors_publish_one_request_for_each_member_this_client_sends() {
+    assert_eq!(
+        published_requests()
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        [
+            "bundle_compare",
+            "bundle_exchange",
+            "bundle_fence",
+            "bundle_status",
+            "compare",
+            "exchange",
+            "fence",
+            "keys",
+            "memberships",
+            "rekey",
+            "resolve",
+            "status",
+        ]
+    );
 }
 
 #[test]

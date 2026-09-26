@@ -795,6 +795,131 @@ async fn a_bundle_is_written_and_read_at_its_locator_with_the_account_token_besi
     );
 }
 
+/// KR-REQ-20.18 and KR-REQ-04.19: each request this client sends about a recovery bundle is the one
+/// the vectors publish for its member, field for field and value for value, with the account token
+/// beside a signature that carries the published digest. A service's contract reads the same
+/// cases, so neither side can come to address the bundle by anything but its locator.
+#[tokio::test]
+async fn every_request_about_a_bundle_is_the_one_the_vectors_publish() {
+    let cases = published_requests();
+    let recorder = Recorder::presented("owner-write");
+    let client = ManagedSyncService::new(
+        GatewayOrigin::new(ORIGIN).expect("an origin"),
+        Arc::clone(&recorder) as Arc<dyn ServiceHttp>,
+        Arc::new(Device {
+            pair: AuthorisationKeyPair::generate().expect("a key pair"),
+        }) as Arc<dyn ServiceSigner>,
+    )
+    .presenting(
+        SignIn::holding("owner-write") as Arc<dyn AccountTokenSource>,
+        BACKUP_WRITE_SCOPE,
+    );
+    // What a caller hands over is the name the kit's locator gives the bundle's collection.
+    let named = |case: &serde_json::Value| {
+        bundle_collection(&at(ORIGIN, &published_field::<String>(case, "locator")))
+    };
+
+    let case = &cases["bundle_exchange"];
+    let bundle: SealedRecoveryBundle = published_field(case, "object");
+    let expected: Option<SyncRevision> = published_field(case, "expected_revision");
+    recorder.answering(vec![exchanged(
+        "written",
+        serde_json::json!({
+            "kind": "recovery_bundle",
+            "object_id": published_field::<String>(case, "locator"),
+            "revision": revision(0xb1).to_string(),
+            "write_sequence": "1",
+            "updated_at": "2026-09-25T10:00:00.000Z",
+            "bytes": "4096",
+        }),
+        Some(revision(0xb1)),
+        "1",
+        serde_json::Value::Null,
+    )]);
+    client
+        .compare_exchange(
+            &named(case),
+            published_field(case, "request_id"),
+            now_ms(),
+            expected.map(|replaced| SyncPosition::at(1, replaced, None)),
+            bundle.ciphertext.as_slice(),
+        )
+        .await
+        .expect("applied");
+    sent_as_published(&recorder, case);
+
+    let case = &cases["bundle_compare"];
+    recorder.answering(vec![serde_json::json!({
+        "changed": [],
+        "removed": [],
+        "revisions": [],
+        "conflicts": [],
+        "next_conflicts_after_sequence": "0",
+        "more_conflicts": false,
+        "recovery_id": null,
+        "stored": stored(false),
+    })]);
+    client.fetch(&named(case)).await.expect("an answer");
+    sent_as_published(&recorder, case);
+
+    let case = &cases["bundle_status"];
+    let request: Uuid = published_field(case, "request_id");
+    recorder.answering(vec![status(request, "unknown", false)]);
+    client
+        .request_status(&named(case), request)
+        .await
+        .expect("an answer");
+    sent_as_published(&recorder, case);
+
+    let case = &cases["bundle_fence"];
+    let request: Uuid = published_field(case, "request_id");
+    let first: U64 = published_field(case, "first_signed_at_ms");
+    let last: U64 = published_field(case, "last_signed_at_ms");
+    let mut fenced = status(request, "fenced", true);
+    fenced["outcome"] = serde_json::Value::String("fenced".to_owned());
+    recorder.answering(vec![fenced]);
+    client
+        .fence_request(&named(case), request, first.get(), last.get())
+        .await
+        .expect("an answer");
+    sent_as_published(&recorder, case);
+}
+
+/// KR-REQ-20.18: this service reads each request about a recovery bundle the vectors publish, as it
+/// reads the requests this client sends. The write lands at the locator it names, the read serves
+/// back the stream the write carried, and the status query and the fence each find the receipt of
+/// the write their request identity names.
+#[test]
+fn this_service_reads_every_request_about_a_bundle_the_vectors_publish() {
+    let cases = published_requests();
+    let web = Web::open();
+    web.issue("owner-write", "owner", &[BACKUP_WRITE_SCOPE]);
+    let take = |id: &str| {
+        let (member, fields) = one_member(&cases[id]["json"]);
+        let answer = web.take(&cases[id]["json"], Some("Bearer owner-write"), now_ms());
+        assert_eq!(answer.status, 200, "{id}");
+        let seen = web.seen().pop().expect("the request it read");
+        assert_eq!(&seen.member, member, "{id}");
+        assert_eq!(seen.asked.as_object(), Some(fields), "{id}");
+        let answer: serde_json::Value = serde_json::from_slice(&answer.body).expect("an envelope");
+        answer["data"].clone()
+    };
+    let write = &cases["bundle_exchange"]["json"]["exchange"];
+
+    let written = take("bundle_exchange");
+    assert_eq!(written["state"], "written");
+    assert_eq!(written["record"]["object_id"], write["locator"]);
+    let read = take("bundle_compare");
+    assert_eq!(read["changed"][0]["object_id"], write["locator"]);
+    assert_eq!(read["changed"][0]["object"], write["object"]);
+    for id in ["bundle_status", "bundle_fence"] {
+        let receipt = take(id);
+        let (_, asked) = one_member(&cases[id]["json"]);
+        assert_eq!(receipt["request_id"], asked["request_id"], "{id}");
+        assert_eq!(receipt["state"], "applied", "{id}: the write's receipt");
+    }
+}
+
 /// KR-ACC-033 and KR-REQ-20.19 through the managed client: a device holding only the kit reaches
 /// the bundle through the access its retrieval policy gave it, a token for the restore alone, and
 /// authenticates it with the kit. Without that access it reaches nothing: a device presenting no
