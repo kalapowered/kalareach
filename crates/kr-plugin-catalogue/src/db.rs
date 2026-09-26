@@ -172,10 +172,12 @@ impl Db {
     ///
     /// The database and the files SQLite keeps beside it are the catalogue's own, like the
     /// directory they are in, so none of them is opened through a link: a link at one of their
-    /// names is refused before anything is read or written, and the open itself follows no link,
-    /// so one put there afterwards fails it too. The directories above the catalogue's own are the
-    /// host's, which is why the database is named through the canonical path of the catalogue's
-    /// directory: a link the host keeps higher up is resolved first, and is no refusal.
+    /// names is refused before anything is read or written. On Unix the open itself follows no
+    /// link as well, so one put there after that check fails the open too. On Windows the check is
+    /// the whole of it: SQLite opens there by name, so a link put in place between the check and
+    /// the open is followed. The directories above the catalogue's own are the host's, which is
+    /// why the database is named through the canonical path of the catalogue's directory on Unix:
+    /// a link the host keeps higher up is resolved first, and is no refusal.
     ///
     /// # Errors
     ///
