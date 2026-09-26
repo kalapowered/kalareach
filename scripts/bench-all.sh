@@ -354,12 +354,15 @@ descriptions_refusal() {
     echo "the host is not on mains power, and descriptions pause on battery"
     return
   fi
+  # Available memory as the product itself reads it before it loads a model: on macOS the free,
+  # speculative, inactive and purgeable pages less what the compressor holds.
   case "$os_name" in
     Darwin)
       available_mib="$(vm_stat | awk '
         NR == 1 { for (i = 1; i <= NF; i++) if ($i ~ /^[0-9]+$/) page = $i }
         /^Pages (free|inactive|speculative|purgeable):/ { gsub(/\./, "", $NF); pages += $NF }
-        END { printf "%d\n", pages * page / 1048576 }')"
+        /^Pages occupied by compressor:/ { gsub(/\./, "", $NF); pages -= $NF }
+        END { if (pages < 0) pages = 0; printf "%d\n", pages * page / 1048576 }')"
       ;;
     *) available_mib="$(awk '/^MemAvailable:/ { printf "%d\n", $2 / 1024 }' /proc/meminfo)" ;;
   esac
@@ -395,8 +398,10 @@ if selected reconnect; then
     "outcome           $(outcome_of reconnect)"
 fi
 if selected companion; then
+  # The default reporter is named, because the runner otherwise picks a quieter one in some
+  # environments and drops what a passing test printed.
   run_step companion "" env NO_COLOR=1 FORCE_COLOR=0 pnpm -C apps/companion exec vitest run \
-    test/performance.test.tsx
+    --reporter=default test/performance.test.tsx
   # The test prints each figure on a line of its own; any colour the runner still adds is taken off
   # before the line is read.
   escape="$(printf '\033')"
