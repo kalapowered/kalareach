@@ -2179,11 +2179,17 @@ async fn a_session_a_draft_and_a_control_need_no_managed_service_and_do_not_chan
     assert!(first.5 && !second.5);
 }
 
+// KR-PERF-006's measurement ends in the painter's bytes for the restored screen, and the painter
+// is the terminal feature's, so the measurement and everything only it uses need that feature.
+
 /// The canonical size KR-PERF-006 names.
+#[cfg(feature = "terminal")]
 const PERF_ROWS: u64 = 40;
+#[cfg(feature = "terminal")]
 const PERF_COLUMNS: u64 = 120;
 
 /// The state half of a projected screen of that size.
+#[cfg(feature = "terminal")]
 fn perf_snapshot() -> Box<kr_protocol::projection::ProjectionSnapshot> {
     use kr_protocol::projection::{
         CharsetState, KittyKeyboardState, MarginState, PaletteProvenance, PaletteState,
@@ -2268,6 +2274,7 @@ fn perf_snapshot() -> Box<kr_protocol::projection::ProjectionSnapshot> {
 }
 
 /// Every row of that screen, full width.
+#[cfg(feature = "terminal")]
 fn perf_rows() -> kr_protocol::projection::ProjectionRowPage {
     use kr_protocol::projection::{
         CellRendition, CellRun, ProjectedBuffer, ProjectedRow, ProjectionRowPage,
@@ -2299,6 +2306,7 @@ fn perf_rows() -> kr_protocol::projection::ProjectionRowPage {
 }
 
 /// Sends one projection event as the notification a host publishes it as.
+#[cfg(feature = "terminal")]
 async fn push_projection(
     pushes: &tokio::sync::mpsc::Sender<ControlFrame>,
     stream_id: &StreamId,
@@ -2329,6 +2337,7 @@ async fn push_projection(
 ///
 /// The clock starts where KR-PERF-006 starts it: the transport has returned, and nothing has been
 /// asked for yet. It stops when there is a screen a terminal can draw.
+#[cfg(feature = "terminal")]
 async fn restore_a_screen(
     session: &Session,
     pushes: &tokio::sync::mpsc::Sender<ControlFrame>,
@@ -2400,6 +2409,7 @@ async fn restore_a_screen(
     (elapsed, drawn.matches(&row).count())
 }
 
+#[cfg(feature = "terminal")]
 #[tokio::test]
 async fn a_reconnect_reaches_a_screen_a_terminal_can_draw_inside_the_budget() {
     // KR-PERF-006: usable state within two seconds for a 120x40 screen, measured from where the
