@@ -104,8 +104,8 @@ check_no_survivors() {
     sleep 1
   done
   echo "FAILED: these processes outlived the script"
-  # shellcheck disable=SC2086
-  ps -o pid=,command= -p $(printf '%s' "$left" | tr '\n' ' ') || true
+  local pids; read -r -a pids <<< "$(printf '%s' "$left" | tr '\n' ' ')"
+  ps -o pid=,command= -p "${pids[@]}" || true
   return 1
 }
 
