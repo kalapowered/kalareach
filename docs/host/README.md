@@ -4483,8 +4483,11 @@ exists. An invitation names approvals by upstream identifiers, and an upstream's
 pick out one recorded request, since two connections both call their first request `1`; so no name
 a grant carries excepts a record from that bound, and a named approval older than the bound is
 withheld with the rest. A caller under a grant whose scope did not come with its read is refused as
-`UNSUPPORTED_CAPABILITY`, with that reason and nothing of the record. An answer larger than the
-control frame the connection declared is refused with both sizes rather than sent.
+`UNSUPPORTED_CAPABILITY`, with that reason and nothing of the record. The worker refuses an answer
+larger than the control frame declared on the connection it answers, with both sizes, rather than
+send it. A paired device's read reaches the worker over the daemon's own link, so for a device that
+check is against the frame of that link, not against a smaller one the device negotiated on its own
+connection.
 
 The five agent mutations each carry the binding revision they were prepared against. A revision
 behind the one in force is `STALE_SESSION`; a draft that moved is `DRAFT_CONFLICT`. A steer or a
