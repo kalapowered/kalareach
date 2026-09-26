@@ -77,6 +77,14 @@ interface Cell {
   readonly height: number
 }
 
+/** One cell at the probe's type size, or null where nothing is laid out. */
+function cellOf(probe: HTMLSpanElement | null): Cell | null {
+  const box = probe?.getBoundingClientRect()
+  return box !== undefined && box.width > 0 && box.height > 0
+    ? { width: box.width / PROBE_CELLS, height: Math.ceil(box.height) }
+    : null
+}
+
 /** The cell a grid is laid out with before its first measure, which a page with no layout keeps. */
 const UNMEASURED_CELL: Cell = { width: 8, height: 16 }
 
@@ -198,22 +206,23 @@ export function RawTerminal({
   // A cell is measured at the current type size before the grid is painted, so a zoom step lays
   // the last frame out again at once, from its top-left corner.
   useLayoutEffect(() => {
-    const box = probe.current?.getBoundingClientRect()
-    const measured =
-      box !== undefined && box.width > 0 && box.height > 0
-        ? { width: box.width / PROBE_CELLS, height: Math.ceil(box.height) }
-        : null
+    const measured = cellOf(probe.current)
     setCell((current) =>
       current?.width === measured?.width && current?.height === measured?.height ? current : measured
     )
   }, [fontSize])
 
-  /** The grid the surface holds at the current cell size. */
+  /**
+   * The grid the surface holds at the current cell size. The view opens before the measured cell
+   * has reached its state, so a missing one is read from the probe at once: the first grid the host
+   * is given is the surface's own.
+   */
   const measure = useCallback((): TerminalGrid => {
     const element = host.current
-    if (element === null || cell === null) return FALLBACK_GRID
-    const columns = Math.floor(element.clientWidth / cell.width)
-    const rows = Math.floor(element.clientHeight / cell.height)
+    const current = cell ?? cellOf(probe.current)
+    if (element === null || current === null) return FALLBACK_GRID
+    const columns = Math.floor(element.clientWidth / current.width)
+    const rows = Math.floor(element.clientHeight / current.height)
     return columns > 0 && rows > 0 ? { columns, rows } : FALLBACK_GRID
   }, [cell])
 

@@ -571,6 +571,16 @@ test.describe('the raw terminal', () => {
     ])
   })
 
+  test('opens its view at the grid its surface holds, with no size report after', async ({ page }) => {
+    await openSession(page)
+    await page.getByRole('tab', { name: 'Terminal' }).click()
+    await expect(page.getByTestId('terminal-surface')).toContainText('cargo test -p kr-client')
+    const grids = await page.evaluate(() => window.krTestHost?.terminalViews[0]?.grids ?? [])
+    // The surface here holds far more than the grid a view opens at when nothing can be measured.
+    expect(grids[0]).not.toEqual({ columns: 80, rows: 24 })
+    expect(grids).toHaveLength(1)
+  })
+
   test('reports the same columns when only the height of its surface changes', async ({ page }) => {
     await openSession(page)
     await page.getByRole('tab', { name: 'Terminal' }).click()
