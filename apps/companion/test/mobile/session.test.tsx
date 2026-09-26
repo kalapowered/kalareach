@@ -195,6 +195,20 @@ describe("the phone's raw terminal view (KR-REQ-08.02, 13.18)", () => {
     const lines = screen.getAllByTestId('mobile-terminal-line').map((line) => line.textContent)
     expect(lines[0]).toBe('$ cargo test -p kr-client\n')
     expect(lines[3]).toBe('ok    done\n')
+    // Each piece is a box of exactly its cells that cuts what it holds at its edges, so no glyph,
+    // an italic one's overhang included, reaches the cells beside it.
+    const pieces = Array.from(
+      screen.getAllByTestId('mobile-terminal-line')[3]?.querySelectorAll<HTMLElement>('[data-cells]') ?? []
+    )
+    expect(pieces.map((piece) => [piece.textContent, piece.style.width])).toEqual([
+      ['ok', '2ch'],
+      ['  ', '2ch'],
+      ['done', '4ch']
+    ])
+    for (const piece of pieces) {
+      expect(piece.style.display).toBe('inline-block')
+      expect(piece.style.overflow).toBe('hidden')
+    }
     expect(screen.getByTestId('terminal-presentation').textContent).toContain(
       'its client declared no terminal profile'
     )

@@ -703,14 +703,27 @@ function RawTerminal({
         {screen && palette
           ? screen.lines.map((line, index) => (
               <span key={`${index}-${line.row}`} data-testid="mobile-terminal-line">
-                {stretchesOf(line).map((stretch) => (
-                  <span
-                    key={stretch.column}
-                    style={stretch.piece === null ? undefined : styleOf(stretch.piece.rendition, palette)}
-                  >
-                    {stretch.text}
-                  </span>
-                ))}
+                {stretchesOf(line).map((stretch) =>
+                  stretch.piece === null ? (
+                    <span key={stretch.column}>{stretch.text}</span>
+                  ) : (
+                    // A box of exactly the piece's cells that cuts what it holds at its edges, so
+                    // no glyph, an italic one's overhang included, reaches the cells beside it.
+                    <span
+                      key={stretch.column}
+                      data-cells={stretch.piece.cells}
+                      style={{
+                        ...styleOf(stretch.piece.rendition, palette),
+                        display: 'inline-block',
+                        width: `${stretch.text.length}ch`,
+                        overflow: 'hidden',
+                        verticalAlign: 'top'
+                      }}
+                    >
+                      {stretch.text}
+                    </span>
+                  )
+                )}
                 {'\n'}
               </span>
             ))
