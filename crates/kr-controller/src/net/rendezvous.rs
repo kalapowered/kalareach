@@ -537,22 +537,43 @@ mod tests {
         }
     }
 
+    /// When a relay test's host answers the relay's questions after its first, the one the relay
+    /// asks before it attaches.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Answers {
+        /// At once, from the invitation as it stands.
+        AtOnce,
+        /// Only once the invitation has ended, as a host that a busy machine runs late does: a
+        /// question the relay asks while the invitation is on offer finds it over.
+        AfterTheEnd,
+    }
+
     /// A host a relay test controls: on offer until the test says otherwise, answering every step
     /// with the same frames, and noting when it answered the relay and what.
     struct TestHost {
         offer: std::sync::Mutex<RoomOffer>,
+        changed: std::sync::Condvar,
         replies: Vec<ClientFrame>,
         on_step: OnStep,
+        later: Answers,
+        questions: std::sync::atomic::AtomicUsize,
         answers: std::sync::Mutex<Vec<(Instant, RoomOffer)>>,
         gate: Arc<Gate>,
     }
 
     impl TestHost {
         fn new(replies: Vec<ClientFrame>, on_step: OnStep) -> Arc<Self> {
+            Self::answering(replies, on_step, Answers::AtOnce)
+        }
+
+        fn answering(replies: Vec<ClientFrame>, on_step: OnStep, later: Answers) -> Arc<Self> {
             Arc::new(Self {
                 offer: std::sync::Mutex::new(RoomOffer::Open),
+                changed: std::sync::Condvar::new(),
                 replies,
                 on_step,
+                later,
+                questions: std::sync::atomic::AtomicUsize::new(0),
                 answers: std::sync::Mutex::new(Vec::new()),
                 gate: Arc::new(Gate::default()),
             })
@@ -560,6 +581,7 @@ mod tests {
 
         fn set(&self, offer: RoomOffer) {
             *self.offer.lock().expect("the offer") = offer;
+            self.changed.notify_all();
         }
 
         /// The invitation ends by itself: its deadline passes.
@@ -597,7 +619,20 @@ mod tests {
 
         fn room_offer(&self, _invitation_id: InvitationId) -> RoomOffer {
             self.gate.pass();
-            let offer = *self.offer.lock().expect("the offer");
+            let first = self
+                .questions
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                == 0;
+            let offer = {
+                let mut offer = self.offer.lock().expect("the offer");
+                if !first && self.later == Answers::AfterTheEnd {
+                    offer = self
+                        .changed
+                        .wait_while(offer, |offer| *offer == RoomOffer::Open)
+                        .expect("the offer");
+                }
+                *offer
+            };
             self.answers
                 .lock()
                 .expect("the answers")
@@ -836,10 +871,14 @@ mod tests {
     /// KR-REQ-10.33: a socket that ends after its invitation did is not followed by the pause
     /// before attaching again: the relay asks the host as the socket ends and releases the locator
     /// at once.
+    ///
+    /// The host answers every question after the one the relay attaches on only once the
+    /// invitation has ended, as a busy machine can make it: a relay that asked again between
+    /// attaching and its socket's end would find the invitation over there, every time.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_socket_that_ends_after_its_invitation_is_released_at_once() {
         for attempt in 1..=PHASE_ATTEMPTS {
-            let host = TestHost::new(Vec::new(), OnStep::Keeps);
+            let host = TestHost::answering(Vec::new(), OnStep::Keeps, Answers::AfterTheEnd);
             let service = TestService::new(8);
             let (relay, _stop) = relaying(&host, &service).await;
             let task = relay.id();
