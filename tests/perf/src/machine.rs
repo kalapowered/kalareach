@@ -1,31 +1,35 @@
 //! Readings of this machine for [`crate::other_work`]: its processors' idle time and every process
 //! on it.
 //!
-//! What this reads rests on how each kernel keeps its counts, and those are this module's
-//! assumptions:
+//! Linux keeps the processors' idle time on the first line of `/proc/stat` and each process's time
+//! in `/proc/<pid>/stat`; macOS keeps each processor's idle time in its load counters and each
+//! process's time in its task information, which another user's process does not open to this
+//! reader, so that process's row is listed as unread. What this reads rests on four things each
+//! kernel does by design, which hold on the reference hosts; each comes with an allowance the
+//! bound includes, and the reader checks what it can:
 //!
-//! * Linux keeps the processors' idle time on the first line of `/proc/stat`. A kernel that stops
-//!   the clock tick on an idle processor measures idle time as it passes, and a count taken while a
-//!   processor is idle includes the idle time so far. That needs a kernel built for it
-//!   (`CONFIG_NO_HZ_COMMON`), not started with it turned off (`nohz=`), and a timer that can fire
-//!   once, which x86-64 and ARM64 machines have; the first two are checked, and a kernel that fails
-//!   them is not read. A process's time, in `/proc/<pid>/stat`, is the kernel's account of it,
-//!   brought up to date for a running thread at every clock tick, so it trails by at most a tick for
-//!   each thread running as it is read; a processor that stops its tick while a thread runs
-//!   (`nohz_full`) breaks that, and a kernel with one is not read. Both are printed in hundredths of
-//!   a second.
-//! * macOS keeps each processor's idle time in its load counters, in ticks of a hundredth of a
-//!   second, and brings an idle processor's up to date as it is read. A process's time, from the
-//!   kernel's task information, is exact, and a running thread's is brought up to date at least
-//!   once in each ten-millisecond scheduling quantum. The task information of another user's
-//!   process cannot be read, and that process's row is listed as unread.
-//!
-//! Both kernels read a processor's idle count from more than one field without a lock, and a count
-//! taken as a processor goes idle or wakes can miss an idle stretch (Linux, when a task waiting for
-//! a disk is woken elsewhere) or count one twice (macOS). Each count is therefore taken three
-//! times: where a count starts a stretch the largest is kept, since a count that falls short would
-//! add idle time from before it, and where it ends a stretch the smallest, since a count that runs
-//! over would add idle time that did not happen. A stretch is misread only if all three are.
+//! 1. Idle time is counted as it passes. Linux counts it exactly on a kernel that stops the clock
+//!    tick on an idle processor, which distribution kernels for x86-64 and ARM64 are built to do on
+//!    machines with one-shot timers; this checks `CONFIG_NO_HZ_COMMON` in the kernel's
+//!    configuration and that no `nohz=` on its command line turns it off, and does not read a
+//!    kernel that fails either. macOS brings an idle processor's count up to date as it is read.
+//!    Allowance: rounding to a hundredth of a second (the idle and waiting counts on Linux), and on
+//!    macOS a hundredth and one ten-millisecond quantum for each processor.
+//! 2. A running thread's charged time trails by at most one clock tick on Linux, since the tick
+//!    brings it up to date and a quiet host holds interrupts off for microseconds; this reads the
+//!    clock rate from the kernel's configuration and does not read a kernel with a processor that
+//!    stops the tick while a thread runs (`nohz_full`). On macOS it trails by at most one
+//!    ten-millisecond scheduling quantum. Allowance: for each process, its running threads times one
+//!    tick or one quantum, and on Linux a further two hundredths of a second for rounding.
+//! 3. An idle count, read from more than one field without a lock, is right at least once in three.
+//!    A count taken just as a processor goes idle or wakes can drop that processor's current idle
+//!    stretch (Linux, when a task waiting for a disk is woken elsewhere) or count it twice (macOS);
+//!    each count is therefore taken three times, and the largest is kept where it starts a stretch,
+//!    since a count that falls short would add idle time from before it, and the smallest where it
+//!    ends one, since a count that runs over would add idle time that did not happen.
+//! 4. A process identifier and start name one process. Linux gives the start in hundredths of a
+//!    second and macOS to the microsecond, and both hand identifiers out in turn, so one returns to
+//!    use only after every other has been used.
 //!
 //! Elsewhere nothing is read and every reading fails.
 

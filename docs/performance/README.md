@@ -37,21 +37,27 @@ four processors, the 8 GiB and the 1% are the figures that
 `crates/kr-transport/tests/support/conditions.rs` holds, and every measurement's record reads its
 host against them, so a record can name a shortfall of its own.
 
-The reading rests on how the kernels keep their counts. Linux counts idle time as it passes on a
-kernel that stops the clock tick on an idle processor, which needs a kernel built for it and a timer
-that can fire once, as x86-64 and ARM64 machines have; the reader checks the kernel's configuration
-and command line and does not read a kernel that fails them. It takes a running thread's time to
-trail by at most one clock tick, and does not read a kernel whose processors can stop the tick while
-a thread runs. macOS keeps each processor's idle time in its load counters, and brings a running
-thread's time up to date at least once in each scheduling quantum. Both kernels can misread an idle
-count taken just as a processor goes idle or wakes, so the reader takes each count three times and
-keeps the one that can only make the host read busier. It allows for each count's rounding and for
-how far a running thread's time can trail. What it bounds is all the processor time the operating
-system does not charge to the run's processes, so the kernel's own work counts as other work, even
-what the kernel does on the run's behalf, which can only make a host read busier. A zero stolen
-share means the hypervisor reported no loss, and a platform that keeps no such count leaves the
-condition unverified. And memory as the operating system reports it is a little less than the
-memory installed, so a machine with exactly 8 GiB installed reads as short of the reference host.
+What the reader bounds is all the processor time the operating system does not charge to the run's
+processes, so the kernel's own work counts as other work, even what the kernel does on the run's
+behalf, which can only make a host read busier. A zero stolen share means the hypervisor reported no
+loss, and a platform that keeps no such count leaves the condition unverified. And memory as the
+operating system reports it is a little less than the memory installed, so a machine with exactly
+8 GiB installed reads as short of the reference host.
+
+### What the reading assumes
+
+The reader cannot see inside a kernel's accounting, so the bound rests on four things each kernel
+does by design. They hold on the reference hosts, and the reader checks what it can. Each one comes
+with an allowance, which the reader adds to the bound, and every conditions section gives how much
+of its bound the allowances make up. Section 27's figures are far coarser than any of them: the
+gate itself allows one processor's worth, five processor-seconds, in any five seconds.
+
+| Assumption | Its bound | Why it holds on a reference host | What the reader checks | Allowance in each stretch between two readings |
+| --- | --- | --- | --- | --- |
+| Idle time is counted as it passes | Linux counts it exactly on a kernel that stops the clock tick on an idle processor; macOS brings an idle processor's count up to date when it is read | Distribution kernels for x86-64 and ARM64 are built for it, and those machines have the one-shot timers it needs | On Linux, `CONFIG_NO_HZ_COMMON` in the kernel's configuration and no `nohz=` that turns it off; a kernel that fails either is not read | Rounding to a hundredth of a second: 0.02 s on Linux (idle and waiting counts), a hundredth of a second and one 10 ms quantum per processor on macOS (0.24 s on twelve processors) |
+| A running thread's charged time trails by little | At most one clock tick on Linux (1 ms at 1000 Hz), one 10 ms scheduling quantum on macOS | The clock tick, or the quantum's timer, brings the running thread's time up to date, and a quiet host holds interrupts off for microseconds | On Linux, the clock rate from the kernel's configuration, and no processor that stops the tick while a thread runs (`nohz_full`) | For each of the run's processes, its running threads times one tick or one quantum, and on Linux a further 0.02 s for rounding |
+| An idle count read without a lock is right at least once in three | A count taken just as a processor goes idle or wakes can drop that processor's current idle stretch (Linux) or count it twice (macOS) | It needs a wake-up to land within the few hundred nanoseconds between two reads of one processor's fields, three times over, on a quiet host | Every count is taken three times; the largest is kept where it starts a stretch and the smallest where it ends one | None |
+| A process identifier and start name one process | Linux gives the start in hundredths of a second, macOS to the microsecond | Both hand identifiers out in turn, Linux up to its `pid_max`, macOS up to 99,999, so one returns only after every other has been used, far longer than a hundredth of a second | Nothing | None |
 
 ## The two configurations
 
