@@ -257,8 +257,11 @@ pub fn take_claim(
 /// A command that left a claim and ran the environment's task asks this to tell a task whose
 /// starter never ran from a daemon that was started and did not answer.
 #[must_use]
-pub fn claim_taken(_environment: &EnvironmentPaths, _request: Uuid) -> bool {
-    todo!("not built yet")
+pub fn claim_taken(environment: &EnvironmentPaths, request: Uuid) -> bool {
+    environment
+        .start_claims_dir()
+        .join(format!("{request}.{TAKEN}"))
+        .exists()
 }
 
 /// Reads one claim this host wrote.
@@ -378,10 +381,10 @@ mod windows {
 
     use kr_protocol::identity::ProcessStartIdentity;
     use windows_sys::Win32::Foundation::{
-        ERROR_ACCESS_DENIED, ERROR_BROKEN_PIPE, ERROR_FILE_NOT_FOUND, ERROR_IO_PENDING,
-        ERROR_NO_DATA, ERROR_OPERATION_ABORTED, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED,
-        ERROR_SEM_TIMEOUT, FILETIME, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
-        LocalFree, WAIT_OBJECT_0,
+        DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_ACCESS_DENIED, ERROR_BROKEN_PIPE,
+        ERROR_FILE_NOT_FOUND, ERROR_IO_PENDING, ERROR_NO_DATA, ERROR_OPERATION_ABORTED,
+        ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, ERROR_SEM_TIMEOUT, FILETIME, GENERIC_READ,
+        GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, LocalFree, WAIT_OBJECT_0,
     };
     use windows_sys::Win32::Security::Authorization::{
         ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
@@ -405,10 +408,13 @@ mod windows {
     use windows_sys::Win32::System::Threading::{
         CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED,
         CREATE_UNICODE_ENVIRONMENT, CreateEventW, CreateProcessW, DETACHED_PROCESS,
-        GetCurrentProcess, GetCurrentThread, GetProcessTimes, OpenProcess, OpenProcessToken,
-        OpenThreadToken, PROCESS_INFORMATION, PROCESS_NAME_WIN32,
-        PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW, ResumeThread, STARTUPINFOW,
-        TerminateProcess, WaitForSingleObject,
+        DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess,
+        GetCurrentThread, GetProcessTimes, InitializeProcThreadAttributeList,
+        LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcess, OpenProcessToken, OpenThreadToken,
+        PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_INFORMATION, PROCESS_NAME_WIN32,
+        PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW, ResumeThread,
+        STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW, TerminateProcess,
+        UpdateProcThreadAttribute, WaitForSingleObject,
     };
 
     use super::{JobPlan, job_plan};
@@ -972,13 +978,55 @@ mod windows {
     /// absent, and takes it only when it is a regular file whose access-control list grants no
     /// account this host does not trust.
     ///
+    /// It is opened without following a reparse point, so a link planted under its name opens as
+    /// the link and is refused rather than written through. A file created here carries the list
+    /// the environment's owner-only state directory gives everything created in it.
+    ///
     /// # Errors
     ///
     /// Returns [`IpcError::UntrustedFile`](crate::IpcError::UntrustedFile) for a link, something
     /// other than a regular file, or a list that grants another account, and an I/O failure when
     /// it cannot be opened or its list cannot be read.
-    pub fn open_log(_path: &Path) -> crate::Result<std::fs::File> {
-        todo!("not built yet")
+    pub fn open_log(path: &Path) -> crate::Result<std::fs::File> {
+        use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT,
+        };
+
+        let untrusted = |reason| crate::IpcError::UntrustedFile {
+            path: path.to_path_buf(),
+            reason,
+        };
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .append(true)
+            .create(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+            .map_err(|error| crate::IpcError::io("open", path, error))?;
+        let metadata = file
+            .metadata()
+            .map_err(|error| crate::IpcError::io("inspect", path, error))?;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(untrusted(
+                "this file must not be a symbolic link or a junction",
+            ));
+        }
+        if !metadata.is_file() {
+            return Err(untrusted("this file must be a regular file"));
+        }
+        match crate::paths::check_access_list(file.as_handle(), &path.display().to_string(), false)
+        {
+            Ok(()) => Ok(file),
+            Err(crate::paths::AccessListRefusal::Policy(_)) => Err(untrusted(
+                "this file's access-control list grants an account this host does not trust",
+            )),
+            Err(crate::paths::AccessListRefusal::Unreadable(detail)) => Err(crate::IpcError::io(
+                "inspect",
+                path,
+                io::Error::other(detail),
+            )),
+        }
     }
 
     /// What a starter is asked to run.
@@ -1075,30 +1123,56 @@ mod windows {
             .collect();
         let directory = wide(command.directory.as_os_str());
         let block = environment_block(command.environment);
+        // The output file goes to the child as an inheritable copy named in a list of the handles
+        // it may inherit, so nothing else this starter holds reaches it. Both live until the
+        // create has returned.
+        let handed = match command.output.map(Handed::output).transpose() {
+            Ok(handed) => handed,
+            Err(error) => {
+                return Err(ChildRefusal::nothing_created(format!(
+                    "the output file could not be handed to {}: {error}",
+                    command.application.display()
+                )));
+            }
+        };
         // SAFETY: all-zero is the documented initial state of both structures; the size field of
         // the first is set next.
-        let mut startup: STARTUPINFOW = unsafe { std::mem::zeroed() };
-        startup.cb = u32::try_from(std::mem::size_of::<STARTUPINFOW>()).unwrap_or(0);
+        let mut startup: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
+        startup.StartupInfo.cb = u32::try_from(std::mem::size_of::<STARTUPINFOW>()).unwrap_or(0);
+        let mut inherit = 0;
+        if let Some(handed) = &handed {
+            startup.StartupInfo.cb =
+                u32::try_from(std::mem::size_of::<STARTUPINFOEXW>()).unwrap_or(0);
+            startup.StartupInfo.dwFlags |= STARTF_USESTDHANDLES;
+            startup.StartupInfo.hStdOutput = handed.handle.as_raw_handle();
+            startup.StartupInfo.hStdError = handed.handle.as_raw_handle();
+            startup.lpAttributeList = handed.list.pointer();
+            creation |= EXTENDED_STARTUPINFO_PRESENT;
+            inherit = 1;
+        }
         let mut created: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
         // SAFETY: every string is terminated and outlives the call, the command line is a mutable
         // buffer as the call requires, the environment is either absent or a terminated block of
-        // wide strings, no handle is inherited, and `created` is a live out parameter.
+        // wide strings, a handle is inherited only when it is named in the attribute list the
+        // extended structure carries, which with the handle outlives the call, and `created` is a
+        // live out parameter.
         let ok = unsafe {
             CreateProcessW(
                 application.as_ptr(),
                 line.as_mut_ptr(),
                 std::ptr::null(),
                 std::ptr::null(),
-                0,
+                inherit,
                 creation,
                 block
                     .as_ref()
                     .map_or(std::ptr::null(), |block| block.as_ptr().cast()),
                 directory.as_ptr(),
-                &raw const startup,
+                (&raw const startup).cast::<STARTUPINFOW>(),
                 &raw mut created,
             )
         };
+        drop(handed);
         if ok == 0 {
             let error = io::Error::last_os_error();
             let detail = if plan == JobPlan::BreakAway && code(&error) == Some(ERROR_ACCESS_DENIED)
@@ -1255,6 +1329,113 @@ mod windows {
             ChildRefusal {
                 detail,
                 remaining_pid: (!ended).then_some(self.pid),
+            }
+        }
+    }
+
+    /// A file handed to a child as its standard output and standard error: an inheritable copy of
+    /// the starter's handle, and the list that names it as the one handle the child inherits.
+    struct Handed {
+        handle: OwnedHandle,
+        list: AttributeList,
+    }
+
+    impl Handed {
+        fn output(file: BorrowedHandle<'_>) -> io::Result<Self> {
+            let mut copy: HANDLE = std::ptr::null_mut();
+            // SAFETY: the file handle is borrowed for the call, both process handles are this
+            // process's own pseudo-handle, and `copy` is a live out parameter.
+            let duplicated = unsafe {
+                DuplicateHandle(
+                    current_process(),
+                    file.as_raw_handle(),
+                    current_process(),
+                    &raw mut copy,
+                    0,
+                    1,
+                    DUPLICATE_SAME_ACCESS,
+                )
+            };
+            if duplicated == 0 || copy.is_null() {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: the call above returned a new handle that nothing else owns.
+            let handle = unsafe { OwnedHandle::from_raw_handle(copy) };
+            let list = AttributeList::inheriting(handle.as_raw_handle())?;
+            Ok(Self { handle, list })
+        }
+    }
+
+    /// A process attribute list naming the one handle a child inherits.
+    ///
+    /// The list keeps a pointer to the handle's value rather than the value, so the value lives in
+    /// the list's own allocation for as long as the list does.
+    struct AttributeList {
+        buffer: Vec<usize>,
+        handles: Box<[HANDLE; 1]>,
+    }
+
+    impl AttributeList {
+        fn inheriting(handle: HANDLE) -> io::Result<Self> {
+            let mut size = 0_usize;
+            // SAFETY: a null list with a zero size asks for the size, which is all this call is
+            // for; its expected failure is ignored.
+            let _ = unsafe {
+                InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &raw mut size)
+            };
+            if size == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let mut list = Self {
+                buffer: vec![0_usize; size.div_ceil(std::mem::size_of::<usize>())],
+                handles: Box::new([handle]),
+            };
+            // SAFETY: the buffer holds at least `size` bytes, aligned for the list, and `size`
+            // says so.
+            let initialised = unsafe {
+                InitializeProcThreadAttributeList(list.as_pointer(), 1, 0, &raw mut size)
+            };
+            if initialised == 0 {
+                // Nothing was initialised, so the list must not be deleted either.
+                let error = io::Error::last_os_error();
+                list.buffer = Vec::new();
+                return Err(error);
+            }
+            // SAFETY: the list was initialised for one attribute, and the handle array it points
+            // at is boxed with it and lives exactly as long as it does.
+            let updated = unsafe {
+                UpdateProcThreadAttribute(
+                    list.as_pointer(),
+                    0,
+                    PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+                    list.handles.as_ptr().cast(),
+                    std::mem::size_of::<[HANDLE; 1]>(),
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                )
+            };
+            if updated == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(list)
+        }
+
+        /// The list, for a call that changes it.
+        fn as_pointer(&mut self) -> LPPROC_THREAD_ATTRIBUTE_LIST {
+            self.buffer.as_mut_ptr().cast()
+        }
+
+        /// The list, for the create, which only reads it.
+        fn pointer(&self) -> LPPROC_THREAD_ATTRIBUTE_LIST {
+            self.buffer.as_ptr().cast_mut().cast()
+        }
+    }
+
+    impl Drop for AttributeList {
+        fn drop(&mut self) {
+            if !self.buffer.is_empty() {
+                // SAFETY: the list was initialised in this buffer and is deleted exactly once.
+                unsafe { DeleteProcThreadAttributeList(self.as_pointer()) };
             }
         }
     }

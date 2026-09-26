@@ -1825,6 +1825,11 @@ mod launching {
             "--state-dir".into(),
             state_root.as_os_str().to_owned(),
         ]);
+        // What the daemon writes goes to the environment's log, as it does wherever a start runs
+        // the daemon. A log that is not a regular file of this user's alone is not written
+        // through: the daemon then runs with nothing to write to, and the command that asked for
+        // it has already said what is wrong with the log.
+        let log = starter::open_log(&environment.state_dir().join(super::DAEMON_LOG)).ok();
         // The admission point: the deadline is read again right before anything is created.
         if !taken.admits(&boot, kr_ipc::clock::boot_elapsed_ms()) {
             return StarterExit::Done;
@@ -1835,7 +1840,7 @@ mod launching {
             directory: environment.state_dir(),
             environment: &[],
             session,
-            output: None,
+            output: log.as_ref().map(std::os::windows::io::AsHandle::as_handle),
         }) {
             Ok(_) => StarterExit::Done,
             Err(_) => StarterExit::Refused,
