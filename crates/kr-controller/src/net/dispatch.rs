@@ -4582,6 +4582,7 @@ mod write_boundary {
     use kr_protocol::scalars::{DurationMs, Nullable};
 
     use kr_protocol::method::Method;
+    use kr_protocol::rights::ActionRight;
 
     use super::{Authorisation, FrameSink, RelayGrant, Relaying, RemoteOutput, Written};
     use crate::grants::organisation::testing::TestOrganisation;
@@ -5398,10 +5399,11 @@ mod write_boundary {
     }
 
     /// A frame gate reads one snapshot of each bound, and never waits for the writer publishing the
-    /// next. With a lease's renewal stopped after its snapshot is built and before the swap, the gate
-    /// reads the snapshot in force, which has ended; stopped after the swap, it reads the renewal. The
-    /// writer holds the policy's lock throughout, and the store is held with every write made to
-    /// wait an hour for it, so a gate that took the lock or called the store could not answer.
+    /// next. With a lease's renewal stopped after its snapshot is built and before the swap, and the
+    /// first lease's end passed meanwhile, the gate reads the snapshot in force, which has ended;
+    /// stopped after the swap, it reads the renewal, which continues the lease's run. The writer
+    /// holds the policy's lock throughout, and the store is held with every write made to wait an
+    /// hour for it, so a gate that took the lock or called the store could not answer.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_frame_gate_reads_one_snapshot_and_never_waits_for_its_writer() {
         let temp = kr_ipc::testing::TempHost::create();
@@ -5415,8 +5417,8 @@ mod write_boundary {
             "the lease holds"
         );
 
-        // Past the lease's end on the continuous clock, a renewal is presented.
-        continuous.advance(Duration::from_secs(15 * 60));
+        // A minute on, while the lease holds, a renewal is presented: it ends a minute later.
+        continuous.advance(Duration::from_secs(60));
         let (built, stopped) = std::sync::mpsc::channel();
         let (swap, swapping) = std::sync::mpsc::channel::<()>();
         let (swapped, swap_seen) = std::sync::mpsc::channel();
@@ -5433,12 +5435,20 @@ mod write_boundary {
                     let _ = swapped.send(());
                     let _ = finishing.recv();
                 });
-                super::super::tests::renew_member(&controller, &organisation, &grant, now + 1_000)
+                super::super::tests::renew_member(
+                    &controller,
+                    &organisation,
+                    &grant,
+                    now + 1_000,
+                    &[ActionRight::SessionView],
+                )
             })
         };
         stopped
             .recv_timeout(WAIT_BOUND)
             .expect("the renewal built its snapshot");
+        // Past the first lease's end and inside the renewal's, with the renewal not yet swapped in.
+        continuous.advance(Duration::from_secs(14 * 60 + 30));
         controller
             .sharing()
             .grants()
@@ -5491,9 +5501,15 @@ mod write_boundary {
             let under = asked.decision.bounds();
             if renewed {
                 continuous.advance(Duration::from_secs(60));
-                super::super::tests::renew_member(&controller, &organisation, &grant, now + 60_000)
-                    .expect("written down")
-                    .expect("the renewal installs");
+                super::super::tests::renew_member(
+                    &controller,
+                    &organisation,
+                    &grant,
+                    now + 60_000,
+                    &[ActionRight::SessionView],
+                )
+                .expect("written down")
+                .expect("the renewal installs");
             }
             let stream = HeldStream::new(false);
             let output = output(&controller, &stream);
@@ -5596,6 +5612,7 @@ mod write_boundary {
                         held.continuous_deadline,
                         held.utc_deadline_ms.map(|end| end + 60_000),
                         false,
+                        true,
                     );
                 }
                 stream.writer.add_permits(1);
@@ -5720,6 +5737,96 @@ mod write_boundary {
                 other => panic!("not an answer: {other:?}"),
             }
             drop(controller);
+        }
+    }
+
+    /// A response decided under a lease that has ended is never written under a lease installed
+    /// after that end, which is a new run of the device's lease and can grant less: installed after
+    /// the end, a replacement that drops the right the response needed is not a narrowing the host
+    /// fences, so the response is decided again, and refused, instead. The control: a renewal
+    /// installed while the lease held continues its run and lets the response go.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_response_is_not_written_under_a_lease_installed_after_its_own_ended() {
+        for renewed_in_time in [false, true] {
+            let temp = kr_ipc::testing::TempHost::create();
+            let (continuous, wall, clocks) = super::super::tests::manual_clocks();
+            let controller = super::super::tests::daemon_on(&temp, clocks).await;
+            let now = wall.load(Ordering::SeqCst);
+            let (organisation, grant, _connection, _asked) = member(&controller, 0x47, now);
+            let recording = Arc::new(Recording::default());
+            let connection = super::RemoteConnection::for_test_writing_to(
+                &controller,
+                record_for(&grant),
+                Box::new(Arc::clone(&recording)),
+            );
+            let answered = connection
+                .answer(ControlFrame::Request(listing(1)))
+                .await
+                .expect("an answer");
+            if renewed_in_time {
+                continuous.advance(Duration::from_secs(60));
+                super::super::tests::renew_member(
+                    &controller,
+                    &organisation,
+                    &grant,
+                    now + 60_000,
+                    &[ActionRight::SessionView],
+                )
+                .expect("written down")
+                .expect("the renewal installs");
+                continuous.advance(Duration::from_secs(14 * 60 + 30));
+            } else {
+                continuous.advance(Duration::from_secs(15 * 60 + 30));
+                super::super::tests::renew_member(
+                    &controller,
+                    &organisation,
+                    &grant,
+                    now + 60_000,
+                    &[],
+                )
+                .expect("written down")
+                .expect("the replacement installs");
+            }
+            assert!(
+                connection.write_answer(answered).await,
+                "the connection stands"
+            );
+            let written = recording.frames();
+            assert_eq!(written.len(), 1, "one answer");
+            match &written[0] {
+                ControlFrame::Response(kr_protocol::envelope::Response {
+                    outcome: kr_protocol::envelope::Outcome::Error(refusal),
+                    ..
+                }) => assert!(
+                    !renewed_in_time && refusal.message.contains("session.view"),
+                    "refused as the replacement decides: {refusal:?}"
+                ),
+                ControlFrame::Response(kr_protocol::envelope::Response {
+                    outcome: kr_protocol::envelope::Outcome::Ok(_),
+                    ..
+                }) => assert!(
+                    renewed_in_time,
+                    "the listing went under a lease installed after its own ended"
+                ),
+                other => panic!("not an answer: {other:?}"),
+            }
+            drop(controller);
+        }
+    }
+
+    /// A session listing asked by a paired device.
+    fn listing(request_id: u64) -> kr_protocol::envelope::Request {
+        kr_protocol::envelope::Request {
+            request_id: kr_protocol::ids::RequestId::new(request_id),
+            method: Method::SessionList.into(),
+            method_version: kr_protocol::method::MethodVersion::V1,
+            params: kr_protocol::envelope::ParamsValue::from_typed(
+                &kr_protocol::session::SessionListParams {
+                    environment_id: Nullable::null(),
+                    include_closed: false,
+                },
+            )
+            .expect("encodes"),
         }
     }
 }

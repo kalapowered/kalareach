@@ -1211,6 +1211,8 @@ impl Controller {
                 policy.offline_cell(),
                 policy.offline_validity(),
                 offline_anchor,
+                clock.now(),
+                utc_floor.get(),
             );
         }
         // The automation service carries out its change-set nodes through the change-set service,
@@ -2685,7 +2687,13 @@ impl Controller {
         // The time bounds the written policy states, published under its lock before it is put in
         // force, so a reader that loads a cell sees what the policy it could read says.
         candidate.publish_leases(&held);
-        net::publish_offline_bound(candidate.offline_cell(), candidate.offline_validity(), next);
+        net::publish_offline_bound(
+            candidate.offline_cell(),
+            candidate.offline_validity(),
+            next,
+            self.clock.now(),
+            self.settled_utc_now(),
+        );
         *held = candidate;
         *anchor = next;
         // Published with the policy, under its lock, so a decision that reads this epoch reads the

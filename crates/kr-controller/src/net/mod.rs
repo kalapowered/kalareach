@@ -773,31 +773,38 @@ impl OfflineAnchor {
 ///
 /// A bound that has synchronised with no anchor for that synchronisation is shown ended, because
 /// nothing shows it holding, and one that has never synchronised is outside its bound from the
-/// moment it is chosen. With no bound chosen, the cell states no end. Called under the host
-/// policy's lock, with the anchor the policy is measured from.
+/// moment it is chosen. With no bound chosen, the cell states no end. A synchronisation made while
+/// the bound held that ends it no earlier continues its run; anything else starts a new one, so a
+/// response decided before a lapse is never written after a synchronisation that followed it.
+/// Called under the host policy's lock, with the anchor the policy is measured from, at `now` on
+/// the continuous clock and `utc_ms`, this host's reading of UTC through its floor.
 pub(crate) fn publish_offline_bound(
     cell: &crate::grants::policy::BoundCell,
     offline: Option<&kr_protocol::sharing::OfflineValidityPolicy>,
     anchor: Option<OfflineAnchor>,
+    now: ContinuousInstant,
+    utc_ms: u64,
 ) {
     use crate::grants::policy::BoundIdentity;
 
+    let current = cell.load();
     let Some(offline) = offline else {
-        cell.publish(BoundIdentity::Unbounded, None, None, false);
+        cell.publish(BoundIdentity::Unbounded, None, None, false, false);
         return;
     };
     let synchronised_at_ms = offline.last_synchronised_at_ms.as_ref().map(|at| at.get());
     let utc_end = crate::grants::policy::offline_utc_end(offline);
     let identity = BoundIdentity::Offline { synchronised_at_ms };
-    match (synchronised_at_ms, anchor) {
-        (Some(at), Some(anchor)) if anchor.synchronised_at_ms == at => cell.publish(
-            identity,
-            anchor.until(offline.maximum_offline_ms.get()),
-            utc_end,
-            false,
-        ),
-        _ => cell.publish(identity, None, utc_end, true),
-    }
+    let (continuous_end, ended) = match (synchronised_at_ms, anchor) {
+        (Some(at), Some(anchor)) if anchor.synchronised_at_ms == at => {
+            (anchor.until(offline.maximum_offline_ms.get()), false)
+        }
+        _ => (None, true),
+    };
+    let continues = !ended
+        && matches!(current.identity, BoundIdentity::Offline { .. })
+        && current.continued_by(continuous_end, utc_end, now, utc_ms);
+    cell.publish(identity, continuous_end, utc_end, ended, continues);
 }
 
 /// Where an offline anchor's readings come from, and where it is written down.
@@ -2630,13 +2637,42 @@ pub(crate) mod tests {
         drop(restarted);
     }
 
-    /// Presents a renewal for the member device of `grant` in `organisation`, issued at `issued_ms`
-    /// and read at the same moment, and writes the policy holding it down.
+    /// A synchronisation made while the offline bound holds continues its run in the cell, so a
+    /// response decided before it may be written after it; one made after the bound lapsed starts
+    /// a new run, so nothing decided before the lapse is written after it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_offline_cell_continues_its_run_only_while_the_bound_holds() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let (continuous, wall, clocks) = manual_clocks();
+        let synchronised = wall.load(std::sync::atomic::Ordering::SeqCst);
+        let controller = daemon_on(&temp, clocks).await;
+        choose_offline_bound(&controller, synchronised, 60_000);
+        let first = controller.policy().offline_cell().load();
+
+        // Synchronised again while the bound holds.
+        continuous.advance(std::time::Duration::from_secs(10));
+        choose_offline_bound(&controller, synchronised + 10_000, 60_000);
+        let renewed = controller.policy().offline_cell().load();
+        assert_ne!(renewed.version, first.version);
+        assert_eq!(renewed.lineage, first.lineage, "the run continues");
+
+        // Synchronised again only after the bound ran out on the continuous clock.
+        continuous.advance(std::time::Duration::from_secs(120));
+        choose_offline_bound(&controller, synchronised + 130_000, 60_000);
+        let after = controller.policy().offline_cell().load();
+        assert_ne!(after.lineage, renewed.lineage, "a new run starts");
+        drop(controller);
+    }
+
+    /// Presents a lease granting at most `rights` for the member device of `grant` in
+    /// `organisation`, issued at `issued_ms` and read at the same moment, and writes the policy
+    /// holding it down.
     pub(super) fn renew_member(
         controller: &Controller,
         organisation: &crate::grants::organisation::testing::TestOrganisation,
         grant: &Grant,
         issued_ms: u64,
+        rights: &[ActionRight],
     ) -> crate::error::Result<
         std::result::Result<
             crate::grants::organisation::LeaseInstalled,
@@ -2648,12 +2684,7 @@ pub(crate) mod tests {
             .enrolment(organisation.organisation_id)
             .and_then(|enrolment| enrolment.binding(grant.recipient_device_id).cloned())
             .expect("the device is bound");
-        let lease = organisation.lease(
-            &binding.account_id,
-            binding.device_key,
-            issued_ms,
-            &[ActionRight::SessionView],
-        );
+        let lease = organisation.lease(&binding.account_id, binding.device_key, issued_ms, rights);
         controller.update_policy(|policy| {
             policy.install_lease(crate::grants::organisation::LeasePresentation {
                 lease: &lease,

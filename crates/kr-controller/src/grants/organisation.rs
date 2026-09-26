@@ -208,6 +208,9 @@ pub struct InstalledLease {
     digest: Digest256,
     continuous_deadline: ContinuousInstant,
     cell: Arc<BoundCell>,
+    /// Whether it renewed the lease before it while that lease was in force, narrowing nothing,
+    /// and so continues its run in the cell ([`super::policy::BoundSnapshot::lineage`]).
+    continues: bool,
 }
 
 impl PartialEq for InstalledLease {
@@ -216,6 +219,7 @@ impl PartialEq for InstalledLease {
             && self.digest == other.digest
             && self.continuous_deadline == other.continuous_deadline
             && Arc::ptr_eq(&self.cell, &other.cell)
+            && self.continues == other.continues
     }
 }
 
@@ -278,6 +282,7 @@ impl InstalledLease {
             Some(self.continuous_deadline),
             Some(self.lease.payload.expires_at_ms.get()),
             false,
+            self.continues,
         );
     }
 }
@@ -975,6 +980,10 @@ pub(crate) fn install(
         Some(installed) if !narrowed => own_deadline.max(installed.continuous_deadline),
         _ => own_deadline,
     };
+    // A renewal of a lease still in force that narrows nothing continues its run: what was decided
+    // under the lease before it may be written under this one. After the earlier lease ended, or
+    // when this one narrows it, a new run starts.
+    let continues = live.is_some() && !narrowed;
 
     records.insert(
         holder,
@@ -1005,6 +1014,7 @@ pub(crate) fn install(
             digest,
             continuous_deadline,
             cell,
+            continues,
         },
     );
     if binds {

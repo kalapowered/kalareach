@@ -86,6 +86,11 @@ pub enum BoundIdentity {
 pub struct BoundSnapshot {
     /// Which publication of its cell this is. Versions only rise, across every cell of this host.
     pub version: u64,
+    /// Which unbroken run of the bound this is. A renewal published while the bound held, and
+    /// narrowing nothing, continues its run; anything else starts a new one: a bound
+    /// re-established after it ended, a narrowing, a first installation. A response decided
+    /// under one run is never written under another.
+    pub lineage: u64,
     /// The bound it is of.
     pub identity: BoundIdentity,
     /// When it ends on the continuous clock, when it does.
@@ -114,6 +119,21 @@ impl BoundSnapshot {
                 .is_some_and(|deadline| utc_ms >= deadline)
     }
 
+    /// Whether a snapshot ending at `next_continuous` and `next_utc_ms` would continue this one's
+    /// run at these readings: this one still holds, and the next ends no earlier on either clock.
+    #[must_use]
+    pub fn continued_by(
+        &self,
+        next_continuous: Option<ContinuousInstant>,
+        next_utc_ms: Option<u64>,
+        now: ContinuousInstant,
+        utc_ms: u64,
+    ) -> bool {
+        !self.ended_at(now, utc_ms)
+            && ends_no_earlier(self.continuous_deadline, next_continuous)
+            && ends_no_earlier(self.utc_deadline_ms, next_utc_ms)
+    }
+
     /// Whether it has ended on the continuous clock at `now`, whatever UTC says: the half no
     /// wall clock can move.
     #[must_use]
@@ -131,8 +151,20 @@ impl BoundSnapshot {
     }
 }
 
+/// Whether an end at `next` is no earlier than one at `current`, where no end is later than any.
+fn ends_no_earlier<T: Ord>(current: Option<T>, next: Option<T>) -> bool {
+    match (current, next) {
+        (_, None) => true,
+        (None, Some(_)) => false,
+        (Some(current), Some(next)) => next >= current,
+    }
+}
+
 /// The versions every cell's snapshots are numbered from.
 static BOUND_VERSIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// The lineages every cell's runs are numbered from.
+static BOUND_LINEAGES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// One time bound's cell: the snapshot in force, published whole through one atomic pointer.
 ///
@@ -154,6 +186,7 @@ impl BoundCell {
     ) -> Arc<Self> {
         Arc::new(Self(arc_swap::ArcSwap::from_pointee(BoundSnapshot {
             version: BOUND_VERSIONS.fetch_add(1, Ordering::SeqCst),
+            lineage: BOUND_LINEAGES.fetch_add(1, Ordering::SeqCst),
             identity,
             continuous_deadline,
             utc_deadline_ms,
@@ -168,26 +201,36 @@ impl BoundCell {
     }
 
     /// Publishes a new snapshot stating `identity`, its deadlines and whether it has ended, unless
-    /// the one in force already states exactly that. Called under the host policy's lock.
+    /// the one in force already states exactly that. It continues the run of the snapshot in force
+    /// when `continues`, and starts a new one otherwise ([`BoundSnapshot::lineage`]). Called under
+    /// the host policy's lock.
     pub(crate) fn publish(
         &self,
         identity: BoundIdentity,
         continuous_deadline: Option<ContinuousInstant>,
         utc_deadline_ms: Option<u64>,
         ended: bool,
+        continues: bool,
     ) {
+        let current = self.0.load();
         let next = BoundSnapshot {
             version: 0,
+            lineage: 0,
             identity,
             continuous_deadline,
             utc_deadline_ms,
             ended,
         };
-        if self.0.load().states(&next) {
+        if current.states(&next) {
             return;
         }
         let next = Arc::new(BoundSnapshot {
             version: BOUND_VERSIONS.fetch_add(1, Ordering::SeqCst),
+            lineage: if continues {
+                current.lineage
+            } else {
+                BOUND_LINEAGES.fetch_add(1, Ordering::SeqCst)
+            },
             ..next
         });
         #[cfg(test)]
@@ -204,6 +247,7 @@ impl BoundCell {
             current.identity,
             current.continuous_deadline,
             current.utc_deadline_ms,
+            true,
             true,
         );
     }
@@ -251,11 +295,17 @@ impl HeldBound {
         self.snapshot.utc_deadline_ms
     }
 
-    /// Whether the bound, as its cell publishes it now, still holds at these readings: what a
-    /// response is written under.
+    /// Whether the bound, as its cell publishes it now, still holds at these readings, in the run
+    /// the decision was taken in: what a response is written under. A renewal published while the
+    /// bound held lets the response go on its later deadlines; a bound that ended, or was narrowed,
+    /// and was then established again is another run, and the response is decided again under it.
     #[must_use]
     pub fn stands_at(&self, now: ContinuousInstant, utc_ms: u64) -> Stands {
-        judged(&self.cell.load(), now, utc_ms)
+        let current = self.cell.load();
+        if current.lineage != self.snapshot.lineage {
+            return Stands::Moved;
+        }
+        judged(&current, now, utc_ms)
     }
 
     /// Whether the cell still publishes the snapshot the decision was taken under, and it still
@@ -1082,7 +1132,7 @@ impl HostPolicy {
         match self.offline.as_ref() {
             None => self
                 .offline_cell
-                .publish(BoundIdentity::Unbounded, None, None, false),
+                .publish(BoundIdentity::Unbounded, None, None, false, false),
             Some(offline) => {
                 let synchronised_at_ms =
                     offline.last_synchronised_at_ms.as_ref().map(|at| at.get());
@@ -1091,6 +1141,7 @@ impl HostPolicy {
                     None,
                     offline_utc_end(offline),
                     synchronised_at_ms.is_none(),
+                    false,
                 );
             }
         }
@@ -1570,7 +1621,7 @@ mod one_snapshot_of_each_bound {
         let publishing_to = Arc::clone(&cell);
         let identity = loaded.identity;
         publishing::stop_after_a_load(move || {
-            publishing_to.publish(identity, Some(earlier), Some(utc + 60_000), false);
+            publishing_to.publish(identity, Some(earlier), Some(utc + 60_000), false, false);
         });
 
         let decided = leased.decide(NOW_MS).expect("the lease answers");
@@ -1624,7 +1675,7 @@ mod one_snapshot_of_each_bound {
         let identity = loaded.identity;
         let utc = loaded.utc_deadline_ms;
         publishing::stop_after_a_load(move || {
-            publishing_to.publish(identity, Some(renewed), utc, false);
+            publishing_to.publish(identity, Some(renewed), utc, false, true);
         });
 
         assert_eq!(

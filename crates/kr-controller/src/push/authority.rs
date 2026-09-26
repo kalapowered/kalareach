@@ -38,6 +38,10 @@ pub struct GrantedRecipients {
     /// Every grant's anchor in this boot, with the clocks a grant and a membership lease are both
     /// decided on.
     lifetimes: Arc<GrantLifetimes>,
+    /// Where this host's own tests stop a question once the grant's standing has been read and
+    /// before the policy's lock is taken. Compiled away in every shipped build.
+    #[cfg(test)]
+    before_the_policy_lock: crate::attention::Pause,
 }
 
 impl std::fmt::Debug for GrantedRecipients {
@@ -65,6 +69,8 @@ impl GrantedRecipients {
             policy,
             environment_id,
             lifetimes,
+            #[cfg(test)]
+            before_the_policy_lock: crate::attention::Pause::default(),
         }
     }
 
@@ -127,11 +133,23 @@ impl RecipientAuthority for GrantedRecipients {
         {
             return None;
         }
+        // The grant's anchor in this boot, which the question above took or read back, so what
+        // follows reads no store.
+        let anchored = self.lifetimes.stored(self.sharing.grants(), &record).ok()?;
         let grant = &record.grant;
+        #[cfg(test)]
+        self.before_the_policy_lock.wait();
         // The policy as it stands now, decided under its lock and after every read of a store
         // above. A copy taken earlier could hold a lease its cell no longer states, and the rights
         // a decision takes have to be those of the lease whose time it loads.
         let policy = self.policy.lock().ok()?;
+        // Both of the grant's deadlines again, at readings taken now the lock is held: the grant
+        // can have run out while this waited for it. The policy is decided at the same readings.
+        let now_ms = self.lifetimes.settled_utc_now();
+        let continuous_now = self.lifetimes.continuous_now();
+        if record.state(now_ms) != GrantState::Active || !anchored.holds_at(continuous_now) {
+            return None;
+        }
         if grant.authority_revision.get() > policy.authority_revision().get()
             || !grant.environment_selector.admits(self.environment_id)
         {
@@ -161,7 +179,7 @@ impl RecipientAuthority for GrantedRecipients {
                     claims_geometry: false,
                     own_subject: None,
                     now_ms,
-                    continuous_now: self.lifetimes.continuous_now(),
+                    continuous_now,
                 },
                 now_ms,
             )
@@ -260,6 +278,56 @@ mod tests {
             Arc::new(kr_transport::clock::ManualClock::new()),
             || NOW,
         )
+    }
+
+    /// A grant that runs out while its question waits for the policy's lock admits nothing: both of
+    /// its deadlines are read again once the lock is held, on UTC and on the continuous clock alike.
+    /// The control: with the clocks left where they were, the question admits its recipient.
+    #[test]
+    fn a_grant_that_runs_out_while_its_question_waits_for_the_lock_admits_nothing() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        for runs_out in [None, Some("in UTC"), Some("on the continuous clock")] {
+            let sharing = Arc::new(SharingService::in_memory(host()).expect("a store"));
+            let mut expiring = grant(13, SessionSelector::Any, &[ActionRight::SessionView]);
+            expiring.expiry = GrantExpiry::At {
+                expires_at_ms: kr_protocol::scalars::TimestampMs::new(NOW + 1_000),
+            };
+            issued(&sharing, expiring, true);
+            let wall = Arc::new(AtomicU64::new(NOW));
+            let continuous = kr_transport::clock::ManualClock::new();
+            let recipients = Arc::new(GrantedRecipients::at(
+                Arc::clone(&sharing),
+                personal(),
+                environment(),
+                Arc::new(continuous.clone()),
+                {
+                    let wall = Arc::clone(&wall);
+                    move || wall.load(Ordering::SeqCst)
+                },
+            ));
+            let (arrived, go) = recipients.before_the_policy_lock.arm();
+            let asking = {
+                let recipients = Arc::clone(&recipients);
+                std::thread::spawn(move || recipients.scope_for(&rule(Some(13))))
+            };
+            arrived
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .expect("the question read the grant's standing and reached the lock");
+            match runs_out {
+                Some("in UTC") => wall.store(NOW + 1_000, Ordering::SeqCst),
+                Some(_) => continuous.advance(std::time::Duration::from_millis(1_000)),
+                None => {}
+            }
+            go.send(()).expect("the question waits");
+            let scope = asking.join().expect("the question ends");
+            assert_eq!(
+                scope.is_some(),
+                runs_out.is_none(),
+                "run out {}",
+                runs_out.unwrap_or("nowhere")
+            );
+        }
     }
 
     #[test]
