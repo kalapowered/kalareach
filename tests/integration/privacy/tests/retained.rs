@@ -29,7 +29,7 @@ use kr_client::services::StorageService as _;
 use kr_client::services::SyncBackupService;
 use kr_client::services::relay::{ServiceHttp, ServiceSigner};
 use kr_client::services::storage::{
-    BackupState, ManagedStorageService, NewUpload, RetentionChange, upload_parts,
+    BackupState, ManagedStorageService, NewUpload, RetentionAnswer, RetentionChange, upload_parts,
 };
 use kr_client::services::sync::ManagedSyncService;
 use kr_client::sync::{
@@ -195,14 +195,18 @@ async fn kr_req_24_29_what_is_at_the_services_stays_until_its_own_authorised_act
     )
     .presenting(owner.tokens());
     let status = storage.status().await.expect("the storage status");
-    storage
+    let answer = storage
         .set_retention(&RetentionChange {
             backup: BackupState::On,
             daily_snapshots: None,
             expected_revision: status.retention_revision,
         })
         .await
-        .expect("backup storage on");
+        .expect("an answer to the retention change");
+    assert!(
+        matches!(answer, RetentionAnswer::Done(set) if set.backup == BackupState::On),
+        "backup storage on: {answer:?}"
+    );
     let a = one_collection(&storage).await;
     let b = one_collection(&storage).await;
     kept(&stack, &owner, a).await;
