@@ -246,3 +246,109 @@ impl Grant {
             && (parent.organisation.0.is_none() || self.organisation == parent.organisation)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::HistoryScope;
+    use crate::scalars::{CanonicalSet, Nullable, TimestampMs};
+
+    /// A scope reaching back to 2 000 ms that names nothing, as a build that named approvals by
+    /// upstream text encoded it. An empty set has the same bytes whatever its element is, so every
+    /// row and message that names nothing keeps its bytes.
+    const UNNAMED: &str = concat!(
+        "a4",
+        "6e6c6f7765725f626f756e645f6d73",
+        "1907d0",
+        "6f6e616d65645f617070726f76616c73",
+        "80",
+        "6f6e616d65645f7175657374696f6e73",
+        "80",
+        "73696e636c7564655f6c6976655f73637265656e",
+        "f4",
+    );
+
+    /// The same scope naming two approvals by the broker's resource identity: a set of two
+    /// 16-byte strings.
+    const NAMED: &str = concat!(
+        "a4",
+        "6e6c6f7765725f626f756e645f6d73",
+        "1907d0",
+        "6f6e616d65645f617070726f76616c73",
+        "82",
+        "5011111111111111111111111111111111",
+        "5022222222222222222222222222222222",
+        "6f6e616d65645f7175657374696f6e73",
+        "80",
+        "73696e636c7564655f6c6976655f73637265656e",
+        "f4",
+    );
+
+    /// The same scope naming one approval by an upstream's text identifier, `1`, which is what a
+    /// set of that earlier element held.
+    const NAMED_BY_TEXT: &str = concat!(
+        "a4",
+        "6e6c6f7765725f626f756e645f6d73",
+        "1907d0",
+        "6f6e616d65645f617070726f76616c73",
+        "81",
+        "6131",
+        "6f6e616d65645f7175657374696f6e73",
+        "80",
+        "73696e636c7564655f6c6976655f73637265656e",
+        "f4",
+    );
+
+    fn decode(text: &str) -> kr_cbor::Result<HistoryScope> {
+        kr_cbor::from_canonical_slice(
+            &hex::decode(text).expect("hexadecimal"),
+            &kr_cbor::Limits::DEFAULT,
+        )
+    }
+
+    fn encode(scope: &HistoryScope) -> String {
+        hex::encode(kr_cbor::to_canonical_vec(scope).expect("encodes"))
+    }
+
+    #[test]
+    fn a_scope_that_names_nothing_keeps_the_bytes_an_earlier_build_wrote() {
+        let scope = HistoryScope {
+            lower_bound_ms: Nullable::some(TimestampMs::new(2_000)),
+            include_live_screen: false,
+            named_questions: CanonicalSet::new(),
+            named_approvals: CanonicalSet::new(),
+        };
+        assert_eq!(encode(&scope), UNNAMED);
+        assert_eq!(decode(UNNAMED).expect("reads what it wrote"), scope);
+    }
+
+    #[test]
+    fn a_scope_names_each_approval_by_its_resource_as_a_16_byte_string() {
+        let named = decode(NAMED);
+        assert!(
+            named.is_ok(),
+            "each named approval is a 16-byte resource identity: {named:?}"
+        );
+        let named = named.expect("decoded above");
+        assert_eq!(encode(&named), NAMED);
+        // In JSON a resource identity is its canonical hyphenated text, and the scope reads back.
+        let json = serde_json::to_value(&named).expect("JSON");
+        assert_eq!(
+            json["named_approvals"],
+            serde_json::json!([
+                "11111111-1111-1111-1111-111111111111",
+                "22222222-2222-2222-2222-222222222222",
+            ])
+        );
+        let back: HistoryScope = serde_json::from_value(json).expect("reads its JSON back");
+        assert_eq!(back, named);
+    }
+
+    #[test]
+    fn a_scope_that_names_an_approval_by_upstream_text_is_refused() {
+        let refused = decode(NAMED_BY_TEXT);
+        assert!(
+            refused.is_err(),
+            "an upstream's text names no resource of this host: {refused:?}"
+        );
+    }
+}
