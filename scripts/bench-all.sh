@@ -171,12 +171,15 @@ if [ -z "${KR_TEST_ARTIFACTS_DIR:-}" ]; then
   temporary="${TMPDIR:-/tmp}"
   KR_TEST_ARTIFACTS_DIR="$(mktemp -d "${temporary%/}/kalareach-bench.XXXXXX")" || exit 1
 fi
-export KR_TEST_ARTIFACTS_DIR
-evidence="$KR_TEST_ARTIFACTS_DIR"
-if ! mkdir -p "$evidence" || [ ! -w "$evidence" ]; then
-  echo "bench-all: the evidence directory $evidence cannot be written" >&2
+if ! mkdir -p "$KR_TEST_ARTIFACTS_DIR" || [ ! -w "$KR_TEST_ARTIFACTS_DIR" ]; then
+  echo "bench-all: the evidence directory $KR_TEST_ARTIFACTS_DIR cannot be written" >&2
   exit 1
 fi
+# Absolute, because each suite runs in its own package's directory and would read a relative path
+# as a directory of its own.
+evidence="$(cd "$KR_TEST_ARTIFACTS_DIR" && pwd)"
+KR_TEST_ARTIFACTS_DIR="$evidence"
+export KR_TEST_ARTIFACTS_DIR
 record="$evidence/bench-all.md"
 temporary="${TMPDIR:-/tmp}"
 work="$(mktemp -d "${temporary%/}/kalareach-bench-work.XXXXXX")" || exit 1
@@ -392,8 +395,13 @@ if selected reconnect; then
     "outcome           $(outcome_of reconnect)"
 fi
 if selected companion; then
-  run_step companion "" pnpm -C apps/companion exec vitest run test/performance.test.tsx
-  figures="$(sed -n 's/^KR-PERF-008 //p' "$evidence/companion.log")"
+  run_step companion "" env NO_COLOR=1 FORCE_COLOR=0 pnpm -C apps/companion exec vitest run \
+    test/performance.test.tsx
+  # The test prints each figure on a line of its own; any colour the runner still adds is taken off
+  # before the line is read.
+  escape="$(printf '\033')"
+  figures="$(sed "s/${escape}\[[0-9;]*[A-Za-z]//g" "$evidence/companion.log" |
+    sed -n 's/^KR-PERF-008 //p')"
   if [ -n "$figures" ]; then
     {
       printf '## %s\n\n' "KR-PERF-008 the companion's semantic display"
