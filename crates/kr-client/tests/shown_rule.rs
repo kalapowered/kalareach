@@ -503,12 +503,25 @@ fn gives_removal(contents: &[Located]) -> bool {
         })
 }
 
-/// Whether the inline module whose `{` is at `open` has a `cfg` this reading cannot decide among
-/// the inner attributes that open it, which can leave the whole module out.
+/// Whether the inline module whose `{` is at `open` has, among the inner attributes that open it,
+/// a `cfg` that need not hold without `test`, or a `cfg_attr` that can give one: either can leave
+/// the whole module out.
 fn opens_conditionally(tokens: &[Located], open: usize) -> bool {
     let mut at = open + 1;
     while punct(tokens.get(at), '#') && punct(tokens.get(at + 1), '!') {
-        if cfg_is_conditional(tokens, at + 2) {
+        let inner = at + 2;
+        let removes = closing(tokens, inner).is_some_and(|close| {
+            let contents = &tokens[inner + 1..close];
+            match ident(contents.first()) {
+                Some("cfg") if punct(contents.get(1), '(') => {
+                    let mut at = 2;
+                    without_test(contents, &mut at) != Truth::True
+                }
+                Some("cfg_attr") if punct(contents.get(1), '(') => gives_removal(contents),
+                _ => false,
+            }
+        });
+        if removes {
             return true;
         }
         at = attribute_end(tokens, at).unwrap_or(tokens.len());
