@@ -501,6 +501,42 @@ fn the_catalogue_check_is_not_applicable_until_a_catalogue_registers_evidence() 
     );
 }
 
+/// What the workers said they would not read or bind is named in the catalogue check as a
+/// warning, its words withheld as the workers' own, whatever the repositories say.
+#[test]
+fn the_catalogue_check_names_what_the_workers_refused_as_a_warning() {
+    #[derive(Debug)]
+    struct Refused;
+    impl catalogue::CatalogueEvidence for Refused {
+        fn repositories(&self) -> Vec<catalogue::RepositoryEvidence> {
+            vec![catalogue::RepositoryEvidence {
+                name: "official".to_owned(),
+                generation: 7,
+                metadata_bytes: 1024,
+                metadata_entries: 12,
+                cached_payload_bytes: 2048,
+                capabilities: Vec::new(),
+                detail: "activated".to_owned(),
+                degraded: false,
+            }]
+        }
+
+        fn warnings(&self) -> Vec<String> {
+            vec!["session 1: a package does not pass the package check".to_owned()]
+        }
+    }
+    let check = catalogue::check(Some(&Refused), EnrolmentBudgets::default());
+    assert_eq!(check.status, DoctorStatus::Warning);
+    assert!(
+        check.detail().contains("generation 7") && check.detail().contains("withheld"),
+        "{check:?}"
+    );
+    assert!(
+        !check.detail().contains("package check"),
+        "the workers' words are withheld: {check:?}"
+    );
+}
+
 /// KR-REQ-26.13: a document this build cannot use is never rewritten by an edit.
 #[test]
 fn an_edit_refuses_a_document_at_a_version_this_build_does_not_know() {

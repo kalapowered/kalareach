@@ -9,14 +9,12 @@
 //!   intersected like every other ceiling, and [`budgets`] is what a catalogue client reads to get
 //!   the numbers in force on this host.
 //! * **The shared capability evidence.** "`kr doctor`, launch buttons and disabled-action UI read
-//!   this shared evidence." The doctor's side of that is [`check`], which answers from whatever
-//!   source is registered and answers `NotApplicable` while none is.
+//!   this shared evidence." The doctor's side of that is [`check`], which answers from the evidence
+//!   the catalogue gives when the doctor asks (`crate::catalogue::evidence`).
 //!
-//! Nothing populates either yet, and that is reported rather than hidden: [`check`] says "no
-//! catalogue is synchronised on this host" and claims no evidence. A check that reported a healthy
-//! catalogue because there was nothing to disagree with would be worse than no check.
-
-use std::sync::Arc;
+//! With no repository enrolled [`check`] says "no catalogue is synchronised on this host" and
+//! claims no evidence. A check that reported a healthy catalogue because there was nothing to
+//! disagree with would be worse than no check.
 
 use kr_protocol::desktop::CapabilityRecord;
 use kr_protocol::hostinfo::configuration::EnrolmentBudgets;
@@ -60,10 +58,14 @@ pub struct RepositoryEvidence {
 pub trait CatalogueEvidence: Send + Sync + std::fmt::Debug {
     /// The repositories this host has enrolled, in the order the catalogue lists them.
     fn repositories(&self) -> Vec<RepositoryEvidence>;
-}
 
-/// The evidence source a host holds, when a catalogue has registered one.
-pub type Source = Option<Arc<dyn CatalogueEvidence>>;
+    /// What a person should know beyond the repositories: each package a worker said it would not
+    /// read or bind, with its session and reason, and each set of admissions this host could not
+    /// hand over. The words come from the workers and the catalogue, not from this build.
+    fn warnings(&self) -> Vec<String> {
+        Vec::new()
+    }
+}
 
 /// Returns the enrolment budgets in force on this host.
 ///
@@ -94,7 +96,8 @@ pub fn check(source: Option<&dyn CatalogueEvidence>, budgets: EnrolmentBudgets) 
         );
     };
     let repositories = source.repositories();
-    if repositories.is_empty() {
+    let warnings = source.warnings();
+    if repositories.is_empty() && warnings.is_empty() {
         return DoctorCheck::new(
             CHECK_ID,
             "Catalogue metadata and its capability evidence",
@@ -103,7 +106,8 @@ pub fn check(source: Option<&dyn CatalogueEvidence>, budgets: EnrolmentBudgets) 
             None,
         );
     }
-    let degraded = repositories.iter().any(|repository| repository.degraded);
+    let degraded =
+        !warnings.is_empty() || repositories.iter().any(|repository| repository.degraded);
     // A repository's name and the sentence its synchronisation produced both come from the
     // catalogue rather than from this build, so each one contributes its class and its length. The
     // numbers are this host's own measurements and the budgets are its own configuration.
@@ -131,6 +135,12 @@ pub fn check(source: Option<&dyn CatalogueEvidence>, budgets: EnrolmentBudgets) 
             .stated(" cached payload bytes; ")
             .withheld(ContentClass::Message, &repository.detail);
     }
+    for (index, warning) in warnings.iter().enumerate() {
+        if index > 0 || !repositories.is_empty() {
+            detail = detail.stated("; ");
+        }
+        detail = detail.withheld(ContentClass::Message, warning);
+    }
     DoctorCheck::new(
         CHECK_ID,
         "Catalogue metadata and its capability evidence",
@@ -141,8 +151,9 @@ pub fn check(source: Option<&dyn CatalogueEvidence>, budgets: EnrolmentBudgets) 
         },
         detail,
         degraded.then_some(
-            "A repository that cannot reach its budget keeps its last good generation. \
-             Synchronise it again, or raise its budget in this host's configuration.",
+            "A repository that cannot reach its budget keeps its last good generation, and a \
+             package a worker refused is not used in that session. Synchronise again, raise the \
+             budget in this host's configuration, or install the package again.",
         ),
     )
 }

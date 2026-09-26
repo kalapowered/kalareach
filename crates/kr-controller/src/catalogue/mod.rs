@@ -30,6 +30,7 @@
 
 pub mod admissions;
 pub mod bridge;
+pub mod evidence;
 pub(crate) mod files;
 pub mod native_bridge;
 
@@ -433,6 +434,23 @@ impl CatalogueModule {
     pub async fn admission_revision_within(&self, deadline: tokio::time::Instant) -> Answer<u64> {
         self.read_within(deadline, |catalogue| {
             catalogue.admission_revision().map_err(ProtocolError::from)
+        })
+        .await
+    }
+
+    /// Returns one evidence record per enrolled repository, for the doctor, waiting no later than
+    /// `deadline`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `RESOURCE_UNAVAILABLE` when the catalogue stays busy or the read runs past
+    /// `deadline`, and the refusal the catalogue decided when its records cannot be read.
+    pub async fn evidence_within(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Answer<Vec<crate::config::catalogue::RepositoryEvidence>> {
+        self.read_within(deadline, |catalogue| {
+            evidence::repositories(catalogue).map_err(ProtocolError::from)
         })
         .await
     }

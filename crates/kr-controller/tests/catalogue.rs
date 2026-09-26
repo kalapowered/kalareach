@@ -1682,6 +1682,32 @@ async fn a_stalled_records_read_holds_the_cadence_no_longer_than_its_bound() {
     assert!(host.module.admission_revision_within(later).await.is_ok());
 }
 
+/// The doctor's evidence names each enrolled repository with the generation it activated, its
+/// entries and what its metadata costs.
+#[tokio::test]
+async fn the_doctor_evidence_names_each_enrolled_repository() {
+    let host = host();
+    let before = host
+        .module
+        .evidence_within(tokio::time::Instant::now() + std::time::Duration::from_secs(30))
+        .await
+        .expect("readable");
+    assert!(before.is_empty(), "nothing enrolled: {before:?}");
+    let _ = synchronised(&host).await;
+    let evidence = host
+        .module
+        .evidence_within(tokio::time::Instant::now() + std::time::Duration::from_secs(30))
+        .await
+        .expect("readable");
+    assert_eq!(evidence.len(), 1, "{evidence:?}");
+    let repository = &evidence[0];
+    assert_eq!(repository.name, "development");
+    assert!(repository.generation >= 1, "{repository:?}");
+    assert!(repository.metadata_entries >= 1, "{repository:?}");
+    assert!(repository.metadata_bytes > 0, "{repository:?}");
+    assert!(!repository.degraded, "{repository:?}");
+}
+
 /// Counts the workers gave at one admission revision are shown only while that is the revision
 /// the answer renders: a change committed after the workers answered leaves them unknown.
 #[tokio::test]

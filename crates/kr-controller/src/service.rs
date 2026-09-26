@@ -678,13 +678,6 @@ pub struct Controller {
     /// calls rather than answers, so what belongs to the daemon is the accounting: what was
     /// admitted, what is staged, what has been dispatched and what became of it.
     backup: Arc<crate::backup::BackupService>,
-    /// The catalogue's evidence about itself, once a catalogue has registered some.
-    ///
-    /// Section 11 gives `kr doctor`, launch buttons and disabled-action UI one shared capability
-    /// evidence to read, and this is where the catalogue's half of it arrives. It is empty on a
-    /// host that has never synchronised a catalogue, and the diagnostic says so rather than
-    /// claiming anything about a catalogue this host does not have.
-    catalogue_evidence: Option<Arc<dyn crate::config::catalogue::CatalogueEvidence>>,
     /// The configuration this daemon has put into force.
     ///
     /// A document is a file a person may also edit by hand, and its effects live outside it: the
@@ -1276,7 +1269,6 @@ impl Controller {
             plugin_bridge,
             admissions_due: Arc::new(tokio::sync::Notify::new()),
             admission_notes: std::sync::Mutex::new(Vec::new()),
-            catalogue_evidence: None,
             accepted_configuration: Mutex::new(accepted_configuration),
             in_force: std::sync::Mutex::new(in_force),
             started,
@@ -8265,13 +8257,11 @@ impl Controller {
             crate::config::secret_line(&effective),
             None,
         ));
-        // The shared section 11 capability evidence a catalogue contributes. `NotApplicable` with
-        // the reason stated while nothing has synchronised one, rather than a claim about a
-        // catalogue this host does not have.
-        checks.push(crate::config::catalogue::check(
-            self.catalogue_evidence.as_deref(),
-            budgets,
-        ));
+        // The shared section 11 capability evidence the catalogue contributes, read now.
+        // `NotApplicable` with the reason stated while nothing is enrolled, rather than a claim
+        // about a catalogue this host does not have.
+        let evidence = self.catalogue_evidence().await;
+        checks.push(crate::config::catalogue::check(Some(&evidence), budgets));
         Ok(HostDoctorResult::new(checks, effective))
     }
 

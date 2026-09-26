@@ -54,6 +54,49 @@ impl Controller {
         }
     }
 
+    /// The catalogue's evidence for the doctor: each enrolled repository, each package a worker
+    /// said it would not read or bind, with its session, and each set of admissions this daemon
+    /// could not hand over.
+    pub(crate) async fn catalogue_evidence(&self) -> crate::catalogue::evidence::Evidence {
+        let deadline = tokio::time::Instant::now() + WORKER_EXCHANGE;
+        let mut warnings = Vec::new();
+        let repositories = match self.catalogue.evidence_within(deadline).await {
+            Ok(repositories) => repositories,
+            Err(error) => {
+                warnings.push(format!(
+                    "the catalogue's records could not be read: {}",
+                    error.message
+                ));
+                Vec::new()
+            }
+        };
+        for (session_id, refusal) in self.plugin_bridge.refusals() {
+            warnings.push(format!(
+                "session {session_id} did not use the package {}: {}{}",
+                kr_plugin_sdk::digest::PayloadDigest::from_bytes(
+                    *refusal.package_digest.as_bytes()
+                ),
+                refusal.detail,
+                if refusal.detail_cut {
+                    " (cut short)"
+                } else {
+                    ""
+                }
+            ));
+        }
+        warnings.extend(
+            self.admission_notes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .cloned(),
+        );
+        crate::catalogue::evidence::Evidence {
+            repositories,
+            warnings,
+        }
+    }
+
     /// Records why admissions could not be handed over, for the doctor's catalogue check.
     fn note_admissions(&self, why: String) {
         let mut notes = self
