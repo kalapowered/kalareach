@@ -222,7 +222,7 @@ impl RelayGrant {
             .until
             .is_some_and(|until| controller.clock.now() >= until)
         {
-            controller.owe_offline_time();
+            controller.lifetimes().owe_offline_time();
             return false;
         }
         if let Some(lapses_at_ms) = self.lapses_at_ms {
@@ -260,7 +260,7 @@ fn bounds_hold(
             }
             Stands::EndedOnTheContinuousClock => {
                 if matches!(held.snapshot().identity, BoundIdentity::Offline { .. }) {
-                    controller.owe_offline_time();
+                    controller.lifetimes().owe_offline_time();
                 }
                 return false;
             }

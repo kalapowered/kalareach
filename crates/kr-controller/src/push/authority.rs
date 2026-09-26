@@ -113,9 +113,10 @@ impl GrantedRecipients {
 impl RecipientAuthority for GrantedRecipients {
     /// Every lapse a clock decides here is written down where it is found, before the answer, as a
     /// paired device's and a workflow's are, so a clock wound back before a restart or a reboot
-    /// cannot bring back what was refused: the end of the grant's own bound as its tombstone, and a
-    /// lapse found in UTC, the grant's own or a bound of the policy, as the floor it was found at. A
-    /// write that fails stays owed, and the host's next decision or its record task writes it.
+    /// cannot bring back what was refused: the end of the grant's own bound as its tombstone; a
+    /// lapse found in UTC, the grant's own or a bound of the policy, as the floor it was found at;
+    /// and the offline bound's end on the continuous clock as the time the bound has spent. A write
+    /// that fails stays owed, and the host's next decision or its record task writes it.
     fn scope_for(&self, rule: &DeliveryRule) -> Option<RecipientScope> {
         let grant_id = rule.grant_id?;
         // A store this host cannot read is a grant this host cannot show, and a grant it cannot
@@ -202,17 +203,16 @@ impl RecipientAuthority for GrantedRecipients {
                 return None;
             }
         };
-        drop(policy);
         // The offline bound the intersection loaded is held to its continuous end as well, as a
-        // device's request is: a wall clock wound back does not hold it open. The time it has spent
-        // is written down by the host's record task at every mark.
-        if effective.offline.as_ref().is_some_and(|offline| {
-            offline
-                .snapshot()
-                .ended_on_the_continuous_clock(continuous_now)
-        }) {
+        // device's request is: a wall clock wound back does not hold it open. Run out there, the
+        // time it has spent is written down before this refuses.
+        if self
+            .lifetimes
+            .offline_bound_ended(effective.offline.as_ref(), continuous_now, &policy)
+        {
             return None;
         }
+        drop(policy);
         if !effective.rights.contains(&ActionRight::SessionView) {
             return None;
         }

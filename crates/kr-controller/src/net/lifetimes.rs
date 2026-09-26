@@ -20,6 +20,7 @@
 //! that nothing inside a transaction takes.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -30,9 +31,10 @@ use kr_protocol::scalars::TimestampMs;
 use kr_transport::clock::{ContinuousClock, ContinuousInstant};
 
 use super::devices::{ClockTrust, DeviceDirectory, DeviceRecord, PendingExpiry};
+use super::{AnchorSources, OfflineAnchor};
 use crate::error::{ControllerError, Result};
-use crate::grants::policy::UtcFloor;
-use crate::grants::{GrantDirectory, GrantRecord};
+use crate::grants::policy::{HeldBound, UtcFloor};
+use crate::grants::{GrantDirectory, GrantRecord, HostPolicy};
 
 /// When one grant runs out on the continuous clock.
 #[derive(Clone, Copy, Debug)]
@@ -110,6 +112,19 @@ pub struct GrantLifetimes {
     wall: crate::service::WallClock,
     /// This host's clock floor, which a grant's expiry in UTC is read through.
     floor: Arc<UtcFloor>,
+    /// The time the bounded offline validity has spent, kept on the continuous clock
+    /// ([`OfflineAnchor`]).
+    ///
+    /// Measured in UTC alone, the bound would be lengthened by a wall clock wound back while it
+    /// runs: the floor holds UTC still until the clock catches up. Taken when the policy holding
+    /// the bound is restored, accepted or synchronised, and changed only under the policy's lock.
+    /// It is kept here, beside the grants' own anchors, so every decision that can find the bound
+    /// run out writes down the same time: a paired device's, a workflow's and push's.
+    offline_anchor: Mutex<Option<OfflineAnchor>>,
+    /// True while the time the offline bound has spent is owed its record: a poll found the bound
+    /// run out, or a write of the time failed. The next step that settles the clock floor writes
+    /// it.
+    offline_time_owed: AtomicBool,
 }
 
 impl std::fmt::Debug for GrantLifetimes {
@@ -144,6 +159,8 @@ impl GrantLifetimes {
             clock_trust: Arc::new(ClockTrust::new(wall.clone(), Arc::clone(&floor))),
             wall,
             floor,
+            offline_anchor: Mutex::new(None),
+            offline_time_owed: AtomicBool::new(false),
         }
     }
 
@@ -566,6 +583,89 @@ impl GrantLifetimes {
             )?;
         }
         Ok(remaining)
+    }
+
+    /// The readings and the record an offline anchor on this host is taken from: this host's
+    /// clocks, its boot, its device directory and its floor.
+    pub(crate) fn anchor_sources(&self) -> AnchorSources<'_> {
+        AnchorSources {
+            clock: &*self.clock,
+            boot_clock: &*self.shared_clock,
+            wall_clock: &*self.wall,
+            boot: &self.boot_identity,
+            devices: &self.devices,
+            floor: &self.floor,
+        }
+    }
+
+    /// The anchor the offline bound is measured with now, when the policy in force has one.
+    pub(crate) fn offline_anchor(&self) -> Option<OfflineAnchor> {
+        *self
+            .offline_anchor
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Puts `anchor` in force for the offline bound, with the policy's lock held: the anchor of the
+    /// policy that has just been restored, accepted or synchronised.
+    pub(crate) fn hold_offline_anchor(
+        &self,
+        anchor: Option<OfflineAnchor>,
+        _policy: &MutexGuard<'_, HostPolicy>,
+    ) {
+        *self
+            .offline_anchor
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = anchor;
+    }
+
+    /// Whether the offline bound a decision loaded, `offline`, has run out at `now` on the
+    /// continuous clock, the one clock that cannot be wound back, with the policy's lock held.
+    ///
+    /// The time the bound has spent is written down before this answers that it has, so the
+    /// refusal the caller makes of it stands after a restart or a reboot; a write that fails stays
+    /// owed. Every decision that holds the bound to its continuous end asks here, so none can find
+    /// it run out and leave that time unwritten.
+    pub(crate) fn offline_bound_ended(
+        &self,
+        offline: Option<&HeldBound>,
+        now: ContinuousInstant,
+        policy: &MutexGuard<'_, HostPolicy>,
+    ) -> bool {
+        let ended =
+            offline.is_some_and(|offline| offline.snapshot().ended_on_the_continuous_clock(now));
+        if ended {
+            self.write_offline_time(policy);
+        }
+        ended
+    }
+
+    /// Writes down the time the offline bound has spent by now, with the policy's lock held.
+    ///
+    /// A write that fails leaves the record owed, and the next step that settles the clock floor
+    /// writes it; meanwhile the anchor held here still holds the time.
+    pub(crate) fn write_offline_time(&self, _policy: &MutexGuard<'_, HostPolicy>) {
+        self.offline_time_owed.store(false, Ordering::SeqCst);
+        let Some(anchor) = self.offline_anchor() else {
+            return;
+        };
+        if let Err(error) = self.anchor_sources().record(&anchor) {
+            self.offline_time_owed.store(true, Ordering::SeqCst);
+            eprintln!(
+                "kr-controller: could not record the time the offline bound has spent: {error}"
+            );
+        }
+    }
+
+    /// Records that the offline bound was found run out where nothing may wait, a poll among
+    /// them, so the next step that settles the clock floor writes the time spent down.
+    pub(crate) fn owe_offline_time(&self) {
+        self.offline_time_owed.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether the time the offline bound has spent is owed its record.
+    pub(crate) fn offline_time_owed(&self) -> bool {
+        self.offline_time_owed.load(Ordering::SeqCst)
     }
 
     fn anchor(&self, grant_id: GrantId, deadline: Option<ContinuousInstant>) {

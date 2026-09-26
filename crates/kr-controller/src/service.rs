@@ -788,17 +788,6 @@ pub struct Controller {
     /// once a batch is refused, and the network's record task write the floor again until a write
     /// lands.
     utc_floor: Arc<crate::grants::policy::UtcFloor>,
-    /// The time the bounded offline validity has spent, kept on the continuous clock
-    /// ([`net::OfflineAnchor`]).
-    ///
-    /// Measured in UTC alone, the bound would be lengthened by a wall clock wound back while it
-    /// runs: the floor holds UTC still until the clock catches up. Taken when the policy holding
-    /// the bound is restored, accepted or synchronised, and changed only under the policy's lock.
-    offline_anchor: std::sync::Mutex<Option<net::OfflineAnchor>>,
-    /// True while the time the offline bound has spent is owed its record: a poll found the bound
-    /// run out, or a write of the time failed. The next step that settles the clock floor writes
-    /// it.
-    offline_time_owed: std::sync::atomic::AtomicBool,
     /// This host's half of the remote authority feed: the revisions only it issues, the revocation
     /// records it retains, and the synchronisation it owes before it serves remote work again.
     feed: std::sync::Mutex<crate::grants::AuthorityFeed>,
@@ -1186,14 +1175,7 @@ impl Controller {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .offline_validity(),
             None,
-            &net::AnchorSources {
-                clock: &*clock,
-                boot_clock: &*shared_clock,
-                wall_clock: &*wall,
-                boot: &setup.boot_identity,
-                devices: &devices,
-                floor: &utc_floor,
-            },
+            &lifetimes.anchor_sources(),
         )?;
         // A record for any other synchronisation is one a policy write never reached.
         if let Err(error) = devices
@@ -1207,6 +1189,7 @@ impl Controller {
             let policy = policy
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            lifetimes.hold_offline_anchor(offline_anchor, &policy);
             net::publish_offline_bound(
                 policy.offline_cell(),
                 policy.offline_validity(),
@@ -1311,8 +1294,6 @@ impl Controller {
             policy,
             authority_epoch: std::sync::atomic::AtomicU64::new(0),
             utc_floor,
-            offline_anchor: std::sync::Mutex::new(offline_anchor),
-            offline_time_owed: std::sync::atomic::AtomicBool::new(false),
             feed: std::sync::Mutex::new(feed),
             changesets,
             automation,
@@ -2663,16 +2644,13 @@ impl Controller {
         // The offline bound's time is taken with the policy that holds it: a change measured from
         // another synchronisation starts it again, and any other change keeps the time already
         // spent. Its record is written before the policy and is one of its own, so a stop between
-        // the two leaves the record the policy on disk is measured from as it was.
-        let mut anchor = self
-            .offline_anchor
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let previous = *anchor;
+        // the two leaves the record the policy on disk is measured from as it was. The anchor is
+        // changed only under the policy's lock, which is held from here until it is put in force.
+        let previous = self.lifetimes.offline_anchor();
         let next = net::offline_anchor(
             candidate.offline_validity(),
             previous,
-            &self.anchor_sources(),
+            &self.lifetimes.anchor_sources(),
         )?;
         let snapshot = candidate.snapshot();
         self.sharing.grants().store_policy(&snapshot)?;
@@ -2695,7 +2673,7 @@ impl Controller {
             self.settled_utc_now(),
         );
         *held = candidate;
-        *anchor = next;
+        self.lifetimes.hold_offline_anchor(next, &held);
         // Published with the policy, under its lock, so a decision that reads this epoch reads the
         // policy it names or a later one.
         self.advance_authority_epoch();
@@ -3060,11 +3038,8 @@ impl Controller {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.write_owed_floor(&policy);
-        if self
-            .offline_time_owed
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
-            self.write_offline_time(&policy);
+        if self.lifetimes.offline_time_owed() {
+            self.lifetimes.write_offline_time(&policy);
         }
     }
 
@@ -3187,13 +3162,12 @@ impl Controller {
         // the time it spent is written down.
         let decided = match decided {
             Ok(intersection)
-                if intersection.offline.as_ref().is_some_and(|offline| {
-                    offline
-                        .snapshot()
-                        .ended_on_the_continuous_clock(self.clock.now())
-                }) =>
+                if self.lifetimes.offline_bound_ended(
+                    intersection.offline.as_ref(),
+                    self.clock.now(),
+                    &policy,
+                ) =>
             {
-                self.write_offline_time(&policy);
                 Err(crate::grants::Refusal::OfflineValidityLapsed {
                     last_synchronised_at_ms: policy
                         .offline_validity()

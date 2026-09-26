@@ -1666,13 +1666,12 @@ impl Controller {
         // down so the refusal stands after a restart or a reboot.
         let decided = match decided {
             Ok(decided)
-                if decided.permitted.offline.as_ref().is_some_and(|offline| {
-                    offline
-                        .snapshot()
-                        .ended_on_the_continuous_clock(self.clock.now())
-                }) =>
+                if self.lifetimes.offline_bound_ended(
+                    decided.permitted.offline.as_ref(),
+                    self.clock.now(),
+                    &policy,
+                ) =>
             {
-                self.write_offline_time(&policy);
                 Err(crate::config::ceilings::CeilingRefusal::Refused(
                     crate::grants::Refusal::OfflineValidityLapsed {
                         last_synchronised_at_ms: policy
@@ -1710,51 +1709,6 @@ impl Controller {
         decided
     }
 
-    /// The readings and the record an offline anchor on this daemon is taken from.
-    pub(crate) fn anchor_sources(&self) -> AnchorSources<'_> {
-        AnchorSources {
-            clock: &*self.clock,
-            boot_clock: &*self.shared_clock,
-            wall_clock: &*self.wall,
-            boot: &self.boot_identity,
-            devices: &self.devices,
-            floor: &self.utc_floor,
-        }
-    }
-
-    /// Writes down the time the offline bound has spent by now, with the policy's lock held.
-    ///
-    /// A write that fails leaves the record owed, and the next step that settles the clock floor
-    /// writes it; meanwhile this daemon's anchor still holds the time.
-    pub(crate) fn write_offline_time(
-        &self,
-        _policy: &std::sync::MutexGuard<'_, crate::grants::HostPolicy>,
-    ) {
-        self.offline_time_owed
-            .store(false, std::sync::atomic::Ordering::SeqCst);
-        let anchor = *self
-            .offline_anchor
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(anchor) = anchor else {
-            return;
-        };
-        if let Err(error) = self.anchor_sources().record(&anchor) {
-            self.offline_time_owed
-                .store(true, std::sync::atomic::Ordering::SeqCst);
-            eprintln!(
-                "kr-controller: could not record the time the offline bound has spent: {error}"
-            );
-        }
-    }
-
-    /// Records that the offline bound was found run out where nothing may wait, a poll among
-    /// them, so the next step that settles the clock floor writes the time spent down.
-    pub(crate) fn owe_offline_time(&self) {
-        self.offline_time_owed
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-    }
-
     /// Writes down the time the offline bound has spent, as the network's record task does at
     /// every mark.
     ///
@@ -1767,7 +1721,7 @@ impl Controller {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if policy.offline_validity().is_some() {
-            self.write_offline_time(&policy);
+            self.lifetimes.write_offline_time(&policy);
         }
     }
 
@@ -3246,6 +3200,97 @@ pub(crate) mod tests {
             floor,
             "and no floor is raised for it"
         );
+        drop(controller);
+    }
+
+    /// Push holds a rule's grant to the offline bound as a device's request is held, and writes down
+    /// what it finds the same way. With the wall clock still inside the bound, a rule admits
+    /// nothing once the bound has run out on the continuous clock; the time the bound spent is
+    /// written down at the refusal, and a write of it that failed stays owed until storage takes
+    /// it. A daemon started in another boot, whose wall clock and floor read the synchronisation
+    /// itself, takes the bound's time from that record and finds it run out, so the rule stays
+    /// refused. The control: inside the bound, the rule admits its recipient.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn push_writes_down_the_time_an_offline_bound_spent_when_it_finds_it_run_out() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let (continuous, wall, clocks) = manual_clocks();
+        let controller = daemon_on(&temp, clocks).await;
+        let revision = controller.policy().authority_revision();
+        let synchronised = wall.load(std::sync::atomic::Ordering::SeqCst);
+        choose_offline_bound(&controller, synchronised, 200);
+        let (grant, record) = granted(GrantExpiry::Never, revision);
+        controller
+            .sharing()
+            .grants()
+            .issue(&record, || Ok(()))
+            .expect("the grant is written");
+        // Push's own reading of this daemon's grants, under its policy and on its clocks.
+        let recipients = crate::push::authority::GrantedRecipients::new(
+            Arc::clone(controller.sharing()),
+            Arc::clone(&controller.policy),
+            temp.environment_id(),
+            Arc::clone(controller.lifetimes()),
+        );
+        let rule = kr_delivery::destination::DeliveryRule {
+            name: "on a failed command".to_owned(),
+            grant_id: Some(grant.grant_id),
+        };
+        assert!(
+            kr_delivery::producer::RecipientAuthority::scope_for(&recipients, &rule).is_some(),
+            "inside the bound"
+        );
+
+        // The continuous clock passes the bound while the wall clock stays at the synchronisation,
+        // and the record cannot be written.
+        continuous.advance(std::time::Duration::from_millis(300));
+        let registry = refuse_offline_time_writes(&temp);
+        assert!(
+            kr_delivery::producer::RecipientAuthority::scope_for(&recipients, &rule).is_none(),
+            "the bound ran out on the continuous clock"
+        );
+        assert!(
+            recorded_offline_time(&controller, synchronised) < 200,
+            "the write failed"
+        );
+        allow_offline_time_writes(&registry);
+        controller.settle_floor();
+        assert!(
+            recorded_offline_time(&controller, synchronised) > 200,
+            "the time spent is written down once storage takes it"
+        );
+
+        // With storage whole, the refusal itself writes the time down.
+        continuous.advance(std::time::Duration::from_millis(200));
+        assert!(
+            kr_delivery::producer::RecipientAuthority::scope_for(&recipients, &rule).is_none(),
+            "the bound is still run out"
+        );
+        assert!(
+            recorded_offline_time(&controller, synchronised) >= 500,
+            "the time spent is written down at the refusal"
+        );
+
+        // Another boot: its boot clock starts again, and its wall clock and floor read the
+        // synchronisation. The anchor it takes when it starts is the time on record, so the bound
+        // its offline cell states has already run out.
+        let rebooted = ByHand {
+            clock: kr_transport::clock::ManualClock::new(),
+            boot_clock: kr_ipc::clock::ManualSharedClock::new(),
+            wall_ms: std::sync::atomic::AtomicU64::new(synchronised),
+            paused_while_reading: std::time::Duration::ZERO,
+            boot: kr_protocol::identity::BootIdentity {
+                value: kr_protocol::scalars::Bytes::new(vec![0x5a; 16]),
+                ..controller.boot_identity.clone()
+            },
+            devices: Arc::clone(controller.devices()),
+            floor: crate::grants::policy::UtcFloor::at(synchronised),
+        };
+        let restored = rebooted.anchor(&offline_bound(synchronised, 200), None);
+        assert!(
+            rebooted.run_out(&restored, 200),
+            "the time recorded at the refusal still counts in another boot"
+        );
+        drop(recipients);
         drop(controller);
     }
 
