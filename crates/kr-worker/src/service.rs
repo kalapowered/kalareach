@@ -4828,7 +4828,6 @@ impl WorkerService {
         encode(&result)
     }
 
-    /// Returns the two clocks a question's deadlines are measured on.
     /// Answers `agent.capabilities`: what this installation can do, with its evidence.
     fn agent_capabilities(&self, params: &ParamsValue) -> Result<ParamsValue> {
         let params: kr_protocol::agent::AgentCapabilitiesParams = parse(params)?;
@@ -5003,6 +5002,7 @@ impl WorkerService {
         }
     }
 
+    /// Returns the two clocks a question's deadlines are measured on.
     fn question_clock(&self) -> crate::questions::Now {
         crate::questions::Now {
             utc_ms: kr_ipc::now_ms(),
