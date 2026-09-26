@@ -1766,8 +1766,10 @@ the grant is checked against and the read is routed to. `agent.snapshot` and
 of the device's grant, and the worker holds the answer to it through the shared history filter: a
 snapshot carries what the agent said at or after the moment the grant reaches back to, and says how
 much it withheld, and an approval's record from before that moment is answered as a resource the
-host does not hold. A worker says in its answer to the daemon's hello that it reads such a scope,
-and one that does not say so is sent none and refuses both reads itself. `grant.list` answers with
+host does not hold, unless the grant names that approval and it can still be decided. A worker says
+in its answer to the daemon's hello that it reads such a scope, one that names approvals by the
+broker's resource identity, and one that does not say so is sent none and refuses both reads
+itself. `grant.list` answers with
 the grants the device issued and everything delegated from them, and it needs `session.share`.
 
 Four reads are refused as `UNSUPPORTED_CAPABILITY`, with the read and the reason in the message:
@@ -4479,10 +4481,12 @@ hold all get the same `STALE_SESSION` refusal, and its text does not say which. 
 `session.view`. A paired device reads a record through the session's worker, held to its grant's
 history scope at the moment the request arrived: a record from before the moment the grant reaches
 back to gets that same refusal, decided before the size of the answer, so neither says the record
-exists. An invitation names approvals by upstream identifiers, and an upstream's identifier does not
-pick out one recorded request, since two connections both call their first request `1`; so no name
-a grant carries excepts a record from that bound, and a named approval older than the bound is
-withheld with the rest. A caller under a grant whose scope did not come with its read is refused as
+exists. A grant names an approval by the broker's resource identity, which picks out exactly one
+recorded request; an upstream's own identifier would not, since two connections both call their
+first request `1`. A grant that names the approval reaches its record however early the request
+arrived, while the approval can still be decided, pending or claimed by an answer on its way, and
+with `session.view`; once the approval has ended, the bound decides, as for any other record. A
+caller under a grant whose scope did not come with its read is refused as
 `UNSUPPORTED_CAPABILITY`, with that reason and nothing of the record. The worker refuses an answer
 larger than the control frame declared on the connection it answers, with both sizes, rather than
 send it. A paired device's read reaches the worker over the daemon's own link, so for a device that

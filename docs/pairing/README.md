@@ -194,6 +194,12 @@ invitation somebody can answer; and the grant itself is issued through `issue_gr
 committing transaction, so what is written is a grant that passed both rules rather than one a
 caller handed in.
 
+A pairing proposal of either kind names no current approval or question. A grant may name exact
+current decisions only where they are previewed to the person issuing it, and a pairing invitation
+shows its issuer the rights it proposes and no preview of any named resource. So the host gives no
+challenge to confirm issuing such an invitation, and both issues and `issue_grant` refuse the
+proposal as well, with that reason, before anything is written.
+
 A remote owner publishes a signed revocation **request**, which carries no host revision: only the
 target host issues ordered authority revisions, and a device that could name one would be assigning
 itself a place in the host's order. A host rejects a revision record that does not follow the one it
