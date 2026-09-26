@@ -80,9 +80,12 @@ fn product_sources() -> Vec<PathBuf> {
     found
 }
 
+/// A path as it reads from the repository's root, with the platform's own separator throughout.
 fn relative(path: &Path) -> String {
     path.strip_prefix(repository_root())
         .unwrap_or(path)
+        .components()
+        .collect::<PathBuf>()
         .display()
         .to_string()
 }
@@ -141,12 +144,18 @@ fn the_binding_is_the_pinned_libsodium_sys_stable_release() {
 /// module of the cryptography crate that may contain unsafe code.
 #[test]
 fn one_module_is_the_whole_libsodium_boundary() {
-    let boundary = repository_root().join("crates/kr-crypto/src/sodium.rs");
+    // Paths are built and compared as paths, name by name, so the separator a platform writes
+    // them with has no part in the answer.
+    let source = repository_root()
+        .join("crates")
+        .join("kr-crypto")
+        .join("src");
+    let boundary = source.join("sodium.rs");
     let mut naming = Vec::new();
     for path in product_sources() {
         let text = read(&path);
         if text.contains("libsodium_sys") {
-            naming.push(relative(&path));
+            naming.push(path.clone());
         }
         for declared in ["fn crypto_", "fn sodium_", "fn randombytes_"] {
             assert!(
@@ -155,7 +164,7 @@ fn one_module_is_the_whole_libsodium_boundary() {
                 relative(&path)
             );
         }
-        if path.starts_with(repository_root().join("crates/kr-crypto/src")) && path != boundary {
+        if path.starts_with(&source) && path != boundary {
             assert!(
                 !text.contains("allow(unsafe_code)"),
                 "{} relaxes the crate's unsafe-code rule",
@@ -163,7 +172,16 @@ fn one_module_is_the_whole_libsodium_boundary() {
             );
         }
     }
-    assert_eq!(naming, [relative(&boundary)]);
+    assert!(
+        naming.as_slice() == std::slice::from_ref(&boundary),
+        "{} is the whole libsodium boundary, and these files use the binding: {}",
+        relative(&boundary),
+        naming
+            .iter()
+            .map(|path| relative(path))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
 }
 
 /// KR-REQ-20.01: the pairing AEAD is libsodium's XChaCha20-Poly1305: the vector its specification
