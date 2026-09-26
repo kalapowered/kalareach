@@ -15,11 +15,12 @@
  * a window in the history back to the live screen.
  *
  * The frame is drawn where the moves the page made and native code has not yet settled will put
- * the window (`pan.ts`), and a drag follows the pointer to the pixel; nothing animates. A drag and
- * a wheel's part of a cell belong to the view as it was when they began: its opening, its mode, its
- * life and its cell. When any of those changes the drag is over, its part not sent dropped, and a
- * pointer still down begins again only after a zoom step. Four labelled buttons move the window a
- * page at a time, for a keyboard and for a screen reader.
+ * the window (`pan.ts`), and a drag follows the pointer to the pixel; nothing animates. Every change
+ * of the view a gesture was made in ends it at the change itself: another opening, mode or life
+ * drops a drag and a wheel's part of a cell, and the pointer's remaining events are ignored; a zoom
+ * step begins a drag again from where the pointer is. A change that comes back to where it was is
+ * still a change. Four labelled buttons move the window a page at a time, for a keyboard and for a
+ * screen reader.
  *
  * The view holds no geometry claim. Leaving it for the conversation closes it, which releases what
  * it held and nothing of anyone else's.
@@ -34,6 +35,7 @@ import {
   type CSSProperties,
   type ReactNode
 } from 'react'
+import { flushSync } from 'react-dom'
 
 import type { PaletteState } from '@kalareach/protocol'
 
@@ -68,13 +70,11 @@ import {
 import {
   beginDrag,
   dragTo,
-  followGeneration,
   releaseDrag,
-  sameGeneration,
+  restartDrag,
   WHEEL_AT_REST,
   wheelTurn,
   type Cells,
-  type DragGeneration,
   type HeldDrag,
   type Point,
   type WheelRest
@@ -301,33 +301,61 @@ export function RawTerminal({
   const drawnCell = cell ?? UNMEASURED_CELL
   const ended = state?.state === 'ended'
   const draggable = mode === 'view' && !ended
-  // What a drag or a wheel's part belongs to now: this opening, in this mode, while it lasts, and
-  // this cell.
-  const generation: DragGeneration = {
-    view: `${openingKey}:${mode}:${ended ? 'ended' : 'open'}`,
-    cell: drawnCell
-  }
 
-  // The drag in progress, and the part of it not sent, as drawn: only while it belongs to the view
-  // as it is, so any change of opening, mode, life or cell stops drawing it at once. A wheel's part
-  // short of a cell is carried to its next turn in the same way.
+  // The drag in progress, and a wheel's part of a cell carried to its next turn. The part of the
+  // drag not sent is drawn on a layer of its own, which only the drag and the changes below touch.
   const dragging = useRef<HeldDrag | null>(null)
-  const [dragged, setDragged] = useState<{ readonly generation: DragGeneration; readonly at: Point } | null>(
-    null
-  )
-  const wheelRest = useRef<{ readonly generation: DragGeneration; readonly rest: WheelRest } | null>(null)
-  const drawnDrag = dragged !== null && sameGeneration(dragged.generation, generation) ? dragged.at : AT_REST
+  const dragLayer = useRef<HTMLDivElement | null>(null)
+  const wheelRest = useRef<WheelRest>(WHEEL_AT_REST)
   // The newest way to move the window, for the wheel's own listener.
-  const panning = useRef({ pan, roomNow, generation })
+  const panning = useRef({ pan, roomNow, cell: drawnCell })
   useEffect(() => {
-    panning.current = { pan, roomNow, generation }
+    panning.current = { pan, roomNow, cell: drawnCell }
   })
+
+  /** Draws the part of the drag not sent. */
+  const drawDrag = (at: Point) => {
+    const layer = dragLayer.current
+    if (layer === null) return
+    layer.style.transform = at.x === 0 && at.y === 0 ? '' : `translate(${at.x}px, ${at.y}px)`
+  }
 
   /** Ends the drag in progress, sending nothing: its part not sent is dropped. */
   const dropDrag = () => {
     dragging.current = null
-    setDragged(null)
+    drawDrag(AT_REST)
   }
+
+  /**
+   * Sends the whole cells a drag has crossed, and draws the frame at its new place before the next
+   * paint, so the frame and the drag's part on its own layer never show out of step.
+   */
+  const sendDragged = (cells: Cells) => {
+    flushSync(() => {
+      pan(cells)
+    })
+  }
+
+  // Every change of the view a gesture was made in ends it here, at the change itself: another
+  // opening, another mode, or the view's end. A change that comes back to where it was is a change
+  // too, so nothing made before it can count again. A pointer still down sends nothing more.
+  useLayoutEffect(() => {
+    dragging.current = null
+    wheelRest.current = WHEEL_AT_REST
+    const layer = dragLayer.current
+    if (layer !== null) layer.style.transform = ''
+  }, [openingKey, mode, ended])
+  // A zoom step changes the cell: a drag begins again from where the pointer is, and a wheel's part
+  // of the old cell is dropped.
+  const cellWidth = drawnCell.width
+  const cellHeight = drawnCell.height
+  useLayoutEffect(() => {
+    const held = dragging.current
+    if (held !== null) dragging.current = restartDrag(held, { width: cellWidth, height: cellHeight })
+    wheelRest.current = WHEEL_AT_REST
+    const layer = dragLayer.current
+    if (layer !== null) layer.style.transform = ''
+  }, [cellWidth, cellHeight])
 
   // The grid goes to the host whenever the surface or the cell size changes: at once, and then as
   // the surface is resized.
@@ -371,8 +399,7 @@ export function RawTerminal({
         setZoom((current) => zoomBy(current, outcome.steps))
         return
       }
-      const { pan: send, roomNow: roomOf, generation: now } = panning.current
-      const at = now.cell
+      const { pan: send, roomNow: roomOf, cell: at } = panning.current
       const room = roomOf()
       if (room === null) return
       // A wheel that counts in lines or pages is measured in rows and columns of this grid.
@@ -380,9 +407,8 @@ export function RawTerminal({
       const page = event.deltaMode === 2
       const rows = Math.max(1, Math.floor(element.clientHeight / at.height))
       const columns = Math.max(1, Math.floor(element.clientWidth / at.width))
-      const rest = wheelRest.current
       const turned = wheelTurn(
-        rest !== null && sameGeneration(rest.generation, now) ? rest.rest : WHEEL_AT_REST,
+        wheelRest.current,
         {
           across: outcome.across * (line ? at.width : page ? at.width * columns : 1),
           down: outcome.down * (line ? at.height : page ? at.height * rows : 1)
@@ -390,7 +416,7 @@ export function RawTerminal({
         at,
         room
       )
-      wheelRest.current = { generation: now, rest: turned.rest }
+      wheelRest.current = turned.rest
       if (moves(turned.send)) send(turned.send)
     }
     element.addEventListener('wheel', onWheel, { capture: true, passive: false })
@@ -411,8 +437,8 @@ export function RawTerminal({
         ? null
         : placeOf(frame)
   const drawnShift: Point = {
-    x: drawnDrag.x - shift.across * drawnCell.width,
-    y: drawnDrag.y - shift.down * drawnCell.height
+    x: -shift.across * drawnCell.width,
+    y: -shift.down * drawnCell.height
   }
 
   return (
@@ -427,7 +453,6 @@ export function RawTerminal({
               { value: 'view', label: 'View' }
             ]}
             onChange={(next) => {
-              dropDrag()
               // Control mode shows the program's live screen: a window in the history comes back.
               if (next === 'control') live()
               setMode(next)
@@ -481,9 +506,8 @@ export function RawTerminal({
         <div
           ref={host}
           onPointerDown={(event) => {
-            const held = dragging.current === null ? null : followGeneration(dragging.current, generation)
             // A second pointer ends the drag in progress, sending nothing more.
-            if (held !== null) {
+            if (dragging.current !== null) {
               dropDrag()
               return
             }
@@ -491,44 +515,32 @@ export function RawTerminal({
             event.preventDefault()
             event.currentTarget.setPointerCapture(event.pointerId)
             const at = { x: event.clientX, y: event.clientY }
-            dragging.current = { pointer: event.pointerId, drag: beginDrag(at), generation, last: at }
+            dragging.current = { pointer: event.pointerId, drag: beginDrag(at), cell: drawnCell, last: at }
           }}
           onPointerMove={(event) => {
-            const current = dragging.current
-            if (current === null || event.pointerId !== current.pointer) return
-            const held = followGeneration(current, generation)
-            if (held === null) {
-              dropDrag()
-              return
-            }
+            const held = dragging.current
+            if (held === null || event.pointerId !== held.pointer) return
             const room = roomNow()
             if (room === null) return
             const at = { x: event.clientX, y: event.clientY }
             const element = event.currentTarget
-            const cellNow = held.generation.cell
-            const step = dragTo(held.drag, at, cellNow, room, {
-              width: element.clientWidth || (frame?.window.columns ?? 0) * cellNow.width,
-              height: element.clientHeight || (frame?.window.rows ?? 0) * cellNow.height
+            const step = dragTo(held.drag, at, held.cell, room, {
+              width: element.clientWidth || (frame?.window.columns ?? 0) * held.cell.width,
+              height: element.clientHeight || (frame?.window.rows ?? 0) * held.cell.height
             })
-            if (moves(step.send)) pan(step.send)
+            if (moves(step.send)) sendDragged(step.send)
             dragging.current = { ...held, drag: step.drag, last: at }
-            setDragged({ generation: held.generation, at: step.offset })
+            drawDrag(step.offset)
           }}
           onPointerUp={(event) => {
-            const current = dragging.current
-            if (current === null || event.pointerId !== current.pointer) return
-            // A release sends only the cells rounding adds, and only for the view the drag began in.
-            const held = followGeneration(current, generation)
+            const held = dragging.current
+            if (held === null || event.pointerId !== held.pointer) return
+            // A release sends only the cells rounding adds.
             dropDrag()
             const room = roomNow()
-            if (held === null || room === null) return
-            const rounding = releaseDrag(
-              held.drag,
-              { x: event.clientX, y: event.clientY },
-              held.generation.cell,
-              room
-            )
-            if (moves(rounding)) pan(rounding)
+            if (room === null) return
+            const rounding = releaseDrag(held.drag, { x: event.clientX, y: event.clientY }, held.cell, room)
+            if (moves(rounding)) sendDragged(rounding)
           }}
           onPointerCancel={(event) => {
             if (event.pointerId === dragging.current?.pointer) dropDrag()
@@ -555,7 +567,9 @@ export function RawTerminal({
           >
             {'M'.repeat(PROBE_CELLS)}
           </span>
-          {frame === null ? null : <Grid screen={frame} cell={drawnCell} shift={drawnShift} />}
+          <div ref={dragLayer}>
+            {frame === null ? null : <Grid screen={frame} cell={drawnCell} shift={drawnShift} />}
+          </div>
         </div>
       </div>
 

@@ -11,10 +11,12 @@
  * the wire carries a pinch, so zooming takes nothing from anyone. In view mode a one-finger drag
  * moves the window across the session, up into its history and down its live screen: the screen
  * follows the finger, and comes to rest on the screen the host draws for the window's new place.
- * Taking control brings a window in the history back to the live screen.
+ * Taking control brings a window in the history back to the live screen. A finger that is down
+ * when the view changes under it, another opening, mode or life, counts for nothing until it lifts.
  */
 
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { flushSync } from 'react-dom'
 
 import { useApp } from '../../app/state'
 import { Badge, Banner, Button, Segmented } from '../../components/ui'
@@ -54,11 +56,10 @@ import {
 import {
   beginDrag,
   dragTo,
-  followGeneration,
   releaseDrag,
-  sameGeneration,
+  restartDrag,
   type Cells,
-  type DragGeneration,
+  type CellSize,
   type HeldDrag,
   type Point
 } from '../../terminal/pan'
@@ -641,7 +642,7 @@ export function MobileSession({
 const PROBE_CELLS = 10
 
 /** One cell of the phone's grid in pixels: a column of the probe, and a line of the grid. */
-function cellOf(probe: HTMLSpanElement | null): { width: number; height: number } | null {
+function cellOf(probe: HTMLSpanElement | null): CellSize | null {
   const box = probe?.getBoundingClientRect()
   if (!probe || !box || box.width <= 0) return null
   const grid = probe.parentElement
@@ -700,38 +701,75 @@ function RawTerminal({
   readonly onZoom: (steps: number) => void
   readonly onApplicationScroll: (lines: number) => void
 }): ReactNode {
-  const pointers = useRef(new Map<number, { x: number; y: number }>())
-  // The one-finger drag in progress in view mode, and the part of it not sent, as drawn.
+  // The fingers down in the gesture in progress, each where it is now. An event of any other finger
+  // belongs to no gesture and is ignored.
+  const pointers = useRef(new Map<number, Point>())
+  // Where the gesture began. A drag is the displacement from that origin, not a sum of each move's
+  // step: adding steps makes the distance depend on how many events the device sent.
+  const start = useRef<{ x: number; y: number; spread: number } | null>(null)
+  // The one-finger drag in progress in view mode. The part of it not sent is drawn on a layer of
+  // its own, which only the drag and the changes below touch.
   const dragging = useRef<HeldDrag | null>(null)
-  const [dragged, setDragged] = useState<{ readonly generation: DragGeneration; readonly at: Point } | null>(
-    null
-  )
+  const dragLayer = useRef<HTMLDivElement | null>(null)
   // One cell in pixels, measured once laid out at each zoom and screen, for drawing the shift.
-  const [cell, setCell] = useState<{ width: number; height: number } | null>(null)
+  const [cell, setCell] = useState<CellSize | null>(null)
   useLayoutEffect(() => {
     const measured = cellOf(probeRef.current)
     setCell((current) =>
       current?.width === measured?.width && current?.height === measured?.height ? current : measured
     )
   }, [probeRef, zoom, screen])
-  // A drag belongs to the view as it was when it began: this opening, in view mode, while it lasts,
-  // and this cell. When any of those changes its part not sent is no longer drawn, and its next
-  // event ends it without sending anything.
   const draggable = mode === 'view' && !ended
-  const generation: DragGeneration = {
-    view: `${openingKey}:${mode}:${ended ? 'ended' : 'open'}`,
-    cell: cell ?? { width: 0, height: 0 }
+
+  /** Draws the part of the drag not sent. */
+  const drawDrag = (at: Point) => {
+    const layer = dragLayer.current
+    if (layer === null) return
+    layer.style.transform = at.x === 0 && at.y === 0 ? '' : `translate(${at.x}px, ${at.y}px)`
   }
-  const drawnDrag = dragged !== null && sameGeneration(dragged.generation, generation) ? dragged.at : AT_REST
 
   /** Ends the drag in progress, sending nothing: its part not sent is dropped. */
   const dropDrag = () => {
     dragging.current = null
-    setDragged(null)
+    drawDrag(AT_REST)
   }
-  // Where the gesture began. A drag is the displacement from that origin, not a sum of each move's
-  // step: adding steps makes the distance depend on how many events the device sent.
-  const start = useRef<{ x: number; y: number; spread: number } | null>(null)
+
+  /**
+   * Sends the whole cells a drag has crossed, and draws the screen at its new place before the next
+   * paint, so the screen and the drag's part on its own layer never show out of step.
+   */
+  const sendDragged = (cells: Cells) => {
+    if (cells.across === 0 && cells.down === 0) return
+    flushSync(() => {
+      onPan(cells)
+    })
+  }
+
+  // Every change of the view a gesture was made in ends it here, at the change itself: another
+  // opening, another mode, or the view's end. A change that comes back to where it was is a change
+  // too. The fingers still down leave the gesture, so what they do until they lift neither moves
+  // the window nor reaches the program.
+  useLayoutEffect(() => {
+    pointers.current.clear()
+    start.current = null
+    dragging.current = null
+    const layer = dragLayer.current
+    if (layer !== null) layer.style.transform = ''
+  }, [openingKey, mode, ended])
+  // A new cell size: a drag begins again from where the finger is, and its part not sent is dropped.
+  const cellWidth = cell?.width
+  const cellHeight = cell?.height
+  useLayoutEffect(() => {
+    const held = dragging.current
+    if (held !== null) {
+      dragging.current =
+        cellWidth === undefined || cellHeight === undefined
+          ? null
+          : restartDrag(held, { width: cellWidth, height: cellHeight })
+    }
+    const layer = dragLayer.current
+    if (layer !== null) layer.style.transform = ''
+  }, [cellWidth, cellHeight])
 
   /** Takes the gesture's origin again from the fingers that are still down. */
   const rebase = () => {
@@ -749,6 +787,13 @@ function RawTerminal({
           ? Math.hypot(first.x - points[1].x, first.y - points[1].y)
           : 0
     }
+  }
+
+  /** A finger the browser took away: it ends what it was doing and sends nothing. */
+  const forget = (pointer: number) => {
+    if (!pointers.current.delete(pointer)) return
+    rebase()
+    if (dragging.current?.pointer === pointer) dropDrag()
   }
 
   const gestureFrom = (event: React.PointerEvent): TouchGesture => {
@@ -791,7 +836,7 @@ function RawTerminal({
         // One finger in view mode drags the window; a second one ends the drag and pinches.
         if (pointers.current.size === 1 && draggable && cell !== null) {
           const at = { x: event.clientX, y: event.clientY }
-          dragging.current = { pointer: event.pointerId, drag: beginDrag(at), generation, last: at }
+          dragging.current = { pointer: event.pointerId, drag: beginDrag(at), cell, last: at }
         } else if (dragging.current !== null) {
           dropDrag()
         }
@@ -799,42 +844,35 @@ function RawTerminal({
       onPointerMove={(event) => {
         if (!pointers.current.has(event.pointerId)) return
         pointers.current.set(event.pointerId, { x: event.clientX, y: event.clientY })
-        const current = dragging.current
-        if (current === null || current.pointer !== event.pointerId) return
-        const held = followGeneration(current, generation)
-        if (held === null) {
-          dropDrag()
-          return
-        }
+        const held = dragging.current
+        if (held === null || held.pointer !== event.pointerId) return
         const room = roomNow()
         if (room === null) return
         const at = { x: event.clientX, y: event.clientY }
         const element = event.currentTarget
-        const step = dragTo(held.drag, at, held.generation.cell, room, {
+        const step = dragTo(held.drag, at, held.cell, room, {
           width: element.clientWidth,
           height: element.clientHeight
         })
-        if (step.send.across !== 0 || step.send.down !== 0) onPan(step.send)
+        sendDragged(step.send)
         dragging.current = { ...held, drag: step.drag, last: at }
-        setDragged({ generation: held.generation, at: step.offset })
+        drawDrag(step.offset)
       }}
       onPointerUp={(event) => {
+        if (!pointers.current.has(event.pointerId)) return
         const outcome = routeGesture(mode, gestureFrom(event))
         pointers.current.delete(event.pointerId)
         // A finger leaving changes what the gesture is measured from, so the origin is taken
         // again from the fingers still down. Keeping the old one makes the next gesture jump by
         // whatever the lifted finger had travelled.
         rebase()
-        const current = dragging.current
-        if (current?.pointer === event.pointerId) {
-          // A lifted finger sends only the cells rounding adds, and only for the view the drag
-          // began in.
-          const held = followGeneration(current, generation)
+        const held = dragging.current
+        if (held?.pointer === event.pointerId) {
+          // A lifted finger sends only the cells rounding adds.
           dropDrag()
           const room = roomNow()
-          if (held === null || room === null) return
-          const rounding = releaseDrag(held.drag, { x: event.clientX, y: event.clientY }, held.generation.cell, room)
-          if (rounding.across !== 0 || rounding.down !== 0) onPan(rounding)
+          if (room === null) return
+          sendDragged(releaseDrag(held.drag, { x: event.clientX, y: event.clientY }, held.cell, room))
           return
         }
         if (outcome.kind === 'zoom') onZoom(outcome.steps)
@@ -842,60 +880,58 @@ function RawTerminal({
         if (outcome.kind === 'application' && outcome.lines !== 0) onApplicationScroll(outcome.lines)
       }}
       onPointerCancel={(event) => {
-        pointers.current.delete(event.pointerId)
-        rebase()
-        if (dragging.current?.pointer === event.pointerId) dropDrag()
+        forget(event.pointerId)
       }}
       onLostPointerCapture={(event) => {
-        pointers.current.delete(event.pointerId)
-        rebase()
-        if (dragging.current?.pointer === event.pointerId) dropDrag()
+        forget(event.pointerId)
       }}
     >
-      <pre
-        className="m-terminal-grid"
-        style={{
-          transform: `translate(${drawnDrag.x - shift.across * (cell?.width ?? 0)}px, ${
-            drawnDrag.y - shift.down * (cell?.height ?? 0)
-          }px)`
-        }}
-      >
-        <span
-          ref={probeRef}
-          aria-hidden="true"
-          style={{ position: 'absolute', visibility: 'hidden', pointerEvents: 'none' }}
+      <div ref={dragLayer}>
+        <pre
+          className="m-terminal-grid"
+          style={{
+            transform: `translate(${-shift.across * (cell?.width ?? 0)}px, ${
+              -shift.down * (cell?.height ?? 0)
+            }px)`
+          }}
         >
-          {'M'.repeat(PROBE_CELLS)}
-        </span>
-        {screen && palette
-          ? screen.lines.map((line, index) => (
-              <span key={`${index}-${line.row}`} data-testid="mobile-terminal-line">
-                {stretchesOf(line).map((stretch) =>
-                  stretch.piece === null ? (
-                    <span key={stretch.column}>{stretch.text}</span>
-                  ) : (
-                    // A box of exactly the piece's cells that cuts what it holds at its edges, so
-                    // no glyph, an italic one's overhang included, reaches the cells beside it.
-                    <span
-                      key={stretch.column}
-                      data-cells={stretch.piece.cells}
-                      style={{
-                        ...styleOf(stretch.piece.rendition, palette),
-                        display: 'inline-block',
-                        width: `${stretch.text.length}ch`,
-                        overflow: 'hidden',
-                        verticalAlign: 'top'
-                      }}
-                    >
-                      {stretch.text}
-                    </span>
-                  )
-                )}
-                {'\n'}
-              </span>
-            ))
-          : null}
-      </pre>
+          <span
+            ref={probeRef}
+            aria-hidden="true"
+            style={{ position: 'absolute', visibility: 'hidden', pointerEvents: 'none' }}
+          >
+            {'M'.repeat(PROBE_CELLS)}
+          </span>
+          {screen && palette
+            ? screen.lines.map((line, index) => (
+                <span key={`${index}-${line.row}`} data-testid="mobile-terminal-line">
+                  {stretchesOf(line).map((stretch) =>
+                    stretch.piece === null ? (
+                      <span key={stretch.column}>{stretch.text}</span>
+                    ) : (
+                      // A box of exactly the piece's cells that cuts what it holds at its edges, so
+                      // no glyph, an italic one's overhang included, reaches the cells beside it.
+                      <span
+                        key={stretch.column}
+                        data-cells={stretch.piece.cells}
+                        style={{
+                          ...styleOf(stretch.piece.rendition, palette),
+                          display: 'inline-block',
+                          width: `${stretch.text.length}ch`,
+                          overflow: 'hidden',
+                          verticalAlign: 'top'
+                        }}
+                      >
+                        {stretch.text}
+                      </span>
+                    )
+                  )}
+                  {'\n'}
+                </span>
+              ))
+            : null}
+        </pre>
+      </div>
     </div>
   )
 }

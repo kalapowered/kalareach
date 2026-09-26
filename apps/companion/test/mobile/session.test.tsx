@@ -438,13 +438,19 @@ describe("the phone's raw terminal view (KR-REQ-08.02, 13.18)", () => {
     })
   }
 
-  /** How far the phone's grid is drawn from its place, in pixels. */
+  /** How far `element` is drawn from its place, in pixels. */
+  function translation(element: HTMLElement | null | undefined): { x: number; y: number } {
+    const found = /translate\((-?[\d.]+)px, (-?[\d.]+)px\)/.exec(element?.style.transform ?? '')
+    return found === null ? { x: 0, y: 0 } : { x: Number(found[1]), y: Number(found[2]) }
+  }
+
+  /** How far the phone's grid is drawn from its place, in pixels: the moves waiting and the drag's part. */
   function gridShift(): { x: number; y: number } {
     const grid = screen.getByTestId('mobile-terminal').querySelector<HTMLElement>('.m-terminal-grid')
-    const found = /translate\((-?[\d.]+)px, (-?[\d.]+)px\)/.exec(grid?.style.transform ?? '')
-    if (found === null) return { x: 0, y: 0 }
-    const x = Number(found[1])
-    const y = Number(found[2])
+    const waiting = translation(grid)
+    const dragged = translation(grid?.parentElement)
+    const x = waiting.x + dragged.x
+    const y = waiting.y + dragged.y
     return { x: x === 0 ? 0 : x, y: y === 0 ? 0 : y }
   }
 
@@ -540,6 +546,50 @@ describe("the phone's raw terminal view (KR-REQ-08.02, 13.18)", () => {
       finger('pointerup', 1, 100, 140)
       expect(controls.terminalViews[0]?.moves).toHaveLength(2)
       expect(gridShift()).toEqual({ x: 0, y: 0 })
+    } finally {
+      restore()
+    }
+  })
+
+  it('ignores a finger whose drag a change of view ended until it lifts, and never gives it to the program', async () => {
+    const restore = measured()
+    try {
+      const { port, controls } = fakeHost()
+      controls.holdTerminalMoves()
+      const typed = vi.spyOn(port, 'terminalInput')
+      const person = await onTerminal(port)
+      await waitFor(() => {
+        expect(screen.getAllByTestId('mobile-terminal-line').length).toBeGreaterThan(0)
+      })
+      await person.click(screen.getByRole('button', { name: 'Look around' }))
+      finger('pointerdown', 1, 100, 100)
+      finger('pointermove', 1, 100, 124)
+      await person.click(screen.getByRole('button', { name: 'Take control' }))
+      finger('pointermove', 1, 100, 180)
+      finger('pointerup', 1, 100, 180)
+      expect(controls.terminalViews[0]?.moves).toEqual([
+        { number: 1, across: 0, down: -1 },
+        { number: 2, live: true }
+      ])
+      expect(typed).not.toHaveBeenCalled()
+
+      // Look around, drag half a row, and take control and look around again without the finger
+      // moving: the drag is over, and what it had not sent is gone.
+      await person.click(screen.getByRole('button', { name: 'Look around' }))
+      finger('pointerdown', 2, 100, 100)
+      finger('pointermove', 2, 100, 108)
+      expect(gridShift()).toEqual({ x: 0, y: 8 })
+      await person.click(screen.getByRole('button', { name: 'Take control' }))
+      await person.click(screen.getByRole('button', { name: 'Look around' }))
+      expect(gridShift()).toEqual({ x: 0, y: 0 })
+      finger('pointermove', 2, 100, 140)
+      finger('pointerup', 2, 100, 140)
+      expect(controls.terminalViews[0]?.moves).toEqual([
+        { number: 1, across: 0, down: -1 },
+        { number: 2, live: true },
+        { number: 3, live: true }
+      ])
+      expect(typed).not.toHaveBeenCalled()
     } finally {
       restore()
     }

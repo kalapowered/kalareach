@@ -773,6 +773,94 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
     expect(screen.getByRole('button', { name: 'Move the window down' })).toBeEnabled()
   })
 
+  it('ends a drag at any change of the view, one that comes back to where it was included', async () => {
+    const person = userEvent.setup()
+    const { port, controls } = fakeHost()
+    controls.holdTerminalMoves()
+    open(port)
+    await screen.findByTestId('palette-provenance')
+    await person.click(screen.getByRole('tab', { name: 'View' }))
+    pointer('pointerdown', 100, 100)
+    pointer('pointermove', 100, 108)
+    expect(gridShift()).toEqual({ x: 0, y: 8 })
+    // Control, and back to view, with the pointer still down and not moving.
+    await person.click(screen.getByRole('tab', { name: 'Control' }))
+    await person.click(screen.getByRole('tab', { name: 'View' }))
+    expect(gridShift()).toEqual({ x: 0, y: 0 })
+    pointer('pointermove', 100, 140)
+    pointer('pointerup', 100, 140)
+    expect(controls.terminalViews[0]?.moves).toEqual([{ number: 1, live: true }])
+    expect(gridShift()).toEqual({ x: 0, y: 0 })
+  })
+
+  it('begins a drag again at each zoom step, one back to the size it began at included', async () => {
+    const person = userEvent.setup()
+    // A cell two thirds of the type size wide and four thirds of it high: 8 by 16 at first.
+    const rects = vi
+      .spyOn(Element.prototype, 'getBoundingClientRect')
+      .mockImplementation(function (this: Element) {
+        const text = this.textContent ?? ''
+        const size = parseFloat(this.parentElement?.style.fontSize ?? '')
+        if (this.getAttribute('aria-hidden') !== 'true' || !/^M+$/.test(text) || !(size > 0)) {
+          return new DOMRect()
+        }
+        return DOMRect.fromRect({ x: 0, y: 0, width: (text.length * size * 2) / 3, height: (size * 4) / 3 })
+      })
+    try {
+      const { port, controls } = fakeHost()
+      controls.holdTerminalMoves()
+      open(port)
+      await screen.findByTestId('palette-provenance')
+      await person.click(screen.getByRole('tab', { name: 'View' }))
+      pointer('pointerdown', 100, 100)
+      pointer('pointermove', 100, 108)
+      expect(gridShift()).toEqual({ x: 0, y: 8 })
+      // Larger, and back to the size the drag began at, with the pointer still down and not moving:
+      // the half row is dropped at each step.
+      wheel({ deltaY: -100, ctrlKey: true })
+      expect(gridShift()).toEqual({ x: 0, y: 0 })
+      wheel({ deltaY: 100, ctrlKey: true })
+      expect(gridShift()).toEqual({ x: 0, y: 0 })
+      // A row from where the pointer was: one row goes, and nothing is left to round on release.
+      pointer('pointermove', 100, 124)
+      expect(gridShift()).toEqual({ x: 0, y: 16 })
+      pointer('pointerup', 100, 124)
+      expect(controls.terminalViews[0]?.moves).toEqual([{ number: 1, across: 0, down: -1 }])
+    } finally {
+      rects.mockRestore()
+    }
+  })
+
+  it("drops a wheel's part of a cell at any change of the view, and a part a move has put past a limit", async () => {
+    const person = userEvent.setup()
+    const { port, controls } = fakeHost()
+    controls.holdTerminalMoves()
+    open(port)
+    await screen.findByTestId('palette-provenance')
+    await person.click(screen.getByRole('tab', { name: 'View' }))
+    // A session wider than the view, with one column of room to the right.
+    act(() => {
+      controls.terminalViews[0]?.show({
+        window: { rows: 8, columns: 70, column: 9, line: 0, above: 0 },
+        room: { up: 0, down: 0, left: 9, right: 1 }
+      })
+    })
+    // Half a column, then the view changes and comes back: the half is gone.
+    wheel({ deltaX: 4 })
+    await person.click(screen.getByRole('tab', { name: 'Control' }))
+    await person.click(screen.getByRole('tab', { name: 'View' }))
+    wheel({ deltaX: 4 })
+    expect(controls.terminalViews[0]?.moves).toEqual([{ number: 1, live: true }])
+    // Half a column carried, then a button takes the last column: a turn back goes at once.
+    await person.click(screen.getByRole('button', { name: 'Move the window right' }))
+    wheel({ deltaX: -8 })
+    expect(controls.terminalViews[0]?.moves).toEqual([
+      { number: 1, live: true },
+      { number: 2, across: 1, down: 0 },
+      { number: 3, across: -1, down: 0 }
+    ])
+  })
+
   it('keeps an ended view ended when a move it took before the end is answered after it', async () => {
     const person = userEvent.setup()
     const { port, controls } = fakeHost()
@@ -830,13 +918,19 @@ function pointer(type: string, x: number, y: number, id = 1): void {
   })
 }
 
-/** How far the grid is drawn from its place, in pixels. */
+/** How far `element` is drawn from its place, in pixels. */
+function translation(element: HTMLElement | null): { x: number; y: number } {
+  const found = /translate\((-?[\d.]+)px, (-?[\d.]+)px\)/.exec(element?.style.transform ?? '')
+  return found === null ? { x: 0, y: 0 } : { x: Number(found[1]), y: Number(found[2]) }
+}
+
+/** How far the grid is drawn from its place, in pixels: the moves waiting and the drag's part. */
 function gridShift(): { x: number; y: number } {
-  const transform = screen.getByTestId('terminal-grid').style.transform
-  const found = /translate\((-?[\d.]+)px, (-?[\d.]+)px\)/.exec(transform)
-  if (found === null) return { x: 0, y: 0 }
-  const x = Number(found[1])
-  const y = Number(found[2])
+  const grid = screen.getByTestId('terminal-grid')
+  const waiting = translation(grid)
+  const dragged = translation(grid.parentElement)
+  const x = waiting.x + dragged.x
+  const y = waiting.y + dragged.y
   return { x: x === 0 ? 0 : x, y: y === 0 ? 0 : y }
 }
 

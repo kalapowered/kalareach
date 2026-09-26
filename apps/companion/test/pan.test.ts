@@ -11,10 +11,10 @@ import type { TerminalMove, TerminalRoom, TerminalScreen } from '../src/host/por
 import {
   beginDrag,
   dragTo,
-  followGeneration,
   releaseDrag,
   replay,
   resisted,
+  restartDrag,
   roomLeft,
   STILL,
   WHEEL_AT_REST,
@@ -135,35 +135,31 @@ describe('a wheel', () => {
     expect(reaching.send).toEqual({ across: 1, down: 0 })
     expect(reaching.rest).toEqual({ across: 0, down: 0 })
   })
+
+  it('drops a part it carries that another move has since put past a limit', () => {
+    // Half a column carried toward a column of room; something else then takes that column.
+    const carried = wheelTurn(WHEEL_AT_REST, { across: 4, down: 0 }, cell, { up: 0, down: 0, left: 5, right: 1 })
+    expect(carried.rest).toEqual({ across: 4, down: 0 })
+    const now: TerminalRoom = { up: 0, down: 0, left: 6, right: 0 }
+    expect(wheelTurn(carried.rest, { across: -8, down: 0 }, cell, now).send).toEqual({ across: -1, down: 0 })
+  })
 })
 
-describe('what a drag belongs to', () => {
-  const cell = { width: 8, height: 16 }
-  const held: HeldDrag = {
-    pointer: 1,
-    drag: { origin: { x: 100, y: 100 }, sent: { across: 0, down: -1 } },
-    generation: { view: 'session:1:view', cell },
-    last: { x: 100, y: 124 }
-  }
-
-  it('goes on while its view, its mode and its cell stay as they were', () => {
-    expect(followGeneration(held, { view: 'session:1:view', cell: { ...cell } })).toBe(held)
-  })
-
-  it('begins again from the last point, keeping what it sent, when the cell changes', () => {
+describe('a drag across a zoom step', () => {
+  it('begins again from the last point in the new cell, its part dropped and what it sent kept', () => {
+    const held: HeldDrag = {
+      pointer: 1,
+      drag: { origin: { x: 100, y: 100 }, sent: { across: 0, down: -1 } },
+      cell: { width: 8, height: 16 },
+      last: { x: 100, y: 124 }
+    }
     const larger = { width: 9, height: 18 }
-    expect(followGeneration(held, { view: 'session:1:view', cell: larger })).toEqual({
+    expect(restartDrag(held, larger)).toEqual({
       pointer: 1,
       drag: { origin: { x: 100, y: 124 }, sent: STILL },
-      generation: { view: 'session:1:view', cell: larger },
+      cell: larger,
       last: { x: 100, y: 124 }
     })
-  })
-
-  it('ends when its view ends, opens again, changes session or leaves view mode', () => {
-    for (const view of ['session:1:ended', 'session:2:view', 'other:1:view', 'session:1:control']) {
-      expect(followGeneration(held, { view, cell })).toBeNull()
-    }
   })
 })
 
