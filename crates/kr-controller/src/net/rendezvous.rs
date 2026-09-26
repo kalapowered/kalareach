@@ -838,7 +838,7 @@ mod tests {
     /// at once.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_socket_that_ends_after_its_invitation_is_released_at_once() {
-        for _ in 0..PHASE_ATTEMPTS {
+        for attempt in 1..=PHASE_ATTEMPTS {
             let host = TestHost::new(Vec::new(), OnStep::Keeps);
             let service = TestService::new(8);
             let (relay, _stop) = relaying(&host, &service).await;
@@ -849,6 +849,7 @@ mod tests {
             // The relay marks the socket's end before it asks the host. A recheck that found the
             // end first releases without that mark, and proves nothing about the socket's end.
             let Some(ended) = marked(task, Moment::SocketEnded).first().copied() else {
+                eprintln!("attempt {attempt}: a recheck ended the relay before its socket did");
                 continue;
             };
             assert!(
