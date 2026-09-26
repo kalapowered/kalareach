@@ -9,9 +9,11 @@
 //! crate, so this reads every crate in the workspace for what it declares. A type *carries* text
 //! when its `Debug` can print text that arrived: text, a character, bytes, a JSON or CBOR value, a
 //! path, a file, a URL, an I/O failure, a trait object; or a type of any crate whose own `Debug`
-//! prints one, found to a fixpoint. A type a macro declares is read from the macro's own text at
-//! each place it is invoked. The test fails with the file, the line and the item wherever a type of
-//! the two crates has
+//! prints one, found to a fixpoint. A type or a `Debug` that a `macro_rules!` writes is read from
+//! the macro's own text where the file that writes the macro invokes it; a type a macro declares
+//! anywhere else is one this reading cannot place, and a type whose `Debug` it cannot find
+//! carries. The test fails with the file, the line and the item wherever a type of the two crates
+//! has
 //!
 //! * a derived `Debug` over a field whose type names a carrier anywhere in it, its generic
 //!   arguments included, or
@@ -23,6 +25,26 @@
 //! workspace that it does not list, a name it cannot place, a generic parameter formatted by hand,
 //! an expression it does not read. `shown!("{}", value)` is always read: the compiler holds its
 //! parts to `Plain`.
+//!
+//! Each name is placed as the compiler places it, through scopes, imports, globs, namespaces and
+//! every set of `cfg` conditions, and a name this reading cannot place counts against the code: in
+//! the two crates a trait, a macro, an attribute or a derive it cannot place is a finding where it
+//! is written, and a type it cannot place carries. The name `Debug` itself is the standard
+//! library's alone in the two crates, its trait and its derive: an item named `Debug`, an import
+//! renamed to it, and an import or a glob that can give the name anything else, or that this
+//! reading cannot follow, are findings, so no scope or condition leads the name elsewhere.
+//!
+//! This reads the code the workspace writes, not every program Rust accepts, and it does not try
+//! to hold code written to get past it. What it does not read:
+//!
+//! * the traits, imports and modules that a macro writes at item level in another crate: no scope
+//!   gives their names here (the types and the `Debug`s it writes are read as above). So a glob
+//!   of that crate can give a name this reading does not know of, which it then places where the
+//!   scopes around the glob place it. In the two crates, outside the files that define what may
+//!   be shown, a macro used is one this reading reads or lists, or a finding;
+//! * values: a function, a constant or a static is not read, so a glob that gives the name `Debug`
+//!   only to one of them is not found. The compiler never takes a value for a type, a trait or a
+//!   macro.
 
 use super::*;
 
