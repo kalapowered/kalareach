@@ -270,7 +270,7 @@ pub fn run(paths: &HostPaths, arguments: &StartupArguments, json: bool) -> Resul
 }
 
 /// What `kr host startup` changed.
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct Changed {
     /// What a person should know about what the service manager holds.
     notes: Vec<String>,
@@ -1228,7 +1228,7 @@ pub(crate) mod task {
 
     /// What the environment's task is, read for a person: whose it is, whether it is the one this
     /// installation registers, and whether a start can use it now.
-    #[derive(Clone, Debug, PartialEq, Eq)]
+    #[derive(Clone, PartialEq, Eq)]
     pub struct Report {
         /// The environment.
         pub environment_id: EnvironmentId,
@@ -1401,7 +1401,6 @@ mod windows {
     }
 
     /// What `kr host startup` did to the environment's task.
-    #[derive(Debug)]
     pub struct TaskChanged {
         /// What changed.
         change: TaskChange,
