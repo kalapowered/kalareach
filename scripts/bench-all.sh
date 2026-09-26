@@ -15,8 +15,8 @@
 #   descriptions  scripts/bench-descriptions.sh               KR-PERF-009, where the host can hold
 #                                                             its budget
 #
-# KR-PERF-010 is measured on a paired phone against the voice provider, so a run names it as not
-# run here, with that reason.
+# KR-PERF-010 is measured on a paired phone with a connected media path to the voice provider, so a
+# run names it as not run here, with that reason.
 #
 # Every measurement writes its figures under KR_TEST_ARTIFACTS_DIR as Markdown sections headed by
 # the identifier they measure (`## KR-PERF-007 ...`). For each identifier this script adds a section
@@ -412,7 +412,14 @@ if selected descriptions; then
     section "KR-PERF-009 local session descriptions, not run here" "reason            $refusal"
   else
     run_step descriptions "" bash scripts/bench-descriptions.sh
-    figures="$(sed -n '/^# KR-PERF-009/,$ p' "$evidence/descriptions.log" | sed '1d')"
+    # The benchmark's own lines, which end with the hardware they were taken on, and not what the
+    # model's runtime logs beside them; a line repeated for every job is given once, with a count.
+    machine="$(sed -n 's/^hardware: //p' "$evidence/descriptions.log" | head -1)"
+    figures="$(sed -n '/^# KR-PERF-009/,$ p' "$evidence/descriptions.log" | sed '1d' |
+      awk -v tag="[$machine]" '
+        /^(hardware|profile|runtime|gpu_layers): / || /^--- / ||
+          (length($0) >= length(tag) && substr($0, length($0) - length(tag) + 1) == tag)' |
+      uniq -c | awk '{ count = $1; sub(/^ *[0-9]+ /, ""); print (count > 1 ? count " times: " : "") $0 }')"
     if [ -n "$figures" ]; then
       {
         printf '## KR-PERF-009 local session descriptions\n\n'
@@ -426,7 +433,7 @@ if selected descriptions; then
 fi
 if [ -z "$only" ]; then
   section "KR-PERF-010 voice, not run here" \
-    "reason            first audio and delegation latency are measured on a paired phone against the voice provider, by the web's voice tests and scripts/e2e-voice-device.sh, not on a host"
+    "reason            first audio and delegation latency are measured on a paired phone with a connected media path to the voice provider, and the voice service records what starting each call took; neither is measured on a host"
 fi
 
 # Which identifiers each step measures.
