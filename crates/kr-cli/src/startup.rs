@@ -1369,8 +1369,9 @@ mod windows {
 
     use kr_client::shown;
     use kr_client::shown::Shown;
+    use kr_controller::supervision;
     use kr_controller::supervision::windows::{
-        self as scheduled, Standing, TaskChange, TaskDefinition,
+        Registration, Standing, TaskChange, TaskDefinition, TaskError,
     };
     use kr_ipc::paths::EnvironmentPaths;
     use kr_ipc::starter::Withdrawal;
@@ -1399,7 +1400,7 @@ mod windows {
         /// What changed.
         change: TaskChange,
         /// A task under the name that `--clear` left, and why.
-        left: Option<scheduled::TaskError>,
+        left: Option<TaskError>,
     }
 
     impl TaskChanged {
@@ -1471,7 +1472,7 @@ mod windows {
         }
         // Held until the document is written or the task is put back, so another environment
         // whose task shares the name cannot change it in between.
-        let registration = scheduled::registration(&definition)
+        let registration = supervision::windows::registration(&definition)
             .map_err(|error| refused(&error, environment_id))?;
         let changed = if standalone {
             let change = registration
@@ -1502,13 +1503,10 @@ mod windows {
 
     /// The failure of a change to the environment's task, which says whether the task is as it
     /// was.
-    fn refused(
-        error: &scheduled::TaskError,
-        environment_id: kr_protocol::ids::EnvironmentId,
-    ) -> CliError {
+    fn refused(error: &TaskError, environment_id: kr_protocol::ids::EnvironmentId) -> CliError {
         let said = task::error(error, environment_id);
         match error {
-            scheduled::TaskError::Locked(_) => {
+            TaskError::Locked(_) => {
                 CliError::HostUnavailable(shown!("{}; nothing was changed", said))
             }
             _ if error.changed_nothing() => {
@@ -1524,7 +1522,7 @@ mod windows {
     /// put back under the registration the change was made under, which is still held.
     fn put_back(
         environment: &EnvironmentPaths,
-        registration: &scheduled::Registration<'_>,
+        registration: &Registration<'_>,
         change: &TaskChange,
         prior: Option<ControllerStartup>,
         error: &CliError,
@@ -1554,12 +1552,12 @@ mod windows {
     pub fn report(environment: &EnvironmentPaths, selected: bool) -> Option<task::Report> {
         let program = super::daemon_program().ok()?;
         let definition = definition(environment, &program).ok()?;
-        let standing = scheduled::standing(&definition);
+        let standing = supervision::windows::standing(&definition);
         if !selected && !matches!(standing, Ok(Standing::Owned(_))) {
             return None;
         }
         let last_result = match standing {
-            Ok(Standing::Owned(_)) => scheduled::last_result(&definition).ok(),
+            Ok(Standing::Owned(_)) => supervision::windows::last_result(&definition).ok(),
             _ => None,
         };
         Some(task::Report {
@@ -1597,7 +1595,7 @@ mod windows {
         let environment_id = environment.environment_id();
         let name = task::name(environment_id);
         let held = crate::service_manager::lock(environment)?;
-        match scheduled::standing(&definition) {
+        match supervision::windows::standing(&definition) {
             Ok(Standing::Owned(differences)) if differences.is_empty() => {}
             Ok(Standing::Owned(differences)) => {
                 return Err(CliError::HostUnavailable(shown!(
@@ -1662,17 +1660,15 @@ mod windows {
             },
         )
         .map_err(CliError::Ipc)?;
-        if let Err(failure) = scheduled::run(&definition) {
+        if let Err(failure) = supervision::windows::run(&definition) {
             // A run can fail after the Task Scheduler began it, and another command's run can
             // have a starter take this request: only a request withdrawn before any starter took
             // it has nothing started for it.
             if let Ok(Withdrawal::Withdrawn) = kr_ipc::starter::withdraw_claim(environment, request)
             {
                 let asked = match failure {
-                    kr_controller::supervision::RunFailure::NotRun(_) => {
-                        Shown::said("could not be asked to run")
-                    }
-                    kr_controller::supervision::RunFailure::Failed(_) => Shown::said("did not run"),
+                    supervision::RunFailure::NotRun(_) => Shown::said("could not be asked to run"),
+                    supervision::RunFailure::Failed(_) => Shown::said("did not run"),
                 };
                 return Err(CliError::Unfinished {
                     code: kr_protocol::error::ErrorCode::EnvironmentUnavailable,
@@ -1753,7 +1749,7 @@ mod windows {
         let program = super::daemon_program().ok();
         let last = program
             .and_then(|program| definition(environment, &program).ok())
-            .and_then(|definition| scheduled::last_result(&definition).ok())
+            .and_then(|definition| supervision::windows::last_result(&definition).ok())
             .map_or_else(
                 || Shown::said("its last result cannot be read"),
                 task::last_result,
