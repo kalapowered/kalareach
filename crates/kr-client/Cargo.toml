@@ -26,7 +26,8 @@ kr-pairing.workspace = true
 # renders what packages produce, so the contract it renders against is the package contract's.
 kr-plugin-sdk.workspace = true
 kr-protocol.workspace = true
-# Only the projected screen needs it, and only a client with a local terminal to paint has one.
+# Only the projection's painter needs it, to measure text, and only a client with a local terminal
+# to paint uses the painter.
 kr-term = { workspace = true, optional = true }
 kr-transport.workspace = true
 # The managed-service transport, with the feature set the workspace cuts it to.
