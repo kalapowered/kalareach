@@ -99,7 +99,7 @@ steps="${only:-$all_steps}"
 # too) and how much other work may run beside a step, in processors' worth in any five seconds.
 reference_processors=4
 reference_memory_mib=8192
-max_stolen_share=0.01
+max_stolen_percent=1
 quiet_processors=1.0
 
 # What the host is. `processors` is what the measurements can run on, which is what the reference
@@ -164,12 +164,16 @@ cpu_ticks() {
   END { exit !found }' /proc/stat
 }
 
-# The share of the span between two cpu_ticks readings that the hypervisor took.
+# The share of the span between two cpu_ticks readings that the hypervisor took, and whether it is
+# within the limit: "<share> within" or "<share> above". The limit is judged on the counts
+# themselves, and only the share shown is rounded.
 stolen_share() {
-  awk -v a="$1" -v b="$2" 'BEGIN {
-    split(a, x, " "); split(b, y, " "); t = y[1] - x[1]
-    if (t <= 0 || y[2] < x[2]) { print "unread"; exit }
-    printf "%.4f\n", (y[2] - x[2]) / t
+  awk -v a="$1" -v b="$2" -v limit="$max_stolen_percent" 'BEGIN {
+    if (split(a, x, " ") != 2 || split(b, y, " ") != 2) exit 1
+    for (i = 1; i <= 2; i++) if (x[i] !~ /^[0-9]+$/ || y[i] !~ /^[0-9]+$/) exit 1
+    t = y[1] - x[1]; s = y[2] - x[2]
+    if (t <= 0 || s < 0) exit 1
+    printf "%.4f %s\n", s / t, (s * 100 > t * limit ? "above" : "within")
   }'
 }
 
@@ -178,8 +182,13 @@ below() {
   awk -v a="$1" -v b="$2" 'BEGIN { exit !(a + 0 < b + 0) }'
 }
 
-percent() {
-  awk -v s="$1" 'BEGIN { printf "%.2f%%", s * 100 }'
+# A stolen share as a person reads it.
+stolen_words() {
+  case "$1" in
+    "not accounted on this platform") printf '%s' "$1" ;;
+    *" within" | *" above") awk -v s="${1%% *}" 'BEGIN { printf "%.3f%%", s * 100 }' ;;
+    *) printf 'unread' ;;
+  esac
 }
 
 # The evidence directory, and a working directory of this run's own.
@@ -468,6 +477,7 @@ verdicts() {
 # the record file its figures land in.
 run_step() {
   local step="$1" expected="$2" status logged load_in load_out other_in during ticks_in="" ticks_out
+  local stolen
   local pair identifier file name gained found line watch reader waited began_read text
   shift 2
   echo
@@ -517,8 +527,9 @@ run_step() {
   put "$step" other_during "$during"
   if [ "$stolen_accounted" -eq 0 ]; then
     put "$step" stolen "not accounted on this platform"
-  elif [ -n "$ticks_in" ] && ticks_out="$(cpu_ticks)"; then
-    put "$step" stolen "$(stolen_share "$ticks_in" "$ticks_out")"
+  elif [ -n "$ticks_in" ] && ticks_out="$(cpu_ticks)" &&
+    stolen="$(stolen_share "$ticks_in" "$ticks_out")"; then
+    put "$step" stolen "$stolen"
   else
     put "$step" stolen unread
   fi
@@ -526,7 +537,7 @@ run_step() {
     lost "$evidence/$step.log"
   fi
   echo "  exit $status; other work in processors' worth through the step: $(other_words "$during");" \
-    "load average leaving: $load_out; stolen share: $(get "$step" stolen)"
+    "load average leaving: $load_out; stolen share: $(stolen_words "$(get "$step" stolen)")"
   for pair in $expected; do
     identifier="${pair%%:*}"
     name="${pair#*:}"
@@ -778,13 +789,11 @@ step_shortfalls() {
   done
   stolen="$(get "$1" stolen)"
   case "$stolen" in
-    "" | unread) shortfalls="${shortfalls:+$shortfalls; }the hypervisor's share could not be read" ;;
-    not*) ;;
-    *)
-      if below "$max_stolen_share" "$stolen"; then
-        shortfalls="${shortfalls:+$shortfalls; }the hypervisor took $(percent "$stolen") of the step, above $(percent "$max_stolen_share")"
-      fi
+    "not accounted on this platform" | *" within") ;;
+    *" above")
+      shortfalls="${shortfalls:+$shortfalls; }the hypervisor took $(stolen_words "$stolen") of the step, above $max_stolen_percent%"
       ;;
+    *) shortfalls="${shortfalls:+$shortfalls; }the hypervisor's share could not be read" ;;
   esac
   printf '%s\n' "$shortfalls"
 }
@@ -843,11 +852,7 @@ for identifier in $measured; do
   shortfalls=""
   for step in $ran; do
     case " $(identifiers_of "$step") " in *" $identifier "*) ;; *) continue ;; esac
-    stolen="$(get "$step" stolen)"
-    case "$stolen" in
-      "" | unread | not*) stolen="${stolen:-unread}" ;;
-      *) stolen="$(percent "$stolen")" ;;
-    esac
+    stolen="$(stolen_words "$(get "$step" stolen)")"
     lines+=("step $step  exit $(get "$step" status); load average (1, 5 and 15 minutes) $(get "$step" load_in) entering, $(get "$step" load_out) leaving; other work in processors' worth over the ten seconds before the step $(other_words "$(get "$step" other_in)"), and through the step $(other_words "$(get "$step" other_during)"); stolen share $stolen")
     problems="$(problems_of "$step" "$identifier")"
     if [ "$(get "$step" status)" != 0 ] || [ -n "$problems" ]; then
