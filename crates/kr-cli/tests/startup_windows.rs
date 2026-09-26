@@ -354,6 +354,75 @@ fn a_choice_that_cannot_be_written_leaves_the_task_and_the_choice_as_they_were()
     );
 }
 
+/// KR-REQ-07.12: another environment whose task shares the name cannot take it between a clear and
+/// the putting back of a clear whose choice was not written. `kr` holds the name's registration
+/// from the removal until the task is put back, so the other environment's registration waits,
+/// finds the task put back, and is refused; the task is exactly as it was.
+#[test]
+fn another_environment_waiting_for_the_name_finds_the_task_put_back_after_a_failed_clear() {
+    let host = Host::create();
+    let _task = host.removes_its_task();
+    let name = host.definition().name;
+    let chose = host.kr(&["--json", "host", "startup", "--set", "standalone"]);
+    assert!(chose.status.success(), "{}", document(&chose, "the choice"));
+    let before = exported(&name).expect("the environment's task");
+    let theirs = TaskDefinition {
+        environment_id: EnvironmentId::new(kr_ipc::new_uuid()),
+        ..host.definition()
+    };
+    let _theirs = Registered(theirs.clone());
+
+    let held = kr_protocol::hostinfo::configuration::lock(host.environment().state_dir())
+        .expect("this test holds the document's lock");
+    let clearing = Command::new(support::kr())
+        .args(["--json", "host", "startup", "--clear"])
+        .env(
+            kr_ipc::paths::RUNTIME_DIR_VARIABLE,
+            host.temp.paths().runtime_root(),
+        )
+        .env(
+            kr_ipc::paths::STATE_DIR_VARIABLE,
+            host.temp.paths().state_root(),
+        )
+        .current_dir(installation())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("kr host startup --clear starts");
+    // The clear has removed the task, holding the name's registration, and waits for the document.
+    let removed = Instant::now();
+    while exported(&name).is_some() {
+        assert!(
+            removed.elapsed() < LIVENESS_DEADLINE,
+            "the clear removes the environment's task"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let registering = std::thread::spawn(move || scheduled::register(&theirs));
+    let output = finish(clearing, "kr host startup --clear");
+    drop(held);
+    let registered = registering.join().expect("the other registration ends");
+    let refused = document(&output, "a clear whose choice cannot be written");
+    assert_eq!(output.status.code(), Some(2), "{refused}");
+    assert!(
+        refused["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("is as it was"),
+        "{refused}"
+    );
+    assert!(
+        matches!(registered, Err(scheduled::TaskError::Foreign(_))),
+        "the other environment waited, found the task put back and was refused: {registered:?}"
+    );
+    assert_eq!(
+        exported(&name).as_deref(),
+        Some(before.as_str()),
+        "the task is exactly as it was"
+    );
+}
+
 /// KR-REQ-07.12, KR-REQ-07.13: `--clear` removes the environment's own task and the choice; a task
 /// under the name that is not the environment's own is reported and left, and the choice is
 /// cleared all the same.
