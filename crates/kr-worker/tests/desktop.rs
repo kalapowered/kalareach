@@ -116,10 +116,14 @@ impl Host {
     async fn start(&self) -> RunningDaemon {
         let environment = self.paths();
         let environment_id = self.environment_id;
+        // The daemon this one replaces may not have let go of the environment yet, which the start
+        // waits out: what a restart test asserts is that the replacement takes the environment
+        // over, not how soon the runtime drops the last reference to the one before it. Anything
+        // else fails at once.
         let started = std::time::Instant::now();
-        let controller = loop {
+        let controller = kr_controller::testing::taken_over(|| {
             let secrets = environment.secrets_dir();
-            let outcome = Controller::start(ControllerSetup {
+            Controller::start(ControllerSetup {
                 paths: environment.clone(),
                 environment_id,
                 identity: Box::new(move || {
@@ -141,22 +145,14 @@ impl Host {
                 shell_packages: None,
                 terminal: Box::new(kr_controller::supervision::NoTerminal),
             })
-            .await;
-            match outcome {
-                Ok(controller) => break controller,
-                // The daemon this one replaces has not let go of the environment yet. Waiting for
-                // it is a liveness condition: what a restart test asserts is that the replacement
-                // takes the environment over, not how soon the runtime drops the last reference to
-                // the one before it. Anything else fails at once.
-                Err(kr_controller::ControllerError::AlreadyRunning { .. })
-                    if started.elapsed() < ENVIRONMENT_HANDOVER_DEADLINE => {}
-                Err(error) => panic!(
-                    "the daemon did not start in {:.1?}: {error}",
-                    started.elapsed()
-                ),
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        };
+        })
+        .await
+        .unwrap_or_else(|error| {
+            panic!(
+                "the daemon did not start in {:.1?}: {error}",
+                started.elapsed()
+            )
+        });
         let rendezvous = Listener::bind(&environment.rendezvous_endpoint().expect("an endpoint"))
             .expect("binds the rendezvous");
         let clients = Listener::bind(&environment.controller_endpoint().expect("an endpoint"))
@@ -200,14 +196,6 @@ impl RunningDaemon {
         drop(self.controller);
     }
 }
-
-/// How long a replacement daemon is given to take the environment over.
-///
-/// The environment's singleton lock is released when the last reference to the controller goes,
-/// which is after the serving tasks have been dropped, and a reference this daemon handed to
-/// something of its own outlives that moment. A bound this generous fails only when the handover
-/// never happens.
-const ENVIRONMENT_HANDOVER_DEADLINE: Duration = Duration::from_secs(120);
 
 fn build() -> BuildId {
     BuildId::new("kr-test/0").expect("a build identifier")

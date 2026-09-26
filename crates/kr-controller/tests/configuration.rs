@@ -2443,56 +2443,40 @@ fn write_document_bytes(environment: &kr_ipc::paths::EnvironmentPaths, bytes: &[
     kr_ipc::paths::write_owner_only_file(&path, bytes).expect("the document");
 }
 
-/// How long a start is given to take over an environment a daemon before it held.
-///
-/// A daemon lets go of its environment once nothing of it is left, and its own tasks can still
-/// hold it for a moment after the test has let it go. A restart can therefore find the environment
-/// held. That is a liveness condition: what these tests assert is that the restart takes the
-/// environment over, not how soon the last reference goes.
-const ENVIRONMENT_HANDOVER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
-
-/// Starts a daemon on an environment that may already hold one daemon's worth of state, and starts
-/// it again while a daemon this test let go still holds the environment, until
-/// [`ENVIRONMENT_HANDOVER_DEADLINE`]. Any other failure fails the test.
+/// Starts a daemon on an environment that may already hold one daemon's worth of state, waiting
+/// out a daemon this test let go that still holds the environment
+/// ([`kr_controller::testing::taken_over`]). Any other failure fails the test.
 async fn start_controller(
     environment: &kr_ipc::paths::EnvironmentPaths,
     environment_id: kr_protocol::ids::EnvironmentId,
 ) -> std::sync::Arc<kr_controller::service::Controller> {
-    let begun = std::time::Instant::now();
-    loop {
+    kr_controller::testing::taken_over(|| {
         let secrets = environment.secrets_dir();
-        let started =
-            kr_controller::service::Controller::start(kr_controller::service::ControllerSetup {
-                paths: environment.clone(),
-                environment_id,
-                identity: Box::new(move || {
-                    let store = kr_crypto::store::open_store_in(&secrets)
-                        .expect("a secret store for the test environment");
-                    Ok(kr_ipc::verify::ControllerIdentity::open(
-                        store.store.as_ref(),
-                        environment_id,
-                        false,
-                    )
-                    .expect("an identity"))
-                }),
-                secret_store: kr_crypto::store::StoreSelection::File,
-                boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
-                supervisor: Box::new(net_support::RefusingSupervisor),
-                worker_program: std::path::PathBuf::from("/nonexistent/kr-worker"),
-                build_id: net_support::build(),
-                release: "0".to_owned(),
-                shell_packages: None,
-                terminal: Box::new(kr_controller::supervision::NoTerminal),
-            })
-            .await;
-        match started {
-            Ok(controller) => return controller,
-            Err(kr_controller::error::ControllerError::AlreadyRunning { .. })
-                if begun.elapsed() < ENVIRONMENT_HANDOVER_DEADLINE => {}
-            Err(error) => panic!("the daemon starts: {error}"),
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
+        kr_controller::service::Controller::start(kr_controller::service::ControllerSetup {
+            paths: environment.clone(),
+            environment_id,
+            identity: Box::new(move || {
+                let store = kr_crypto::store::open_store_in(&secrets)
+                    .expect("a secret store for the test environment");
+                Ok(kr_ipc::verify::ControllerIdentity::open(
+                    store.store.as_ref(),
+                    environment_id,
+                    false,
+                )
+                .expect("an identity"))
+            }),
+            secret_store: kr_crypto::store::StoreSelection::File,
+            boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
+            supervisor: Box::new(net_support::RefusingSupervisor),
+            worker_program: std::path::PathBuf::from("/nonexistent/kr-worker"),
+            build_id: net_support::build(),
+            release: "0".to_owned(),
+            shell_packages: None,
+            terminal: Box::new(kr_controller::supervision::NoTerminal),
+        })
+    })
+    .await
+    .unwrap_or_else(|error| panic!("the daemon starts: {error}"))
 }
 
 /// The fence this environment durably owes, read straight out of its registry.

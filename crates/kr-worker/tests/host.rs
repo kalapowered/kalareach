@@ -329,8 +329,12 @@ impl Host {
 
     async fn start(&self) -> RunningDaemon {
         let environment = self.paths();
+        // The daemon this one replaces may not have let go of the environment yet, which the start
+        // waits out: what a restart test asserts is that the replacement takes the environment
+        // over, not how soon the runtime drops the last reference to the one before it. Anything
+        // else fails at once.
         let started = std::time::Instant::now();
-        loop {
+        kr_controller::testing::taken_over(|| {
             let supervisor = self.temp.supervisor(
                 match (self.worker_packages.clone(), self.launched.clone()) {
                     (Some(packages), _) => Box::new(WorkerWithPackageRoot {
@@ -345,28 +349,20 @@ impl Host {
                     (None, None) => self.platform_supervisor(),
                 },
             );
-            let outcome = start_daemon(
+            start_daemon(
                 &environment,
                 supervisor,
                 self.worker.clone(),
                 self.shell_packages.clone(),
             )
-            .await;
-            match outcome {
-                Ok(daemon) => return daemon,
-                // The daemon this one replaces has not let go of the environment yet. Waiting for
-                // it is a liveness condition: what a restart test asserts is that the replacement
-                // takes the environment over, not how soon the runtime drops the last reference to
-                // the one before it. Anything else fails at once.
-                Err(kr_controller::ControllerError::AlreadyRunning { .. })
-                    if started.elapsed() < ENVIRONMENT_HANDOVER_DEADLINE => {}
-                Err(error) => panic!(
-                    "the daemon did not start in {:.1?}: {error}",
-                    started.elapsed()
-                ),
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
+        })
+        .await
+        .unwrap_or_else(|error| {
+            panic!(
+                "the daemon did not start in {:.1?}: {error}",
+                started.elapsed()
+            )
+        })
     }
 
     async fn client(&self) -> LocalClient {
@@ -436,13 +432,6 @@ async fn start_daemon(
 fn starts_through_the_task() -> bool {
     std::env::var_os("KR_HOST_TEST_SUPERVISOR").is_none_or(|value| value != "detached")
 }
-
-/// How long a replacement daemon is given to take the environment over.
-///
-/// The environment's singleton lock is released when the last reference to the controller goes,
-/// which is after the serving tasks have been dropped, so a replacement starting at once can find
-/// the environment still held. A bound this generous fails only when the handover never happens.
-const ENVIRONMENT_HANDOVER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// A control daemon that is running, and the tasks that are serving for it.
 ///
@@ -1839,7 +1828,7 @@ async fn a_worker_outlives_the_nested_jobs_its_daemon_ran_in() {
         }
     });
     is_ready
-        .recv_timeout(ENVIRONMENT_HANDOVER_DEADLINE)
+        .recv_timeout(kr_controller::testing::ENVIRONMENT_HANDOVER_DEADLINE)
         .expect("the daemon in the nested jobs is ready");
 
     let mut client = host.client().await;

@@ -155,16 +155,15 @@ async fn host_on(clocks: Clocks) -> Host {
 }
 
 /// Starts a daemon on an environment and on `clocks`, waiting out one that is still letting go of
-/// the environment.
+/// the environment ([`kr_controller::testing::taken_over`]).
 async fn start_daemon(
     environment: &kr_ipc::paths::EnvironmentPaths,
     environment_id: EnvironmentId,
     clocks: Clocks,
 ) -> kr_controller::error::Result<Arc<Controller>> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    loop {
+    kr_controller::testing::taken_over(|| {
         let secrets = environment.secrets_dir();
-        let attempt = Controller::start_on_clocks(
+        Controller::start_on_clocks(
             ControllerSetup {
                 paths: environment.clone(),
                 environment_id,
@@ -187,16 +186,8 @@ async fn start_daemon(
             },
             clocks.clone(),
         )
-        .await;
-        match attempt {
-            Err(kr_controller::error::ControllerError::AlreadyRunning { .. })
-                if std::time::Instant::now() < deadline =>
-            {
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            }
-            answered => return answered,
-        }
-    }
+    })
+    .await
 }
 
 async fn client(host: &Host) -> LocalClient {

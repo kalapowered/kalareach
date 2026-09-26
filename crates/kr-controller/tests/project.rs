@@ -111,10 +111,9 @@ async fn host_on(temp: kr_ipc::testing::TempHost, work: Arc<tempfile::TempDir>) 
     // A replacement daemon on the same environment has to wait for the one it replaces to release
     // the singleton lock. The previous daemon's per-connection tasks hold a reference to it, so
     // the release is not instantaneous even after the accept loop is stopped.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    let controller = loop {
+    let controller = kr_controller::testing::taken_over(|| {
         let secrets = environment.secrets_dir();
-        let attempt = Controller::start(ControllerSetup {
+        Controller::start(ControllerSetup {
             paths: environment.clone(),
             environment_id,
             identity: Box::new(move || {
@@ -134,22 +133,9 @@ async fn host_on(temp: kr_ipc::testing::TempHost, work: Arc<tempfile::TempDir>) 
             shell_packages: None,
             terminal: Box::new(kr_controller::supervision::NoTerminal),
         })
-        .await;
-        match attempt {
-            Ok(controller) => break controller,
-            Err(error) if std::time::Instant::now() < deadline => {
-                assert!(
-                    matches!(
-                        error,
-                        kr_controller::error::ControllerError::AlreadyRunning { .. }
-                    ),
-                    "the daemon starts: {error}"
-                );
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            }
-            Err(error) => panic!("the daemon starts: {error}"),
-        }
-    };
+    })
+    .await
+    .unwrap_or_else(|error| panic!("the daemon starts: {error}"));
     let endpoint = environment.controller_endpoint().expect("an endpoint");
     let listener = Listener::bind(&endpoint).expect("binds the endpoint");
     let clients = tokio::spawn(Arc::clone(&controller).serve_clients(listener));

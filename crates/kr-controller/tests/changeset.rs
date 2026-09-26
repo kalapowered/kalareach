@@ -88,10 +88,9 @@ async fn host() -> Host {
     let temp = kr_ipc::testing::TempHost::create();
     let environment = temp.environment();
     let environment_id = temp.environment_id();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    let controller = loop {
+    let controller = kr_controller::testing::taken_over(|| {
         let secrets = environment.secrets_dir();
-        let attempt = Controller::start(ControllerSetup {
+        Controller::start(ControllerSetup {
             paths: environment.clone(),
             environment_id,
             identity: Box::new(move || {
@@ -111,22 +110,9 @@ async fn host() -> Host {
             shell_packages: None,
             terminal: Box::new(kr_controller::supervision::NoTerminal),
         })
-        .await;
-        match attempt {
-            Ok(controller) => break controller,
-            Err(error) if std::time::Instant::now() < deadline => {
-                assert!(
-                    matches!(
-                        error,
-                        kr_controller::error::ControllerError::AlreadyRunning { .. }
-                    ),
-                    "the daemon starts: {error}"
-                );
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            }
-            Err(error) => panic!("the daemon starts: {error}"),
-        }
-    };
+    })
+    .await
+    .unwrap_or_else(|error| panic!("the daemon starts: {error}"));
     let endpoint = environment.controller_endpoint().expect("an endpoint");
     let listener = Listener::bind(&endpoint).expect("binds the endpoint");
     let clients = tokio::spawn(Arc::clone(&controller).serve_clients(listener));

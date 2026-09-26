@@ -2813,23 +2813,15 @@ async fn start_controller() -> (kr_ipc::testing::TempHost, Arc<Controller>) {
     (temp, controller)
 }
 
-/// How long a daemon is given to take over an environment a daemon before it held.
-///
-/// A daemon lets go of its environment once nothing of it is left, and its own tasks can still hold
-/// it for a moment after the test has let it go. A replacement started at once can therefore find
-/// the environment held. That is a liveness condition: what these tests assert is that the
-/// replacement takes the environment over, not how soon the last reference goes.
-const ENVIRONMENT_HANDOVER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
-
 /// Starts a daemon over an environment that may already hold what an earlier one left, waiting
-/// for a daemon this test let go to let go of the environment.
+/// for a daemon this test let go to let go of the environment
+/// ([`kr_controller::testing::taken_over`]).
 async fn start_controller_in(temp: &kr_ipc::testing::TempHost) -> Arc<Controller> {
     let environment = temp.environment();
     let environment_id = temp.environment_id();
-    let begun = std::time::Instant::now();
-    loop {
+    kr_controller::testing::taken_over(|| {
         let secrets = environment.secrets_dir();
-        let outcome = Controller::start(ControllerSetup {
+        Controller::start(ControllerSetup {
             paths: environment.clone(),
             environment_id,
             identity: Box::new(move || {
@@ -2849,15 +2841,9 @@ async fn start_controller_in(temp: &kr_ipc::testing::TempHost) -> Arc<Controller
             shell_packages: None,
             terminal: Box::new(kr_controller::supervision::NoTerminal),
         })
-        .await;
-        match outcome {
-            Ok(controller) => return controller,
-            Err(kr_controller::error::ControllerError::AlreadyRunning { .. })
-                if begun.elapsed() < ENVIRONMENT_HANDOVER_DEADLINE => {}
-            Err(error) => panic!("the daemon starts: {error}"),
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
+    })
+    .await
+    .unwrap_or_else(|error| panic!("the daemon starts: {error}"))
 }
 
 fn dummy_grant(device_id: DeviceId) -> Grant {

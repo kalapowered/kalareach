@@ -81,16 +81,6 @@ async fn host() -> Host {
     host_on(kr_ipc::testing::TempHost::create()).await
 }
 
-/// How long a replacement daemon is given to take the environment over.
-///
-/// A daemon in this suite ends in the process that started it, and the environment's lock is
-/// released when the last reference to the controller goes. Awaiting the two listener tasks does
-/// not account for every reference: a connection task the daemon spawned of its own, or a sweep
-/// still running, holds one too. So a replacement starting at once can find the environment held.
-/// That is a liveness condition: what these tests assert is that the replacement takes the
-/// environment over, not how soon the last reference goes.
-const ENVIRONMENT_HANDOVER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
-
 /// Starts a daemon on an environment that may already hold a transfer journal.
 async fn host_on(temp: kr_ipc::testing::TempHost) -> Host {
     let environment = temp.environment();
@@ -146,7 +136,8 @@ fn setup(
     }
 }
 
-/// Starts the controller, waiting for a daemon this one replaces to let go of the environment.
+/// Starts the controller, waiting for a daemon this one replaces to let go of the environment
+/// ([`kr_controller::testing::taken_over`]).
 ///
 /// Anything other than the environment still being held fails at once, with what it said and how
 /// long the start had been going.
@@ -155,19 +146,14 @@ async fn start_controller(
     environment_id: EnvironmentId,
 ) -> Arc<Controller> {
     let started = std::time::Instant::now();
-    loop {
-        let outcome = Controller::start(setup(environment, environment_id)).await;
-        match outcome {
-            Ok(controller) => return controller,
-            Err(kr_controller::error::ControllerError::AlreadyRunning { .. })
-                if started.elapsed() < ENVIRONMENT_HANDOVER_DEADLINE => {}
-            Err(error) => panic!(
+    kr_controller::testing::taken_over(|| Controller::start(setup(environment, environment_id)))
+        .await
+        .unwrap_or_else(|error| {
+            panic!(
                 "the daemon did not start in {:.1?}: {error}",
                 started.elapsed()
-            ),
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
+            )
+        })
 }
 
 async fn client(host: &Host) -> LocalClient {

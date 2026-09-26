@@ -71,10 +71,11 @@ fn serve_a_control_daemon_for_the_kill_test() {
                 .expect("the host's roots");
             let environment_id = paths.open_environment_id().expect("the environment");
             let environment = paths.environment(environment_id);
-            let started = std::time::Instant::now();
-            let controller = loop {
+            // The killed daemon's environment lock goes with its process; the start waits for the
+            // kernel to let go of it, which is a liveness condition, not a measurement.
+            let controller = kr_controller::testing::taken_over(|| {
                 let secrets = environment.secrets_dir();
-                match Controller::start(ControllerSetup {
+                Controller::start(ControllerSetup {
                     paths: environment.clone(),
                     environment_id,
                     identity: Box::new(move || {
@@ -93,19 +94,9 @@ fn serve_a_control_daemon_for_the_kill_test() {
                     shell_packages: None,
                     terminal: Box::new(kr_controller::supervision::NoTerminal),
                 })
-                .await
-                {
-                    Ok(controller) => break controller,
-                    // The killed daemon's environment lock goes with its process; waiting for
-                    // the kernel to let go of it is a liveness condition, not a measurement.
-                    Err(kr_controller::ControllerError::AlreadyRunning { .. })
-                        if started.elapsed() < LIVENESS_DEADLINE =>
-                    {
-                        tokio::time::sleep(Duration::from_millis(20)).await;
-                    }
-                    Err(error) => panic!("the daemon did not start: {error}"),
-                }
-            };
+            })
+            .await
+            .unwrap_or_else(|error| panic!("the daemon did not start: {error}"));
             let rendezvous =
                 Listener::bind(&environment.rendezvous_endpoint().expect("an endpoint"))
                     .expect("binds the rendezvous");

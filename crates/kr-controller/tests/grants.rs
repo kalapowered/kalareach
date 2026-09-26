@@ -2677,29 +2677,34 @@ async fn daemon() -> (kr_ipc::testing::TempHost, Arc<Controller>) {
     (temp, controller)
 }
 
-/// Starts a daemon over an environment tree that may already hold another daemon's records.
+/// Starts a daemon over an environment tree that may already hold another daemon's records,
+/// waiting out a daemon this test let go that still holds the environment
+/// ([`kr_controller::testing::taken_over`]).
 async fn start_daemon(temp: &kr_ipc::testing::TempHost) -> Arc<Controller> {
     let environment = temp.environment();
     let environment_id = temp.environment_id();
-    let secrets = environment.secrets_dir();
-    Controller::start(ControllerSetup {
-        paths: environment.clone(),
-        environment_id,
-        identity: Box::new(move || {
-            let store = open_store_in(&secrets).expect("a secret store for the test environment");
-            Ok(
-                ControllerIdentity::open(store.store.as_ref(), environment_id, false)
-                    .expect("an identity"),
-            )
-        }),
-        secret_store: StoreSelection::File,
-        boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
-        supervisor: Box::new(SilentSupervisor),
-        worker_program: std::path::PathBuf::from("/nonexistent/kr-worker"),
-        build_id: BuildId::new("kr-test/0").expect("a build identifier"),
-        release: "0".to_owned(),
-        shell_packages: None,
-        terminal: Box::new(kr_controller::supervision::NoTerminal),
+    kr_controller::testing::taken_over(|| {
+        let secrets = environment.secrets_dir();
+        Controller::start(ControllerSetup {
+            paths: environment.clone(),
+            environment_id,
+            identity: Box::new(move || {
+                let store =
+                    open_store_in(&secrets).expect("a secret store for the test environment");
+                Ok(
+                    ControllerIdentity::open(store.store.as_ref(), environment_id, false)
+                        .expect("an identity"),
+                )
+            }),
+            secret_store: StoreSelection::File,
+            boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
+            supervisor: Box::new(SilentSupervisor),
+            worker_program: std::path::PathBuf::from("/nonexistent/kr-worker"),
+            build_id: BuildId::new("kr-test/0").expect("a build identifier"),
+            release: "0".to_owned(),
+            shell_packages: None,
+            terminal: Box::new(kr_controller::supervision::NoTerminal),
+        })
     })
     .await
     .expect("the daemon starts")
@@ -3007,7 +3012,8 @@ impl Serving {
         clients.abort();
         let _ = clients.await;
         // Each connection's task holds the daemon, and the daemon holds its environment's lock
-        // until the last of them ends.
+        // until the last of them ends. The daemon's own tasks can hold it a moment longer through
+        // a reference this count does not see, which the start waits out.
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while Arc::strong_count(&controller) > 1 {
             assert!(

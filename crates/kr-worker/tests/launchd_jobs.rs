@@ -48,9 +48,6 @@ mod teardown;
 /// while is slow rather than broken.
 const LIVENESS_DEADLINE: Duration = Duration::from_secs(120);
 
-/// How long a replacement daemon is given to take the environment over from the one before it.
-const ENVIRONMENT_HANDOVER_DEADLINE: Duration = Duration::from_secs(120);
-
 /// What `launchctl print` exits with for a domain that is not there.
 const NO_SUCH_DOMAIN: i32 = 112;
 
@@ -129,10 +126,12 @@ impl Host {
         );
         let environment = self.paths();
         let environment_id = self.environment_id;
+        // The daemon this one replaces may not have let go of the environment yet, which the start
+        // waits out.
         let started = Instant::now();
-        let controller = loop {
+        let controller = kr_controller::testing::taken_over(|| {
             let secrets = environment.secrets_dir();
-            let outcome = Controller::start(ControllerSetup {
+            Controller::start(ControllerSetup {
                 paths: environment.clone(),
                 environment_id,
                 identity: Box::new(move || {
@@ -151,19 +150,14 @@ impl Host {
                 shell_packages: None,
                 terminal: Box::new(kr_controller::supervision::NoTerminal),
             })
-            .await;
-            match outcome {
-                Ok(controller) => break controller,
-                // The daemon this one replaces has not let go of the environment yet.
-                Err(kr_controller::ControllerError::AlreadyRunning { .. })
-                    if started.elapsed() < ENVIRONMENT_HANDOVER_DEADLINE => {}
-                Err(error) => panic!(
-                    "the daemon did not start in {:.1?}: {error}",
-                    started.elapsed()
-                ),
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        };
+        })
+        .await
+        .unwrap_or_else(|error| {
+            panic!(
+                "the daemon did not start in {:.1?}: {error}",
+                started.elapsed()
+            )
+        });
         let rendezvous = Listener::bind(&environment.rendezvous_endpoint().expect("an endpoint"))
             .expect("binds the rendezvous");
         let clients = Listener::bind(&environment.controller_endpoint().expect("an endpoint"))
