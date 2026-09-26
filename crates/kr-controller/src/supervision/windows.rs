@@ -1236,9 +1236,10 @@ mod platform {
                     if let Err(error) = create(definition, &definition.xml(), false) {
                         // A creation refused because the name was taken meanwhile, by something
                         // that does not take this lock, leaves that task as it is and says whose
-                        // it is.
-                        return match standing(definition)? {
-                            Standing::Foreign(foreign) => Err(TaskError::Foreign(foreign)),
+                        // it is. Otherwise the creation's own failure stands, a look that fails
+                        // included: it is what says whether anything may have changed.
+                        return match standing(definition) {
+                            Ok(Standing::Foreign(foreign)) => Err(TaskError::Foreign(foreign)),
                             _ => Err(error),
                         };
                     }
