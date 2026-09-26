@@ -126,13 +126,101 @@ struct Area {
 }
 
 impl Area {
-    /// Opens the directory `name` in this one, making it where it is missing.
+    /// Opens the directory `name` in this one, making it where it is missing ([`Self::make`]).
     fn child(&self, name: &str) -> CatalogueResult<Self> {
-        open_child(&self.dir, &self.path.join(name), Path::new(name), true)
+        self.make(Path::new(name))
+    }
+
+    /// Opens the directory `name` in this one without following a link, making it first where it
+    /// is missing, and returns it once its name is confirmed in this one.
+    ///
+    /// A directory's name is an entry in the directory above it, so what the store writes into a
+    /// directory it made survives a crash only once that entry has been flushed. The store confirms
+    /// the name before anything can be written into the directory, and it marks the name as not yet
+    /// confirmed until then: before it makes a directory it leaves a marker beside it, an empty
+    /// directory named by [`marker_of`], and it takes the marker away only once this directory has
+    /// been flushed. So nobody finds the directory under its name without the marker until the name
+    /// is confirmed: a refused flush, a process that stops, and another process making the same
+    /// directory at the same moment all leave the marker, and the next call that reaches the
+    /// directory confirms the name before the directory is used. A directory with no marker beside
+    /// it was confirmed when it was made, or was made before the store marked its directories, and
+    /// is not flushed again. A marker that cannot be made stops the call before the directory is
+    /// made.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogueError::StorageUnavailable`] when the directory or its marker cannot be
+    /// made, when what is at its name is a link or not a directory, and when its name cannot be
+    /// confirmed; that failure names the directory and the one it is in.
+    fn make(&self, name: &Path) -> CatalogueResult<Self> {
+        let path = self.path.join(name);
+        let marker = marker_of(name);
+        let missing = match self.dir.symlink_metadata(name) {
+            Ok(_) => false,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => true,
+            Err(source) => return Err(CatalogueError::storage(&path, &source)),
+        };
+        if missing {
+            self.mark_unconfirmed(&marker)?;
+            match self.dir.create_dir(name) {
+                Ok(()) => {}
+                // Another process made it after the look above; the marker is beside it all the
+                // same.
+                Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(source) => return Err(CatalogueError::storage(&path, &source)),
+            }
+        }
+        // Whatever is at the name now, made here or by another process meanwhile, is used only if
+        // it is a directory and not a link.
+        let made = open_child(&self.dir, &path, name)?;
+        if !missing && !self.marked(&marker)? {
+            return Ok(made);
+        }
+        flush_directory(self, NameKind::Directory).map_err(|error| {
+            CatalogueError::StorageUnavailable {
+                detail: format!(
+                    "{} was made and its name is not confirmed in the directory it is in: {error}",
+                    path.display()
+                ),
+            }
+        })?;
+        // Confirmed. A marker that stays only has the next call flush this directory again.
+        let _ = self.dir.remove_dir(&marker);
+        Ok(made)
+    }
+
+    /// Leaves the marker `marker` in this directory, an empty directory, whether or not another
+    /// process or a call that stopped left it there already. Anything else at that name, a link
+    /// among them, stops the call.
+    fn mark_unconfirmed(&self, marker: &Path) -> CatalogueResult<()> {
+        match self.dir.create_dir(marker) {
+            Ok(()) => Ok(()),
+            Err(source)
+                if source.kind() == std::io::ErrorKind::AlreadyExists
+                    && self
+                        .dir
+                        .symlink_metadata(marker)
+                        .is_ok_and(|found| found.is_dir()) =>
+            {
+                Ok(())
+            }
+            Err(source) => Err(CatalogueError::storage(&self.path.join(marker), &source)),
+        }
+    }
+
+    /// Whether anything is at the marker's name `marker` in this directory. Anything there counts,
+    /// so a directory is never taken as confirmed while something stands at its marker's name.
+    fn marked(&self, marker: &Path) -> CatalogueResult<bool> {
+        match self.dir.symlink_metadata(marker) {
+            Ok(_) => Ok(true),
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(source) => Err(CatalogueError::storage(&self.path.join(marker), &source)),
+        }
     }
 
     /// Opens every directory from this one down to the one `relative` names a file in, making
-    /// each where it is missing when `create` says so, and returns it with the file's name.
+    /// each where it is missing when `create` says so ([`Self::make`]), and returns it with the
+    /// file's name.
     fn parent_of(&self, relative: &Path, create: bool) -> CatalogueResult<(Self, OsString)> {
         let unnamed = || CatalogueError::StorageUnavailable {
             detail: format!(
@@ -147,12 +235,11 @@ impl Area {
             let std::path::Component::Normal(part) = component else {
                 return Err(unnamed());
             };
-            directory = open_child(
-                &directory.dir,
-                &directory.path.join(part),
-                Path::new(part),
-                create,
-            )?;
+            directory = if create {
+                directory.make(Path::new(part))?
+            } else {
+                open_child(&directory.dir, &directory.path.join(part), Path::new(part))?
+            };
         }
         Ok((directory, name))
     }
@@ -218,22 +305,32 @@ fn open_own(path: &Path) -> CatalogueResult<Area> {
     };
     let above = Dir::open_ambient_dir(parent, cap_std::ambient_authority())
         .map_err(|source| CatalogueError::storage(parent, &source))?;
-    open_child(&above, &path, Path::new(name), false)
+    open_child(&above, &path, Path::new(name))
 }
 
-/// Opens the directory `name` in `parent` without following a link, making it first where it is
-/// missing and `create` says so.
+/// The end of the name of the marker that stands beside a directory the store made, in the
+/// directory it is in, until the directory's name is confirmed there ([`Area::make`]).
+///
+/// The marker's name is the directory's behind a dot and before this, and a `~` is in no name the
+/// store gives a directory or a file otherwise: a package's paths are ASCII letters, digits, `.`,
+/// `-` and `_`, and every other name is the store's own. It is an empty directory, so making it
+/// asks of the directory it is in only the right to add a directory, which making the directory it
+/// marks asks anyway.
+const UNCONFIRMED: &str = "~unconfirmed";
+
+/// The name of the marker of the directory `name`: `.<name>~unconfirmed`, in the same directory.
+fn marker_of(name: &Path) -> PathBuf {
+    let mut marker = OsString::from(".");
+    marker.push(name.as_os_str());
+    marker.push(UNCONFIRMED);
+    PathBuf::from(marker)
+}
+
+/// Opens the directory `name` in `parent` without following a link.
 ///
 /// A link, whether it was there before or put there while the directory was made, fails the open
 /// itself, so there is no moment between a check and the open for it to redirect.
-fn open_child(parent: &Dir, path: &Path, name: &Path, create: bool) -> CatalogueResult<Area> {
-    if create {
-        match parent.create_dir(name) {
-            Ok(()) => {}
-            Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(source) => return Err(CatalogueError::storage(path, &source)),
-        }
-    }
+fn open_child(parent: &Dir, path: &Path, name: &Path) -> CatalogueResult<Area> {
     match parent.open_dir_nofollow(name) {
         Ok(dir) => Ok(Area {
             dir,
@@ -310,7 +407,6 @@ fn files_in(area: &Area) -> CatalogueResult<BTreeSet<PathBuf>> {
                     &directory.dir,
                     &directory.path.join(&name),
                     Path::new(&name),
-                    false,
                 )?;
                 pending.push((below, relative.join(&name)));
             } else if kind.is_file() {
@@ -442,12 +538,7 @@ impl StagingEntry {
 
     /// Opens the directory without following a link.
     fn open(&self) -> CatalogueResult<Area> {
-        open_child(
-            &self.staging.dir,
-            &self.path(),
-            Path::new(&self.name),
-            false,
-        )
+        open_child(&self.staging.dir, &self.path(), Path::new(&self.name))
     }
 }
 
@@ -1742,7 +1833,7 @@ impl StagedPackage {
         })
         .map_err(|source| CatalogueError::storage(&destination, &source))?;
         entry.remove = false;
-        let arrived = open_child(&packages.dir, &destination, Path::new(name), false)
+        let arrived = open_child(&packages.dir, &destination, Path::new(name))
             .and_then(|arrived| identity(&arrived));
         let same = arrived.as_ref().is_ok_and(|arrived| *arrived == staged);
         drop(kept);
@@ -1786,12 +1877,7 @@ impl StagedPackage {
     /// not hold the checked bytes.
     fn repair_in_place(&self, packages: &Area) -> CatalogueResult<()> {
         let name = self.digest.to_string();
-        let package = open_child(
-            &packages.dir,
-            &packages.path.join(&name),
-            Path::new(&name),
-            false,
-        )?;
+        let package = open_child(&packages.dir, &packages.path.join(&name), Path::new(&name))?;
         // Every directory between the package and a file it declares has to be a directory, not a
         // link: a rename through a linked directory would write outside the package. The whole
         // package is checked before anything is replaced, so a refusal changes nothing. How many of
@@ -1818,7 +1904,6 @@ impl StagedPackage {
                             &directory.dir,
                             &directory.path.join(part),
                             Path::new(part),
-                            false,
                         )?;
                         depth += 1;
                     }
@@ -1888,7 +1973,6 @@ impl StagedPackage {
                     &directory.dir,
                     &directory.path.join(component),
                     Path::new(component.as_os_str()),
-                    false,
                 )
                 .map_err(|error| stopped(&replaced, error))?;
                 let made_here = depth >= *depth_present;
@@ -2336,7 +2420,6 @@ fn flush_tree(directory: &Area) -> CatalogueResult<()> {
                 &directory.dir,
                 &directory.path.join(&name),
                 Path::new(&name),
-                false,
             )?)?;
         } else {
             holds_file = true;
@@ -3097,26 +3180,59 @@ mod tests {
         let staged = stage_nested(&store, digest);
         let package = owned(|permit| staged.activate(permit)).expect("activated");
 
-        // Every directory from the recreated file up to the package's own holds a new entry.
-        for failing in [
-            package.join("assets/icons"),
-            package.join("assets"),
-            package.clone(),
+        // Every directory from the recreated file up to the package's own holds a new entry. A
+        // directory the repair makes is confirmed in the one it is in before anything is renamed
+        // into it, so a flush refused there refuses the repair before it replaces anything. The
+        // file's own directory is flushed once the file is in it, so a flush refused there leaves
+        // the file in place and whether it survives a crash unknown.
+        for (failing, placed) in [
+            (package.join("assets/icons"), true),
+            (package.join("assets"), false),
+            (package.clone(), false),
         ] {
             std::fs::remove_dir_all(package.join("assets")).expect("removable");
             let staged = stage_nested(&store, digest);
             flush_fault::fail(&failing);
             let outcome = owned(|permit| staged.activate(permit));
             flush_fault::clear();
-            assert!(
-                matches!(outcome, Err(CatalogueError::PublicationUncertain { .. })),
-                "{}: {outcome:?}",
-                failing.display()
-            );
-            assert_eq!(
-                std::fs::read(package.join("assets/icons/icon.bin")).expect("in place"),
-                b"icon"
-            );
+            if placed {
+                assert!(
+                    matches!(outcome, Err(CatalogueError::PublicationUncertain { .. })),
+                    "{}: {outcome:?}",
+                    failing.display()
+                );
+                assert_eq!(
+                    std::fs::read(package.join("assets/icons/icon.bin")).expect("in place"),
+                    b"icon"
+                );
+            } else {
+                assert!(
+                    matches!(outcome, Err(CatalogueError::StorageUnavailable { .. })),
+                    "{}: {outcome:?}",
+                    failing.display()
+                );
+                assert!(
+                    !package.join("assets/icons/icon.bin").exists(),
+                    "{}: nothing was replaced",
+                    failing.display()
+                );
+            }
+        }
+
+        // The next repair confirms what the refused one left unconfirmed, and places the file.
+        let staged = stage_nested(&store, digest);
+        owned(|permit| staged.activate(permit)).expect("repaired");
+        assert_eq!(
+            std::fs::read(package.join("assets/icons/icon.bin")).expect("in place"),
+            b"icon"
+        );
+        for directory in [package.clone(), package.join("assets")] {
+            let markers: Vec<_> = std::fs::read_dir(&directory)
+                .expect("readable")
+                .flatten()
+                .filter(|entry| entry.file_name().to_string_lossy().ends_with(UNCONFIRMED))
+                .collect();
+            assert!(markers.is_empty(), "{}: {markers:?}", directory.display());
         }
     }
 
