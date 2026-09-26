@@ -162,13 +162,130 @@ function ConvertFrom-KrUuidText {
 
 # ---- the endpoint -------------------------------------------------------------------------------
 
+# The accounts a pipe's list may grant besides its owner's own: the machine's own accounts (SYSTEM
+# and the Administrators group), which already hold the machine, and the two placeholders that stand
+# for the owner (CREATOR OWNER and OWNER RIGHTS).
+$script:KR_TRUSTED_ACCOUNTS = @('S-1-5-18', 'S-1-5-32-544', 'S-1-3-0', 'S-1-3-4')
+
+# The type that holds the calls below, once a shell has defined it.
+$script:KrSecurityCalls = $null
+
+# The platform calls that read a kernel object's security descriptor as the kernel stores it,
+# defined once per shell with System.Reflection.Emit, which runs no compiler at shell start.
+#
+# .NET's own reading of a pipe's descriptor, PipeSecurity, rebuilds it and leaves out entries it
+# judges to grant nothing, among them an allow entry with an empty mask or one that only passes to
+# children, and it reads a missing list as one that admits everyone. The check below judges every
+# entry as the kernel stores it, as the host's own client does, so it reads the bytes itself.
+function Get-KrSecurityCalls {
+    if ($null -ne $script:KrSecurityCalls) { return $script:KrSecurityCalls }
+    $name = [System.Reflection.AssemblyName]::new('KalaReach.ShellBridge.Security')
+    $assembly = [System.Reflection.Emit.AssemblyBuilder]::DefineDynamicAssembly(
+        $name, [System.Reflection.Emit.AssemblyBuilderAccess]::Run)
+    $module = $assembly.DefineDynamicModule($name.Name)
+    $type = $module.DefineType('KalaReach.ShellBridge.Security',
+        [System.Reflection.TypeAttributes]'Public, Abstract, Sealed')
+    $pointer = [IntPtr]
+    foreach ($call in @(
+            # The descriptor of the object `handle` names, allocated for the caller: SE_FILE_OBJECT
+            # and the parts asked for; the four part pointers are not asked for.
+            @{ Library = 'advapi32.dll'; Name = 'GetSecurityInfo'; Returns = [uint32]; Parameters = [Type[]]@(
+                    [System.Runtime.InteropServices.SafeHandle], [uint32], [uint32],
+                    $pointer, $pointer, $pointer, $pointer, $pointer.MakeByRefType()) },
+            @{ Library = 'advapi32.dll'; Name = 'GetSecurityDescriptorLength'; Returns = [uint32]; Parameters = [Type[]]@($pointer) },
+            @{ Library = 'kernel32.dll'; Name = 'LocalFree'; Returns = $pointer; Parameters = [Type[]]@($pointer) }
+        )) {
+        $method = $type.DefinePInvokeMethod($call.Name, $call.Library,
+            [System.Reflection.MethodAttributes]'Public, Static, PinvokeImpl, HideBySig',
+            [System.Reflection.CallingConventions]::Standard, $call.Returns, $call.Parameters,
+            [System.Runtime.InteropServices.CallingConvention]::Winapi,
+            [System.Runtime.InteropServices.CharSet]::Unicode)
+        $method.SetImplementationFlags([System.Reflection.MethodImplAttributes]::PreserveSig)
+    }
+    $script:KrSecurityCalls = $type.CreateType()
+    $script:KrSecurityCalls
+}
+
+# Reads a connected pipe's owner and discretionary list as the kernel stores them.
+#
+# The handle goes to the platform as the pipe's own SafeHandle, which keeps it open for the call.
+# The descriptor is copied out of the platform's allocation before that allocation is freed, once.
+function Read-KrPipeDescriptor {
+    param([System.IO.Pipes.PipeStream]$Pipe)
+    $calls = Get-KrSecurityCalls
+    $descriptor = [IntPtr]::Zero
+    # SE_FILE_OBJECT (1); OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION (5).
+    $status = $calls::GetSecurityInfo($Pipe.SafePipeHandle, [uint32]1, [uint32]5,
+        [IntPtr]::Zero, [IntPtr]::Zero, [IntPtr]::Zero, [IntPtr]::Zero, [ref]$descriptor)
+    if ($status -ne 0) { throw [System.ComponentModel.Win32Exception]::new([int]$status) }
+    try {
+        $length = [int]$calls::GetSecurityDescriptorLength($descriptor)
+        $bytes = [byte[]]::new($length)
+        [System.Runtime.InteropServices.Marshal]::Copy($descriptor, $bytes, 0, $length)
+    } finally {
+        [void]$calls::LocalFree($descriptor)
+    }
+    [System.Security.AccessControl.RawSecurityDescriptor]::new($bytes, 0)
+}
+
+# Returns why a pipe's descriptor is not one this shell may send its hello to, or nothing when it is.
+#
+# The host's own client's rule, applied to the descriptor as the kernel stores it: the owner is this
+# account's user or the owner this process's new objects receive (`Own`, as identifiers); the list is
+# present and protected from what anything above it passes down; every allow entry, whatever its
+# mask or flags, names one of those two or an account that already holds the machine; denial, audit
+# and alarm entries grant nothing and pass; an entry of any other kind is one this rule does not read,
+# and refuses.
+function Test-KrPipeDescriptor {
+    param([System.Security.AccessControl.RawSecurityDescriptor]$Descriptor, [string[]]$Own)
+    $owner = $Descriptor.Owner
+    if ($null -eq $owner) { return 'it records no owner' }
+    if ($Own -notcontains $owner.Value) {
+        return "it belongs to $($owner.Value), and this shell runs as another account"
+    }
+    $protected = [System.Security.AccessControl.ControlFlags]::DiscretionaryAclProtected
+    if (($Descriptor.ControlFlags -band $protected) -ne $protected) {
+        return 'it inherits its access-control list from above it, which can widen it at any time'
+    }
+    $list = $Descriptor.DiscretionaryAcl
+    if ($null -eq $list) {
+        return 'it carries no access-control list, which grants every account full access'
+    }
+    foreach ($entry in $list) {
+        $kind = [int]$entry.AceType
+        # Access denied, system audit and system alarm.
+        if ($kind -in 1, 2, 3) { continue }
+        if ($kind -ne 0) {
+            return "its access-control list carries a type-$kind entry, which this shell does not evaluate"
+        }
+        $account = $entry.SecurityIdentifier.Value
+        if ($Own -notcontains $account -and $script:KR_TRUSTED_ACCOUNTS -notcontains $account) {
+            return "its access-control list grants access to $account, which is neither its owner nor an account that already holds this machine"
+        }
+    }
+    $null
+}
+
+# Returns why the pipe this client reached is not this account's own, or nothing when it is.
+function Test-KrPipeServer {
+    param([System.IO.Pipes.PipeStream]$Pipe)
+    try {
+        $descriptor = Read-KrPipeDescriptor $Pipe
+        $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+        try {
+            $own = @($identity.User, $identity.Owner) |
+                Where-Object { $null -ne $_ } | ForEach-Object { $_.Value }
+        } finally { $identity.Dispose() }
+    } catch {
+        return "its owner and access-control list could not be read: $($_.Exception.Message)"
+    }
+    Test-KrPipeDescriptor $descriptor @($own)
+}
+
 function Connect-KrEndpoint {
     param([string]$Path)
     try {
         if ($IsWindows) {
-            # A named pipe is the platform's own owner-only endpoint. Running the module on Windows
-            # is qualified separately from this package's own tests.
-            #
             # The bootstrap address holds the full `\\.\pipe\` path an external client connects to.
             # NamedPipeClientStream expects the pipe name alone and supplies the server and
             # namespace itself, so connecting with the prefix passes it twice and fails. Strip the
@@ -178,10 +295,28 @@ function Connect-KrEndpoint {
             } else {
                 $Path
             }
+            # The pipe namespace is shared by every account, so the name the worker exported can be
+            # held by a pipe another account created first. The pipe is opened for identification
+            # only: the server may read which account this is, as the worker does to prove it, and
+            # never act as this account. Then, before a byte is written, the pipe itself has to be
+            # this account's own; one that is not gets nothing, and the shell carries on without
+            # integration as it does when the connect fails.
             $pipe = [System.IO.Pipes.NamedPipeClientStream]::new(
                 '.', $name, [System.IO.Pipes.PipeDirection]::InOut,
-                [System.IO.Pipes.PipeOptions]::Asynchronous)
-            $pipe.Connect(2000)
+                [System.IO.Pipes.PipeOptions]::Asynchronous,
+                [System.Security.Principal.TokenImpersonationLevel]::Identification)
+            try {
+                $pipe.Connect(2000)
+            } catch {
+                $pipe.Dispose()
+                return $null
+            }
+            $refused = Test-KrPipeServer $pipe
+            if ($null -ne $refused) {
+                Write-KrTrace "the endpoint was refused before the hello: $refused"
+                $pipe.Dispose()
+                return $null
+            }
             return $pipe
         }
         $endpoint = [System.Net.Sockets.UnixDomainSocketEndPoint]::new($Path)
