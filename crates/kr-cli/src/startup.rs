@@ -946,37 +946,146 @@ pub(crate) mod task {
     /// the name the Task Scheduler lists it under in its root folder. It is derived here from a
     /// fixed name and an identifier, so it is said whole, as a path this program derived is.
     pub fn name(environment_id: EnvironmentId) -> Shown {
-        todo!("not built yet")
+        Shown::root(Path::new(&task_name(environment_id)))
     }
 
     /// One way the task differs from the one this installation registers.
     pub fn difference(difference: &Difference) -> Shown {
-        todo!("not built yet")
+        match difference {
+            Difference::Program { .. } => {
+                Shown::said("it runs another program than this installation's kr-controller")
+            }
+            Difference::Arguments { .. } => {
+                Shown::said("it gives its program other arguments than this installation's")
+            }
+            Difference::WorkingDirectory { .. } => {
+                Shown::said("it runs in another directory than the environment's state directory")
+            }
+            Difference::Actions(count) => shown!("it has {} actions, not one", *count),
+            Difference::Triggered => {
+                Shown::said("it has a trigger, so it runs without being asked")
+            }
+            Difference::Logon { found, expected } => shown!(
+                "it logs on as {}, not {}",
+                found.map_or("something kr does not register", LogonType::as_str),
+                expected.as_str()
+            ),
+            Difference::RunLevel(_) => Shown::said("it runs with more than the least privilege"),
+            Difference::NotOnBatteries => Shown::said("it does not start on batteries"),
+            Difference::StopsOnBatteries => {
+                Shown::said("it stops when the machine goes on batteries")
+            }
+            Difference::WaitsForIdle => Shown::said("it waits for the machine to be idle"),
+            Difference::StopsWhenBusy => Shown::said("it stops when the machine stops being idle"),
+            Difference::WaitsForNetwork => Shown::said("it waits for a network"),
+            Difference::NotOnDemand => Shown::said("it may not be run when asked"),
+            Difference::NotParallel(_) => {
+                Shown::said("a second run while one is running is not in parallel")
+            }
+            Difference::TimeLimited(_) => Shown::said("its runs are limited in time"),
+            Difference::Priority(_) => Shown::said("it runs at another priority than the normal 5"),
+            Difference::Disabled => Shown::said("it is disabled"),
+        }
     }
 
     /// Every way the task differs, one after another.
     pub fn differences(differences: &[Difference]) -> Shown {
-        todo!("not built yet")
+        Shown::joined(differences.iter().map(difference), "; ")
     }
 
     /// Why a task under the environment's name is not its own.
-    pub fn foreign(reason: &ForeignReason) -> &'static str {
-        todo!("not built yet")
+    pub const fn foreign(reason: &ForeignReason) -> &'static str {
+        match reason {
+            ForeignReason::Unreadable { .. } => {
+                "this user cannot read it, so whose it is cannot be established"
+            }
+            ForeignReason::Account { .. } => "it runs as another account",
+            ForeignReason::Environment { .. } => "it belongs to another environment of this user's",
+        }
     }
 
     /// Why a look at, or a change to, the environment's task did not happen.
     pub fn error(error: &TaskError, environment_id: EnvironmentId) -> Shown {
-        todo!("not built yet")
+        let name = name(environment_id);
+        match error {
+            TaskError::Foreign(foreign) => shown!(
+                "a task named {} is registered and is not this environment's own: {}; kr neither \
+                 replaces nor removes it",
+                name,
+                self::foreign(&foreign.reason)
+            ),
+            TaskError::Scheduler {
+                asked,
+                code: Some(code),
+                ..
+            } => shown!(
+                "the Task Scheduler did not {} the scheduled task {} (exit code {}); schtasks \
+                 /Query /TN {} shows what it holds",
+                asked.as_str(),
+                name,
+                *code,
+                name
+            ),
+            TaskError::Scheduler {
+                asked, code: None, ..
+            } => shown!(
+                "the Task Scheduler could not be asked to {} the scheduled task {}",
+                asked.as_str(),
+                name
+            ),
+            TaskError::ReadBack {
+                differences: Some(differences),
+                undone,
+                ..
+            } => shown!(
+                "the scheduled task {} was changed and does not read back as it was asked to be ({}); \
+                 the change was {}",
+                name,
+                self::differences(differences),
+                if *undone { "undone" } else { "not undone" }
+            ),
+            TaskError::ReadBack {
+                differences: None,
+                undone,
+                ..
+            } => shown!(
+                "the scheduled task {} was changed and cannot be found; the change was {}",
+                name,
+                if *undone { "undone" } else { "not undone" }
+            ),
+            TaskError::Locked(_) => shown!(
+                "another change to the scheduled task {} held it for longer than the wait, or its \
+                 lock could not be taken",
+                name
+            ),
+            TaskError::Unwritten(_) => shown!(
+                "the definition of the scheduled task {} could not be written in the environment's \
+                 state directory",
+                name
+            ),
+        }
     }
 
     /// How the task's last run ended, which is one result for all of its runs.
     pub fn last_result(result: LastResult) -> Shown {
-        todo!("not built yet")
+        match result {
+            LastResult::NotRun => Shown::said("it has not run since it was registered"),
+            LastResult::Running => Shown::said("a run of it is under way"),
+            LastResult::Ended(0) => Shown::said("its last run succeeded"),
+            LastResult::Ended(code) => shown!(
+                "its last run ended with code 0x{}",
+                Shown::hexadecimal(u64::from(code))
+            ),
+        }
     }
 
     /// The word a report's `--json` form gives a last result.
     pub fn last_result_word(result: LastResult) -> String {
-        todo!("not built yet")
+        match result {
+            LastResult::NotRun => "not_run".to_owned(),
+            LastResult::Running => "running".to_owned(),
+            LastResult::Ended(code) => format!("0x{code:08x}"),
+        }
     }
 
     /// What the environment's task is, read for a person: whose it is, whether it is the one this
@@ -997,24 +1106,117 @@ pub(crate) mod task {
 
     impl Report {
         /// Whose the task is: `own`, `absent`, `foreign` or `unknown`.
-        pub fn ownership(&self) -> &'static str {
-            todo!("not built yet")
+        pub const fn ownership(&self) -> &'static str {
+            match &self.standing {
+                Ok(Standing::Owned(_)) => "own",
+                Ok(Standing::Absent) => "absent",
+                Ok(Standing::Foreign(_)) => "foreign",
+                Err(_) => "unknown",
+            }
         }
 
         /// Whether the task is this environment's own, the one this installation registers, and
         /// runs a program that is there.
         pub fn usable(&self) -> bool {
-            todo!("not built yet")
+            matches!(&self.standing, Ok(Standing::Owned(differences)) if differences.is_empty())
+                && self.program_present
         }
 
         /// Whose the task is, whether it is valid, and whether a start can use it, apart.
         pub fn describe(&self) -> Shown {
-            todo!("not built yet")
+            let name = name(self.environment_id);
+            let whose = match &self.standing {
+                Ok(Standing::Absent) => {
+                    return shown!(
+                        "the scheduled task {} is not registered: {} registers it",
+                        name,
+                        SETUP_ACTION
+                    );
+                }
+                Ok(Standing::Foreign(foreign)) => {
+                    return shown!(
+                        "a task named {} is registered and is not this environment's own: {}; kr \
+                         neither replaces nor removes it",
+                        name,
+                        self::foreign(&foreign.reason)
+                    );
+                }
+                Err(error) => {
+                    return shown!(
+                        "the scheduled task {} cannot be read: {}",
+                        name,
+                        self::error(error, self.environment_id)
+                    );
+                }
+                Ok(Standing::Owned(differences)) => differences,
+            };
+            let valid = if !whose.is_empty() {
+                shown!(
+                    "it differs from the one this installation registers: {}; {} repairs it",
+                    differences(whose),
+                    SETUP_ACTION
+                )
+            } else if self.program_present {
+                Shown::said("it is the one this installation registers")
+            } else {
+                Shown::said(
+                    "it is the one this installation registers, and the program it runs, this \
+                     installation's kr-controller, is not there",
+                )
+            };
+            let available = match self.session {
+                Some(0) => Shown::said(
+                    "this command runs in no interactive session (login session 0), so whether \
+                     you are signed in elsewhere is not known here, and the task starts the \
+                     daemon only in a session where you are signed in",
+                ),
+                Some(session) => shown!(
+                    "you are signed in to login session {}, where the task can start the daemon",
+                    session
+                ),
+                None => Shown::said(
+                    "this command's login session cannot be read, and the task starts the daemon \
+                     only in a session where you are signed in",
+                ),
+            };
+            let last = self.last_result.map_or_else(
+                || Shown::said("its last result cannot be read"),
+                last_result,
+            );
+            shown!(
+                "the scheduled task {} is this environment's own; {}; {}; {}, for all of its \
+                 runs; the daemon it starts runs only while you are signed in, so signing out \
+                 ends it and every session",
+                name,
+                valid,
+                available,
+                last
+            )
         }
 
         /// The report as a command's `--json` output carries it.
         pub fn json(&self) -> serde_json::Value {
-            todo!("not built yet")
+            let differences = match &self.standing {
+                Ok(Standing::Owned(differences)) => differences
+                    .iter()
+                    .map(|found| difference(found).into_string())
+                    .collect::<Vec<_>>(),
+                _ => Vec::new(),
+            };
+            serde_json::json!({
+                "name": name(self.environment_id).into_string(),
+                "ownership": self.ownership(),
+                "valid": match &self.standing {
+                    Ok(Standing::Owned(found)) => Some(found.is_empty()),
+                    _ => None,
+                },
+                "differences": differences,
+                "program_present": self.program_present,
+                "session": self.session,
+                "interactive": self.session.map(|session| session != 0),
+                "last_result": self.last_result.map(last_result_word),
+                "ends_at_sign_out": true,
+            })
         }
     }
 }
@@ -1068,7 +1270,29 @@ mod windows {
     impl TaskChanged {
         /// What was done, for a person.
         pub fn describe(&self, environment_id: kr_protocol::ids::EnvironmentId) -> Shown {
-            todo!("not built yet")
+            let name = task::name(environment_id);
+            let done = match &self.change {
+                TaskChange::Unchanged if self.left.is_some() => Shown::said("nothing was removed"),
+                TaskChange::Unchanged => shown!("the scheduled task {} needed no change", name),
+                TaskChange::Registered => shown!("registered the scheduled task {}", name),
+                TaskChange::Repaired { .. } => shown!(
+                    "registered the scheduled task {} again, as this installation registers it",
+                    name
+                ),
+                TaskChange::Removed { .. } => shown!(
+                    "removed the scheduled task {}; a daemon or worker it started keeps running",
+                    name
+                ),
+            };
+            match &self.left {
+                Some(left) => shown!(
+                    "{}; left {}: {}",
+                    done,
+                    name,
+                    task::error(left, environment_id)
+                ),
+                None => done,
+            }
         }
 
         /// What was done, as a command's `--json` output carries it.
@@ -1099,7 +1323,77 @@ mod windows {
         startup: Option<ControllerStartup>,
         change: &Change,
     ) -> Result<TaskChanged> {
-        todo!("not built yet")
+        let program = super::daemon_program()?;
+        let definition = definition(environment, &program)?;
+        let environment_id = environment.environment_id();
+        let changed = if startup == Some(ControllerStartup::Standalone) {
+            if !program.is_file() {
+                return Err(CliError::Usage(shown!(
+                    "the standalone start runs the control daemon installed beside this command, \
+                     {}, and there is none there; nothing was changed",
+                    Shown::root(&program)
+                )));
+            }
+            let change = scheduled::set_up(&definition).map_err(|error| {
+                CliError::Usage(shown!(
+                    "{}; nothing was changed",
+                    task::error(&error, environment_id)
+                ))
+            })?;
+            TaskChanged { change, left: None }
+        } else {
+            match scheduled::clear(&definition) {
+                Ok(change) => TaskChanged { change, left: None },
+                Err(error) => TaskChanged {
+                    change: TaskChange::Unchanged,
+                    left: Some(error),
+                },
+            }
+        };
+        let prior = super::Chosen::read(environment).controller;
+        if let Err(error) = crate::doctor::configuration::apply(environment, change) {
+            return Err(put_back(
+                environment,
+                &definition,
+                &changed.change,
+                prior,
+                &error,
+            ));
+        }
+        Ok(changed)
+    }
+
+    /// The failure of a document write whose task change was undone, or could not be.
+    ///
+    /// The document is replaced whole or not at all, so a write that failed leaves the prior
+    /// choice; it is read again to be sure, and a choice that differs is said.
+    fn put_back(
+        environment: &EnvironmentPaths,
+        definition: &TaskDefinition,
+        change: &TaskChange,
+        prior: Option<ControllerStartup>,
+        error: &CliError,
+    ) -> CliError {
+        let environment_id = environment.environment_id();
+        let choice = if super::Chosen::read(environment).controller == prior {
+            Shown::said("startup.controller is as it was")
+        } else {
+            Shown::said("startup.controller is not as it was; run kr host startup to see it")
+        };
+        match scheduled::undo(definition, change) {
+            Ok(()) => CliError::Usage(shown!(
+                "{}; the scheduled task {} is as it was, and {}",
+                *error,
+                task::name(environment_id),
+                choice
+            )),
+            Err(undone) => CliError::HostUnavailable(shown!(
+                "{}; the scheduled task could not be put back as it was: {}; {}",
+                *error,
+                task::error(&undone, environment_id),
+                choice
+            )),
+        }
     }
 
     /// Reads what the environment's task is, for `kr host startup` and `kr doctor`.
@@ -1107,7 +1401,23 @@ mod windows {
     /// Reported where the standalone start is chosen, and otherwise only where this environment's
     /// own task is still registered, which nothing then uses.
     pub fn report(environment: &EnvironmentPaths, selected: bool) -> Option<task::Report> {
-        todo!("not built yet")
+        let program = super::daemon_program().ok()?;
+        let definition = definition(environment, &program).ok()?;
+        let standing = scheduled::standing(&definition);
+        if !selected && !matches!(standing, Ok(Standing::Owned(_))) {
+            return None;
+        }
+        let last_result = match standing {
+            Ok(Standing::Owned(_)) => scheduled::last_result(&definition).ok(),
+            _ => None,
+        };
+        Some(task::Report {
+            environment_id: environment.environment_id(),
+            standing,
+            program_present: program.is_file(),
+            session: kr_ipc::starter::current_session().ok(),
+            last_result,
+        })
     }
 }
 

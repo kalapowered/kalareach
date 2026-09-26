@@ -832,8 +832,44 @@ impl LastResult {
 /// Every field is quoted and a quote inside one is doubled. The list's words are in the machine's
 /// own language, and this field is a number in every language.
 #[must_use]
-pub fn last_result_in(_line: &str) -> Option<LastResult> {
-    todo!("not built yet")
+pub fn last_result_in(line: &str) -> Option<LastResult> {
+    let field = csv_fields(line).into_iter().nth(6)?;
+    let field = field.trim();
+    let code = field
+        .parse::<i64>()
+        .ok()
+        .and_then(|code| {
+            u32::try_from(code)
+                .ok()
+                .or_else(|| i32::try_from(code).ok().map(i32::cast_unsigned))
+        })
+        .or_else(|| {
+            field
+                .strip_prefix("0x")
+                .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+        })?;
+    Some(LastResult::from_code(code))
+}
+
+/// Splits one line of comma-separated fields, each quoted, a doubled quote standing for one.
+fn csv_fields(line: &str) -> Vec<String> {
+    let mut fields = Vec::new();
+    let mut field = String::new();
+    let mut quoted = false;
+    let mut characters = line.trim_end_matches(['\r', '\n']).chars().peekable();
+    while let Some(character) = characters.next() {
+        match character {
+            '"' if quoted && characters.peek() == Some(&'"') => {
+                field.push('"');
+                characters.next();
+            }
+            '"' => quoted = !quoted,
+            ',' if !quoted => fields.push(std::mem::take(&mut field)),
+            other => field.push(other),
+        }
+    }
+    fields.push(field);
+    fields
 }
 
 #[cfg(windows)]
@@ -844,7 +880,7 @@ pub use self::platform::{clear, last_result, register, remove, run, set_up, stan
 mod platform {
     use super::{
         Asked, Foreign, ForeignReason, LastResult, RegisteredTask, Standing, TaskChange,
-        TaskDefinition, TaskError, decode_output,
+        TaskDefinition, TaskError, decode_output, last_result_in,
     };
     use crate::supervision::{RunFailure, SERVICE_MANAGER_BOUND, command_within};
 
@@ -965,47 +1001,77 @@ mod platform {
 
     /// Registers `definition`, or brings this environment's own task back to it.
     ///
-    /// A task of the same name that is not this environment's is refused and left as it is. The
-    /// definition is written to a UTF-16 file in the environment's owner-only state directory for
-    /// the Task Scheduler to read, and removed again. The task is read back afterwards and must be
-    /// exactly the one registered.
+    /// # Errors
+    ///
+    /// Returns what went wrong, as [`set_up`] does.
+    pub fn register(definition: &TaskDefinition) -> Result<(), TaskError> {
+        set_up(definition).map(drop)
+    }
+
+    /// Registers `definition` for its environment and says what that changed, so the change can be
+    /// undone.
+    ///
+    /// A task of the same name that is not this environment's is refused and left as it is. This
+    /// environment's own task is left as it is when it is already `definition`, and registered
+    /// again when it differs, its prior form kept as the Task Scheduler exported it. A name no
+    /// task holds is taken only while it is still free. The definition is written to a UTF-16
+    /// file in the environment's owner-only state directory for the Task Scheduler to read, and
+    /// removed again. The task is read back afterwards and must be exactly `definition`; one that
+    /// is not has its change undone, and the refusal says so.
     ///
     /// # Errors
     ///
     /// Returns what went wrong: a foreign task, a registration the Task Scheduler refused, or a
     /// task that did not read back as the one registered.
-    pub fn register(definition: &TaskDefinition) -> Result<(), TaskError> {
+    pub fn set_up(definition: &TaskDefinition) -> Result<TaskChange, TaskError> {
         let _lock = registration_lock(&definition.name)?;
-        let replace = match standing(definition)? {
+        let (found, exported) = read(definition)?;
+        let change = match found {
             Standing::Foreign(foreign) => return Err(TaskError::Foreign(foreign)),
-            Standing::Owned(_) => true,
-            Standing::Absent => false,
+            Standing::Owned(differences) if differences.is_empty() => {
+                return Ok(TaskChange::Unchanged);
+            }
+            Standing::Owned(_) => {
+                create(definition, &definition.xml(), true)?;
+                TaskChange::Repaired { prior: exported }
+            }
+            Standing::Absent => {
+                if let Err(error) = create(definition, &definition.xml(), false) {
+                    // A creation refused because the name was taken meanwhile, by something that
+                    // does not take this lock, leaves that task as it is and says whose it is.
+                    return match standing(definition)? {
+                        Standing::Foreign(foreign) => Err(TaskError::Foreign(foreign)),
+                        _ => Err(error),
+                    };
+                }
+                TaskChange::Registered
+            }
         };
-        if let Err(error) = create(definition, &definition.xml(), replace) {
-            // A creation refused because the name was taken meanwhile, by something that does not
-            // take this lock, leaves that task as it is and says whose it is.
-            return match standing(definition)? {
-                Standing::Foreign(foreign) => Err(TaskError::Foreign(foreign)),
-                _ => Err(error),
-            };
-        }
-        match standing(definition)? {
-            Standing::Owned(differences) if differences.is_empty() => Ok(()),
-            Standing::Owned(differences) => Err(TaskError::ReadBack {
-                name: definition.name.clone(),
-                differences: Some(differences),
-                undone: false,
-            }),
-            Standing::Absent => Err(TaskError::ReadBack {
-                name: definition.name.clone(),
-                differences: None,
-                undone: false,
-            }),
-            Standing::Foreign(foreign) => Err(TaskError::Foreign(foreign)),
-        }
+        let differences = match standing(definition)? {
+            Standing::Owned(differences) if differences.is_empty() => return Ok(change),
+            Standing::Owned(differences) => Some(differences),
+            Standing::Absent => None,
+            Standing::Foreign(foreign) => return Err(TaskError::Foreign(foreign)),
+        };
+        let undone = revert(definition, &change).is_ok();
+        Err(TaskError::ReadBack {
+            name: definition.name.clone(),
+            differences,
+            undone,
+        })
     }
 
     /// Removes this environment's own task, and says whether there was one.
+    ///
+    /// # Errors
+    ///
+    /// Returns what went wrong, as [`clear`] does.
+    pub fn remove(definition: &TaskDefinition) -> Result<bool, TaskError> {
+        clear(definition).map(|change| matches!(change, TaskChange::Removed { .. }))
+    }
+
+    /// Removes this environment's own task and says what that changed, its prior form kept as the
+    /// Task Scheduler exported it so the removal can be undone.
     ///
     /// A task of the same name that is not this environment's is refused and left as it is.
     /// Removing a task leaves every process it started running: only ending a run would end them,
@@ -1014,15 +1080,59 @@ mod platform {
     /// # Errors
     ///
     /// Returns what went wrong: a foreign task, or a removal the Task Scheduler refused.
-    pub fn remove(definition: &TaskDefinition) -> Result<bool, TaskError> {
+    pub fn clear(definition: &TaskDefinition) -> Result<TaskChange, TaskError> {
         let _lock = registration_lock(&definition.name)?;
-        match standing(definition)? {
-            Standing::Absent => return Ok(false),
+        let (found, exported) = read(definition)?;
+        match found {
+            Standing::Absent => return Ok(TaskChange::Unchanged),
             Standing::Foreign(foreign) => return Err(TaskError::Foreign(foreign)),
             Standing::Owned(_) => {}
         }
         delete(definition)?;
-        Ok(true)
+        Ok(TaskChange::Removed { prior: exported })
+    }
+
+    /// Undoes `change`, which [`set_up`] or [`clear`] made for `definition`'s environment: a task
+    /// registered where there was none is removed, and a task repaired or removed is put back as it
+    /// was exported.
+    ///
+    /// Whatever is under the name now is checked first: a task that is not this environment's own
+    /// is never replaced or removed, and one that is gone is put back only while the name is free.
+    ///
+    /// # Errors
+    ///
+    /// Returns what went wrong: a foreign task under the name, or a change the Task Scheduler
+    /// refused.
+    pub fn undo(definition: &TaskDefinition, change: &TaskChange) -> Result<(), TaskError> {
+        let _lock = registration_lock(&definition.name)?;
+        revert(definition, change)
+    }
+
+    /// Undoes `change` while the registration lock is held.
+    fn revert(definition: &TaskDefinition, change: &TaskChange) -> Result<(), TaskError> {
+        let found = standing(definition)?;
+        if let Standing::Foreign(foreign) = found {
+            return Err(TaskError::Foreign(foreign));
+        }
+        match change {
+            TaskChange::Unchanged => Ok(()),
+            TaskChange::Registered => match found {
+                Standing::Owned(_) => delete(definition),
+                _ => Ok(()),
+            },
+            TaskChange::Repaired { prior } | TaskChange::Removed { prior } => {
+                create(definition, prior, matches!(found, Standing::Owned(_)))?;
+                match standing(definition)? {
+                    Standing::Owned(_) => Ok(()),
+                    Standing::Foreign(foreign) => Err(TaskError::Foreign(foreign)),
+                    Standing::Absent => Err(TaskError::ReadBack {
+                        name: definition.name.clone(),
+                        differences: None,
+                        undone: false,
+                    }),
+                }
+            }
+        }
     }
 
     /// Registers `xml` under `definition`'s name, through the Task Scheduler.
@@ -1082,43 +1192,36 @@ mod platform {
         Ok(())
     }
 
-    /// Registers `definition` for its environment and says what that changed, so the change can be
-    /// undone.
-    ///
-    /// # Errors
-    ///
-    /// Returns what went wrong: a foreign task, a registration the Task Scheduler refused, or a
-    /// task that did not read back as the one registered.
-    pub fn set_up(_definition: &TaskDefinition) -> Result<TaskChange, TaskError> {
-        todo!("not built yet")
-    }
-
-    /// Removes this environment's own task and says what that changed.
-    ///
-    /// # Errors
-    ///
-    /// Returns what went wrong: a foreign task, or a removal the Task Scheduler refused.
-    pub fn clear(_definition: &TaskDefinition) -> Result<TaskChange, TaskError> {
-        todo!("not built yet")
-    }
-
-    /// Undoes `change`, which [`set_up`] or [`clear`] made for `definition`'s environment.
-    ///
-    /// # Errors
-    ///
-    /// Returns what went wrong: a foreign task under the name, or a change the Task Scheduler
-    /// refused.
-    pub fn undo(_definition: &TaskDefinition, _change: &TaskChange) -> Result<(), TaskError> {
-        todo!("not built yet")
-    }
-
     /// Reads how the task's last run ended, which is one result for all of its runs.
     ///
     /// # Errors
     ///
-    /// Returns what went wrong when the Task Scheduler could not be asked.
-    pub fn last_result(_definition: &TaskDefinition) -> Result<LastResult, TaskError> {
-        todo!("not built yet")
+    /// Returns what went wrong when the Task Scheduler could not be asked, or its list has no
+    /// result for the task.
+    pub fn last_result(definition: &TaskDefinition) -> Result<LastResult, TaskError> {
+        let output = schtasks_within(
+            Asked::Query,
+            &["/Query", "/TN", &definition.name, "/V", "/FO", "CSV", "/NH"],
+        )?;
+        if !output.status.success() {
+            return Err(refused(
+                Asked::Query,
+                &format!("the Task Scheduler could not list {}", definition.name),
+                &output,
+            ));
+        }
+        decode_output(&output.stdout)
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .and_then(last_result_in)
+            .ok_or_else(|| TaskError::Scheduler {
+                asked: Asked::Query,
+                code: None,
+                detail: format!(
+                    "the Task Scheduler's list of {} has no last result",
+                    definition.name
+                ),
+            })
     }
 
     /// Asks the Task Scheduler to run `definition`'s task once, now.
