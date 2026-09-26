@@ -807,7 +807,8 @@ fixed_bytes!(
 fixed_bytes!(
     /// An X25519 notification-preview public key.
     ///
-    /// The notification extension receives only this private key and paired sender public keys.
+    /// The public half of a paired device's preview key pair, and the only key preview envelopes
+    /// are sealed to. The device's notification extension holds the private half.
     NotificationPreviewKey,
     32,
     "A 32-byte X25519 notification-preview public key. On the wire it is a CBOR byte string; in JSON it is unpadded base64url."

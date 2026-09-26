@@ -11,10 +11,11 @@
 //!   added instead.
 //! * **An installation that enlarges what a package may do,** beyond the installation it replaces
 //!   or, with none to replace, beyond what its repository permits by itself, and every release that
-//!   installs a native bridge. `kr plugin install` asks without a confirmation, which is enough for
-//!   an installation inside what is already permitted. When the daemon answers that the owner has to
-//!   confirm this one, the command says so and stops: the confirmation is an owner device's own,
-//!   given with the installation it confirms, so nothing is left waiting here for it.
+//!   installs a native bridge or declares a command integration. `kr plugin install` asks without
+//!   a confirmation, which is enough for an installation inside what is already permitted. When the
+//!   daemon answers that the owner has to confirm this one, the command says so and stops: the
+//!   confirmation is an owner device's own, given with the installation it confirms, so nothing is
+//!   left waiting here for it.
 
 use kr_client::error::refusal;
 use kr_client::shown;
