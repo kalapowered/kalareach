@@ -30,15 +30,28 @@ export function bytesToBase64Url (bytes: Uint8Array): string {
   return out
 }
 
-/** Decodes unpadded base64url. Padding and non-alphabet characters are rejected. */
+/**
+ * Decodes unpadded base64url. Padding and non-alphabet characters are rejected.
+ *
+ * A refusal names the rule the text broke and the offset or the length where it broke it, in the
+ * words the Rust decoders use. Never the symbol it refused: the text can be a secret, a pairing
+ * invitation's among them, and a refused symbol is part of it.
+ */
 export function base64UrlToBytes (text: string): Uint8Array {
   const out: number[] = []
   let accumulator = 0
   let bits = 0
+  let offset = 0
   for (const character of text) {
     const value = BASE64URL.indexOf(character)
     if (value < 0) {
-      throw new Error(`invalid base64url character ${JSON.stringify(character)}`)
+      // Every symbol before this one was a base64url symbol, one byte each, so the count of
+      // symbols read is its offset in the text's UTF-8 bytes as well.
+      throw new Error(
+        character === '='
+          ? 'unpadded base64url carries no padding'
+          : `the symbol at offset ${offset} is not a base64url symbol`
+      )
     }
     accumulator = (accumulator << 6) | value
     bits += 6
@@ -46,9 +59,13 @@ export function base64UrlToBytes (text: string): Uint8Array {
       bits -= 8
       out.push((accumulator >> bits) & 0xff)
     }
+    offset += 1
   }
-  if (bits >= 6 || (accumulator & ((1 << bits) - 1)) !== 0) {
-    throw new Error('invalid base64url length or padding bits')
+  if (bits >= 6) {
+    throw new Error(`${offset} symbols is not the length of any base64url encoding`)
+  }
+  if ((accumulator & ((1 << bits) - 1)) !== 0) {
+    throw new Error(`the last symbol, at offset ${offset - 1}, sets bits past the last byte`)
   }
   return new Uint8Array(out)
 }

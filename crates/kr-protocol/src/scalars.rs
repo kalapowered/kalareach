@@ -521,7 +521,7 @@ pub fn to_base64url(bytes: &[u8]) -> String {
 pub fn from_base64url(text: &str) -> Result<Vec<u8>, String> {
     URL_SAFE_NO_PAD
         .decode(text)
-        .map_err(|error| decode_fault(&error))
+        .map_err(|error| decode_fault(&error, Base64Alphabet::UrlUnpadded))
 }
 
 /// Decodes unpadded base64url into a caller-supplied buffer.
@@ -537,7 +537,7 @@ pub fn from_base64url(text: &str) -> Result<Vec<u8>, String> {
 pub fn from_base64url_into(text: &str, buffer: &mut Vec<u8>) -> Result<(), String> {
     URL_SAFE_NO_PAD
         .decode_vec(text, buffer)
-        .map_err(|error| decode_fault(&error))
+        .map_err(|error| decode_fault(&error, Base64Alphabet::UrlUnpadded))
 }
 
 /// What a failed decode says: which rule the text broke, and the offset or the length where it
@@ -546,20 +546,40 @@ pub fn from_base64url_into(text: &str, buffer: &mut Vec<u8>) -> Result<(), Strin
 /// Never the symbol the decoder refused. The text decoded here can carry a secret, a direct
 /// pairing invitation's among them, and a refused symbol is a symbol of that text, so a message
 /// that named it would print part of the secret. The offset is enough to find the fault in a text
-/// somebody holds.
-fn decode_fault(error: &base64::DecodeError) -> String {
+/// somebody holds. Any other decoder of this protocol's base64 says its faults through here, naming
+/// the alphabet it reads.
+#[must_use]
+pub fn decode_fault(error: &base64::DecodeError, alphabet: Base64Alphabet) -> String {
+    let name = match alphabet {
+        Base64Alphabet::Standard => "base64",
+        Base64Alphabet::UrlUnpadded => "base64url",
+    };
     match *error {
         base64::DecodeError::InvalidByte(offset, _) => {
-            format!("the symbol at offset {offset} is not a base64url symbol")
+            format!("the symbol at offset {offset} is not a {name} symbol")
         }
         base64::DecodeError::InvalidLength(length) => {
-            format!("{length} symbols is not the length of any base64url encoding")
+            format!("{length} symbols is not the length of any {name} encoding")
         }
         base64::DecodeError::InvalidLastSymbol { offset, .. } => {
             format!("the last symbol, at offset {offset}, sets bits past the last byte")
         }
-        base64::DecodeError::InvalidPadding => "unpadded base64url carries no padding".to_owned(),
+        base64::DecodeError::InvalidPadding => match alphabet {
+            Base64Alphabet::Standard => {
+                "the padding is not the padding a base64 encoding of that length carries".to_owned()
+            }
+            Base64Alphabet::UrlUnpadded => "unpadded base64url carries no padding".to_owned(),
+        },
     }
+}
+
+/// The two base64 alphabets this protocol's text carries bytes in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Base64Alphabet {
+    /// The standard alphabet, padded to a multiple of four symbols.
+    Standard,
+    /// The URL-safe alphabet, unpadded: every byte string in a JSON document.
+    UrlUnpadded,
 }
 
 impl Serialize for Bytes {

@@ -96,3 +96,37 @@ describe('the base64url patterns the schema publishes', () => {
     expect(bytes.test('AAAAAA')).toBe(true)
   })
 })
+
+describe('a refused base64url text', () => {
+  /** What the decoder says of `text`, which it refuses. */
+  function refusal (text: string): string {
+    try {
+      base64UrlToBytes(text)
+    } catch (error) {
+      return (error as Error).message
+    }
+    throw new Error('the text decodes')
+  }
+
+  it('names the rule and the offset, never the symbol it refused', () => {
+    for (const planted of ['~', '§', '€', '"kr-marker-7c1e"', '\u0000']) {
+      const said = refusal(`AAAA${planted}AAA`)
+      expect(said).toBe('the symbol at offset 4 is not a base64url symbol')
+      expect(said.includes(planted)).toBe(false)
+      expect(said.includes(JSON.stringify(planted))).toBe(false)
+    }
+  })
+
+  it('names a length no encoding has, a last symbol that sets bits past the last byte, and padding', () => {
+    expect(refusal('AAAAA')).toBe('5 symbols is not the length of any base64url encoding')
+    expect(refusal('AB')).toBe('the last symbol, at offset 1, sets bits past the last byte')
+    expect(refusal('AA==')).toBe('unpadded base64url carries no padding')
+  })
+
+  it('decodes a valid text as before', () => {
+    expect(Array.from(base64UrlToBytes('a3ItbWFya2VyLTdjMWU'))).toEqual(
+      Array.from(new TextEncoder().encode('kr-marker-7c1e'))
+    )
+    expect(base64UrlToBytes('').length).toBe(0)
+  })
+})

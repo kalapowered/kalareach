@@ -1648,7 +1648,13 @@ fn decode_root(text: &str) -> Answer<Vec<u8>> {
         .map_err(|source| {
             ProtocolError::new(
                 ErrorCode::InvalidArgument,
-                format!("the trust root is not base64: {source}"),
+                format!(
+                    "the trust root is not base64: {}",
+                    kr_protocol::scalars::decode_fault(
+                        &source,
+                        kr_protocol::scalars::Base64Alphabet::Standard
+                    )
+                ),
             )
         })
 }
@@ -1745,6 +1751,30 @@ fn encode<T: serde::Serialize>(value: &T) -> Answer<ParamsValue> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A trust root that is not base64 is refused by the rule it broke and the offset where, never
+    /// by the symbol there or that symbol's byte, which base64's own message quotes; one that is
+    /// base64 decodes as before.
+    #[test]
+    fn a_refused_trust_root_names_the_offset_and_never_the_symbol() {
+        for planted in ['~', '\u{a7}', '#'] {
+            let text = format!("AAAA{planted}AAA");
+            let Err(refused) = decode_root(&text) else {
+                panic!("a root with {planted:?} in it is refused");
+            };
+            let said = refused.message;
+            assert!(said.contains("offset 4"), "{said}");
+            assert!(!said.contains(planted), "{said}");
+            let mut first = [0; 4];
+            let byte = planted.encode_utf8(&mut first).as_bytes()[0];
+            assert!(!said.contains(&byte.to_string()), "{said}");
+        }
+        assert_eq!(
+            decode_root("AAECAw==").ok(),
+            Some(vec![0, 1, 2, 3]),
+            "a root that is base64 decodes"
+        );
+    }
 
     /// KR-REQ-26.14: a repository address is fetched through the proxy this host selected. The
     /// proxy is asked for a tunnel to the repository, and when it refuses, the fetch fails rather
