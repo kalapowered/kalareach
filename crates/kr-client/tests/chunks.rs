@@ -78,6 +78,8 @@ struct Script {
     drop_after_chunks: Option<usize>,
     /// The control endpoint ends the connection instead of answering a reservation.
     drop_reservation: bool,
+    /// Once the attachment-chunk endpoint has renewed the window, the first window has expired.
+    expire_first_window: bool,
     /// The attachment-chunk endpoint ends the connection instead of acknowledging the hello.
     drop_hello: bool,
     /// What the host answers `download.chunk` with, by index: the descriptor and the bytes.
@@ -94,6 +96,8 @@ struct Seen {
     reservations: usize,
     publications: usize,
     statuses: usize,
+    /// How many renewals the attachment-chunk endpoint has written.
+    renewals: usize,
 }
 
 /// One upload the host holds.
@@ -430,12 +434,16 @@ async fn converse(
     {
         return;
     }
+    let mut current = window("window-1");
     if let (Some(_), Some(renewal)) = (leg, host.script.renewal.clone()) {
-        let renewed =
-            ControlFrame::Event(ControlEvent::ActionWindowRenewed(action_window(renewal)));
+        let renewed = ControlFrame::Event(ControlEvent::ActionWindowRenewed(action_window(
+            renewal.clone(),
+        )));
         if writer.write_message(&renewed).await.is_err() {
             return;
         }
+        host.seen.lock().expect("what the host saw").renewals += 1;
+        current = renewal;
     }
     let mut carried = 0_usize;
     loop {
@@ -452,6 +460,17 @@ async fn converse(
                     ..
                 } = *mutation;
                 match (method.method(), leg) {
+                    (Some(Method::UploadChunk), Some(_))
+                        if host.script.expire_first_window && action_window_id != current =>
+                    {
+                        answer(
+                            request_id,
+                            Err(ProtocolError::new(
+                                ErrorCode::PermissionDenied,
+                                "the action window has expired",
+                            )),
+                        )
+                    }
                     (Some(Method::UploadChunk), Some(leg)) => {
                         let outcome = parameters::<UploadChunkParams>(&params).and_then(|chunk| {
                             let index = chunk.chunk.index.get();
@@ -578,9 +597,11 @@ async fn a_full_chunk_travels_on_the_lane_under_the_window_the_host_renewed() {
 
     let seen = host.seen();
     assert_eq!(seen.legs, vec![vec![0, 1]], "one lane carried both chunks");
-    // The first chunk went under the window the acknowledgement gave, before the lane had read
-    // the renewal; the second under the renewed one.
-    assert_eq!(seen.windows, vec!["window-1", "window-2"]);
+    // The first chunk went under whichever of the two windows the lane had read when it was built;
+    // the renewal was read by the time the second one was, at the latest with the first answer.
+    assert_eq!(seen.windows.len(), 2);
+    assert!(["window-1", "window-2"].contains(&seen.windows[0].as_str()));
+    assert_eq!(seen.windows[1], "window-2");
     assert_eq!(seen.reservations, 1);
     assert_eq!(seen.publications, 1);
 }
@@ -840,4 +861,44 @@ async fn an_uncertain_reservation_is_never_reserved_again() {
         .expect_err("a new session does not reserve again either");
     assert_eq!(refused.code(), ErrorCode::OutcomeUnknown);
     assert_eq!(host.seen().reservations, 1);
+}
+
+/// A lane that sat idle while its window expired sends its next chunk under the window the host
+/// renewed meanwhile, not the one it opened with.
+#[tokio::test]
+async fn an_idle_lane_sends_under_the_window_the_host_renewed_while_it_waited() {
+    let host = Host::start(Script {
+        renewal: Some(window("window-2")),
+        expire_first_window: true,
+        ..Script::default()
+    });
+    let session = host.session().await;
+    let bytes = pattern(4096);
+    let reserved = reserve(&host, &session, &bytes).await;
+    let mut lane = host
+        .route()
+        .open(reserved.transfer_id)
+        .await
+        .expect("a lane");
+    // The lane waits, and the host renews its window and lets the first one expire meanwhile.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    while host.seen().renewals == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the host never renewed"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let accepted = lane
+        .send_chunk(
+            &host.target(),
+            &chunk_of(reserved.transfer_id, &bytes, 0),
+            TTL,
+        )
+        .await
+        .expect("the chunk goes under the renewed window");
+    assert_eq!(accepted.index, U64::new(0));
+    assert_eq!(host.seen().windows, vec!["window-2"]);
 }

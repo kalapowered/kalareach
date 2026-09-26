@@ -154,6 +154,7 @@ impl ChunkLane {
             ));
         }
         let Carrier::Local(carrier) = &mut self.carrier;
+        carrier.refresh()?;
         let entry = Method::UploadChunk.entry();
         if entry.freshness == FreshnessRequirement::ActionWindow
             && carrier.window.valid_for_ms.get() == 0
@@ -199,6 +200,7 @@ impl ChunkLane {
     /// under its code, and `ATTACHMENT_INTEGRITY` when the answer is not the chunk described.
     pub async fn read_chunk(&mut self, expected: &ChunkDescriptor) -> Result<Bytes> {
         let Carrier::Local(carrier) = &mut self.carrier;
+        carrier.refresh()?;
         let request_id = carrier.next_request_id();
         let request = Request {
             request_id,
@@ -317,6 +319,45 @@ impl LocalCarrier {
     fn next_request_id(&mut self) -> RequestId {
         self.next_request = self.next_request.saturating_add(1);
         RequestId::new(self.next_request)
+    }
+
+    /// Applies whatever the host has already sent on this connection, without waiting for more.
+    ///
+    /// The host renews the window on its own schedule, at half its validity, and says so on this
+    /// connection whether or not a call is in flight. A lane that sat idle past its window's
+    /// validity has the renewal waiting unread, so it is read here, before the next call is built,
+    /// rather than after that call has gone out under a window that expired while the lane waited.
+    /// The reader keeps a frame it has only partly read, so stopping at the first frame that is not
+    /// complete loses nothing.
+    fn refresh(&mut self) -> Result<()> {
+        use futures_util::FutureExt as _;
+
+        if self.ended {
+            return Err(ClientError::ConnectionEnded);
+        }
+        while let Some(read) = self.reader.read_message::<ControlFrame>().now_or_never() {
+            let frame = match read {
+                Ok(frame) => frame,
+                Err(error) => return Err(self.failed(error)),
+            };
+            match frame {
+                ControlFrame::Event(ControlEvent::ActionWindowRenewed(window)) => {
+                    self.window = window;
+                }
+                ControlFrame::Event(ControlEvent::Keepalive)
+                | ControlFrame::Notification(_)
+                | ControlFrame::Receipt(_) => {}
+                // Nothing is outstanding, so an answer here answers nothing this lane asked.
+                _ => {
+                    self.ended = true;
+                    return Err(refusal(
+                        ErrorCode::InvalidArgument,
+                        "the host sent a frame an attachment-chunk lane does not carry",
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Sends one frame and reads until its answer arrives, adopting a renewed window on the way.
