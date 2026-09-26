@@ -599,11 +599,8 @@ mod tests {
         assert!(read.entries[0].builds.is_empty());
         assert_eq!(read.canonical_json().expect("serialisable"), rendered);
 
-        index.entries[0].builds = vec![build(
-            "1.4.0",
-            OperatingSystem::Linux,
-            Architecture::X86_64,
-        )];
+        index.entries[0].builds =
+            vec![build("1.4.0", OperatingSystem::Linux, Architecture::X86_64)];
         let rendered = index.canonical_json().expect("serialisable");
         assert!(rendered.contains("\"builds\""), "{rendered}");
         let read: CatalogueIndex = serde_json::from_str(&rendered).expect("readable");
@@ -638,9 +635,11 @@ mod tests {
         );
 
         let mut unlisted = entry.clone();
-        unlisted
-            .builds
-            .push(build("1.4.1", OperatingSystem::MacOs, Architecture::Aarch64));
+        unlisted.builds.push(build(
+            "1.4.1",
+            OperatingSystem::MacOs,
+            Architecture::Aarch64,
+        ));
         assert_eq!(
             unlisted.check_builds(),
             Err(BuildsError::UnlistedPlatform {
