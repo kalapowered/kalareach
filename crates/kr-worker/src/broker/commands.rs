@@ -12,7 +12,8 @@
 //! 1. **Establish**, when the root shell asks to resolve an integrated invocation: an endpoint in a
 //!    fresh owner-only directory, a credential, and a launch record that says where to connect and
 //!    which flags the integration added. Nothing is reserved and no registration exists yet. The
-//!    answer names the registration's path and the installation's launcher.
+//!    answer names the registration's path, the variables the connector's verified manifest
+//!    declares, and the installation's launcher.
 //! 2. **Present**: the shell runs the launcher in the child it forked for the invocation, and the
 //!    launcher presents itself, with the credential, the executable and the argument vector.
 //! 3. **Admit**: the process the kernel names is the root shell's own child, started after the
@@ -295,7 +296,8 @@ pub struct EstablishRequest<'a> {
     pub typed: &'a [String],
     /// The vector the answer gives the launcher to run: the typed one with the flags added.
     pub arguments: &'a [String],
-    /// The flags the integration added.
+    /// The flags the integration added: all of the connector's, in order, or none where the
+    /// person typed them.
     pub added: &'a [String],
     /// The session's integration entry the resolution came from.
     pub integration: &'a CommandIntegration,
@@ -572,8 +574,25 @@ impl CommandBackends {
                  connector declares"
             ));
         }
+        // The flags are whole argument elements in a fixed order, so they are added as one run or,
+        // where the person typed them, not at all: a value is never added without its flag.
+        if !request.added.is_empty() && request.added != declared.flags.as_slice() {
+            return Err(format!(
+                "the answer adds only some of the flags {command:?} is integrated with, and they are \
+                 added whole or not at all"
+            ));
+        }
         let launcher = self.launcher()?;
         check_executable(request.executable)?;
+        // The command name matched the package; where the shell found it has to as well, so a
+        // match rule that names its application's directory is held to it.
+        if !connector.recognises(command, request.executable) {
+            return Err(format!(
+                "none of {}'s match rules recognises {command:?} where the shell found it, {}",
+                connector.plugin_id(),
+                request.executable
+            ));
+        }
         let added_at =
             added_run(request.typed, request.arguments, request.added).ok_or_else(|| {
                 "the answered vector is not the typed one with the added flags as one run"
@@ -743,19 +762,25 @@ impl CommandBackends {
         Ok(launcher)
     }
 
+    /// The answer the shell runs an established invocation from: the registration's path, then
+    /// the variables the connector's verified manifest declares, in its order.
     fn answer(
         &self,
         backend: &Backend,
         prompt_generation: PromptGeneration,
         launcher: &Path,
     ) -> CommandBackend {
+        let mut environment = vec![EnvironmentVariable {
+            name: "KR_REGISTRATION".to_owned(),
+            value: backend.registration.display().to_string(),
+        }];
+        if let Some(integration) = backend.connector.integration() {
+            environment.extend(integration.variables.iter().cloned());
+        }
         CommandBackend {
             session_id: self.session_id,
             prompt_generation,
-            environment: vec![EnvironmentVariable {
-                name: "KR_REGISTRATION".to_owned(),
-                value: backend.registration.display().to_string(),
-            }],
+            environment,
             launcher: launcher.display().to_string(),
         }
     }

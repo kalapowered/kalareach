@@ -124,6 +124,9 @@ pub struct InstalledConnector {
     table: ConnectorManifest,
     package: PackageIdentity,
     integration: Option<ConnectorCommand>,
+    /// The application the integration's flags register the forwarder's hook for, where they
+    /// register one: the package's own name.
+    flag_hook: Option<String>,
 }
 
 impl InstalledConnector {
@@ -135,8 +138,10 @@ impl InstalledConnector {
     /// the SDK's package check (a file that is not the bytes the manifest names, a table for
     /// another package, or a command integration the contract does not permit, among them), its
     /// manifest does not hash to the installed hash, it carries no table, the installation
-    /// describes a native bridge the package does not declare or was not granted, or its
-    /// publisher is not one this host can record.
+    /// describes a native bridge the package does not declare, was not granted or that is another
+    /// application's, the integration's flags start the forwarder other than as the package's own
+    /// hook or beside the native bridge it installs, or its publisher is not one this host can
+    /// record.
     pub fn read(source: ConnectorSource) -> Result<Self, ConnectorRefusal> {
         let validated = kr_plugin_sdk::validate::validate_package_directory(&source.package_dir);
         if !validated.report.is_valid() {
@@ -206,6 +211,28 @@ impl InstalledConnector {
                      registration or no absolute forwarder"
                 )));
             }
+            // A bridge admitted for a launch is the package's own, whatever registered it.
+            if bridge.application != package.manifest.plugin_name.as_str() {
+                return Err(ConnectorRefusal::new(format!(
+                    "the native bridge installed for {plugin_id} starts the forwarder for {:?}, \
+                     which is not the package's own",
+                    bridge.application
+                )));
+            }
+        }
+        let flag_hook = match package.manifest.command_integration.as_ref() {
+            None => None,
+            Some(declared) => {
+                registered_hook(&declared.flags, package.manifest.plugin_name.as_str()).map_err(
+                    |why| ConnectorRefusal::new(format!("{plugin_id}'s integration {why}")),
+                )?
+            }
+        };
+        if flag_hook.is_some() && package.manifest.native_bridge.is_present() {
+            return Err(ConnectorRefusal::new(format!(
+                "{plugin_id}'s integration starts {FORWARDER} beside the native bridge the package \
+                 installs, and a launch's bridge comes from one of them"
+            )));
         }
         let publisher_id =
             PublisherId::new(package.manifest.publisher_id.as_str()).map_err(|error| {
@@ -247,6 +274,7 @@ impl InstalledConnector {
             table,
             package: identity,
             integration,
+            flag_hook,
         })
     }
 
@@ -307,14 +335,24 @@ impl InstalledConnector {
     }
 
     /// Returns the bridge a launch of this connector admits: the one the installation put in
-    /// place, where there is one.
+    /// place, or else the hook the integration's own flags register for the launch.
     ///
-    /// `launcher` is this installation's own `kr-hook`, the forwarder a bridge registered for the
-    /// launch alone is expected to run.
+    /// `launcher` is this installation's own `kr-hook`. A hook the flags register names the
+    /// forwarder as a bare command, which the application finds on the launch's search path, and
+    /// a hook is admitted only when the process it runs is this file.
     #[must_use]
     pub fn launch_bridge(&self, launcher: &std::path::Path) -> Option<InstalledBridge> {
-        let _ = launcher;
-        self.installed_bridge()
+        if let Some(installed) = self.installed_bridge() {
+            return Some(installed);
+        }
+        self.integration.as_ref()?;
+        let application = self.flag_hook.clone()?;
+        Some(InstalledBridge {
+            plugin_id: self.plugin_id(),
+            application,
+            surfaces: std::iter::once(BridgeSurface::Hook).collect(),
+            forwarder: launcher.to_path_buf(),
+        })
     }
 
     /// Returns the version a signed qualification record names for an executable with this digest,
@@ -335,6 +373,22 @@ impl InstalledConnector {
             .match_rules
             .iter()
             .any(|rule| rule.executable.matches_path(path))
+    }
+
+    /// Returns true when one of the package's match rules recognises `command` in the directory
+    /// the shell resolved it to, `executable` being the file it found there.
+    ///
+    /// A shell resolves a command name to the file of that name in a directory on its search path,
+    /// so the rule's name is held to the command and its directories to where the file is: a rule
+    /// that names the directory its application installs into does not recognise the same name
+    /// anywhere else.
+    #[must_use]
+    pub fn recognises(&self, command: &str, executable: &str) -> bool {
+        let executable = executable.replace('\\', "/");
+        let Some((directory, _)) = executable.rsplit_once('/') else {
+            return false;
+        };
+        self.matches_executable(&format!("{directory}/{command}"))
     }
 
     /// Returns the decisions a declarative interpretation offers: the ones the table's decision
@@ -380,6 +434,72 @@ impl InstalledConnector {
             })
             .collect()
     }
+}
+
+/// The forwarder's name, as a registration names it.
+const FORWARDER: &str = "kr-hook";
+
+/// Returns the application an integration's flags register the forwarder's hook for, where they
+/// register one.
+///
+/// Each flag that is a JSON document is read for the objects that start the forwarder, by the rule
+/// the host applies to a native bridge's files: `command` is `kr-hook` and `args` is the
+/// application and the registration. A launch's flags may register only a hook, and only for
+/// `own`, the package's own name; the forwarder started any other way is refused.
+fn registered_hook(flags: &[String], own: &str) -> Result<Option<String>, String> {
+    let mut applications = BTreeSet::new();
+    for flag in flags {
+        if let Ok(document) = serde_json::from_str::<serde_json::Value>(flag) {
+            forwarder_invocations(&document, &mut applications)?;
+        }
+    }
+    if let Some(other) = applications.iter().find(|application| *application != own) {
+        return Err(format!(
+            "starts {FORWARDER} for {other:?}, and a launch's hooks are the package's own"
+        ));
+    }
+    Ok(applications.into_iter().next())
+}
+
+fn forwarder_invocations(
+    value: &serde_json::Value,
+    applications: &mut BTreeSet<String>,
+) -> Result<(), String> {
+    match value {
+        serde_json::Value::Object(members) => {
+            if members.get("command").and_then(serde_json::Value::as_str) == Some(FORWARDER) {
+                let arguments = members.get("args").and_then(serde_json::Value::as_array);
+                let words: Vec<&str> = arguments
+                    .map(|arguments| {
+                        arguments
+                            .iter()
+                            .filter_map(serde_json::Value::as_str)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                match (words.as_slice(), arguments.map(Vec::len)) {
+                    ([application, "hook"], Some(2)) => {
+                        applications.insert((*application).to_owned());
+                    }
+                    _ => {
+                        return Err(format!(
+                            "starts {FORWARDER} with {words:?}, and a launch registers only a hook"
+                        ));
+                    }
+                }
+            }
+            for nested in members.values() {
+                forwarder_invocations(nested, applications)?;
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                forwarder_invocations(item, applications)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 /// The projection schema a request read from a connector's own decision destination is written
