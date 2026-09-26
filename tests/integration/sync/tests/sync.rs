@@ -1367,24 +1367,28 @@ fn one_object(run: &Run) -> (SyncClient, SyncObjectId) {
     (client, object_id)
 }
 
-/// Holds every exchange a stand-in was sent to being one request: one identity, one set of bytes and
-/// one comparison.
+/// Holds every exchange a stand-in was sent to being one request: the first carries every member a
+/// write carries, and every later one is that same body, member for member, so the same identity
+/// names the same collection, object, comparison and bytes each time.
 fn one_request(exchanges: &[serde_json::Value]) {
     let first = &exchanges[0];
+    for member in [
+        "request_id",
+        "collection_id",
+        "kind",
+        "object_id",
+        "expected_revision",
+        "object",
+    ] {
+        assert!(first.get(member).is_some(), "the write carries {member}");
+    }
     assert!(
         first["request_id"].is_string(),
         "the write names its request"
     );
+    assert!(first["object"].is_object(), "the write carries its bytes");
     for exchange in exchanges {
-        assert_eq!(
-            exchange["request_id"], first["request_id"],
-            "the same identity"
-        );
-        assert_eq!(exchange["object"], first["object"], "the same bytes");
-        assert_eq!(
-            exchange["expected_revision"], first["expected_revision"],
-            "the same comparison"
-        );
+        assert_eq!(exchange, first, "every send is the same request");
     }
 }
 
