@@ -206,29 +206,30 @@ impl Host {
     ) -> Self {
         let environment = temp.environment();
         let environment_id = temp.environment_id();
-        let secrets = environment.secrets_dir();
-        let controller = Controller::start(ControllerSetup {
-            paths: environment.clone(),
-            environment_id,
-            identity: Box::new(move || {
-                let store =
-                    open_store_in(&secrets).expect("a secret store for the test environment");
-                Ok(
-                    ControllerIdentity::open(store.store.as_ref(), environment_id, false)
-                        .expect("an identity"),
-                )
-            }),
-            secret_store: StoreSelection::File,
-            boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
-            supervisor: Box::new(RefusingSupervisor),
-            worker_program: PathBuf::from("/nonexistent/kr-worker"),
-            build_id: build(),
-            release: "0".to_owned(),
-            shell_packages: None,
-            terminal: Box::new(kr_controller::supervision::NoTerminal),
+        let controller = taken_over(|| {
+            let secrets = environment.secrets_dir();
+            Controller::start(ControllerSetup {
+                paths: environment.clone(),
+                environment_id,
+                identity: Box::new(move || {
+                    let store =
+                        open_store_in(&secrets).expect("a secret store for the test environment");
+                    Ok(
+                        ControllerIdentity::open(store.store.as_ref(), environment_id, false)
+                            .expect("an identity"),
+                    )
+                }),
+                secret_store: StoreSelection::File,
+                boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
+                supervisor: Box::new(RefusingSupervisor),
+                worker_program: PathBuf::from("/nonexistent/kr-worker"),
+                build_id: build(),
+                release: "0".to_owned(),
+                shell_packages: None,
+                terminal: Box::new(kr_controller::supervision::NoTerminal),
+            })
         })
-        .await
-        .expect("the daemon starts");
+        .await;
         let endpoint = environment.controller_endpoint().expect("an endpoint");
         let listener = Listener::bind(&endpoint).expect("binds the client endpoint");
         let clients = tokio::spawn(Arc::clone(&controller).serve_clients(listener));
@@ -343,6 +344,34 @@ impl Host {
         self.network.shutdown().await;
         drop(self.controller);
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// How long a start is given to take over an environment a daemon before it held.
+///
+/// A daemon lets go of its environment once nothing of it is left, and its own tasks can still
+/// hold it for a moment after a suite has let it go: they keep a weak reference and upgrade it to
+/// act, which the count a restart waits on does not see. A start can therefore find the
+/// environment held. That is a liveness condition: what the suites assert is that the start takes
+/// the environment over, not how soon the last reference goes.
+const ENVIRONMENT_HANDOVER_DEADLINE: Duration = Duration::from_secs(60);
+
+/// Starts a daemon with `start`, and again while the environment is held, until
+/// [`ENVIRONMENT_HANDOVER_DEADLINE`]. Any other failure fails the suite.
+async fn taken_over<F, S>(start: F) -> Arc<Controller>
+where
+    F: Fn() -> S,
+    S: std::future::Future<Output = kr_controller::error::Result<Arc<Controller>>>,
+{
+    let begun = std::time::Instant::now();
+    loop {
+        match start().await {
+            Ok(controller) => return controller,
+            Err(kr_controller::error::ControllerError::AlreadyRunning { .. })
+                if begun.elapsed() < ENVIRONMENT_HANDOVER_DEADLINE => {}
+            Err(error) => panic!("the daemon starts: {error}"),
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 
