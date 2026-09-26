@@ -271,6 +271,12 @@ and a package supplies no quoting of its own.
 An implementation that cannot produce the class its action declares is a finding, as is one that
 names a component the package does not ship or a method its connector table does not route.
 
+This host carries two of the forms today. A `decision_destination` action is admitted as the answer
+it is and written on the connection its request arrived on. A `presentation` action is admitted on
+`session.view` and answered with its receipt, and nothing more: no token is issued, no plan is
+asked for and nothing leaves the host, so its result names the action and carries no upstream
+result. Every other action is refused as `UNSUPPORTED_CAPABILITY` before anything is marked.
+
 How a package with no component answers an approval, from the connector table to the call, is in
 [Answering approvals from a declarative package](sdk.md).
 

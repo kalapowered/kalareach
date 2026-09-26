@@ -105,7 +105,7 @@ configuration file this host reads.
 | 64 KiB | The most of the document that is ever read. A larger file is not one of ours and is refused rather than parsed |
 | owner-only | A document that is a symbolic link, or that belongs to another user, is refused rather than read |
 | unknown fields | Refused. A misspelled key is a mistake a person can see, not a setting that quietly does nothing |
-| omitted fields | The product's own value, and reported as the product's own. Every budget inside `enrolment` is separate: the example above configures one of the ten, and `kr doctor` names that one rather than reporting ten choices nobody made |
+| omitted fields | The product's own value, and reported as the product's own. Every budget inside `enrolment` is separate: the example above configures one of the eleven, and `kr doctor` names that one rather than reporting eleven choices nobody made |
 
 Editing is validated before a revision is applied, and one writer edits at a time: a writer takes an
 operating-system lock on `.config.lock` in the environment's state directory, reads, validates,
@@ -446,7 +446,7 @@ force is refused and reported as refused.
 | --- | --- |
 | `session_limit` | what this machine's own resources allow. 128 is the product default rather than a maximum: the owner may set a higher number, and this host establishes no resource limit yet, so nothing narrows the choice and `kr doctor` says so |
 | `grant_rights` | the rights the grant and this host's policy already allow, which the grant intersection decides; this ceiling only removes |
-| `enrolment` | section 11's own budgets; a cached payload budget above 1 GiB is a full mirror and needs `full_offline_mirror` set explicitly |
+| `enrolment` | section 11's own budgets: what one repository's metadata, kept generations and cached payloads may cost, how large one package may be and how many bytes one synchronisation may transfer; a cached payload budget above 1 GiB is a full mirror and needs `full_offline_mirror` set explicitly |
 
 A ceiling is applied where the thing it restricts reads it, and an edit whose value the
 intersection would refuse is refused before it is written rather than recorded and then quietly
@@ -482,6 +482,22 @@ like any other. A fence that could not be raised, because the revision could not
 owed: every later reading raises it, whether or not anything in the document moved, and only a
 fence that was raised settles it. The host policy moves to that revision with the registry, so a device paired after the edit is
 issued a grant this host recognises as its own.
+
+`enrolment` is applied where each budget is used, and follows the document the way the session
+number does. An enrolment asks for its own budgets, and `catalogue.add` refuses one that asks for
+more than the configuration allows, before anything is fetched, with `QUOTA_EXCEEDED` and the name of
+the budget. `retained_metadata_bytes` bounds the metadata a repository keeps across the generations
+it keeps. A document that names none gets `metadata_bytes` times `retained_generations`, as each is
+resolved, and `kr doctor` says the value is the product's own. `package_bytes`, `object_count` and
+`expanded_pack_bytes` hold every package to a declared size, a number of files and a size once
+extracted, each no larger than the package format's own maximum: 64 MiB, 512 files and 64 MiB,
+which are also the defaults. They are read each time a package is installed, enabled or admitted,
+so a lowered limit reaches packages already installed; one past a limit is not admitted, and the
+catalogue check in `kr doctor` warns about it. A change to them moves the plugin admissions to a new
+revision in the same step, and an acceptance whose revision cannot be written puts none of the
+budgets in force and reports why, so the next acceptance tries again. `transfer_bytes` bounds the
+bytes one synchronisation transfers, the metadata, the index and a full mirror's payloads together,
+2 GiB by default; a sync past it is refused by name and the generation in use stays.
 
 A secret is never in the document. `secrets` holds named references: what this configuration calls
 it, which secure store it lives in and its name inside that store. There is no field a value would
@@ -772,10 +788,12 @@ time the daemon starts, the package's bridge is brought to what its installation
 a stopped daemon left part way is finished or taken out before anything else is served. The recipe
 keeps a journal of its own for each package under `native-bridges/` in the environment's state
 directory, apart from the catalogue's records, and never changes a method's answer or receipt: an
-installation's answer says what the catalogue did, and the journal says what the recipe did. No
-recipe is applied yet: its version check needs a signed record that names the application's
-executable by digest, which no release carries, so every recipe is refused and the journal says
-why. `docs/plugins/catalogue.md` has what is checked before anything is written and what a removal
+installation's answer says what the catalogue did, and the journal says what the recipe did. Its
+version check needs a signed record that names the application's executable by digest: a build the
+release's entry in the repository's signed index names for this host's platform. Records arrive
+with a synchronisation, so the bridges are brought up to date after every sync as well. No published
+release names a build yet, so every recipe is still refused and the journal says why.
+`docs/plugins/catalogue.md` has what is checked before anything is written and what a removal
 leaves.
 
 The registry admits a paired device to all thirteen of these methods, and the daemon serves them
@@ -787,6 +805,23 @@ runs on a task a dropped connection cannot cancel part way. Every mutation in bo
 `catalogue.list`, require `host.manage`; `plugin.list` and `plugin.capabilities` require no right,
 because what they describe is what this environment already runs. The owner's confirmation is the
 same ceremony on both doors, and a device cannot stand in for it.
+
+What a session may bind is the daemon's to decide and the worker's to enforce. The daemon computes
+the environment's plugin admissions from the catalogue's current records: every installation that
+is enabled, supported on this host's operating system and architecture, whole in the store, within
+the package limits in force and not revoked. Every change that could alter them raises an admission
+revision in the catalogue's own transaction. Each worker is handed the admissions with its launch
+specification, and a round on its authority connection after every such change and every 30
+seconds while it has not answered at the current revision or holds a release no installation
+describes; its answer reports every live binding and the release it holds. A worker binds only what
+the admissions it holds admit.
+
+`plugin.list` counts live bindings from answers every worker gives after the read began, so a count
+is exact or null: null while any worker has not answered. It also lists every release a worker
+holds that no installation describes, such as one an upgrade left, until its bindings end.
+`plugin.remove` answers with the bindings its own refresh found, or null. Every other answer that
+carries a summary carries no count. A reclaim of a repository's space that needs room waits until
+every worker has answered at the current revision, so no release a live binding holds is removed.
 
 `docs/plugins/catalogue.md` has the sync, the budgets, the extraction rules and what a signed
 qualification may not do.

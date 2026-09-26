@@ -156,9 +156,11 @@ another instance's is `PERMISSION_DENIED` and an answered one is `QUESTION_RESOL
 The upstream identifier never comes from the caller. It is the one the host recorded with the
 resource when the request arrived.
 
-This host transmits no plugin action's effect. After these checks it refuses the call as
-`UNSUPPORTED_CAPABILITY`, before anything is marked, and the request stays pending for another
-answer, such as the one a person gives in the terminal.
+After these checks the call is admitted as the answer it is: its one transmission is reserved before
+anything is marked, and it goes out on the connection the request arrived on, written as the verdict
+the table maps. Its result names the action and what the application did with the answer. A call
+refused by any check leaves the request pending for another answer, such as the one a person gives
+in the terminal.
 
 ## Showing a control for one request
 

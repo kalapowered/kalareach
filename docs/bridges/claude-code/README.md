@@ -39,8 +39,9 @@ The host applies the recipe in `.claude` in the account's home, the directory Cl
 `CLAUDE_CONFIG_DIR` is not set, once the owner's confirmed installation of the release has
 committed, and removes it when the package is removed; `docs/plugins/catalogue.md` says what it
 checks before writing anything and what a removal leaves. One of those checks is Claude Code's
-version, which only a signed record naming its executable by digest establishes; no release carries
-one yet, so the recipe is refused and nothing is written. The settings key is spliced into the
+version, which only a signed record naming its executable by digest establishes: a build the
+release's entry in the signed index names for this platform. No release names one yet, so the recipe
+is refused and nothing is written. The settings key is spliced into the
 person's own `settings.json`, so every other byte of it stays as it was. The registration names the
 forwarder as `kr-hook`, a bare command Claude Code finds on its own search path. The installation
 expects the `kr-hook` beside the daemon, and a connection running another copy is refused at
@@ -154,8 +155,9 @@ A package turns the integration on by declaring it in its manifest, as
 is `claude` and the two flags above. The worker takes them only from the verified package, and only
 while the installation holds `command_integration.launch`, which the owner confirms for each
 release. The two flags are added together or not at all, so a `claude` typed with one of them runs
-as typed. Sessions are created with no command integration enabled, and the worker holds no
-installed connector to launch from, so a `claude` typed at a prompt runs as typed.
+as typed. The worker holds the connectors its session's plugin admissions carry, and it launches
+from those alone, but sessions are still created with no command integration enabled, so a `claude`
+typed at a prompt runs as typed.
 
 ## A Claude Code the integration did not launch
 
@@ -163,16 +165,18 @@ Claude Code started any other way is adopted rather than launched: by absolute p
 integration off, after a refused or retired launch, in a pipeline or another form the shell does not
 ask about, or from a shell that does not ask. Four times a second, while a command has the terminal,
 the worker looks at the terminal's foreground process group. It adopts a process there that the
-root shell started itself, that no launch holds, and whose executable the connector recognises, and
-records it as a native terminal instance. The record holds the executable and argument vector the
-kernel reports, the executable's digest, and the reason the shell's question about it was answered
-with a bypass, where the line running it asked one.
+root shell started itself, that no launch holds, and whose executable an admitted package recognises,
+by the rule the catalogue's search uses: an exact rule beats an inferred one, and a program two
+packages recognise exactly is adopted by neither. It records the process as a native terminal
+instance and binds it to that package in the same step. The record holds the executable and argument
+vector the kernel reports, the executable's digest, and the reason the shell's question about it was
+answered with a bypass, where the line running it asked one.
 
 An adopted Claude Code gets no registration, endpoint or credential. Its environment names no
 registration either, since a bypassed invocation is given no variable, so its hooks answer `{}` with
-nothing to report to and its channel declares nothing. None of its bridges is admitted. The instance
-ends when its process exits. Adoption recognises Claude Code by the installed connector, which the
-worker does not yet receive, so today nothing is adopted.
+nothing to report to and its channel declares nothing. None of its bridges is admitted. Its process
+places the questions it asks, and the ones its programs ask, under its instance, and does nothing
+else. The instance ends when its process exits, and its binding with it.
 
 Every instance, launched or adopted, is announced to the session's attached views when it starts,
 when its bridges are refused and when it ends, with its mode, its plugin and profile, and the reason
@@ -354,7 +358,8 @@ table maps, for Allow:
 ```
 
 Without such a binding the approval stays visible and unanswerable, and the terminal's dialog
-answers it. Nothing binds the package yet, so today that is every approval.
+answers it. A launch binds the connector its command resolved, from the admissions the worker
+holds, and what the binding may interpret and answer is what the installation was granted.
 
 Claude Code tells the channel nothing back. An approval answered in the terminal stays pending here
 until the channel closes, and a written verdict is never acknowledged: whichever answer Claude Code

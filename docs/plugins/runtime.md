@@ -420,6 +420,16 @@ declared effect class, and claims and dispatches. Pending and dispatch state liv
 broker ledger, never in a component and never in the plugin host, which is why a plugin-host crash
 cannot destroy an approval ledger.
 
+A binding is the broker's, and it is made only from the plugin admissions the control daemon hands
+the worker (`docs/plugins/catalogue.md`). What a binding may do is derived from the installation's
+effective capabilities, never from what a caller describes: observation from
+`broker.semantic_events`, `terminal.stream`, `terminal.transcript_tail` or `process.observe`;
+upstream action from `upstream.action`; and the approval interpreter from `approval.decode`, with
+the right to answer only where `approval.respond` is granted beside it. The decoding trust comes
+from the admitted package's connector table, and the actions from its verified manifest's
+declarations. A package with a component binds for its declarative parts, and the binder does not
+register the component with the plugin host yet.
+
 The broker lives in `crates/kr-worker/src/broker`. Its way to a component is the plugin host,
 through the client in `crates/kr-plugin-service`: register a binding, offer events to its queue,
 make a call, take a checkpoint, unbind. `docs/host/README.md` has its whole contract; what matters

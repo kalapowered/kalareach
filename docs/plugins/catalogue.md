@@ -28,9 +28,13 @@ Nothing is fetched before a repository is enrolled, and enrolment fixes four thi
 | | |
 | --- | --- |
 | The trust root | The one this repository's metadata is verified against, and no other |
-| The budgets | 64 MiB of metadata and 100,000 entries a sync, two kept generations in 128 MiB of kept metadata, and 1 GiB of cached payloads by default |
+| The budgets | What the enrolment asks for, within what this host's configuration allows: 64 MiB of metadata and 100,000 entries a sync, two kept generations in 128 MiB of kept metadata, and 1 GiB of cached payloads by default |
 | The capability ceiling | Metadata matching, declarative presentation and already-authorised broker semantic events |
 | The mirror setting | Off, so a sync fetches metadata and not every payload |
+
+An enrolment that asks for more than the configuration's `enrolment` budgets allow is refused
+before anything is fetched, with `QUOTA_EXCEEDED` and the name of the budget it is past.
+`docs/host/README.md` has the configuration.
 
 Each repository keeps its own root. An enterprise or vendor repository that adopted a root out of
 band is not verified against the official one, and adopting a second root never widens the first.
@@ -205,7 +209,8 @@ the second check, and one that declares a gigabyte never reaches it.
 Exceeding a budget names the exact allowance that ran out, because "out of space" sends a person to
 the wrong setting. The last generation stays usable either way.
 
-Everything a repository leaves on disk is inside one of them:
+Everything a repository leaves on disk is inside one of them. Each is the enrolment's, within what
+the configuration allows, and the table has the defaults:
 
 | What stays | Budget |
 | --- | --- |
@@ -238,6 +243,22 @@ declaration's word. Staging holds only the work of the operation holding the rep
 whatever an operation that stopped left there is removed when the lock is next taken; what cannot
 be removed stops the operation, because the room it takes would be outside every budget.
 
+One package and one synchronisation have limits of their own, whatever a repository declares. A
+package may declare at most `package_bytes`, hold at most `object_count` files and take at most
+`expanded_pack_bytes` once extracted. The package format's own maxima, 64 MiB, 512 files and
+64 MiB, are the defaults and the ceiling: the configuration can lower each limit and never raise
+it. One synchronisation may transfer at most `transfer_bytes`, 2 GiB by default, and the metadata,
+the index and a full mirror's payloads count together; a payload the mirror already holds intact
+costs nothing. What the index and a mirror declare is checked before either is fetched, and the
+bytes are counted again as they arrive. A sync that goes past the limit stops, names it, and leaves
+the generation in use as it was.
+
+The package limits are read each time a package is used: when it is installed, enabled, checked
+after it is extracted and admitted. So a lowered limit reaches packages already installed. One past
+a limit in force is not admitted, and no new binding uses it, while a live binding keeps the
+release it holds. Changing a limit moves the admissions to a new revision in the same step, and a
+change whose revision cannot be written puts nothing in force.
+
 Reclaiming space never takes a payload an installed package, a live binding or a pinned generation
 still needs. That is every file such a package consists of, not only the manifest its hash names: a
 component nobody can read is a binding that does not work, and an installed package with its files
@@ -252,23 +273,59 @@ to lose. One this repository holds and whose files it cannot name stops the recl
 being guessed at. When the only thing left to evict is one of those, the sync reports the limit
 instead.
 
+What the live bindings hold is what the workers report. A reclaim that needs room asks at the
+admission revision its own transaction reads, and while any worker has not answered at that
+revision it is refused, retryably, with the sessions it waits for named: a worker that has not
+answered may hold a release nothing else here describes. A reclaim with room to spare asks nothing.
+
 ## Matching, enabling and binding
 
-Downloading the whole catalogue does not activate every module. Three separate facts decide whether
+Downloading the whole catalogue does not activate every module. Four separate facts decide whether
 a package runs against an application:
 
 - it is **installed** here, at one exact package hash;
 - it is **enabled** here, which is a separate decision from installing it;
+- it is **admitted**: supported on this host's operating system and architecture, whole in the
+  store, within the package limits in force, and not revoked by its repository;
 - its declarative rules **recognise** what is running.
+
+The control daemon decides what is admitted, from the catalogue's current records, and hands each
+session's worker the whole set with the state of every release a live binding holds: with the
+worker's launch, after every change that could alter it, and every 30 seconds while the worker has
+not answered at the current admission revision or holds a release no installation describes. A
+worker binds only a package the admissions it holds admit, at the frame they were handed over in. It
+reads each admitted package itself, from its checked copy and with the check a publisher's build
+runs, so the match rules, the actions, the connector table and the command integration all come from
+the manifest the package hash names.
 
 Match rules are indexed by executable file stem and by distribution, so recognising a running
 application is a lookup rather than a scan of every rule in the catalogue. An explicit selection
 wins a conflict outright; an exact rule beats an inferred one; two exact rules are a conflict the
-person settles, not one the host settles for them.
+person settles, not one the host settles for them. A worker applies the same rule. A program the
+command integration launched is bound to the connector its command resolved. A program found running
+that the integration did not launch is bound to the one admitted package that recognises it, which
+need not have a connector table, and one that two packages recognise exactly is adopted by neither.
+An instance nothing recognised when it started is bound once a package that recognises its program
+is admitted.
 
 A binding records the hash it was made against and stays on it. An upgrade moves the installation
 and leaves every live binding where it is, because a running process was qualified against the bytes
-it bound to and not against the bytes that arrived afterwards.
+it bound to and not against the bytes that arrived afterwards. The binding also records the release
+and the repository it came through, and the program it was made for with the version the program's
+signed record named then; a later record for the same program changes no live binding's version.
+
+What a binding may do follows its installation. A grant the owner withdraws reaches every live
+binding of the package, on every release it holds, and the next action that needs it is refused. A
+grant the owner confirms reaches only bindings on the installed release: a release the installation
+left is held to what it could do when it was left, and never gains. A package disabled or removed
+ends its bindings at the next snapshot, each once no request it admitted is still open, and a
+binding is reported as ending until it has closed.
+
+`plugin.list` counts each installation's live bindings, and every release a worker still holds that
+no installation describes, from reports every worker makes after the read began. While a worker
+has not answered, a count is null rather than a guess. `plugin.remove` answers with the bindings
+its own refresh found, which are the ones the workers are told to end, and with null when a worker
+did not answer or the admissions moved before the removal committed.
 
 ## Revocation
 
@@ -276,10 +333,23 @@ A revoked release stops receiving new bindings immediately, and stops matching, 
 ever offered it.
 
 An active binding is not torn down under a request that is already running: the process was
-qualified against the bytes it bound to. The catalogue lists each live binding on a revoked release
-against that exact release, with the administrator's explicit disable policy beside it — keep
-serving, admit nothing new, or disable at the next admission — for the person or the caller that
-reads it. A revocation changes nothing under a request already running.
+qualified against the bytes it bound to. The session is told once, with the repository's own
+statement, and the administrator's disable policy decides what happens next, at the next admission
+and never in the middle of one:
+
+| Policy | A live binding on a revoked release |
+| --- | --- |
+| Warn only, the default | Keeps serving |
+| Disable at the next admission | Keeps observing, and every rich admission through it is refused with the revocation as the reason, until the revocation no longer stands or the policy only warns |
+| Disable at once | Admits nothing more, and closes once the requests it admitted have finished |
+
+The release's state is found by where the release came from, so a revocation reaches a binding on
+an old release after an upgrade, or after the package moved to another repository. The first notice
+raises the trusted adapter item for the session, which escalates and repeats until the session holds
+no binding on a revoked release of that package, and the notice that says so resolves it. Both
+travel with the package's name while privacy mode withholds their words. `plugin.list` reports which
+installations and live releases are revoked. No method sets the policy yet, so every catalogue warns
+only.
 
 ## Capabilities and qualification
 
@@ -332,11 +402,13 @@ plugin change, and each time the daemon starts, each package's bridge is brought
 installation wants. The method's answer and receipt say what the catalogue did and are never changed
 by the recipe.
 
-No recipe is applied yet. The version check below needs a signed qualification record that names
-the application's executable by its digest, and no release carries one: the catalogue's signed
-results name a capability, a subject and a profile instead. So every recipe is refused and nothing
-is written, the package's journal records why, and the check runs again after every plugin change
-and each time the daemon starts.
+A recipe is applied only where a signed record names the application's executable. The version check
+below reads the builds the release's entry in the repository's signed index names for this host's
+operating system and architecture, each an executable's SHA-256 digest with its version. Records
+arrive with a synchronisation, so every package's bridge is followed after every sync as well as
+after every plugin change. No published release names a build yet, so every recipe is still refused
+and nothing is written; the package's journal records why, and the check runs again after every
+plugin change, every synchronisation and each time the daemon starts.
 
 Before anything is written, everything the recipe needs is checked, and a failed check is a refusal
 that writes nothing:
@@ -350,8 +422,8 @@ that writes nothing:
 - every step the recipe installs has the removal that undoes it, and every file it installs is the
   bytes its recipe names;
 - every executable the package's match rules name on the daemon's search path is read, never run,
-  and each must be one a signed qualification record of the package names by its SHA-256 digest, at
-  a version inside the recipe's range. A version nothing establishes refuses the recipe;
+  and each must be one a build of the release names by its SHA-256 digest, at a version inside the
+  recipe's range. A version nothing establishes refuses the recipe;
 - every path is walked from one handle on the application's directory, each directory opened without
   following a link, and a link or a non-directory on the way, or a destination that is not a regular
   file, is refused;
@@ -428,6 +500,7 @@ transport fetches over https with the platform's own trust store and reads a loc
 and a host may supply another. Which transport carried the bytes changes nothing above: verification
 never trusted the transport, only the signatures over what it delivered.
 
-Capability evidence from a live binding, and admission of a package's declarative proxy, come from
-the trusted broker through a trait the catalogue client defines. Where no broker is bound, there
-is no live evidence and no proxy is admitted, and both say so rather than guessing.
+Capability evidence from a live binding, admission of a package's declarative proxy and what the
+workers hold live come from the trusted broker through a trait the catalogue client defines. Where
+no broker is bound, there is no live evidence, no proxy is admitted and no worker holds anything,
+and each says so rather than guessing.
