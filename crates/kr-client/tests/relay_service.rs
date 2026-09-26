@@ -28,6 +28,7 @@ use kr_crypto::keys::AuthorisationKeyPair;
 use kr_crypto::sign::{SigningTranscript, sign, verify};
 use kr_protocol::error::{ErrorCode, RetryCategory};
 use kr_protocol::ids::RelayLeaseId;
+use kr_protocol::relay::RelayLeaseState;
 use kr_protocol::scalars::{AuthorisationKey, EndpointKey, Signature64, Uuid};
 use kr_protocol::service::{GatewayOrigin, ServiceRequestSigner};
 
@@ -677,6 +678,103 @@ async fn a_revocation_reports_what_the_reservation_settled() {
         "11111111-1111-1111-1111-111111111111"
     );
     assert_eq!(sent["signature"]["payload"]["method"], "relay.lease.revoke");
+}
+
+/// A revocation the relay confirmed, whose charge the service could not settle yet, answers with no
+/// settlement. It is an ending all the same: the relay says the lease is revoked, and revoking again
+/// answers with the settlement as it stands.
+#[tokio::test]
+async fn a_revocation_whose_charge_is_not_known_yet_ends_the_lease_without_a_settlement() {
+    let http = Recorder::new(
+        &serde_json::json!({
+            "ok": true,
+            "data": {
+                "lease_id": "11111111-1111-1111-1111-111111111111",
+                "revision": "2",
+                "relay": {
+                    "lease_id": "11111111-1111-1111-1111-111111111111",
+                    "revision": "2",
+                    "state": "revoked",
+                    "bytes_consumed": "1048576",
+                    "bytes_remaining": "0",
+                    "grace_remaining_ms": serde_json::Value::Null
+                },
+                "settlement": serde_json::Value::Null,
+                "grace": serde_json::Value::Null
+            }
+        })
+        .to_string(),
+    );
+    let service = ManagedRelayLeaseService::new(
+        origin(),
+        http.clone(),
+        Installation::new(ServiceRequestSigner::Installation),
+    );
+
+    let lease_id = RelayLeaseId::new(Uuid::from_bytes([0x11; 16]));
+    let ending = service
+        .revoke(lease_id, LeaseEndReason::Finished)
+        .await
+        .unwrap_or_else(|error| panic!("an ending, not {:?}: {error}", error.code()));
+
+    assert_eq!(ending.lease_id, lease_id);
+    assert_eq!(ending.revision.get(), 2);
+    let relay = ending
+        .relay
+        .as_ref()
+        .expect("the relay confirmed the revocation");
+    assert_eq!(relay.state, RelayLeaseState::Revoked);
+    assert_eq!(format!("{:?}", ending.settlement), "Nullable(None)");
+}
+
+/// KR-REQ-04.11: the service's own failure while it handled a lease request leaves the request's
+/// outcome unknown, because the service can fail after it reserved bytes and installed a lease. So
+/// nothing asks again by itself, and a caller finds out by sending the same request again. A
+/// revocation that failed the same way stays transient, because a repeated revocation finishes
+/// whatever the first did not.
+#[tokio::test]
+async fn the_services_own_failure_of_a_lease_request_leaves_its_outcome_unknown() {
+    let http = Recorder::new(&granted_answer());
+    let service = ManagedRelayLeaseService::new(
+        origin(),
+        http.clone(),
+        Installation::new(ServiceRequestSigner::Installation),
+    );
+    http.answer_with(
+        500,
+        &serde_json::json!({
+            "ok": false,
+            "error": { "code": "INTERNAL", "message": "The request could not be completed." }
+        })
+        .to_string(),
+    );
+
+    let error = service
+        .issue(&issue_request())
+        .await
+        .expect_err("the service's own failure");
+    let (url, _) = http.last();
+    assert_eq!(url, "https://reach.kala.to/api/relay/lease");
+    assert_eq!(error.code(), ErrorCode::OutcomeUnknown);
+    assert_eq!(error.code().retry_category(), RetryCategory::OutcomeUnknown);
+    assert_eq!(error.user_action(), UserAction::CheckTheOutcome);
+    assert!(
+        !error
+            .decision(RequestClass::IdempotentRead)
+            .retries_automatically()
+    );
+
+    // The control: a revocation is asked again as it was, so its failure is one to wait out.
+    let error = service
+        .revoke(
+            RelayLeaseId::new(Uuid::from_bytes([0x11; 16])),
+            LeaseEndReason::Finished,
+        )
+        .await
+        .expect_err("the service's own failure");
+    assert_eq!(error.code(), ErrorCode::UpstreamUnavailable);
+    assert_eq!(error.code().retry_category(), RetryCategory::Transient);
+    assert_eq!(error.user_action(), UserAction::Wait);
 }
 
 #[tokio::test]
