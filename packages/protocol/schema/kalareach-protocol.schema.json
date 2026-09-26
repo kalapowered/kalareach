@@ -13290,6 +13290,17 @@
           ],
           "description": "When the authority behind this request runs out, on the machine's own continuous clock.\n\nA read is not a mutation and carries no accepted deadline, but the authority behind it\nstill ends: a grant expires while the request is in the worker's queue, and raw input is a\nrequest. The worker compares this inside the boundary that decides what reaches the\napplication, so bytes admitted a moment before an expiry are not written after it. Null\nwhen the caller's authority is not something that expires, which is what a locally\nauthenticated caller's operating-system identity is."
         },
+        "history": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HistoryScope"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The history scope of the grant the host decided this read under.\n\nSection 10 narrows a grant's history in one place, the shared host-side filter, and the\nworker applies that filter to what it retains: an agent's semantic history and an\napproval's record. The worker holds no grants, so the scope travels with the read. It is\nabsent for a caller acting under no grant. Absence never widens what a caller reads: a\nworker serves retained history without a scope only to a caller it can see is the local\nowner, and refuses anybody else.\n\nIt is absent from the wire when it is absent, so a read without one is byte for byte what a\nworker built before scopes travelled reads. A daemon sends one only to a worker that states\n[`FORWARDED_HISTORY_SCOPE`]."
+        },
         "request": {
           "$ref": "#/$defs/Request",
           "description": "The caller's request, exactly as it arrived at the host."
