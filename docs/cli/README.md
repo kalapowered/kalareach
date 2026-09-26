@@ -233,12 +233,16 @@ it in half, and while a paste is open nothing is a key or a pointer report. Past
 reaches the session byte for byte. A paste a terminal sends without delimiters at all is text the
 command cannot tell from typing.
 
-The window this terminal is looking through is the session's answer to say. A scroll-back report
-waits for the one before it, and what the person presses meanwhile is measured from where the
-window actually landed. A report about this terminal's *size* goes out when the size changes,
-whatever else is in flight, because a window drawn for a size the terminal no longer has is wrong
-about every row; it carries what the newest report still waiting for an answer asked for, and
-otherwise the window the screen says this terminal is drawing.
+The window this terminal is looking through is the session's to say. Each report about it waits
+for the one before it to settle, which happens when the session has answered it and the screen
+that answer names has arrived: every answer and every screen names a revision of the window, so a
+screen the session drew before a report, a repaint of where the window was, is never taken for
+the report's own. What the person presses meanwhile waits too, and goes from where that screen
+puts the window. Presses in one direction add up, and a reversal waits its turn, so a press the
+window cannot make is spent without taking the next one with it. A report of this terminal's
+*size* waits the same way. Only the newest size waits, carrying where the window is, so a report
+refused meanwhile never takes a newer size with it. A resize this terminal makes as the size's
+owner is not such a report and goes at once.
 
 They are this terminal's keys only where this terminal has no history of its own. A terminal being
 handed the session's bytes has them, so its own scrollback holds what scrolled past and the command

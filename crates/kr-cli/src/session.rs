@@ -504,11 +504,11 @@ const fn landed(position: Option<ViewportPosition>) -> Option<u64> {
 
 /// Where a movement of `steps` puts this terminal's window.
 ///
-/// `parked` is the row the host last said this window starts at, and `None` means it is on the
-/// live screen. Going back from the live screen is the one case that cannot name a row: this
-/// client has not been given one above the page it is looking at, so it asks by distance and the
-/// host answers with the row it landed on. Going forward from the live screen asks nothing,
-/// because the live screen is as far forward as a window goes.
+/// `parked` is the row this window starts at, as the screen its last report caused says, and
+/// `None` means it is on the live screen. Going back from the live screen is the one case that
+/// cannot name a row: this client has not been given one above the page it is looking at, so it
+/// asks by distance and the host answers with the row it landed on. Going forward from the live
+/// screen asks nothing, because the live screen is as far forward as a window goes.
 fn scrolled(parked: Option<u64>, steps: i64, step: u64) -> Option<Option<ViewportPosition>> {
     let distance = step.saturating_mul(steps.unsigned_abs());
     match (parked, steps) {
@@ -521,6 +521,357 @@ fn scrolled(parked: Option<u64>, steps: i64, step: u64) -> Option<Option<Viewpor
         (Some(row), ..=-1) => Some(Some(ViewportPosition::Row(U64::new(
             row.saturating_add(distance),
         )))),
+    }
+}
+
+/// What one viewport report this terminal sends is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Report {
+    /// Where the window moves to, after a scroll-back key or the wheel.
+    Move,
+    /// This terminal's new size.
+    Size,
+    /// Back to the live screen, because the person typed while following it.
+    Return,
+    /// Who owns the size and at which epoch, which a refused resize leaves this terminal asking.
+    Question,
+}
+
+/// One viewport report to send.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Sending {
+    what: Report,
+    dimensions: Dimensions,
+    position: Option<ViewportPosition>,
+}
+
+/// How the host answered one viewport report.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Answer {
+    /// Refused: nothing changed.
+    Refused,
+    /// Accepted, with the revision the report left the window at, whether this terminal is now
+    /// handed the stream, and where the window landed.
+    Accepted {
+        window_revision: u64,
+        direct: bool,
+        landed: Option<u64>,
+    },
+}
+
+/// Where this terminal's window is, and the viewport reports it owes the session.
+///
+/// Every viewport report this terminal sends goes through here, one at a time, and the session
+/// answers each with the revision it left the window at; every screen it installs names the
+/// revision of the window it is drawn for. That is what lets a report be settled by the screen
+/// it caused and by nothing else: the answer and the screens reach this terminal from two writers,
+/// either can arrive first, and a screen of an earlier revision, such as a repaint queued before
+/// the report, is not the report's.
+///
+/// What goes next is one choice, and the command's loop asks for it at the top of every turn, so
+/// nothing owed waits on an event that does not come: a return to the live screen, then the
+/// question a refused resize leaves owed, then the newest size if it is not the one last sent,
+/// then the next run of moves. Nothing goes while a report is in flight, while no screen is held
+/// to measure a move from, or once the session has said it is closing.
+#[derive(Debug)]
+struct WindowReports {
+    /// Where the window is: `Some(Some(row))` above the live page, `Some(None)` on the live screen
+    /// from its origin, and `None` while this terminal holds no screen to say.
+    record: Option<Option<u64>>,
+    /// The newest revision any answer has named. A screen of an earlier one is drawn for a window
+    /// this terminal has since moved, and never moves the record.
+    answered: u64,
+    /// The revision the newest complete screen named.
+    installed: Option<u64>,
+    /// The report in flight, if any.
+    in_flight: Option<InFlight>,
+    /// A return to the live screen, asked for and not yet sent.
+    return_owed: bool,
+    /// The question a refused resize leaves owed: who owns the size, and at which epoch.
+    question_owed: bool,
+    /// The newest size this terminal measured.
+    size: Dimensions,
+    /// The size the last report carried.
+    size_sent: Dimensions,
+    /// Moves not yet sent, in runs: neighbouring moves in one direction merge, and a reversal
+    /// starts a new run, so a movement the window cannot make at a limit takes nothing else with it.
+    runs: std::collections::VecDeque<i64>,
+    /// How far one step moves the window.
+    step: u64,
+    /// Whether the session has said it is closing.
+    closing: bool,
+}
+
+/// The one report in flight.
+#[derive(Clone, Copy, Debug)]
+struct InFlight {
+    /// Its request, once the loop has sent it.
+    request: Option<kr_protocol::ids::RequestId>,
+    /// The revision its answer named, once it has one and until a screen naming it arrives.
+    awaiting: Option<u64>,
+}
+
+impl WindowReports {
+    /// A terminal that has just attached at this size, and holds no screen yet.
+    fn new(size: Dimensions) -> Self {
+        Self {
+            record: None,
+            answered: 0,
+            installed: None,
+            in_flight: None,
+            return_owed: false,
+            question_owed: false,
+            size,
+            size_sent: size,
+            runs: std::collections::VecDeque::new(),
+            step: 1,
+            closing: false,
+        }
+    }
+
+    /// Where the window is, when this terminal holds a screen that says.
+    const fn record(&self) -> Option<Option<u64>> {
+        self.record
+    }
+
+    /// A scroll-back key or a turn of the wheel: `steps` pages of `step` rows, back through the
+    /// history when positive.
+    fn pressed(&mut self, steps: i64, step: u64, size: Dimensions) {
+        self.step = step;
+        self.size = size;
+        match self.runs.back_mut() {
+            Some(run) if run.signum() == steps.signum() => *run = run.saturating_add(steps),
+            _ if steps != 0 => self.runs.push_back(steps),
+            _ => {}
+        }
+    }
+
+    /// This terminal's size changed.
+    const fn measured(&mut self, size: Dimensions) {
+        self.size = size;
+    }
+
+    /// This terminal gave the session its size as the owner, which tells the session without a
+    /// viewport report. Later reports carry that size, and none is owed for it.
+    const fn took_size(&mut self, size: Dimensions) {
+        self.size = size;
+        self.size_sent = size;
+    }
+
+    /// A resize was refused because somebody else owns the size, or owns it at another epoch.
+    const fn owe_question(&mut self, size: Dimensions) {
+        self.size = size;
+        self.question_owed = true;
+    }
+
+    /// The person typed while following the live screen, which takes the window back to it. That
+    /// is a newer instruction than any move still waiting.
+    fn return_to_live(&mut self) {
+        self.return_owed = true;
+        self.runs.clear();
+    }
+
+    /// A screen arrived whole: the revision of the window it is drawn for, and where it puts the
+    /// window.
+    fn installed(&mut self, window_revision: u64, above: Option<u64>) {
+        self.installed = Some(window_revision);
+        if window_revision >= self.answered {
+            self.record = Some(above);
+        }
+        if let Some(InFlight {
+            awaiting: Some(awaited),
+            ..
+        }) = self.in_flight
+            && window_revision >= awaited
+        {
+            self.in_flight = None;
+        }
+    }
+
+    /// A subscription began with the stream's restoration rather than a screen.
+    ///
+    /// The session hands the stream only to a window at the live screen's origin, so that is where
+    /// the window is, and every report sent before the subscription was asked for is settled by it.
+    /// The moves still waiting were meant for a projection this terminal is no longer drawing: its
+    /// keys are the session's while the stream is its screen.
+    fn streamed(&mut self) {
+        self.record = Some(None);
+        self.in_flight = None;
+        self.runs.clear();
+    }
+
+    /// This terminal discarded its screen and asked for a new subscription. Until that one's first
+    /// screen or restoration arrives, nothing says where the window is.
+    const fn recovering(&mut self) {
+        self.record = None;
+    }
+
+    /// The session has said it is closing, and is sent nothing more.
+    const fn close(&mut self) {
+        self.closing = true;
+    }
+
+    /// The report to send now, if any. It is in flight from here until it settles.
+    fn next(&mut self) -> Option<Sending> {
+        if self.closing || self.in_flight.is_some() {
+            return None;
+        }
+        let record = self.record?;
+        let place = record.map(|row| ViewportPosition::Row(U64::new(row)));
+        let sending = if self.return_owed {
+            self.return_owed = false;
+            Sending {
+                what: Report::Return,
+                dimensions: self.size,
+                position: None,
+            }
+        } else if self.question_owed {
+            // What it asks for is the answer's owner and epoch, so it goes whatever its size.
+            self.question_owed = false;
+            Sending {
+                what: Report::Question,
+                dimensions: self.size,
+                position: place,
+            }
+        } else if self.size != self.size_sent {
+            Sending {
+                what: Report::Size,
+                dimensions: self.size,
+                position: place,
+            }
+        } else {
+            loop {
+                let run = self.runs.pop_front()?;
+                // A movement the window cannot make is spent here, inside the same choice, so the
+                // run behind it goes now rather than waiting for something else to happen.
+                if let Some(position) = scrolled(record, run, self.step) {
+                    break Sending {
+                        what: Report::Move,
+                        dimensions: self.size,
+                        position,
+                    };
+                }
+            }
+        };
+        self.size_sent = sending.dimensions;
+        self.in_flight = Some(InFlight {
+            request: None,
+            awaiting: None,
+        });
+        Some(sending)
+    }
+
+    /// The loop sent the report `next` handed it, under this request.
+    const fn sent(&mut self, request: kr_protocol::ids::RequestId) {
+        if let Some(in_flight) = self.in_flight.as_mut() {
+            in_flight.request = Some(request);
+        }
+    }
+
+    /// The session answered one of this terminal's viewport reports.
+    ///
+    /// A refusal settles it and changes nothing. An answer that hands this terminal the stream
+    /// settles it where that answer says the window landed, which for a terminal handed the stream
+    /// is the live screen's origin. Any other answer settles it only once a screen naming its
+    /// revision, or a later one, has arrived, whether that screen came before the answer or comes
+    /// after it.
+    fn answered(&mut self, request: kr_protocol::ids::RequestId, answer: Answer) {
+        let ours = self
+            .in_flight
+            .is_some_and(|in_flight| in_flight.request == Some(request));
+        match answer {
+            Answer::Refused => {
+                if ours {
+                    self.in_flight = None;
+                }
+            }
+            Answer::Accepted {
+                window_revision,
+                direct,
+                landed: at,
+            } => {
+                self.answered = self.answered.max(window_revision);
+                if !ours {
+                    return;
+                }
+                if direct {
+                    self.record = Some(at);
+                    self.runs.clear();
+                    self.in_flight = None;
+                } else if self
+                    .installed
+                    .is_some_and(|installed| installed >= window_revision)
+                {
+                    self.in_flight = None;
+                } else if let Some(in_flight) = self.in_flight.as_mut() {
+                    in_flight.awaiting = Some(window_revision);
+                }
+            }
+        }
+    }
+}
+
+/// Which subscription a notification belongs to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Heard {
+    /// A notification of the stream a new subscription is replacing.
+    Replaced,
+    /// The first delivery of a subscription, other than a gap: its screen or the stream's
+    /// restoration.
+    First,
+    /// Anything else.
+    Later,
+}
+
+/// The subscriptions this terminal asks for, and where a new one's stream begins.
+///
+/// Every subscription's notifications on one connection share a stream identifier and restart
+/// their sequence at zero, and the one being replaced stops before the new one writes anything.
+/// This terminal asks for a new one only after reading a notification of the old one, so the next
+/// notification of sequence zero is the new stream's first, and it asks for one at a time, so there
+/// is never a second new stream to mistake for it. The sequence is read before anything else about
+/// a notification, which is what lets a first notification that cannot be decoded still open the
+/// new stream.
+#[derive(Debug, Default)]
+struct Subscriptions {
+    /// A new subscription has been asked for, and its stream has not begun.
+    replacing: bool,
+    /// The stream's first delivery other than a gap has not arrived.
+    opening: bool,
+}
+
+impl Subscriptions {
+    /// The first subscription, whose first delivery has not arrived.
+    const fn new() -> Self {
+        Self {
+            replacing: false,
+            opening: true,
+        }
+    }
+
+    /// Asks for a new subscription, unless one is already being asked for; says which.
+    const fn replace(&mut self) -> bool {
+        if self.replacing {
+            return false;
+        }
+        self.replacing = true;
+        true
+    }
+
+    /// Says which subscription a notification belongs to, from its sequence and its type.
+    fn heard(&mut self, sequence: u64, event_type: &str) -> Heard {
+        if self.replacing {
+            if sequence != 0 {
+                return Heard::Replaced;
+            }
+            self.replacing = false;
+            self.opening = true;
+        }
+        if self.opening && event_type != "session.gap" {
+            self.opening = false;
+            return Heard::First;
+        }
+        Heard::Later
     }
 }
 
@@ -802,12 +1153,10 @@ enum Outstanding {
     Input(u64),
     /// A size change this terminal made as the size owner.
     Resize,
-    /// A size this terminal reported while somebody else owns the size.
-    Viewport,
+    /// A viewport report, and what it was for.
+    Window(Report),
     /// A fresh screen this terminal asked for after a resynchronisation marker.
     Resubscribe,
-    /// Where this terminal's window is now looking, after a scroll-back key.
-    Scrollback,
 }
 
 /// Runs the attachment's input, output and connection in one loop.
@@ -855,25 +1204,11 @@ async fn drive(
     let mut outstanding: std::collections::BTreeMap<kr_protocol::ids::RequestId, Outstanding> =
         std::collections::BTreeMap::new();
     let mut next_request = 1_u64;
-    // The row this terminal's window starts at while it is looking above the live page. `None` is
-    // the live screen. It is reported with every size report as well, so a window the person has
-    // scrolled back to stays where they put it when they resize their terminal.
-    let mut parked: Option<u64> = None;
-    // What each report still in flight asked for, exactly as it asked: a distance above the live
-    // screen is not the row it resolves to, and a size report that turned one into the other would
-    // name somewhere else. A size report sent meanwhile carries what the newest of them asked for
-    // rather than the position the window has left, because the session answers them in the order
-    // they arrive and the last one is the one it keeps. They are kept per request, so an older
-    // answer cannot forget what a newer request is still waiting to be told.
-    let mut requested: std::collections::BTreeMap<
-        kr_protocol::ids::RequestId,
-        Option<ViewportPosition>,
-    > = std::collections::BTreeMap::new();
-    // Movement the person has asked for and the session has not answered yet, the step it was
-    // measured with, and the size that report carried.
-    let mut queued = 0_i64;
-    let mut step = 1_u64;
-    let mut dimensions_now = attached.dimensions;
+    // Where this terminal's window is, and every viewport report it owes the session about it,
+    // which go one at a time and are settled by the screen each one caused.
+    let mut window = WindowReports::new(attached.dimensions);
+    // Which subscription each notification belongs to, while a new one replaces the old.
+    let mut subscriptions = Subscriptions::new();
 
     // The output cursor of the last whole screen this terminal was given, which is how it tells a
     // screen the session had something new to say from one it asked for itself.
@@ -923,6 +1258,32 @@ async fn drive(
         sequence += 1;
     }
     loop {
+        // What this terminal owes the session about its window goes first, one report at a time.
+        // It is asked here, at the top of every turn, so an event that lets a report go is never
+        // one that forgot to ask for it.
+        if let Some(report) = window.next() {
+            let request_id = kr_protocol::ids::RequestId::new(next_request);
+            next_request += 1;
+            let params = kr_protocol::attachment::AttachmentViewportParams {
+                attachment_id,
+                dimensions: report.dimensions,
+                position: Nullable(report.position),
+                column: U64::ZERO,
+            };
+            if !send_geometry(
+                client,
+                descriptor,
+                request_id,
+                Method::AttachmentViewport,
+                &params,
+            )
+            .await
+            {
+                return AttachOutcome::Disconnected;
+            }
+            window.sent(request_id);
+            outstanding.insert(request_id, Outstanding::Window(report.what));
+        }
         tokio::select! {
             // Biased towards the worker, so output and refusals are seen before more input is
             // sent. What comes before even that is a held prefix whose moment has passed: it is
@@ -937,41 +1298,10 @@ async fn drive(
                     undelivered |= !held.is_empty();
                     continue;
                 }
-                if !held.is_empty() {
-                    // Typing brings a following window back to the live screen, wherever in this
-                    // loop the typing turns out to have been.
-                    if follow_live
-                        && showing_history
-                        && let Ok(size) = terminal.size()
-                        && size.columns > 0
-                        && size.rows > 0
-                    {
-                        let request_id = kr_protocol::ids::RequestId::new(next_request);
-                        next_request += 1;
-                        let params = kr_protocol::attachment::AttachmentViewportParams {
-                            attachment_id,
-                            dimensions: Dimensions::new(
-                                u64::from(size.columns),
-                                u64::from(size.rows),
-                            ),
-                            position: Nullable(None),
-                            column: U64::ZERO,
-                        };
-                        if !send_geometry(
-                            client,
-                            descriptor,
-                            request_id,
-                            Method::AttachmentViewport,
-                            &params,
-                        )
-                        .await
-                        {
-                            return AttachOutcome::Disconnected;
-                        }
-                        outstanding.insert(request_id, Outstanding::Scrollback);
-                        requested.insert(request_id, None);
-                        queued = 0;
-                    }
+                // Typing brings a following window back to the live screen, wherever in this loop
+                // the typing turns out to have been.
+                if !held.is_empty() && follow_live && showing_history {
+                    window.return_to_live();
                 }
                 if !held.is_empty()
                     && let Some(epoch) = epoch
@@ -1005,6 +1335,29 @@ async fn drive(
                         // attachment with the status the closure implies.
                         if notification.event_type.as_str() == SESSION_CLOSED_EVENT {
                             return closed(&notification.payload, undelivered);
+                        }
+                        // Which subscription this belongs to, read before anything else about it:
+                        // a first notification that cannot even be decoded still opens the new
+                        // stream. While a new subscription replaces the old one, the old stream's
+                        // screens and markers describe what is being replaced and are passed over.
+                        let heard = subscriptions.heard(
+                            notification.sequence.get(),
+                            notification.event_type.as_str(),
+                        );
+                        if heard == Heard::Replaced
+                            && (crate::render::is_projection_event(
+                                notification.event_type.as_str(),
+                            ) || notification.event_type.as_str() == "session.resync")
+                        {
+                            continue;
+                        }
+                        // A subscription that begins with the stream rather than a screen is
+                        // served at the live screen's origin, which is the only place the session
+                        // hands its stream to.
+                        if heard == Heard::First
+                            && notification.event_type.as_str() == "session.output"
+                        {
+                            window.streamed();
                         }
                         if notification.event_type.as_str() == "session.output"
                             && let Ok(event) = notification
@@ -1040,9 +1393,10 @@ async fn drive(
                                 // at. What is held goes with it, because the next thing drawn has
                                 // to be a screen this terminal was actually sent.
                                 display.discard();
-                                if closing {
+                                if closing || !subscriptions.replace() {
                                     continue;
                                 }
+                                window.recovering();
                                 let request_id = kr_protocol::ids::RequestId::new(next_request);
                                 next_request += 1;
                                 if !resubscribe(client, descriptor, request_id, attachment_id).await
@@ -1066,66 +1420,29 @@ async fn drive(
                                 }
                                 None => false,
                             };
-                            // Where the window actually is, which is not always where this
-                            // terminal last asked for: the session gives up its oldest rows, and a
-                            // window that was over them is moved to the oldest ones that survive.
-                            //
-                            // A full-screen application takes the screen, and the window comes
-                            // back to the live screen with it: that buffer keeps no history, and
-                            // its rows are numbered from its own beginning, so a row identifier
-                            // taken from it would name a row of another screen.
-                            //
-                            // Only a screen that has arrived whole says anything. Between a reset
-                            // and the last of its pages this terminal holds no screen at all, and
-                            // reading a position out of that would forget where the window is
-                            // half way through being told.
+                            // What this terminal is showing, which every screen and update it draws
+                            // decides: the rows on the person's terminal are the ones drawn last.
                             if let Some(above) = display.window_above_the_live_page() {
-                                parked = above;
                                 showing_history = above.is_some();
+                            }
+                            // Where the window is, which only a whole screen says: the session
+                            // gives up its oldest rows, and a window over them is moved to the
+                            // oldest that survive; a full-screen application takes the screen,
+                            // and the window comes back to the live screen with it. The screen
+                            // names the window's revision, so one drawn for a window this terminal
+                            // has since moved is told apart from the one its report caused.
+                            if drawn.installed
+                                && let (Some(revision), Some(above)) =
+                                    (display.window_revision(), display.window_above_the_live_page())
+                            {
+                                window.installed(revision, above);
                             }
                             // The client's own choice, not the session's: a person who asked to
                             // follow the live screen is taken back to it the moment the session
                             // writes, and one who did not stays where they scrolled to while the
                             // output goes on arriving underneath.
-                            if follow_live
-                                && changed
-                                && parked.is_some()
-                                && !closing
-                                && let Ok(size) = terminal.size()
-                                && size.columns > 0
-                                && size.rows > 0
-                            {
-                                let request_id =
-                                    kr_protocol::ids::RequestId::new(next_request);
-                                next_request += 1;
-                                let params =
-                                    kr_protocol::attachment::AttachmentViewportParams {
-                                        attachment_id,
-                                        dimensions: Dimensions::new(
-                                            u64::from(size.columns),
-                                            u64::from(size.rows),
-                                        ),
-                                        position: Nullable(None),
-                                        column: U64::ZERO,
-                                    };
-                                if !send_geometry(
-                                    client,
-                                    descriptor,
-                                    request_id,
-                                    Method::AttachmentViewport,
-                                    &params,
-                                )
-                                .await
-                                {
-                                    return AttachOutcome::Disconnected;
-                                }
-                                outstanding.insert(request_id, Outstanding::Scrollback);
-                                // Like every other report that names a position: a size report
-                                // sent before this is answered carries what this asked for.
-                                requested.insert(request_id, None);
-                                // Going back to the live screen is a newer instruction than
-                                // anything the person had queued above it.
-                                queued = 0;
+                            if follow_live && changed && window.record().flatten().is_some() {
+                                window.return_to_live();
                             }
                             if !drawn.bytes.is_empty() {
                                 let mut handle = output.as_ref();
@@ -1134,7 +1451,8 @@ async fn drive(
                                 }
                                 let _ = handle.flush();
                             }
-                            if drawn.resubscribe && !closing {
+                            if drawn.resubscribe && !closing && subscriptions.replace() {
+                                window.recovering();
                                 let request_id = kr_protocol::ids::RequestId::new(next_request);
                                 next_request += 1;
                                 if !resubscribe(client, descriptor, request_id, attachment_id).await
@@ -1155,9 +1473,10 @@ async fn drive(
                             // It is discarded before the fresh one is asked for, so nothing is
                             // drawn from it in between.
                             display.discard();
-                            if closing {
+                            if closing || !subscriptions.replace() {
                                 continue;
                             }
+                            window.recovering();
                             let request_id = kr_protocol::ids::RequestId::new(next_request);
                             next_request += 1;
                             if !resubscribe(client, descriptor, request_id, attachment_id).await {
@@ -1176,9 +1495,6 @@ async fn drive(
                         let Some(what) = outstanding.remove(&answered) else {
                             continue;
                         };
-                        // Only this request's own record: an older answer must not forget what a
-                        // newer request is still waiting to be told.
-                        requested.remove(&answered);
                         // A session that is closing has nothing more to say to this terminal in an
                         // answer, and nothing an answer would have it send is of use any more.
                         if closing {
@@ -1216,59 +1532,45 @@ async fn drive(
                                         // anyway. Asking would swap one refusal for another.
                                         continue;
                                     }
-                                    let request_id =
-                                        kr_protocol::ids::RequestId::new(next_request);
-                                    next_request += 1;
-                                    let params =
-                                        kr_protocol::attachment::AttachmentViewportParams {
-                                            attachment_id,
-                                            dimensions: Dimensions::new(
-                                                u64::from(size.columns),
-                                                u64::from(size.rows),
-                                            ),
-                                            position: Nullable(
-                                                requested
-                                                    .values()
-                                                    .next_back()
-                                                    .copied()
-                                                    .unwrap_or_else(|| {
-                                                        display
-                                                            .window_above_the_live_page()
-                                                            .unwrap_or(parked)
-                                                            .map(|row| {
-                                                                ViewportPosition::Row(U64::new(
-                                                                    row,
-                                                                ))
-                                                            })
-                                                    }),
-                                            ),
-                                            column: U64::ZERO,
-                                        };
-                                    if !send_geometry(
-                                        client,
-                                        descriptor,
-                                        request_id,
-                                        Method::AttachmentViewport,
-                                        &params,
-                                    )
-                                    .await
-                                    {
-                                        return AttachOutcome::Disconnected;
-                                    }
-                                    outstanding.insert(request_id, Outstanding::Viewport);
-                                    requested.insert(request_id, params.position.0);
+                                    // It goes behind whatever viewport report is in flight, with
+                                    // where the window is, whatever its size.
+                                    window.owe_question(Dimensions::new(
+                                        u64::from(size.columns),
+                                        u64::from(size.rows),
+                                    ));
                                 }
                                 kr_protocol::envelope::Outcome::Error(_) => {}
                             },
                             // A viewport report answers with the presentation it produced as well
                             // as the geometry, so it has its own result type and its own decoder.
-                            (Outstanding::Viewport, outcome) => {
-                                if let kr_protocol::envelope::Outcome::Ok(value) = outcome
-                                    && let Ok(result) = value.to_typed::<
-                                        kr_protocol::attachment::AttachmentViewportResult,
-                                    >()
-                                {
-                                    parked = landed(result.position.0);
+                            // Where the window is comes from the screen the answer names, not from
+                            // the answer: an answer can arrive before that screen, and after one
+                            // drawn for an earlier window.
+                            (Outstanding::Window(report), outcome) => {
+                                let result = match outcome {
+                                    kr_protocol::envelope::Outcome::Ok(value) => value
+                                        .to_typed::<kr_protocol::attachment::AttachmentViewportResult>(
+                                        )
+                                        .ok(),
+                                    kr_protocol::envelope::Outcome::Error(_) => None,
+                                };
+                                let Some(result) = result else {
+                                    window.answered(answered, Answer::Refused);
+                                    continue;
+                                };
+                                window.answered(
+                                    answered,
+                                    Answer::Accepted {
+                                        window_revision: result.window_revision.get(),
+                                        direct: result.presentation
+                                            == kr_protocol::attachment::TerminalPresentationMode::Direct,
+                                        landed: landed(result.position.0),
+                                    },
+                                );
+                                // What a size report or a question says of the geometry is read here,
+                                // before the next report is chosen, so a terminal that has become the
+                                // owner resizes as the owner.
+                                if matches!(report, Report::Size | Report::Question) {
                                     geometry_epoch = result.geometry.epoch;
                                     owns_geometry =
                                         result.geometry.owner.as_ref() == Some(&attachment_id);
@@ -1320,6 +1622,7 @@ async fn drive(
                                 // began. This terminal stops sending and waits for the closure.
                                 ErrorCode::SessionClosed => {
                                     closing = true;
+                                    window.close();
                                     undelivered = true;
                                 }
                                 code => {
@@ -1332,52 +1635,6 @@ async fn drive(
                                 }
                             },
                             (Outstanding::Input(_), kr_protocol::envelope::Outcome::Ok(_)) => {}
-                            // A scroll-back report answers with the row the window actually
-                            // landed on, which is not always the one it asked for: a row the
-                            // session has given up becomes the oldest one it still holds, and a
-                            // row inside the live page becomes the live screen. The pages that
-                            // cover it arrive as ordinary output.
-                            (Outstanding::Scrollback, outcome) => {
-                                if let kr_protocol::envelope::Outcome::Ok(value) = outcome
-                                    && let Ok(result) = value.to_typed::<
-                                        kr_protocol::attachment::AttachmentViewportResult,
-                                    >()
-                                {
-                                    parked = landed(result.position.0);
-                                }
-                                // What the person asked for while this was in flight, resolved
-                                // against where the window actually ended up. A refusal leaves the
-                                // window where it was, and the movement is measured from there.
-                                let asked = (queued != 0)
-                                    .then(|| scrolled(parked, queued, step))
-                                    .flatten();
-                                queued = 0;
-                                if let Some(position) = asked {
-                                    let request_id =
-                                        kr_protocol::ids::RequestId::new(next_request);
-                                    next_request += 1;
-                                    let params =
-                                        kr_protocol::attachment::AttachmentViewportParams {
-                                            attachment_id,
-                                            dimensions: dimensions_now,
-                                            position: Nullable(position),
-                                            column: U64::ZERO,
-                                        };
-                                    if !send_geometry(
-                                        client,
-                                        descriptor,
-                                        request_id,
-                                        Method::AttachmentViewport,
-                                        &params,
-                                    )
-                                    .await
-                                    {
-                                        return AttachOutcome::Disconnected;
-                                    }
-                                    outstanding.insert(request_id, Outstanding::Scrollback);
-                                    requested.insert(request_id, position);
-                                }
-                            }
                             // The screen follows as ordinary output. A refusal because the session
                             // is closing is answered by the closure, which is still to come; any
                             // other means the session no longer has this attachment, which is the
@@ -1388,6 +1645,7 @@ async fn drive(
                                         return AttachOutcome::Disconnected;
                                     }
                                     closing = true;
+                                    window.close();
                                 }
                             }
                         }
@@ -1416,66 +1674,34 @@ async fn drive(
                     u64::from(size.columns),
                     u64::from(size.rows),
                 );
-                // What every later report about this window carries, so one queued behind a scroll
-                // does not put the terminal's old size back.
-                dimensions_now = dimensions;
+                // The owner moves the session's size at once, which is not a viewport report and
+                // waits behind none. Anybody else reports the size it is looking at, which changes
+                // which presentation it is served and nothing else: only the newest size waits,
+                // behind whatever viewport report is in flight, and goes with where the window is.
+                if !owns_geometry {
+                    window.measured(dimensions);
+                    continue;
+                }
+                window.took_size(dimensions);
                 let request_id = kr_protocol::ids::RequestId::new(next_request);
                 next_request += 1;
-                // The owner moves the session's size; anybody else reports the size it is
-                // looking at, which changes which presentation it is served and nothing else.
-                let (sent, what) = if owns_geometry {
-                    let params = kr_protocol::attachment::TerminalResizeParams {
-                        attachment_id,
-                        dimensions,
-                        expected_geometry_epoch: geometry_epoch,
-                    };
-                    (
-                        send_geometry(
-                            client,
-                            descriptor,
-                            request_id,
-                            Method::TerminalResize,
-                            &params,
-                        )
-                        .await,
-                        Outstanding::Resize,
-                    )
-                } else {
-                    let params = kr_protocol::attachment::AttachmentViewportParams {
-                        attachment_id,
-                        dimensions,
-                        position: Nullable(requested.values().next_back().copied().unwrap_or_else(
-                            || {
-                                // The window this terminal is drawing, not the last thing an
-                                // answer said about it: a screen is newer than an answer that
-                                // crossed it.
-                                display
-                                    .window_above_the_live_page()
-                                    .unwrap_or(parked)
-                                    .map(|row| ViewportPosition::Row(U64::new(row)))
-                            },
-                        )),
-                        column: U64::ZERO,
-                    };
-                    // Like every other report that names a position: one sent after this, before
-                    // this is answered, carries what this asked for.
-                    requested.insert(request_id, params.position.0);
-                    (
-                        send_geometry(
-                            client,
-                            descriptor,
-                            request_id,
-                            Method::AttachmentViewport,
-                            &params,
-                        )
-                        .await,
-                        Outstanding::Viewport,
-                    )
+                let params = kr_protocol::attachment::TerminalResizeParams {
+                    attachment_id,
+                    dimensions,
+                    expected_geometry_epoch: geometry_epoch,
                 };
-                if !sent {
+                if !send_geometry(
+                    client,
+                    descriptor,
+                    request_id,
+                    Method::TerminalResize,
+                    &params,
+                )
+                .await
+                {
                     return AttachOutcome::Disconnected;
                 }
-                outstanding.insert(request_id, what);
+                outstanding.insert(request_id, Outstanding::Resize);
             }
             bytes = input.recv() => {
                 let Some(bytes) = bytes else {
@@ -1579,48 +1805,14 @@ async fn drive(
                     let shown = display
                         .window_rows()
                         .unwrap_or_else(|| u64::from(size.rows));
-                    step = scroll_step(shown);
-                    dimensions_now =
-                        Dimensions::new(u64::from(size.columns), u64::from(size.rows));
-                    // Where the window is is the answer's to say and never a request's guess, so
-                    // one request is in flight at a time and what the person presses meanwhile
-                    // waits for it. A key answered from a position the host had already moved past
-                    // would ask for somewhere nobody is, and two keys resolved against the same
-                    // position would land where one of them did.
-                    queued = queued.saturating_add(steps);
-                    if !outstanding
-                        .values()
-                        .any(|what| matches!(what, Outstanding::Scrollback))
-                    {
-                        // A movement the window cannot make is spent rather than kept: a window on
-                        // the live screen asked to go forward has nowhere to go, and holding that
-                        // against the next key would swallow it.
-                        let asked = scrolled(parked, queued, step);
-                        queued = 0;
-                        if let Some(position) = asked {
-                        let request_id = kr_protocol::ids::RequestId::new(next_request);
-                        next_request += 1;
-                        let params = kr_protocol::attachment::AttachmentViewportParams {
-                            attachment_id,
-                            dimensions: dimensions_now,
-                            position: Nullable(position),
-                            column: U64::ZERO,
-                        };
-                        if !send_geometry(
-                            client,
-                            descriptor,
-                            request_id,
-                            Method::AttachmentViewport,
-                            &params,
-                        )
-                        .await
-                        {
-                            return AttachOutcome::Disconnected;
-                        }
-                        outstanding.insert(request_id, Outstanding::Scrollback);
-                        requested.insert(request_id, position);
-                        }
-                    }
+                    // Where the window is is the session's to say and never a request's guess, so
+                    // one report is in flight at a time and what the person presses meanwhile
+                    // waits for it to settle, then goes from where it put the window.
+                    window.pressed(
+                        steps,
+                        scroll_step(shown),
+                        Dimensions::new(u64::from(size.columns), u64::from(size.rows)),
+                    );
                     if key.is_some() {
                         // The key was this terminal's, so nothing of that read reaches the
                         // session, whether or not the window had anywhere to go.
@@ -1633,39 +1825,8 @@ async fn drive(
                 // Typing goes to the application wherever the window is. A person who asked to
                 // follow the live screen is taken back to it by the first key they press, because
                 // what they type is answered there and not in what they were reading.
-                if follow_live
-                    && showing_history
-                    && let Ok(size) = terminal.size()
-                    && size.columns > 0
-                    && size.rows > 0
-                {
-                    let request_id = kr_protocol::ids::RequestId::new(next_request);
-                    next_request += 1;
-                    let params = kr_protocol::attachment::AttachmentViewportParams {
-                        attachment_id,
-                        dimensions: Dimensions::new(
-                            u64::from(size.columns),
-                            u64::from(size.rows),
-                        ),
-                        position: Nullable(None),
-                        column: U64::ZERO,
-                    };
-                    if !send_geometry(
-                        client,
-                        descriptor,
-                        request_id,
-                        Method::AttachmentViewport,
-                        &params,
-                    )
-                    .await
-                    {
-                        return AttachOutcome::Disconnected;
-                    }
-                    outstanding.insert(request_id, Outstanding::Scrollback);
-                    requested.insert(request_id, None);
-                    // Going back to the live screen is a newer instruction than anything the
-                    // person had queued above it.
-                    queued = 0;
+                if follow_live && showing_history {
+                    window.return_to_live();
                 }
                 let Some(epoch) = epoch else {
                     // This terminal may not type. The bytes go nowhere, and the attachment goes on
@@ -1845,8 +2006,8 @@ async fn wait_for_resize(_resized: &mut Option<&mut WindowChanges>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        AttachOutcome, SCROLL_BACK_KEY, SCROLL_FORWARD_KEY, landed, scroll_keys, scroll_step,
-        scrolled,
+        Answer, AttachOutcome, Heard, Report, SCROLL_BACK_KEY, SCROLL_FORWARD_KEY, Sending,
+        Subscriptions, WindowReports, landed, scroll_keys, scroll_step, scrolled,
     };
     use kr_client::shown::Shown;
     use kr_protocol::attachment::ViewportPosition;
@@ -2345,6 +2506,381 @@ mod tests {
                 42
             )))),
             Some(42)
+        );
+    }
+
+    fn size(columns: u64, rows: u64) -> kr_protocol::session::Dimensions {
+        kr_protocol::session::Dimensions::new(columns, rows)
+    }
+
+    fn request(id: u64) -> kr_protocol::ids::RequestId {
+        kr_protocol::ids::RequestId::new(id)
+    }
+
+    fn accepted(window_revision: u64, landed: Option<u64>) -> Answer {
+        Answer::Accepted {
+            window_revision,
+            direct: false,
+            landed,
+        }
+    }
+
+    fn row(row: u64) -> Option<ViewportPosition> {
+        Some(ViewportPosition::Row(U64::new(row)))
+    }
+
+    fn above(rows: u64) -> Option<ViewportPosition> {
+        Some(ViewportPosition::Above(U64::new(rows)))
+    }
+
+    /// Sends what the window owes next, as the command's loop does, and says what it was.
+    fn send(window: &mut WindowReports, id: u64) -> Option<Sending> {
+        let sending = window.next()?;
+        window.sent(request(id));
+        Some(sending)
+    }
+
+    /// A terminal that attached on the live screen and moved one page back, to row 477, whose
+    /// report was answered with revision 1 and whose screen arrived.
+    fn parked_at_477() -> WindowReports {
+        let mut window = WindowReports::new(size(80, 24));
+        window.installed(0, None);
+        window.pressed(1, 23, size(80, 24));
+        let first = send(&mut window, 1).expect("the first page back goes at once");
+        assert_eq!(first.position, above(23));
+        window.answered(request(1), accepted(1, Some(477)));
+        window.installed(1, Some(477));
+        assert_eq!(window.record(), Some(Some(477)));
+        window
+    }
+
+    /// An earlier report's screen never moves the record of where the window is.
+    ///
+    /// The host queues a repaint of the window where it was, then the screen for the next move,
+    /// and the move's answer can overtake the repaint. The repaint names the revision before the
+    /// move's, so it is not the move's screen, and the press made meanwhile goes from where the
+    /// move's answer and its own screen put the window.
+    #[test]
+    fn an_earlier_reports_screen_never_moves_the_record() {
+        let mut window = parked_at_477();
+        window.pressed(1, 23, size(80, 24));
+        let second = send(&mut window, 2).expect("the next page back");
+        assert_eq!(second.position, row(454));
+        window.answered(request(2), accepted(2, Some(454)));
+        // The repaint of row 477, queued before the report and read after its answer.
+        window.installed(1, Some(477));
+        window.pressed(1, 23, size(80, 24));
+        assert_eq!(
+            window.next(),
+            None,
+            "the press waits for the screen the answer names, not the repaint before it"
+        );
+        window.installed(2, Some(454));
+        let third = send(&mut window, 3).expect("the press goes once the report has settled");
+        assert_eq!(
+            third.position,
+            row(431),
+            "measured from where the answer and its screen put the window"
+        );
+    }
+
+    /// Presses queued behind a report go from where its answer and named screen put the window,
+    /// and when the next subscription's first screen names a change of the host's own, from there.
+    #[test]
+    fn queued_presses_go_from_where_the_answer_and_its_screen_put_the_window() {
+        let mut window = parked_at_477();
+        window.pressed(1, 23, size(80, 24));
+        let second = send(&mut window, 2).expect("the next page back");
+        assert_eq!(second.position, row(454));
+        window.pressed(1, 23, size(80, 24));
+        window.answered(request(2), accepted(2, Some(454)));
+        assert_eq!(
+            window.next(),
+            None,
+            "an answer alone does not settle a move: its screen has not arrived"
+        );
+        // This terminal is told to resynchronise before the move's screen reaches it, and the
+        // host brings its window back to the live screen meanwhile.
+        window.recovering();
+        assert_eq!(window.next(), None, "nothing goes while no screen is held");
+        window.installed(3, None);
+        let third = send(&mut window, 3).expect("the queued press goes");
+        assert_eq!(
+            third.position,
+            above(23),
+            "from the live screen, where the host's own change put the window"
+        );
+    }
+
+    /// A screen that arrives before its report's answer is the one the answer then names.
+    #[test]
+    fn a_screen_before_its_answer_is_found_by_the_answer() {
+        let mut window = parked_at_477();
+        window.pressed(1, 23, size(80, 24));
+        send(&mut window, 2).expect("the next page back");
+        window.installed(2, Some(454));
+        window.pressed(1, 23, size(80, 24));
+        assert_eq!(window.next(), None, "the report is not answered yet");
+        window.answered(request(2), accepted(2, Some(454)));
+        let third = send(&mut window, 3).expect("settled by the screen already held");
+        assert_eq!(third.position, row(431));
+    }
+
+    /// At the oldest row a page back is spent where the host holds the window, and the reversal
+    /// queued behind it still goes, from the oldest row.
+    #[test]
+    fn a_reversal_at_the_oldest_row_goes_from_the_oldest_row() {
+        let mut window = WindowReports::new(size(80, 24));
+        window.installed(0, None);
+        window.pressed(1, 23, size(80, 24));
+        send(&mut window, 1).expect("back from the live screen");
+        window.answered(request(1), accepted(1, Some(100)));
+        window.installed(1, Some(100));
+        // Row 100 is the oldest there is. Back once more, back again and forward, quickly.
+        window.pressed(1, 23, size(80, 24));
+        assert_eq!(send(&mut window, 2).map(|s| s.position), Some(row(77)));
+        window.pressed(1, 23, size(80, 24));
+        window.pressed(-1, 23, size(80, 24));
+        // The host holds the window at row 100 and sends nothing for it.
+        window.answered(request(2), accepted(1, Some(100)));
+        assert_eq!(
+            send(&mut window, 3).map(|s| s.position),
+            Some(row(77)),
+            "the page back queued behind it is asked for from row 100"
+        );
+        window.answered(request(3), accepted(1, Some(100)));
+        assert_eq!(
+            send(&mut window, 4).map(|s| s.position),
+            Some(row(123)),
+            "and the reversal is not lost to it"
+        );
+    }
+
+    /// On the live screen a page forward is spent inside the same choice, and the reversal
+    /// behind it goes without waiting for anything else to happen.
+    #[test]
+    fn a_reversal_at_the_live_screen_goes_at_once() {
+        let mut window = parked_at_477();
+        window.pressed(-1, 23, size(80, 24));
+        assert_eq!(send(&mut window, 2).map(|s| s.position), Some(row(500)));
+        window.pressed(-1, 23, size(80, 24));
+        window.pressed(1, 23, size(80, 24));
+        // Row 500 is the live screen's first row: the host answers with the live screen.
+        window.answered(request(2), accepted(2, None));
+        window.installed(2, None);
+        assert_eq!(
+            send(&mut window, 3).map(|s| s.position),
+            Some(above(23)),
+            "the page forward had nowhere to go, and the page back goes from the live screen"
+        );
+    }
+
+    /// A refused move does not take a newer size with it: the size waits for the move and goes
+    /// next, with the place the window is really at.
+    #[test]
+    fn a_refused_move_while_a_newer_size_waits_keeps_the_size() {
+        let mut window = parked_at_477();
+        window.pressed(1, 23, size(80, 24));
+        send(&mut window, 2).expect("the next page back");
+        window.measured(size(100, 30));
+        assert_eq!(window.next(), None, "the size waits for the move");
+        window.answered(request(2), Answer::Refused);
+        let next = send(&mut window, 3).expect("the size goes after the refusal");
+        assert_eq!(
+            (next.what, next.dimensions, next.position),
+            (Report::Size, size(100, 30), row(477)),
+            "with the newest size and where the window is, not where the refused move asked"
+        );
+        window.pressed(1, 23, size(100, 30));
+        window.answered(request(3), accepted(2, Some(477)));
+        window.recovering();
+        window.installed(2, Some(477));
+        assert_eq!(
+            send(&mut window, 4).map(|s| s.position),
+            Some(row(454)),
+            "and a press made meanwhile goes from the next complete screen"
+        );
+    }
+
+    /// An answer that hands this terminal the stream settles its report at the live screen's
+    /// origin, and so does a subscription that begins with the stream; the presses waiting are
+    /// the session's keys now, and go nowhere.
+    #[test]
+    fn the_stream_settles_a_report_at_the_live_origin_and_drops_the_presses() {
+        let mut window = parked_at_477();
+        window.pressed(-1, 23, size(80, 24));
+        send(&mut window, 2).expect("forward, onto the live screen");
+        window.pressed(1, 23, size(80, 24));
+        window.answered(
+            request(2),
+            Answer::Accepted {
+                window_revision: 2,
+                direct: true,
+                landed: None,
+            },
+        );
+        assert_eq!(window.record(), Some(None), "the live screen's origin");
+        // A screen of the window before the report, queued ahead of the marker that a change of
+        // presentation brings, can still arrive after the answer. It names an earlier revision
+        // than the answer, and does not move the record back into the history.
+        window.installed(1, Some(477));
+        assert_eq!(
+            window.record(),
+            Some(None),
+            "still the live screen's origin"
+        );
+        assert_eq!(window.next(), None, "the press waiting is dropped");
+
+        let mut window = parked_at_477();
+        window.pressed(1, 23, size(80, 24));
+        send(&mut window, 2).expect("the next page back");
+        window.pressed(1, 23, size(80, 24));
+        window.recovering();
+        window.streamed();
+        assert_eq!(
+            window.record(),
+            Some(None),
+            "the stream is served at the origin"
+        );
+        assert_eq!(window.next(), None, "the press waiting is dropped");
+        window.pressed(1, 23, size(80, 24));
+        assert_eq!(
+            send(&mut window, 3).map(|s| s.position),
+            Some(above(23)),
+            "and the report that was in flight no longer holds anything back"
+        );
+    }
+
+    /// A size measured while no screen is held goes once the next subscription gives one, or
+    /// once it begins with the stream, even with nothing else to answer.
+    #[test]
+    fn a_size_measured_during_a_recovery_goes_once_the_record_returns() {
+        for streamed in [false, true] {
+            let mut window = WindowReports::new(size(80, 24));
+            window.installed(0, None);
+            window.recovering();
+            window.measured(size(100, 30));
+            assert_eq!(window.next(), None, "no screen, so no place to report");
+            if streamed {
+                window.streamed();
+            } else {
+                window.installed(1, None);
+            }
+            let next = send(&mut window, 1).expect("the size goes");
+            assert_eq!(
+                (next.what, next.dimensions, next.position),
+                (Report::Size, size(100, 30), None)
+            );
+        }
+    }
+
+    /// A report refused while a recovery is under way sends nothing until the recovery gives a
+    /// record.
+    #[test]
+    fn a_refusal_during_a_recovery_waits_for_the_record() {
+        let mut window = parked_at_477();
+        window.pressed(1, 23, size(80, 24));
+        send(&mut window, 2).expect("the next page back");
+        window.recovering();
+        window.measured(size(100, 30));
+        window.answered(request(2), Answer::Refused);
+        assert_eq!(window.next(), None, "no record yet");
+        window.installed(1, Some(477));
+        let next = send(&mut window, 3).expect("the size goes");
+        assert_eq!((next.what, next.position), (Report::Size, row(477)));
+    }
+
+    /// The report a refused resize leaves this terminal owing goes whatever its size, even the
+    /// size last sent: what it asks for is who owns the size and at which epoch.
+    #[test]
+    fn the_question_a_refused_resize_owes_goes_at_the_size_last_sent() {
+        let mut window = WindowReports::new(size(80, 24));
+        window.installed(0, None);
+        window.owe_question(size(80, 24));
+        let next = send(&mut window, 1).expect("the question goes");
+        assert_eq!(
+            (next.what, next.dimensions, next.position),
+            (Report::Question, size(80, 24), None)
+        );
+        // A return asked for while a question is owed goes first; a newer size is not lost.
+        window.answered(request(1), accepted(0, None));
+        window.owe_question(size(80, 24));
+        window.return_to_live();
+        window.measured(size(90, 30));
+        let first = send(&mut window, 2).expect("the return");
+        assert_eq!(first.what, Report::Return);
+        window.answered(request(2), accepted(0, None));
+        let second = send(&mut window, 3).expect("then the question");
+        assert_eq!(
+            (second.what, second.dimensions),
+            (Report::Question, size(90, 30)),
+            "carrying the newest size, which then needs no report of its own"
+        );
+        window.answered(request(3), accepted(1, None));
+        window.installed(1, None);
+        assert_eq!(window.next(), None);
+    }
+
+    /// Once the session has said it is closing, nothing more is sent.
+    #[test]
+    fn a_closing_session_is_sent_nothing_more() {
+        let mut window = parked_at_477();
+        window.pressed(1, 23, size(80, 24));
+        window.close();
+        window.measured(size(100, 30));
+        assert_eq!(window.next(), None);
+    }
+
+    /// While a new subscription replaces the old one, the old stream's notifications are told
+    /// apart from the new stream's, whose first delivery other than a gap is its screen.
+    #[test]
+    fn a_new_subscription_begins_at_its_first_notification_of_sequence_zero() {
+        let mut subscriptions = Subscriptions::new();
+        assert_eq!(
+            subscriptions.heard(0, "session.projection.reset"),
+            Heard::First,
+            "the first subscription's first delivery"
+        );
+        assert_eq!(
+            subscriptions.heard(1, "session.projection.snapshot"),
+            Heard::Later
+        );
+        assert!(
+            subscriptions.replace(),
+            "a marker asks for a new subscription"
+        );
+        assert!(
+            !subscriptions.replace(),
+            "and a second reason before the new stream begins asks nothing more"
+        );
+        for (sequence, event) in [
+            (7, "session.projection.delta"),
+            (8, "session.output"),
+            (9, "session.resync"),
+        ] {
+            assert_eq!(
+                subscriptions.heard(sequence, event),
+                Heard::Replaced,
+                "{event} at {sequence} belongs to the stream being replaced"
+            );
+        }
+        assert_eq!(subscriptions.heard(0, "session.gap"), Heard::Later);
+        assert_eq!(
+            subscriptions.heard(1, "session.output"),
+            Heard::First,
+            "the new stream's first delivery after its gap is its restoration"
+        );
+        assert_eq!(subscriptions.heard(2, "session.output"), Heard::Later);
+        // A new stream whose first notification cannot even be decoded still opens it: the
+        // sequence is read first, and the next reason asks again.
+        assert!(subscriptions.replace());
+        assert_eq!(
+            subscriptions.heard(0, "session.projection.reset"),
+            Heard::First
+        );
+        assert!(
+            subscriptions.replace(),
+            "a new stream is under way, so another can be asked for"
         );
     }
 }

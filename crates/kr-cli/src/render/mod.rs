@@ -39,6 +39,8 @@ pub struct Drawn {
     pub bytes: Vec<u8>,
     /// Whether the command must ask the session for a fresh screen.
     pub resubscribe: bool,
+    /// Whether this event completed a screen, which is then the one this terminal holds.
+    pub installed: bool,
 }
 
 /// One projected session, as this terminal is showing it.
@@ -110,6 +112,7 @@ impl ProjectedDisplay {
                 Drawn {
                     bytes: painted.bytes,
                     resubscribe: false,
+                    installed: true,
                 }
             }
             Applied::Updated(changed) => {
@@ -128,6 +131,7 @@ impl ProjectedDisplay {
                 Drawn {
                     bytes: painted.bytes,
                     resubscribe: false,
+                    installed: false,
                 }
             }
             // The session sent an update this terminal cannot apply: it continues from a screen
@@ -136,6 +140,7 @@ impl ProjectedDisplay {
             Applied::Refused(_) => Drawn {
                 bytes: Vec::new(),
                 resubscribe: true,
+                installed: false,
             },
         }
     }
@@ -184,6 +189,18 @@ impl ProjectedDisplay {
                 && top < screen.viewport.screen_top_row.get())
             .then_some(top)
         })
+    }
+
+    /// The revision of this attachment's window the screen it holds was drawn for.
+    ///
+    /// `None` until a whole screen has arrived. The session names a revision in every answer to a
+    /// viewport report and in every screen, which is how a screen is matched to the report it
+    /// answers.
+    #[must_use]
+    pub fn window_revision(&self) -> Option<u64> {
+        self.projection
+            .screen()
+            .map(|screen| screen.window_revision)
     }
 
     /// The output cursor of the screen this terminal is holding.
