@@ -175,6 +175,27 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
     opened.mockRestore()
   })
 
+  it('warns of cells left blank, rows cut short and a shortened screen', async () => {
+    const { port, controls } = fakeHost()
+    open(port)
+    await screen.findByTestId('palette-provenance')
+    expect(screen.getByTestId('substituted-count').textContent).toBe('1 left blank')
+    expect(screen.queryByTestId('rows-truncated')).toBeNull()
+    expect(screen.queryByTestId('screen-degraded')).toBeNull()
+    const whole = terminalScreen(SESSION_MAIN, { columns: 80, rows: 8 })
+    act(() => {
+      controls.terminalViews[0]?.show({
+        ...whole,
+        degraded: true,
+        replaced: 3,
+        lines: whole.lines.map((line, index) => (index === 1 ? { ...line, truncated: true } : line))
+      })
+    })
+    expect(screen.getByTestId('substituted-count').textContent).toBe('3 left blank')
+    expect(screen.getByTestId('rows-truncated').textContent).toBe('Rows cut short')
+    expect(screen.getByTestId('screen-degraded').textContent).toBe('Shortened by the session')
+  })
+
   it('keeps the last frame while it waits, busy at once and saying so only after a moment', async () => {
     const opened = vi.spyOn(Terminal.prototype, 'open')
     const { port, controls } = fakeHost()

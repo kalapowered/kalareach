@@ -31,6 +31,7 @@ import {
   presentationOf,
   routeWheel,
   WAITING,
+  warningsOf,
   zoomBy,
   ZOOM_DEFAULT_INDEX,
   ZOOM_STEPS,
@@ -169,7 +170,6 @@ export function RawTerminal({
   // shows only part of the session.
   const position =
     waiting && (frame === null || slow) ? WAITING : frame === null ? null : clipping(frame)
-  const truncated = frame?.lines.some((line) => line.truncated) ?? false
 
   return (
     <section className="raw-terminal" data-testid="raw-terminal" data-mode={mode}>
@@ -200,21 +200,11 @@ export function RawTerminal({
             <Badge tone="neutral" data-testid="terminal-size">
               {`${frame.dimensions.columns}×${frame.dimensions.rows}`}
             </Badge>
-            {frame.replaced > 0 ? (
-              <Badge tone="warning" data-testid="substituted-count">
-                {frame.replaced} left blank
+            {warningsOf(frame).map((warning) => (
+              <Badge key={warning.id} tone="warning" data-testid={warning.id}>
+                {warning.words}
               </Badge>
-            ) : null}
-            {truncated ? (
-              <Badge tone="warning" data-testid="rows-truncated">
-                Rows cut short
-              </Badge>
-            ) : null}
-            {frame.degraded ? (
-              <Badge tone="warning" data-testid="screen-degraded">
-                Shortened by the session
-              </Badge>
-            ) : null}
+            ))}
           </span>
         ) : null}
       </header>

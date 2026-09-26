@@ -43,6 +43,7 @@ import {
   clipping,
   presentationOf,
   WAITING,
+  warningsOf,
   ZOOM_DEFAULT_INDEX,
   ZOOM_STEPS,
   zoomBy,
@@ -457,6 +458,13 @@ export function MobileSession({
               {terminalPosition === null ? null : (
                 <span data-testid="terminal-position">{terminalPosition}</span>
               )}
+              {frame === null
+                ? null
+                : warningsOf(frame).map((warning) => (
+                    <Badge key={warning.id} tone="warning" data-testid={warning.id}>
+                      {warning.words}
+                    </Badge>
+                  ))}
             </div>
             <AccessoryRow
               surface={surface}

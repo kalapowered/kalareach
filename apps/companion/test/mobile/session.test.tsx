@@ -15,7 +15,7 @@ import userEvent from '@testing-library/user-event'
 import type { DocumentNode } from '@kalareach/plugin-sdk'
 
 import { AppProvider } from '../../src/app/state'
-import { fakeHost, type HeldReads } from '../../src/host/fake'
+import { fakeHost, terminalScreen, type HeldReads } from '../../src/host/fake'
 import { MobileSession } from '../../src/mobile/views/MobileSession'
 import { useLifecycle } from '../../src/mobile/useLifecycle'
 
@@ -224,6 +224,29 @@ describe("the phone's raw terminal view (KR-REQ-08.02, 13.18)", () => {
     await waitFor(() => {
       expect(controls.terminalViews[0]?.closed).toBe(true)
     })
+  })
+
+  it('warns of cells left blank, rows cut short and a shortened screen, in the desktop words', async () => {
+    const { port, controls } = fakeHost()
+    await onTerminal(port)
+    await waitFor(() => {
+      expect(screen.getAllByTestId('mobile-terminal-line')).toHaveLength(8)
+    })
+    expect(screen.getByTestId('substituted-count').textContent).toBe('1 left blank')
+    expect(screen.queryByTestId('rows-truncated')).toBeNull()
+    expect(screen.queryByTestId('screen-degraded')).toBeNull()
+    const whole = terminalScreen(SESSION_MAIN, { columns: 80, rows: 8 })
+    act(() => {
+      controls.terminalViews[0]?.show({
+        ...whole,
+        degraded: true,
+        replaced: 3,
+        lines: whole.lines.map((line, index) => (index === 1 ? { ...line, truncated: true } : line))
+      })
+    })
+    expect(screen.getByTestId('substituted-count').textContent).toBe('3 left blank')
+    expect(screen.getByTestId('rows-truncated').textContent).toBe('Rows cut short')
+    expect(screen.getByTestId('screen-degraded').textContent).toBe('Shortened by the session')
   })
 
   it('ends with the host words and attaches again when asked', async () => {

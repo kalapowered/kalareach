@@ -53,6 +53,7 @@ import {
   PRESENTATION_REASONS,
   presentationOf,
   routeWheel,
+  warningsOf,
   zoomBy,
   ZOOM_STEPS
 } from '../src/terminal/modes'
@@ -480,6 +481,23 @@ describe('the raw terminal', () => {
     if (line === undefined) throw new Error('the scripted screen has four lines')
     expect(stretchesOf(line).map((stretch) => stretch.text).join('')).toBe('ok    done')
     expect(stretchesOf(line).map((stretch) => stretch.column)).toEqual([0, 2, 3, 5, 6])
+  })
+
+  it('names what a screen warns of, in the words and the order both views show', () => {
+    const whole = terminalScreen('8a7b6c50-22bb-4c3d-8e4f-000000000101', { columns: 80, rows: 8 })
+    expect(warningsOf({ ...whole, replaced: 0 })).toEqual([])
+    expect(
+      warningsOf({
+        ...whole,
+        degraded: true,
+        replaced: 2,
+        lines: whole.lines.map((line, index) => (index === 4 ? { ...line, truncated: true } : line))
+      })
+    ).toEqual([
+      { id: 'substituted-count', words: '2 left blank' },
+      { id: 'rows-truncated', words: 'Rows cut short' },
+      { id: 'screen-degraded', words: 'Shortened by the session' }
+    ])
   })
 
   it('swaps the colours of a reversed piece on a phone', () => {

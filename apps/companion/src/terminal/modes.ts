@@ -12,7 +12,8 @@
  *
  * The raw views on the desktop and the phone also share what they say: how the host presents a
  * view, directly or as a viewport, and why, from the view's own attachment; where its palette came
- * from; and the words for attaching, waiting and a window smaller than the session.
+ * from; the words for attaching, waiting and a window smaller than the session; and what a screen
+ * warns of.
  */
 
 import type {
@@ -111,6 +112,29 @@ export function clipping(screen: TerminalScreen): string | null {
   const rows = Number(screen.dimensions.rows)
   if (screen.window.columns >= columns && screen.window.rows >= rows) return null
   return `Showing the top-left ${screen.window.columns}×${screen.window.rows} of the session's ${columns}×${rows}.`
+}
+
+/** Something a screen is missing, with the words a view shows for it. */
+export interface ScreenWarning {
+  /** Which warning it is, as the view's markup names it. */
+  readonly id: 'substituted-count' | 'rows-truncated' | 'screen-degraded'
+  readonly words: string
+}
+
+/**
+ * What a screen warns of, in the order both views show it: cells native code could not place and
+ * left blank, lines the session cut short, and a screen the session shortened.
+ */
+export function warningsOf(screen: TerminalScreen): readonly ScreenWarning[] {
+  const warnings: ScreenWarning[] = []
+  if (screen.replaced > 0) {
+    warnings.push({ id: 'substituted-count', words: `${screen.replaced} left blank` })
+  }
+  if (screen.lines.some((line) => line.truncated)) {
+    warnings.push({ id: 'rows-truncated', words: 'Rows cut short' })
+  }
+  if (screen.degraded) warnings.push({ id: 'screen-degraded', words: 'Shortened by the session' })
+  return warnings
 }
 
 /**
