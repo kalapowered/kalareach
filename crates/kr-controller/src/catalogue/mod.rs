@@ -398,6 +398,7 @@ impl CatalogueModule {
                         .iter()
                         .map(plugin_summary)
                         .collect::<Answer<Vec<_>>>()?,
+                    live_releases: Vec::new(),
                 })
             }
             Method::PluginCapabilities => {
@@ -851,7 +852,7 @@ impl CatalogueModule {
                         affected_bindings,
                     } => Ok(wire::PluginRemoveResult {
                         plugin_id: plugin_id.clone(),
-                        closed_bindings: U64::new(affected_bindings.unwrap_or(0)),
+                        affected_bindings: Nullable::from(affected_bindings.map(U64::new)),
                     }),
                     _ => Err(unexpected(transition)),
                 });
@@ -1318,7 +1319,7 @@ fn plugin_summary(view: &InstallationView) -> Answer<wire::PluginSummary> {
         pinned: installation.pinned,
         revoked: view.revoked,
         // The workers' own records are what counts bindings, and this answer asks none of them.
-        live_bindings: U64::new(0),
+        live_bindings: Nullable::null(),
     })
 }
 

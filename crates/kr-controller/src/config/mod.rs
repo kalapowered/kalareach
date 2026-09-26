@@ -605,6 +605,8 @@ pub fn effective(
                         .stated(" entries, ")
                         .number(budgets.retained_generations)
                         .stated(" generations retained, ")
+                        .number(budgets.retained_metadata_bytes)
+                        .stated(" retained metadata bytes, ")
                         .number(budgets.cached_payload_bytes)
                         .stated(" cached payload bytes, ")
                         .number(budgets.package_bytes)
@@ -620,8 +622,8 @@ pub fn effective(
                     if budgets.full_offline_mirror {
                         line = line.stated(", full offline mirror");
                     }
-                    // Which of the ten this host's configuration chose, so one budget raised in a
-                    // document cannot read as ten budgets the owner set.
+                    // Which of the eleven this host's configuration chose, so one budget raised
+                    // in a document cannot read as eleven budgets the owner set.
                     if supplied_budgets.is_empty() {
                         line.stated("; every budget is the default")
                     } else {

@@ -111,6 +111,7 @@
 pub mod account;
 pub mod action;
 pub mod actor;
+pub mod admission;
 pub mod agent;
 pub mod archive;
 pub mod attachment;

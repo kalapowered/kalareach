@@ -552,7 +552,11 @@ fn an_agent_on_its_terminal_route_is_advertised_no_typed_capability_and_every_ty
             "no capability of the installed package is advertised as qualified and available: \
              {states:?}"
         );
-        assert_eq!(bindings, 0, "no live binding holds the installed package");
+        assert_eq!(
+            bindings,
+            Some(0),
+            "no live binding holds the installed package"
+        );
         for answer in &answers {
             // A mutation, a plugin action and an agent read, which a device is served under its
             // grant, each name an instance the host does not hold. The attachment request is
@@ -1020,7 +1024,7 @@ fn forged_titles_transcripts_identifiers_and_hook_input_leave_the_host_unchanged
                     stage.runtime,
                     &stage.installed.plugin_id
                 ),
-                0,
+                Some(0),
                 "after {what}, no binding holds the package"
             );
             for answer in typed_actions(

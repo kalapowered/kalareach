@@ -1537,7 +1537,7 @@ pub mod configuration {
 
     /// The enrolment budgets a document chooses, each present only where its owner wrote one.
     ///
-    /// [`EnrolmentBudgets`] is what a caller acts on: ten numbers, every one of them decided. This
+    /// [`EnrolmentBudgets`] is what a caller acts on: eleven numbers, every one of them decided. This
     /// is what the document holds, and a budget nobody wrote is absent here rather than equal to
     /// the default. Keeping the two apart is the whole of what lets a report say which numbers a
     /// person chose: a budget that happens to equal the default is not evidence that anybody set
@@ -1552,6 +1552,11 @@ pub mod configuration {
         pub metadata_entries: Nullable<u64>,
         /// How many metadata generations a repository may retain.
         pub retained_generations: Nullable<u64>,
+        /// How many bytes of metadata a repository may retain across the generations it keeps.
+        ///
+        /// Where the document names none, the budget in force is the metadata budget times the
+        /// generations retained, both as resolved here.
+        pub retained_metadata_bytes: Nullable<u64>,
         /// The cached payload budget per repository, in bytes.
         pub cached_payload_bytes: Nullable<u64>,
         /// The largest single package or asset a repository may fetch, in bytes.
@@ -1575,13 +1580,21 @@ pub mod configuration {
         #[must_use]
         pub fn resolve(&self) -> EnrolmentBudgets {
             let default = EnrolmentBudgets::default();
+            let metadata_bytes = self.metadata_bytes.0.unwrap_or(default.metadata_bytes);
+            let retained_generations = self
+                .retained_generations
+                .0
+                .unwrap_or(default.retained_generations);
             EnrolmentBudgets {
-                metadata_bytes: self.metadata_bytes.0.unwrap_or(default.metadata_bytes),
+                metadata_bytes,
                 metadata_entries: self.metadata_entries.0.unwrap_or(default.metadata_entries),
-                retained_generations: self
-                    .retained_generations
+                retained_generations,
+                // Calculated from the two budgets this document resolves to, never from a fixed
+                // product: a document that raises either raises what may be retained with it.
+                retained_metadata_bytes: self
+                    .retained_metadata_bytes
                     .0
-                    .unwrap_or(default.retained_generations),
+                    .unwrap_or_else(|| metadata_bytes.saturating_mul(retained_generations)),
                 cached_payload_bytes: self
                     .cached_payload_bytes
                     .0
@@ -1617,6 +1630,10 @@ pub mod configuration {
                     self.retained_generations.is_present(),
                 ),
                 (
+                    "retained_metadata_bytes",
+                    self.retained_metadata_bytes.is_present(),
+                ),
+                (
                     "cached_payload_bytes",
                     self.cached_payload_bytes.is_present(),
                 ),
@@ -1644,6 +1661,7 @@ pub mod configuration {
                 ("metadata_bytes", self.metadata_bytes.0),
                 ("metadata_entries", self.metadata_entries.0),
                 ("retained_generations", self.retained_generations.0),
+                ("retained_metadata_bytes", self.retained_metadata_bytes.0),
                 ("cached_payload_bytes", self.cached_payload_bytes.0),
                 ("package_bytes", self.package_bytes.0),
                 ("object_count", self.object_count.0),
@@ -1674,6 +1692,8 @@ pub mod configuration {
         pub metadata_entries: u64,
         /// How many metadata generations a repository may retain.
         pub retained_generations: u64,
+        /// How many bytes of metadata a repository may retain across the generations it keeps.
+        pub retained_metadata_bytes: u64,
         /// The cached payload budget per repository, in bytes.
         pub cached_payload_bytes: u64,
         /// The largest single package or asset a repository may fetch, in bytes.
@@ -1699,6 +1719,8 @@ pub mod configuration {
                 metadata_bytes: DEFAULT_METADATA_BYTES,
                 metadata_entries: DEFAULT_METADATA_ENTRIES,
                 retained_generations: DEFAULT_RETAINED_GENERATIONS,
+                retained_metadata_bytes: DEFAULT_METADATA_BYTES
+                    .saturating_mul(DEFAULT_RETAINED_GENERATIONS),
                 cached_payload_bytes: DEFAULT_CACHED_PAYLOAD_BYTES,
                 package_bytes: DEFAULT_PACKAGE_BYTES,
                 object_count: DEFAULT_OBJECT_COUNT,

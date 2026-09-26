@@ -387,6 +387,12 @@ export type ControlFrame =
       authority_revision_ack: AuthorityRevisionAck
     }
   | {
+      plugin_admissions: PluginAdmissions
+    }
+  | {
+      plugin_admissions_ack: PluginAdmissionsAck
+    }
+  | {
       forwarded: ForwardedMutation
     }
   | {
@@ -5077,6 +5083,15 @@ export interface AttentionGap {
  */
 export interface AttentionHostRecord {
   /**
+   * What the session's worker recorded about a plugin binding it holds, where this record is
+   * that: a release revoked by its repository, or the last such binding gone.
+   *
+   * Only the worker writes it, from its own broker, so an application's notification can never
+   * be one; the transition travels whether or not the text does, so a session whose text is
+   * withheld still raises and resolves the item. Null for every other record.
+   */
+  adapter: AdapterNotice | null
+  /**
    * A keyed digest of what a notification said, under the request's fingerprint key.
    *
    * It travels whether or not the text does, so two notifications that say the same thing are
@@ -5101,6 +5116,19 @@ export interface AttentionHostRecord {
    * and null when it does not.
    */
   text: string | null
+}
+/**
+ * A plugin binding's revocation state, as the session's worker records it.
+ */
+export interface AdapterNotice {
+  /**
+   * The package whose release the transition is about.
+   */
+  plugin_id: string
+  /**
+   * What changed.
+   */
+  transition: 'revoked' | 'cleared'
 }
 /**
  * One source's part of a page: where the source stands, and its records after the cursor.
@@ -6470,6 +6498,7 @@ export interface WorkerLaunchSpec {
    * The environment the session belongs to.
    */
   environment_id: string
+  plugins: AdmissionsHeader
   /**
    * The release string the session reports as its terminal program version.
    */
@@ -6642,6 +6671,35 @@ export interface Rgb1 {
    * Red.
    */
   red: number
+}
+/**
+ * The first snapshot of plugin admissions, whose parts follow this specification on the
+ * same connection before anything else does. The worker reads them before it starts the
+ * shell, so a package admitted at launch is there for the shell's first command.
+ */
+export interface AdmissionsHeader {
+  frame: FrameId
+  /**
+   * How many [`PluginAdmissions`] frames follow the specification, at least one.
+   */
+  parts: number
+}
+/**
+ * The snapshot's frame.
+ */
+export interface FrameId {
+  /**
+   * The daemon generation whose connection carried the frame.
+   */
+  generation: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  revision: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  round: string
 }
 /**
  * What a worker reports once its root shell is running.
@@ -6844,6 +6902,349 @@ export interface GenerationAccepted {
    * The generation the worker now accepts.
    */
   generation: string
+}
+/**
+ * One part of a snapshot of admissions.
+ */
+export interface PluginAdmissions {
+  /**
+   * The environment the admissions are for.
+   */
+  environment_id: string
+  frame: FrameId1
+  /**
+   * This part's share of the packages new bindings may use.
+   */
+  packages: AdmittedPackage[]
+  /**
+   * Which part this is, from one.
+   */
+  part: number
+  /**
+   * How many parts the snapshot has.
+   */
+  parts: number
+  /**
+   * The administrator's revocation policy.
+   */
+  policy: 'warn_only' | 'disable_at_next_admission' | 'disable_at_once'
+  /**
+   * This part's share of the release states.
+   */
+  releases: ReleaseState[]
+}
+/**
+ * The snapshot's frame, the same in every part.
+ */
+export interface FrameId1 {
+  /**
+   * The daemon generation whose connection carried the frame.
+   */
+  generation: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  revision: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  round: string
+}
+/**
+ * One package new bindings may use.
+ */
+export interface AdmittedPackage {
+  /**
+   * The native bridge the installation put in place, where it put one.
+   */
+  bridge: AdmittedBridge | null
+  /**
+   * The builds the release's signed record names for this host's platform.
+   */
+  builds: AdmittedBuild[]
+  /**
+   * Its component, where it ships one.
+   */
+  component: AdmittedComponent | null
+  /**
+   * What the installation may use, by capability wire name.
+   */
+  grants: string[]
+  origin: ReleaseOrigin
+  /**
+   * The exact installed package hash: the digest of its manifest.
+   */
+  package_digest: string
+  /**
+   * The absolute directory its checked, extracted copy is in.
+   */
+  package_dir: string
+  /**
+   * The package.
+   */
+  plugin_id: string
+  /**
+   * Its publisher.
+   */
+  publisher_id: string
+  /**
+   * The installed release.
+   */
+  version: string
+}
+/**
+ * The native bridge an installation put in place for a package, as the host applied it.
+ */
+export interface AdmittedBridge {
+  /**
+   * The application name the installed registration starts the forwarder for.
+   */
+  application: string
+  /**
+   * The forwarder executable the installed registration starts, as an absolute path.
+   */
+  forwarder: string
+  /**
+   * The registrations the installed recipe wrote, by wire name.
+   */
+  surfaces: string[]
+}
+/**
+ * One executable a signed build record of the release names for this host's platform.
+ */
+export interface AdmittedBuild {
+  /**
+   * The SHA-256 digest of the executable.
+   */
+  executable_digest: string
+  /**
+   * The version the record says it is.
+   */
+  version: string
+}
+/**
+ * A package's component, by its path below the directory that holds every repository's store.
+ */
+export interface AdmittedComponent {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  bytes: string
+  /**
+   * The component's digest.
+   */
+  digest: string
+  /**
+   * The component's path relative to that directory, with `/` between its parts.
+   */
+  path: string
+}
+/**
+ * Where it came from.
+ */
+export interface ReleaseOrigin {
+  /**
+   * This host's identity for the enrolment the release came through.
+   */
+  enrolment_key: string
+  /**
+   * The repository's name.
+   */
+  repository_id: string
+}
+/**
+ * What one release a binding may hold is now.
+ */
+export interface ReleaseState {
+  /**
+   * Whether a binding on it ends at its next admission boundary.
+   */
+  ends_at_next_boundary: boolean
+  /**
+   * The most a binding on it may use, by capability wire name.
+   */
+  grant_cap: string[]
+  origin: ReleaseOrigin1
+  /**
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
+   */
+  package_digest: string
+  /**
+   * A plugin identifier from its manifest.
+   */
+  plugin_id: string
+  /**
+   * The revocation its own repository publishes, where it publishes one.
+   */
+  revocation: AdmissionRevocation | null
+}
+/**
+ * Where it came from.
+ */
+export interface ReleaseOrigin1 {
+  /**
+   * This host's identity for the enrolment the release came through.
+   */
+  enrolment_key: string
+  /**
+   * The repository's name.
+   */
+  repository_id: string
+}
+/**
+ * A revocation the release's own repository published.
+ */
+export interface AdmissionRevocation {
+  /**
+   * Why, as the repository states it.
+   */
+  reason: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  revoked_at: string
+  /**
+   * What a person reads about it.
+   */
+  statement: string
+}
+/**
+ * One part of a worker's answer to a complete snapshot.
+ */
+export interface PluginAdmissionsAck {
+  /**
+   * This part's share of the live bindings.
+   */
+  bindings: LiveBinding[]
+  frame: FrameId2
+  /**
+   * Which part this is, from one.
+   */
+  part: number
+  /**
+   * How many parts the report has.
+   */
+  parts: number
+  /**
+   * This part's share of the refused packages.
+   */
+  refusals: PackageRefusal[]
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  report_seq: string
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+}
+/**
+ * One live binding, as a worker reports it.
+ */
+export interface LiveBinding {
+  /**
+   * One foreground application within a terminal session.
+   */
+  application_instance_id: string
+  /**
+   * One component bound to one application instance inside the broker.
+   */
+  binding_id: string
+  /**
+   * Its component, where the package ships one.
+   */
+  component: ComponentReport | null
+  /**
+   * True while it is due to end and its admitted requests finish.
+   */
+  ending: boolean
+  release: LiveRelease
+}
+/**
+ * What a binding's component is doing, where the package ships one.
+ */
+export interface ComponentReport {
+  /**
+   * Why, where the state has a reason, cut to the report's bound.
+   */
+  reason: string | null
+  /**
+   * True when the reason was cut.
+   */
+  reason_cut: boolean
+  /**
+   * Where it stands.
+   */
+  state: 'pending' | 'registered' | 'unavailable' | 'disabled'
+}
+/**
+ * The release it holds.
+ */
+export interface LiveRelease {
+  origin: ReleaseOrigin2
+  /**
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
+   */
+  package_digest: string
+  /**
+   * A plugin identifier from its manifest.
+   */
+  plugin_id: string
+  /**
+   * A package publisher identity from its manifest. Decoding trust is recorded against it.
+   */
+  publisher_id: string
+  /**
+   * The release's version.
+   */
+  version: string
+}
+/**
+ * Where it came from.
+ */
+export interface ReleaseOrigin2 {
+  /**
+   * This host's identity for the enrolment the release came through.
+   */
+  enrolment_key: string
+  /**
+   * The repository's name.
+   */
+  repository_id: string
+}
+/**
+ * The frame the worker holds, which it applied before answering.
+ */
+export interface FrameId2 {
+  /**
+   * The daemon generation whose connection carried the frame.
+   */
+  generation: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  revision: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  round: string
+}
+/**
+ * An admitted package a worker would not read or bind, and why.
+ */
+export interface PackageRefusal {
+  /**
+   * Why, cut to the report's bound.
+   */
+  detail: string
+  /**
+   * True when the detail was cut.
+   */
+  detail_cut: boolean
+  /**
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
+   */
+  package_digest: string
 }
 /**
  * A mutation the host admitted for a caller, passed to the component that owns its subject.
@@ -9247,7 +9648,7 @@ export interface ConfigurationCeilings {
 /**
  * The enrolment budgets a document chooses, each present only where its owner wrote one.
  *
- * [`EnrolmentBudgets`] is what a caller acts on: ten numbers, every one of them decided. This
+ * [`EnrolmentBudgets`] is what a caller acts on: eleven numbers, every one of them decided. This
  * is what the document holds, and a budget nobody wrote is absent here rather than equal to
  * the default. Keeping the two apart is the whole of what lets a report say which numbers a
  * person chose: a budget that happens to equal the default is not evidence that anybody set
@@ -9292,6 +9693,13 @@ export interface ConfiguredEnrolmentBudgets {
    * How many metadata generations a repository may retain.
    */
   retained_generations?: number | null
+  /**
+   * How many bytes of metadata a repository may retain across the generations it keeps.
+   *
+   * Where the document names none, the budget in force is the metadata budget times the
+   * generations retained, both as resolved here.
+   */
+  retained_metadata_bytes?: number | null
   /**
    * How many bytes one synchronisation may transfer.
    */
@@ -16065,9 +16473,11 @@ export interface PluginSummary {
    */
   environment_id: string
   /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   * How many live bindings hold it: counted in `plugin.list` from reports every worker made
+   * after the read began, and null there while a worker has not reported, and in every other
+   * answer, which asks no worker.
    */
-  live_bindings: string
+  live_bindings: U64 | null
   /**
    * The exact package hash installed.
    */
@@ -16125,9 +16535,11 @@ export interface PluginSummary1 {
    */
   environment_id: string
   /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   * How many live bindings hold it: counted in `plugin.list` from reports every worker made
+   * after the read began, and null there while a worker has not reported, and in every other
+   * answer, which asks no worker.
    */
-  live_bindings: string
+  live_bindings: U64 | null
   /**
    * The exact package hash installed.
    */
@@ -16233,9 +16645,11 @@ export interface PluginSummary2 {
    */
   environment_id: string
   /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   * How many live bindings hold it: counted in `plugin.list` from reports every worker made
+   * after the read began, and null there while a worker has not reported, and in every other
+   * answer, which asks no worker.
    */
-  live_bindings: string
+  live_bindings: U64 | null
   /**
    * The exact package hash installed.
    */
@@ -16328,9 +16742,11 @@ export interface PluginSummary3 {
    */
   environment_id: string
   /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   * How many live bindings hold it: counted in `plugin.list` from reports every worker made
+   * after the read began, and null there while a worker has not reported, and in every other
+   * answer, which asks no worker.
    */
-  live_bindings: string
+  live_bindings: U64 | null
   /**
    * The exact package hash installed.
    */
@@ -16366,9 +16782,48 @@ export interface PluginListParams {
  */
 export interface PluginListResult {
   /**
+   * Every release a worker reports live that no installation describes: one an upgrade, a move
+   * or a removal left, which stays here, ending where it ends, until its bindings close.
+   */
+  live_releases: LiveReleaseSummary[]
+  /**
    * The installations, ordered by package identifier.
    */
   plugins: PluginSummary4[]
+}
+/**
+ * A live release no installation describes any more, as `plugin.list` reports it.
+ */
+export interface LiveReleaseSummary {
+  /**
+   * The repository it came from.
+   */
+  catalogue_id: string
+  /**
+   * True while its bindings are due to end.
+   */
+  ending: boolean
+  /**
+   * How many live bindings hold it, counted from reports every worker made after the read
+   * began; null while a worker has not reported.
+   */
+  live_bindings: U64 | null
+  /**
+   * The exact package hash.
+   */
+  package_digest: string
+  /**
+   * A plugin identifier from its manifest.
+   */
+  plugin_id: string
+  /**
+   * True when its repository revoked it.
+   */
+  revoked: boolean
+  /**
+   * The release's version.
+   */
+  version: string
 }
 /**
  * One installed plugin as `plugin.list` reports it.
@@ -16387,9 +16842,11 @@ export interface PluginSummary4 {
    */
   environment_id: string
   /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   * How many live bindings hold it: counted in `plugin.list` from reports every worker made
+   * after the read began, and null there while a worker has not reported, and in every other
+   * answer, which asks no worker.
    */
-  live_bindings: string
+  live_bindings: U64 | null
   /**
    * The exact package hash installed.
    */
@@ -16451,9 +16908,11 @@ export interface PluginSummary5 {
    */
   environment_id: string
   /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   * How many live bindings hold it: counted in `plugin.list` from reports every worker made
+   * after the read began, and null there while a worker has not reported, and in every other
+   * answer, which asks no worker.
    */
-  live_bindings: string
+  live_bindings: U64 | null
   /**
    * The exact package hash installed.
    */
@@ -16493,9 +16952,11 @@ export interface PluginRemoveParams {
  */
 export interface PluginRemoveResult {
   /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   * How many live bindings the workers reported holding it at the revision the removal
+   * committed after, which are the bindings told to end; null when a worker had not reported,
+   * or another change committed in between.
    */
-  closed_bindings: string
+  affected_bindings: U64 | null
   /**
    * A plugin identifier from its manifest.
    */

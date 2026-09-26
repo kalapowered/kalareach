@@ -127,7 +127,7 @@ pub fn capability_states(
         .collect()
 }
 
-/// How many live bindings hold the installed package.
+/// How many live bindings hold the installed package, or `None` while a session has not reported.
 ///
 /// # Panics
 ///
@@ -137,7 +137,7 @@ pub fn live_bindings(
     remote: &Remote,
     runtime: &tokio::runtime::Runtime,
     plugin_id: &PluginId,
-) -> u64 {
+) -> Option<u64> {
     let listed: PluginListResult = runtime
         .block_on(remote.read(
             Method::PluginList,
@@ -150,7 +150,7 @@ pub fn live_bindings(
         .plugins
         .iter()
         .find(|plugin| &plugin.plugin_id == plugin_id)
-        .map(|plugin| plugin.live_bindings.get())
+        .map(|plugin| plugin.live_bindings.0.map(|count| count.get()))
         .unwrap_or_else(|| panic!("plugin.list names {plugin_id}"))
 }
 

@@ -1307,7 +1307,8 @@ fn the_installed_package_is_bound_into_the_session_and_acts_through_its_broker()
             .plugins
             .iter()
             .find(|plugin| plugin.plugin_id.as_str() == PLUGIN)
-            .map_or(0, |plugin| plugin.live_bindings.get());
+            .and_then(|plugin| plugin.live_bindings.0)
+            .map_or(0, |count| count.get());
         if live > 0 || started.elapsed() > BINDING {
             break live;
         }

@@ -1072,6 +1072,9 @@ async fn route(state: &Arc<SessionState>, frame: ControlFrame) -> bool {
         | ControlFrame::GenerationAccepted(_)
         | ControlFrame::AuthorityRevision(_)
         | ControlFrame::AuthorityRevisionAck(_)
+        // A daemon's plugin admissions and a worker's report on them are that pair's own.
+        | ControlFrame::PluginAdmissions(_)
+        | ControlFrame::PluginAdmissionsAck(_)
         | ControlFrame::Forwarded(_)
         | ControlFrame::ForwardedRead(_)
         // A marked retained answer travels between a host and a worker, never to a client: what a

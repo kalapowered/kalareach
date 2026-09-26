@@ -837,7 +837,7 @@ async fn an_installation_that_needs_the_owners_confirmation_is_sent_to_an_owner_
             enabled: true,
             pinned: false,
             revoked: false,
-            live_bindings: kr_protocol::scalars::U64::new(0),
+            live_bindings: kr_protocol::scalars::Nullable::null(),
         },
         capabilities: Vec::new(),
     };

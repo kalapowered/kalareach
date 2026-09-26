@@ -102,7 +102,7 @@ pub fn enrolment(ceilings: &ConfigurationCeilings) -> Ceiling<EnrolmentBudgets> 
     };
     // The budgets the document names, with the schema's own numbers for the rest. Which of them
     // the document named is kept separately, because that is what the report's source field is
-    // about and a resolved set of ten numbers can no longer say it.
+    // about and a resolved set of eleven numbers can no longer say it.
     let configured = written.resolve();
     if configured.cached_payload_bytes > default.cached_payload_bytes
         && !configured.full_offline_mirror

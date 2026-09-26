@@ -474,8 +474,10 @@ pub struct PluginSummary {
     pub pinned: bool,
     /// Whether the catalogue has revoked this release.
     pub revoked: bool,
-    /// How many live bindings hold it.
-    pub live_bindings: U64,
+    /// How many live bindings hold it: counted in `plugin.list` from reports every worker made
+    /// after the read began, and null there while a worker has not reported, and in every other
+    /// answer, which asks no worker.
+    pub live_bindings: Nullable<U64>,
 }
 
 /// Parameters of `plugin.list`.
@@ -492,6 +494,9 @@ pub struct PluginListParams {
 pub struct PluginListResult {
     /// The installations, ordered by package identifier.
     pub plugins: Vec<PluginSummary>,
+    /// Every release a worker reports live that no installation describes: one an upgrade, a move
+    /// or a removal left, which stays here, ending where it ends, until its bindings close.
+    pub live_releases: Vec<crate::admission::LiveReleaseSummary>,
 }
 
 /// Parameters of `plugin.install`.
@@ -551,8 +556,10 @@ pub struct PluginRemoveParams {
 pub struct PluginRemoveResult {
     /// The package that was removed.
     pub plugin_id: PluginId,
-    /// How many live bindings it had, which removal closed.
-    pub closed_bindings: U64,
+    /// How many live bindings the workers reported holding it at the revision the removal
+    /// committed after, which are the bindings told to end; null when a worker had not reported,
+    /// or another change committed in between.
+    pub affected_bindings: Nullable<U64>,
 }
 
 /// Parameters of `plugin.pin`.

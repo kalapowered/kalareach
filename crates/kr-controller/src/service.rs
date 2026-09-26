@@ -4004,10 +4004,18 @@ impl Controller {
                 "the worker did not present a startup claim",
             ));
         };
-        let specification = self.admit_rendezvous(&claim, peer).await?;
+        let (specification, admissions) = self.admit_rendezvous(&claim, peer).await?;
         writer
             .write_message(&ControlFrame::LaunchSpec(Box::new(specification)))
             .await?;
+        // The first snapshot of admissions follows the specification on this connection, before
+        // the worker starts its shell. Nothing answers it here: the worker answers a round on its
+        // own endpoint once it is recorded.
+        for part in admissions {
+            writer
+                .write_message(&ControlFrame::PluginAdmissions(Box::new(part)))
+                .await?;
+        }
 
         let report: ControlFrame = reader.read_message().await?;
         let reservation_id = claim.reservation_id;
@@ -4042,7 +4050,10 @@ impl Controller {
         &self,
         claim: &WorkerRendezvous,
         peer: &PeerIdentity,
-    ) -> Result<WorkerLaunchSpec> {
+    ) -> Result<(
+        WorkerLaunchSpec,
+        Vec<kr_protocol::admission::PluginAdmissions>,
+    )> {
         check_rendezvous(claim).map_err(ControllerError::rendezvous)?;
         {
             let registry = self.registry.lock().await;
@@ -4130,17 +4141,44 @@ impl Controller {
         } else {
             Nullable::null()
         };
-        Ok(WorkerLaunchSpec {
-            session_id: reservation.session_id,
-            session_epoch: SessionEpoch::V1,
+        let admissions = self.first_admissions();
+        let plugins = kr_protocol::admission::AdmissionsHeader {
+            frame: admissions[0].frame,
+            parts: admissions[0].parts,
+        };
+        Ok((
+            WorkerLaunchSpec {
+                session_id: reservation.session_id,
+                session_epoch: SessionEpoch::V1,
+                environment_id: self.paths.environment_id(),
+                display_number: reservation.display_number,
+                create,
+                shell_package,
+                controller_public_key: *self.identity.public_key(),
+                controller_generation: self.generation,
+                release: self.release.clone(),
+                plugins,
+            },
+            admissions,
+        ))
+    }
+
+    /// The first snapshot of plugin admissions a worker is handed with its specification: one
+    /// part, admitting nothing.
+    fn first_admissions(&self) -> Vec<kr_protocol::admission::PluginAdmissions> {
+        vec![kr_protocol::admission::PluginAdmissions {
             environment_id: self.paths.environment_id(),
-            display_number: reservation.display_number,
-            create,
-            shell_package,
-            controller_public_key: *self.identity.public_key(),
-            controller_generation: self.generation,
-            release: self.release.clone(),
-        })
+            frame: kr_protocol::admission::FrameId {
+                generation: self.generation,
+                revision: kr_protocol::scalars::U64::new(0),
+                round: kr_protocol::scalars::U64::new(1),
+            },
+            part: 1,
+            parts: 1,
+            policy: kr_protocol::admission::RevocationPolicy::WarnOnly,
+            packages: Vec::new(),
+            releases: Vec::new(),
+        }]
     }
 
     /// Waits for the launcher's reported identity to reach the registry.

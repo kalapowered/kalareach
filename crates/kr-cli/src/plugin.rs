@@ -168,16 +168,19 @@ async fn remove(paths: &HostPaths, arguments: &PluginArguments, json: bool) -> R
     if json {
         report::print_json(&report::answer(&removed)?);
     } else {
-        println!(
-            "Removed {}; {} live binding{} closed.",
-            removed.plugin_id,
-            removed.closed_bindings.get(),
-            if removed.closed_bindings.get() == 1 {
-                ""
-            } else {
-                "s"
-            }
-        );
+        match removed.affected_bindings.0 {
+            Some(count) => println!(
+                "Removed {}; {} live binding{} told to end.",
+                removed.plugin_id,
+                count.get(),
+                if count.get() == 1 { "" } else { "s" }
+            ),
+            None => println!(
+                "Removed {}; a session has not yet said whether a live binding held it, and any \
+                 that did is told to end.",
+                removed.plugin_id
+            ),
+        }
     }
     Ok(())
 }

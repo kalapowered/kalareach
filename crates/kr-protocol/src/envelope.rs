@@ -501,6 +501,12 @@ pub enum ControlFrame {
     AuthorityRevision(crate::worker::AuthorityRevisionNotice),
     /// The worker's acknowledgement of an authority revision.
     AuthorityRevisionAck(crate::worker::AuthorityRevisionAck),
+    /// One part of a snapshot of plugin admissions: after a launch specification on the
+    /// rendezvous connection, and on the control daemon's authority connection to a worker.
+    PluginAdmissions(Box<crate::admission::PluginAdmissions>),
+    /// One part of a worker's report on a complete snapshot of admissions, on the connection the
+    /// snapshot arrived on.
+    PluginAdmissionsAck(Box<crate::admission::PluginAdmissionsAck>),
     /// A mutation the control daemon admitted, passed to the worker that owns its subject.
     Forwarded(Box<crate::local::ForwardedMutation>),
     /// A read the control daemon admitted for a caller it authenticated elsewhere.

@@ -676,6 +676,234 @@
         }
       ]
     },
+    "AdapterNotice": {
+      "additionalProperties": false,
+      "description": "A plugin binding's revocation state, as the session's worker records it.",
+      "properties": {
+        "plugin_id": {
+          "$ref": "#/$defs/PluginId",
+          "description": "The package whose release the transition is about."
+        },
+        "transition": {
+          "$ref": "#/$defs/AdapterTransition",
+          "description": "What changed."
+        }
+      },
+      "required": [
+        "plugin_id",
+        "transition"
+      ],
+      "type": "object"
+    },
+    "AdapterTransition": {
+      "description": "What changed about a session's bindings on a package's revoked releases.",
+      "oneOf": [
+        {
+          "const": "revoked",
+          "description": "A binding the session holds is on a release its repository revoked.",
+          "type": "string"
+        },
+        {
+          "const": "cleared",
+          "description": "The session holds no binding on the package's revoked releases any more.",
+          "type": "string"
+        }
+      ]
+    },
+    "AdmissionRevocation": {
+      "additionalProperties": false,
+      "description": "A revocation the release's own repository published.",
+      "properties": {
+        "reason": {
+          "description": "Why, as the repository states it.",
+          "type": "string"
+        },
+        "revoked_at": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When it was published."
+        },
+        "statement": {
+          "description": "What a person reads about it.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "reason",
+        "revoked_at",
+        "statement"
+      ],
+      "type": "object"
+    },
+    "AdmissionsHeader": {
+      "additionalProperties": false,
+      "description": "What follows a launch specification: the first snapshot of admissions, in `parts` frames.",
+      "properties": {
+        "frame": {
+          "$ref": "#/$defs/FrameId",
+          "description": "The snapshot's frame."
+        },
+        "parts": {
+          "description": "How many [`PluginAdmissions`] frames follow the specification, at least one.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "frame",
+        "parts"
+      ],
+      "type": "object"
+    },
+    "AdmittedBridge": {
+      "additionalProperties": false,
+      "description": "The native bridge an installation put in place for a package, as the host applied it.",
+      "properties": {
+        "application": {
+          "description": "The application name the installed registration starts the forwarder for.",
+          "type": "string"
+        },
+        "forwarder": {
+          "description": "The forwarder executable the installed registration starts, as an absolute path.",
+          "type": "string"
+        },
+        "surfaces": {
+          "description": "The registrations the installed recipe wrote, by wire name.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "application",
+        "surfaces",
+        "forwarder"
+      ],
+      "type": "object"
+    },
+    "AdmittedBuild": {
+      "additionalProperties": false,
+      "description": "One executable a signed build record of the release names for this host's platform.",
+      "properties": {
+        "executable_digest": {
+          "$ref": "#/$defs/Digest256",
+          "description": "The SHA-256 digest of the executable."
+        },
+        "version": {
+          "description": "The version the record says it is.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "executable_digest",
+        "version"
+      ],
+      "type": "object"
+    },
+    "AdmittedComponent": {
+      "additionalProperties": false,
+      "description": "A package's component, by its path below the directory that holds every repository's store.",
+      "properties": {
+        "bytes": {
+          "$ref": "#/$defs/U64",
+          "description": "Its exact size."
+        },
+        "digest": {
+          "$ref": "#/$defs/Digest256",
+          "description": "The component's digest."
+        },
+        "path": {
+          "description": "The component's path relative to that directory, with `/` between its parts.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "digest",
+        "bytes"
+      ],
+      "type": "object"
+    },
+    "AdmittedPackage": {
+      "additionalProperties": false,
+      "description": "One package new bindings may use.",
+      "properties": {
+        "bridge": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AdmittedBridge"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The native bridge the installation put in place, where it put one."
+        },
+        "builds": {
+          "description": "The builds the release's signed record names for this host's platform.",
+          "items": {
+            "$ref": "#/$defs/AdmittedBuild"
+          },
+          "type": "array"
+        },
+        "component": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AdmittedComponent"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Its component, where it ships one."
+        },
+        "grants": {
+          "description": "What the installation may use, by capability wire name.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "origin": {
+          "$ref": "#/$defs/ReleaseOrigin",
+          "description": "Where it came from."
+        },
+        "package_digest": {
+          "$ref": "#/$defs/Digest256",
+          "description": "The exact installed package hash: the digest of its manifest."
+        },
+        "package_dir": {
+          "description": "The absolute directory its checked, extracted copy is in.",
+          "type": "string"
+        },
+        "plugin_id": {
+          "$ref": "#/$defs/PluginId",
+          "description": "The package."
+        },
+        "publisher_id": {
+          "$ref": "#/$defs/PublisherId",
+          "description": "Its publisher."
+        },
+        "version": {
+          "description": "The installed release.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "plugin_id",
+        "publisher_id",
+        "version",
+        "package_digest",
+        "origin",
+        "package_dir",
+        "grants",
+        "bridge",
+        "builds",
+        "component"
+      ],
+      "type": "object"
+    },
     "AdoptionFlow": {
       "description": "The one adoption flow this host supports for a destination that already exists.\n\nSection 14 rejects a nonempty or existing destination *unless the user explicitly chooses an\nindependently supported adoption flow*, and forbids merging a clone into one. So there is\nexactly one member: adopting a checkout that is already a Git repository, which reads what is\nthere and writes nothing into the working tree. A second member would have to be a merge, and\nthat is the thing the paragraph forbids.",
       "oneOf": [
@@ -2925,6 +3153,17 @@
       "additionalProperties": false,
       "description": "One terminal side effect that had no attachment to go to, as the attention store reads it.",
       "properties": {
+        "adapter": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AdapterNotice"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "What the session's worker recorded about a plugin binding it holds, where this record is\nthat: a release revoked by its repository, or the last such binding gone.\n\nOnly the worker writes it, from its own broker, so an application's notification can never\nbe one; the transition travels whether or not the text does, so a session whose text is\nwithheld still raises and resolves the item. Null for every other record."
+        },
         "fingerprint": {
           "anyOf": [
             {
@@ -2965,7 +3204,8 @@
         "notification",
         "recorded_at_ms",
         "text",
-        "fingerprint"
+        "fingerprint",
+        "adapter"
       ],
       "type": "object"
     },
@@ -7088,6 +7328,62 @@
       ],
       "type": "object"
     },
+    "ComponentReport": {
+      "additionalProperties": false,
+      "description": "What a binding's component is doing, where the package ships one.",
+      "properties": {
+        "reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Why, where the state has a reason, cut to the report's bound."
+        },
+        "reason_cut": {
+          "description": "True when the reason was cut.",
+          "type": "boolean"
+        },
+        "state": {
+          "$ref": "#/$defs/ComponentState",
+          "description": "Where it stands."
+        }
+      },
+      "required": [
+        "state",
+        "reason",
+        "reason_cut"
+      ],
+      "type": "object"
+    },
+    "ComponentState": {
+      "description": "Where a binding's component stands.",
+      "oneOf": [
+        {
+          "const": "pending",
+          "description": "Not registered with a plugin runtime yet.",
+          "type": "string"
+        },
+        {
+          "const": "registered",
+          "description": "Registered and running.",
+          "type": "string"
+        },
+        {
+          "const": "unavailable",
+          "description": "No plugin runtime can run it now.",
+          "type": "string"
+        },
+        {
+          "const": "disabled",
+          "description": "Disabled after its faults, for the binding's life.",
+          "type": "string"
+        }
+      ]
+    },
     "ConfigurationCeilings": {
       "additionalProperties": false,
       "description": "The ceilings this host configures.\n\nEvery one of them narrows. A configured value above what authority, an organisation\nrestriction, a grant or a hard resource limit already allows is rejected rather than\napplied, which is section 26's second paragraph and why these are not in\n[`PreferenceSet`].",
@@ -7235,7 +7531,7 @@
     },
     "ConfiguredEnrolmentBudgets": {
       "additionalProperties": false,
-      "description": "The enrolment budgets a document chooses, each present only where its owner wrote one.\n\n[`EnrolmentBudgets`] is what a caller acts on: ten numbers, every one of them decided. This\nis what the document holds, and a budget nobody wrote is absent here rather than equal to\nthe default. Keeping the two apart is the whole of what lets a report say which numbers a\nperson chose: a budget that happens to equal the default is not evidence that anybody set\nit, and inferring the source from the value would report the one they did set as the\nproduct's own.",
+      "description": "The enrolment budgets a document chooses, each present only where its owner wrote one.\n\n[`EnrolmentBudgets`] is what a caller acts on: eleven numbers, every one of them decided. This\nis what the document holds, and a budget nobody wrote is absent here rather than equal to\nthe default. Keeping the two apart is the whole of what lets a report say which numbers a\nperson chose: a budget that happens to equal the default is not evidence that anybody set\nit, and inferring the source from the value would report the one they did set as the\nproduct's own.",
       "properties": {
         "cached_payload_bytes": {
           "anyOf": [
@@ -7360,6 +7656,20 @@
           ],
           "default": null,
           "description": "How many metadata generations a repository may retain."
+        },
+        "retained_metadata_bytes": {
+          "anyOf": [
+            {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "How many bytes of metadata a repository may retain across the generations it keeps.\n\nWhere the document names none, the budget in force is the metadata budget times the\ngenerations retained, both as resolved here."
         },
         "transfer_bytes": {
           "anyOf": [
@@ -8139,6 +8449,32 @@
           },
           "required": [
             "authority_revision_ack"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "One part of a snapshot of plugin admissions: after a launch specification on the\nrendezvous connection, and on the control daemon's authority connection to a worker.",
+          "properties": {
+            "plugin_admissions": {
+              "$ref": "#/$defs/PluginAdmissions"
+            }
+          },
+          "required": [
+            "plugin_admissions"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "One part of a worker's report on a complete snapshot of admissions, on the connection the\nsnapshot arrived on.",
+          "properties": {
+            "plugin_admissions_ack": {
+              "$ref": "#/$defs/PluginAdmissionsAck"
+            }
+          },
+          "required": [
+            "plugin_admissions_ack"
           ],
           "type": "object"
         },
@@ -13318,6 +13654,30 @@
       ],
       "type": "object"
     },
+    "FrameId": {
+      "additionalProperties": false,
+      "description": "Which admissions frame this is: the daemon generation that sent it, the admission revision it\ncarries, and the round.\n\nFrames are ordered by generation, then revision, then round, and a worker applies only a frame\nabove the one it holds. The daemon raises the round on every frame it sends a worker, from one\nin each generation, so a frame sent again at an unchanged revision is still newer than the last.",
+      "properties": {
+        "generation": {
+          "$ref": "#/$defs/ControllerGeneration",
+          "description": "The daemon generation whose connection carried the frame."
+        },
+        "revision": {
+          "$ref": "#/$defs/U64",
+          "description": "The admission revision the frame carries."
+        },
+        "round": {
+          "$ref": "#/$defs/U64",
+          "description": "The round, raised on every frame this generation sends the worker."
+        }
+      },
+      "required": [
+        "generation",
+        "revision",
+        "round"
+      ],
+      "type": "object"
+    },
     "FreshnessRequirement": {
       "description": "Which freshness context a request must carry.",
       "oneOf": [
@@ -15741,6 +16101,132 @@
       "maxLength": 256,
       "minLength": 1,
       "type": "string"
+    },
+    "LiveBinding": {
+      "additionalProperties": false,
+      "description": "One live binding, as a worker reports it.",
+      "properties": {
+        "application_instance_id": {
+          "$ref": "#/$defs/ApplicationInstanceId",
+          "description": "The instance it is bound to."
+        },
+        "binding_id": {
+          "$ref": "#/$defs/BrokerBindingId",
+          "description": "The binding."
+        },
+        "component": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ComponentReport"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Its component, where the package ships one."
+        },
+        "ending": {
+          "description": "True while it is due to end and its admitted requests finish.",
+          "type": "boolean"
+        },
+        "release": {
+          "$ref": "#/$defs/LiveRelease",
+          "description": "The release it holds."
+        }
+      },
+      "required": [
+        "binding_id",
+        "application_instance_id",
+        "release",
+        "ending",
+        "component"
+      ],
+      "type": "object"
+    },
+    "LiveRelease": {
+      "additionalProperties": false,
+      "description": "One release a live binding holds.",
+      "properties": {
+        "origin": {
+          "$ref": "#/$defs/ReleaseOrigin",
+          "description": "Where it came from."
+        },
+        "package_digest": {
+          "$ref": "#/$defs/Digest256",
+          "description": "The exact package hash the binding holds."
+        },
+        "plugin_id": {
+          "$ref": "#/$defs/PluginId",
+          "description": "The package."
+        },
+        "publisher_id": {
+          "$ref": "#/$defs/PublisherId",
+          "description": "Its publisher."
+        },
+        "version": {
+          "description": "The release's version.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "plugin_id",
+        "publisher_id",
+        "version",
+        "package_digest",
+        "origin"
+      ],
+      "type": "object"
+    },
+    "LiveReleaseSummary": {
+      "additionalProperties": false,
+      "description": "A live release no installation describes any more, as `plugin.list` reports it.",
+      "properties": {
+        "catalogue_id": {
+          "description": "The repository it came from.",
+          "type": "string"
+        },
+        "ending": {
+          "description": "True while its bindings are due to end.",
+          "type": "boolean"
+        },
+        "live_bindings": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/U64"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "How many live bindings hold it, counted from reports every worker made after the read\nbegan; null while a worker has not reported."
+        },
+        "package_digest": {
+          "description": "The exact package hash.",
+          "type": "string"
+        },
+        "plugin_id": {
+          "$ref": "#/$defs/PluginId",
+          "description": "The package."
+        },
+        "revoked": {
+          "description": "True when its repository revoked it.",
+          "type": "boolean"
+        },
+        "version": {
+          "description": "The release's version.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "plugin_id",
+        "version",
+        "package_digest",
+        "catalogue_id",
+        "live_bindings",
+        "ending",
+        "revoked"
+      ],
+      "type": "object"
     },
     "LiveScreenPreview": {
       "additionalProperties": false,
@@ -19158,6 +19644,30 @@
         }
       ]
     },
+    "PackageRefusal": {
+      "additionalProperties": false,
+      "description": "An admitted package a worker would not read or bind, and why.",
+      "properties": {
+        "detail": {
+          "description": "Why, cut to the report's bound.",
+          "type": "string"
+        },
+        "detail_cut": {
+          "description": "True when the detail was cut.",
+          "type": "boolean"
+        },
+        "package_digest": {
+          "$ref": "#/$defs/Digest256",
+          "description": "The package's exact hash."
+        }
+      },
+      "required": [
+        "package_digest",
+        "detail",
+        "detail_cut"
+      ],
+      "type": "object"
+    },
     "PairCancelParams": {
       "additionalProperties": false,
       "description": "The parameters of `pair.cancel`.",
@@ -20594,6 +21104,114 @@
       ],
       "type": "object"
     },
+    "PluginAdmissions": {
+      "additionalProperties": false,
+      "description": "One part of a snapshot of admissions.",
+      "properties": {
+        "environment_id": {
+          "$ref": "#/$defs/EnvironmentId",
+          "description": "The environment the admissions are for."
+        },
+        "frame": {
+          "$ref": "#/$defs/FrameId",
+          "description": "The snapshot's frame, the same in every part."
+        },
+        "packages": {
+          "description": "This part's share of the packages new bindings may use.",
+          "items": {
+            "$ref": "#/$defs/AdmittedPackage"
+          },
+          "type": "array"
+        },
+        "part": {
+          "description": "Which part this is, from one.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "parts": {
+          "description": "How many parts the snapshot has.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "policy": {
+          "$ref": "#/$defs/RevocationPolicy",
+          "description": "The administrator's revocation policy."
+        },
+        "releases": {
+          "description": "This part's share of the release states.",
+          "items": {
+            "$ref": "#/$defs/ReleaseState"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "environment_id",
+        "frame",
+        "part",
+        "parts",
+        "policy",
+        "packages",
+        "releases"
+      ],
+      "type": "object"
+    },
+    "PluginAdmissionsAck": {
+      "additionalProperties": false,
+      "description": "One part of a worker's answer to a complete snapshot.",
+      "properties": {
+        "bindings": {
+          "description": "This part's share of the live bindings.",
+          "items": {
+            "$ref": "#/$defs/LiveBinding"
+          },
+          "type": "array"
+        },
+        "frame": {
+          "$ref": "#/$defs/FrameId",
+          "description": "The frame the worker holds, which it applied before answering."
+        },
+        "part": {
+          "description": "Which part this is, from one.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "parts": {
+          "description": "How many parts the report has.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "refusals": {
+          "description": "This part's share of the refused packages.",
+          "items": {
+            "$ref": "#/$defs/PackageRefusal"
+          },
+          "type": "array"
+        },
+        "report_seq": {
+          "$ref": "#/$defs/U64",
+          "description": "The report's number, which rises with every report this worker process makes."
+        },
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session whose worker answers."
+        }
+      },
+      "required": [
+        "session_id",
+        "frame",
+        "report_seq",
+        "part",
+        "parts",
+        "bindings",
+        "refusals"
+      ],
+      "type": "object"
+    },
     "PluginCapabilitiesParams": {
       "additionalProperties": false,
       "description": "Parameters of `plugin.capabilities`.",
@@ -21120,6 +21738,13 @@
       "additionalProperties": false,
       "description": "Result of `plugin.list`.",
       "properties": {
+        "live_releases": {
+          "description": "Every release a worker reports live that no installation describes: one an upgrade, a move\nor a removal left, which stays here, ending where it ends, until its bindings close.",
+          "items": {
+            "$ref": "#/$defs/LiveReleaseSummary"
+          },
+          "type": "array"
+        },
         "plugins": {
           "description": "The installations, ordered by package identifier.",
           "items": {
@@ -21129,7 +21754,8 @@
         }
       },
       "required": [
-        "plugins"
+        "plugins",
+        "live_releases"
       ],
       "type": "object"
     },
@@ -21201,9 +21827,16 @@
       "additionalProperties": false,
       "description": "Result of `plugin.remove`.",
       "properties": {
-        "closed_bindings": {
-          "$ref": "#/$defs/U64",
-          "description": "How many live bindings it had, which removal closed."
+        "affected_bindings": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/U64"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "How many live bindings the workers reported holding it at the revision the removal\ncommitted after, which are the bindings told to end; null when a worker had not reported,\nor another change committed in between."
         },
         "plugin_id": {
           "$ref": "#/$defs/PluginId",
@@ -21212,7 +21845,7 @@
       },
       "required": [
         "plugin_id",
-        "closed_bindings"
+        "affected_bindings"
       ],
       "type": "object"
     },
@@ -21233,8 +21866,15 @@
           "description": "The environment it is installed in."
         },
         "live_bindings": {
-          "$ref": "#/$defs/U64",
-          "description": "How many live bindings hold it."
+          "anyOf": [
+            {
+              "$ref": "#/$defs/U64"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "How many live bindings hold it: counted in `plugin.list` from reports every worker made\nafter the read began, and null there while a worker has not reported, and in every other\nanswer, which asks no worker."
         },
         "package_digest": {
           "description": "The exact package hash installed.",
@@ -26063,6 +26703,74 @@
       ],
       "type": "object"
     },
+    "ReleaseOrigin": {
+      "additionalProperties": false,
+      "description": "Where a release came from: the repository's name and the enrolment it came through.",
+      "properties": {
+        "enrolment_key": {
+          "description": "This host's identity for the enrolment the release came through.",
+          "type": "string"
+        },
+        "repository_id": {
+          "description": "The repository's name.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "repository_id",
+        "enrolment_key"
+      ],
+      "type": "object"
+    },
+    "ReleaseState": {
+      "additionalProperties": false,
+      "description": "What one release a binding may hold is now.",
+      "properties": {
+        "ends_at_next_boundary": {
+          "description": "Whether a binding on it ends at its next admission boundary.",
+          "type": "boolean"
+        },
+        "grant_cap": {
+          "description": "The most a binding on it may use, by capability wire name.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "origin": {
+          "$ref": "#/$defs/ReleaseOrigin",
+          "description": "Where it came from."
+        },
+        "package_digest": {
+          "$ref": "#/$defs/Digest256",
+          "description": "The exact package hash."
+        },
+        "plugin_id": {
+          "$ref": "#/$defs/PluginId",
+          "description": "The package."
+        },
+        "revocation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AdmissionRevocation"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The revocation its own repository publishes, where it publishes one."
+        }
+      },
+      "required": [
+        "plugin_id",
+        "package_digest",
+        "origin",
+        "revocation",
+        "grant_cap",
+        "ends_at_next_boundary"
+      ],
+      "type": "object"
+    },
     "RemoteDispatchLeaseId": {
       "description": "One remote dispatch lease from the current controller generation.",
       "format": "uuid",
@@ -27326,6 +28034,26 @@
             "pending"
           ],
           "type": "object"
+        }
+      ]
+    },
+    "RevocationPolicy": {
+      "description": "What the administrator's policy does to a live binding whose release is revoked.",
+      "oneOf": [
+        {
+          "const": "warn_only",
+          "description": "The binding keeps serving, and warns.",
+          "type": "string"
+        },
+        {
+          "const": "disable_at_next_admission",
+          "description": "The binding keeps observing, and every rich admission through it is refused.",
+          "type": "string"
+        },
+        {
+          "const": "disable_at_once",
+          "description": "The binding closes at its next admission boundary.",
+          "type": "string"
         }
       ]
     },
@@ -33111,6 +33839,10 @@
           "$ref": "#/$defs/EnvironmentId",
           "description": "The environment the session belongs to."
         },
+        "plugins": {
+          "$ref": "#/$defs/AdmissionsHeader",
+          "description": "The first snapshot of plugin admissions, whose parts follow this specification on the\nsame connection before anything else does. The worker reads them before it starts the\nshell, so a package admitted at launch is there for the shell's first command."
+        },
         "release": {
           "description": "The release string the session reports as its terminal program version.",
           "type": "string"
@@ -33144,7 +33876,8 @@
         "shell_package",
         "controller_public_key",
         "controller_generation",
-        "release"
+        "release",
+        "plugins"
       ],
       "type": "object"
     },

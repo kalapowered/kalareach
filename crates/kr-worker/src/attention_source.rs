@@ -261,6 +261,7 @@ fn host_record(
         recorded_at_ms: event.recorded_at_ms,
         text: Nullable(text),
         fingerprint: Nullable(notification.then(|| fingerprint(key, &event.detail))),
+        adapter: Nullable::null(),
     }
 }
 

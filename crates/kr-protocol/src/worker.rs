@@ -319,6 +319,10 @@ pub struct WorkerLaunchSpec {
     pub controller_generation: ControllerGeneration,
     /// The release string the session reports as its terminal program version.
     pub release: String,
+    /// The first snapshot of plugin admissions, whose parts follow this specification on the
+    /// same connection before anything else does. The worker reads them before it starts the
+    /// shell, so a package admitted at launch is there for the shell's first command.
+    pub plugins: crate::admission::AdmissionsHeader,
 }
 
 /// What a worker reports once its root shell is running.

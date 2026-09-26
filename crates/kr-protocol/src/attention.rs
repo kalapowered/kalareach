@@ -970,6 +970,33 @@ pub struct AttentionHostRecord {
     /// one condition to the store with or without their text, and nobody without the key can test
     /// a guess at withheld text against it. Null for anything but a notification.
     pub fingerprint: Nullable<Digest256>,
+    /// What the session's worker recorded about a plugin binding it holds, where this record is
+    /// that: a release revoked by its repository, or the last such binding gone.
+    ///
+    /// Only the worker writes it, from its own broker, so an application's notification can never
+    /// be one; the transition travels whether or not the text does, so a session whose text is
+    /// withheld still raises and resolves the item. Null for every other record.
+    pub adapter: Nullable<AdapterNotice>,
+}
+
+/// A plugin binding's revocation state, as the session's worker records it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AdapterNotice {
+    /// The package whose release the transition is about.
+    pub plugin_id: crate::ids::PluginId,
+    /// What changed.
+    pub transition: AdapterTransition,
+}
+
+/// What changed about a session's bindings on a package's revoked releases.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AdapterTransition {
+    /// A binding the session holds is on a release its repository revoked.
+    Revoked,
+    /// The session holds no binding on the package's revoked releases any more.
+    Cleared,
 }
 
 /// One source's part of a page: where the source stands, and its records after the cursor.

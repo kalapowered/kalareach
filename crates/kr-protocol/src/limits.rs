@@ -20,6 +20,29 @@ pub const MAX_STREAM_HEADER_LEN: usize = 1024;
 /// message size as well.
 pub const MAX_CONTROL_FRAME_LEN: usize = 1024 * 1024;
 
+/// Maximum number of parts one snapshot of plugin admissions, or one worker's report on it, is cut
+/// into.
+///
+/// Each part is one control frame. A snapshot that needs more is refused by name where it is built,
+/// and the worker it was for keeps the admissions it holds.
+pub const MAX_ADMISSION_PARTS: u32 = 64;
+
+/// Maximum encoded size of one record in a snapshot of plugin admissions or a report on it, in
+/// bytes: one admitted package, one release state or one live binding.
+///
+/// A part holds whole records, and every record's members have bounds of their own that keep it
+/// inside this, so the cut into parts never meets a record that cannot fit a frame.
+pub const MAX_ADMISSION_RECORD_BYTES: usize = 128 * 1024;
+
+/// Maximum size of a path an admitted package names (its directory, its forwarder, its
+/// component), in bytes.
+pub const MAX_ADMITTED_PATH_BYTES: usize = 4096;
+
+/// Maximum size of the free text in one record of a worker's report (why it refused a package, or
+/// why a component stands where it does), in bytes; longer text is cut at a character boundary and
+/// marked as cut.
+pub const MAX_REPORT_DETAIL_BYTES: usize = 1024;
+
 /// Maximum size of a complete input frame, in bytes.
 pub const MAX_INPUT_FRAME_LEN: usize = 64 * 1024;
 

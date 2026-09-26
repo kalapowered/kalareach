@@ -181,6 +181,9 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
             .await?;
         return Err("the launch specification does not match the reservation".into());
     }
+    // The first snapshot of plugin admissions follows the specification, in the parts it
+    // announced, before anything else does.
+    let _admissions = read_first_admissions(&mut reader, &specification).await?;
     // Managed mode launches a KalaReach-qualified package: the exact binary its reader patch was
     // built into, with the flags that package declares. A shell no package qualifies is named
     // rather than silently substituted.
@@ -458,6 +461,37 @@ async fn await_qualification(
 ///
 /// A `native_compat` session resolves none: it runs the selected stock shell, which cannot claim
 /// the managed contract and does not pretend to.
+/// Reads the parts of the first snapshot of plugin admissions a specification announced, each of
+/// its frame and in its order.
+///
+/// # Errors
+///
+/// Returns an error when a frame is not the next part the specification announced.
+async fn read_first_admissions(
+    reader: &mut kr_ipc::framed::FrameReader,
+    specification: &WorkerLaunchSpec,
+) -> Result<Vec<kr_protocol::admission::PluginAdmissions>, Box<dyn std::error::Error>> {
+    let header = specification.plugins;
+    let mut parts = Vec::new();
+    for expected in 1..=header.parts {
+        let frame: ControlFrame = reader.read_message().await?;
+        let ControlFrame::PluginAdmissions(part) = frame else {
+            return Err(
+                "the controller did not send the admissions its specification announced".into(),
+            );
+        };
+        if part.frame != header.frame
+            || part.part != expected
+            || part.parts != header.parts
+            || part.environment_id != specification.environment_id
+        {
+            return Err("the controller sent admissions other than the ones it announced".into());
+        }
+        parts.push(*part);
+    }
+    Ok(parts)
+}
+
 fn managed_package(specification: &WorkerLaunchSpec) -> Result<Option<ShellPackage>, PackageFault> {
     if specification.create.shell_mode != ShellMode::Managed {
         return Ok(None);

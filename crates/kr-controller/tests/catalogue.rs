@@ -795,7 +795,7 @@ async fn kr_req_23_29_the_plugin_group_installs_enables_pins_reads_and_removes()
         .await);
     assert_eq!(listed.plugins.len(), 1);
     assert_eq!(listed.plugins[0].catalogue_id, "development");
-    assert_eq!(listed.plugins[0].live_bindings, U64::new(0));
+    assert_eq!(listed.plugins[0].live_bindings, Nullable::null());
 
     let capabilities: wire::PluginCapabilitiesResult = ok(host
         .module
@@ -888,7 +888,7 @@ async fn kr_req_23_29_the_plugin_group_installs_enables_pins_reads_and_removes()
         )
         .await);
     assert_eq!(removed.plugin_id, plugin());
-    assert_eq!(removed.closed_bindings, U64::new(0));
+    assert_eq!(removed.affected_bindings, Nullable::null());
 }
 
 #[tokio::test]
