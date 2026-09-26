@@ -2675,6 +2675,85 @@ mod tests {
         );
     }
 
+    /// A directory the layout makes is confirmed in the directory above it before anything is
+    /// written into it. A refused confirmation fails the open and names that directory, and the
+    /// directory it made stays unconfirmed, so the next open confirms it before it is used.
+    #[test]
+    fn a_directory_the_layout_makes_is_confirmed_in_its_parent_before_it_is_used() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let key = EnrolmentKey::generate().expect("a key");
+        let store = Store::at(directory.path(), &key);
+
+        // The layout makes the repository's own directory and then five directories in it.
+        flush_fault::fail(&store.root);
+        let refused = Store::open(directory.path(), &key);
+        flush_fault::clear();
+        let refused = refused.expect_err("an open whose new directories are not confirmed");
+        assert!(
+            matches!(refused, CatalogueError::StorageUnavailable { .. }),
+            "{refused:?}"
+        );
+        assert!(
+            refused
+                .to_string()
+                .contains(&store.root.display().to_string()),
+            "names the directory: {refused}"
+        );
+
+        flush_fault::fail(&store.root);
+        let again = Store::open(directory.path(), &key);
+        flush_fault::clear();
+        assert!(
+            again.is_err(),
+            "a directory whose confirmation was refused was used without being confirmed"
+        );
+        Store::open(directory.path(), &key).expect("confirmed by the next open");
+    }
+
+    /// Opening a layout already confirmed flushes nothing: every directory the layout's directories
+    /// are in may refuse a flush, and the layout still opens.
+    #[test]
+    fn a_layout_already_confirmed_is_opened_without_a_flush() {
+        let (directory, store) = store();
+        let catalogue = normal(directory.path());
+        for above in [
+            catalogue.clone(),
+            catalogue.join(REPOSITORIES),
+            store.root.clone(),
+        ] {
+            flush_fault::fail(&above);
+            let opened = store.layout();
+            flush_fault::clear();
+            opened.unwrap_or_else(|error| panic!("{}: {error}", above.display()));
+        }
+    }
+
+    /// A directory a write makes below the directory it writes into is confirmed there before the
+    /// write goes on, and a refused confirmation refuses the write.
+    #[test]
+    fn a_directory_a_write_makes_is_confirmed_in_its_parent_first() {
+        let (_directory, store) = store();
+        let mut staged = store
+            .stage_package(PayloadDigest::of(b"nested"))
+            .expect("a staging directory");
+        let staging = staged.path().to_path_buf();
+        flush_fault::fail(&staging);
+        let refused = staged.write(&path("assets/icon.bin"), b"icon");
+        flush_fault::clear();
+        let refused = refused.expect_err("a write whose new directory is not confirmed");
+        assert!(
+            refused.to_string().contains(&staging.display().to_string()),
+            "names the directory: {refused}"
+        );
+        staged
+            .write(&path("assets/icon.bin"), b"icon")
+            .expect("written once its directory is confirmed");
+        assert_eq!(
+            std::fs::read(staging.join("assets/icon.bin")).expect("written"),
+            b"icon"
+        );
+    }
+
     #[test]
     fn a_publication_whose_directory_does_not_flush_is_uncertain_and_in_place() {
         let (_directory, store) = store();
