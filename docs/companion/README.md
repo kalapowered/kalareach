@@ -50,18 +50,37 @@ the host presents it: the session's output directly, or a viewport with the host
 host's own words. It reads the summary of its own attachment and no other, and a viewport whose
 worker reported no reason says so, and is never shown as direct.
 
-In view mode a raw view moves its window over the session: up into the history, down the live
-screen, and across a session wider than the view. On the desktop the wheel does it (Shift turns a
-vertical wheel sideways) and so does a drag; on the phone, a one-finger drag. Four buttons, Up,
-Down, Left and Right, move it a page at a time for a keyboard or a screen reader, and each is
-disabled where the window can go no further. In control mode the wheel and a drag are the program's
-and move nothing, and switching to control mode brings a window in the history back to the live
-screen. A drag belongs to the view it began in: taking control, the view ending or the session
-changing ends it without sending what it had not sent. The page never decides where the window is.
-Native code sends one viewport report at a time, settles each move on the screen the host names for
-it, and tells the page a move is settled only with a screen that holds it. Until then the page draws
-its last screen shifted to where the waiting moves will put the window, so a move shows at once, and
-a drag follows the pointer to the pixel. The footer says where the window is.
+A raw view opens in view mode, which takes nothing from anyone: the program gets nothing from the
+person, and the view moves its window over the session, up into the history, down the live screen,
+and across a session wider than the view. On the desktop the wheel does it (Shift turns a vertical
+wheel sideways) and so does a drag; on the phone, a one-finger drag. Four buttons, Up, Down, Left and
+Right, move it a page at a time for a keyboard or a screen reader, and each is disabled where the
+window can go no further. On a phone with larger text they wrap onto a second line.
+
+Take control is the only way in, and its label says it is a takeover. The view asks the session for
+its one input lease, which takes the keys from whoever held them, and a window in the history comes
+back to the live screen. While the session answers, the view says it is asking. Once
+it has control, the program gets the wheel on both platforms, as wheel events at the session's cell
+under the pointer, one turn for each row of scrolling, in the encoding the program chose, and only
+while the program reports the mouse. A wheel never becomes arrow keys. On the phone a one-finger drag
+turns the wheel the same way, once for each row the finger crosses, at the cell under the finger, and
+the terminal keys and the field's named keys go to the program; while the view watches, the keys are
+disabled and the field keeps its own. When the program is not using the wheel, control mode says so
+and points to Look around, which gives control back at once. Control also ends when another view
+takes it, when the program starts reading keys in a form the view does not send, or when the session
+refuses the view's input, and the view goes back to view mode with a sentence on why. Every write under a
+lease carries its number in the view's input stream, and after a refused write the view writes under
+that lease no more: taking control again starts a new one. A view declares a terminal profile of its
+own, which the host has not qualified, so it is always drawn a projection, and the host takes it to
+send the ordinary encoding of keys: a program that has turned on an enhanced keyboard protocol keeps
+control from it, and the view says why.
+
+A drag belongs to the view it began in: taking control, the view ending or the session changing
+ends it without sending what it had not sent. The page never decides where the window is. Native
+code sends one viewport report at a time, settles each move on the screen the host names for it, and
+tells the page a move is settled only with a screen that holds it. Until then the page draws its last
+screen shifted to where the waiting moves will put the window, so a move shows at once, and a drag
+follows the pointer to the pixel. The footer says where the window is.
 
 A session fits a window as narrow as 320 px. Its actions move below its title, in the same order
 and at the same size, a long name or directory wraps whole, and the terminal's badges and footer
