@@ -524,25 +524,40 @@ fn scrolled(parked: Option<u64>, steps: i64, step: u64) -> Option<Option<Viewpor
     }
 }
 
-/// What one viewport report this terminal sends is for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Report {
-    /// Where the window moves to, after a scroll-back key or the wheel.
-    Move,
-    /// This terminal's new size.
-    Size,
-    /// Back to the live screen, because the person typed while following it.
-    Return,
-    /// Who owns the size and at which epoch, which a refused resize leaves this terminal asking.
-    Question,
-}
-
-/// One viewport report to send.
+/// One viewport report to send: this terminal's size and where its window is to be.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Sending {
-    what: Report,
     dimensions: Dimensions,
     position: Option<ViewportPosition>,
+}
+
+/// Who owns the session's size, as an accepted viewport answer says, and the resize this terminal
+/// owes when it is the owner and the session is not the size it is looking at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Ownership {
+    epoch: kr_protocol::ids::GeometryEpoch,
+    owns: bool,
+    resize: Option<Dimensions>,
+}
+
+/// Reads who owns the session's size from an accepted viewport answer.
+///
+/// Every accepted answer carries the geometry, whatever its report was for, and it is read from
+/// every one of them: a move or a return carries this terminal's newest size too, and its answer
+/// can name this terminal as the owner of a session that is still at another size. `looking_at` is
+/// the size this terminal is looking at, when it has one; an owner looking at another size than the
+/// session's owes the resize that puts the session at its own.
+fn ownership(
+    geometry: &kr_protocol::attachment::GeometryState,
+    attachment_id: kr_protocol::ids::AttachmentId,
+    looking_at: Option<Dimensions>,
+) -> Ownership {
+    let owns = geometry.owner.as_ref() == Some(&attachment_id);
+    Ownership {
+        epoch: geometry.epoch,
+        owns,
+        resize: looking_at.filter(|size| owns && *size != geometry.dimensions),
+    }
 }
 
 /// How the host answered one viewport report.
@@ -572,7 +587,9 @@ enum Answer {
 /// nothing owed waits on an event that does not come: a return to the live screen, then the
 /// question a refused resize leaves owed, then the newest size if it is not the one last sent,
 /// then the next run of moves. Nothing goes while a report is in flight, while no screen is held
-/// to measure a move from, or once the session has said it is closing.
+/// to measure a move from, while a new subscription is being asked for, or once the session has
+/// said it is closing. Holding every report while a subscription is asked for is what lets that
+/// subscription's first delivery settle the report in flight: it can only have been sent before.
 #[derive(Debug)]
 struct WindowReports {
     /// Where the window is: `Some(Some(row))` above the live page, `Some(None)` on the live screen
@@ -585,6 +602,9 @@ struct WindowReports {
     installed: Option<u64>,
     /// The report in flight, if any.
     in_flight: Option<InFlight>,
+    /// Whether a new subscription has been asked for and its first screen or restoration has not
+    /// arrived.
+    recovering: bool,
     /// A return to the live screen, asked for and not yet sent.
     return_owed: bool,
     /// The question a refused resize leaves owed: who owns the size, and at which epoch.
@@ -619,6 +639,7 @@ impl WindowReports {
             answered: 0,
             installed: None,
             in_flight: None,
+            recovering: false,
             return_owed: false,
             question_owed: false,
             size,
@@ -675,6 +696,9 @@ impl WindowReports {
     /// window.
     fn installed(&mut self, window_revision: u64, above: Option<u64>) {
         self.installed = Some(window_revision);
+        // While a subscription replaces another, the one being replaced delivers no screen here, so
+        // a screen that arrives is the new subscription's, and the recovery is over.
+        self.recovering = false;
         if window_revision >= self.answered {
             self.record = Some(above);
         }
@@ -697,13 +721,16 @@ impl WindowReports {
     fn streamed(&mut self) {
         self.record = Some(None);
         self.in_flight = None;
+        self.recovering = false;
         self.runs.clear();
     }
 
     /// This terminal discarded its screen and asked for a new subscription. Until that one's first
-    /// screen or restoration arrives, nothing says where the window is.
+    /// screen or restoration arrives, nothing says where the window is, and nothing is sent: an
+    /// answer that arrives meanwhile, a direct one included, settles its own report and no more.
     const fn recovering(&mut self) {
         self.record = None;
+        self.recovering = true;
     }
 
     /// The session has said it is closing, and is sent nothing more.
@@ -713,7 +740,7 @@ impl WindowReports {
 
     /// The report to send now, if any. It is in flight from here until it settles.
     fn next(&mut self) -> Option<Sending> {
-        if self.closing || self.in_flight.is_some() {
+        if self.closing || self.recovering || self.in_flight.is_some() {
             return None;
         }
         let record = self.record?;
@@ -721,7 +748,6 @@ impl WindowReports {
         let sending = if self.return_owed {
             self.return_owed = false;
             Sending {
-                what: Report::Return,
                 dimensions: self.size,
                 position: None,
             }
@@ -729,13 +755,11 @@ impl WindowReports {
             // What it asks for is the answer's owner and epoch, so it goes whatever its size.
             self.question_owed = false;
             Sending {
-                what: Report::Question,
                 dimensions: self.size,
                 position: place,
             }
         } else if self.size != self.size_sent {
             Sending {
-                what: Report::Size,
                 dimensions: self.size,
                 position: place,
             }
@@ -746,7 +770,6 @@ impl WindowReports {
                 // run behind it goes now rather than waiting for something else to happen.
                 if let Some(position) = scrolled(record, run, self.step) {
                     break Sending {
-                        what: Report::Move,
                         dimensions: self.size,
                         position,
                     };
@@ -1153,8 +1176,8 @@ enum Outstanding {
     Input(u64),
     /// A size change this terminal made as the size owner.
     Resize,
-    /// A viewport report, and what it was for.
-    Window(Report),
+    /// A viewport report, which `WindowReports` holds.
+    Window,
     /// A fresh screen this terminal asked for after a resynchronisation marker.
     Resubscribe,
 }
@@ -1282,7 +1305,7 @@ async fn drive(
                 return AttachOutcome::Disconnected;
             }
             window.sent(request_id);
-            outstanding.insert(request_id, Outstanding::Window(report.what));
+            outstanding.insert(request_id, Outstanding::Window);
         }
         tokio::select! {
             // Biased towards the worker, so output and refusals are seen before more input is
@@ -1546,7 +1569,7 @@ async fn drive(
                             // Where the window is comes from the screen the answer names, not from
                             // the answer: an answer can arrive before that screen, and after one
                             // drawn for an earlier window.
-                            (Outstanding::Window(report), outcome) => {
+                            (Outstanding::Window, outcome) => {
                                 let result = match outcome {
                                     kr_protocol::envelope::Outcome::Ok(value) => value
                                         .to_typed::<kr_protocol::attachment::AttachmentViewportResult>(
@@ -1567,50 +1590,46 @@ async fn drive(
                                         landed: landed(result.position.0),
                                     },
                                 );
-                                // What a size report or a question says of the geometry is read here,
-                                // before the next report is chosen, so a terminal that has become the
-                                // owner resizes as the owner.
-                                if matches!(report, Report::Size | Report::Question) {
-                                    geometry_epoch = result.geometry.epoch;
-                                    owns_geometry =
-                                        result.geometry.owner.as_ref() == Some(&attachment_id);
-                                    // A report this terminal made because a resize was refused for
-                                    // a stale epoch answers with the epoch it should have quoted.
-                                    // The size it asked for is still the size the person is looking
-                                    // at, so it asks again, once, with what the answer said.
-                                    if owns_geometry
-                                        && let Ok(size) = terminal.size()
-                                        && size.columns > 0
-                                        && size.rows > 0
-                                    {
-                                        let dimensions = Dimensions::new(
+                                // Who owns the size is read from every accepted answer, before the
+                                // next report is chosen, so a terminal an answer names as the owner
+                                // resizes as the owner. A report this terminal made because a resize
+                                // was refused for a stale epoch answers with the epoch it should have
+                                // quoted, and the size it asked for is still the size the person is
+                                // looking at, so it asks again, once, with what the answer said.
+                                let looking_at = terminal
+                                    .size()
+                                    .ok()
+                                    .filter(|size| size.columns > 0 && size.rows > 0)
+                                    .map(|size| {
+                                        Dimensions::new(
                                             u64::from(size.columns),
                                             u64::from(size.rows),
-                                        );
-                                        if dimensions != result.geometry.dimensions {
-                                            let request_id =
-                                                kr_protocol::ids::RequestId::new(next_request);
-                                            next_request += 1;
-                                            let params =
-                                                kr_protocol::attachment::TerminalResizeParams {
-                                                    attachment_id,
-                                                    dimensions,
-                                                    expected_geometry_epoch: geometry_epoch,
-                                                };
-                                            if !send_geometry(
-                                                client,
-                                                descriptor,
-                                                request_id,
-                                                Method::TerminalResize,
-                                                &params,
-                                            )
-                                            .await
-                                            {
-                                                return AttachOutcome::Disconnected;
-                                            }
-                                            outstanding.insert(request_id, Outstanding::Resize);
-                                        }
+                                        )
+                                    });
+                                let owner = ownership(&result.geometry, attachment_id, looking_at);
+                                geometry_epoch = owner.epoch;
+                                owns_geometry = owner.owns;
+                                if let Some(dimensions) = owner.resize {
+                                    window.took_size(dimensions);
+                                    let request_id = kr_protocol::ids::RequestId::new(next_request);
+                                    next_request += 1;
+                                    let params = kr_protocol::attachment::TerminalResizeParams {
+                                        attachment_id,
+                                        dimensions,
+                                        expected_geometry_epoch: geometry_epoch,
+                                    };
+                                    if !send_geometry(
+                                        client,
+                                        descriptor,
+                                        request_id,
+                                        Method::TerminalResize,
+                                        &params,
+                                    )
+                                    .await
+                                    {
+                                        return AttachOutcome::Disconnected;
                                     }
+                                    outstanding.insert(request_id, Outstanding::Resize);
                                 }
                             }
                             (
@@ -2006,8 +2025,8 @@ async fn wait_for_resize(_resized: &mut Option<&mut WindowChanges>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        Answer, AttachOutcome, Heard, Report, SCROLL_BACK_KEY, SCROLL_FORWARD_KEY, Sending,
-        Subscriptions, WindowReports, landed, scroll_keys, scroll_step, scrolled,
+        Answer, AttachOutcome, Heard, Ownership, SCROLL_BACK_KEY, SCROLL_FORWARD_KEY, Sending,
+        Subscriptions, WindowReports, landed, ownership, scroll_keys, scroll_step, scrolled,
     };
     use kr_client::shown::Shown;
     use kr_protocol::attachment::ViewportPosition;
@@ -2687,8 +2706,8 @@ mod tests {
         window.answered(request(2), Answer::Refused);
         let next = send(&mut window, 3).expect("the size goes after the refusal");
         assert_eq!(
-            (next.what, next.dimensions, next.position),
-            (Report::Size, size(100, 30), row(477)),
+            (next.dimensions, next.position),
+            (size(100, 30), row(477)),
             "with the newest size and where the window is, not where the refused move asked"
         );
         window.pressed(1, 23, size(100, 30));
@@ -2767,10 +2786,7 @@ mod tests {
                 window.installed(1, None);
             }
             let next = send(&mut window, 1).expect("the size goes");
-            assert_eq!(
-                (next.what, next.dimensions, next.position),
-                (Report::Size, size(100, 30), None)
-            );
+            assert_eq!((next.dimensions, next.position), (size(100, 30), None));
         }
     }
 
@@ -2787,7 +2803,7 @@ mod tests {
         assert_eq!(window.next(), None, "no record yet");
         window.installed(1, Some(477));
         let next = send(&mut window, 3).expect("the size goes");
-        assert_eq!((next.what, next.position), (Report::Size, row(477)));
+        assert_eq!((next.dimensions, next.position), (size(100, 30), row(477)));
     }
 
     /// The report a refused resize leaves this terminal owing goes whatever its size, even the
@@ -2798,27 +2814,116 @@ mod tests {
         window.installed(0, None);
         window.owe_question(size(80, 24));
         let next = send(&mut window, 1).expect("the question goes");
-        assert_eq!(
-            (next.what, next.dimensions, next.position),
-            (Report::Question, size(80, 24), None)
-        );
-        // A return asked for while a question is owed goes first; a newer size is not lost.
+        assert_eq!((next.dimensions, next.position), (size(80, 24), None));
         window.answered(request(1), accepted(0, None));
+        assert_eq!(window.next(), None, "and only once");
+
+        // A return asked for while a question is owed goes first, and the question after it keeps
+        // the window where the return put it; a newer size measured meanwhile is not lost.
+        let mut window = parked_at_477();
         window.owe_question(size(80, 24));
         window.return_to_live();
         window.measured(size(90, 30));
         let first = send(&mut window, 2).expect("the return");
-        assert_eq!(first.what, Report::Return);
-        window.answered(request(2), accepted(0, None));
+        assert_eq!(
+            (first.dimensions, first.position),
+            (size(90, 30), None),
+            "the return goes first, with the newest size"
+        );
+        window.answered(request(2), accepted(2, None));
+        window.installed(2, None);
         let second = send(&mut window, 3).expect("then the question");
         assert_eq!(
-            (second.what, second.dimensions),
-            (Report::Question, size(90, 30)),
-            "carrying the newest size, which then needs no report of its own"
+            (second.dimensions, second.position),
+            (size(90, 30), None),
+            "from the live screen, where the return put the window, at the size already sent"
         );
-        window.answered(request(3), accepted(1, None));
-        window.installed(1, None);
-        assert_eq!(window.next(), None);
+        window.answered(request(3), accepted(2, None));
+        assert_eq!(
+            window.next(),
+            None,
+            "the newest size needs no report of its own"
+        );
+    }
+
+    /// Every accepted answer says who owns the session's size, whatever its report was for, and an
+    /// owner looking at another size than the session's owes the resize.
+    #[test]
+    fn every_accepted_answer_says_who_owns_the_size() {
+        let this =
+            kr_protocol::ids::AttachmentId::new(kr_protocol::scalars::Uuid::from_bytes([4; 16]));
+        let other =
+            kr_protocol::ids::AttachmentId::new(kr_protocol::scalars::Uuid::from_bytes([9; 16]));
+        let geometry = |owner, columns, rows| kr_protocol::attachment::GeometryState {
+            owner: Nullable::some(owner),
+            epoch: kr_protocol::ids::GeometryEpoch::new(7),
+            dimensions: size(columns, rows),
+        };
+        // A return that carried this terminal's newer size, answered after the owner left and this
+        // terminal inherited the size at the one it reported before.
+        assert_eq!(
+            ownership(&geometry(this, 80, 24), this, Some(size(100, 30))),
+            Ownership {
+                epoch: kr_protocol::ids::GeometryEpoch::new(7),
+                owns: true,
+                resize: Some(size(100, 30)),
+            },
+            "the owner resizes the session to what it is looking at"
+        );
+        assert_eq!(
+            ownership(&geometry(this, 100, 30), this, Some(size(100, 30))).resize,
+            None,
+            "an owner already at its size owes nothing"
+        );
+        assert_eq!(
+            ownership(&geometry(other, 80, 24), this, Some(size(100, 30))),
+            Ownership {
+                epoch: kr_protocol::ids::GeometryEpoch::new(7),
+                owns: false,
+                resize: None,
+            },
+            "a terminal that does not own the size resizes nothing"
+        );
+        assert_eq!(
+            ownership(&geometry(this, 80, 24), this, None).resize,
+            None,
+            "a terminal with no size of its own asks for none"
+        );
+    }
+
+    /// Nothing is sent while a new subscription is being asked for, not even after a direct answer
+    /// arrives meanwhile, so that subscription's first delivery settles only a report sent before
+    /// it was asked for.
+    #[test]
+    fn nothing_goes_until_the_next_subscription_begins() {
+        let mut window = parked_at_477();
+        // A new size, which the session answers by telling this terminal to resynchronise.
+        window.measured(size(80, 30));
+        send(&mut window, 2).expect("the size goes");
+        window.recovering();
+        window.answered(
+            request(2),
+            Answer::Accepted {
+                window_revision: 2,
+                direct: true,
+                landed: None,
+            },
+        );
+        window.measured(size(80, 32));
+        assert_eq!(
+            window.next(),
+            None,
+            "the direct answer settles its own report and opens nothing while the subscription is asked for"
+        );
+        window.streamed();
+        let next = send(&mut window, 3).expect("the newest size goes once the stream begins");
+        assert_eq!((next.dimensions, next.position), (size(80, 32), None));
+        window.pressed(1, 23, size(80, 32));
+        assert_eq!(
+            window.next(),
+            None,
+            "and it stays in flight until its own answer settles it"
+        );
     }
 
     /// Once the session has said it is closing, nothing more is sent.

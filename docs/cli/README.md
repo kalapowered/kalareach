@@ -234,10 +234,14 @@ reaches the session byte for byte. A paste a terminal sends without delimiters a
 command cannot tell from typing.
 
 The window this terminal is looking through is the session's to say. Each report about it waits
-for the one before it to settle, which happens when the session has answered it and the screen
+for the one before it to settle. Usually that is when the session has answered it and the screen
 that answer names has arrived: every answer and every screen names a revision of the window, so a
 screen the session drew before a report, a repaint of where the window was, is never taken for
-the report's own. What the person presses meanwhile waits too, and goes from where that screen
+the report's own. A refusal settles a report at once and changes nothing. So does an answer that
+hands this terminal the session's own bytes, and so does a new subscription that begins with
+them, because the session hands its bytes only to a window at the live screen's first line and
+column. Nothing is reported while a new subscription is being asked for, so the first thing it
+delivers can only answer what was sent before. What the person presses meanwhile waits too, and goes from where that screen
 puts the window. Presses in one direction add up, and a reversal waits its turn, so a press the
 window cannot make is spent without taking the next one with it. A report of this terminal's
 *size* waits the same way. Only the newest size waits, carrying where the window is, so a report
