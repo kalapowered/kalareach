@@ -420,10 +420,14 @@ impl MachineStore {
     fn publish(&self, record: &MachineGroup) -> Result<()> {
         let bytes = encode(record, &self.record)?;
         let temporary = self.temporary();
+        // On Windows another program can hold the record it just saw written, and a rename over it
+        // is refused while it does; the rename is tried again for a bounded time.
         let staged = self
             .stage(&temporary, &bytes)
             .and_then(|()| self.passed(Boundary::Flushed))
-            .and_then(|()| std::fs::rename(&temporary, &self.record));
+            .and_then(|()| {
+                kr_flush::retry_while_held(|| std::fs::rename(&temporary, &self.record))
+            });
         if let Err(error) = staged {
             // Nothing was published: the record is still the one this step read.
             let _ = std::fs::remove_file(&temporary);
@@ -1994,8 +1998,9 @@ mod tests {
     }
 
     /// KR-REQ-03.07: while another program holds the record open without sharing its deletion,
-    /// Windows refuses to rename a new record over it. The step fails safe: it reports the
-    /// refusal, the record's name keeps the record the step read, and no temporary file is left.
+    /// Windows refuses to rename a new record over it. A holder that never lets go outlasts the
+    /// bound the rename is tried again for, and the step fails safe once it has passed: it reports
+    /// the refusal, the record's name keeps the record the step read, and no temporary file is left.
     #[cfg(windows)]
     #[test]
     fn a_record_held_without_shared_deletion_is_not_replaced_and_the_step_says_so() {
@@ -2005,6 +2010,7 @@ mod tests {
         let kept = std::fs::read(environment.record()).expect("reads the record");
 
         let holding = hold_without_shared_deletion(&environment.record());
+        let started = std::time::Instant::now();
         let refused = store
             .join(
                 &environment.lock,
@@ -2014,8 +2020,14 @@ mod tests {
                 2_000,
             )
             .expect_err("the record's replacement is refused while it is held");
+        let took = started.elapsed();
         drop(holding);
 
+        assert!(took >= kr_flush::HELD_RENAME_BOUND, "tried again: {took:?}");
+        assert!(
+            took < kr_flush::HELD_RENAME_BOUND + Duration::from_secs(5),
+            "and no longer than the bound: {took:?}"
+        );
         assert_eq!(refused.code(), ErrorCode::StorageUnavailable, "{refused}");
         assert!(
             refused.to_string().contains("(os error 5)"),
@@ -2032,6 +2044,42 @@ mod tests {
             "no temporary file is left"
         );
         assert_eq!(environment.reopened(), before);
+    }
+
+    /// KR-REQ-03.07: a record another program holds for a moment without sharing its deletion, as a
+    /// scanner holds one it has just seen written, is replaced once that program lets go, within
+    /// the bound: the step succeeds, and the record's name holds the new record.
+    #[cfg(windows)]
+    #[test]
+    fn a_record_held_for_a_moment_is_replaced_once_it_is_let_go() {
+        let environment = Environment::create();
+        let store = environment.open();
+        let before = store.group().expect("reads the group");
+        let into = some_group();
+
+        let holding = hold_without_shared_deletion(&environment.record());
+        let letting_go = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            drop(holding);
+        });
+        let joined = store
+            .join(
+                &environment.lock,
+                into,
+                before.expected(),
+                &approval(),
+                2_000,
+            )
+            .expect("the record is replaced once it is let go");
+        letting_go.join().expect("let go");
+
+        assert_eq!(joined.machine_id, into);
+        assert_eq!(environment.reopened(), joined);
+        assert_eq!(
+            leftovers(environment.paths().state_dir()),
+            Vec::<String>::new(),
+            "no temporary file is left"
+        );
     }
 
     /// Runs `publication` held at the point its record's name changed, while `directory` is held
