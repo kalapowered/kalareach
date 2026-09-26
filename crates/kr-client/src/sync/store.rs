@@ -1195,12 +1195,23 @@ pub type Result<T> = std::result::Result<T, SyncError>;
 /// A damaged file is named rather than dropped and rather than deleted. A conflict copy is content
 /// a person is meant to choose between and a publication record is the only account of what left
 /// this device; neither is a cache this store may throw away because a byte went wrong.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct Listing<T> {
     /// What was read, oldest first.
     pub items: Vec<T>,
     /// The files that are not records this build reads.
     pub unreadable: Vec<PathBuf>,
+}
+
+impl<T> std::fmt::Debug for Listing<T> {
+    /// How many items were read and how many files could not be. Never a file's name.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Listing")
+            .field("items", &self.items.len())
+            .field("unreadable", &self.unreadable.len())
+            .finish()
+    }
 }
 
 impl<T> Listing<T> {
@@ -1238,7 +1249,6 @@ pub struct WhatLeft {
 /// every file whole or not at all.
 ///
 /// Every method blocks, on the filesystem and on the store's lock.
-#[derive(Debug)]
 pub struct SyncStore {
     directory: PathBuf,
 }
@@ -3565,10 +3575,11 @@ impl SyncStore {
 }
 
 /// The store's lock, held for as long as this value is, and not a moment longer.
-#[derive(Debug)]
 pub(super) struct Lock {
     file: std::fs::File,
 }
+
+crate::debug_as_name!(Lock);
 
 impl Drop for Lock {
     /// Releases the lock itself, rather than leaving the release to the file's closing.
@@ -3626,7 +3637,6 @@ impl Lock {
 /// while somebody is still waiting for its answer. Releasing it says this device's call is over; it
 /// never says the request stopped at the service, which is why what a released request needs is a
 /// claim and a question rather than a conclusion.
-#[derive(Debug)]
 pub struct Dispatch {
     directory: PathBuf,
     work_id: Uuid,
@@ -3635,6 +3645,8 @@ pub struct Dispatch {
     basis: Basis,
     _lock: Lock,
 }
+
+crate::debug_fields!(Dispatch { work_id });
 
 impl Dispatch {
     /// Returns the request this dispatch is held for.

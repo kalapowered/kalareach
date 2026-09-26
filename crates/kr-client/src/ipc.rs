@@ -52,7 +52,6 @@ pub struct LocalContext {
 }
 
 /// A connection to a host on this machine.
-#[derive(Debug)]
 pub struct IpcTransport {
     connection_id: ConnectionId,
     limits: ReceiveLimits,
@@ -75,6 +74,8 @@ pub struct IpcTransport {
     /// Set once a session has claimed the receive side.
     claimed: AtomicBool,
 }
+
+crate::debug_fields!(IpcTransport { connection_id });
 
 impl IpcTransport {
     /// Connects to a host endpoint on this machine and negotiates the protocol version.

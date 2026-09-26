@@ -44,10 +44,11 @@ const LIMITS: kr_cbor::Limits = kr_cbor::Limits {
 };
 
 /// Where one device keeps its membership file.
-#[derive(Debug)]
 pub(crate) struct MembershipFile {
     directory: PathBuf,
 }
+
+crate::debug_as_name!(MembershipFile);
 
 /// The hold one operation keeps on the membership file.
 #[derive(Debug)]

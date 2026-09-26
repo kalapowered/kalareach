@@ -68,7 +68,6 @@ mod console {
     /// Windows has no controlling terminal and no `termios`. What it has is a console whose input
     /// and output modes are read and set through the console API, and that pair of mode words is
     /// the state a guard restores.
-    #[derive(Debug)]
     pub struct ControllingTerminal {
         input: File,
         output: File,

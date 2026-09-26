@@ -273,7 +273,7 @@ pub enum RelayDirection {
 /// bounded by the free allowance and by the 8 MiB aggregate section 17 gives every principal. The
 /// bounded grace a principal is granted when its allowance runs out is not measured against the
 /// authorisation's figure, because it is not taken from the allowance the figure protects.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct LeaseRequest {
     /// The endpoint the traffic comes from.
     pub source: EndpointKey,
@@ -305,7 +305,7 @@ pub struct LeaseRequest {
 /// carries nothing is its own name, and a case that carries facts is a map under it. One serde
 /// definition therefore produces the JSON the service reads and the canonical bytes the credential
 /// covers, which is what keeps the two from drifting.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LeasePayer {
     /// This installation itself, drawing on the free allowance.
@@ -1234,7 +1234,7 @@ impl ManagedService {
 /// model. This is an explanation and only an explanation. Nothing in this library consults it
 /// before doing local work, and a client that deleted every field of [`ServiceClients`] would lose
 /// the managed resources and keep the product.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Availability {
     /// Which service.
     pub service: ManagedService,
@@ -1248,11 +1248,16 @@ pub struct Availability {
     pub explanation: String,
 }
 
+crate::debug_fields!(Availability {
+    service,
+    configured
+});
+
 /// Every service client one client holds.
 ///
 /// A field left `None` is a service this client does not use. Nothing degrades: the local product
 /// is complete without any of them.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct ServiceClients {
     /// Account login.
     pub account: Option<std::sync::Arc<dyn AccountService>>,

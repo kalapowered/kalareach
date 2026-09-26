@@ -309,11 +309,22 @@ impl crate::shown::Said for Refusal {
 crate::display_as_said!(Refusal);
 
 /// A snapshot whose pages are still arriving.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct Installing {
     header: Box<ProjectionSnapshot>,
     rows: BTreeMap<(ProjectedBuffer, u64), ProjectedRow>,
     hyperlinks: BTreeMap<(ProjectedBuffer, u64), Vec<HyperlinkRange>>,
+}
+
+impl std::fmt::Debug for Installing {
+    /// How much of the snapshot has arrived. Never a row, a link or the header's text.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Installing")
+            .field("rows", &self.rows.len())
+            .field("hyperlinks", &self.hyperlinks.len())
+            .finish_non_exhaustive()
+    }
 }
 
 /// One client's projection of a session.

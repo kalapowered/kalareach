@@ -156,7 +156,7 @@ struct Waiters {
 /// The identifier alone is not enough to act on: a person asking what happened needs to know which
 /// intent is uncertain, and two cancelled calls leave two identifiers that would otherwise be
 /// indistinguishable. The record is immutable, and it is what a reconnect carries.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SubmittedAction {
     /// The durable operation identity.
     pub action_id: ActionId,
@@ -173,6 +173,12 @@ pub struct SubmittedAction {
     /// The request it was sent as, which correlates the host's answer.
     pub request_id: RequestId,
 }
+
+crate::debug_fields!(SubmittedAction {
+    action_id,
+    method,
+    request_id
+});
 
 /// Whose identity a mutation is submitted under.
 ///
@@ -269,7 +275,6 @@ impl Outcomes {
 pub const MAX_UNRESOLVED_ACTIONS: usize = 1024;
 
 /// The shared state of one connection.
-#[derive(Debug)]
 struct SessionState {
     waiters: std::sync::Mutex<Waiters>,
     action_window: Mutex<ActionWindow>,
@@ -283,6 +288,11 @@ struct SessionState {
     outstanding: AtomicU64,
     max_outstanding: u64,
 }
+
+crate::debug_fields!(SessionState {
+    outstanding,
+    max_outstanding
+});
 
 impl SessionState {
     /// Ends the session, waking every waiter.
@@ -310,13 +320,14 @@ impl SessionState {
 }
 
 /// A client's connection to one host.
-#[derive(Debug)]
 pub struct Session {
     transport: Arc<dyn ControlTransport>,
     state: Arc<SessionState>,
     next_request_id: AtomicU64,
     reader: tokio::task::JoinHandle<()>,
 }
+
+crate::debug_as_name!(Session);
 
 impl Session {
     /// Starts a session on an authorised connection.

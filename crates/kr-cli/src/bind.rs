@@ -33,7 +33,7 @@ pub const SETUP_INSTRUCTION: &str =
     "start this agent inside a KalaReach session: run `kr new --attach` and launch it there";
 
 /// One session this helper is bound to.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Bound {
     /// The worker that owns it.
     pub descriptor: WorkerDescriptor,

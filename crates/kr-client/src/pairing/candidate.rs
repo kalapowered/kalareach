@@ -136,11 +136,11 @@ pub struct Candidate {
 }
 
 impl std::fmt::Debug for Candidate {
+    /// Its platform. Never its keys, and never its name or its build, which are whatever it was
+    /// given.
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("Candidate")
-            .field("endpoint_id", self.keys.transport.public())
-            .field("name", &self.name)
             .field("platform", &self.platform)
             .finish_non_exhaustive()
     }
@@ -231,7 +231,7 @@ pub enum Stage {
 }
 
 /// What a person is shown of a paired host.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 pub struct HostView {
     /// The name the host gives people, when it could be read.
     pub name: Option<String>,
@@ -264,7 +264,7 @@ fn expiry(expiry: &GrantExpiry) -> Option<u64> {
 }
 
 /// Where an attempt has got to, as a person is shown it. Nothing in it is secret.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum AttemptState {
     /// No attempt is running.
@@ -311,6 +311,41 @@ pub enum AttemptState {
         /// up after a restart, whose endings are the host's.
         service: Option<String>,
     },
+}
+
+impl std::fmt::Debug for AttemptState {
+    /// Which stage the attempt is at and when it expires. Never the verification value, a host's
+    /// name or what the host said of its authority or its service.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Idle => formatter.write_str("Idle"),
+            Self::Working { stage } => formatter
+                .debug_struct("Working")
+                .field("stage", stage)
+                .finish(),
+            Self::AwaitingApproval {
+                expires_at_ms,
+                rights,
+                grant_expires_at_ms,
+                ..
+            } => formatter
+                .debug_struct("AwaitingApproval")
+                .field("expires_at_ms", expires_at_ms)
+                .field("rights", rights)
+                .field("grant_expires_at_ms", grant_expires_at_ms)
+                .finish_non_exhaustive(),
+            Self::Reconnecting { expires_at_ms, .. } => formatter
+                .debug_struct("Reconnecting")
+                .field("expires_at_ms", expires_at_ms)
+                .finish_non_exhaustive(),
+            Self::Paired { .. } => formatter.debug_struct("Paired").finish_non_exhaustive(),
+            Self::Ended { failure, mode, .. } => formatter
+                .debug_struct("Ended")
+                .field("failure", failure)
+                .field("mode", mode)
+                .finish_non_exhaustive(),
+        }
+    }
 }
 
 /// How a candidate opens its room.
@@ -1705,7 +1740,6 @@ impl Relay {
 }
 
 /// Why kr-pairing's start returned no attempt.
-#[derive(Debug)]
 pub(crate) enum StartRefused {
     /// It refused, and when the lookup failed, how the room ended.
     Pairing {
@@ -1716,6 +1750,16 @@ pub(crate) enum StartRefused {
     },
     /// The blocking thread did not finish.
     Lost(Shown),
+}
+
+impl std::fmt::Debug for StartRefused {
+    /// Which refusal it is, and a lost start's words. Never the pairing library's own text.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Pairing { .. } => formatter.debug_struct("Pairing").finish_non_exhaustive(),
+            Self::Lost(lost) => formatter.debug_tuple("Lost").field(lost).finish(),
+        }
+    }
 }
 
 /// Runs kr-pairing's start on a blocking thread with a lookup that opens the room.

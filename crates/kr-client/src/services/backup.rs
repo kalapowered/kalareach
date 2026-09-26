@@ -82,7 +82,7 @@ pub const BACKUP_ANSWER_LIMIT_BYTES: u64 = 256 * 1024;
 /* -------------------------------------------------------------------------- */
 
 /// The writer a collection holds, as the service summarises it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct WriterSummary {
     /// The writer's signing key identifier.
     pub writer_key_id: KeyId,
@@ -91,6 +91,8 @@ pub struct WriterSummary {
     /// When the service took the enrolment, as it wrote it.
     pub enrolled_at: String,
 }
+
+crate::debug_fields!(WriterSummary { writer_revision });
 
 /// What one collection holds now.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -108,7 +110,7 @@ pub struct CollectionSummary {
 }
 
 /// One kept generation, as the service summarises it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct GenerationSummary {
     /// The generation.
     pub backup_generation: BackupGeneration,
@@ -121,6 +123,12 @@ pub struct GenerationSummary {
     /// When the service stored it, as it wrote it.
     pub published_at: String,
 }
+
+crate::debug_fields!(GenerationSummary {
+    backup_generation,
+    descriptor_bytes,
+    recipients
+});
 
 /// What an enrolment answered.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -410,7 +418,7 @@ impl ManagedBackupManifestService {
         };
         let data = match answer {
             Answer::Data(data) => data,
-            Answer::Refused(refusal) if refusal.code() == "COLLECTION_DELETED" => {
+            Answer::Refused(refusal) if refusal.code() == Some("COLLECTION_DELETED") => {
                 return Ok(Dispatched::Answered(ArchiveAnswer::CollectionDeleted));
             }
             // Every other refusal is the error the service named. `FORBIDDEN` covers a writer the
@@ -456,7 +464,7 @@ impl ManagedBackupManifestService {
             Answer::Data(data) => data,
             // No collection, no such generation, or none the service holds as new as the
             // checkpoint: the service holds nothing this fetch may be answered with.
-            Answer::Refused(refusal) if refusal.code() == "NOT_FOUND" => return Ok(None),
+            Answer::Refused(refusal) if refusal.code() == Some("NOT_FOUND") => return Ok(None),
             Answer::Refused(refusal) => return Err(refusal.into_error()),
         };
         let answer: FetchAnswer = read(data, "what a fetch answered")?;

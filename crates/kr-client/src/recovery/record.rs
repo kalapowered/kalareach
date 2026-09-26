@@ -136,7 +136,6 @@ pub(super) enum Known {
 }
 
 /// Where one bundle store keeps its record, and the lock that makes it the only store doing so.
-#[derive(Debug)]
 pub(super) struct RecordFile {
     directory: PathBuf,
     path: PathBuf,

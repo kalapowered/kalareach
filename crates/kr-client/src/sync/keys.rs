@@ -122,10 +122,12 @@ fn corrupt_stored_key(collection: &str, epoch: u64) -> ClientError {
 /// It is the implementation a demonstration, a bench or a test of the collection rules uses: the
 /// keys are put in deliberately, they last as long as the process and they reach no store. It is
 /// not a device's own key store, and nothing here writes one to disk.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct MemoryCollectionKeys {
     keys: Mutex<BTreeMap<(String, u64), SymmetricKey>>,
 }
+
+crate::debug_as_name!(MemoryCollectionKeys);
 
 impl MemoryCollectionKeys {
     /// Returns a set holding no keys.
@@ -198,20 +200,18 @@ fn poisoned() -> ClientError {
 /// [`StoreKind`]: kr_crypto::store::StoreKind
 pub struct StoredCollectionKeys {
     store: Box<dyn SecretStore>,
-    description: String,
     kind: kr_crypto::store::StoreKind,
     scope: String,
 }
 
 impl std::fmt::Debug for StoredCollectionKeys {
-    /// Names the store and the scope, and never a key or a key's name.
+    /// Which kind of store holds the keys, and never a key, a key's name or the scope, which is the
+    /// caller's text.
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("StoredCollectionKeys")
-            .field("store", &self.description)
             .field("kind", &self.kind)
-            .field("scope", &self.scope)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -241,7 +241,6 @@ impl StoredCollectionKeys {
     #[must_use]
     pub fn of(opened: OpenedStore, scope: &str) -> Self {
         Self {
-            description: opened.store.describe(),
             kind: opened.kind,
             store: opened.store,
             scope: scope.to_owned(),
@@ -336,11 +335,22 @@ impl CollectionKeys for StoredCollectionKeys {
 /// call instead of at the next restart.
 ///
 /// One sealer belongs to one collection at one epoch, because that is what one key belongs to.
-#[derive(Debug)]
 pub struct CollectionSealer {
     keys: Arc<dyn CollectionKeys>,
     collection: String,
     epoch: u64,
+}
+
+impl std::fmt::Debug for CollectionSealer {
+    /// Which collection, by its identifier when it is one, and which epoch. Never a key.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let collection: Option<kr_protocol::scalars::Uuid> = self.collection.parse().ok();
+        formatter
+            .debug_struct("CollectionSealer")
+            .field("collection", &collection)
+            .field("epoch", &self.epoch)
+            .finish_non_exhaustive()
+    }
 }
 
 impl CollectionSealer {
@@ -861,8 +871,12 @@ mod tests {
         .expect("a store");
         let key: SymmetricKey = Secret::from_bytes([0x5a; 32]);
         keys.put(COLLECTION, 1, &key).expect("written");
+        // The store by its kind alone: never a key, and never the scope, which is the caller's.
         let rendered = format!("{keys:?}");
-        assert!(rendered.contains(SCOPE));
-        assert!(!rendered.contains("5a5a5a"));
+        assert_eq!(rendered, "StoredCollectionKeys { kind: FileFallback, .. }");
+        assert_eq!(
+            format!("{sealer:?}"),
+            format!("CollectionSealer {{ collection: Some(Uuid({COLLECTION})), epoch: 1, .. }}")
+        );
     }
 }

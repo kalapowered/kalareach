@@ -113,14 +113,17 @@ pub struct SettingsCollection {
 }
 
 impl fmt::Debug for SettingsCollection {
-    /// The archive and the keys by their identifiers. Never a private key.
+    /// The archive, the service's origin as a diagnostic names one, and the device that owns it.
+    /// Never a key.
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("SettingsCollection")
             .field("archive_id", &self.archive_id)
-            .field("service_origin", &self.service_origin)
-            .field("writer_key_id", &self.writer.key_id())
-            .field("producer_key_id", &self.producer.key_id())
+            .field(
+                "service_origin",
+                &crate::shown::Shown::address(&self.service_origin),
+            )
+            .field("owner_device_id", &self.owner_device_id)
             .finish_non_exhaustive()
     }
 }
@@ -144,10 +147,11 @@ pub struct ArchiveServices {
 impl fmt::Debug for ArchiveServices {
     /// The gateway and the signer's kind. Never a token.
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let signer: kr_protocol::service::ServiceRequestSigner = self.signer.signer();
         formatter
             .debug_struct("ArchiveServices")
             .field("origin", &self.origin)
-            .field("signer", &self.signer.signer())
+            .field("signer", &signer)
             .finish_non_exhaustive()
     }
 }
@@ -162,10 +166,11 @@ impl fmt::Debug for SettingsArchive {
     /// The collection, as its own rendering gives it, and the bundle revision that carries the
     /// writer.
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let bundle_revision: u64 = self.enabled.bundle_revision();
         formatter
             .debug_struct("SettingsArchive")
             .field("collection", &self.collection)
-            .field("bundle_revision", &self.enabled.bundle_revision())
+            .field("bundle_revision", &bundle_revision)
             .finish()
     }
 }

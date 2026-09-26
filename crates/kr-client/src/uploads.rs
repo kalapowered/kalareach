@@ -75,13 +75,12 @@ pub struct Held {
 }
 
 impl std::fmt::Debug for Held {
-    /// How much is held and its digest, never the bytes.
+    /// How much is held, never the bytes or their digest.
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("Held")
             .field("bytes", &self.bytes.len())
-            .field("digest", &self.digest)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -164,7 +163,7 @@ impl std::fmt::Debug for Subject {
 }
 
 /// What the caller should send next.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum Step {
     /// Reserve the transfer.
     Begin(Box<UploadBeginParams>),
@@ -177,7 +176,7 @@ pub enum Step {
 }
 
 /// What one sent step answered with.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub enum Answer {
     /// The result of `upload.begin`.
     Begun(Box<UploadBeginResult>),
@@ -199,7 +198,6 @@ enum Phase {
 }
 
 /// One upload, from the content to the published handle.
-#[derive(Debug)]
 pub struct Upload {
     subject: Subject,
     content: Box<dyn Content>,

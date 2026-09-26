@@ -355,7 +355,6 @@ fn detached(program: &std::path::Path) -> Command {
 }
 
 /// A terminal attached to a session.
-#[derive(Debug)]
 pub struct Attachment {
     /// The attachment the worker allocated.
     pub attachment_id: AttachmentId,

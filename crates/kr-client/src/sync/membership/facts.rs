@@ -179,7 +179,7 @@ pub(crate) struct Candidate<R, A> {
 /// installed one and the head (the chain check 2 accepted), the issuer that opened each epoch,
 /// the mark of every key this device opened since its current join (check 5), and the history
 /// those records were read in.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(bound = "", deny_unknown_fields)]
 pub(crate) struct Facts<K: Kinds> {
     /// The file format.
@@ -226,6 +226,21 @@ pub(crate) struct Facts<K: Kinds> {
     /// while it names none, so such a file keeps its shape.
     #[serde(default = "Nullable::null", skip_serializing_if = "names_no_recovery")]
     pub recovery: Nullable<SyncRecoveryId>,
+}
+
+impl<K: Kinds> std::fmt::Debug for Facts<K> {
+    /// Where the membership stands and how much it holds. Never a record, a member or an answer.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Facts")
+            .field("join", &self.join)
+            .field("installed", &self.installed)
+            .field("head", &self.head)
+            .field("records", &self.records.len())
+            .field("out", &self.out)
+            .field("recovery", &self.recovery)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Why a file's facts are not ones any sequence of writes produces.

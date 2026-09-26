@@ -1133,10 +1133,21 @@ fn predictable(text: &str) -> bool {
 }
 
 /// One cell of text: a scalar with a width of its own, plus the zero-width scalars that join it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct Cluster<'a> {
     text: &'a str,
     cells: u64,
+}
+
+impl std::fmt::Debug for Cluster<'_> {
+    /// How long its text is and how many cells it covers. Never the text, which a terminal showed.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Cluster")
+            .field("text_bytes", &self.text.len())
+            .field("cells", &self.cells)
+            .finish()
+    }
 }
 
 /// Splits text into the clusters the pinned width model measures.

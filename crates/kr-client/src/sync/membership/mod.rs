@@ -154,7 +154,7 @@ pub struct CollectionRef {
 }
 
 /// One device a key record names: its authorisation key and its stored-envelope key.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Device {
     /// The Ed25519 authorisation key, from which its installation identifier derives.
@@ -162,6 +162,8 @@ pub struct Device {
     /// The X25519 stored-envelope key its wrap is sealed to.
     pub stored_envelope: StoredEnvelopeKey,
 }
+
+crate::debug_as_name!(Device);
 
 impl Device {
     /// The device one record entry names.
@@ -190,7 +192,7 @@ impl Device {
 }
 
 /// One device as one host's device list reports it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HostDevice {
     /// Its authorisation key, as the host recorded it when the owner committed its pairing.
@@ -202,6 +204,11 @@ pub struct HostDevice {
     /// Whether the host reports it revoked.
     pub revoked: bool,
 }
+
+crate::debug_fields!(HostDevice {
+    manages_host,
+    revoked
+});
 
 /// What one host answered.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -221,7 +228,7 @@ pub struct HostAnswers {
 
 /// The host answers as this device recorded them, with every revocation it verified from an
 /// authority feed.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RecordedAnswers {
     /// The hosts' answers at the last refresh.
@@ -229,6 +236,17 @@ pub struct RecordedAnswers {
     /// The devices a verified authority feed revoked, by authorisation key. A refresh keeps
     /// them: a host that has not received a revocation yet does not undo it.
     pub verified: BTreeSet<AuthorisationKey>,
+}
+
+impl std::fmt::Debug for RecordedAnswers {
+    /// What each host answered, and how many devices were verified. Never a key.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RecordedAnswers")
+            .field("hosts", &self.hosts)
+            .field("verified", &self.verified.len())
+            .finish()
+    }
 }
 
 impl RecordedAnswers {
@@ -758,7 +776,6 @@ impl std::fmt::Debug for SyncMembership {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("SyncMembership")
-            .field("environment", &self.reconciler.env)
             .finish_non_exhaustive()
     }
 }

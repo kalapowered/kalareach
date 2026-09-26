@@ -76,12 +76,13 @@ pub struct AnswerDraft {
 impl std::fmt::Debug for AnswerDraft {
     /// Which question the answer is for and what kind of answer it is, never what it says.
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let answer: &'static str = self.answer.kind();
         formatter
             .debug_struct("AnswerDraft")
             .field("session_id", &self.session_id)
             .field("question_id", &self.question_id)
             .field("question_revision", &self.question_revision)
-            .field("answer", &self.answer.kind())
+            .field("answer", &answer)
             .field("drafted_at_ms", &self.drafted_at_ms)
             .finish_non_exhaustive()
     }
@@ -352,7 +353,7 @@ impl QuestionHost for Session {
 }
 
 /// The answers this device keeps, in a directory the caller names.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct AnswerDrafts {
     directory: PathBuf,
 }

@@ -492,7 +492,7 @@ pub struct SyncCheckpoint {
 ///
 /// One damaged file does not hide the drafts beside it, and it is not dropped either: it is named,
 /// so a client can say which one it cannot open rather than quietly showing one draft fewer.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct Listing {
     /// The drafts that were read, oldest first.
     pub drafts: Vec<Draft>,
@@ -510,11 +510,13 @@ pub struct Listing {
 /// Every method blocks, on the filesystem and on the store's lock. A draft is a few kilobytes and
 /// the calls are a person's own edits, so a caller on an asynchronous runtime that cares about the
 /// difference runs them on a blocking task.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct DraftStore {
     directory: PathBuf,
     device_id: DeviceId,
 }
+
+crate::debug_fields!(DraftStore { device_id });
 
 impl DraftStore {
     /// Opens or creates a store in `directory` for one device.
@@ -1113,7 +1115,6 @@ impl DraftStore {
 ///
 /// Dropping it closes the file, and closing the file releases the lock on every platform the
 /// standard library supports.
-#[derive(Debug)]
 struct Lock {
     _file: std::fs::File,
 }
@@ -1454,7 +1455,6 @@ enum BroughtDown {
 /// has, because it was reset or replaced, is the case that does not resolve itself: the
 /// publication is refused and there is nothing to fetch, and [`DraftStore::forget_checkpoint`] is
 /// how a caller says so.
-#[derive(Debug)]
 pub struct DraftSync {
     service: std::sync::Arc<dyn crate::services::SyncBackupService>,
     sealer: std::sync::Arc<dyn DraftSealer>,

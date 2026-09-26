@@ -11,7 +11,7 @@ use kr_pairing::platform::{BootIdentity, PairingClock};
 use crate::error::{ClientError, Result};
 
 /// This device's pairing clock, for the boot it is running in.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct DeviceClock {
     boot: BootIdentity,
 }

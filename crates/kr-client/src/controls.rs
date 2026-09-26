@@ -45,7 +45,7 @@ use kr_protocol::ids::ApprovalRequestId;
 /// Rights, present nodes and pending approvals are supplied as whole sets, because a client that
 /// has them has all of them: the question is whether it was told at all, which is what the option
 /// answers.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct ControlState {
     capabilities: Vec<(PluginCapability, CapabilityState)>,
     rights: Option<Vec<ActionRight>>,
@@ -177,7 +177,7 @@ impl Truth {
 }
 
 /// Why a control is not shown.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum Hidden {
     /// The predicate is false for what this client knows.
     PredicateFalse,
@@ -192,6 +192,20 @@ pub enum Hidden {
     /// admits. The control is hidden and the failure is reported, because a package whose
     /// visibility rule cannot be read is a package whose controls nobody can vouch for.
     OutsideTheGrammar(PredicateError),
+}
+
+impl std::fmt::Debug for Hidden {
+    /// Why the control is hidden, and never the name of a fact or the grammar's own words, which
+    /// are the package's text.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PredicateFalse => formatter.write_str("PredicateFalse"),
+            Self::UnknownFact { .. } => formatter
+                .debug_struct("UnknownFact")
+                .finish_non_exhaustive(),
+            Self::OutsideTheGrammar(_) => formatter.write_str("OutsideTheGrammar(..)"),
+        }
+    }
 }
 
 impl crate::shown::Said for Hidden {
@@ -345,7 +359,7 @@ fn unknown_fact(predicate: &Predicate, state: &ControlState) -> Option<String> {
 ///
 /// It carries the control's revision, which is what lets the host recheck the condition against the
 /// control the person actually saw rather than against whatever the package has published since.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Invocation {
     /// The control that was pressed.
     pub control_id: ControlId,
@@ -355,8 +369,10 @@ pub struct Invocation {
     pub action_id: ActionName,
 }
 
+crate::debug_fields!(Invocation { control_revision });
+
 /// Why a control cannot be invoked.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum NotInvocable {
     /// It is not shown, so there was nothing to press.
     Hidden(Hidden),
@@ -367,6 +383,21 @@ pub enum NotInvocable {
         /// The reason the package gives a person, when it gave one.
         reason: Option<String>,
     },
+}
+
+impl std::fmt::Debug for NotInvocable {
+    /// Why the control cannot be invoked, and whether the package gave a reason. Never the
+    /// reason, which is the package's text.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Hidden(hidden) => formatter.debug_tuple("Hidden").field(hidden).finish(),
+            Self::Disabled { because, reason } => formatter
+                .debug_struct("Disabled")
+                .field("because", because)
+                .field("reason", &reason.as_ref().map(|_| "<present>"))
+                .finish(),
+        }
+    }
 }
 
 impl crate::shown::Said for NotInvocable {
@@ -434,10 +465,13 @@ impl core::fmt::Debug for Rendered {
     /// Which kind of rendering it is and how many controls it holds, never the document.
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::Node(node) => formatter
-                .debug_struct("Node")
-                .field("controls", &node.body.controls().len())
-                .finish_non_exhaustive(),
+            Self::Node(node) => {
+                let controls: usize = node.body.controls().len();
+                formatter
+                    .debug_struct("Node")
+                    .field("controls", &controls)
+                    .finish_non_exhaustive()
+            }
             Self::Unsupported(_) => formatter.write_str("Unsupported(..)"),
         }
     }

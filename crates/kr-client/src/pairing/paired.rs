@@ -37,7 +37,7 @@ const HOSTS_FILE: &str = "hosts.json";
 const ATTEMPT_FILE: &str = "attempt.json";
 
 /// A host this device is paired with.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PairedHost {
     /// The host's device identity.
@@ -61,6 +61,14 @@ pub struct PairedHost {
     /// When the pairing committed, in UTC milliseconds.
     pub paired_at_ms: u64,
 }
+
+crate::debug_fields!(PairedHost {
+    host_device_id,
+    host_key_revision,
+    device_id,
+    grant_id,
+    paired_at_ms
+});
 
 impl PairedHost {
     /// The host as this device's connection proof is checked against it.
@@ -94,7 +102,7 @@ pub enum AttemptMode {
 }
 
 /// An attempt that has proved itself to the host and waits for the owner.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PendingAttempt {
     /// How it was made.
@@ -146,12 +154,13 @@ struct AttemptFile {
 }
 
 /// The paired-host records and the waiting attempt, in one directory of the application's own.
-#[derive(Debug)]
 pub struct PairedHosts {
     directory: PathBuf,
     /// Serialises this process's read-modify-write of the records.
     writing: Mutex<()>,
 }
+
+crate::debug_as_name!(PairedHosts);
 
 impl PairedHosts {
     /// Opens the records in `directory`, creating it owner-only when it does not exist.

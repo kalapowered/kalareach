@@ -216,10 +216,21 @@ impl Default for HttpDeadlines {
 /// One figure would have to be the largest any operation needs, which would let every other
 /// operation's answer grow to it. The path is what names the operation, so the bound is stated
 /// against the path and the default applies to everything unstated.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ResponseLimits {
     default_bytes: u64,
     by_path: Vec<(String, u64)>,
+}
+
+impl fmt::Debug for ResponseLimits {
+    /// The default limit and how many paths have their own.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ResponseLimits")
+            .field("default_bytes", &self.default_bytes)
+            .field("paths", &self.by_path.len())
+            .finish()
+    }
 }
 
 impl ResponseLimits {
@@ -278,7 +289,7 @@ impl fmt::Debug for HttpService {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("HttpService")
-            .field("origin", &self.origin.as_str())
+            .field("origin", &self.origin)
             .field("deadlines", &self.deadlines)
             .field("limits", &self.limits)
             .finish()

@@ -19,7 +19,7 @@ use serde_json::{Value, json};
 use crate::error::{CliError, Result};
 
 /// What one shell's integration is, as `kr shell status` reports it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ShellReport {
     /// Which managed shell this is.
     pub kind: ShellKind,
@@ -33,8 +33,10 @@ pub struct ShellReport {
     pub entries: Vec<EntryReport>,
 }
 
+kr_client::debug_fields!(ShellReport { kind });
+
 /// What the installed package for one shell resolved to.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct PackageReport {
     /// The executable a managed session would launch.
     pub executable: String,
@@ -49,7 +51,7 @@ pub struct PackageReport {
 }
 
 /// One startup file, and what is in it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct EntryReport {
     /// The file.
     pub path: String,
