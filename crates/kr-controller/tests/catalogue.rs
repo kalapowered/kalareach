@@ -1782,6 +1782,78 @@ async fn the_configured_budgets_bound_what_an_enrolment_may_ask_for() {
     assert_eq!(listed().await, 1);
 }
 
+/// The configured package limits hold each package, each no larger than the format's own: a
+/// package past `package_bytes`, `object_count` or `expanded_pack_bytes` is refused by that name
+/// and not installed, and within the limits it installs.
+#[tokio::test]
+async fn a_package_past_a_configured_package_limit_is_refused_by_name() {
+    use kr_protocol::hostinfo::configuration::EnrolmentBudgets;
+    let host = host();
+    let digest = synchronised(&host).await;
+    let install = || {
+        let host = &host;
+        let digest = digest.clone();
+        async move {
+            host.module
+                .write_frame_admitted(
+                    &mutation(
+                        Method::PluginInstall,
+                        host.environment_id,
+                        &install_params(host, &digest),
+                    ),
+                    Method::PluginInstall,
+                    Some(host.confirmations()),
+                )
+                .await
+        }
+    };
+    let defaults = EnrolmentBudgets::default();
+    for (name, budgets) in [
+        (
+            "package_bytes",
+            EnrolmentBudgets {
+                package_bytes: 1,
+                ..defaults
+            },
+        ),
+        (
+            "object_count",
+            EnrolmentBudgets {
+                object_count: 1,
+                ..defaults
+            },
+        ),
+        (
+            "expanded_pack_bytes",
+            EnrolmentBudgets {
+                expanded_pack_bytes: 1,
+                ..defaults
+            },
+        ),
+    ] {
+        host.module.put_budgets_in_force(budgets);
+        let refused = refusal(install().await);
+        assert!(
+            matches!(
+                refused.code,
+                ErrorCode::QuotaExceeded | ErrorCode::OutcomeUnknown
+            ),
+            "{name}: {refused:?}"
+        );
+        assert!(refused.message.contains(name), "{name}: {refused:?}");
+        let catalogue = host.module.catalogue().lock().await;
+        assert!(
+            catalogue
+                .installation(host.environment_id, &plugin())
+                .expect("readable")
+                .is_none(),
+            "{name}: nothing installed"
+        );
+    }
+    host.module.put_budgets_in_force(defaults);
+    let _: wire::PluginInstallResult = ok(install().await);
+}
+
 /// Counts the workers gave at one admission revision are shown only while that is the revision
 /// the answer renders: a change committed after the workers answered leaves them unknown.
 #[tokio::test]

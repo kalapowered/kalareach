@@ -89,7 +89,7 @@ pub use crate::admission::{
 };
 pub use crate::authority::{Authority, Committed, Effect, Failure, Owner, Recording};
 pub use crate::broker::{BrokerBridge, LivePackages, UnboundBroker};
-pub use crate::budget::{BudgetLedger, Resource, ResourceLimit, Retained, Stage};
+pub use crate::budget::{BudgetLedger, PackageLimits, Resource, ResourceLimit, Retained, Stage};
 pub use crate::ceiling::{
     CapabilityDecision, GrantRequirement, InstallationGrant, capability_from_str,
 };
@@ -319,6 +319,8 @@ pub struct Catalogue {
     fetches_network: bool,
     broker: Arc<dyn BrokerBridge>,
     transport: Arc<dyn tough::Transport + Send + Sync>,
+    /// The limits each package is held to, as its host put them in force for the change at hand.
+    package_limits: PackageLimits,
 }
 
 impl Catalogue {
@@ -366,6 +368,7 @@ impl Catalogue {
             fetches_network: true,
             broker,
             transport,
+            package_limits: PackageLimits::format(),
         })
     }
 
@@ -747,6 +750,11 @@ impl Catalogue {
         host: &HostPlatform,
     ) -> CatalogueResult<Admissions> {
         self.admission_plan(environment_id, live, host)?.complete()
+    }
+
+    /// Holds every package the changes that follow check to `limits`.
+    pub fn set_package_limits(&mut self, limits: PackageLimits) {
+        self.package_limits = limits;
     }
 
     /// Raises the admission revision under `authority`, for something the admissions carry that
@@ -1136,7 +1144,7 @@ impl Catalogue {
         // that a newer root withdrew is not where a load starts.
         let (store, _lock, enrolled) = self.locked(&enrolled)?;
         self.check_reachable(&enrolled.enrolment)?;
-        let ledger = ledger_of(&store, &enrolled)?;
+        let ledger = ledger_of(&store, &enrolled, self.package_limits)?;
 
         let transport = Arc::clone(&self.transport);
         // The client works in a private copy of the accepted trust checkpoint, never in the
@@ -1488,7 +1496,7 @@ impl Catalogue {
                 verified_here.insert(*digest);
                 continue;
             }
-            let ledger = ledger_of(store, enrolled)?;
+            let ledger = ledger_of(store, enrolled, self.package_limits)?;
             let bytes = verified
                 .read_target(
                     target,
@@ -1677,7 +1685,7 @@ impl Catalogue {
             extract::reconcile(&entry, package.manifest(), &subject)?;
             return Ok(*package);
         }
-        extract::check_declared(&entry, &ledger_of(store, enrolled)?)?;
+        extract::check_declared(&entry, &ledger_of(store, enrolled, self.package_limits)?)?;
 
         // The package is staged whole, beside everything the cache and the packages already here
         // hold, and what it still has to fetch is cached on the way. Room for both is made before
@@ -1765,7 +1773,7 @@ impl Catalogue {
             &checked,
             staged_bytes,
             staged_files,
-            &ledger_of(store, enrolled)?,
+            &ledger_of(store, enrolled, self.package_limits)?,
         )?;
         committed(
             authority,
@@ -1856,7 +1864,7 @@ impl Catalogue {
         let bytes = trust::fetch_accepted(
             &self.transport,
             &accepted_target,
-            &ledger_of(store, enrolled)?,
+            &ledger_of(store, enrolled, self.package_limits)?,
         )
         .await?;
         committed(authority, &Effect::Payload(digest), |permit| {
@@ -2506,7 +2514,8 @@ fn reclaim(
         // A reclaim that has to remove nothing asks nothing about what is protected: a live
         // package this host cannot name holds up only the removals it would have to be weighed
         // against.
-        let ledger = ledger_of(store, &enrolled)?;
+        // Reclaim measures what the directory holds; it checks no package against a limit.
+        let ledger = ledger_of(store, &enrolled, PackageLimits::format())?;
         if ledger
             .check_payload_bytes(length, Stage::Declared, subject)
             .is_ok()
@@ -2692,8 +2701,12 @@ fn check_decided_under(
 /// Counted from the directory each time rather than carried: a count kept in memory drifts from
 /// the directory whenever another writer changes it, and a budget nobody can explain is the
 /// result.
-fn ledger_of(store: &Store, enrolled: &Enrolled) -> CatalogueResult<BudgetLedger> {
-    let mut ledger = BudgetLedger::new(enrolled.enrolment.budgets);
+fn ledger_of(
+    store: &Store,
+    enrolled: &Enrolled,
+    limits: PackageLimits,
+) -> CatalogueResult<BudgetLedger> {
+    let mut ledger = BudgetLedger::new(enrolled.enrolment.budgets).with_package_limits(limits);
     for size in store
         .cached_payloads()?
         .values()

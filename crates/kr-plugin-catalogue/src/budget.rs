@@ -35,6 +35,8 @@ pub enum Resource {
     PackageBytes,
     /// Files in one package.
     PackageFiles,
+    /// Bytes one package takes once extracted.
+    ExpandedPackBytes,
 }
 
 impl Resource {
@@ -48,7 +50,8 @@ impl Resource {
             Self::RetainedMetadataBytes => "retained_metadata_bytes",
             Self::PayloadCacheBytes => "payload_cache_bytes",
             Self::PackageBytes => "package_bytes",
-            Self::PackageFiles => "package_files",
+            Self::PackageFiles => "object_count",
+            Self::ExpandedPackBytes => "expanded_pack_bytes",
         }
     }
 
@@ -61,7 +64,9 @@ impl Resource {
                 "the repository's retention budget"
             }
             Self::PayloadCacheBytes => "the repository's cached payload budget",
-            Self::PackageBytes | Self::PackageFiles => "the package size limit in the SDK",
+            Self::PackageBytes | Self::PackageFiles | Self::ExpandedPackBytes => {
+                "this host's package limits, which the package format's own maxima cap"
+            }
         }
     }
 }
@@ -69,6 +74,41 @@ impl Resource {
 impl core::fmt::Display for Resource {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         formatter.write_str(self.as_str())
+    }
+}
+
+/// The limits this host holds one package to: the configuration's values, each no larger than
+/// the package format's own maximum.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PackageLimits {
+    /// The bytes one package may declare.
+    pub package_bytes: u64,
+    /// The files one package may hold.
+    pub object_count: u64,
+    /// The bytes one package may take once extracted.
+    pub expanded_pack_bytes: u64,
+}
+
+impl PackageLimits {
+    /// The package format's own maxima.
+    #[must_use]
+    pub const fn format() -> Self {
+        Self {
+            package_bytes: kr_plugin_sdk::package::MAX_PACKAGE_BYTES,
+            object_count: kr_plugin_sdk::package::MAX_PACKAGE_FILES as u64,
+            expanded_pack_bytes: kr_plugin_sdk::package::MAX_PACKAGE_BYTES,
+        }
+    }
+
+    /// The configured limits, each no larger than the format's maximum.
+    #[must_use]
+    pub fn configured(package_bytes: u64, object_count: u64, expanded_pack_bytes: u64) -> Self {
+        let format = Self::format();
+        Self {
+            package_bytes: package_bytes.min(format.package_bytes),
+            object_count: object_count.min(format.object_count),
+            expanded_pack_bytes: expanded_pack_bytes.min(format.expanded_pack_bytes),
+        }
     }
 }
 
@@ -129,16 +169,25 @@ pub struct Retained {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BudgetLedger {
     budgets: RepositoryBudgets,
+    package: PackageLimits,
     metadata_bytes: u64,
     metadata_entries: u64,
     payload_bytes: u64,
 }
 
 impl BudgetLedger {
+    /// Holds each package this ledger checks to `limits` rather than the format's own maxima.
+    #[must_use]
+    pub const fn with_package_limits(mut self, limits: PackageLimits) -> Self {
+        self.package = limits;
+        self
+    }
+
     /// Starts an empty ledger against one enrolment's budgets.
     #[must_use]
     pub const fn new(budgets: RepositoryBudgets) -> Self {
         Self {
+            package: PackageLimits::format(),
             budgets,
             metadata_bytes: 0,
             metadata_entries: 0,
@@ -346,16 +395,25 @@ impl BudgetLedger {
         stage: Stage,
         subject: &str,
     ) -> Result<(), ResourceLimit> {
-        if bytes > kr_plugin_sdk::package::MAX_PACKAGE_BYTES {
+        // What a package declares is held to `package_bytes`, and what it takes once extracted to
+        // `expanded_pack_bytes`; its files to `object_count` at both.
+        let (resource, limit) = match stage {
+            Stage::Declared => (Resource::PackageBytes, self.package.package_bytes),
+            Stage::Actual => (
+                Resource::ExpandedPackBytes,
+                self.package.expanded_pack_bytes,
+            ),
+        };
+        if bytes > limit {
             return Err(ResourceLimit {
-                resource: Resource::PackageBytes,
-                limit: kr_plugin_sdk::package::MAX_PACKAGE_BYTES,
+                resource,
+                limit,
                 requested: bytes,
                 stage,
                 subject: subject.to_owned(),
             });
         }
-        let file_limit = kr_plugin_sdk::package::MAX_PACKAGE_FILES as u64;
+        let file_limit = self.package.object_count;
         if files > file_limit {
             return Err(ResourceLimit {
                 resource: Resource::PackageFiles,
@@ -372,6 +430,24 @@ impl BudgetLedger {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A configured package limit is never above the format's own maximum.
+    #[test]
+    fn a_configured_package_limit_is_capped_at_the_format() {
+        assert_eq!(
+            PackageLimits::configured(u64::MAX, u64::MAX, u64::MAX),
+            PackageLimits::format()
+        );
+        let lower = PackageLimits::configured(10, 2, 20);
+        assert_eq!(
+            (
+                lower.package_bytes,
+                lower.object_count,
+                lower.expanded_pack_bytes
+            ),
+            (10, 2, 20)
+        );
+    }
 
     fn ledger() -> BudgetLedger {
         BudgetLedger::new(RepositoryBudgets::defaults())

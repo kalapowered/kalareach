@@ -917,6 +917,14 @@ impl CatalogueModule {
     ) -> Answer<ParamsValue> {
         let mut catalogue = self.catalogue.lock().await;
         admission.check().map_err(ProtocolError::from)?;
+        // Every package this change checks is held to the package limits in force: the
+        // configuration's values, each no larger than the package format's own maximum.
+        let budgets = self.budgets_in_force();
+        catalogue.set_package_limits(kr_plugin_catalogue::PackageLimits::configured(
+            budgets.package_bytes,
+            budgets.object_count,
+            budgets.expanded_pack_bytes,
+        ));
         let digest = kr_protocol::digest::mutation_digest(mutation, actor_id)
             .map_err(|error| ProtocolError::new(ErrorCode::InvalidArgument, error.to_string()))?;
         let key = receipt_key(actor_id, mutation.action_id);
