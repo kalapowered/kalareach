@@ -103,8 +103,13 @@ session again when the child exits with code 199, as it does after an update or 
 for; and it relays administrator settings to the child. Every hook is the child's, not the process
 KalaReach launched, so the worker admits each hook and records what it reports, and none of them
 selects the session's thread. With `GEMINI_CLI_NO_RELAUNCH=true` in the launch's environment the
-launched process starts the hooks itself, and it gives up the heap sizing and the restart. No
-package can declare the environment a command integration sets yet, so today no launch sets it.
+launched process runs the session and starts the hooks itself. It then gives up the heap sizing, so
+a very large session runs out of memory sooner, and the restart: when Gemini CLI exits with code
+199 after an update or to apply a change, the session ends and the person starts `gemini` again.
+The relay of administrator settings serves only a restarted child. A package declares the variable
+as its command integration's, the one pair the package contract permits, and the worker exports it
+beside `KR_REGISTRATION` for an integrated launch. Sessions are created with no command integration
+enabled, and the shell applies an integration only where it adds a flag, so no launch sets it.
 
 An interactive Gemini CLI runs its `SessionEnd` hooks more than once when it exits, with the same
 session and reason (twice in one run, three times in two others), and prints three lines of its own

@@ -68,7 +68,9 @@ stopping at the first.
 - **Capabilities.** What the package asks to be permitted, each with the reason a person reads in
   the installation grant.
 - **Actions.** Everything a control may invoke, each with its effect class and parameter schema.
-- **Attachments and native bridge.** Optional, and each needs its matching capability.
+- **Attachments, native bridge and command integration.** Optional, and each needs its matching
+  capability. A manifest with a command integration states `"sdk_range": ">=0.1.2, <0.2.0"`,
+  because a host on an earlier contract cannot read the member and refuses the package.
 
 ### Paths
 
@@ -105,6 +107,51 @@ A rule states its own confidence. An `exact` rule identifies the application by 
 cannot be coincidence, such as a bundle identifier. An `inferred` rule is a reasonable guess from a
 name on disk, and it is presented as a guess. Neither overrides a selection the user made.
 
+### Command integration
+
+`command_integration` states what the package's command integration does when a person runs the
+agent in a KalaReach session with the integration on: the command it applies to, the flags it adds
+and the environment variables it sets. A package that has none leaves the member out, so a manifest
+written before the member existed reads and hashes as it did.
+
+```json
+"command_integration": {
+  "command": "gemini",
+  "flags": [],
+  "variables": [{ "name": "GEMINI_CLI_NO_RELAUNCH", "value": "true" }],
+  "grant_statement": "Keeps the session in the launched process, so its hooks select the thread."
+}
+```
+
+- `command` is a bare name of 1 to 64 bytes: letters, digits, `.`, `_`, `+` and `-`, not starting
+  with `-` or `.`. It is the executable name of one of the package's own match rules, and where
+  that rule names directories, the host applies the integration only to a command the shell found
+  in them.
+- `flags` are whole argument elements in the order they are added: at most 16, each 1 to 4096
+  bytes, never `--`, and never a control, zero-width or bidirectional character. The host adds them
+  as one run, in front of the first `--` a person typed, or not at all where the person typed them.
+- `variables` are exact name and value pairs from a closed list, which the package contract
+  publishes as `command_integration.permitted_variables`. It holds one pair,
+  `GEMINI_CLI_NO_RELAUNCH=true`, which keeps Gemini CLI's session in the process that was launched.
+  A reserved `KR_` name, a loader, a search path and a startup variable are never on the list, and
+  adding a pair is a new contract version.
+- The declaration adds at least one flag or sets at least one variable, and the package requests
+  `command_integration.launch`.
+
+The owner confirms `command_integration.launch` on every release, as for a native bridge, because
+the flags and variables are part of the release. The grant shows the package's `grant_statement`
+beside the exact list `CommandIntegration::statement` renders from the declaration: the command,
+each flag as a JSON string in order, and each variable as `NAME="value"`, nothing shortened.
+
+A host reads the integration only from the verified manifest, never from what an installation says
+about it, and applies it only while the installation holds `command_integration.launch`. For an
+integrated launch the worker exports the declared variables after `KR_REGISTRATION`; the answer for
+an invocation that bypasses the integration names no backend and no variable. Where the flags
+register the forwarder's hook, an object whose `command` is `kr-hook` and whose `args` are the
+package's own name and `hook`, the launch admits that hook running this installation's own
+`kr-hook` and nothing else. A package that installs a native bridge does not register the forwarder
+in its flags, and flags that start the forwarder any other way are refused.
+
 ## Capabilities
 
 A package asks for capabilities from a closed vocabulary:
@@ -124,6 +171,7 @@ A package asks for capabilities from a closed vocabulary:
 | `network.outbound` | no | yes |
 | `approval.respond` | no | yes |
 | `native_bridge.install` | no | yes |
+| `command_integration.launch` | no | yes |
 
 Enrolling a repository sets a ceiling before anything is fetched. The default ceiling is the first
 three rows: metadata matching, declarative presentation and broker semantic events the actor is
@@ -132,11 +180,12 @@ becoming thousands of permission prompts. Everything else needs an explicit pack
 grant.
 
 The last column is a floor rather than the whole rule. It marks the capabilities nobody gets under
-any repository ceiling: an executable bridge that runs under the application's own permissions,
-anything that writes, and the trust to interpret or answer native requests. Section 11 also requires
-an explicit grant for any increase over what was previously granted, which compares two capability
-sets rather than asking about one capability, so an upgrade that asks for more than the last one is
-a new decision even when every capability in it sits in an unmarked row.
+any repository ceiling: an executable bridge that runs under the application's own permissions, a
+command integration that changes how an application runs, anything that writes, and the trust to
+interpret or answer native requests. The owner confirms the first two on every release. Section 11
+also requires an explicit grant for any increase over what was previously granted, which compares
+two capability sets rather than asking about one capability, so an upgrade that asks for more than
+the last one is a new decision even when every capability in it sits in an unmarked row.
 
 Capability evidence is a separate thing with a confusingly similar name. A capability request is
 what a package asks for. A capability evidence record is what a host currently knows about whether
@@ -538,6 +587,8 @@ report the same code for the same defect.
 | `duplicate_element_id` | Two nodes or two controls share an identifier |
 | `control_parameters_widen` | A control's parameters do not narrow its action's |
 | `qualification_invalid` | A qualification result claims something the catalogue cannot know |
+| `integration_without_capability` | A command integration without `command_integration.launch` |
+| `integration_invalid` | A command integration names another command, adds a flag it may not or sets a variable the contract does not permit |
 
 `kr-plugin-sandbox` walks the package through a handle on its directory rather than by path. Every
 file and subdirectory is opened from the handle of the directory that holds it, so a link, an

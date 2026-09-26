@@ -149,8 +149,13 @@ Claude Code that execs another program in its own process loses its bridges from
 
 The Claude Code package asks for no file access, so its launch is granted no directory to read.
 
-No package can turn a command integration on yet, and the worker does not yet receive the installed
-connectors it launches from, so today a `claude` typed at a prompt runs as typed.
+A package turns the integration on by declaring it in its manifest, as
+[the plugin reference](../../plugins/README.md#command-integration) describes; for Claude Code that
+is `claude` and the two flags above. The worker takes them only from the verified package, and only
+while the installation holds `command_integration.launch`, which the owner confirms for each
+release. The two flags are added together or not at all, so a `claude` typed with one of them runs
+as typed. Sessions are created with no command integration enabled, and the worker holds no
+installed connector to launch from, so a `claude` typed at a prompt runs as typed.
 
 ## A Claude Code the integration did not launch
 
