@@ -16,6 +16,7 @@
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::time::{Duration, Instant};
 
 /// The stand-in for `cargo`: every build and every suite succeeds at once and prints what the
 /// script looks for. When `KR_PERF_PLANT` names a file, the first measurement also starts a process
@@ -41,10 +42,40 @@ esac
 /// A process this test planted, ended when the test ends however it ends.
 struct Planted(u32);
 
+impl Planted {
+    /// Ends the planted process by the identifier this test recorded, and says whether it has gone
+    /// within ten seconds.
+    fn end(&self) -> bool {
+        let _ = Command::new("/bin/kill").arg(self.0.to_string()).status();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if !running(self.0) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
 impl Drop for Planted {
     fn drop(&mut self) {
-        let _ = Command::new("/bin/kill").arg(self.0.to_string()).status();
+        let _ = self.end();
     }
+}
+
+/// Whether a process is running: in the process table and not waiting to be collected.
+fn running(pid: u32) -> bool {
+    Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .is_ok_and(|output| {
+            let state = String::from_utf8_lossy(&output.stdout);
+            let state = state.trim();
+            !state.is_empty() && !state.starts_with('Z')
+        })
 }
 
 fn repository() -> PathBuf {
@@ -92,7 +123,7 @@ fn a_process_that_outlives_the_script_is_reported() {
         .trim()
         .parse()
         .expect("its identifier");
-    let _planted = Planted(pid);
+    let planted = Planted(pid);
     let printed = String::from_utf8_lossy(&output.stdout);
     assert!(
         !output.status.success(),
@@ -104,6 +135,10 @@ fn a_process_that_outlives_the_script_is_reported() {
                 .lines()
                 .any(|line| line.trim_start().starts_with(&format!("{pid} "))),
         "the script names process {pid} as the one that outlived it:\n{printed}"
+    );
+    assert!(
+        planted.end(),
+        "the process this test planted, {pid}, has ended"
     );
 }
 
