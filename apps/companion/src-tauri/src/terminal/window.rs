@@ -145,9 +145,10 @@ struct Untold {
 ///
 /// Every report the view sends goes through here, one at a time. What goes next is one choice,
 /// asked after every event: the newest size if it is not the size last sent, else the next run of
-/// moves. Nothing goes while a report is in flight or while a new subscription is being asked for,
-/// whose first screen is what says where the window then is, and no move goes while the view holds
-/// no complete screen to measure it against.
+/// moves. Nothing goes while a report is in flight, while a new subscription is being asked for,
+/// whose first screen is what says where the window then is, or, once a screen has arrived, while
+/// the view holds no complete one; before the first, only a size goes, from where the attach put
+/// the window.
 #[derive(Debug)]
 pub struct WindowReports {
     /// Where the window is, from the newest complete screen naming at least `answered`, and at the
@@ -285,6 +286,11 @@ impl WindowReports {
             return None;
         }
         let record = self.record?;
+        // Before the first screen the window is where the attach put it. After it, a reset can move
+        // the window, so nothing goes while the view holds no complete screen.
+        if screen.is_none() && self.installed.is_some() {
+            return None;
+        }
         let (sending, carries) = if self.size == self.size_sent {
             let screen = screen?;
             loop {

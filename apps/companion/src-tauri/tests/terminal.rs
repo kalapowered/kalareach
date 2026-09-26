@@ -1445,13 +1445,80 @@ async fn a_screen_before_its_answer_is_drawn_with_the_answer() {
     let (call, asked) = report(&mut link).await;
     assert_eq!(asked.column.get(), 3);
     link.answer(&call, &viewport_answer(2)).await;
-    frame(&mut link, &at.at(0, 3).revision(2)).await;
+    // The host changed the window again after this report, so the screen names a later revision.
+    frame(&mut link, &at.at(0, 3).revision(3)).await;
     let again = page_view.newest(3, |state| settled(state, 2)).await;
     assert_eq!(
         place(&again),
         (3, 0, 0),
         "drawn as it came, its answer already heard"
     );
+}
+
+/// A refusal releases a screen that waited for its answer: nothing moved, so the move is settled
+/// with it, and the screen is the host's own change. A view that ends while a screen waits
+/// publishes its end.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refusal_or_the_end_releases_a_waiting_screen() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page_view = Page::new(worker.paths());
+    let at = wide_session();
+    let (view, mut link) = panned(&page_view, &mut worker, 3, &at).await;
+    page_view.pan(&view, 1, 2, 0);
+    let (call, _) = report(&mut link).await;
+    frame(&mut link, &at.at(1, 0).revision(1)).await;
+    tokio::time::sleep(QUIET).await;
+    assert_eq!(
+        page_view.states(3).last().expect("a state")["state"],
+        "waiting"
+    );
+    link.refuse(&call, "that window is not one this session shows")
+        .await;
+    let released = page_view.newest(3, |state| settled(state, 1)).await;
+    assert_eq!(released["state"], "showing");
+    assert_eq!(place(&released), (0, 1, 0), "the host's own change");
+
+    page_view.pan(&view, 2, 2, 0);
+    let _ = report(&mut link).await;
+    frame(&mut link, &at.at(1, 2).revision(2)).await;
+    tokio::time::sleep(QUIET).await;
+    link.push(
+        kr_protocol::session::SESSION_CLOSED_EVENT,
+        &json!({"session_id": worker.session_id.to_string()}),
+    )
+    .await;
+    let ended = page_view.newest(3, |state| state["state"] == "ended").await;
+    assert_eq!(ended["reason"], "This session has closed.");
+}
+
+/// A size the page measures between the host's reset and the last page of the screen that
+/// follows it waits for that screen, and goes with where it puts the window: a canonical resize
+/// can move the window's column.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_size_measured_during_a_reset_goes_from_the_screen_that_follows() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page_view = Page::new(worker.paths());
+    let at = wide_session().at(0, 8);
+    let (view, mut link) = panned(&page_view, &mut worker, 3, &at).await;
+    link.push(
+        PROJECTION_RESET_EVENT,
+        &reset(2, 60, ProjectionResetReason::BufferSwitch, 0),
+    )
+    .await;
+    page_view
+        .newest(3, |state| state["state"] == "waiting")
+        .await;
+    page_view.resize(&view, 9, 2);
+    assert!(
+        link.quiet_for(QUIET).await,
+        "nothing goes until the screen is whole"
+    );
+    let mut narrower = Frame::live((15, 6), (10, 2), 30).at(0, 5);
+    narrower.generation = 2;
+    frame(&mut link, &narrower).await;
+    let (_, asked) = report(&mut link).await;
+    assert_eq!(asked.dimensions, Dimensions::new(9, 2));
+    assert_eq!(asked.column.get(), 5, "where the new screen put the window");
 }
 
 /// A screen that was waiting for its answer and was then discarded, by the host's reset or by the
