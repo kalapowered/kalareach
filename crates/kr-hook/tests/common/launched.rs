@@ -237,10 +237,74 @@ impl Launch {
 }
 
 impl Drop for Launch {
+    /// Ends the application and every process it started that is still its own: the channel
+    /// server it runs, or a hook it is running.
+    ///
+    /// The application is stopped first, so it can start nothing more and collect nothing it
+    /// started, and while it is stopped each identifier it started still names the process it
+    /// started: even one that has exited stays its uncollected child. Those are ended by their
+    /// identifiers, and then the application. A process the application started and collected
+    /// before it was stopped has already gone.
     fn drop(&mut self) {
+        if matches!(self.application.try_wait(), Ok(None)) {
+            let application = self.application.id().to_string();
+            if signal("-STOP", &application) && stopped(&application) {
+                for child in children(&application) {
+                    let _ = signal("-KILL", &child);
+                }
+            }
+        }
         let _ = self.application.kill();
         let _ = self.application.wait();
     }
+}
+
+/// Sends `signal` to the process `pid` names, and says whether it was sent.
+fn signal(signal: &str, pid: &str) -> bool {
+    std::process::Command::new("kill")
+        .args([signal, pid])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// Waits, within the liveness bound, until the process `pid` names is stopped, and says whether it
+/// is. A process that has exited meanwhile is not, and whatever it had started is no longer its
+/// own to find.
+fn stopped(pid: &str) -> bool {
+    let deadline = std::time::Instant::now() + LIVENESS;
+    while std::time::Instant::now() < deadline {
+        let Ok(state) = std::process::Command::new("ps")
+            .args(["-o", "state=", "-p", pid])
+            .output()
+        else {
+            return false;
+        };
+        match String::from_utf8_lossy(&state.stdout)
+            .trim_start()
+            .chars()
+            .next()
+        {
+            Some('T') => return true,
+            None | Some('Z') => return false,
+            Some(_) => std::thread::sleep(Duration::from_millis(5)),
+        }
+    }
+    false
+}
+
+/// The identifiers of the processes whose parent is the process `pid` names.
+fn children(pid: &str) -> Vec<String> {
+    std::process::Command::new("pgrep")
+        .args(["-P", pid])
+        .output()
+        .map(|listed| {
+            String::from_utf8_lossy(&listed.stdout)
+                .split_whitespace()
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// What one hook the application ran produced, once it has ended.
