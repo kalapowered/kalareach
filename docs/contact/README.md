@@ -235,20 +235,19 @@ Three properties make an installation safe to undo:
   first write, so a refusal leaves the agent's tree exactly as it found it.
 * **Other settings survive.** A TOML configuration is edited in place with a format-preserving
   editor, so ordering and comments are untouched. A JSON configuration is read with the place of
-  every member: the server entry is spliced in, the removal takes it out again with the server
-  container the installation made, and every other byte stays as it was. A JSON document that names
-  a member twice in one object is refused before anything is written, because which of the two a
-  reader keeps is the reader's choice. On macOS and Linux the replacement keeps the permission bits
-  of the document it replaces, because an agent's configuration can hold a credential. What it
-  cannot keep, it will not take: a document protected by an access-control list beyond those bits,
-  or whose owner or group is not the one the replacement would get, is refused, by both installation
-  and removal, before anything is written, with the advice to add or remove the server with the
-  agent's own command.
-  Reapplying such a list needs calls this host does not make, and somebody who restricted a file
-  meant it. The same refusal covers a document whose directory hands out access to whatever is
-  created in it, because the replacement is a new file in that directory and would be given what the
-  document it replaces does not have. Where a platform will not answer the question at all, the
-  answer is not read as "no list": the document is refused.
+  every member: the server entry is spliced in, the removal takes it out again, and every byte that
+  was already there stays as it was. A JSON document that names a member twice in one object is
+  refused before anything is written, because which of the two a reader keeps is the reader's
+  choice. On macOS and Linux the replacement keeps the permission bits of the document it replaces,
+  because an agent's configuration can hold a credential. What it cannot keep, it will not take: a
+  document protected by an access-control list beyond those bits, or whose owner or group is not the
+  one the replacement would get, is refused, by both installation and removal, before anything is
+  written, with the advice to add or remove the server with the agent's own command. Reapplying such
+  a list needs calls this host does not make, and somebody who restricted a file meant it. The same
+  refusal covers a document whose directory hands out access to whatever is created in it, because
+  the replacement is a new file in that directory and would be given what the document it replaces
+  does not have. Where a platform will not answer the question at all, the answer is not read as "no
+  list": the document is refused.
 
 A directory the installation created is removed only when it is empty, and a directory that was
 already there is never claimed. A project's `.mcp.json` is read by more than one agent, so the entry
@@ -256,8 +255,9 @@ in one is written identically whichever installation wrote it and is removed onl
 recorded installation still names it. Removal does not undo every object an installation brought
 into being: a JSON document this host created goes with the entry when nothing else was ever put in
 it, but a TOML one stays, because a format-preserving editor keeps comments and spacing this host
-cannot read as its own, and a shared document outlives the record of whoever created it when that
-installation is removed first. What is left behind is empty and inert, and a later installation
+cannot read as its own; a shared document outlives the record of whoever created it when that
+installation is removed first; and a server container an installation added to somebody's JSON
+document stays when the entry goes. What is left behind is empty and inert, and a later installation
 writes into it rather than around it.
 
 Installing and removing are mutations, and they carry section 9's receipt contract: the same action
