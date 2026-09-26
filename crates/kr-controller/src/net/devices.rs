@@ -1358,8 +1358,29 @@ impl PairedDirectory for DeviceDirectory {
     }
 }
 
+/// Reads one device row. A row this build cannot read is refused with its table and the device its
+/// key column names, read apart from the rest, so the row can be found and removed.
 fn read_record(row: &rusqlite::Row<'_>) -> Result<DeviceRecord> {
     let device_id: Vec<u8> = row.get(0).map_err(ControllerError::registry)?;
+    let named = uuid(&device_id)?;
+    decode_record(row, &device_id).map_err(|error| {
+        unreadable_row(format_args!("network_devices row of device {named}"), error)
+    })
+}
+
+/// Says which stored row could not be read, keeping what the reading said.
+pub(super) fn unreadable_row(
+    row: std::fmt::Arguments<'_>,
+    error: ControllerError,
+) -> ControllerError {
+    let detail = match error {
+        ControllerError::RegistryUnavailable { detail } => detail,
+        other => other.to_string(),
+    };
+    ControllerError::registry(format!("the {row} cannot be read: {detail}"))
+}
+
+fn decode_record(row: &rusqlite::Row<'_>, device_id: &[u8]) -> Result<DeviceRecord> {
     let endpoint_id: Vec<u8> = row.get(1).map_err(ControllerError::registry)?;
     let device_key_revision: i64 = row.get(2).map_err(ControllerError::registry)?;
     let authorisation: Vec<u8> = row.get(3).map_err(ControllerError::registry)?;
@@ -1373,7 +1394,7 @@ fn read_record(row: &rusqlite::Row<'_>) -> Result<DeviceRecord> {
     let notification_preview: Option<Vec<u8>> = row.get(11).map_err(ControllerError::registry)?;
     let stored_envelope: Option<Vec<u8>> = row.get(12).map_err(ControllerError::registry)?;
     Ok(DeviceRecord {
-        device_id: DeviceId::new(uuid(&device_id)?),
+        device_id: DeviceId::new(uuid(device_id)?),
         endpoint_id: EndpointKey::from_bytes(key(&endpoint_id)?),
         device_key_revision: DeviceKeyRevision::new(
             u64::try_from(device_key_revision).unwrap_or_default(),

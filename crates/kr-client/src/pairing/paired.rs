@@ -202,9 +202,15 @@ impl PairedHosts {
             return Ok(Vec::new());
         };
         let file: HostsFile = serde_json::from_slice(&bytes).map_err(|error| {
-            store_failed(crate::shown!(
-                "the paired hosts cannot be read: {}",
-                Shown::json(&error)
+            store_failed(unreadable_host(&bytes).map_or_else(
+                || crate::shown!("the paired hosts cannot be read: {}", Shown::json(&error)),
+                |host| {
+                    crate::shown!(
+                        "the paired host {} in hosts.json cannot be read: {}",
+                        host,
+                        Shown::json(&error)
+                    )
+                },
             ))
         })?;
         if file.version != FORMAT_VERSION {
@@ -304,12 +310,19 @@ impl PairedHosts {
         let Some(bytes) = self.read(ATTEMPT_FILE)? else {
             return Ok(None);
         };
-        let file: AttemptFile = serde_json::from_slice(&bytes).map_err(|error| {
-            store_failed(crate::shown!(
-                "the waiting attempt cannot be read: {}",
-                Shown::json(&error)
+        let file: AttemptFile =
+            serde_json::from_slice(&bytes).map_err(|error| {
+                store_failed(unreadable_attempt(&bytes).map_or_else(
+                || crate::shown!("the waiting attempt cannot be read: {}", Shown::json(&error)),
+                |invitation| {
+                    crate::shown!(
+                        "the waiting attempt for invitation {} in attempt.json cannot be read: {}",
+                        invitation,
+                        Shown::json(&error)
+                    )
+                },
             ))
-        })?;
+            })?;
         if file.version != FORMAT_VERSION {
             return Err(store_failed(crate::shown!(
                 "the waiting attempt is version {}, and this release reads {}",
@@ -383,6 +396,36 @@ impl PairedHosts {
 
 fn store_failed(detail: Shown) -> PairingFailure {
     PairingFailure::new(FailureKind::StoreFailed, detail)
+}
+
+/// Names the paired host a file this build cannot read fails on: the host's device identity, or
+/// where the host stands in the file when that identity cannot be read either. A record is named so
+/// it can be found and removed; nothing else of it is said.
+fn unreadable_host(bytes: &[u8]) -> Option<Shown> {
+    let file: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    file.get("hosts")?
+        .as_array()?
+        .iter()
+        .enumerate()
+        .find(|(_, host)| serde_json::from_value::<PairedHost>((*host).clone()).is_err())
+        .map(|(position, host)| {
+            host.get("host_device_id")
+                .and_then(|id| serde_json::from_value::<DeviceId>(id.clone()).ok())
+                .map_or_else(
+                    || crate::shown!("at position {}", position),
+                    |id| crate::shown!("{}", id),
+                )
+        })
+}
+
+/// Names the invitation a waiting attempt this build cannot read was made for, when that
+/// identity can be read.
+fn unreadable_attempt(bytes: &[u8]) -> Option<Shown> {
+    let file: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    let invitation = file.get("attempt")?.get("invitation_id")?;
+    serde_json::from_value::<InvitationId>(invitation.clone())
+        .ok()
+        .map(|invitation| crate::shown!("{}", invitation.get()))
 }
 
 #[cfg(test)]

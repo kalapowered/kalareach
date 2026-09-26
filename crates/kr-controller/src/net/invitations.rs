@@ -63,7 +63,7 @@ use kr_protocol::scalars::{Digest256, Nullable, TimestampMs, Uuid};
 use rusqlite::{Connection, OptionalExtension as _, params};
 use serde::{Deserialize, Serialize};
 
-use super::devices::{DeviceDirectory, DeviceRecord, insert_record};
+use super::devices::{DeviceDirectory, DeviceRecord, insert_record, unreadable_row};
 use super::lifetimes::GrantLifetimes;
 use crate::error::{ControllerError, Result};
 
@@ -953,7 +953,16 @@ impl InvitationStore for InvitationRows {
             .and_then(|bytes| {
                 bytes
                     .map(|bytes| {
-                        decode::<StoredCommitment>(&bytes).map(StoredCommitment::into_commitment)
+                        decode::<StoredCommitment>(&bytes)
+                            .map(StoredCommitment::into_commitment)
+                            .map_err(|error| {
+                                unreadable_row(
+                                    format_args!(
+                                        "pairing_commitments row of invitation {invitation_id}"
+                                    ),
+                                    error,
+                                )
+                            })
                     })
                     .transpose()
             })
@@ -1500,7 +1509,19 @@ fn decode_record(raw: &RawRow) -> Result<InvitationRecord> {
     })
 }
 
+/// Reads one invitation row. A row this build cannot read is refused with its table and the
+/// invitation its key column names, so the row can be found and removed.
 fn decode_row(raw: RawRow) -> Result<InvitationRow> {
+    let named = uuid(Some(raw.invitation_id.as_slice()))?;
+    decode_terms(raw).map_err(|error| {
+        unreadable_row(
+            format_args!("pairing_invitations row of invitation {named}"),
+            error,
+        )
+    })
+}
+
+fn decode_terms(raw: RawRow) -> Result<InvitationRow> {
     let record = decode_record(&raw)?;
     Ok(InvitationRow {
         record,
