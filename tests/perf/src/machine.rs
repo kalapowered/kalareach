@@ -465,6 +465,12 @@ mod platform {
             .args(["-n", "kern.clockrate"])
             .output()
             .map_err(|error| format!("read the clock rate: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "reading the clock rate ended with {}",
+                output.status
+            ));
+        }
         let text = String::from_utf8_lossy(&output.stdout);
         text.split(',')
             .find_map(|part| {
