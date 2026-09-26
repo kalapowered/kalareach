@@ -14,6 +14,7 @@
 
 use std::path::{Path, PathBuf};
 
+use kr_plugin_sdk::digest::PayloadDigest;
 use kr_plugin_sdk::example;
 use kr_plugin_sdk::integration::{MAX_FLAGS, PERMITTED_VARIABLES};
 use kr_plugin_sdk::package::{MANIFEST_FILE, PRESENTATION_FILE};
@@ -220,16 +221,10 @@ fn kr_req_12_22_qoder_cli_s_launch_flags_validate() {
 }
 
 /// A manifest written before the member existed declares no integration, and a manifest that
-/// declares none is written without the member, so every existing package reads, validates and
-/// hashes as it did.
+/// declares none is written without the member: every committed manifest, published packages and
+/// examples alike, reads and is written again byte for byte, so its hash is the one it has now.
 #[test]
 fn a_manifest_without_an_integration_reads_and_writes_as_before() {
-    let text = example::example_manifest_json();
-    let value: Value = serde_json::from_str(&text).expect("the example manifest");
-    assert!(value.get("command_integration").is_none(), "{text}");
-    let manifest: PluginManifest = serde_json::from_str(&text).expect("the example reads");
-    assert!(manifest.command_integration.is_none());
-
     let mut read = 0;
     for root in [
         repository_root().join("fixtures/plugins/valid"),
@@ -242,16 +237,39 @@ fn a_manifest_without_an_integration_reads_and_writes_as_before() {
             let manifest: PluginManifest = serde_json::from_slice(&bytes)
                 .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
             assert!(manifest.command_integration.is_none(), "{}", path.display());
-            let written = serde_json::to_value(&manifest).expect("the manifest serialises");
-            assert!(
-                written.get("command_integration").is_none(),
-                "{} is written without the member",
+            let mut written =
+                serde_json::to_string_pretty(&manifest).expect("the manifest serialises");
+            written.push('\n');
+            assert_eq!(
+                written.as_bytes(),
+                bytes.as_slice(),
+                "{} is written back byte for byte",
+                path.display()
+            );
+            assert_eq!(
+                PayloadDigest::of(written.as_bytes()),
+                PayloadDigest::of(&bytes),
+                "{}",
                 path.display()
             );
             read += 1;
         }
     }
     assert!(read >= 10, "only {read} committed manifests were read");
+    // The examples the generator writes are the committed bytes too.
+    for (committed, rendered) in [
+        (
+            "fixtures/plugins/valid/example-declarative/plugin.json",
+            example::example_manifest_json(),
+        ),
+        (
+            "fixtures/plugins/valid/example-connector/plugin.json",
+            example::example_connector_manifest_json(),
+        ),
+    ] {
+        let bytes = std::fs::read(repository_root().join(committed)).expect("the committed file");
+        assert_eq!(rendered.as_bytes(), bytes.as_slice(), "{committed}");
+    }
 }
 
 fn manifests_under(root: &Path) -> Vec<PathBuf> {
