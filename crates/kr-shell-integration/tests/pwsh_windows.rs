@@ -529,36 +529,47 @@ async fn the_module_lets_the_server_identify_it_and_never_act_as_it() {
 }
 
 /// The lists a pipe of this account may carry that the host's own client refuses, each with what the
-/// module's trace says about it.
-const REFUSED_LISTS: &[(&str, &str, &str)] = &[
+/// module's trace and the host's own client's refusal say about it.
+///
+/// Both clients read the list the same way, through `GetSecurityInfo` for a file object, and Windows
+/// will not hand back through a pipe's handle a list that is not protected: it answers that the
+/// parameter is incorrect. So both refuse that pipe as unreadable, for the same reason, and the
+/// refusal of an inherited list itself is proved on a descriptor in memory below.
+const REFUSED_LISTS: &[(&str, &str, &str, &str)] = &[
     (
         "widened",
         "D:P(A;;GA;;;OW)(A;;GA;;;WD)",
         "grants access to S-1-1-0",
+        "grants access to",
     ),
     (
         "unprotected",
         "D:(A;;GA;;;OW)",
-        "inherits its access-control list",
+        "could not be read",
+        "could not be read",
     ),
     (
         "missing",
         "D:PNO_ACCESS_CONTROL",
+        "carries no access-control list",
         "carries no access-control list",
     ),
     (
         "empty-mask",
         "D:P(A;;GA;;;OW)(A;;0x0;;;WD)",
         "grants access to S-1-1-0",
+        "grants access to",
     ),
     (
         "inherit-only",
         "D:P(A;;GA;;;OW)(A;IO;GA;;;WD)",
         "grants access to S-1-1-0",
+        "grants access to",
     ),
     (
         "callback",
         "D:P(A;;GA;;;OW)(XA;;GA;;;SY;(Member_of {SID(BA)}))",
+        "type-9 entry",
         "type-9 entry",
     ),
 ];
@@ -574,7 +585,7 @@ async fn the_module_refuses_before_its_hello_every_list_the_hosts_client_refuses
     let directory = tempfile::tempdir().expect("a temporary directory");
     // Every case runs and says what went wrong, so one run shows each list's outcome.
     let mut problems = Vec::new();
-    for (case, list, said) in REFUSED_LISTS {
+    for (case, list, said, host_said) in REFUSED_LISTS {
         let case_directory = directory.path().join(case);
         std::fs::create_dir(&case_directory).expect("a directory for the case");
         let name = pipe_name();
@@ -595,11 +606,11 @@ async fn the_module_refuses_before_its_hello_every_list_the_hosts_client_refuses
             received
         });
 
-        let host = Connection::connect(&endpoint).await;
-        if !matches!(host, Err(kr_ipc::IpcError::PeerAccountRejected { .. })) {
-            problems.push(format!(
-                "{case}: the host's own client took {list}: {host:?}"
-            ));
+        match Connection::connect(&endpoint).await {
+            Err(kr_ipc::IpcError::PeerAccountRejected { detail }) if detail.contains(host_said) => {}
+            other => problems.push(format!(
+                "{case}: the host's own client was to refuse {list}, saying '{host_said}': {other:?}"
+            )),
         }
         let mut client = start_client_at(&name, &case_directory, "hello", &[]);
         let ended = ends(&mut client, || report(&case_directory, "hello")).await;
