@@ -459,6 +459,27 @@ fn cfg_compiles_without_test(tokens: &[Located], open: usize) -> Option<bool> {
     Some(without_test(tokens, &mut at) != Truth::False)
 }
 
+/// Whether the attribute whose `[` is at `open` is a `cfg` this reading cannot decide without
+/// `test`: the item it is on is compiled under some conditions and not under others.
+fn cfg_is_conditional(tokens: &[Located], open: usize) -> bool {
+    if ident(tokens.get(open + 1)) != Some("cfg") || !punct(tokens.get(open + 2), '(') {
+        return false;
+    }
+    let mut at = open + 3;
+    without_test(tokens, &mut at) == Truth::Unknown
+}
+
+/// Whether the item whose keyword is at `at` has a `cfg` this reading cannot decide among the
+/// attributes in front of it.
+fn item_conditional(tokens: &[Located], at: usize) -> bool {
+    let mut start = at;
+    while start > 0 && matches!(ident(tokens.get(start - 1)), Some("unsafe" | "auto")) {
+        start -= 1;
+    }
+    (before_item(tokens, start)..start)
+        .any(|index| punct(tokens.get(index), '#') && cfg_is_conditional(tokens, index + 1))
+}
+
 /// Returns the index just past the attribute that opens at `start` (`#` or `#!`).
 fn attribute_end(tokens: &[Located], start: usize) -> Option<usize> {
     let mut index = start + 1;
@@ -635,6 +656,8 @@ struct Import {
     global: bool,
     /// Where the imported name may be seen from.
     visibility: Visibility,
+    /// Whether a `cfg` this reading cannot decide can leave the import out.
+    conditional: bool,
 }
 
 /// One module a file imports everything from.
@@ -648,6 +671,8 @@ struct Glob {
     global: bool,
     /// Where the names it imports may be seen from, at most.
     visibility: Visibility,
+    /// Whether a `cfg` this reading cannot decide can leave the import out.
+    conditional: bool,
 }
 
 /// One source file, as the rule reads it.
@@ -674,6 +699,12 @@ struct Source {
     definitions: BTreeSet<(usize, String)>,
     /// Where each type, trait, alias and module a scope declares may be seen from.
     visibilities: BTreeMap<(usize, String), Visibility>,
+    /// The types, traits, aliases and modules a scope declares at least once with no `cfg` this
+    /// reading cannot decide: the others can be left out.
+    always: BTreeSet<(usize, String)>,
+    /// Whether a `cfg` at the top of the file that this reading cannot decide can leave the whole
+    /// module out.
+    conditional: bool,
     /// What this reading cannot follow in it.
     problems: Vec<Finding>,
 }
@@ -995,6 +1026,8 @@ fn read_source(
         globs: Vec::new(),
         definitions: BTreeSet::new(),
         visibilities: BTreeMap::new(),
+        always: BTreeSet::new(),
+        conditional: false,
         problems: Vec::new(),
     };
     let mut file_test = test;
@@ -1040,6 +1073,7 @@ fn read_source(
                 }
                 if depth == 0 {
                     file_test |= compiles == Some(false);
+                    source.conditional |= cfg_is_conditional(&all, open);
                 }
                 if !file_test {
                     source.tokens.extend_from_slice(&all[index..end]);
@@ -1125,11 +1159,17 @@ fn read_source(
                 if let Some(defined) = ident(tokens.get(at + 1)) {
                     source.definitions.insert((scope, defined.to_owned()));
                     source.declare_visibility(scope, defined, visibility_before(&tokens, at));
+                    if !item_conditional(&tokens, at) {
+                        source.always.insert((scope, defined.to_owned()));
+                    }
                 }
             }
             Some("mod") if punct(tokens.get(at + 2), ';') || punct(tokens.get(at + 2), '{') => {
                 if let Some(declared) = ident(tokens.get(at + 1)) {
                     source.declare_visibility(scope, declared, visibility_before(&tokens, at));
+                    if !item_conditional(&tokens, at) {
+                        source.always.insert((scope, declared.to_owned()));
+                    }
                 }
             }
             Some("use") => {
@@ -1138,6 +1178,7 @@ fn read_source(
                     .unwrap_or(tokens.len());
                 let global = punct(tokens.get(at + 1), ':') && punct(tokens.get(at + 2), ':');
                 let visibility = visibility_before(&tokens, at);
+                let conditional = item_conditional(&tokens, at);
                 let mut in_scope = Vec::new();
                 use_tree(
                     &tokens[at + 1..end],
@@ -1146,23 +1187,22 @@ fn read_source(
                     &mut source,
                     &mut in_scope,
                 );
-                found.extend(
-                    in_scope
-                        .into_iter()
-                        .map(|(segments, renamed)| (scope, segments, renamed, global, visibility)),
-                );
+                found.extend(in_scope.into_iter().map(|(segments, renamed)| {
+                    (scope, segments, renamed, global, visibility, conditional)
+                }));
             }
             _ => {}
         }
     }
     source.tokens = tokens;
-    for (scope, segments, renamed, global, visibility) in found {
+    for (scope, segments, renamed, global, visibility, conditional) in found {
         if renamed.as_deref() == Some("*") {
             source.globs.push(Glob {
                 scope,
                 written: segments,
                 global,
                 visibility,
+                conditional,
             });
             continue;
         }
@@ -1196,6 +1236,7 @@ fn read_source(
                 written: without_self(segments),
                 global,
                 visibility,
+                conditional,
             });
         }
     }
@@ -1902,6 +1943,9 @@ struct Field {
     source: bool,
     /// Its type's tokens.
     type_tokens: Vec<Located>,
+    /// Whether a `cfg` this reading cannot decide can leave the field out, which moves the
+    /// positions of a tuple's fields after it.
+    conditional: bool,
 }
 
 /// The fields in the group that opens at `open`.
@@ -1914,9 +1958,11 @@ fn fields(tokens: &[Located], open: usize) -> Vec<Field> {
         .map(|(position, part)| {
             let mut index = 0;
             let mut source = false;
+            let mut conditional = false;
             while index < part.len() {
                 if punct(part.get(index), '#') {
                     source |= matches!(ident(part.get(index + 2)), Some("source" | "from"));
+                    conditional |= cfg_is_conditional(&part, index + 1);
                     index = attribute_end(&part, index).unwrap_or(part.len());
                     continue;
                 }
@@ -1941,6 +1987,7 @@ fn fields(tokens: &[Located], open: usize) -> Vec<Field> {
                 line,
                 source,
                 type_tokens: part[index.min(part.len())..].to_vec(),
+                conditional,
             }
         })
         .collect()
