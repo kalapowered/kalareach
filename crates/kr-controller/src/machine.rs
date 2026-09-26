@@ -1975,6 +1975,65 @@ mod tests {
             .expect("the directory is held")
     }
 
+    /// Holds `file` open with a handle that shares reading and writing but not deletion, as a
+    /// program that reads each file as it is written does for a moment, until it is dropped.
+    #[cfg(windows)]
+    fn hold_without_shared_deletion(file: &Path) -> std::fs::File {
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        /// Reading is shared with other handles.
+        const FILE_SHARE_READ: u32 = 0x0001;
+        /// Writing is shared; deleting is not.
+        const FILE_SHARE_WRITE: u32 = 0x0002;
+
+        std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(file)
+            .expect("the record is held")
+    }
+
+    /// KR-REQ-03.07: while another program holds the record open without sharing its deletion,
+    /// Windows refuses to rename a new record over it. The step fails safe: it reports the
+    /// refusal, the record's name keeps the record the step read, and no temporary file is left.
+    #[cfg(windows)]
+    #[test]
+    fn a_record_held_without_shared_deletion_is_not_replaced_and_the_step_says_so() {
+        let environment = Environment::create();
+        let store = environment.open();
+        let before = store.group().expect("reads the group");
+        let kept = std::fs::read(environment.record()).expect("reads the record");
+
+        let holding = hold_without_shared_deletion(&environment.record());
+        let refused = store
+            .join(
+                &environment.lock,
+                some_group(),
+                before.expected(),
+                &approval(),
+                2_000,
+            )
+            .expect_err("the record's replacement is refused while it is held");
+        drop(holding);
+
+        assert_eq!(refused.code(), ErrorCode::StorageUnavailable, "{refused}");
+        assert!(
+            refused.to_string().contains("(os error 5)"),
+            "refused as access denied: {refused}"
+        );
+        assert_eq!(
+            std::fs::read(environment.record()).expect("reads the record"),
+            kept,
+            "the record the step read is kept"
+        );
+        assert_eq!(
+            leftovers(environment.paths().state_dir()),
+            Vec::<String>::new(),
+            "no temporary file is left"
+        );
+        assert_eq!(environment.reopened(), before);
+    }
+
     /// Runs `publication` held at the point its record's name changed, while `directory` is held
     /// without shared writing, and returns its answer once it has been let go on.
     #[cfg(windows)]
