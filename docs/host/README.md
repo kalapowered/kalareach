@@ -582,8 +582,8 @@ the machine leaves both as they were, so every read in one boot gives the same v
 normally gives the pair another value, and the pair repeats exactly when both records repeat. The
 new kernel records its System process's creation as the clock it starts from plus the time it took
 to start, to the hundred nanoseconds. Unless the clock went back between two starts, the later one
-records a later time. The time repeats only if the later start's clock read earlier by exactly as
-much as that start took longer, as it can when a dead battery resets the real-time clock to one
+records a later time. The time repeats whenever that sum comes out the same at two starts, whichever
+of them read the earlier clock, as it can when a dead battery resets the real-time clock to one
 instant and two starts take the same time. The counter usually advances at a restart, but nothing
 guarantees that it does. A repeat would take the new boot for the old one and measure the old
 boot's continuous deadlines on the new boot's clock.

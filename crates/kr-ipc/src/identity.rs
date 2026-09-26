@@ -1423,7 +1423,9 @@ mod windows_boot {
     pub(super) const ENTRY_PROCESS: usize = 80;
     /// The bytes of an entry read here, through the identifier. No entry is shorter.
     pub(super) const ENTRY_READ: usize = 88;
-    /// The boundary every entry begins on, that of the entry's eight-byte fields.
+    /// The boundary every entry begins on, that of the entry's eight-byte fields. The assertion
+    /// below holds it to the SDK's declaration of an entry; that the kernel begins every entry
+    /// there is what the native tests show, by reading a real list with this rule.
     pub(super) const ENTRY_ALIGNMENT: usize = 8;
 
     // The offsets above are the SDK's own on the target this is built for.
@@ -1646,12 +1648,12 @@ mod windows_boot {
     /// A restart normally gives another value; the pair repeats exactly when both of its records
     /// repeat. The new kernel records its System process's creation as the clock it starts from
     /// plus the time it took to start, to the hundred nanoseconds. Unless the clock went back
-    /// between the two starts, that time is later than the earlier boot's. It repeats only if the
-    /// later start's clock read earlier by exactly as much as that start took longer, as it can
-    /// when a dead battery resets the real-time clock to one instant and two starts take one time.
-    /// The counter usually advances at a restart, but nothing guarantees that it does. A repeat
-    /// would take the new boot for the old one, and apply the old boot's continuous deadlines to
-    /// the new boot's clock.
+    /// between the two starts, that sum is later than the earlier boot's. It repeats whenever the
+    /// two sums are equal, whichever start read the earlier clock: as they can be when a dead
+    /// battery resets the real-time clock to one instant and two starts take one time. The counter
+    /// usually advances at a restart, but nothing guarantees that it does. A repeat would take the
+    /// new boot for the old one, and apply the old boot's continuous deadlines to the new boot's
+    /// clock.
     pub(super) fn value(boot_count: u32, system_created: u64) -> [u8; 12] {
         let mut value = [0_u8; 12];
         value[..4].copy_from_slice(&boot_count.to_be_bytes());
