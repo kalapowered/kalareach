@@ -900,6 +900,69 @@ test.describe("moving a raw view's window", () => {
     })
   }
 
+  // The same on the desktop: whatever the page has selected, a drag in view mode moves the window
+  // and the browser starts no selection and no native drag of its own.
+  test("the desktop's view-mode drag moves the window whatever is selected, and starts no selection or native drag", async ({
+    page
+  }) => {
+    await openSession(page)
+    await page.getByRole('tab', { name: 'Terminal' }).click()
+    const surface = page.getByTestId('terminal-surface')
+    await expect(surface).toContainText('$ cargo test -p kr-client')
+    await page.getByRole('tab', { name: 'View' }).click()
+    await page.evaluate(() => {
+      const started = { selections: 0, drags: 0 }
+      Object.assign(window, { started })
+      window.addEventListener('selectstart', () => {
+        started.selections += 1
+      })
+      window.addEventListener('dragstart', (event) => {
+        if (!event.defaultPrevented) started.drags += 1
+      })
+      const element = document.querySelector('[data-testid="terminal-grid"]')
+      if (element !== null) getSelection()?.selectAllChildren(element)
+    })
+    await drag(page, surface, 90)
+    await expect(page.getByTestId('terminal-position')).toContainText('Showing the history')
+    expect(await page.evaluate(() => (window as unknown as { started: unknown }).started)).toEqual({
+      selections: 0,
+      drags: 0
+    })
+  })
+
+  // A press in view mode is the view's alone. Whatever the page has selected, the phone's drag
+  // moves the window and the browser starts no selection and no native drag of its own.
+  test("the phone's view-mode drag moves the window whatever is selected, and starts no selection or native drag", async ({
+    page
+  }) => {
+    await page.setViewportSize({ width: 320, height: 1000 })
+    await page.goto(`/harness.html?surface=ios&session=${SESSION_MAIN}`)
+    await page.getByRole('tab', { name: 'Terminal' }).click()
+    const terminal = page.getByTestId('mobile-terminal')
+    await expect(page.getByTestId('mobile-terminal-line').first()).toContainText('$ cargo')
+    await page.getByRole('button', { name: 'Look around' }).click()
+    // The terminal's text selected, as a drag in control mode leaves it, and from here on every
+    // selection and every native drag the browser starts counted.
+    await page.evaluate(() => {
+      const started = { selections: 0, drags: 0 }
+      Object.assign(window, { started })
+      window.addEventListener('selectstart', () => {
+        started.selections += 1
+      })
+      window.addEventListener('dragstart', (event) => {
+        if (!event.defaultPrevented) started.drags += 1
+      })
+      const element = document.querySelector('[data-testid="mobile-terminal"]')
+      if (element !== null) getSelection()?.selectAllChildren(element)
+    })
+    await drag(page, terminal, 60)
+    await expect(page.getByTestId('terminal-position')).toContainText('Showing the history')
+    expect(await page.evaluate(() => (window as unknown as { started: unknown }).started)).toEqual({
+      selections: 0,
+      drags: 0
+    })
+  })
+
   for (const theme of ['light', 'dark'] as const) {
     test(`the desktop view moves across the session and into its history, ${theme}, at 320 px`, async ({
       page

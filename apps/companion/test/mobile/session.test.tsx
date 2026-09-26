@@ -430,9 +430,9 @@ describe("the phone's raw terminal view (KR-REQ-08.02, 13.18)", () => {
     }
   }
 
-  /** One finger's `type` at `x`, `y`. */
-  function fingerEvent(type: string, pointerId: number, x: number, y: number): PointerEvent {
-    return new PointerEvent(type, { bubbles: true, pointerId, pointerType: 'touch', clientX: x, clientY: y })
+  /** One finger's `type` at `x`, `y`, or a mouse's when told. */
+  function fingerEvent(type: string, pointerId: number, x: number, y: number, pointerType = 'touch'): PointerEvent {
+    return new PointerEvent(type, { bubbles: true, cancelable: true, pointerId, pointerType, clientX: x, clientY: y })
   }
 
   /** One finger's `type` on the phone's terminal at `x`, `y`. */
@@ -641,6 +641,34 @@ describe("the phone's raw terminal view (KR-REQ-08.02, 13.18)", () => {
     expect(screen.getByRole('button', { name: 'Move the window down' })).toBeDisabled()
     await person.click(up)
     expect(controls.terminalViews[0]?.moves).toEqual([{ number: 1, across: 0, down: -8 }])
+  })
+
+  it("takes a press in view mode from the browser, so it starts no selection or native drag, and leaves control mode's alone", async () => {
+    const { port } = fakeHost()
+    const person = await onTerminal(port)
+    await waitFor(() => {
+      expect(screen.getAllByTestId('mobile-terminal-line').length).toBeGreaterThan(0)
+    })
+    /** Whether the view kept the browser from its own way with `event`, sent over the terminal. */
+    const kept = (event: Event, target: Element = screen.getByTestId('mobile-terminal')): boolean => {
+      act(() => {
+        target.dispatchEvent(event)
+      })
+      return event.defaultPrevented
+    }
+    const dragOfText = () => new Event('dragstart', { bubbles: true, cancelable: true })
+    const line = () => screen.getAllByTestId('mobile-terminal-line')[0] ?? document.body
+    // Control mode: the press and a drag of selected text are the browser's, as before.
+    expect(kept(fingerEvent('pointerdown', 1, 100, 100, 'mouse'))).toBe(false)
+    kept(fingerEvent('pointerup', 1, 100, 100, 'mouse'))
+    expect(kept(dragOfText(), line())).toBe(false)
+    // View mode: a press of a finger or a mouse, and a drag of text selected before, are the view's.
+    await person.click(screen.getByRole('button', { name: 'Look around' }))
+    expect(kept(fingerEvent('pointerdown', 2, 100, 100, 'mouse'))).toBe(true)
+    kept(fingerEvent('pointerup', 2, 100, 100, 'mouse'))
+    expect(kept(fingerEvent('pointerdown', 3, 100, 100))).toBe(true)
+    kept(fingerEvent('pointerup', 3, 100, 100))
+    expect(kept(dragOfText(), line())).toBe(true)
   })
 
   it('gives a one-finger drag to the program in control mode and moves nothing', async () => {

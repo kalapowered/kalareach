@@ -13,6 +13,9 @@
  * follows the finger, and comes to rest on the screen the host draws for the window's new place.
  * Taking control brings a window in the history back to the live screen. A finger that is down
  * when the view changes under it, another opening, mode or life, counts for nothing until it lifts.
+ * In view mode a press is the view's alone: whatever the page has selected, the browser starts no
+ * selection and no native drag of its own, so a drag always moves the window. Control mode leaves
+ * the browser its own way with the text.
  */
 
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
@@ -828,10 +831,15 @@ function RawTerminal({
             ? {
                 background: `rgb(${palette.background.red}, ${palette.background.green}, ${palette.background.blue})`
               }
-            : {})
+            : {}),
+          // In view mode the text is not selectable, so a press or a long press starts no selection.
+          ...(mode === 'view' ? { userSelect: 'none', WebkitUserSelect: 'none' } : {})
         } as React.CSSProperties
       }
       onPointerDown={(event) => {
+        // In view mode the press is the view's: the browser neither starts a selection nor drags
+        // away text selected before, which would take the pointer from the drag.
+        if (mode === 'view') event.preventDefault()
         event.currentTarget.setPointerCapture(event.pointerId)
         pointers.current.set(event.pointerId, { x: event.clientX, y: event.clientY })
         rebase()
@@ -883,6 +891,9 @@ function RawTerminal({
       }}
       onPointerCancel={(event) => {
         forget(event.pointerId)
+      }}
+      onDragStart={(event) => {
+        if (mode === 'view') event.preventDefault()
       }}
       onLostPointerCapture={(event) => {
         forget(event.pointerId)
