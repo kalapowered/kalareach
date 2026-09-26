@@ -3254,6 +3254,49 @@ mod tests {
         staged.abandon();
     }
 
+    /// KR-REQ-11.06: on Windows a directory held open through the store cannot be renamed, since
+    /// the store opens its directories without sharing their deletion and a rename deletes the old
+    /// name. A staged package holds its own directory while it is staged, so nothing renames it
+    /// then, while a directory beside it that no staged package holds is renamed with every one of
+    /// the store's own directories held. The package's activation lets go of its handle and renames
+    /// the directory into place.
+    #[cfg(windows)]
+    #[test]
+    fn a_staged_package_holds_its_directory_until_its_activation_lets_it_go() {
+        /// Another handle on the directory does not share what the rename's open asks for.
+        const ERROR_SHARING_VIOLATION: i32 = 32;
+
+        let (_directory, store) = store();
+        let layout = store.layout().expect("the store's directories");
+        let digest = PayloadDigest::of(b"manifest");
+        let mut staged = store.stage_package(digest).expect("a staging directory");
+        staged
+            .write(&path("plugin.json"), b"manifest")
+            .expect("written");
+
+        let aside = layout.staging.path.join("aside");
+        let refused = std::fs::rename(staged.path(), &aside)
+            .expect_err("the staged package holds its directory");
+        assert_eq!(
+            refused.raw_os_error(),
+            Some(ERROR_SHARING_VIOLATION),
+            "{refused}"
+        );
+        let unheld = layout.staging.path.join("unheld");
+        std::fs::create_dir(&unheld).expect("a directory beside it");
+        std::fs::rename(&unheld, &aside)
+            .expect("a directory no handle holds is renamed while the store's own are held");
+        std::fs::remove_dir(&aside).expect("removable");
+
+        let activated = owned(|permit| staged.activate(permit))
+            .expect("the staged directory is let go of and renamed into place");
+        assert_eq!(activated, store.package_dir(digest));
+        assert_eq!(
+            std::fs::read(activated.join("plugin.json")).expect("readable"),
+            b"manifest"
+        );
+    }
+
     /// Runs a program and returns what it printed, failing the test when it fails.
     #[cfg(windows)]
     fn run_program(program: &str, arguments: &[&std::ffi::OsStr]) -> String {
