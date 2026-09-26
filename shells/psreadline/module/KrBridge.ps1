@@ -167,11 +167,12 @@ function ConvertFrom-KrUuidText {
 # for the owner (CREATOR OWNER and OWNER RIGHTS).
 $script:KR_TRUSTED_ACCOUNTS = @('S-1-5-18', 'S-1-5-32-544', 'S-1-3-0', 'S-1-3-4')
 
-# The type that holds the calls below, once a shell has defined it.
+# The type that holds the calls below, once this module has defined it.
 $script:KrSecurityCalls = $null
 
 # The platform calls that read a kernel object's security descriptor as the kernel stores it,
-# defined once per shell with System.Reflection.Emit, which runs no compiler at shell start.
+# defined once for as long as this module is loaded, with System.Reflection.Emit, which runs no
+# compiler at shell start.
 #
 # .NET's own reading of a pipe's descriptor, PipeSecurity, rebuilds it and leaves out entries it
 # judges to grant nothing, among them an allow entry with an empty mask or one that only passes to
