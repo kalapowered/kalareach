@@ -2874,4 +2874,132 @@ mod tests {
             after.token(scope).await.expect(scope);
         }
     }
+
+    /// A gateway in front of the account service, answering every request with one status and a
+    /// body of its own.
+    #[derive(Debug)]
+    struct Gateway {
+        status: u16,
+        body: &'static [u8],
+    }
+
+    impl Gateway {
+        fn answer(&self) -> ServiceFuture<'_, ServiceHttpAnswer> {
+            let answer = ServiceHttpAnswer {
+                status: self.status,
+                body: self.body.to_vec(),
+            };
+            Box::pin(async move { Ok(answer) })
+        }
+    }
+
+    impl AccountHttp for Gateway {
+        fn post_form<'a>(
+            &'a self,
+            _url: &'a str,
+            _body: &'a [u8],
+        ) -> ServiceFuture<'a, ServiceHttpAnswer> {
+            self.answer()
+        }
+
+        fn get<'a>(
+            &'a self,
+            _url: &'a str,
+            _headers: &'a [(&'a str, &'a str)],
+        ) -> ServiceFuture<'a, ServiceHttpAnswer> {
+            self.answer()
+        }
+    }
+
+    /// The account service behind a gateway that answers with `status` and `body`.
+    fn behind(status: u16, body: &'static [u8]) -> ManagedAccountService {
+        ManagedAccountService::new(
+            Arc::new(Gateway { status, body }) as Arc<dyn AccountHttp>,
+            Client::Desktop,
+        )
+    }
+
+    /// A code the browser handed back for a fresh request, ready to exchange.
+    fn granted() -> AuthorisationGrant {
+        let request =
+            AuthorisationRequest::new(Client::Desktop, Redirect::Loopback).expect("a request");
+        let state = request.state.clone();
+        let mut pending = PendingAuthorisation::new(request);
+        let mut answer = Url::parse(Redirect::Loopback.uri()).expect("the redirect");
+        answer
+            .query_pairs_mut()
+            .append_pair("code", "a-code")
+            .append_pair("state", &state)
+            .append_pair("iss", ISSUER);
+        let Answer::Granted(grant) = pending.answer(answer.as_str(), Carrier::Terminal) else {
+            panic!("the answer grants a code");
+        };
+        grant
+    }
+
+    /// KR-REQ-23.57: a gateway's 502 or 504 with no OAuth error of the service's can follow the
+    /// service spending the code or rotating the refresh token, so an exchange or a refresh it
+    /// answers has an unknown outcome, which nothing sends again. The controls: the service's own
+    /// error on a 502 keeps its reading, and a revocation, an identity read and a usage read, which
+    /// are safe to send again, stay transient on a 503 and on a gateway's 502 or 504 alike.
+    #[tokio::test]
+    async fn kr_req_23_57_a_gateway_that_lost_an_exchange_or_a_refresh_leaves_its_outcome_unknown()
+    {
+        let grant = granted();
+        let stored =
+            StoredGrant::new(issued("a-refresh"), Client::Desktop, "a-nonce", 0).expect("a grant");
+        let page: &'static [u8] = b"<html><body>Bad Gateway</body></html>";
+        for status in [502, 504] {
+            let service = behind(status, page);
+            let exchanged = service
+                .exchange(&grant)
+                .await
+                .expect_err("no exchange was read");
+            let refreshed = service
+                .refresh(&stored)
+                .await
+                .expect_err("no refresh was read");
+            for error in [exchanged, refreshed] {
+                assert_eq!(error.code(), ErrorCode::OutcomeUnknown, "{status}: {error}");
+                let decision = error.decision(crate::retry::RequestClass::IdempotentRead);
+                assert_eq!(
+                    decision.recovery,
+                    crate::retry::Recovery::QueryOutcome,
+                    "{status}"
+                );
+            }
+        }
+
+        // The service's own error on a 502 is read as the service's.
+        let service = behind(
+            502,
+            br#"{"error":"server_error","error_description":"Not now."}"#,
+        );
+        for error in [
+            service.exchange(&grant).await.expect_err("refused"),
+            service.refresh(&stored).await.expect_err("refused"),
+        ] {
+            assert_eq!(error.code(), ErrorCode::UpstreamUnavailable, "{error}");
+        }
+
+        // A call that is safe to send again stays transient, whoever gave up.
+        let access = AccountToken::new("an-access-token").expect("a token");
+        for status in [502, 503, 504] {
+            let service = behind(status, page);
+            for error in [
+                service
+                    .revoke(stored.refresh_token())
+                    .await
+                    .expect_err("not revoked"),
+                service.identity(&access).await.expect_err("not read"),
+                service.usage(&access).await.expect_err("not read"),
+            ] {
+                assert_eq!(
+                    error.code(),
+                    ErrorCode::UpstreamUnavailable,
+                    "{status}: {error}"
+                );
+            }
+        }
+    }
 }

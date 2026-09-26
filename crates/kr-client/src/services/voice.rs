@@ -1835,6 +1835,60 @@ mod tests {
         );
     }
 
+    /// KR-REQ-23.57: a gateway's 502 or 504 with no envelope of the service's can follow the
+    /// service starting the call, so the start is an unknown creation, never a refusal a person
+    /// could take for nothing having started. The controls: the service's own refusal on a 502 is
+    /// read as the service said, and the terms and a closure, which are safe to ask for again,
+    /// stay transient on a 503 and on a gateway's 502 or 504 alike.
+    #[test]
+    fn kr_req_23_57_a_gateway_that_lost_a_starts_answer_leaves_the_creation_unknown() {
+        for status in [502, 504] {
+            for body in [
+                &b"<html><body>Bad Gateway</body></html>"[..],
+                &b""[..],
+                &br#"{"message":"The upstream did not answer."}"#[..],
+            ] {
+                let start = read_start_answer(&ServiceHttpAnswer {
+                    status,
+                    body: body.to_vec(),
+                });
+                assert!(
+                    matches!(
+                        start,
+                        VoiceStart::CreationUnknown {
+                            attempt_id: None,
+                            ..
+                        }
+                    ),
+                    "{status}: {start:?}"
+                );
+                assert!(!start.may_ask_again());
+            }
+        }
+
+        // The service's own refusal on a 502 is read as the service's.
+        let start = read_start_answer(&ServiceHttpAnswer {
+            status: 502,
+            body: br#"{"ok":false,"error":{"code":"INTERNAL","reason":"provider_refused",
+                "message":"The provider refused the call."}}"#
+                .to_vec(),
+        });
+        let VoiceStart::Refused(refusal) = &start else {
+            panic!("the service's refusal: {start:?}");
+        };
+        assert_eq!(refusal.reason, VoiceRefusalReason::ProviderRefused);
+
+        // The terms and a closure are safe to ask for again, whoever gave up.
+        for status in [502, 503, 504] {
+            let error = data_of(&ServiceHttpAnswer {
+                status,
+                body: b"<html><body>Unavailable</body></html>".to_vec(),
+            })
+            .expect_err("no envelope");
+            assert_eq!(error.code(), ErrorCode::UpstreamUnavailable, "{status}");
+        }
+    }
+
     #[test]
     fn a_capacity_refusal_carries_the_paths_that_still_work() {
         let answer = ServiceHttpAnswer {
