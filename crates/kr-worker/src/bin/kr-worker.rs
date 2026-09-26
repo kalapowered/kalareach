@@ -465,10 +465,6 @@ async fn await_qualification(
     }
 }
 
-/// Resolves the qualified package a managed session launches.
-///
-/// A `native_compat` session resolves none: it runs the selected stock shell, which cannot claim
-/// the managed contract and does not pretend to.
 /// Reads the parts of the first snapshot of plugin admissions a specification announced, each of
 /// its frame and in its order.
 ///
@@ -501,6 +497,10 @@ async fn read_first_admissions(
     Ok(parts)
 }
 
+/// Resolves the qualified package a managed session launches.
+///
+/// A `native_compat` session resolves none: it runs the selected stock shell, which cannot claim
+/// the managed contract and does not pretend to.
 fn managed_package(specification: &WorkerLaunchSpec) -> Result<Option<ShellPackage>, PackageFault> {
     if specification.create.shell_mode != ShellMode::Managed {
         return Ok(None);
