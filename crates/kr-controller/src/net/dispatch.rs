@@ -3168,9 +3168,10 @@ impl RemoteConnection {
                     "this device's grant does not include the session's live screen",
                 ))
             }
-            // Everything else returns metadata or an effect rather than session content. The
-            // registry's filter is recorded here so a method added later is decided rather than
-            // admitted by omission.
+            // Everything else returns metadata or an effect rather than session content, or
+            // content the session's worker holds to the scope this connection sends with the read:
+            // an agent's snapshot and an approval's record. The registry's filter is recorded here
+            // so a method added later is decided rather than admitted by omission.
             _ => match entry.history_filter {
                 HistoryFilter::NotApplicable
                 | HistoryFilter::GrantLowerBound
