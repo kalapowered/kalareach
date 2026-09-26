@@ -7,6 +7,7 @@
 //! here is decided by that alone, and every other caller is narrowed:
 //!
 //! * it is drawn the screen that is showing, and never the buffer behind it;
+//! * it is not served the session's retained output;
 //! * it detaches the attachments its own connection made, and no other;
 //! * an authority revision takes its input lease away;
 //! * it cancels its own undispatched intents, and no other actor's.
@@ -20,6 +21,7 @@
 //! | Row | What proves it |
 //! | --- | --- |
 //! | KR-REQ-10.50 | `a_local_caller_under_a_grant_is_drawn_the_live_screen_alone`, `the_local_owner_is_drawn_the_whole_screen_and_a_device_the_live_screen` |
+//! | KR-REQ-10.49 | `a_local_caller_under_a_grant_is_refused_the_retained_history`, `the_local_owner_reads_the_retained_history_on_either_socket` |
 //! | KR-REQ-10.41 | `a_local_caller_under_a_grant_detaches_only_what_its_own_connection_made`, `the_local_owner_detaches_another_windows_attachment_and_a_device_does_not` |
 //! | KR-REQ-10.45 | `a_revision_takes_the_lease_from_a_local_caller_under_a_grant`, `a_revision_takes_a_devices_lease_and_leaves_the_local_owners` |
 //! | KR-REQ-23.46 | `a_local_caller_under_a_grant_cancels_its_own_intent_and_no_other`, `the_local_owner_cancels_another_actors_intent_and_a_device_does_not` |
@@ -52,7 +54,9 @@ use kr_protocol::input::InputAcquireParams;
 use kr_protocol::local::{ControllerConnectionRole, ForwardedRequest, LocalClientKind};
 use kr_protocol::method::{Method, MethodVersion};
 use kr_protocol::receipt::{ActionCancelParams, Receipt, ReceiptState, RejectionReason};
-use kr_protocol::recovery::{EventStream, EventsSubscribeParams, OutputEvent};
+use kr_protocol::recovery::{
+    EventStream, EventsSubscribeParams, HistoryPageParams, HistoryPageResult, OutputEvent,
+};
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{CanonicalSet, Digest256, Nullable, TimestampMs, U64, Uuid};
 use kr_protocol::session::{ClosureReason, Dimensions, DisplayNumber, ShellMode};
@@ -224,6 +228,50 @@ async fn drawn(client: &mut LocalClient, frame: ControlFrame, request_id: Reques
 /// What a terminal was sent, as text a failure message can show.
 fn printable(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).escape_debug().to_string()
+}
+
+/// One read, forwarded by the control daemon for the actor it vouches for.
+///
+/// A caller under a grant has authority that runs out, so its read carries a deadline; the owner's
+/// does not.
+fn forwarded_read(actor: &ActorEnvelope, request: Request) -> ControlFrame {
+    ControlFrame::ForwardedRead(Box::new(ForwardedRequest {
+        request,
+        authority_deadline_boot_ms: if actor.grant_id.is_present() {
+            Nullable::some(U64::new(kr_ipc::clock::boot_elapsed_ms() + 30_000))
+        } else {
+            Nullable::null()
+        },
+        actor: actor.clone(),
+        history: None,
+    }))
+}
+
+/// Writes one request and returns the worker's answer to it.
+async fn answer(
+    client: &mut LocalClient,
+    frame: ControlFrame,
+    request_id: RequestId,
+) -> Result<ParamsValue, ProtocolError> {
+    within("the worker's answer", async {
+        client
+            .writer()
+            .write_message(&frame)
+            .await
+            .expect("writes the request");
+        loop {
+            if let ControlFrame::Response(response) =
+                client.recv().await.expect("the worker answers")
+                && response.request_id == request_id
+            {
+                return match response.outcome {
+                    Outcome::Ok(value) => Ok(value),
+                    Outcome::Error(error) => Err(error),
+                };
+            }
+        }
+    })
+    .await
 }
 
 /// One worker service with a real session behind it, and the daemon identity to forward through.
@@ -421,16 +469,10 @@ impl Wired {
             .await;
         served_the_stream(&attached);
         let request_id = next_request();
-        let frame = ControlFrame::ForwardedRead(Box::new(ForwardedRequest {
-            request: self.subscription(request_id, attached.attachment.attachment_id),
-            authority_deadline_boot_ms: if actor.grant_id.is_present() {
-                Nullable::some(U64::new(kr_ipc::clock::boot_elapsed_ms() + 30_000))
-            } else {
-                Nullable::null()
-            },
-            actor: actor.clone(),
-            history: None,
-        }));
+        let frame = forwarded_read(
+            actor,
+            self.subscription(request_id, attached.attachment.attachment_id),
+        );
         drawn(daemon, frame, request_id).await
     }
 
@@ -445,6 +487,43 @@ impl Wired {
         let frame =
             ControlFrame::Request(self.subscription(request_id, attached.attachment.attachment_id));
         drawn(window, frame, request_id).await
+    }
+
+    /// A read of the session's retained output from its beginning.
+    fn page(&self, request_id: RequestId) -> Request {
+        Request {
+            request_id,
+            method: Method::HistoryPage.into(),
+            method_version: MethodVersion::V1,
+            params: ParamsValue::from_typed(&HistoryPageParams {
+                session_id: self.session_id,
+                from_cursor: U64::ZERO,
+                max_bytes: U64::new(64 * 1024),
+            })
+            .expect("encodes"),
+        }
+    }
+
+    /// Forwards a read of the session's retained output for `actor`.
+    async fn page_for(
+        &self,
+        daemon: &mut LocalClient,
+        actor: &ActorEnvelope,
+    ) -> Result<HistoryPageResult, ProtocolError> {
+        let request_id = next_request();
+        let frame = forwarded_read(actor, self.page(request_id));
+        answer(daemon, frame, request_id)
+            .await
+            .map(|page| page.to_typed().expect("a history page"))
+    }
+
+    /// Reads the session's retained output in one of the owner's windows.
+    async fn page_in(&self, window: &mut LocalClient) -> Result<HistoryPageResult, ProtocolError> {
+        let request_id = next_request();
+        let frame = ControlFrame::Request(self.page(request_id));
+        answer(window, frame, request_id)
+            .await
+            .map(|page| page.to_typed().expect("a history page"))
     }
 
     /// Forwards a request for the input lease for `actor`'s attachment.
@@ -740,6 +819,83 @@ async fn the_local_owner_is_drawn_the_whole_screen_and_a_device_the_live_screen(
     );
 
     drop((window, proxy, phone));
+    wired.close();
+}
+
+// ---------------------------------------------------------------------------------------------
+// KR-REQ-10.49: who is served the session's retained output
+// ---------------------------------------------------------------------------------------------
+
+/// KR-REQ-10.49: a caller the daemon heard on its local socket, acting under a grant, is refused the
+/// session's retained output, and so is a paired device.
+///
+/// A history page is a byte range and a grant's history scope is a moment in time, so nothing on
+/// this path can narrow one to the other, and a host that cannot narrow content to a grant refuses
+/// it rather than serving more than the grant allows. The daemon already refuses a paired device
+/// this read; the worker holds every caller but the local owner to the same rule, whichever socket
+/// it came in on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_local_caller_under_a_grant_is_refused_the_retained_history() {
+    let wired = wired(TWO_BUFFERS).await;
+    common::produced(&wired.runtime, b"kr-the-application-screen\r\n").await;
+
+    let mut proxy = wired.daemon(ControllerConnectionRole::Proxy).await;
+    let refused = wired
+        .page_for(&mut proxy, &local_under_a_grant(1))
+        .await
+        .expect_err("a caller under a grant is not served the retained output");
+    assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
+    assert!(
+        refused.message.contains("retained history"),
+        "the refusal says what it withheld: {refused:?}"
+    );
+
+    // A paired device the daemon forwarded anyway is refused here in the same words.
+    let mut phone = wired.daemon(ControllerConnectionRole::Proxy).await;
+    let refused = wired
+        .page_for(&mut phone, &device(1))
+        .await
+        .expect_err("a device is not served the retained output");
+    assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
+    assert!(refused.message.contains("retained history"), "{refused:?}");
+
+    drop((proxy, phone));
+    wired.close();
+}
+
+/// KR-REQ-10.49: the local owner reads the session's retained output on either socket, as it
+/// always did.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_local_owner_reads_the_retained_history_on_either_socket() {
+    let wired = wired(TWO_BUFFERS).await;
+    common::produced(&wired.runtime, b"kr-the-application-screen\r\n").await;
+
+    // In one of its own windows, it reads everything the application wrote, the line the buffer
+    // behind the application holds included.
+    let mut window = wired.window().await;
+    let page = wired
+        .page_in(&mut window)
+        .await
+        .expect("the owner reads the retained output");
+    assert!(
+        carries(page.bytes.as_slice(), BEHIND),
+        "{}",
+        printable(page.bytes.as_slice())
+    );
+
+    // And as the daemon forwards it.
+    let mut proxy = wired.daemon(ControllerConnectionRole::Proxy).await;
+    let page = wired
+        .page_for(&mut proxy, &the_owner_forwarded())
+        .await
+        .expect("the owner the daemon forwards reads the retained output");
+    assert!(
+        carries(page.bytes.as_slice(), BEHIND),
+        "{}",
+        printable(page.bytes.as_slice())
+    );
+
+    drop((window, proxy));
     wired.close();
 }
 
