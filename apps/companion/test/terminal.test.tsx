@@ -14,7 +14,7 @@ import userEvent from '@testing-library/user-event'
 
 import { App } from '../src/App'
 import { AppProvider, type Place } from '../src/app/state'
-import { fakeHost, terminalScreen } from '../src/host/fake'
+import { fakeHost, LOST_CONTROL, terminalScreen } from '../src/host/fake'
 import type { HostPort, TerminalScreen } from '../src/host/port'
 import { ATTACHING, SLOW_MS, WAITING } from '../src/terminal/modes'
 
@@ -91,7 +91,7 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
       controls.terminalViews[0]?.attach()
     })
     expect(presentation()).toBe(
-      "This view is shown a viewport because its client declared no terminal profile, so what the session's output would do on its terminal is not known."
+      'This view is shown a viewport because the terminal profile its client declared is not one this build has qualified.'
     )
     expect(position()).toBe(WAITING)
     expect(screen.queryByTestId('terminal-grid')).toBeNull()
@@ -364,7 +364,7 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
     await waitFor(() => {
       expect(controls.terminalViews).toHaveLength(2)
     })
-    expect(await screen.findByText(/declared no terminal profile/)).toBeInTheDocument()
+    expect(await screen.findByText(/the terminal profile its client declared/)).toBeInTheDocument()
     expect(screen.queryByTestId('terminal-ended')).toBeNull()
   })
 
@@ -476,14 +476,15 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
         state: 'showing',
         attachment: first.attachment,
         settled: 0,
-        screen: terminalScreen(SESSION_MAIN, { columns: 80, rows: 24 })
+        screen: terminalScreen(SESSION_MAIN, { columns: 80, rows: 24 }),
+        control: { number: 0, state: 'watching', ended: null }
       })
     })
     await settle()
     const lines = drawn()
     expect(lines[0]).toBe('$ pnpm -r build')
     expect(lines.join('')).not.toContain('cargo test')
-    expect(presentation()).toContain('declared no terminal profile')
+    expect(presentation()).toContain('the terminal profile its client declared')
     expect(screen.getByTestId('terminal-size').textContent).toBe('100×4')
   })
 
@@ -514,39 +515,225 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
     expect(drawn()[0]).toBe('a\u{fffd}[6n\u{fffd}]11;?\u{fffd}b')
   })
 
-  it('gives the wheel to the program in control mode, and moves the window with it in view mode', async () => {
+  it('opens watching, takes control only when the person asks, and gives it back when they look around', async () => {
     const person = userEvent.setup()
     const { port, controls } = fakeHost()
-    const forwarded = vi.spyOn(port, 'terminalInput')
+    controls.holdTerminalControl()
     open(port)
     await screen.findByTestId('palette-provenance')
+    // A view opens watching: opening takes the session's input from nobody.
+    expect(modeBadge()).toBe('View')
+    expect(sentence()).toBe('Scroll or drag to move around the session. The program gets nothing.')
+    expect(controls.terminalViews[0]?.inputs).toEqual([])
 
-    // Control mode: the same call the page has always made for the program's wheel, and no move.
-    const given = wheel({ deltaY: 48 })
-    expect(given.defaultPrevented).toBe(false)
-    expect(forwarded).toHaveBeenCalledWith({ session_id: SESSION_MAIN, wheel: { lines: 3 } })
-    expect(controls.terminalViews[0]?.moves).toEqual([])
-
-    await person.click(screen.getByRole('tab', { name: 'View' }))
-    forwarded.mockClear()
-    // Three rows of wheel up take the window three rows into the history.
-    const taken = wheel({ deltaY: -48 })
-    expect(taken.defaultPrevented).toBe(true)
-    expect(forwarded).not.toHaveBeenCalled()
-    expect(controls.terminalViews[0]?.moves).toEqual([{ number: 1, across: 0, down: -3 }])
-    await waitFor(() => {
-      expect(position()).toBe('Showing the history, 3 rows above the live screen.')
+    // Taking control is the person's own press, labelled as that, and says so at once.
+    const take = screen.getByRole('button', { name: 'Take control' })
+    await person.click(take)
+    expect(controls.terminalViews[0]?.inputs).toEqual([{ kind: 'take', number: 1 }])
+    expect(controls.terminalViews[0]?.moves).toEqual([{ number: 1, live: true }])
+    expect(modeBadge()).toBe('Taking control…')
+    expect(sentence()).toBe('Asking the session for control…')
+    // The same button, which keeps the focus, now looks around.
+    expect(take).toHaveAccessibleName('Look around')
+    expect(take).toHaveFocus()
+    act(() => {
+      controls.terminalViews[0]?.grantControl()
     })
-    expect(drawn()[0]).toBe('$ echo earlier 10')
-    expect(controls.terminalViews[0]?.grids).toHaveLength(1)
+    await waitFor(() => {
+      expect(modeBadge()).toBe('Control')
+    })
+    expect(sentence()).toBe('The program gets the wheel.')
+
+    await person.click(screen.getByRole('button', { name: 'Look around' }))
+    expect(controls.terminalViews[0]?.inputs.at(-1)).toEqual({ kind: 'release', number: 2 })
+    expect(modeBadge()).toBe('View')
+    expect(sentence()).toBe('Scroll or drag to move around the session. The program gets nothing.')
+  })
+
+  it("gives the wheel to the program at the session's cell under the pointer, never as arrow keys", async () => {
+    const person = userEvent.setup()
+    const restore = laidOut()
+    try {
+      const { port, controls } = fakeHost()
+      open(port)
+      await screen.findByTestId('palette-provenance')
+      await takeControl(person, controls)
+      // A window of 20 by 4 at column 3 and line 2 of the session.
+      act(() => {
+        controls.terminalViews[0]?.show(
+          terminalScreen(SESSION_MAIN, { columns: 20, rows: 4 }, { column: 3, line: 2, above: 0 })
+        )
+      })
+      // Five cells across and one down from the grid's corner: the session's column 8 and line 3.
+      const turned = wheel({ deltaY: 16, clientX: 12 + 5 * 8 + 1, clientY: 12 + 16 + 1 })
+      expect(turned.defaultPrevented).toBe(true)
+      const up = wheel({ deltaY: -32, clientX: 12 + 1, clientY: 12 + 1, shiftKey: true, altKey: true })
+      expect(up.defaultPrevented).toBe(true)
+      expect(programInputs(controls)).toEqual([
+        { kind: 'wheel', take: 1, column: 8, line: 3, turns: 1, shift: false, alt: false, control: false },
+        { kind: 'wheel', take: 1, column: 3, line: 2, turns: -2, shift: true, alt: true, control: false }
+      ])
+      expect(screen.getByTestId('terminal-surface')).toHaveAttribute('data-wheel-to-application', '2')
+      // Nothing of the wheel moved the window.
+      expect(controls.terminalViews[0]?.moves).toEqual([{ number: 1, live: true }])
+    } finally {
+      restore()
+    }
+  })
+
+  it('reads the cell under the pointer through the frame as drawn, its unsettled moves included once', async () => {
+    const person = userEvent.setup()
+    const restore = laidOut()
+    try {
+      const { port, controls } = fakeHost()
+      controls.holdTerminalMoves()
+      open(port)
+      await screen.findByTestId('palette-provenance')
+      act(() => {
+        controls.terminalViews[0]?.show(
+          terminalScreen(SESSION_MAIN, { columns: 20, rows: 4 }, { column: 3, line: 2, above: 0 })
+        )
+      })
+      // Two rows up in view mode, not yet settled: the frame is drawn two rows lower.
+      wheel({ deltaY: -32 })
+      expect(gridShift()).toEqual({ x: 0, y: 32 })
+      await takeControl(person, controls)
+      expect(gridShift()).toEqual({ x: 0, y: 32 })
+      // The pointer is over the frame's second row, which is the session's line 3.
+      wheel({ deltaY: 16, clientX: 12 + 1, clientY: 12 + 3 * 16 + 1 })
+      // Over the rows the shifted frame does not cover, nothing is under the pointer.
+      wheel({ deltaY: 16, clientX: 12 + 1, clientY: 12 + 1 })
+      expect(programInputs(controls)).toEqual([
+        { kind: 'wheel', take: 1, column: 3, line: 3, turns: 1, shift: false, alt: false, control: false }
+      ])
+    } finally {
+      restore()
+    }
+  })
+
+  it('counts a turn for each row of the wheel, in lines and pages too, and carries the part of a row', async () => {
+    const person = userEvent.setup()
+    const restore = laidOut()
+    try {
+      const { port, controls } = fakeHost()
+      open(port)
+      await screen.findByTestId('palette-provenance')
+      await takeControl(person, controls)
+      const at = { clientX: 12 + 1, clientY: 12 + 1 }
+      wheel({ deltaY: 10, ...at })
+      expect(programInputs(controls)).toEqual([])
+      wheel({ deltaY: 6, ...at })
+      wheel({ deltaY: 2, deltaMode: 1, ...at })
+      wheel({ deltaY: 1, deltaMode: 2, ...at })
+      expect(programInputs(controls).map((input) => (input.kind === 'wheel' ? input.turns : 0))).toEqual([
+        1, 2, 8
+      ])
+      // A part of a row carried when the program stops reading the wheel is dropped with it.
+      wheel({ deltaY: 10, ...at })
+      act(() => {
+        controls.terminalViews[0]?.show({ wheel: 'unreported' })
+      })
+      act(() => {
+        controls.terminalViews[0]?.show({ wheel: 'reaches' })
+      })
+      wheel({ deltaY: 6, ...at })
+      expect(programInputs(controls)).toHaveLength(3)
+    } finally {
+      restore()
+    }
+  })
+
+  it('sends nothing to a program that does not use the wheel from this view, and says so', async () => {
+    const person = userEvent.setup()
+    const restore = laidOut()
+    try {
+      const { port, controls } = fakeHost()
+      open(port)
+      await screen.findByTestId('palette-provenance')
+      await takeControl(person, controls)
+      act(() => {
+        controls.terminalViews[0]?.show({ wheel: 'unreported' })
+      })
+      expect(sentence()).toBe('The program is not using the wheel. Look around to scroll.')
+      const ignored = wheel({ deltaY: 48, clientX: 12 + 1, clientY: 12 + 1 })
+      expect(ignored.defaultPrevented).toBe(false)
+      act(() => {
+        controls.terminalViews[0]?.show({ wheel: 'unwritable' })
+      })
+      expect(sentence()).toBe(
+        'The program asks for the wheel in a form this view cannot send. Look around to scroll.'
+      )
+      wheel({ deltaY: 48, clientX: 12 + 1, clientY: 12 + 1 })
+      expect(programInputs(controls)).toEqual([])
+      expect(controls.terminalViews[0]?.moves).toEqual([{ number: 1, live: true }])
+    } finally {
+      restore()
+    }
+  })
+
+  it('returns to view mode when control ends, and says why until the person asks again', async () => {
+    const person = userEvent.setup()
+    const restore = laidOut()
+    try {
+      const { port, controls } = fakeHost()
+      controls.holdTerminalMoves()
+      controls.holdTerminalControl()
+      open(port)
+      await screen.findByTestId('palette-provenance')
+      await takeControl(person, controls)
+      act(() => {
+        controls.terminalViews[0]?.loseControl()
+      })
+      await waitFor(() => {
+        expect(modeBadge()).toBe('View')
+      })
+      expect(sentence()).toBe(LOST_CONTROL)
+      expect(screen.getByRole('button', { name: 'Take control' })).toBeInTheDocument()
+      // The wheel is the view's again: it moves the window, and the program gets nothing.
+      wheel({ deltaY: -16, clientX: 12 + 1, clientY: 12 + 1 })
+      expect(controls.terminalViews[0]?.moves.at(-1)).toEqual({ number: 2, across: 0, down: -1 })
+      expect(programInputs(controls)).toEqual([])
+      // A take the session refuses says why, in the same place.
+      await person.click(screen.getByRole('button', { name: 'Take control' }))
+      act(() => {
+        controls.terminalViews[0]?.refuseControl('the program reads keys in a form the view does not send.')
+      })
+      await waitFor(() => {
+        expect(sentence()).toBe(
+          'This view cannot take control: the program reads keys in a form the view does not send.'
+        )
+      })
+      expect(modeBadge()).toBe('View')
+    } finally {
+      restore()
+    }
+  })
+
+  it('stops sending the moment the person looks around, before the view has answered', async () => {
+    const person = userEvent.setup()
+    const restore = laidOut()
+    try {
+      const { port, controls } = fakeHost()
+      controls.holdTerminalMoves()
+      open(port)
+      await screen.findByTestId('palette-provenance')
+      await takeControl(person, controls)
+      // Pressed and turned in one moment: the view has not yet said it watches.
+      fireEvent.click(screen.getByRole('button', { name: 'Look around' }))
+      expect(controls.terminalViews[0]?.inputs.at(-1)).toEqual({ kind: 'release', number: 2 })
+      expect(modeBadge()).toBe('View')
+      wheel({ deltaY: -16, clientX: 12 + 1, clientY: 12 + 1 })
+      expect(programInputs(controls)).toEqual([])
+      expect(controls.terminalViews[0]?.moves.at(-1)).toEqual({ number: 2, across: 0, down: -1 })
+    } finally {
+      restore()
+    }
   })
 
   it('moves the window only as far as it can go, and a wheel at a limit moves nothing', async () => {
-    const person = userEvent.setup()
     const { port, controls } = fakeHost()
     open(port)
     await screen.findByTestId('palette-provenance')
-    await person.click(screen.getByRole('tab', { name: 'View' }))
     // The window holds the live screen's last line already, and the session is narrower than it.
     wheel({ deltaY: 160 })
     wheel({ deltaX: 80 })
@@ -568,12 +755,10 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
   it('draws the frame where its unsettled moves put it, busy at once and saying so after a moment', async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true })
     try {
-      const person = userEvent.setup({ advanceTimers: vi.advanceTimersByTime })
       const { port, controls } = fakeHost()
       controls.holdTerminalMoves()
       open(port)
       await screen.findByTestId('palette-provenance')
-      await person.click(screen.getByRole('tab', { name: 'View' }))
       wheel({ deltaY: -32 })
       expect(controls.terminalViews[0]?.moves).toEqual([{ number: 1, across: 0, down: -2 }])
       // The frame moves down two rows at once, over the cells it does not cover.
@@ -616,12 +801,10 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
   })
 
   it('follows a drag in view mode to the pixel, and sends a move for each whole row it crosses', async () => {
-    const person = userEvent.setup()
     const { port, controls } = fakeHost()
     controls.holdTerminalMoves()
     open(port)
     await screen.findByTestId('palette-provenance')
-    await person.click(screen.getByRole('tab', { name: 'View' }))
     // Down a row and a half: the window goes up one row, and the frame follows the pointer.
     pointer('pointerdown', 100, 100)
     pointer('pointermove', 100, 124)
@@ -642,7 +825,6 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
     controls.holdTerminalMoves()
     open(port)
     await screen.findByTestId('palette-provenance')
-    await person.click(screen.getByRole('tab', { name: 'View' }))
     for (const end of ['pointercancel', 'lostpointercapture']) {
       pointer('pointerdown', 100, 100)
       pointer('pointermove', 100, 108)
@@ -654,7 +836,7 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
 
     pointer('pointerdown', 100, 100)
     pointer('pointermove', 100, 124)
-    await person.click(screen.getByRole('tab', { name: 'Control' }))
+    await person.click(screen.getByRole('button', { name: 'Take control' }))
     expect(controls.terminalViews[0]?.moves).toEqual([
       { number: 1, across: 0, down: -1 },
       { number: 2, live: true }
@@ -665,12 +847,10 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
   })
 
   it('resists a drag past a limit and sends nothing past it', async () => {
-    const person = userEvent.setup()
     const { port, controls } = fakeHost()
     controls.holdTerminalMoves()
     open(port)
     await screen.findByTestId('palette-provenance')
-    await person.click(screen.getByRole('tab', { name: 'View' }))
     // Fifteen rows down with twelve kept: twelve go, and the other three are drawn resisting.
     pointer('pointerdown', 100, 100)
     pointer('pointermove', 100, 100 + 15 * 16)
@@ -688,7 +868,6 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
     const { port, controls } = fakeHost()
     open(port)
     await screen.findByTestId('palette-provenance')
-    await person.click(screen.getByRole('tab', { name: 'View' }))
     act(() => {
       controls.terminalViews[0]?.end('This session has closed.')
     })
@@ -696,7 +875,7 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
     pointer('pointerdown', 100, 100)
     pointer('pointermove', 100, 140)
     pointer('pointerup', 100, 140)
-    await person.click(screen.getByRole('tab', { name: 'Control' }))
+    await person.click(screen.getByRole('button', { name: 'Take control' }))
     await settle()
     expect(controls.terminalViews[0]?.moves).toEqual([])
     expect(gridShift()).toEqual({ x: 0, y: 0 })
@@ -704,12 +883,10 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
   })
 
   it('ends a drag without sending its part when a second pointer comes down', async () => {
-    const person = userEvent.setup()
     const { port, controls } = fakeHost()
     controls.holdTerminalMoves()
     open(port)
     await screen.findByTestId('palette-provenance')
-    await person.click(screen.getByRole('tab', { name: 'View' }))
     pointer('pointerdown', 100, 100)
     pointer('pointermove', 100, 108)
     expect(gridShift()).toEqual({ x: 0, y: 8 })
@@ -720,12 +897,10 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
   })
 
   it('settles only the moves a frame holds, and replays the rest over it', async () => {
-    const person = userEvent.setup()
     const { port, controls } = fakeHost()
     controls.holdTerminalMoves()
     open(port)
     await screen.findByTestId('palette-provenance')
-    await person.click(screen.getByRole('tab', { name: 'View' }))
     // A frame of a session wider than the view, at column 5 of 0 to 10.
     const wide = (column: number, right: number, settled: number) => {
       act(() => {
@@ -761,8 +936,6 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
     open(port)
     await screen.findByTestId('palette-provenance')
     const up = screen.getByRole('button', { name: 'Move the window up' })
-    expect(up).toBeDisabled()
-    await person.click(screen.getByRole('tab', { name: 'View' }))
     // Twelve rows of history above a window of eight: a page up is eight rows.
     expect(up).toBeEnabled()
     expect(screen.getByRole('button', { name: 'Move the window down' })).toBeDisabled()
@@ -774,7 +947,11 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
     await person.click(up)
     expect(controls.terminalViews[0]?.moves.at(-1)).toEqual({ number: 2, across: 0, down: -4 })
     expect(up).toBeDisabled()
-    expect(screen.getByRole('button', { name: 'Move the window down' })).toBeEnabled()
+    const down = screen.getByRole('button', { name: 'Move the window down' })
+    expect(down).toBeEnabled()
+    // In control mode the window stays where the program's screen is: no button moves it.
+    await person.click(screen.getByRole('button', { name: 'Take control' }))
+    expect(down).toBeDisabled()
   })
 
   it('ends a drag at any change of the view, one that comes back to where it was included', async () => {
@@ -783,13 +960,12 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
     controls.holdTerminalMoves()
     open(port)
     await screen.findByTestId('palette-provenance')
-    await person.click(screen.getByRole('tab', { name: 'View' }))
     pointer('pointerdown', 100, 100)
     pointer('pointermove', 100, 108)
     expect(gridShift()).toEqual({ x: 0, y: 8 })
     // Control, and back to view, with the pointer still down and not moving.
-    await person.click(screen.getByRole('tab', { name: 'Control' }))
-    await person.click(screen.getByRole('tab', { name: 'View' }))
+    await person.click(screen.getByRole('button', { name: 'Take control' }))
+    await person.click(screen.getByRole('button', { name: 'Look around' }))
     expect(gridShift()).toEqual({ x: 0, y: 0 })
     pointer('pointermove', 100, 140)
     pointer('pointerup', 100, 140)
@@ -798,14 +974,12 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
   })
 
   it('begins a drag again at each zoom step, one back to the size it began at included', async () => {
-    const person = userEvent.setup()
     const rects = cellsFromTypeSize()
     try {
       const { port, controls } = fakeHost()
       controls.holdTerminalMoves()
       open(port)
       await screen.findByTestId('palette-provenance')
-      await person.click(screen.getByRole('tab', { name: 'View' }))
       pointer('pointerdown', 100, 100)
       pointer('pointermove', 100, 108)
       expect(gridShift()).toEqual({ x: 0, y: 8 })
@@ -826,14 +1000,12 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
   })
 
   it('begins a drag again from the pointer when the row it sends draws a zoom step still to be drawn', async () => {
-    const person = userEvent.setup()
     const rects = cellsFromTypeSize()
     try {
       const { port, controls } = fakeHost()
       controls.holdTerminalMoves()
       open(port)
       await screen.findByTestId('palette-provenance')
-      await person.click(screen.getByRole('tab', { name: 'View' }))
       pointer('pointerdown', 100, 100)
       // A zoom step is taken and not yet drawn when the pointer crosses a row and a half. Sending
       // the row draws the zoom step with it, and the drag begins again from the pointer in the
@@ -857,7 +1029,6 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
     controls.holdTerminalMoves()
     open(port)
     await screen.findByTestId('palette-provenance')
-    await person.click(screen.getByRole('tab', { name: 'View' }))
     // A session wider than the view, with one column of room to the right.
     act(() => {
       controls.terminalViews[0]?.show({
@@ -867,8 +1038,8 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
     })
     // Half a column, then the view changes and comes back: the half is gone.
     wheel({ deltaX: 4 })
-    await person.click(screen.getByRole('tab', { name: 'Control' }))
-    await person.click(screen.getByRole('tab', { name: 'View' }))
+    await person.click(screen.getByRole('button', { name: 'Take control' }))
+    await person.click(screen.getByRole('button', { name: 'Look around' }))
     wheel({ deltaX: 4 })
     expect(controls.terminalViews[0]?.moves).toEqual([{ number: 1, live: true }])
     // Half a column carried, then a button takes the last column: a turn back goes at once.
@@ -887,7 +1058,6 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
     controls.holdTerminalMoves()
     open(port)
     await screen.findByTestId('palette-provenance')
-    await person.click(screen.getByRole('tab', { name: 'View' }))
     // A session wider than the view, with one column of room to the right.
     act(() => {
       controls.terminalViews[0]?.show({
@@ -908,12 +1078,10 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
   })
 
   it("drops a wheel's part of a cell once a limit is reached, though the host's screens leave it before the next turn", async () => {
-    const person = userEvent.setup()
     const { port, controls } = fakeHost()
     controls.holdTerminalMoves()
     open(port)
     await screen.findByTestId('palette-provenance')
-    await person.click(screen.getByRole('tab', { name: 'View' }))
     const at = (column: number) =>
       act(() => {
         controls.terminalViews[0]?.show({
@@ -933,11 +1101,9 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
   })
 
   it('keeps an ended view ended when a move it took before the end is answered after it', async () => {
-    const person = userEvent.setup()
     const { port, controls } = fakeHost()
     open(port)
     await screen.findByTestId('palette-provenance')
-    await person.click(screen.getByRole('tab', { name: 'View' }))
     wheel({ deltaY: -48 })
     act(() => {
       controls.terminalViews[0]?.end('This session has closed.')
@@ -947,17 +1113,89 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
   })
 
   it('moves nothing with a drag in control mode', async () => {
+    const person = userEvent.setup()
     const { port, controls } = fakeHost()
     open(port)
     await screen.findByTestId('palette-provenance')
+    await takeControl(person, controls)
     pointer('pointerdown', 100, 100)
     pointer('pointermove', 100, 180)
     pointer('pointerup', 100, 180)
     await settle()
-    expect(controls.terminalViews[0]?.moves).toEqual([])
+    expect(controls.terminalViews[0]?.moves).toEqual([{ number: 1, live: true }])
     expect(gridShift()).toEqual({ x: 0, y: 0 })
+    expect(programInputs(controls)).toEqual([])
   })
 })
+
+/** What the mode badge says. */
+function modeBadge(): string | null {
+  return screen.getByTestId('terminal-mode').textContent
+}
+
+/** The sentence beside the mode: what it does, or why control ended. */
+function sentence(): string | null {
+  return screen.getByTestId('terminal-mode-sentence').textContent
+}
+
+/** Takes control of the first view, as the person does, and has the session grant it. */
+async function takeControl(
+  person: ReturnType<typeof userEvent.setup>,
+  controls: ReturnType<typeof fakeHost>['controls']
+): Promise<void> {
+  await person.click(screen.getByRole('button', { name: 'Take control' }))
+  // A held take is granted here; one that is not has been, or is granted by itself.
+  act(() => {
+    controls.terminalViews[0]?.grantControl()
+  })
+  await waitFor(() => {
+    expect(controls.terminalViews[0]?.control.state).toBe('controlling')
+  })
+  await waitFor(() => {
+    expect(modeBadge()).toBe('Control')
+  })
+}
+
+/** Every wheel turn and key the first view took for the program, in order. */
+function programInputs(controls: ReturnType<typeof fakeHost>['controls']) {
+  return (controls.terminalViews[0]?.inputs ?? []).filter(
+    (input) => input.kind === 'wheel' || input.kind === 'keys'
+  )
+}
+
+/**
+ * Lays the view out as a browser would: cells of 8 by 16 pixels at the unscaled type size, the
+ * surface's inner box at (12, 12), 640 by 384 pixels, and the grid at its corner, moved by its own
+ * transform and its drag layer's, as a browser reports a transformed box. Returns what puts it
+ * back.
+ */
+function laidOut(): () => void {
+  const rects = vi.spyOn(Element.prototype, 'getBoundingClientRect').mockImplementation(function (this: Element) {
+    const element = this as HTMLElement
+    const text = element.textContent ?? ''
+    const size = parseFloat(element.parentElement?.style.fontSize ?? '')
+    if (element.getAttribute('aria-hidden') === 'true' && /^M+$/.test(text) && size > 0) {
+      return DOMRect.fromRect({ x: 0, y: 0, width: (text.length * size * 2) / 3, height: (size * 4) / 3 })
+    }
+    if (element.dataset.testid === 'terminal-grid') {
+      const own = translation(element)
+      const layer = translation(element.parentElement)
+      return DOMRect.fromRect({
+        x: 12 + own.x + layer.x,
+        y: 12 + own.y + layer.y,
+        width: parseFloat(element.style.width) || 0,
+        height: parseFloat(element.style.height) || 0
+      })
+    }
+    if (element.parentElement?.dataset.testid === 'terminal-surface') {
+      return DOMRect.fromRect({ x: 12, y: 12, width: 640, height: 384 })
+    }
+    return new DOMRect()
+  })
+  return () => {
+    rects.mockRestore()
+  }
+}
 
 /** Turns the wheel over the terminal. */
 function wheel(init: WheelEventInit): WheelEvent {

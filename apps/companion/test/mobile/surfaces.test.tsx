@@ -169,7 +169,13 @@ describe('the terminal keys and the two views (KR-REQ-13.17, 13.03)', () => {
     const escape = within(keys).getByRole('button', { name: 'Escape' })
     expect(declaredTarget(escape).inline).toBeGreaterThanOrEqual(TOUCH_TARGET.android)
     expect(declaredTarget(escape).block).toBeGreaterThanOrEqual(TOUCH_TARGET.android)
+    // The keys are the program's, so they wait for control of it.
     const control = within(keys).getByRole('button', { name: 'Control, off' })
+    expect(control).toBeDisabled()
+    await person.click(await screen.findByRole('button', { name: 'Take control' }))
+    await waitFor(() => {
+      expect(control).toBeEnabled()
+    })
     await person.click(control)
     expect(within(keys).getByRole('button', { name: /Control, held for the next key/ })).toBeInTheDocument()
   })

@@ -87,11 +87,11 @@ describe('the desktop raw view says how the host presents it, and why (KR-REQ-08
     })
   }
 
-  it('says, as the host does for a view with no terminal profile, why it is a viewport', async () => {
+  it('says, as the host does for the profile a view declares, why it is a viewport', async () => {
     const { port } = fakeHost()
     openTerminal(port)
     await screen.findByTestId('palette-provenance')
-    expect(await presented()).toBe(viewport(HOST_WORDS[0]?.[1] ?? ''))
+    expect(await presented()).toBe(viewport(HOST_WORDS[1]?.[1] ?? ''))
   })
 
   it('shows a direct presentation with no reason', async () => {
@@ -134,7 +134,7 @@ describe('the desktop raw view says how the host presents it, and why (KR-REQ-08
     act(() => {
       controls.terminalViews[0]?.attach()
     })
-    expect(await presented()).toBe(viewport(HOST_WORDS[0]?.[1] ?? ''))
+    expect(await presented()).toBe(viewport(HOST_WORDS[1]?.[1] ?? ''))
   })
 })
 
@@ -191,7 +191,7 @@ describe("the phone's raw view says the same (KR-REQ-08.02)", () => {
   it('shows what its newest view attached with when it is left and opened again', async () => {
     const { port, controls } = fakeHost()
     const person = await openTerminal(port)
-    expect(await presented()).toBe(viewport(HOST_WORDS[0]?.[1] ?? ''))
+    expect(await presented()).toBe(viewport(HOST_WORDS[1]?.[1] ?? ''))
 
     // The presentation changes, and the person leaves the terminal and comes back to it: a new
     // view attaches, and says what it attached with.

@@ -9,7 +9,9 @@
  * larger or smaller.
  *
  * The switch is explicit in both directions. Nothing here infers a mode from how fast a wheel
- * turned or whether a modifier was held.
+ * turned or whether a modifier was held. Control mode is taking control of the session's input: a
+ * view opens in view mode, taking nothing from anyone, and is in control mode from the person's own
+ * take until they look around or the session ends control.
  *
  * The raw views on the desktop and the phone also share what they say: how the host presents a
  * view, directly or as a viewport, and why, from the view's own attachment; where its palette came
@@ -23,15 +25,41 @@ import type {
   TerminalPresentationMode
 } from '@kalareach/protocol'
 
-import type { TerminalScreen } from '../host/port'
+import type { TerminalControl, TerminalScreen, TerminalWheel } from '../host/port'
 
 /** Who owns the pointer. */
 export type ViewMode = 'control' | 'view'
 
+/**
+ * The mode a view is in: control mode from the person's take, while the view takes control and
+ * while it holds it, and view mode otherwise.
+ */
+export function modeOf(control: TerminalControl | null): ViewMode {
+  return control?.state === 'taking' || control?.state === 'controlling' ? 'control' : 'view'
+}
+
+/** What a view says while it asks the session for control. */
+export const ASKING = 'Asking the session for control…'
+
+/**
+ * Why a wheel turn in control mode does not reach the program, in words that end with the way to
+ * scroll, or null when it does reach it.
+ */
+export function wheelHeldBack(wheel: TerminalWheel): string | null {
+  switch (wheel) {
+    case 'reaches':
+      return null
+    case 'unreported':
+      return 'The program is not using the wheel. Look around to scroll.'
+    case 'unwritable':
+      return 'The program asks for the wheel in a form this view cannot send. Look around to scroll.'
+  }
+}
+
 /** What a wheel event turns into. */
 export type WheelOutcome =
-  /** Forwarded to the application as its own scroll. */
-  | { readonly kind: 'application'; readonly lines: number }
+  /** The application's own wheel, turned at the cell under the pointer. */
+  | { readonly kind: 'application' }
   /** Used by the view to zoom. */
   | { readonly kind: 'zoom'; readonly steps: number }
   /**
@@ -50,9 +78,6 @@ export interface Wheel {
   readonly sideways: boolean
 }
 
-/** How many pixels of wheel make one row. */
-export const WHEEL_ROW_PIXELS = 16
-
 /**
  * Decides what one wheel event does.
  *
@@ -62,7 +87,7 @@ export const WHEEL_ROW_PIXELS = 16
  */
 export function routeWheel(mode: ViewMode, wheel: Wheel): WheelOutcome {
   if (mode === 'control') {
-    return { kind: 'application', lines: Math.trunc(wheel.deltaY / WHEEL_ROW_PIXELS) }
+    return { kind: 'application' }
   }
   if (wheel.zoomGesture) {
     return { kind: 'zoom', steps: -Math.sign(wheel.deltaY) }

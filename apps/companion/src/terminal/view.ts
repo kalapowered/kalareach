@@ -14,13 +14,21 @@
  * and draws the last frame shifted to where they will put the window (`pan.ts`). Native code says a
  * move is settled only with a screen that holds it, so the shift is dropped exactly as the frame
  * that holds the move replaces the one it was drawn over.
+ *
+ * And it asks for control of the program and gives it back, numbering each request in the order the
+ * person makes them. Until native code has answered the newest, the page shows that request's own
+ * state at once: taking control, or watching. It sends the program a wheel turn or keys only while
+ * native code says the view controls the program under the newest take, and names that take, so
+ * nothing made in one period of control is written in another.
  */
 
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 
 import {
   failureMessage,
   type HostPort,
+  type ProgramInput,
+  type TerminalControl,
   type TerminalGrid,
   type TerminalMove,
   type TerminalRoom,
@@ -62,6 +70,21 @@ export interface TerminalViewing {
   readonly pan: (cells: Cells) => Cells
   /** Brings a window in the history back to the live screen, behind the moves already made. */
   readonly live: () => void
+  /**
+   * Whether the view controls the program, as the page shows it: native code's word once it has
+   * answered the person's newest request, and that request's own state until then. Null before the
+   * first state and once the view has ended.
+   */
+  readonly control: TerminalControl | null
+  /** Takes control: brings a window in the history back to the live screen, and asks for control. */
+  readonly takeControl: () => void
+  /** Gives control back, and sends the program nothing more from this moment. */
+  readonly lookAround: () => void
+  /**
+   * Sends the program a wheel turn or keys, under the newest take, while the view controls the
+   * program; otherwise sends nothing. Rejects with native code's refusal.
+   */
+  readonly toProgram: (input: ProgramInput) => Promise<void>
 }
 
 /** The grid a view opens at when its surface cannot be measured yet. */
@@ -84,6 +107,26 @@ interface Opening {
   since: number | null
   /** Whether native code has said the view ended: nothing settles a move made after that. */
   ended: boolean
+  /** The person's newest control request: its number, and whether it takes control. */
+  asked: ControlRequest
+}
+
+/** One of the person's requests for control, numbered in the order they made them. */
+interface ControlRequest {
+  readonly number: number
+  readonly take: boolean
+}
+
+/** Before the person has asked for anything: watching. */
+const NOTHING_ASKED: ControlRequest = { number: 0, take: false }
+
+/**
+ * What the page shows of control: native code's word once it names the person's newest request, and
+ * that request's own state until then.
+ */
+function shownControl(published: TerminalControl, asked: ControlRequest): TerminalControl {
+  if (published.number >= asked.number) return published
+  return { number: asked.number, state: asked.take ? 'taking' : 'watching', ended: null }
 }
 
 /** No moves waiting. */
@@ -131,6 +174,12 @@ export function useTerminalView(
     readonly since: number | null
   } | null>(null)
   const [movingSlowSince, setMovingSlowSince] = useState<number | null>(null)
+  // The person's newest control request, with the opening it belongs to.
+  const [askedControl, setAskedControl] = useState<{
+    readonly sessionId: string
+    readonly attempt: number
+    readonly asked: ControlRequest
+  } | null>(null)
   const ownMoves = waitingMoves?.sessionId === sessionId && waitingMoves.attempt === attempt
   const pending = ownMoves ? waitingMoves.moves : NO_MOVES
   const movingSince = ownMoves ? waitingMoves.since : null
@@ -162,7 +211,8 @@ export function useTerminalView(
       number: 0,
       pending: [],
       since: null,
-      ended: false
+      ended: false,
+      asked: NOTHING_ASKED
     }
     opening.current = open
     port
@@ -209,9 +259,11 @@ export function useTerminalView(
       if (open.view !== null) void open.view.close()
       // What this opening said ends with it: the next one starts from attaching. Its last frame is
       // kept, as the session's, until the next one has a screen of its own. Its moves go with it:
-      // native code closed the view that would have settled them.
+      // native code closed the view that would have settled them. Its control goes too: the next
+      // opening starts watching.
       setHeld(null)
       setWaitingMoves(null)
+      setAskedControl(null)
     }
   }, [port, sessionId, attempt, showing, keepMoves])
 
@@ -264,6 +316,46 @@ export function useTerminalView(
     if (open?.view == null || open.ended) return
     send(open, open.view, (number) => ({ number, live: true }))
   }, [send])
+
+  /** Makes the person's next control request, and sends it. */
+  const ask = useCallback((take: boolean) => {
+    const open = opening.current
+    if (open?.view == null || open.ended) return
+    const asked = { number: open.asked.number + 1, take }
+    open.asked = asked
+    setAskedControl({ sessionId: open.sessionId, attempt: open.attempt, asked })
+    void open.view.input({ kind: take ? 'take' : 'release', number: asked.number }).catch(() => {
+      // A failed call is a view that has gone; its end says so.
+    })
+  }, [])
+
+  const takeControl = useCallback(() => {
+    // Control mode shows the program's live screen: a window in the history comes back first.
+    live()
+    ask(true)
+  }, [live, ask])
+
+  const lookAround = useCallback(() => {
+    ask(false)
+  }, [ask])
+
+  const published = state?.state === 'waiting' || state?.state === 'showing' ? state.control : null
+  const asked =
+    askedControl?.sessionId === sessionId && askedControl.attempt === attempt ? askedControl.asked : NOTHING_ASKED
+  const control = published === null ? null : shownControl(published, asked)
+  // Kept at each commit, so no event after it reads the control before it.
+  const controlNow = useRef(control)
+  useLayoutEffect(() => {
+    controlNow.current = control
+  }, [control])
+
+  const toProgram = useCallback((input: ProgramInput): Promise<void> => {
+    const open = opening.current
+    const shown = controlNow.current
+    if (open?.view == null || open.ended || shown?.state !== 'controlling') return Promise.resolve()
+    if (shown.number !== open.asked.number || !open.asked.take) return Promise.resolve()
+    return open.view.input({ ...input, take: open.asked.number })
+  }, [])
 
   // Moves that wait say so only once they have waited a moment without a break: a state that
   // arrives meanwhile does not start the wait again.
@@ -335,6 +427,10 @@ export function useTerminalView(
     movingSlow: moving && movingSince !== null && movingSlowSince === movingSince,
     roomNow,
     pan,
-    live
+    live,
+    control,
+    takeControl,
+    lookAround,
+    toProgram
   }
 }

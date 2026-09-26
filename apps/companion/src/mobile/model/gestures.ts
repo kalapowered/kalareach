@@ -5,15 +5,17 @@
  * terminal, and a pan control that took it would make a pager or an editor unusable. A finger is
  * the same question in a different shape, and it gets the same answer.
  *
- * In control mode a one-finger drag is the program's scroll, exactly as the wheel is. Zoom is the
- * one thing a finger can do that no program has a meaning for: nothing on the wire carries a pinch,
- * so a pinch cannot be taken from anyone. In view mode the person is reading the screen rather than
+ * In control mode a one-finger drag is the program's wheel, exactly as the wheel is: the view turns
+ * it once for each row the finger crosses, at the session's cell under the finger. Zoom is the one
+ * thing a finger can do that no program has a meaning for: nothing on the wire carries a pinch, so a
+ * pinch cannot be taken from anyone. In view mode the person is reading the screen rather than
  * driving the program, so the view owns every gesture: a one-finger drag moves the window across
  * the session, up into its history and down its live screen, and a pinch makes the text larger or
  * smaller.
  */
 
-import { WHEEL_ROW_PIXELS, type ViewMode, type WheelOutcome } from '../../terminal/modes'
+import type { TerminalControl, TerminalWheel } from '../../host/port'
+import { ASKING, type ViewMode, type WheelOutcome } from '../../terminal/modes'
 
 /** One touch gesture, in the terms both modes understand. */
 export interface TouchGesture {
@@ -32,8 +34,8 @@ export const PINCH_THRESHOLD = 0.08
 /**
  * Decides what a touch gesture does.
  *
- * A one-finger drag in control mode produces the same outcome a wheel would, in the same units, so
- * the program receives one kind of scroll however the person produced it.
+ * A one-finger drag in control mode produces the same outcome a wheel would, so the program
+ * receives one kind of scroll however the person produced it.
  */
 export function routeGesture(mode: ViewMode, gesture: TouchGesture): WheelOutcome {
   const pinching = gesture.pointers >= 2 && Math.abs(gesture.scale - 1) >= PINCH_THRESHOLD
@@ -41,9 +43,7 @@ export function routeGesture(mode: ViewMode, gesture: TouchGesture): WheelOutcom
     return { kind: 'zoom', steps: gesture.scale > 1 ? 1 : -1 }
   }
   if (mode === 'control') {
-    // Down the screen is backwards through the program's output, which is a negative line count,
-    // the same sign the wheel produces for the same movement.
-    return { kind: 'application', lines: Math.trunc(-gesture.deltaY / WHEEL_ROW_PIXELS) }
+    return { kind: 'application' }
   }
   // The screen follows the finger, so the window moves the other way: a finger dragged up moves the
   // window down, as a wheel turned down does.
@@ -68,9 +68,27 @@ export function consumesGesture(mode: ViewMode, gesture: TouchGesture): boolean 
   return mode === 'control' || Math.abs(gesture.deltaY) > 0 || Math.abs(gesture.deltaX) > 0
 }
 
-/** What the mode switch says it does, which is the same sentence on both platforms. */
-export function describeMode(mode: ViewMode): string {
-  return mode === 'control'
-    ? 'Control: your touches go to the program in this terminal.'
-    : 'View: drag to move around the session, pinch to make the text larger or smaller.'
+/**
+ * What the view says of control: what view mode does, or why control last ended; that it asks the
+ * session for control; or what reaches the program while it controls it, which the program's
+ * `wheel` decides for a drag.
+ */
+export function describeMode(control: TerminalControl, wheel: TerminalWheel | null): string {
+  switch (control.state) {
+    case 'watching':
+      return control.ended ?? 'View: drag to move around the session, pinch to make the text larger or smaller.'
+    case 'taking':
+      return ASKING
+    case 'controlling':
+      switch (wheel) {
+        case null:
+          return 'Control: your keys go to the program in this terminal.'
+        case 'reaches':
+          return 'Control: your keys and drags go to the program in this terminal.'
+        case 'unreported':
+          return 'Control: your keys go to the program, which is not using the wheel. Look around to scroll.'
+        case 'unwritable':
+          return 'Control: your keys go to the program, which asks for the wheel in a form this view cannot send. Look around to scroll.'
+      }
+  }
 }

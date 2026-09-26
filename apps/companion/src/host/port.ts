@@ -567,7 +567,6 @@ export interface HostPort {
     grid: TerminalGrid,
     listener: (state: TerminalViewState) => void
   ): Promise<TerminalView>
-  terminalInput(params: unknown): Promise<unknown>
 
   /**
    * What a voice session started now would be, before one exists.
@@ -849,17 +848,68 @@ export interface TerminalGrid {
  * over, for a reason in the host's words or the link's, and every move the page made with it is
  * settled. The attachment's summary, which says how the host presents the view and why, rides on
  * the first two, and so does `settled`: the newest of the page's moves it may take as settled,
- * which native code says only with a screen that holds it.
+ * which native code says only with a screen that holds it. So does `control`: whether the view
+ * controls the program, told at once whenever it changes.
  */
 export type TerminalViewState =
-  | { readonly state: 'waiting'; readonly attachment: AttachmentSummary; readonly settled: number }
+  | {
+      readonly state: 'waiting'
+      readonly attachment: AttachmentSummary
+      readonly settled: number
+      readonly control: TerminalControl
+    }
   | {
       readonly state: 'showing'
       readonly attachment: AttachmentSummary
       readonly screen: TerminalScreen
       readonly settled: number
+      readonly control: TerminalControl
     }
   | { readonly state: 'ended'; readonly reason: string }
+
+/**
+ * Whether a view controls the program: it watches, and nothing of the person's reaches the program;
+ * it is taking control, and waits for the session's answer; or it holds the session's input, and the
+ * program gets its wheel and keys. `number` is the page's newest control request native code took,
+ * and `ended` says why control last ended or was refused, until a newer request.
+ */
+export interface TerminalControl {
+  readonly number: number
+  readonly state: 'watching' | 'taking' | 'controlling'
+  readonly ended: string | null
+}
+
+/**
+ * Whether a wheel turn over a screen reaches its program: it reports the mouse in an encoding the
+ * view writes, it does not report the mouse, or it reports it in an encoding the view does not
+ * write.
+ */
+export type TerminalWheel = 'reaches' | 'unreported' | 'unwritable'
+
+/**
+ * What the page tells a view of the person: taking control or giving it back, numbered in the order
+ * the page asks, or a turn of the program's wheel at a cell of the session's grid or keys, each made
+ * under the page's take `take`. `turns` go towards the person when positive.
+ */
+export type TerminalInput =
+  | { readonly kind: 'take'; readonly number: number }
+  | { readonly kind: 'release'; readonly number: number }
+  | ({ readonly take: number } & ProgramInput)
+
+/** What reaches the program while a view controls it: its wheel turned at a cell, or keys. */
+export type ProgramInput =
+  | {
+      readonly kind: 'wheel'
+      /** The cell's column in the session's grid, from 0. */
+      readonly column: number
+      /** The cell's line of the live screen, from 0. */
+      readonly line: number
+      readonly turns: number
+      readonly shift: boolean
+      readonly alt: boolean
+      readonly control: boolean
+    }
+  | { readonly kind: 'keys'; readonly keys: string }
 
 /** The window the host drew for a view: its size in cells, and where it starts. */
 export interface TerminalWindow {
@@ -910,6 +960,8 @@ export interface TerminalScreen {
   readonly degraded: boolean
   /** How many runs and clusters could not be placed, and are blank or left out. */
   readonly replaced: number
+  /** Whether a wheel turn over the screen reaches the program. */
+  readonly wheel: TerminalWheel
 }
 
 /** One line of a view's window. */
@@ -950,6 +1002,12 @@ export interface TerminalView {
   resize(grid: TerminalGrid): Promise<void>
   /** Moves the view's window. */
   move(move: TerminalMove): Promise<void>
+  /**
+   * Hands the view the person's input. Resolves once native code has taken it; a wheel turn or keys
+   * the view may not write, since it does not control the program under the take they name, is
+   * refused with `LEASE_LOST`, and a shape native code does not read with `INVALID_ARGUMENT`.
+   */
+  input(input: TerminalInput): Promise<void>
   /** Closes the view. Resolves once it has ended: nothing it publishes arrives after. */
   close(): Promise<void>
 }

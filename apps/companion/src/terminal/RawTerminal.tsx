@@ -7,12 +7,14 @@
  * its cells, joins to its neighbour or lays out right to left stays inside its own cells, and the
  * view runs no terminal state machine: nothing the session printed can make it answer.
  *
- * Two modes, and the wheel belongs to whichever one is active. In control mode the application
- * inside the terminal gets the wheel, unchanged. In view mode the person is reading the screen: the
- * wheel and a drag move the window across the session, up into its history and down its live
- * screen, a zoom gesture makes the text larger or smaller, and the program gets nothing. A drag in
- * view mode moves the window, so text is selected in control mode. Switching to control mode brings
- * a window in the history back to the live screen.
+ * Two modes, and the wheel belongs to whichever one is active. A view opens in view mode, where the
+ * person is reading the screen: the wheel and a drag move the window across the session, up into its
+ * history and down its live screen, a zoom gesture makes the text larger or smaller, and the program
+ * gets nothing. Control mode is the person's own take of the session's input, labelled as that, and
+ * brings a window in the history back to the live screen: the program then gets the wheel, turned at
+ * the session's cell under the pointer while it reports the mouse, and nothing otherwise. A drag in
+ * view mode moves the window, so text is selected in control mode. Looking around gives control back
+ * at once, and a view whose control the session ends says why.
  *
  * The frame is drawn where the moves the page made and native code has not yet settled will put
  * the window (`pan.ts`), and a drag follows the pointer to the pixel; nothing animates. Every change
@@ -40,7 +42,7 @@ import { flushSync } from 'react-dom'
 
 import type { PaletteState } from '@kalareach/protocol'
 
-import { Badge, Button, Segmented } from '../components/ui'
+import { Badge, Button } from '../components/ui'
 import { useApp } from '../app/state'
 import type { TerminalGrid, TerminalScreen } from '../host/port'
 import { styleOf } from './cells'
@@ -55,18 +57,21 @@ import {
   selectionRule,
   type PlacedCursor
 } from './frame'
+import { cellUnder, wheelPixels, wheelTurns } from './input'
 import {
+  ASKING,
   ATTACHING,
   describeProvenance,
+  modeOf,
   placeOf,
   presentationOf,
   routeWheel,
   WAITING,
   warningsOf,
+  wheelHeldBack,
   zoomBy,
   ZOOM_DEFAULT_INDEX,
-  ZOOM_STEPS,
-  type ViewMode
+  ZOOM_STEPS
 } from './modes'
 import {
   beginDrag,
@@ -168,12 +173,15 @@ function cursorStyle(cursor: PlacedCursor, cell: Cell, palette: PaletteState): C
 function Grid({
   screen,
   cell,
-  shift
+  shift,
+  gridRef
 }: {
   readonly screen: TerminalScreen
   readonly cell: Cell
   /** How far the frame is drawn from its place, in pixels. */
   readonly shift: Point
+  /** Where the grid is, for finding the session's cell under the pointer. */
+  readonly gridRef: React.RefObject<HTMLDivElement | null>
 }): ReactNode {
   const palette = screen.palette
   const cursor = placedCursor(screen)
@@ -183,6 +191,7 @@ function Grid({
   const name = useId()
   return (
     <div
+      ref={gridRef}
       data-terminal-grid={name}
       data-testid="terminal-grid"
       data-columns={columns}
@@ -254,7 +263,7 @@ export function RawTerminal({
   const host = useRef<HTMLDivElement | null>(null)
   const surface = useRef<HTMLDivElement | null>(null)
   const probe = useRef<HTMLSpanElement | null>(null)
-  const [mode, setMode] = useState<ViewMode>('control')
+  const grid = useRef<HTMLDivElement | null>(null)
   const [zoom, setZoom] = useState(ZOOM_DEFAULT_INDEX)
   const [cell, setCell] = useState<Cell | null>(null)
   const [wheelToApplication, setWheelToApplication] = useState(0)
@@ -296,22 +305,29 @@ export function RawTerminal({
     movingSlow,
     roomNow,
     pan,
-    live
+    control,
+    takeControl,
+    lookAround,
+    toProgram
   } = useTerminalView(port, sessionId, measure)
   const drawnCell = cell ?? UNMEASURED_CELL
   const ended = state?.state === 'ended'
+  const mode = modeOf(control)
   const draggable = mode === 'view' && !ended
 
-  // The drag in progress, and a wheel's part of a cell carried to its next turn. The part of the
-  // drag not sent is drawn on a layer of its own, which only the drag and the changes below touch.
+  // The drag in progress, a wheel's part of a cell carried to its next move of the window, and a
+  // wheel's part of a row carried to its next turn of the program's wheel. The part of the drag not
+  // sent is drawn on a layer of its own, which only the drag and the changes below touch.
   const dragging = useRef<HeldDrag | null>(null)
   const dragLayer = useRef<HTMLDivElement | null>(null)
   const wheelRest = useRef<WheelRest>(WHEEL_AT_REST)
-  // The newest way to move the window, for the wheel's own listener: kept at each commit, so the
-  // wheel never measures a turn in a cell the view has left.
-  const panning = useRef({ pan, roomNow, cell: drawnCell })
+  const turnRest = useRef(0)
+  // The newest way to move the window and to reach the program, for the wheel's own listener: kept
+  // at each commit, so the wheel never measures a turn in a cell the view has left, nor sends one to
+  // a program the view no longer controls.
+  const panning = useRef({ pan, roomNow, cell: drawnCell, frame, control, toProgram })
   useLayoutEffect(() => {
-    panning.current = { pan, roomNow, cell: drawnCell }
+    panning.current = { pan, roomNow, cell: drawnCell, frame, control, toProgram }
   })
 
   /** Draws the part of the drag not sent. */
@@ -345,6 +361,7 @@ export function RawTerminal({
   useLayoutEffect(() => {
     dragging.current = null
     wheelRest.current = WHEEL_AT_REST
+    turnRest.current = 0
     const layer = dragLayer.current
     if (layer !== null) layer.style.transform = ''
   }, [openingKey, mode, ended])
@@ -356,9 +373,15 @@ export function RawTerminal({
     const held = dragging.current
     if (held !== null) dragging.current = restartDrag(held, { width: cellWidth, height: cellHeight })
     wheelRest.current = WHEEL_AT_REST
+    turnRest.current = 0
     const layer = dragLayer.current
     if (layer !== null) layer.style.transform = ''
   }, [cellWidth, cellHeight])
+  // The program starting or stopping to read the wheel takes the part of a row carried towards it.
+  const programWheel = frame?.wheel ?? null
+  useLayoutEffect(() => {
+    turnRest.current = 0
+  }, [programWheel])
 
   // A limit the window reaches takes the wheel's part of a cell toward it as the room is drawn,
   // whatever reached it, so the window leaving the limit before the next turn does not bring it back.
@@ -391,10 +414,11 @@ export function RawTerminal({
     }
   }, [resize, measure])
 
-  // The wheel is read here rather than through a React handler, so that in view mode it can be
-  // cancelled before the page scrolls. In control mode it must reach the program unchanged, so this
-  // neither cancels it nor stops it; in view mode this is the owner and cancels it. The listener is
-  // replaced as a change of mode is committed, so no turn after it is routed by the mode before.
+  // The wheel is read here rather than through a React handler, so that it can be cancelled before
+  // the page scrolls. In control mode it is the program's: turned at the session's cell under the
+  // pointer, once for each row of pixels, while the program reads it, and cancelled then; left to the
+  // page while it does not. In view mode this is the owner and cancels it. The listener is replaced
+  // as a change of mode is committed, so no turn after it is routed by the mode before.
   useLayoutEffect(() => {
     const element = host.current
     if (!element) return
@@ -406,12 +430,30 @@ export function RawTerminal({
         sideways: event.shiftKey
       })
       if (outcome.kind === 'application') {
-        setWheelToApplication((count) => count + 1)
-        void port
-          .terminalInput({ session_id: sessionId, wheel: { lines: outcome.lines } })
-          .catch(() => {
-            // A failed forward is a transport failure; the banner above already says so.
-          })
+        const { cell: at, frame: shown, control: now, toProgram: send } = panning.current
+        if (now?.state !== 'controlling' || shown === null || shown.wheel !== 'reaches') return
+        event.preventDefault()
+        const turned = wheelTurns(turnRest.current, wheelPixels(event, at.height, count(shown.window.rows)), at.height)
+        turnRest.current = turned.rest
+        if (turned.turns === 0) return
+        const drawnGrid = grid.current
+        const under =
+          drawnGrid === null
+            ? null
+            : cellUnder({ x: event.clientX, y: event.clientY }, drawnGrid, element, shown, at)
+        if (under === null) return
+        setWheelToApplication((sent) => sent + 1)
+        void send({
+          kind: 'wheel',
+          column: under.column,
+          line: under.line,
+          turns: turned.turns,
+          shift: event.shiftKey,
+          alt: event.altKey,
+          control: event.ctrlKey
+        }).catch(() => {
+          // A refusal here is control that has just ended, which the view's state says.
+        })
         return
       }
       event.preventDefault()
@@ -443,7 +485,7 @@ export function RawTerminal({
     return () => {
       element.removeEventListener('wheel', onWheel, { capture: true })
     }
-  }, [mode, port, sessionId])
+  }, [mode])
 
   const attachment = state !== null && state.state !== 'ended' ? state.attachment : null
   const presentation = attachment === null ? null : presentationOf(attachment)
@@ -461,27 +503,33 @@ export function RawTerminal({
     y: -shift.down * drawnCell.height
   }
 
+  // What the mode does, in the words of its state, or why control last ended.
+  const sentence =
+    control === null || control.state === 'watching'
+      ? (control?.ended ?? 'Scroll or drag to move around the session. The program gets nothing.')
+      : control.state === 'taking'
+        ? ASKING
+        : ((frame === null ? null : wheelHeldBack(frame.wheel)) ?? 'The program gets the wheel.')
+
   return (
     <section className="raw-terminal" data-testid="raw-terminal" data-mode={mode}>
       <header className="terminal-heading">
         <span className="row">
-          <Segmented
-            label="Pointer mode"
-            value={mode}
-            options={[
-              { value: 'control', label: 'Control' },
-              { value: 'view', label: 'View' }
-            ]}
-            onChange={(next) => {
-              // Control mode shows the program's live screen: a window in the history comes back.
-              if (next === 'control') live()
-              setMode(next)
+          <Badge tone={control?.state === 'controlling' ? 'accent' : 'neutral'} data-testid="terminal-mode">
+            {control?.state === 'controlling' ? 'Control' : control?.state === 'taking' ? 'Taking control…' : 'View'}
+          </Badge>
+          {/* One button whose words change, so the focus stays on it through the take. */}
+          <Button
+            disabled={control === null}
+            onClick={() => {
+              if (mode === 'view') takeControl()
+              else lookAround()
             }}
-          />
-          <span className="small faint">
-            {mode === 'control'
-              ? 'The program in this terminal gets the wheel and the keys.'
-              : 'Scroll or drag to move around the session. The program gets nothing.'}
+          >
+            {mode === 'view' ? 'Take control' : 'Look around'}
+          </Button>
+          <span className="small faint" role="status" data-testid="terminal-mode-sentence">
+            {sentence}
           </span>
         </span>
         {frame ? (
@@ -588,7 +636,9 @@ export function RawTerminal({
             {'M'.repeat(PROBE_CELLS)}
           </span>
           <div ref={dragLayer}>
-            {frame === null ? null : <Grid screen={frame} cell={drawnCell} shift={drawnShift} />}
+            {frame === null ? null : (
+              <Grid screen={frame} cell={drawnCell} shift={drawnShift} gridRef={grid} />
+            )}
           </div>
         </div>
       </div>

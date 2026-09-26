@@ -56,13 +56,16 @@ import type {
   ReviewOutcome,
   SettingsPane,
   SetupIdentity,
+  TerminalControl,
   TerminalGrid,
+  TerminalInput,
   TerminalLine,
   TerminalMove,
   TerminalRoom,
   TerminalScreen,
   TerminalView,
   TerminalViewState,
+  TerminalWheel,
   VoiceCallState,
   VoiceStartRequest,
   Written
@@ -300,10 +303,22 @@ export interface FakeHostControls {
   /**
    * Sets how the host presents raw terminal views opened from now on: directly, as a viewport for
    * `reason`, as a viewport with no reason (which is how a worker built before reasons reports every
-   * viewport), or with null, not as a terminal at all. A view declares no terminal profile, so a
-   * host presents it as a viewport for that reason unless a test says otherwise.
+   * viewport), or with null, not as a terminal at all. A view declares a terminal profile of its own,
+   * which no host has qualified, so a host presents it as a viewport for that reason unless a test
+   * says otherwise.
    */
   presentTerminal(presentation: TerminalPresentationMode | null, reason?: PresentationReason): void
+  /**
+   * Sets whether the program of the raw terminal views opened from now on reads the wheel: it
+   * reports the mouse in an encoding a view writes (as it does unless a test says otherwise), not at
+   * all, or in one a view does not write.
+   */
+  terminalWheel(wheel: TerminalWheel): void
+  /**
+   * Holds the control requests of every raw terminal view opened from now on: a take waits, taking
+   * control, until the test grants or refuses it on the view.
+   */
+  holdTerminalControl(): void
   /** Holds every raw terminal view opened from now on: nothing is published until the test says. */
   holdTerminalViews(): void
   /**
@@ -334,6 +349,19 @@ export interface FakeTerminalView {
   readonly attachment: AttachmentSummary
   /** Every move the page made, in the order it made them. */
   readonly moves: readonly TerminalMove[]
+  /** Every input the page sent that the view took, in the order it sent them. */
+  readonly inputs: readonly TerminalInput[]
+  /** Whether the view controls the program, as native code would say. */
+  readonly control: TerminalControl
+  /** Grants the take in force, as the session would. */
+  grantControl(): void
+  /** Refuses the take in force, for `reason`, as the session would. */
+  refuseControl(reason: string): void
+  /**
+   * Ends control as a refused write would: another view took it, or the program changed how it reads
+   * keys, unless `reason` says otherwise.
+   */
+  loseControl(reason?: string): void
   /** Publishes that it attached, with no screen yet. */
   attach(): void
   /**
@@ -444,7 +472,9 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
   let terminalPresentation: {
     readonly presentation: TerminalPresentationMode | null
     readonly reason: PresentationReason | undefined
-  } = { presentation: 'viewport', reason: 'no_terminal_profile' }
+  } = { presentation: 'viewport', reason: 'unqualified_terminal_profile' }
+  let terminalWheel: TerminalWheel = 'reaches'
+  let holdingTerminalControl = false
   const acknowledged = new Set<string>()
   const deletedArtefacts = new Set<string>()
   const openedPanes: string[] = []
@@ -815,7 +845,11 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
     },
 
     openTerminalView: (sessionId, grid, listener) => {
-      const view = fakeTerminalView(sessionId, grid, listener, terminalPresentation, holdingTerminalMoves)
+      const view = fakeTerminalView(sessionId, grid, listener, terminalPresentation, {
+        holdingMoves: holdingTerminalMoves,
+        holdingControl: holdingTerminalControl,
+        wheel: terminalWheel
+      })
       terminalViews.push(view)
       if (!connected) {
         // Native code publishes the failure on the view's channel; the open itself answers.
@@ -831,10 +865,6 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
         }, 0)
       }
       return terminalOpensAnswer.then(() => view.handle)
-    },
-    terminalInput: (params) => {
-      requireConnection()
-      return Promise.resolve({ accepted: true, sequence: '1', echo: params })
     },
     pairingView: () => Promise.resolve(pairing),
     pairingSetOrigin: (origin) => {
@@ -1308,6 +1338,12 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
     },
     holdTerminalMoves() {
       holdingTerminalMoves = true
+    },
+    terminalWheel(wheel) {
+      terminalWheel = wheel
+    },
+    holdTerminalControl() {
+      holdingTerminalControl = true
     },
     holdTerminalOpens() {
       let answer = () => {}
@@ -1942,31 +1978,73 @@ function fakeTerminalView(
     readonly presentation: TerminalPresentationMode | null
     readonly reason: PresentationReason | undefined
   },
-  holdingMoves = false
+  held: {
+    readonly holdingMoves: boolean
+    readonly holdingControl: boolean
+    readonly wheel: TerminalWheel
+  } = { holdingMoves: false, holdingControl: false, wheel: 'reaches' }
 ): HeldTerminalView {
   terminalViewCount += 1
   const grids: TerminalGrid[] = [grid]
   const moves: TerminalMove[] = []
+  const inputs: TerminalInput[] = []
   let closed = false
   let ended = false
   // Where the window is, and the newest move that put it there.
   let place: TerminalPlace = HOME
   let applied = 0
+  // Control, kept as native code keeps the session's input lease: the page's newest control request,
+  // whether it asks for control and nothing has ended it since, whether the lease is held, whether an
+  // acquire is in flight, and why control last ended or was refused.
+  let asked = 0
+  let wanted = false
+  let leased = false
+  let acquiring = false
+  let endedWhy: string | null = null
+  const controlNow = (): TerminalControl => ({
+    number: asked,
+    state: !wanted ? 'watching' : leased ? 'controlling' : 'taking',
+    ended: endedWhy
+  })
   const attachment: AttachmentSummary = {
     attached_at_ms: String(FAKE_NOW_MS),
     attachment_id: `a77ac4ed-0000-4000-8000-${String(terminalViewCount).padStart(12, '0')}`,
     claim_geometry: false,
     dimensions: { columns: String(grid.columns), rows: String(grid.rows) },
-    granted: ['observe_terminal'],
+    granted: ['observe_terminal', 'input'],
     mode: 'terminal',
     ordinal: String(3 + terminalViewCount),
     presentation: presented.presentation,
     // Left out when there is none, as the host writes it.
     ...(presented.reason === undefined ? {} : { presentation_reason: presented.reason }),
-    terminal_profile_id: null
+    terminal_profile_id: 'kalareach-companion'
   }
+  let last: TerminalViewState | null = null
   const publish = (state: TerminalViewState) => {
-    if (!closed) listener(state)
+    if (closed) return
+    last = state
+    listener(state)
+  }
+  const screenAt = () => ({ ...terminalScreen(sessionId, grids.at(-1) ?? grid, place), wheel: held.wheel })
+  // A change of control is told with the state the page was last sent, once native code's task has
+  // taken the request: after the call that made it has answered, as the view's own channel carries it.
+  const controlChanged = () => {
+    setTimeout(() => {
+      if (last === null || last.state === 'ended' || ended) return
+      publish({ ...last, control: controlNow() })
+    }, 0)
+  }
+  const answerTake = (granted: boolean, reason = '') => {
+    if (!acquiring) return
+    acquiring = false
+    if (!wanted) return
+    if (granted) {
+      leased = true
+    } else {
+      wanted = false
+      endedWhy = `This view cannot take control: ${reason}`
+    }
+    controlChanged()
   }
   return {
     sessionId,
@@ -1980,19 +2058,39 @@ function fakeTerminalView(
     get moves() {
       return moves
     },
+    get inputs() {
+      return inputs
+    },
+    get control() {
+      return controlNow()
+    },
+    grantControl() {
+      answerTake(true)
+    },
+    refuseControl(reason) {
+      answerTake(false, reason)
+    },
+    loseControl(reason = LOST_CONTROL) {
+      if (!leased) return
+      leased = false
+      wanted = false
+      endedWhy = reason
+      controlChanged()
+    },
     attach() {
-      publish({ state: 'waiting', attachment, settled: applied })
+      publish({ state: 'waiting', attachment, settled: applied, control: controlNow() })
     },
     show(screen, settled) {
       publish({
         state: 'showing',
         attachment,
-        screen: { ...terminalScreen(sessionId, grids.at(-1) ?? grid, place), ...screen },
-        settled: settled ?? applied
+        screen: { ...screenAt(), ...screen },
+        settled: settled ?? applied,
+        control: controlNow()
       })
     },
     wait(settled) {
-      publish({ state: 'waiting', attachment, settled: settled ?? applied })
+      publish({ state: 'waiting', attachment, settled: settled ?? applied, control: controlNow() })
     },
     end(reason) {
       ended = true
@@ -2004,7 +2102,7 @@ function fakeTerminalView(
       resize: (next) => {
         grids.push(next)
         // The host holds the window inside what a window of the new size can reach.
-        place = held(sessionId, next, place)
+        place = heldInside(sessionId, next, place)
         return Promise.resolve()
       },
       // Native code applies a move, has the host draw the window there, and says the move is
@@ -2013,7 +2111,7 @@ function fakeTerminalView(
       // drawn for a view that ends before it is sent is never sent.
       move: (next) => {
         moves.push(next)
-        if (!holdingMoves && !closed && !ended && next.number > applied) {
+        if (!held.holdingMoves && !closed && !ended && next.number > applied) {
           place = moved(sessionId, grids.at(-1) ?? grid, place, next)
           applied = next.number
           setTimeout(() => {
@@ -2021,18 +2119,146 @@ function fakeTerminalView(
             publish({
               state: 'showing',
               attachment,
-              screen: terminalScreen(sessionId, grids.at(-1) ?? grid, place),
-              settled: applied
+              screen: screenAt(),
+              settled: applied,
+              control: controlNow()
             })
           }, 0)
         }
         return Promise.resolve()
+      },
+      // Read as native code reads it: anything that is not the view's input shape is refused before
+      // anything happens, and a wheel turn or keys only go while the view controls the program under
+      // the take they name.
+      input: (next) => {
+        const input = readTerminalInput(next)
+        if (typeof input === 'string') return refused('INVALID_ARGUMENT', input)
+        if (closed || ended) return Promise.resolve()
+        switch (input.kind) {
+          case 'take':
+          case 'release': {
+            if (input.number <= asked) return Promise.resolve()
+            asked = input.number
+            wanted = input.kind === 'take'
+            endedWhy = null
+            if (!wanted) leased = false
+            inputs.push(input)
+            controlChanged()
+            if (wanted && !leased && !acquiring) {
+              acquiring = true
+              if (!held.holdingControl) {
+                setTimeout(() => {
+                  answerTake(true)
+                }, 0)
+              }
+            }
+            return Promise.resolve()
+          }
+          case 'wheel':
+          case 'keys':
+            if (!(wanted && leased && input.take === asked)) {
+              return refused('LEASE_LOST', 'This view does not control the program.')
+            }
+            inputs.push(input)
+            return Promise.resolve()
+        }
       },
       close: () => {
         closed = true
         return Promise.resolve()
       }
     }
+  }
+}
+
+/** What native code says when control ends at a write the session refused because the lease moved. */
+export const LOST_CONTROL = 'Control ended: another view took it, or the program changed how it reads keys.'
+
+/** The most wheel turns one input carries, as native code reads it. */
+const MAX_TURNS = 1024
+
+/** The most bytes of keys one input carries: one input frame. */
+const MAX_KEYS_BYTES = 64 * 1024
+
+/** A refusal of a view's handle, as native code rejects with it. */
+function refused(code: string, message: string): Promise<never> {
+  return new Promise((_, reject) => {
+    // eslint-disable-next-line @typescript-eslint/prefer-promise-reject-errors -- a refusal is the data native code rejects with, never an Error
+    reject(new FakeHostError(code, message).toPayload())
+  })
+}
+
+/**
+ * The page's input read as native code reads it, or why it is not the view's input shape: exactly
+ * the fields of its kind, a whole number for each number, and turns and keys within what one input
+ * carries.
+ */
+export function readTerminalInput(value: unknown): TerminalInput | string {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return 'an input is a map'
+  const fields = value as Record<string, unknown>
+  const exactly = (...names: string[]): string | null => {
+    const extra = Object.keys(fields).filter((name) => !names.includes(name))
+    if (extra.length > 0) return `unknown field \`${extra[0] ?? ''}\``
+    const missing = names.filter((name) => !(name in fields))
+    return missing.length > 0 ? `missing field \`${missing[0] ?? ''}\`` : null
+  }
+  const whole = (name: string, highest = Number.MAX_SAFE_INTEGER): number | string => {
+    const number = fields[name]
+    return typeof number === 'number' && Number.isInteger(number) && number >= 0 && number <= highest
+      ? number
+      : `\`${name}\` is not a whole number in range`
+  }
+  const flag = (name: string): boolean | string =>
+    typeof fields[name] === 'boolean' ? fields[name] : `\`${name}\` is not true or false`
+  switch (fields['kind']) {
+    case 'take':
+    case 'release': {
+      const wrong = exactly('kind', 'number')
+      if (wrong !== null) return wrong
+      const number = whole('number')
+      return typeof number === 'string' ? number : { kind: fields['kind'], number }
+    }
+    case 'wheel': {
+      const wrong = exactly('kind', 'take', 'column', 'line', 'turns', 'shift', 'alt', 'control')
+      if (wrong !== null) return wrong
+      const take = whole('take')
+      const column = whole('column', 0xffff_ffff)
+      const line = whole('line', 0xffff_ffff)
+      const turns = fields['turns']
+      const shift = flag('shift')
+      const alt = flag('alt')
+      const control = flag('control')
+      for (const read of [take, column, line, shift, alt, control]) {
+        if (typeof read === 'string') return read
+      }
+      if (typeof turns !== 'number' || !Number.isInteger(turns) || turns === 0 || Math.abs(turns) > MAX_TURNS) {
+        return `a wheel turns between 1 and ${MAX_TURNS} times either way`
+      }
+      return {
+        kind: 'wheel',
+        take: take as number,
+        column: column as number,
+        line: line as number,
+        turns,
+        shift: shift as boolean,
+        alt: alt as boolean,
+        control: control as boolean
+      }
+    }
+    case 'keys': {
+      const wrong = exactly('kind', 'take', 'keys')
+      if (wrong !== null) return wrong
+      const take = whole('take')
+      if (typeof take === 'string') return take
+      const keys = fields['keys']
+      if (typeof keys !== 'string' || keys.length === 0) return 'keys send something'
+      if (new TextEncoder().encode(keys).length > MAX_KEYS_BYTES) {
+        return `keys send at most ${MAX_KEYS_BYTES} bytes at once`
+      }
+      return { kind: 'keys', take, keys }
+    }
+    default:
+      return 'unknown variant: an input is a take, a release, a wheel or keys'
   }
 }
 
@@ -2095,7 +2321,7 @@ function roomOf(session: FakeScreen, grid: TerminalGrid, place: TerminalPlace): 
 }
 
 /** `place`, held inside what a window of `grid` can reach on the session's screen. */
-function held(sessionId: string, grid: TerminalGrid, place: TerminalPlace): TerminalPlace {
+function heldInside(sessionId: string, grid: TerminalGrid, place: TerminalPlace): TerminalPlace {
   const session = fakeScreenOf(sessionId)
   const rows = Math.min(grid.rows, session.rows)
   const columns = Math.min(grid.columns, session.columns)
@@ -2204,7 +2430,9 @@ export function terminalScreen(
       overrides: [{ index: 1, colour: { red: 0xa2, green: 0x35, blue: 0x2e } }]
     },
     degraded: false,
-    replaced: main && place.column === 0 && top <= 3 && top + window.rows > 3 ? 1 : 0
+    replaced: main && place.column === 0 && top <= 3 && top + window.rows > 3 ? 1 : 0,
+    // The session's program reports the mouse in an encoding a view writes.
+    wheel: 'reaches'
   }
 }
 

@@ -91,6 +91,24 @@ describe('the desktop port and a raw terminal view', () => {
       { command: 'terminal_view_close', args: { view: '7' } }
     ])
   })
+
+  it("sends the person's input to the view's own command, in the shape native code reads", async () => {
+    shell.answers.set('terminal_view_open', '7')
+    const view = await tauriPort().openTerminalView(SESSION, { columns: 80, rows: 24 }, () => undefined)
+    const wheel = { kind: 'wheel', take: 1, column: 3, line: 2, turns: -1, shift: false, alt: true, control: false } as const
+    await view.input({ kind: 'take', number: 1 })
+    await view.input(wheel)
+    await view.input({ kind: 'keys', take: 1, keys: '\u001b' })
+    await view.input({ kind: 'release', number: 2 })
+    expect(shell.invoked.slice(1)).toEqual([
+      { command: 'terminal_view_input', args: { view: '7', input: { kind: 'take', number: 1 } } },
+      { command: 'terminal_view_input', args: { view: '7', input: wheel } },
+      { command: 'terminal_view_input', args: { view: '7', input: { kind: 'keys', take: 1, keys: '\u001b' } } },
+      { command: 'terminal_view_input', args: { view: '7', input: { kind: 'release', number: 2 } } }
+    ])
+    // The page names no other way to write to a program.
+    expect('terminalInput' in tauriPort()).toBe(false)
+  })
 })
 
 describe('the desktop port and the connection state', () => {

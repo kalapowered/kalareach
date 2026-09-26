@@ -624,13 +624,12 @@ describe('the raw terminal', () => {
   })
 
   it('gives the wheel to the application in control mode, whatever is held', () => {
+    // The view counts the turns, at the cell under the pointer, and the view takes nothing of it.
     expect(routeWheel('control', { deltaX: 0, deltaY: 48, zoomGesture: false, sideways: false })).toEqual({
-      kind: 'application',
-      lines: 3
+      kind: 'application'
     })
     expect(routeWheel('control', { deltaX: 0, deltaY: 48, zoomGesture: true, sideways: true })).toEqual({
-      kind: 'application',
-      lines: 3
+      kind: 'application'
     })
   })
 

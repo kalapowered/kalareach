@@ -31,6 +31,27 @@ async function openSession(page: Page): Promise<void> {
   await page.getByTestId('conversation').waitFor()
 }
 
+/**
+ * Takes control of the open raw view, as the person does, and waits until the session has given
+ * it: the mode button looks around, and the scripted host holds the view's take.
+ */
+async function takeControl(page: Page): Promise<void> {
+  await page.getByRole('button', { name: 'Take control' }).click()
+  await expect(page.getByRole('button', { name: 'Look around' })).toBeVisible()
+  await expect
+    .poll(async () => page.evaluate(() => window.krTestHost?.terminalViews.at(-1)?.control.state))
+    .toBe('controlling')
+}
+
+/** Every wheel turn and key the newest raw view took for the program, in order. */
+async function programInputs(page: Page) {
+  return page.evaluate(() =>
+    (window.krTestHost?.terminalViews.at(-1)?.inputs ?? []).filter(
+      (input) => input.kind === 'wheel' || input.kind === 'keys'
+    )
+  )
+}
+
 test.describe('the attention inbox', () => {
   test('shows the four states and never calls a lost connection a failure', async ({ page }) => {
     await open(page)
@@ -549,6 +570,8 @@ test.describe('the raw terminal', () => {
     await openSession(page)
     await page.getByRole('tab', { name: 'Terminal' }).click()
     await expect(page.getByTestId('terminal-surface')).toContainText('cargo test -p kr-client')
+    // Text is selected in control mode: in view mode a drag moves the window.
+    await takeControl(page)
     const copied = await page.evaluate(() => {
       const grid = document.querySelector('[data-testid="terminal-grid"]')
       if (grid === null) return null
@@ -583,6 +606,8 @@ test.describe('the raw terminal', () => {
     await openSession(page)
     await page.getByRole('tab', { name: 'Terminal' }).click()
     await expect(page.getByTestId('terminal-surface')).toContainText('cargo test -p kr-client')
+    // Text is selected in control mode: in view mode a drag moves the window.
+    await takeControl(page)
     await page.evaluate(() => {
       window.addEventListener('copy', (event) => {
         Object.assign(window, { krCopied: event.clipboardData?.getData('text/plain') ?? null })
@@ -639,56 +664,54 @@ test.describe('the raw terminal', () => {
     expect((await reported())?.columns).toBe(before.columns)
   })
 
-  test('gives the wheel to the application in control mode and takes it in view mode', async ({
+  test("gives the wheel to the program at the session's cell under the pointer once the person takes control", async ({
     page
   }) => {
     await openSession(page)
     await page.getByRole('tab', { name: 'Terminal' }).click()
     const surface = page.getByTestId('terminal-surface')
-    await expect(page.getByTestId('raw-terminal')).toHaveAttribute('data-mode', 'control')
+    const raw = page.getByTestId('raw-terminal')
+    await expect(surface).toContainText('$ cargo test -p kr-client')
+    // A view opens watching, in view mode: the wheel is the view's, and the program gets nothing.
+    await expect(raw).toHaveAttribute('data-mode', 'view')
+    await expect(page.getByTestId('terminal-mode')).toHaveText('View')
 
-    await surface.hover()
-    await page.mouse.wheel(0, 120)
-    await expect(surface).toHaveAttribute('data-wheel-to-application', '1')
-
-    await page.getByRole('tab', { name: 'View' }).click()
-    await expect(page.getByTestId('raw-terminal')).toHaveAttribute('data-mode', 'view')
-    // Back over the surface first: clicking the tab left the pointer on the header, and a wheel
-    // delivered there would never reach the terminal at all.
-    await surface.hover()
-    // The count standing still says nothing on its own, because it was already standing at one.
-    // This watches the wheel itself instead. The view owns the wheel here and cancels it, and the
-    // path that would have given it to the application returns before anything is cancelled, so a
-    // wheel that was cancelled is a wheel that was not forwarded. This listener sits on the same
-    // element and in the same phase as the view's own, the element that holds the renderer, and was
-    // added after it, so it is called second and reads a decision that has already been made.
-    await surface.evaluate((element) => {
-      const held = window as unknown as { krWheelCancelled?: boolean }
-      held.krWheelCancelled = undefined
-      element.firstElementChild?.addEventListener(
-        'wheel',
-        (event) => {
-          held.krWheelCancelled = event.defaultPrevented
-        },
-        { capture: true, once: true }
-      )
+    // The person takes control, and the program gets the wheel at the cell under the pointer.
+    await takeControl(page)
+    await expect(raw).toHaveAttribute('data-mode', 'control')
+    await expect(page.getByTestId('terminal-mode-sentence')).toHaveText('The program gets the wheel.')
+    const cell = await page.getByTestId('terminal-grid').evaluate((element) => {
+      const box = element.getBoundingClientRect()
+      const style = (element as HTMLElement).style
+      return {
+        x: box.x,
+        y: box.y,
+        width: parseFloat(style.width) / Number(element.getAttribute('data-columns')),
+        height: parseFloat(style.lineHeight)
+      }
     })
-    await page.mouse.wheel(0, 120)
+    // Over the session's column 4 and line 2, three rows of wheel towards the person.
+    await page.mouse.move(cell.x + 4.5 * cell.width, cell.y + 2.5 * cell.height)
+    await page.mouse.wheel(0, 3 * cell.height)
     await expect
-      .poll(
-        async () =>
-          page.evaluate(() => (window as unknown as { krWheelCancelled?: boolean }).krWheelCancelled),
-        { timeout: PRESENTATION_DEADLINE }
+      .poll(async () =>
+        (await programInputs(page)).reduce((sum, input) => sum + (input.kind === 'wheel' ? input.turns : 0), 0)
       )
-      .toBe(true)
-    await expect(surface).toHaveAttribute('data-wheel-to-application', '1')
+      .toBe(3)
+    const turned = await programInputs(page)
+    for (const input of turned) {
+      expect(input).toMatchObject({ kind: 'wheel', take: 1, column: 4, line: 2, shift: false })
+    }
+    await expect(surface).toHaveAttribute('data-wheel-to-application', String(turned.length))
 
-    // And control mode still gives it away, so the count moves when it is meant to.
-    await page.getByRole('tab', { name: 'Control' }).click()
-    await expect(page.getByTestId('raw-terminal')).toHaveAttribute('data-mode', 'control')
-    await surface.hover()
-    await page.mouse.wheel(0, 120)
-    await expect(surface).toHaveAttribute('data-wheel-to-application', '2')
+    // Looking around gives control back at once: the wheel moves the window again, and the program
+    // gets nothing more.
+    await page.getByRole('button', { name: 'Look around' }).click()
+    await expect(raw).toHaveAttribute('data-mode', 'view')
+    await page.mouse.move(cell.x + 4.5 * cell.width, cell.y + 2.5 * cell.height)
+    await page.mouse.wheel(0, -3 * cell.height)
+    await expect(page.getByTestId('terminal-position')).toContainText('Showing the history')
+    expect(await programInputs(page)).toEqual(turned)
     await page.screenshot({ path: shot('terminal-modes-13.18'), fullPage: true })
   })
 })
@@ -739,7 +762,7 @@ test.describe('how the host presents a raw view', () => {
       await page.getByRole('tab', { name: 'Terminal' }).click()
       await expect(page.getByTestId('terminal-surface')).toContainText('$ cargo test -p kr-client')
       await expect(page.getByTestId('terminal-presentation')).toContainText(
-        'its client declared no terminal profile'
+        'the terminal profile its client declared is not one this build has qualified'
       )
       await expect(page.locator('html')).toHaveAttribute('data-theme', theme)
       await page.screenshot({
@@ -792,7 +815,7 @@ test.describe('how the host presents a raw view', () => {
       expect(line.y).toBeGreaterThanOrEqual(pane.y)
       expect(line.y + line.height).toBeLessThanOrEqual(pane.y + pane.height)
       await expect(page.getByTestId('terminal-presentation')).toContainText(
-        'its client declared no terminal profile'
+        'the terminal profile its client declared is not one this build has qualified'
       )
       await expect(page.getByTestId('substituted-count')).toHaveText('1 left blank')
       await expect(page.locator('html')).toHaveAttribute('data-theme', theme)
@@ -814,7 +837,7 @@ test.describe('how the host presents a raw view', () => {
     const before = await page.evaluate(() => window.krTestHost?.terminalViews[0]?.grids.at(-1))
     expect(before?.columns ?? 0).toBeGreaterThan(20)
 
-    await page.getByRole('tab', { name: 'View' }).click()
+    // A view opens in view mode, where the sizes can be pressed.
     for (let step = 0; step < 5; step += 1) await page.getByTestId('zoom-in').click()
     await expect(surface).toContainText('$ cargo test')
     await expect
@@ -1063,7 +1086,7 @@ test.describe("the phone's room for its terminal", () => {
           await page.goto(`/harness.html?surface=${surface}&session=${SESSION_MAIN}`)
           await page.getByRole('tab', { name: 'Terminal' }).click()
           await expect(page.getByTestId('mobile-terminal-line').first()).toContainText('$ cargo')
-          if (mode === 'view') await page.getByRole('button', { name: 'Look around' }).click()
+          if (mode === 'control') await takeControl(page)
           await expectRoom(page, phone.rows, 'with the keyboard down')
           // Nothing in the bar runs past the screen's edge; only the terminal keys scroll sideways.
           const past = await page.evaluate(() =>
@@ -1108,7 +1131,7 @@ test.describe("the phone's room for its terminal", () => {
           await page.goto(`/harness.html?surface=${surface}&session=${SESSION_MAIN}`)
           await page.getByRole('tab', { name: 'Terminal' }).click()
           await expect(page.getByTestId('mobile-terminal-line').first()).toContainText('$ cargo')
-          if (mode === 'view') await page.getByRole('button', { name: 'Look around' }).click()
+          if (mode === 'control') await takeControl(page)
           await page.setViewportSize({ width: phone.width, height: phone.height - phone.keyboard })
           await expectRoom(page, FLOOR, 'on a page the keyboard made shorter')
           // Whole to the pixel: WebKit can leave a scrolled box's last fraction of a pixel out.
@@ -1188,17 +1211,17 @@ test.describe("the phone's room for its terminal", () => {
         await page.goto(`/harness.html?surface=ios&session=${SESSION_MAIN}`)
         await page.getByRole('tab', { name: 'Terminal' }).click()
         await expect(page.getByTestId('mobile-terminal-line').first()).toContainText('$ cargo')
-        await expectRoom(page, phone.rows, 'control mode')
         await expect(page.locator('html')).toHaveAttribute('data-theme', theme)
         const size = `${phone.width}x${phone.height}`
-        await still(page, `terminal-room-13.19-phone-${size}-control-${theme}`)
-        await page.getByRole('button', { name: 'Look around' }).click()
+        // A view opens in view mode.
         await expectRoom(page, phone.rows, 'view mode')
         await still(page, `terminal-room-13.19-phone-${size}-view-${theme}`)
         await page.getByRole('button', { name: 'More' }).click()
         await still(page, `terminal-room-13.19-phone-${size}-view-more-${theme}`)
         await page.getByRole('button', { name: 'Less' }).click()
-        await page.getByRole('button', { name: 'Take control' }).click()
+        await takeControl(page)
+        await expectRoom(page, phone.rows, 'control mode')
+        await still(page, `terminal-room-13.19-phone-${size}-control-${theme}`)
         await keyboard(page, phone.keyboard)
         await expectRoom(page, phone.typing, 'the keyboard up')
         await still(page, `terminal-room-13.19-phone-${size}-keyboard-${theme}`)
@@ -1246,21 +1269,13 @@ test.describe("moving a raw view's window", () => {
     const position = page.getByTestId('terminal-position')
     await expect(surface).toContainText('$ cargo test -p kr-client')
 
-    // Control mode: the program's wheel and nothing else, and a drag moves nothing.
-    await surface.hover()
-    await page.mouse.wheel(0, -120)
-    await expect(surface).toHaveAttribute('data-wheel-to-application', '1')
-    await drag(page, surface, 90)
-    expect(await moves(page)).toBe(0)
-    await expect(position).toHaveText('')
-
-    // View mode: the wheel turned up takes the window into the history, and down brings it back.
-    await page.getByRole('tab', { name: 'View' }).click()
+    // View mode, where a view opens: the wheel turned up takes the window into the history, and down
+    // brings it back. The program gets nothing.
     await surface.hover()
     await page.mouse.wheel(0, -120)
     await expect(position).toContainText('Showing the history')
     await expect(surface).toContainText('$ echo earlier')
-    await expect(surface).toHaveAttribute('data-wheel-to-application', '1')
+    await expect(surface).toHaveAttribute('data-wheel-to-application', '0')
     await page.mouse.wheel(0, 600)
     await expect(position).toHaveText('')
     await expect(surface).toContainText('$ cargo test -p kr-client')
@@ -1271,10 +1286,20 @@ test.describe("moving a raw view's window", () => {
     await expect.poll(async () => moves(page)).toBeGreaterThan(before)
     await expect(position).toContainText('Showing the history')
 
-    // Taking control brings it back to the live screen.
-    await page.getByRole('tab', { name: 'Control' }).click()
+    // Taking control brings it back to the live screen. Then the wheel is the program's, and a drag
+    // moves nothing.
+    await takeControl(page)
     await expect(position).toHaveText('')
     await expect(surface).toContainText('$ cargo test -p kr-client')
+    const moved = await moves(page)
+    // Over a cell of the session's live screen, which the program is told the wheel turned at.
+    await page.getByTestId('terminal-grid').hover({ position: { x: 20, y: 10 } })
+    await page.mouse.wheel(0, -120)
+    await expect(surface).not.toHaveAttribute('data-wheel-to-application', '0')
+    await drag(page, surface, 90)
+    expect(await moves(page)).toBe(moved)
+    await expect(position).toHaveText('')
+    expect((await programInputs(page)).every((input) => input.kind === 'wheel')).toBe(true)
   })
 
   // A zoom step during a drag begins the drag again from where the pointer is: the part of a row it
@@ -1288,7 +1313,6 @@ test.describe("moving a raw view's window", () => {
       await page.getByRole('tab', { name: 'Terminal' }).click()
       const surface = page.getByTestId('terminal-surface')
       await expect(surface).toContainText('$ cargo test -p kr-client')
-      await page.getByRole('tab', { name: 'View' }).click()
       const grid = page.getByTestId('terminal-grid')
       const rowHeight = await grid.evaluate(
         (element) => element.getBoundingClientRect().height / Number(element.getAttribute('data-rows'))
@@ -1328,7 +1352,6 @@ test.describe("moving a raw view's window", () => {
     await page.getByRole('tab', { name: 'Terminal' }).click()
     const surface = page.getByTestId('terminal-surface')
     await expect(surface).toContainText('$ cargo test -p kr-client')
-    await page.getByRole('tab', { name: 'View' }).click()
     await page.evaluate(() => {
       const started = { selections: 0, drags: 0 }
       Object.assign(window, { started })
@@ -1359,13 +1382,15 @@ test.describe("moving a raw view's window", () => {
     await page.getByRole('tab', { name: 'Terminal' }).click()
     const terminal = page.getByTestId('mobile-terminal')
     await expect(page.getByTestId('mobile-terminal-line').first()).toContainText('$ cargo')
-    // Control mode leaves the browser its own way with the text; view mode's text is not selectable,
-    // so neither a press nor a long press starts a selection there.
+    // View mode's text, where a view opens, is not selectable, so neither a press nor a long press
+    // starts a selection there; control mode leaves the browser its own way with the text.
     const selectable = () =>
       terminal.evaluate((element) => {
         const style = getComputedStyle(element)
         return (style.getPropertyValue('user-select') || style.getPropertyValue('-webkit-user-select')) !== 'none'
       })
+    expect(await selectable()).toBe(false)
+    await takeControl(page)
     expect(await selectable()).toBe(true)
     await page.getByRole('button', { name: 'Look around' }).click()
     expect(await selectable()).toBe(false)
@@ -1412,7 +1437,6 @@ test.describe("moving a raw view's window", () => {
       })
       await expect(position).toContainText('Showing columns 1–')
 
-      await page.getByRole('tab', { name: 'View' }).click()
       await surface.hover()
       // Sideways across a session wider than the view, then up into its history.
       await page.mouse.wheel(120, 0)
@@ -1430,7 +1454,6 @@ test.describe("moving a raw view's window", () => {
       await page.getByRole('tab', { name: 'Terminal' }).click()
       const surface = page.getByTestId('terminal-surface')
       await expect(surface).toContainText('$ cargo')
-      await page.getByRole('tab', { name: 'View' }).click()
       await drag(page, surface, 60)
       await expect(page.getByTestId('terminal-position')).toContainText('Showing the history')
       await expect(page.locator('html')).toHaveAttribute('data-theme', theme)
@@ -1444,10 +1467,7 @@ test.describe("moving a raw view's window", () => {
       await page.getByRole('tab', { name: 'Terminal' }).click()
       const terminal = page.getByTestId('mobile-terminal')
       await expect(page.getByTestId('mobile-terminal-line').first()).toContainText('$ cargo')
-      // Control mode: the drag is the program's.
-      await drag(page, terminal, 60)
-      expect(await moves(page)).toBe(0)
-      await page.getByRole('button', { name: 'Look around' }).click()
+      // View mode, where a view opens: the drag moves the window.
       await expect(
         page.getByText('View: drag to move around the session, pinch to make the text larger or smaller.')
       ).toBeVisible()
@@ -1456,11 +1476,61 @@ test.describe("moving a raw view's window", () => {
       await expect(terminal).toContainText('$ echo earlier')
       await expect(page.locator('html')).toHaveAttribute('data-theme', theme)
       await page.screenshot({ path: shotFor(`terminal-pan-08.75-phone-320-${theme}`), fullPage: true })
-      // Taking control brings the window back to the live screen.
-      await page.getByRole('button', { name: 'Take control' }).click()
+      // Taking control brings the window back to the live screen, and a drag then moves nothing.
+      await takeControl(page)
       await expect(page.getByTestId('mobile-terminal-line').first()).toContainText('$ cargo')
+      const moved = await moves(page)
+      await drag(page, terminal, 60)
+      expect(await moves(page)).toBe(moved)
     })
   }
+
+  // KR-REQ-08.76, KR-REQ-13.18: in control mode the phone's one-finger drag turns the program's
+  // wheel, a turn for each row the finger crosses, at the session's cell under the finger, and never
+  // becomes arrow keys.
+  test("the phone's control-mode drag turns the program's wheel at the cell under the finger", async ({ page }) => {
+    await page.setViewportSize({ width: 320, height: 1000 })
+    await page.goto(`/harness.html?surface=ios&session=${SESSION_MAIN}`)
+    await page.getByRole('tab', { name: 'Terminal' }).click()
+    await expect(page.getByTestId('mobile-terminal-line').first()).toContainText('$ cargo')
+    await takeControl(page)
+    const cell = await page.locator('.m-terminal-grid').evaluate((element) => {
+      const box = element.getBoundingClientRect()
+      const style = getComputedStyle(element)
+      const probe = element.querySelector('[aria-hidden="true"]')?.getBoundingClientRect()
+      return {
+        x: box.x + parseFloat(style.paddingLeft),
+        y: box.y + parseFloat(style.paddingTop),
+        width: (probe?.width ?? 0) / 10,
+        height: parseFloat(style.lineHeight) || (probe?.height ?? 0)
+      }
+    })
+    // Down on the session's column 3 and line 6, then up three and a half rows, with the finger.
+    const x = cell.x + 3.5 * cell.width
+    const y = cell.y + 6.5 * cell.height
+    await page.mouse.move(x, y)
+    await page.mouse.down()
+    await page.mouse.move(x, y - 3.5 * cell.height, { steps: 7 })
+    await page.mouse.up()
+    await expect
+      .poll(async () =>
+        (await programInputs(page)).reduce((sum, input) => sum + (input.kind === 'wheel' ? input.turns : 0), 0)
+      )
+      .toBe(3)
+    const turned = await programInputs(page)
+    for (const input of turned) {
+      expect(input).toMatchObject({ kind: 'wheel', take: 1, column: 3 })
+      if (input.kind === 'wheel') {
+        expect(input.line).toBeGreaterThanOrEqual(3)
+        expect(input.line).toBeLessThanOrEqual(5)
+      }
+    }
+    // The finger crossed each row it turned the wheel for: the lines go up with it.
+    const lines = turned.map((input) => (input.kind === 'wheel' ? input.line : -1))
+    expect([...lines].sort((one, other) => other - one)).toEqual(lines)
+    expect(turned.some((input) => input.kind === 'keys')).toBe(false)
+    expect(await moves(page)).toBe(1)
+  })
 })
 
 // KR-REQ-13.19: a window as narrow as a phone. Nothing runs past the window's edge or the
@@ -1650,14 +1720,15 @@ test.describe('a session in a window 320 px wide', () => {
     expect.soft(await runningPast(page.locator('main')), 'what runs past its own box').toEqual([])
     expect.soft(await pastTheTerminal(page), 'what reaches past the terminal').toEqual([])
 
-    // In View mode the heading says something else and the sizes can be pressed; it all still fits.
-    await page.getByRole('tab', { name: 'View' }).click()
-    await expect(page.getByTestId('raw-terminal')).toHaveAttribute('data-mode', 'view')
-    expect.soft(await pageOverflow(page), 'the page in View mode').toBeLessThanOrEqual(1)
+    // In control mode the heading says something else and the moves and sizes cannot be pressed; it
+    // all still fits.
+    await takeControl(page)
+    await expect(page.getByTestId('raw-terminal')).toHaveAttribute('data-mode', 'control')
+    expect.soft(await pageOverflow(page), 'the page in control mode').toBeLessThanOrEqual(1)
     expect
-      .soft(await runningPast(page.locator('main')), 'what runs past its own box in View mode')
+      .soft(await runningPast(page.locator('main')), 'what runs past its own box in control mode')
       .toEqual([])
-    expect.soft(await pastTheTerminal(page), 'what reaches past the terminal in View mode').toEqual([])
+    expect.soft(await pastTheTerminal(page), 'what reaches past the terminal in control mode').toEqual([])
     inReadingOrder(await placed(footer))
   })
 

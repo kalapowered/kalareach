@@ -219,8 +219,9 @@ describe('camera, library and file input (KR-REQ-13.17)', () => {
 
 describe('the raw terminal on a touch screen (KR-REQ-13.18, 13.17)', () => {
   it('gives a one-finger drag to the program while control mode is active', () => {
+    // The view turns the program's wheel as the finger crosses each row, and takes nothing of it.
     const outcome = routeGesture('control', { pointers: 1, deltaX: 0, deltaY: -64, scale: 1 })
-    expect(outcome).toEqual({ kind: 'application', lines: 4 })
+    expect(outcome).toEqual({ kind: 'application' })
   })
 
   it('never pans the view in control mode, however far the finger travels', () => {
@@ -242,10 +243,28 @@ describe('the raw terminal on a touch screen (KR-REQ-13.18, 13.17)', () => {
       kind: 'zoom',
       steps: 1
     })
-    expect(describeMode('view')).toBe(
+  })
+
+  it('says what each state of control does, and why control ended when it did', () => {
+    const watching = { number: 0, state: 'watching', ended: null } as const
+    const taking = { number: 1, state: 'taking', ended: null } as const
+    const controlling = { number: 1, state: 'controlling', ended: null } as const
+    expect(describeMode(watching, 'reaches')).toBe(
       'View: drag to move around the session, pinch to make the text larger or smaller.'
     )
-    expect(describeMode('control')).toBe('Control: your touches go to the program in this terminal.')
+    expect(describeMode(taking, 'reaches')).toBe('Asking the session for control…')
+    expect(describeMode(controlling, 'reaches')).toBe(
+      'Control: your keys and drags go to the program in this terminal.'
+    )
+    expect(describeMode(controlling, 'unreported')).toBe(
+      'Control: your keys go to the program, which is not using the wheel. Look around to scroll.'
+    )
+    expect(describeMode(controlling, 'unwritable')).toBe(
+      'Control: your keys go to the program, which asks for the wheel in a form this view cannot send. Look around to scroll.'
+    )
+    expect(describeMode(controlling, null)).toBe('Control: your keys go to the program in this terminal.')
+    const lost = 'Control ended: another view took it, or the program changed how it reads keys.'
+    expect(describeMode({ number: 1, state: 'watching', ended: lost }, 'reaches')).toBe(lost)
   })
 
   it('zooms in either mode, because nothing on the wire carries a pinch', () => {

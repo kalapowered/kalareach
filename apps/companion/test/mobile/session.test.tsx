@@ -15,7 +15,7 @@ import userEvent from '@testing-library/user-event'
 import type { DocumentNode } from '@kalareach/plugin-sdk'
 
 import { AppProvider } from '../../src/app/state'
-import { fakeHost, terminalScreen, type HeldReads } from '../../src/host/fake'
+import { fakeHost, LOST_CONTROL, terminalScreen, type HeldReads } from '../../src/host/fake'
 import { describeMode } from '../../src/mobile/model/gestures'
 import { MobileSession } from '../../src/mobile/views/MobileSession'
 import { useLifecycle } from '../../src/mobile/useLifecycle'
@@ -211,7 +211,7 @@ describe("the phone's raw terminal view (KR-REQ-08.02, 13.18)", () => {
       expect(piece.style.overflow).toBe('hidden')
     }
     expect(screen.getByTestId('terminal-presentation').textContent).toContain(
-      'its client declared no terminal profile'
+      'the terminal profile its client declared is not one this build has qualified'
     )
     expect(screen.getByTestId('mobile-terminal')).toHaveAttribute('aria-busy', 'false')
   })
@@ -464,6 +464,90 @@ describe("the phone's raw terminal view (KR-REQ-08.02, 13.18)", () => {
     }
   }
 
+  /**
+   * Gives the phone's view what a browser measures: cells of 8 by 16 pixels, a surface 336 by 420
+   * pixels at the page's corner, and inside it the grid with 8 pixels of padding, moved by its own
+   * transform and its drag layer's, as a browser reports a transformed box. Returns what puts them
+   * back.
+   */
+  function laidOutPhone(): () => void {
+    const ownStyle = window.getComputedStyle.bind(window)
+    const rects = vi.spyOn(Element.prototype, 'getBoundingClientRect').mockImplementation(function (
+      this: Element
+    ) {
+      const element = this as HTMLElement
+      const text = element.textContent ?? ''
+      if (element.getAttribute('aria-hidden') === 'true' && /^M+$/.test(text)) {
+        return DOMRect.fromRect({ x: 0, y: 0, width: text.length * 8, height: 16 })
+      }
+      if (element.dataset.testid === 'mobile-terminal') {
+        return DOMRect.fromRect({ x: 0, y: 0, width: 336, height: 420 })
+      }
+      if (element.classList.contains('m-terminal-grid')) {
+        const own = translation(element)
+        const layer = translation(element.parentElement)
+        return DOMRect.fromRect({ x: own.x + layer.x, y: own.y + layer.y, width: 336, height: 420 })
+      }
+      return new DOMRect()
+    })
+    const widths = vi.spyOn(Element.prototype, 'clientWidth', 'get').mockImplementation(function (
+      this: Element
+    ) {
+      return this.getAttribute('data-testid') === 'mobile-terminal' ? 336 : 0
+    })
+    const heights = vi.spyOn(Element.prototype, 'clientHeight', 'get').mockImplementation(function (
+      this: Element
+    ) {
+      return this.getAttribute('data-testid') === 'mobile-terminal' ? 420 : 0
+    })
+    const styles = vi.spyOn(window, 'getComputedStyle').mockImplementation((element, pseudo) =>
+      element.classList.contains('m-terminal-grid')
+        ? ({
+            paddingLeft: '8px',
+            paddingRight: '8px',
+            paddingTop: '8px',
+            paddingBottom: '8px',
+            borderLeftWidth: '0px',
+            borderTopWidth: '0px',
+            lineHeight: '16px',
+            fontSize: '12px'
+          } as CSSStyleDeclaration)
+        : ownStyle(element, pseudo)
+    )
+    return () => {
+      rects.mockRestore()
+      widths.mockRestore()
+      heights.mockRestore()
+      styles.mockRestore()
+    }
+  }
+
+  /** Takes control of the first view, as the person does, and has the session grant it. */
+  async function takeControl(
+    person: ReturnType<typeof userEvent.setup>,
+    controls: ReturnType<typeof fakeHost>['controls']
+  ): Promise<void> {
+    await person.click(screen.getByRole('button', { name: 'Take control' }))
+    // A held take is granted here; one that is not has been, or is granted by itself.
+    act(() => {
+      controls.terminalViews[0]?.grantControl()
+    })
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Look around' })).toBeInTheDocument()
+      expect(controls.terminalViews[0]?.control.state).toBe('controlling')
+    })
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Escape' })).toBeEnabled()
+    })
+  }
+
+  /** Every wheel turn and key the first view took for the program, in order. */
+  function programInputs(controls: ReturnType<typeof fakeHost>['controls']) {
+    return (controls.terminalViews[0]?.inputs ?? []).filter(
+      (input) => input.kind === 'wheel' || input.kind === 'keys'
+    )
+  }
+
   /** One finger's `type` at `x`, `y`, or a mouse's when told. */
   function fingerEvent(type: string, pointerId: number, x: number, y: number, pointerType = 'touch'): PointerEvent {
     return new PointerEvent(type, { bubbles: true, cancelable: true, pointerId, pointerType, clientX: x, clientY: y })
@@ -501,7 +585,6 @@ describe("the phone's raw terminal view (KR-REQ-08.02, 13.18)", () => {
       await waitFor(() => {
         expect(screen.getAllByTestId('mobile-terminal-line').length).toBeGreaterThan(0)
       })
-      await person.click(screen.getByRole('button', { name: 'Look around' }))
       expect(
         screen.getByText('View: drag to move around the session, pinch to make the text larger or smaller.')
       ).toBeInTheDocument()
@@ -532,11 +615,10 @@ describe("the phone's raw terminal view (KR-REQ-08.02, 13.18)", () => {
     try {
       const { port, controls } = fakeHost()
       controls.holdTerminalMoves()
-      const person = await onTerminal(port)
+      await onTerminal(port)
       await waitFor(() => {
         expect(screen.getAllByTestId('mobile-terminal-line').length).toBeGreaterThan(0)
       })
-      await person.click(screen.getByRole('button', { name: 'Look around' }))
       finger('pointerdown', 1, 100, 100)
       // A screen laid out in a larger cell has come and is not yet drawn when the finger crosses a
       // row and a half. Sending the row draws it, and the drag begins again from the finger in the
@@ -560,11 +642,10 @@ describe("the phone's raw terminal view (KR-REQ-08.02, 13.18)", () => {
     try {
       const { port, controls } = fakeHost()
       controls.holdTerminalMoves()
-      const person = await onTerminal(port)
+      await onTerminal(port)
       await waitFor(() => {
         expect(screen.getAllByTestId('mobile-terminal-line').length).toBeGreaterThan(0)
       })
-      await person.click(screen.getByRole('button', { name: 'Look around' }))
       finger('pointerdown', 1, 100, 100)
       finger('pointermove', 1, 100, 108)
       expect(gridShift()).toEqual({ x: 0, y: 8 })
@@ -589,7 +670,6 @@ describe("the phone's raw terminal view (KR-REQ-08.02, 13.18)", () => {
       await waitFor(() => {
         expect(screen.getAllByTestId('mobile-terminal-line').length).toBeGreaterThan(0)
       })
-      await person.click(screen.getByRole('button', { name: 'Look around' }))
       // A row and a half down; control is taken with the finger still down, and then it lifts.
       finger('pointerdown', 1, 100, 100)
       finger('pointermove', 1, 100, 124)
@@ -623,12 +703,10 @@ describe("the phone's raw terminal view (KR-REQ-08.02, 13.18)", () => {
     try {
       const { port, controls } = fakeHost()
       controls.holdTerminalMoves()
-      const typed = vi.spyOn(port, 'terminalInput')
       const person = await onTerminal(port)
       await waitFor(() => {
         expect(screen.getAllByTestId('mobile-terminal-line').length).toBeGreaterThan(0)
       })
-      await person.click(screen.getByRole('button', { name: 'Look around' }))
       finger('pointerdown', 1, 100, 100)
       finger('pointermove', 1, 100, 124)
       await person.click(screen.getByRole('button', { name: 'Take control' }))
@@ -638,7 +716,7 @@ describe("the phone's raw terminal view (KR-REQ-08.02, 13.18)", () => {
         { number: 1, across: 0, down: -1 },
         { number: 2, live: true }
       ])
-      expect(typed).not.toHaveBeenCalled()
+      expect(programInputs(controls)).toEqual([])
 
       // Look around, drag half a row, and take control and look around again without the finger
       // moving: the drag is over, and what it had not sent is gone.
@@ -656,7 +734,7 @@ describe("the phone's raw terminal view (KR-REQ-08.02, 13.18)", () => {
         { number: 2, live: true },
         { number: 3, live: true }
       ])
-      expect(typed).not.toHaveBeenCalled()
+      expect(programInputs(controls)).toEqual([])
     } finally {
       restore()
     }
@@ -669,12 +747,12 @@ describe("the phone's raw terminal view (KR-REQ-08.02, 13.18)", () => {
     await waitFor(() => {
       expect(screen.getAllByTestId('mobile-terminal-line').length).toBeGreaterThan(0)
     })
-    expect(screen.queryByRole('button', { name: 'Move the window up' })).toBeNull()
-    await person.click(screen.getByRole('button', { name: 'Look around' }))
     const up = screen.getByRole('button', { name: 'Move the window up' })
     expect(screen.getByRole('button', { name: 'Move the window down' })).toBeDisabled()
     await person.click(up)
     expect(controls.terminalViews[0]?.moves).toEqual([{ number: 1, across: 0, down: -8 }])
+    await person.click(screen.getByRole('button', { name: 'Take control' }))
+    expect(screen.queryByRole('button', { name: 'Move the window up' })).toBeNull()
   })
 
   it("takes a press in view mode from the browser, so it starts no selection or native drag, and leaves control mode's alone", async () => {
@@ -692,39 +770,145 @@ describe("the phone's raw terminal view (KR-REQ-08.02, 13.18)", () => {
     }
     const dragOfText = () => new Event('dragstart', { bubbles: true, cancelable: true })
     const line = () => screen.getAllByTestId('mobile-terminal-line')[0] ?? document.body
-    // Control mode: the press and a drag of selected text are the browser's, as before.
-    expect(kept(fingerEvent('pointerdown', 1, 100, 100, 'mouse'))).toBe(false)
-    kept(fingerEvent('pointerup', 1, 100, 100, 'mouse'))
-    expect(kept(dragOfText(), line())).toBe(false)
-    // View mode: a press of a finger or a mouse, and a drag of text selected before, are the view's.
-    await person.click(screen.getByRole('button', { name: 'Look around' }))
+    // View mode, where a view opens: a press of a finger or a mouse, and a drag of text selected
+    // before, are the view's.
     expect(kept(fingerEvent('pointerdown', 2, 100, 100, 'mouse'))).toBe(true)
     kept(fingerEvent('pointerup', 2, 100, 100, 'mouse'))
     expect(kept(fingerEvent('pointerdown', 3, 100, 100))).toBe(true)
     kept(fingerEvent('pointerup', 3, 100, 100))
     expect(kept(dragOfText(), line())).toBe(true)
+    // Control mode: the press and a drag of selected text are the browser's, as before.
+    await person.click(screen.getByRole('button', { name: 'Take control' }))
+    expect(kept(fingerEvent('pointerdown', 1, 100, 100, 'mouse'))).toBe(false)
+    kept(fingerEvent('pointerup', 1, 100, 100, 'mouse'))
+    expect(kept(dragOfText(), line())).toBe(false)
   })
 
-  it('gives a one-finger drag to the program in control mode and moves nothing', async () => {
-    const restore = measured()
+  it("turns the program's wheel with a one-finger drag in control mode, a turn a row at the cell under the finger", async () => {
+    const restore = laidOutPhone()
     try {
       const { port, controls } = fakeHost()
-      const sent = vi.spyOn(port, 'terminalInput')
-      await onTerminal(port)
+      const person = await onTerminal(port)
       await waitFor(() => {
         expect(screen.getAllByTestId('mobile-terminal-line').length).toBeGreaterThan(0)
       })
-      finger('pointerdown', 1, 100, 164)
-      finger('pointermove', 1, 100, 100)
-      finger('pointerup', 1, 100, 100)
-      await waitFor(() => {
-        expect(sent).toHaveBeenCalled()
-      })
-      expect(controls.terminalViews[0]?.moves).toEqual([])
+      await takeControl(person, controls)
+      // The grid's content box starts 8 pixels in, in cells of 8 by 16: the finger goes down on
+      // column 5 of row 6, crosses a row up, then another and a half, then back down past its start.
+      finger('pointerdown', 1, 49, 105)
+      finger('pointermove', 1, 49, 89)
+      finger('pointermove', 1, 49, 65)
+      finger('pointermove', 1, 49, 125)
+      finger('pointerup', 1, 49, 125)
+      expect(programInputs(controls)).toEqual([
+        { kind: 'wheel', take: 1, column: 5, line: 5, turns: 1, shift: false, alt: false, control: false },
+        { kind: 'wheel', take: 1, column: 5, line: 3, turns: 1, shift: false, alt: false, control: false },
+        { kind: 'wheel', take: 1, column: 5, line: 7, turns: -3, shift: false, alt: false, control: false }
+      ])
+      // Nothing of it was an arrow key, and nothing moved the window.
+      expect(programInputs(controls).some((input) => input.kind === 'keys')).toBe(false)
+      expect(controls.terminalViews[0]?.moves).toEqual([{ number: 1, live: true }])
       expect(gridShift()).toEqual({ x: 0, y: 0 })
+
+      // A tap sends nothing; nor do the rows a finger crosses outside the grid, and a cancelled
+      // drag or a second finger ends the turning.
+      finger('pointerdown', 2, 49, 105)
+      finger('pointermove', 2, 49, 110)
+      finger('pointerup', 2, 49, 110)
+      finger('pointerdown', 3, 49, 105)
+      finger('pointermove', 3, 49, 500)
+      finger('pointercancel', 3, 49, 500)
+      finger('pointerdown', 4, 49, 105)
+      finger('pointerdown', 5, 200, 105)
+      finger('pointermove', 4, 49, 40)
+      finger('pointerup', 5, 200, 105)
+      finger('pointerup', 4, 49, 40)
+      expect(programInputs(controls)).toHaveLength(3)
     } finally {
       restore()
     }
+  })
+
+  it('sends nothing while the program does not use the wheel, and says so', async () => {
+    const restore = laidOutPhone()
+    try {
+      const { port, controls } = fakeHost()
+      controls.terminalWheel('unreported')
+      const person = await onTerminal(port)
+      await waitFor(() => {
+        expect(screen.getAllByTestId('mobile-terminal-line').length).toBeGreaterThan(0)
+      })
+      await takeControl(person, controls)
+      expect(
+        screen.getByText('Control: your keys go to the program, which is not using the wheel. Look around to scroll.')
+      ).toBeInTheDocument()
+      finger('pointerdown', 1, 49, 105)
+      finger('pointermove', 1, 49, 40)
+      finger('pointerup', 1, 49, 40)
+      expect(programInputs(controls)).toEqual([])
+      expect(controls.terminalViews[0]?.moves).toEqual([{ number: 1, live: true }])
+    } finally {
+      restore()
+    }
+  })
+
+  it('keeps the terminal keys for control: disabled while the view watches, sent under the take while it controls', async () => {
+    const { port, controls } = fakeHost()
+    controls.holdTerminalControl()
+    const person = await onTerminal(port)
+    await waitFor(() => {
+      expect(screen.getAllByTestId('mobile-terminal-line').length).toBeGreaterThan(0)
+    })
+    const escape = () => screen.getByRole('button', { name: 'Escape' })
+    const field = screen.getByLabelText('Message this session')
+    // Watching: the keys wait for control, and the field keeps its own keys.
+    expect(escape()).toBeDisabled()
+    field.focus()
+    await person.keyboard('{ArrowUp}')
+    expect(programInputs(controls)).toEqual([])
+    // Taking: still nothing reaches the program.
+    await person.click(screen.getByRole('button', { name: 'Take control' }))
+    expect(screen.getByText('Asking the session for control…')).toBeInTheDocument()
+    expect(escape()).toBeDisabled()
+    act(() => {
+      controls.terminalViews[0]?.grantControl()
+    })
+    await waitFor(() => {
+      expect(escape()).toBeEnabled()
+    })
+    await person.click(escape())
+    field.focus()
+    await person.keyboard('{ArrowUp}')
+    expect(programInputs(controls)).toEqual([
+      { kind: 'keys', take: 1, keys: '\u001b' },
+      { kind: 'keys', take: 1, keys: '\u001b[A' }
+    ])
+    expect(screen.getByText('Control: your keys and drags go to the program in this terminal.')).toBeInTheDocument()
+  })
+
+  it('returns to view mode when control ends, says why, and moves focus from a key that can no longer be pressed', async () => {
+    const { port, controls } = fakeHost()
+    const person = await onTerminal(port)
+    await waitFor(() => {
+      expect(screen.getAllByTestId('mobile-terminal-line').length).toBeGreaterThan(0)
+    })
+    await takeControl(person, controls)
+    const escape = screen.getByRole('button', { name: 'Escape' })
+    escape.focus()
+    expect(escape).toHaveFocus()
+    act(() => {
+      controls.terminalViews[0]?.loseControl()
+    })
+    expect(await screen.findByText(LOST_CONTROL)).toBeInTheDocument()
+    expect(escape).toBeDisabled()
+    const mode = screen.getByRole('button', { name: 'Take control' })
+    expect(mode).toHaveFocus()
+    expect(screen.getByRole('button', { name: 'Move the window up' })).toBeInTheDocument()
+    // Asking again clears the words.
+    await person.click(mode)
+    await waitFor(() => {
+      expect(screen.queryByText(LOST_CONTROL)).toBeNull()
+    })
   })
 
   it('folds the composer to one line with Send beside it while the terminal shows, and leaves the picker to the conversation', async () => {
@@ -836,7 +1020,7 @@ describe("the phone's raw terminal view (KR-REQ-08.02, 13.18)", () => {
     // host's presentation.
     expect(status).toContainElement(screen.getByTestId('substituted-count'))
     expect(status).toContainElement(screen.getByTestId('terminal-presentation'))
-    expect(status?.textContent).toContain(describeMode('control'))
+    expect(status?.textContent).toContain(describeMode({ number: 0, state: 'watching', ended: null }, 'reaches'))
 
     await person.click(more)
     expect(screen.getByRole('button', { name: 'Less' })).toHaveAttribute('aria-expanded', 'true')
@@ -846,34 +1030,48 @@ describe("the phone's raw terminal view (KR-REQ-08.02, 13.18)", () => {
   })
 
   it('keeps its controls in keyboard order: the mode, the moves, the status, the keys and the field, with Send after it', async () => {
-    const { port } = fakeHost()
+    const { port, controls } = fakeHost()
     const person = await onTerminal(port)
     await waitFor(() => {
       expect(screen.getAllByTestId('mobile-terminal-line')).toHaveLength(8)
     })
-    await person.click(screen.getByRole('button', { name: 'Look around' }))
     await person.type(screen.getByLabelText('Message this session'), 'ls')
-    screen.getByRole('button', { name: 'Take control' }).focus()
-    const reached: string[] = []
-    for (let step = 0; step < 24; step += 1) {
-      await person.tab()
-      const focused = document.activeElement
-      reached.push(
-        focused?.tagName === 'TEXTAREA'
-          ? 'the field'
-          : (focused?.getAttribute('aria-label') ?? focused?.textContent ?? '')
-      )
+    /** The names of the controls Tab reaches from `start`, in order. */
+    const tabbing = async (start: HTMLElement): Promise<string[]> => {
+      start.focus()
+      const reached: string[] = []
+      for (let step = 0; step < 24; step += 1) {
+        await person.tab()
+        const focused = document.activeElement
+        reached.push(
+          focused?.tagName === 'TEXTAREA'
+            ? 'the field'
+            : (focused?.getAttribute('aria-label') ?? focused?.textContent ?? '')
+        )
+      }
+      return reached
     }
-    const at = (name: string) => reached.indexOf(name)
-    expect(at('Move the window up')).toBe(0)
-    expect(at('More')).toBeGreaterThan(at('Move the window up'))
-    expect(at('Escape')).toBe(at('More') + 1)
-    expect(at('the field')).toBeGreaterThan(at('Escape'))
-    // The field gives Tab to the program, so Send is found as the next control after the field
-    // in the order a keyboard moves through the page.
+    // Watching: the mode, the moves, the status and the field, and Tab goes on from the field to
+    // Send. The keys wait for control, out of the way.
+    const watching = await tabbing(screen.getByRole('button', { name: 'Take control' }))
+    const at = (reached: string[], name: string) => reached.indexOf(name)
+    expect(at(watching, 'Move the window up')).toBe(0)
+    expect(at(watching, 'More')).toBeGreaterThan(at(watching, 'Move the window up'))
+    expect(at(watching, 'Escape')).toBe(-1)
+    expect(at(watching, 'the field')).toBe(at(watching, 'More') + 1)
+    expect(at(watching, 'Send')).toBe(at(watching, 'the field') + 1)
+
+    // Controlling: the mode, the status, the keys and the field.
+    await takeControl(person, controls)
+    const controlling = await tabbing(screen.getByRole('button', { name: 'Look around' }))
+    expect(at(controlling, 'More')).toBe(0)
+    expect(at(controlling, 'Escape')).toBe(at(controlling, 'More') + 1)
+    expect(at(controlling, 'the field')).toBeGreaterThan(at(controlling, 'Escape'))
+    // The field gives Tab to the program while the view controls it, so Send is found as the next
+    // control after the field in the order a keyboard moves through the page.
     const field = screen.getByLabelText('Message this session')
-    const controls = Array.from(document.querySelectorAll<HTMLElement>('button:not([disabled]), textarea'))
-    expect(controls[controls.indexOf(field) + 1]).toBe(screen.getByRole('button', { name: 'Send' }))
+    const enabled = Array.from(document.querySelectorAll<HTMLElement>('button:not([disabled]), textarea'))
+    expect(enabled[enabled.indexOf(field) + 1]).toBe(screen.getByRole('button', { name: 'Send' }))
   })
 
   it('ends with the host words and attaches again when asked', async () => {

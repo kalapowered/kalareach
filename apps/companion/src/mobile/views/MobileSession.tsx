@@ -6,16 +6,18 @@
  * something and waits for a receipt before it says anything was applied, because a request that
  * reached the host is not a prompt the agent took.
  *
- * The terminal view is the one with a rule in it. In control mode the program inside the terminal
- * owns the touch, exactly as it owns the wheel on a desktop. Only a pinch zooms, because nothing on
- * the wire carries a pinch, so zooming takes nothing from anyone. In view mode a one-finger drag
+ * The terminal view is the one with a rule in it. It opens in view mode, where a one-finger drag
  * moves the window across the session, up into its history and down its live screen: the screen
  * follows the finger, and comes to rest on the screen the host draws for the window's new place.
- * Taking control brings a window in the history back to the live screen. A finger that is down
- * when the view changes under it, another opening, mode or life, counts for nothing until it lifts.
- * In view mode a press is the view's alone: whatever the page has selected, the browser starts no
- * selection and no native drag of its own, so a drag always moves the window. Control mode leaves
- * the browser its own way with the text.
+ * Control mode is the person's own take of the session's input, labelled as that, and brings a
+ * window in the history back to the live screen. Then the program owns the touch, exactly as it owns
+ * the wheel on a desktop: a one-finger drag turns its wheel once for each row the finger crosses, at
+ * the session's cell under the finger, while it reads the wheel, and the terminal keys and the
+ * field's named keys reach it. Only a pinch zooms, because nothing on the wire carries a pinch, so
+ * zooming takes nothing from anyone. A finger that is down when the view changes under it, another
+ * opening, mode or life, counts for nothing until it lifts. In view mode a press is the view's alone:
+ * whatever the page has selected, the browser starts no selection and no native drag of its own, so
+ * a drag always moves the window. Control mode leaves the browser its own way with the text.
  */
 
 import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
@@ -43,11 +45,13 @@ import {
   failed
 } from '../../model/receipts'
 import { renderMarkdown } from '../../markdown/render'
-import type { TerminalGrid, TerminalRoom, TerminalScreen } from '../../host/port'
+import type { TerminalGrid, TerminalRoom, TerminalScreen, TerminalWheel } from '../../host/port'
 import { leftBlankOnPhone, stretchesOf, styleOf } from '../../terminal/cells'
 import { selectionRule } from '../../terminal/frame'
+import { cellUnder, dragRows, heldTurns, type TerminalCell } from '../../terminal/input'
 import {
   ATTACHING,
+  modeOf,
   placeOf,
   presentationOf,
   WAITING,
@@ -133,13 +137,13 @@ export function MobileSession({
   } | null>(null)
   const read = conversation?.sessionId === sessionId ? conversation : null
   const nodes = read?.nodes ?? []
-  const [mode, setMode] = useState<ViewMode>('control')
   const [zoom, setZoom] = useState(ZOOM_DEFAULT_INDEX)
   const [latch, setLatch] = useState<Latch>(NO_LATCH)
   const [busy, setBusy] = useState(false)
   // Whether the terminal's status shows all it says, rather than its first two lines.
   const [statusOpen, setStatusOpen] = useState(false)
   const statusId = useId()
+  const modeButtonId = useId()
   // Whether a software keyboard hides part of the session.
   const [keyboardUp, setKeyboardUp] = useState(false)
   const sessionRef = useRef<HTMLDivElement | null>(null)
@@ -238,8 +242,13 @@ export function MobileSession({
     movingSlow,
     roomNow,
     pan,
-    live
+    control,
+    takeControl,
+    lookAround,
+    toProgram
   } = useTerminalView(port, sessionId, measure, pane === 'terminal')
+  const mode = modeOf(control)
+  const controlling = control?.state === 'controlling'
   const terminalAttachmentSummary =
     terminal !== null && terminal.state !== 'ended' ? terminal.attachment : null
   const presented =
@@ -369,14 +378,31 @@ export function MobileSession({
     [draft, lifecycle, port, say, sessionId]
   )
 
+  // Keys reach the program only while the view controls it, under the take it controls it with. A
+  // refusal of control that has just ended is said by the view's own state; any other is said here.
   const sendKeys = useCallback(
-    (bytes: string) => {
-      ask(() => port.terminalInput({ session_id: sessionId, bytes })).catch((failure: unknown) => {
-        say(failureMessage(failure), 'danger')
+    (keys: string) => {
+      toProgram({ kind: 'keys', keys }).catch((failure: unknown) => {
+        if (failureCode(failure) !== 'LEASE_LOST') say(failureMessage(failure), 'danger')
       })
     },
-    [port, say, sessionId]
+    [say, toProgram]
   )
+
+  // Focus that was on a terminal key when control ends goes to the mode button, which takes control
+  // again: a key that can no longer be pressed is no place to leave it.
+  const lastFocused = useRef<Element | null>(null)
+  const wasControlling = useRef(controlling)
+  useLayoutEffect(() => {
+    if (wasControlling.current && !controlling) {
+      const onKey = (element: Element | null) => element?.closest('.m-accessory') != null
+      const active = document.activeElement
+      if (onKey(active) || ((active === null || active === document.body) && onKey(lastFocused.current))) {
+        document.getElementById(modeButtonId)?.focus()
+      }
+    }
+    wasControlling.current = controlling
+  }, [controlling, modeButtonId])
 
   const mine = lifecycle.state.submissions.filter((submission) =>
     isForSession(submission.localId, sessionId)
@@ -405,7 +431,8 @@ export function MobileSession({
         setDraft(edit(draft, event.target.value, Date.now()))
       }}
       onKeyDown={(event) => {
-        if (pane !== 'terminal') return
+        // The field sends the program its named keys only while the view controls it.
+        if (pane !== 'terminal' || !controlling) return
         const bytes = sequenceForKeyPress(event)
         if (bytes === null) return
         // A hardware keyboard drives the terminal directly; the field is only where the
@@ -548,8 +575,20 @@ export function MobileSession({
               onZoom={(steps) => {
                 setZoom((index) => zoomBy(index, steps))
               }}
-              onApplicationScroll={(lines) => {
-                sendKeys(lines > 0 ? '\u001b[A'.repeat(Math.min(10, lines)) : '\u001b[B'.repeat(Math.min(10, -lines)))
+              controlling={controlling}
+              programWheel={frame?.wheel ?? null}
+              onProgramWheel={(at, turns) => {
+                toProgram({
+                  kind: 'wheel',
+                  column: at.column,
+                  line: at.line,
+                  turns,
+                  shift: false,
+                  alt: false,
+                  control: false
+                }).catch(() => {
+                  // A refusal here is control that has just ended, which the view's state says.
+                })
               }}
             />
           </>
@@ -558,26 +597,34 @@ export function MobileSession({
 
       <div className="m-composer">
         {/* One child, so a composer taller than the room it has scrolls with its bottom in view. */}
-        <div className="m-composer-body">
+        <div
+          className="m-composer-body"
+          onFocus={(event) => {
+            lastFocused.current = event.target
+          }}
+        >
           {pane === 'terminal' ? (
             <>
               <div className="m-terminal-hud">
                 <div className="m-terminal-controls">
-                  <Badge tone={mode === 'control' ? 'accent' : 'neutral'}>
-                    {mode === 'control' ? 'Control' : 'View'}
+                  <Badge tone={controlling ? 'accent' : 'neutral'}>
+                    {controlling ? 'Control' : control?.state === 'taking' ? 'Taking control…' : 'View'}
                   </Badge>
+                  {/* One button whose words change, so the focus stays on it through the take. */}
                   <Button
+                    id={modeButtonId}
+                    disabled={control === null}
                     onClick={() => {
-                      // Taking control shows the program's live screen: a window in the history comes back.
-                      if (mode === 'view') live()
-                      setMode(mode === 'control' ? 'view' : 'control')
+                      if (mode === 'view') takeControl()
+                      else lookAround()
                     }}
                   >
                     {mode === 'control' ? 'Look around' : 'Take control'}
                   </Button>
                   <span>{`Zoom ${Math.round((ZOOM_STEPS[zoom] ?? 1) * 100)}%`}</span>
                   {mode === 'view' ? (
-                    <span className="row" role="group" aria-label="Move the window">
+                    // With larger text the four wrap onto a second line rather than run off the screen.
+                    <span className="row" role="group" aria-label="Move the window" style={{ flexWrap: 'wrap' }}>
                       {PAGE_MOVES.map((move) => (
                         <Button
                           key={move.name}
@@ -617,7 +664,9 @@ export function MobileSession({
                       </p>
                     ) : null}
                     <p>
-                      <span>{describeMode(mode)}</span>{' '}
+                      <span role="status">
+                        {describeMode(control ?? { number: 0, state: 'watching', ended: null }, frame?.wheel ?? null)}
+                      </span>{' '}
                       {terminal === null ? (
                         <span data-testid="terminal-presentation" data-presentation="attaching">
                           {ATTACHING}
@@ -643,6 +692,7 @@ export function MobileSession({
               <AccessoryRow
                 surface={surface}
                 latch={latch}
+                disabled={!controlling}
                 onKey={(key) => {
                   if (key.modifier) {
                     setLatch((current) => pressModifier(current, key.modifier as 'ctrl' | 'alt' | 'shift'))
@@ -775,7 +825,9 @@ function RawTerminal({
   mode,
   zoom,
   onZoom,
-  onApplicationScroll
+  controlling,
+  programWheel,
+  onProgramWheel
 }: {
   readonly screen: TerminalScreen | null
   readonly busy: boolean
@@ -791,7 +843,12 @@ function RawTerminal({
   readonly mode: ViewMode
   readonly zoom: number
   readonly onZoom: (steps: number) => void
-  readonly onApplicationScroll: (lines: number) => void
+  /** Whether the view controls the program, so a drag in control mode turns its wheel. */
+  readonly controlling: boolean
+  /** Whether a wheel turn reaches the program, or null with no screen. */
+  readonly programWheel: TerminalWheel | null
+  /** Turns the program's wheel `turns` times at the session's cell `at`. */
+  readonly onProgramWheel: (at: TerminalCell, turns: number) => void
 }): ReactNode {
   // The fingers down in the gesture in progress, each where it is now. An event of any other finger
   // belongs to no gesture and is ignored.
@@ -803,6 +860,9 @@ function RawTerminal({
   // its own, which only the drag and the changes below touch.
   const dragging = useRef<HeldDrag | null>(null)
   const dragLayer = useRef<HTMLDivElement | null>(null)
+  // The one-finger drag in control mode, which turns the program's wheel: its finger, where it began
+  // counting rows from, the rows it has counted, and where the finger is.
+  const turning = useRef<{ pointer: number; origin: number; counted: number; last: Point } | null>(null)
   // One cell in pixels, measured once laid out at each zoom and screen, for drawing the shift.
   const [cell, setCell] = useState<CellSize | null>(null)
   useLayoutEffect(() => {
@@ -847,6 +907,7 @@ function RawTerminal({
     pointers.current.clear()
     start.current = null
     dragging.current = null
+    turning.current = null
     const layer = dragLayer.current
     if (layer !== null) layer.style.transform = ''
   }, [openingKey, mode, ended])
@@ -864,6 +925,12 @@ function RawTerminal({
     const layer = dragLayer.current
     if (layer !== null) layer.style.transform = ''
   }, [cellWidth, cellHeight])
+  // A new cell size, or the program starting or stopping to read the wheel: a drag turning its wheel
+  // counts again from where the finger is, and the part of a row it had is dropped.
+  useLayoutEffect(() => {
+    const held = turning.current
+    if (held !== null) turning.current = { ...held, origin: held.last.y, counted: 0 }
+  }, [cellWidth, cellHeight, programWheel])
 
   /** Takes the gesture's origin again from the fingers that are still down. */
   const rebase = () => {
@@ -888,6 +955,7 @@ function RawTerminal({
     if (!pointers.current.delete(pointer)) return
     rebase()
     if (dragging.current?.pointer === pointer) dropDrag()
+    if (turning.current?.pointer === pointer) turning.current = null
   }
 
   const gestureFrom = (event: React.PointerEvent): TouchGesture => {
@@ -933,17 +1001,37 @@ function RawTerminal({
         event.currentTarget.setPointerCapture(event.pointerId)
         pointers.current.set(event.pointerId, { x: event.clientX, y: event.clientY })
         rebase()
-        // One finger in view mode drags the window; a second one ends the drag and pinches.
+        // One finger in view mode drags the window, and one in control mode turns the program's
+        // wheel; a second one ends either and pinches.
+        const at = { x: event.clientX, y: event.clientY }
         if (pointers.current.size === 1 && draggable && cell !== null) {
-          const at = { x: event.clientX, y: event.clientY }
           dragging.current = { pointer: event.pointerId, drag: beginDrag(at), cell, last: at }
-        } else if (dragging.current !== null) {
-          dropDrag()
+        } else if (pointers.current.size === 1 && mode === 'control' && controlling) {
+          turning.current = { pointer: event.pointerId, origin: at.y, counted: 0, last: at }
+        } else {
+          if (dragging.current !== null) dropDrag()
+          turning.current = null
         }
       }}
       onPointerMove={(event) => {
         if (!pointers.current.has(event.pointerId)) return
         pointers.current.set(event.pointerId, { x: event.clientX, y: event.clientY })
+        const turned = turning.current
+        if (turned !== null && turned.pointer === event.pointerId) {
+          // A turn for each row the finger has crossed since the last, sent at the session's cell
+          // under the finger now. Rows it crosses where no cell of the live screen is are dropped.
+          const at = { x: event.clientX, y: event.clientY }
+          const rows = cell === null ? turned.counted : dragRows(turned.origin, at.y, cell.height)
+          turning.current = { ...turned, counted: rows, last: at }
+          const turns = heldTurns(rows - turned.counted)
+          const surface = surfaceRef.current
+          const grid = probeRef.current?.parentElement
+          if (turns === 0 || programWheel !== 'reaches' || screen === null || cell === null) return
+          if (surface == null || grid == null) return
+          const under = cellUnder(at, grid, surface, screen, cell)
+          if (under !== null) onProgramWheel(under, turns)
+          return
+        }
         const held = dragging.current
         if (held === null || held.pointer !== event.pointerId) return
         const room = roomNow()
@@ -975,9 +1063,10 @@ function RawTerminal({
           sendDragged(releaseDrag(held.drag, { x: event.clientX, y: event.clientY }, held.cell, room))
           return
         }
+        // A finger turning the program's wheel sends nothing more as it lifts: a part of a row is no
+        // turn, so a tap sends nothing.
+        if (turning.current?.pointer === event.pointerId) turning.current = null
         if (outcome.kind === 'zoom') onZoom(outcome.steps)
-        // In control mode the movement was the program's, so it is handed over rather than used.
-        if (outcome.kind === 'application' && outcome.lines !== 0) onApplicationScroll(outcome.lines)
       }}
       onPointerCancel={(event) => {
         forget(event.pointerId)

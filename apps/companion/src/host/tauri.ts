@@ -192,10 +192,11 @@ export function tauriPort(): HostPort {
               ? { view, number: next.number, across: 0, down: 0, live: true }
               : { view, number: next.number, across: next.across, down: next.down, live: false }
           ),
+        // The person's input goes in the shape native code reads, and nothing else is sent.
+        input: (next) => call<undefined>('terminal_view_input', { view, input: next }),
         close: () => call<undefined>('terminal_view_close', { view })
       }
     },
-    terminalInput: (params) => read('input_write', params),
 
     // Voice. The first three each reach one method; the last two reach the call this device is
     // holding and no service at all, which is what keeps mute and closure working when the broker

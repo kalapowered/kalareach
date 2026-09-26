@@ -477,7 +477,7 @@ test.describe('motion', () => {
         window.krTestHost?.terminalViews[0]?.wait()
         window.krTestHost?.terminalViews[0]?.show()
       })
-      await page.getByRole('tab', { name: 'View' }).click()
+      // A view opens in view mode, where the sizes can be pressed.
       await page.getByTestId('zoom-in').click()
       await page.getByTestId('zoom-out').click()
       await expect(surface).toContainText('cargo test -p kr-client')
