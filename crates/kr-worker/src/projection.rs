@@ -171,6 +171,20 @@ impl Window {
     }
 }
 
+/// Where a viewport report left one attachment's window, which is what its answer says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Landed {
+    /// How the attachment now displays the canonical grid.
+    pub presentation: kr_protocol::attachment::TerminalPresentationMode,
+    /// Where the window ended up: a row above the live screen, a line of the live screen below its
+    /// first, or `None` for the live screen from its first line.
+    pub position: Option<kr_protocol::attachment::ViewportPosition>,
+    /// The first canonical column the window ended up at.
+    pub column: u64,
+    /// The revision of the window after the report.
+    pub window_revision: u64,
+}
+
 /// The canonical grid of one session.
 pub struct TerminalEngine {
     engine: Engine,
@@ -526,6 +540,7 @@ impl TerminalEngine {
             ViewportPosition::Above(rows) => {
                 live.saturating_sub(i64::try_from(rows.get()).unwrap_or(i64::MAX))
             }
+            ViewportPosition::Line(_) => live,
         };
         let (oldest, _) = self.engine.grid().stable_range();
         let landed = asked.clamp(oldest, live);

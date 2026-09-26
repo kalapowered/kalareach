@@ -1860,7 +1860,8 @@ impl Session {
         attachment_id: AttachmentId,
         dimensions: Dimensions,
         position: Option<kr_protocol::attachment::ViewportPosition>,
-    ) -> Result<(TerminalPresentationMode, Option<i64>)> {
+        _column: u64,
+    ) -> Result<crate::projection::Landed> {
         let before = self.presentation_of_attachment(attachment_id);
         let before_dimensions = self.attachments.own_dimensions(attachment_id).flatten();
         let before_top_row = self.attachments.history_top_row(attachment_id);
@@ -1898,7 +1899,16 @@ impl Session {
             // bound, exactly as the first screen was.
             self.install_projection(attachment_id)?;
         }
-        Ok((presentation, top_row))
+        Ok(crate::projection::Landed {
+            presentation,
+            position: top_row.map(|row| {
+                kr_protocol::attachment::ViewportPosition::Row(U64::new(
+                    u64::try_from(row).unwrap_or_default(),
+                ))
+            }),
+            column: 0,
+            window_revision: 0,
+        })
     }
 
     /// Returns how one attachment is currently being shown the session, without changing anything.

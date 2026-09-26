@@ -94,6 +94,7 @@ mod tests {
             projection_generation: U64::new(3),
             cursor: U64::new(0),
             reason: ProjectionResetReason::Attached,
+            window_revision: U64::ZERO,
         }));
         assert_eq!(
             applied,

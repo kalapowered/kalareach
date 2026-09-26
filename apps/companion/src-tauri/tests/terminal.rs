@@ -1161,6 +1161,8 @@ fn viewport_answer() -> kr_protocol::attachment::AttachmentViewportResult {
         },
         presentation: kr_protocol::attachment::TerminalPresentationMode::Viewport,
         position: kr_protocol::scalars::Nullable::null(),
+        column: kr_protocol::scalars::U64::ZERO,
+        window_revision: kr_protocol::scalars::U64::ZERO,
     }
 }
 

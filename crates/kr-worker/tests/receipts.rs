@@ -2743,6 +2743,7 @@ async fn a_refusal_the_host_could_decide_leaves_a_rejection_rather_than_an_uncer
             attachment_id: attached.attachment.attachment_id,
             dimensions: Dimensions::new(0, 0),
             position: Nullable::null(),
+            column: U64::ZERO,
         })
         .expect("encodes"),
         ..close_mutation(
@@ -4469,6 +4470,7 @@ async fn a_window_the_host_can_refuse_never_reaches_the_marker() {
             position: Nullable::some(kr_protocol::attachment::ViewportPosition::Above(
                 kr_protocol::scalars::U64::new(40),
             )),
+            column: U64::ZERO,
         })
         .expect("encodes"),
         ..close_mutation(

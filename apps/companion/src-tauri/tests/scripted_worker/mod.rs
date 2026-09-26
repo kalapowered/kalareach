@@ -536,12 +536,13 @@ pub fn palette() -> PaletteState {
     }
 }
 
-/// A reset, at `generation`.
+/// A reset, at `generation`, of a window that has not changed since the view attached.
 pub fn reset(generation: u64, cursor: u64, reason: ProjectionResetReason) -> ProjectionReset {
     ProjectionReset {
         projection_generation: U64::new(generation),
         cursor: U64::new(cursor),
         reason,
+        window_revision: U64::ZERO,
     }
 }
 
@@ -556,6 +557,7 @@ pub fn snapshot(
     ProjectionSnapshot {
         projection_generation: U64::new(generation),
         output_cursor: U64::new(cursor),
+        window_revision: U64::ZERO,
         active_buffer: ProjectedBuffer::Primary,
         dimensions: Dimensions::new(columns, rows),
         viewport: viewport(top_row, columns, rows),

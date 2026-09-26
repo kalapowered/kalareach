@@ -230,10 +230,12 @@ export type PresentationReason =
 /**
  * Where an attachment's window sits in the session's rows.
  *
- * A window is normally on the live screen, which is what no position at all means. A client
- * looking through its scrollback names where it is looking instead, and the host installs the
- * history pages that cover it. Scrolling is a presentation choice and never touches the input
- * lease: section 8 puts passive scrollback with focus events and terminal replies.
+ * A window is normally on the live screen from its first line, which is what no position at all
+ * means. A client looking through its scrollback names where it is looking instead, and the host
+ * installs the history pages that cover it. A client smaller than the grid can also look further
+ * down the live screen by naming a line of it. Scrolling is a presentation choice and never
+ * touches the input lease: section 8 puts passive scrollback with focus events and terminal
+ * replies.
  */
 export type ViewportPosition =
   | {
@@ -241,6 +243,9 @@ export type ViewportPosition =
     }
   | {
       above: U64
+    }
+  | {
+      line: U64
     }
 /**
  * One CLI or application attachment, independently of its device.
@@ -4855,9 +4860,13 @@ export interface AttachmentViewportParams {
    * The reporting attachment.
    */
   attachment_id: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  column: string
   dimensions: Dimensions1
   /**
-   * Where its window sits. Null is the live screen.
+   * Where its window sits. Null is the live screen from its first line.
    */
   position: ViewportPosition | null
 }
@@ -4881,19 +4890,29 @@ export interface Dimensions1 {
  * The result of `attachment.viewport`.
  */
 export interface AttachmentViewportResult {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  column: string
   geometry: GeometryState
   /**
-   * Where the window ended up, as a row identifier, or null for the live screen.
+   * Where the window ended up: a row identifier above the live screen, a line of the live
+   * screen below its first, or null for the live screen from its first line.
    *
    * A request above the oldest row the session still holds is answered with the oldest one
-   * there is rather than refused, and a request at or below the live screen's first row is
-   * answered with the live screen. Either way this says where the window actually is.
+   * there is rather than refused, a row or a distance at or below the live screen's first row is
+   * answered with the live screen, and a line past the last at which the window fits is
+   * answered with that last line. Either way this says where the window actually is.
    */
   position: ViewportPosition | null
   /**
    * How a terminal attachment displays the canonical grid.
    */
   presentation: 'direct' | 'viewport'
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  window_revision: string
 }
 /**
  * The canonical geometry, which a viewport report never changes.
@@ -18677,6 +18696,10 @@ export interface ProjectionReset {
    * Why.
    */
   reason: 'attached' | 'buffer_switch' | 'geometry' | 'replay_gap' | 'repaint' | 'history_evicted'
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  window_revision: string
 }
 /**
  * One page of rows belonging to one buffer of one snapshot.
@@ -18784,6 +18807,10 @@ export interface ProjectionSnapshot {
    */
   title_stack: SavedTitleEntry[]
   viewport: ProjectedViewport1
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  window_revision: string
 }
 /**
  * The designated character sets and the locking shift.

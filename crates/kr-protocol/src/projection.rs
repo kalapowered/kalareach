@@ -13,7 +13,7 @@
 //! presentation state, and nothing in it can ring, copy, notify, download, launch or ask anything.
 //! Installing a snapshot therefore has no side effect, however the history was built.
 //!
-//! # The three rules that shape the types
+//! # The four rules that shape the types
 //!
 //! 1. **Every update names the base it continues from.** A [`ProjectionDelta`] carries
 //!    `base_cursor` and `projection_generation`, and a client that holds neither of them discards
@@ -26,6 +26,11 @@
 //! 3. **A reset is explicit.** A buffer switch, a geometry change and an eviction each replace the
 //!    screen rather than changing it, and each sends [`ProjectionReset`] instead of a delta that a
 //!    client could apply to the wrong grid.
+//! 4. **Every screen names the window it is drawn for.** A reset and a snapshot carry the revision
+//!    of the attachment's own window, which the answer to `attachment.viewport` names as well, so a
+//!    client can tell which of its reports a screen answers. The generation and the cursor cannot
+//!    say that: they are the session's, and a window moved on an idle session is drawn again at the
+//!    same ones.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -259,14 +264,18 @@ pub struct ProjectedViewport {
     pub top_row: U64,
     /// The stable identifier of the live screen's first row.
     ///
-    /// The two are the same for a window on the live screen and different for one above it. Both
-    /// are needed because they are the origins of two different things: the rows a client draws
-    /// are named by [`Self::top_row`], and the cursor's own row is a line of the live screen. A
-    /// client with only one of them would put the cursor on a line of its history.
+    /// The two are the same for a window at the live screen's first line, and different for one
+    /// above it or further down it. Both are needed because they are the origins of two different
+    /// things: the rows a client draws are named by [`Self::top_row`], and the cursor's own row is
+    /// a line of the live screen. A client with only one of them would put the cursor on the
+    /// wrong line.
     pub screen_top_row: U64,
     /// How many rows are shown.
     pub rows: U64,
     /// The first canonical column shown, for a display narrower than the grid.
+    ///
+    /// Rows arrive whole whatever the window's column, so a client draws from here and a pointer
+    /// event at a display column is this many columns further into the grid.
     pub left_column: U64,
     /// How many columns are shown.
     pub columns: U64,
@@ -521,6 +530,14 @@ pub struct ProjectionSnapshot {
     pub projection_generation: U64,
     /// The monotonic output cursor this snapshot describes. Updates resume from here.
     pub output_cursor: U64,
+    /// The revision of this attachment's window the screen is drawn for.
+    ///
+    /// The generation and the cursor are the session's, and a window moved on an idle session is
+    /// drawn again at the same ones; this is the attachment's own, and it is what tells a client
+    /// which of its `attachment.viewport` reports a screen answers. A report's answer names the
+    /// revision it left the window at, and the first complete screen naming that revision or a later
+    /// one is drawn for that window or for a later change of it.
+    pub window_revision: U64,
     /// Which buffer is active.
     pub active_buffer: ProjectedBuffer,
     /// The canonical dimensions.
@@ -713,6 +730,11 @@ pub struct ProjectionReset {
     pub cursor: U64,
     /// Why.
     pub reason: ProjectionResetReason,
+    /// The revision of this attachment's window the screen that follows is drawn for.
+    ///
+    /// The snapshot after it names the same revision. It is given here as well, so that a client
+    /// knows which of its windows is coming before the screen has arrived.
+    pub window_revision: U64,
 }
 
 /// The event type of a projection reset.
@@ -1046,6 +1068,126 @@ mod tests {
         let mut unique = types.to_vec();
         unique.dedup();
         assert_eq!(unique.len(), count);
+    }
+
+    /// The bytes a value goes on the wire as.
+    fn wire<T: Serialize>(value: &T) -> Vec<u8> {
+        kr_cbor::encode(&kr_cbor::to_canonical_value(value).expect("encodes"))
+    }
+
+    fn read<T: crate::wire::WireMessage>(bytes: &[u8]) -> Result<T, kr_cbor::CborError> {
+        crate::wire::decode(bytes, &kr_cbor::Limits::DEFAULT)
+    }
+
+    fn black() -> Rgb {
+        Rgb {
+            red: 0,
+            green: 0,
+            blue: 0,
+        }
+    }
+
+    /// A screen with nothing on it, drawn for the given revision of a window.
+    fn snapshot_for(window_revision: u64) -> ProjectionSnapshot {
+        ProjectionSnapshot {
+            projection_generation: U64::new(2),
+            output_cursor: U64::new(640),
+            window_revision: U64::new(window_revision),
+            active_buffer: ProjectedBuffer::Primary,
+            dimensions: Dimensions::new(80, 24),
+            viewport: ProjectedViewport {
+                top_row: U64::new(104),
+                screen_top_row: U64::new(100),
+                rows: U64::new(10),
+                left_column: U64::new(40),
+                columns: U64::new(40),
+            },
+            cursor: ProjectedCursor {
+                column: U64::ZERO,
+                row: U64::ZERO,
+                visible: true,
+                style: U64::ZERO,
+                pending_wrap: false,
+            },
+            saved_cursors: Vec::new(),
+            margins: MarginState {
+                top: U64::ZERO,
+                bottom: U64::new(23),
+                left: U64::ZERO,
+                right: U64::new(79),
+            },
+            rendition: CellRendition::PLAIN,
+            tab_stops: Vec::new(),
+            charsets: CharsetState {
+                g0: "B".to_owned(),
+                g1: "B".to_owned(),
+                shift_out: false,
+            },
+            modes: Vec::new(),
+            keypad_application: false,
+            keyboard: ProjectedKeyboard {
+                modify_other_keys: U64::ZERO,
+                primary: KittyKeyboardState {
+                    flags: Nullable::null(),
+                    stack: Vec::new(),
+                },
+                alternate: KittyKeyboardState {
+                    flags: Nullable::null(),
+                    stack: Vec::new(),
+                },
+            },
+            title: ProjectedTitle {
+                icon: String::new(),
+                window: String::new(),
+            },
+            title_stack: Vec::new(),
+            hyperlink: Nullable::null(),
+            palette: PaletteState {
+                source: PaletteProvenance::ProfileDefault,
+                foreground: black(),
+                background: black(),
+                cursor: black(),
+                pointer_foreground: black(),
+                pointer_background: black(),
+                selection_background: black(),
+                selection_foreground: black(),
+                overrides: Vec::new(),
+            },
+            oldest_retained_row: U64::ZERO,
+            evicted: false,
+            degraded: false,
+        }
+    }
+
+    /// A reset and the snapshot after it name the window they are drawn for, and both carry it
+    /// through the wire.
+    #[test]
+    fn a_reset_and_a_snapshot_name_the_window_they_are_drawn_for() {
+        let reset = ProjectionReset {
+            projection_generation: U64::new(2),
+            cursor: U64::new(640),
+            reason: ProjectionResetReason::Attached,
+            window_revision: U64::new(7),
+        };
+        let reread: ProjectionReset = read(&wire(&reset)).expect("a reset reads back");
+        assert_eq!(reread, reset);
+        assert_eq!(
+            serde_json::to_value(reset).expect("encodes")["window_revision"],
+            serde_json::json!("7")
+        );
+
+        let snapshot = snapshot_for(7);
+        let reread: ProjectionSnapshot = read(&wire(&snapshot)).expect("a snapshot reads back");
+        assert_eq!(reread, snapshot);
+        let mut without = serde_json::to_value(&snapshot).expect("encodes");
+        without
+            .as_object_mut()
+            .expect("a snapshot is an object")
+            .remove("window_revision");
+        assert!(
+            serde_json::from_value::<ProjectionSnapshot>(without).is_err(),
+            "every screen names the window it is drawn for"
+        );
     }
 
     #[test]

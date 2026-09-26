@@ -322,9 +322,12 @@ async fn only_the_owners_resize_moves_the_pseudo_terminal() {
     {
         let mut session = runtime.session();
         let presentation = session
-            .viewport(watcher, Dimensions::new(52, 14), None)
+            .viewport(watcher, Dimensions::new(52, 14), None, 0)
             .expect("every terminal attachment reports its own size");
-        assert_eq!(presentation.0, TerminalPresentationMode::Viewport);
+        assert_eq!(
+            presentation.presentation,
+            TerminalPresentationMode::Viewport
+        );
         assert_eq!(
             session.geometry().dimensions,
             CANONICAL,
@@ -1363,6 +1366,7 @@ async fn the_attachment_methods_answer_with_the_geometry_and_the_epoch_they_prod
                 position: kr_protocol::scalars::Nullable::null(),
                 attachment_id: owner,
                 dimensions: Dimensions::new(52, 14),
+                column: kr_protocol::scalars::U64::ZERO,
             },
         )
         .await
@@ -1691,6 +1695,7 @@ async fn reported_and_told(
                 position: Nullable::null(),
                 attachment_id: attachment,
                 dimensions,
+                column: kr_protocol::scalars::U64::ZERO,
             },
         )
         .await

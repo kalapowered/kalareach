@@ -26,7 +26,7 @@ use kr_protocol::ids::{ActionId, RequestId, SessionId};
 use kr_protocol::local::LocalClientKind;
 use kr_protocol::method::{Method, MethodVersion};
 use kr_protocol::recovery::{EventStream, EventsSubscribeParams};
-use kr_protocol::scalars::{CanonicalSet, DurationMs, Nullable};
+use kr_protocol::scalars::{CanonicalSet, DurationMs, Nullable, U64};
 use kr_protocol::session::{Dimensions, SESSION_CLOSED_EVENT};
 use kr_protocol::worker::WorkerDescriptor;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -448,7 +448,8 @@ impl View {
     }
 
     /// Sends the newest measurement, when nothing is outstanding and it differs from the size last
-    /// sent. The window stays on the live screen, so a report names no position.
+    /// sent. The window stays on the live screen from its first line and column, so a report names
+    /// no position and the first column.
     async fn report_if_needed(&mut self) -> Option<Ending> {
         if self.report.is_some() || self.wanted == self.last_sent {
             return None;
@@ -457,6 +458,7 @@ impl View {
             attachment_id: self.attachment.attachment_id,
             dimensions: self.wanted,
             position: Nullable::null(),
+            column: U64::ZERO,
         };
         let request_id = self.next_id();
         if !self

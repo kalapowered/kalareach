@@ -2635,6 +2635,10 @@
           "$ref": "#/$defs/AttachmentId",
           "description": "The reporting attachment."
         },
+        "column": {
+          "$ref": "#/$defs/U64",
+          "description": "The first canonical column its window shows.\n\nEvery report states it, a report of a new size included, so a window keeps its column\nthrough a resize. Only a window narrower than the grid can start anywhere but the first\ncolumn, and the host holds it to the last column at which the whole window still fits."
+        },
         "dimensions": {
           "$ref": "#/$defs/Dimensions",
           "description": "Its current physical dimensions."
@@ -2648,13 +2652,14 @@
               "type": "null"
             }
           ],
-          "description": "Where its window sits. Null is the live screen."
+          "description": "Where its window sits. Null is the live screen from its first line."
         }
       },
       "required": [
         "attachment_id",
         "dimensions",
-        "position"
+        "position",
+        "column"
       ],
       "type": "object"
     },
@@ -2662,6 +2667,10 @@
       "additionalProperties": false,
       "description": "The result of `attachment.viewport`.",
       "properties": {
+        "column": {
+          "$ref": "#/$defs/U64",
+          "description": "The first canonical column the window ended up at."
+        },
         "geometry": {
           "$ref": "#/$defs/GeometryState",
           "description": "The canonical geometry, which a viewport report never changes."
@@ -2675,17 +2684,23 @@
               "type": "null"
             }
           ],
-          "description": "Where the window ended up, as a row identifier, or null for the live screen.\n\nA request above the oldest row the session still holds is answered with the oldest one\nthere is rather than refused, and a request at or below the live screen's first row is\nanswered with the live screen. Either way this says where the window actually is."
+          "description": "Where the window ended up: a row identifier above the live screen, a line of the live\nscreen below its first, or null for the live screen from its first line.\n\nA request above the oldest row the session still holds is answered with the oldest one\nthere is rather than refused, a row or a distance at or below the live screen's first row is\nanswered with the live screen, and a line past the last at which the window fits is\nanswered with that last line. Either way this says where the window actually is."
         },
         "presentation": {
           "$ref": "#/$defs/TerminalPresentationMode",
           "description": "How this attachment now displays the canonical grid."
+        },
+        "window_revision": {
+          "$ref": "#/$defs/U64",
+          "description": "The revision of this attachment's window after the report.\n\nThe host advances it whenever the window it keeps for this attachment changes (its size, its\nplace or its column), whether a report changed it or the host did, and every screen it\ninstalls names the revision of the window it is drawn for. A report that moved the window\nis answered with the revision of the screen already queued for it; one that changed the\nsize is drawn on the next subscription, whose screen names this revision or a later one;\none that changed nothing names the revision the window already had, and no screen follows."
         }
       },
       "required": [
         "geometry",
         "presentation",
-        "position"
+        "position",
+        "column",
+        "window_revision"
       ],
       "type": "object"
     },
@@ -22535,7 +22550,7 @@
         },
         "left_column": {
           "$ref": "#/$defs/U64",
-          "description": "The first canonical column shown, for a display narrower than the grid."
+          "description": "The first canonical column shown, for a display narrower than the grid.\n\nRows arrive whole whatever the window's column, so a client draws from here and a pointer\nevent at a display column is this many columns further into the grid."
         },
         "rows": {
           "$ref": "#/$defs/U64",
@@ -22543,7 +22558,7 @@
         },
         "screen_top_row": {
           "$ref": "#/$defs/U64",
-          "description": "The stable identifier of the live screen's first row.\n\nThe two are the same for a window on the live screen and different for one above it. Both\nare needed because they are the origins of two different things: the rows a client draws\nare named by [`Self::top_row`], and the cursor's own row is a line of the live screen. A\nclient with only one of them would put the cursor on a line of its history."
+          "description": "The stable identifier of the live screen's first row.\n\nThe two are the same for a window at the live screen's first line, and different for one\nabove it or further down it. Both are needed because they are the origins of two different\nthings: the rows a client draws are named by [`Self::top_row`], and the cursor's own row is\na line of the live screen. A client with only one of them would put the cursor on the\nwrong line."
         },
         "top_row": {
           "$ref": "#/$defs/U64",
@@ -22793,12 +22808,17 @@
         "reason": {
           "$ref": "#/$defs/ProjectionResetReason",
           "description": "Why."
+        },
+        "window_revision": {
+          "$ref": "#/$defs/U64",
+          "description": "The revision of this attachment's window the screen that follows is drawn for.\n\nThe snapshot after it names the same revision. It is given here as well, so that a client\nknows which of its windows is coming before the screen has arrived."
         }
       },
       "required": [
         "projection_generation",
         "cursor",
-        "reason"
+        "reason",
+        "window_revision"
       ],
       "type": "object"
     },
@@ -22990,11 +23010,16 @@
         "viewport": {
           "$ref": "#/$defs/ProjectedViewport",
           "description": "The window this client is showing."
+        },
+        "window_revision": {
+          "$ref": "#/$defs/U64",
+          "description": "The revision of this attachment's window the screen is drawn for.\n\nThe generation and the cursor are the session's, and a window moved on an idle session is\ndrawn again at the same ones; this is the attachment's own, and it is what tells a client\nwhich of its `attachment.viewport` reports a screen answers. A report's answer names the\nrevision it left the window at, and the first complete screen naming that revision or a later\none is drawn for that window or for a later change of it."
         }
       },
       "required": [
         "projection_generation",
         "output_cursor",
+        "window_revision",
         "active_buffer",
         "dimensions",
         "viewport",
@@ -31202,11 +31227,11 @@
       "type": "object"
     },
     "ViewportPosition": {
-      "description": "Where an attachment's window sits in the session's rows.\n\nA window is normally on the live screen, which is what no position at all means. A client\nlooking through its scrollback names where it is looking instead, and the host installs the\nhistory pages that cover it. Scrolling is a presentation choice and never touches the input\nlease: section 8 puts passive scrollback with focus events and terminal replies.",
+      "description": "Where an attachment's window sits in the session's rows.\n\nA window is normally on the live screen from its first line, which is what no position at all\nmeans. A client looking through its scrollback names where it is looking instead, and the host\ninstalls the history pages that cover it. A client smaller than the grid can also look further\ndown the live screen by naming a line of it. Scrolling is a presentation choice and never\ntouches the input lease: section 8 puts passive scrollback with focus events and terminal\nreplies.",
       "oneOf": [
         {
           "additionalProperties": false,
-          "description": "The stable identifier of the first row shown, taken from the pages the client holds.",
+          "description": "The stable identifier of the first row shown, taken from the pages the client holds.\n\nA row at or below the live screen's first row is the live screen from its first line: a\nrow names a place in the history, and the host moves a window down the live screen only\nwhen a report names a line of it.",
           "properties": {
             "row": {
               "$ref": "#/$defs/U64"
@@ -31227,6 +31252,19 @@
           },
           "required": [
             "above"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The line of the live screen the window starts at, counted from its first line.\n\nThe host keeps a line rather than a row: the live screen moves whenever the application\nwrites, and a window on it goes on showing the same lines of it, as a window at its first\nline does. Only a window shorter than the grid has lines below the first to start at, and\nthe host holds it to the last line at which the whole window still fits.",
+          "properties": {
+            "line": {
+              "$ref": "#/$defs/U64"
+            }
+          },
+          "required": [
+            "line"
           ],
           "type": "object"
         }

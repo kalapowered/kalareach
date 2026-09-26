@@ -2199,6 +2199,7 @@ fn perf_snapshot() -> Box<kr_protocol::projection::ProjectionSnapshot> {
     Box::new(ProjectionSnapshot {
         projection_generation: U64::new(1),
         output_cursor: U64::new(1),
+        window_revision: U64::ZERO,
         active_buffer: ProjectedBuffer::Primary,
         dimensions: kr_protocol::session::Dimensions::new(PERF_COLUMNS, PERF_ROWS),
         viewport: ProjectedViewport {

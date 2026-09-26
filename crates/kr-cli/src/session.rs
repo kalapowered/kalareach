@@ -495,6 +495,10 @@ const fn landed(position: Option<ViewportPosition>) -> Option<u64> {
     match position {
         None => None,
         Some(ViewportPosition::Row(row) | ViewportPosition::Above(row)) => Some(row.get()),
+        // A line is a place on the live screen, which this record holds as none. This terminal
+        // never names one: its window on the live screen stays where its cells are the canonical
+        // cells, because the pointer reports it forwards there are not mapped.
+        Some(ViewportPosition::Line(_)) => None,
     }
 }
 
@@ -951,6 +955,7 @@ async fn drive(
                                 u64::from(size.rows),
                             ),
                             position: Nullable(None),
+                            column: U64::ZERO,
                         };
                         if !send_geometry(
                             client,
@@ -1101,6 +1106,7 @@ async fn drive(
                                             u64::from(size.rows),
                                         ),
                                         position: Nullable(None),
+                                        column: U64::ZERO,
                                     };
                                 if !send_geometry(
                                     client,
@@ -1236,6 +1242,7 @@ async fn drive(
                                                             })
                                                     }),
                                             ),
+                                            column: U64::ZERO,
                                         };
                                     if !send_geometry(
                                         client,
@@ -1354,6 +1361,7 @@ async fn drive(
                                             attachment_id,
                                             dimensions: dimensions_now,
                                             position: Nullable(position),
+                                            column: U64::ZERO,
                                         };
                                     if !send_geometry(
                                         client,
@@ -1447,6 +1455,7 @@ async fn drive(
                                     .map(|row| ViewportPosition::Row(U64::new(row)))
                             },
                         )),
+                        column: U64::ZERO,
                     };
                     // Like every other report that names a position: one sent after this, before
                     // this is answered, carries what this asked for.
@@ -1595,6 +1604,7 @@ async fn drive(
                             attachment_id,
                             dimensions: dimensions_now,
                             position: Nullable(position),
+                            column: U64::ZERO,
                         };
                         if !send_geometry(
                             client,
@@ -1638,6 +1648,7 @@ async fn drive(
                             u64::from(size.rows),
                         ),
                         position: Nullable(None),
+                        column: U64::ZERO,
                     };
                     if !send_geometry(
                         client,

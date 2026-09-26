@@ -432,10 +432,12 @@ pub fn install(
             projection_generation: U64::new(generation),
             cursor: U64::new(cursor),
             reason,
+            window_revision: U64::ZERO,
         })),
         outgoing(ProjectionEvent::Snapshot(Box::new(ProjectionSnapshot {
             projection_generation: U64::new(generation),
             output_cursor: U64::new(cursor),
+            window_revision: U64::ZERO,
             active_buffer: wire::buffer(snapshot.active_buffer),
             dimensions: kr_protocol::session::Dimensions::new(
                 u64::from(snapshot.dimensions.cols),
@@ -904,16 +906,6 @@ fn carries_nothing(delta: &Delta, viewport: Viewport, held: Option<Viewport>) ->
         && delta.saved_cursors.is_none()
         && delta.hyperlink.is_none()
         && held == Some(viewport)
-}
-
-/// Builds the reset one attachment receives when its screen is no longer continuous.
-#[must_use]
-pub fn reset(generation: u64, cursor: u64, reason: ProjectionResetReason) -> ProjectionEvent {
-    ProjectionEvent::Reset(ProjectionReset {
-        projection_generation: U64::new(generation),
-        cursor: U64::new(cursor),
-        reason,
-    })
 }
 
 /// Whether these rows fit one page under every bound.

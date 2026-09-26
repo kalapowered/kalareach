@@ -107,6 +107,12 @@ pub struct Screen {
     pub generation: u64,
     /// The output cursor it describes.
     pub cursor_at: u64,
+    /// The revision of this attachment's window the screen was drawn for.
+    ///
+    /// An update continues the screen it applies to and leaves this as it was: the host installs a
+    /// fresh screen whenever the window it keeps for the attachment changes. A client compares it
+    /// with the revision a viewport report's answer names to tell which report a screen answers.
+    pub window_revision: u64,
     /// Which buffer is showing.
     pub active_buffer: ProjectedBuffer,
     /// The canonical dimensions.
@@ -166,6 +172,7 @@ impl std::fmt::Debug for Screen {
             .debug_struct("Screen")
             .field("generation", &self.generation)
             .field("cursor_at", &self.cursor_at)
+            .field("window_revision", &self.window_revision)
             .field("active_buffer", &self.active_buffer)
             .field("dimensions", &self.dimensions)
             .field("rows", &self.rows.len())
@@ -606,6 +613,7 @@ fn screen_of(installing: Installing) -> Screen {
     Screen {
         generation: header.projection_generation.get(),
         cursor_at: header.output_cursor.get(),
+        window_revision: header.window_revision.get(),
         active_buffer: header.active_buffer,
         dimensions: header.dimensions,
         viewport: header.viewport,
@@ -679,6 +687,7 @@ mod tests {
         Box::new(ProjectionSnapshot {
             projection_generation: U64::new(generation),
             output_cursor: U64::new(cursor),
+            window_revision: U64::ZERO,
             active_buffer: ProjectedBuffer::Primary,
             dimensions: Dimensions::new(4, 2),
             viewport: ProjectedViewport {
@@ -1074,6 +1083,7 @@ mod tests {
                 projection_generation: U64::new(2),
                 cursor: U64::new(9),
                 reason: ProjectionResetReason::BufferSwitch,
+                window_revision: U64::ZERO,
             })),
             Applied::Reset(ProjectionResetReason::BufferSwitch)
         );

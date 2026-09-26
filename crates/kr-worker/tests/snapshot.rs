@@ -2257,6 +2257,7 @@ async fn report_viewport(
                 attachment_id: attached.attachment_id,
                 dimensions,
                 position: Nullable(position),
+                column: kr_protocol::scalars::U64::ZERO,
             },
         )
         .await
@@ -2793,6 +2794,7 @@ async fn try_viewport(
                 attachment_id: attached.attachment_id,
                 dimensions,
                 position: Nullable(position),
+                column: kr_protocol::scalars::U64::ZERO,
             },
         )
         .await
@@ -3018,7 +3020,7 @@ async fn a_window_too_large_for_this_queue_is_refused_rather_than_resynchronised
     session.narrow_content(watcher.attachment_id, kr_worker::render::Scope::WholeScreen);
 
     let refusal = session
-        .viewport(watcher.attachment_id, window, above)
+        .viewport(watcher.attachment_id, window, above, 0)
         .expect_err("a window this queue cannot carry is refused");
     assert_eq!(
         refusal.code(),
@@ -3030,10 +3032,10 @@ async fn a_window_too_large_for_this_queue_is_refused_rather_than_resynchronised
         "and it says what it is about: {refusal}"
     );
     // Nothing was recorded, so the attachment is still looking at the live screen.
-    let (_, landed) = session
-        .viewport(watcher.attachment_id, window, None)
+    let landed = session
+        .viewport(watcher.attachment_id, window, None, 0)
         .expect("the live screen is still where this window is");
-    assert!(landed.is_none());
+    assert!(landed.position.is_none());
 }
 
 /// A full-screen application takes the screen, and every window comes back to the live screen.
@@ -3181,3 +3183,4 @@ async fn a_buffer_switch_reaches_a_window_whose_client_is_behind() {
         "the window came back even though nothing was published to this client"
     );
 }
+

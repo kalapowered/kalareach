@@ -1832,6 +1832,7 @@ mod fixtures {
         let screen = Screen {
             generation: 1,
             cursor_at: 0,
+            window_revision: 0,
             active_buffer: ProjectedBuffer::Primary,
             dimensions: kr_protocol::session::Dimensions::new(
                 window["columns"].as_u64().expect("columns"),
@@ -2783,6 +2784,7 @@ mod safety {
         Screen {
             generation: 1,
             cursor_at: 0,
+            window_revision: 0,
             active_buffer: ProjectedBuffer::Primary,
             dimensions: kr_protocol::session::Dimensions::new(20, 1),
             viewport: ProjectedViewport {

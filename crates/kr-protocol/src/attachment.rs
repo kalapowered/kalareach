@@ -327,14 +327,20 @@ pub struct SessionDetachResult {
 
 /// Where an attachment's window sits in the session's rows.
 ///
-/// A window is normally on the live screen, which is what no position at all means. A client
-/// looking through its scrollback names where it is looking instead, and the host installs the
-/// history pages that cover it. Scrolling is a presentation choice and never touches the input
-/// lease: section 8 puts passive scrollback with focus events and terminal replies.
+/// A window is normally on the live screen from its first line, which is what no position at all
+/// means. A client looking through its scrollback names where it is looking instead, and the host
+/// installs the history pages that cover it. A client smaller than the grid can also look further
+/// down the live screen by naming a line of it. Scrolling is a presentation choice and never
+/// touches the input lease: section 8 puts passive scrollback with focus events and terminal
+/// replies.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ViewportPosition {
     /// The stable identifier of the first row shown, taken from the pages the client holds.
+    ///
+    /// A row at or below the live screen's first row is the live screen from its first line: a
+    /// row names a place in the history, and the host moves a window down the live screen only
+    /// when a report names a line of it.
     Row(U64),
     /// How many rows above the live screen's first row the window starts.
     ///
@@ -342,6 +348,13 @@ pub enum ViewportPosition {
     /// against the live screen at the moment of the report and answers with the row it landed on,
     /// so the window stays where the person put it while the session goes on writing.
     Above(U64),
+    /// The line of the live screen the window starts at, counted from its first line.
+    ///
+    /// The host keeps a line rather than a row: the live screen moves whenever the application
+    /// writes, and a window on it goes on showing the same lines of it, as a window at its first
+    /// line does. Only a window shorter than the grid has lines below the first to start at, and
+    /// the host holds it to the last line at which the whole window still fits.
+    Line(U64),
 }
 
 /// Parameters of `attachment.viewport`.
@@ -354,8 +367,14 @@ pub struct AttachmentViewportParams {
     pub attachment_id: AttachmentId,
     /// Its current physical dimensions.
     pub dimensions: Dimensions,
-    /// Where its window sits. Null is the live screen.
+    /// Where its window sits. Null is the live screen from its first line.
     pub position: Nullable<ViewportPosition>,
+    /// The first canonical column its window shows.
+    ///
+    /// Every report states it, a report of a new size included, so a window keeps its column
+    /// through a resize. Only a window narrower than the grid can start anywhere but the first
+    /// column, and the host holds it to the last column at which the whole window still fits.
+    pub column: U64,
 }
 
 /// The result of `attachment.viewport`.
@@ -366,12 +385,25 @@ pub struct AttachmentViewportResult {
     pub geometry: GeometryState,
     /// How this attachment now displays the canonical grid.
     pub presentation: TerminalPresentationMode,
-    /// Where the window ended up, as a row identifier, or null for the live screen.
+    /// Where the window ended up: a row identifier above the live screen, a line of the live
+    /// screen below its first, or null for the live screen from its first line.
     ///
     /// A request above the oldest row the session still holds is answered with the oldest one
-    /// there is rather than refused, and a request at or below the live screen's first row is
-    /// answered with the live screen. Either way this says where the window actually is.
+    /// there is rather than refused, a row or a distance at or below the live screen's first row is
+    /// answered with the live screen, and a line past the last at which the window fits is
+    /// answered with that last line. Either way this says where the window actually is.
     pub position: Nullable<ViewportPosition>,
+    /// The first canonical column the window ended up at.
+    pub column: U64,
+    /// The revision of this attachment's window after the report.
+    ///
+    /// The host advances it whenever the window it keeps for this attachment changes (its size, its
+    /// place or its column), whether a report changed it or the host did, and every screen it
+    /// installs names the revision of the window it is drawn for. A report that moved the window
+    /// is answered with the revision of the screen already queued for it; one that changed the
+    /// size is drawn on the next subscription, whose screen names this revision or a later one;
+    /// one that changed nothing names the revision the window already had, and no screen follows.
+    pub window_revision: U64,
 }
 
 /// Parameters of `attachment.configure`.
@@ -437,6 +469,65 @@ mod tests {
             serde_json::to_value(ViewportPosition::Above(U64::new(23))).expect("encodes"),
             serde_json::json!({ "above": "23" })
         );
+    }
+
+    /// A line of the live screen has a spelling of its own, beside a row and a distance above.
+    #[test]
+    fn a_line_of_the_live_screen_is_named_as_a_line() {
+        assert_eq!(
+            serde_json::to_value(ViewportPosition::Line(U64::new(3))).expect("encodes"),
+            serde_json::json!({ "line": "3" })
+        );
+        let read: ViewportPosition =
+            read(&wire(&ViewportPosition::Line(U64::new(3)))).expect("a line reads back");
+        assert_eq!(read, ViewportPosition::Line(U64::new(3)));
+    }
+
+    /// A report states its column beside its size and place, and it goes on the wire as one.
+    #[test]
+    fn a_viewport_report_carries_its_column_through_the_wire() {
+        let report = AttachmentViewportParams {
+            attachment_id: AttachmentId::new(crate::scalars::Uuid::from_bytes([3; 16])),
+            dimensions: Dimensions::new(40, 10),
+            position: Nullable::some(ViewportPosition::Line(U64::new(2))),
+            column: U64::new(17),
+        };
+        let reread: AttachmentViewportParams = read(&wire(&report)).expect("the report reads back");
+        assert_eq!(reread, report);
+        assert_eq!(
+            serde_json::to_value(&report).expect("encodes")["column"],
+            serde_json::json!("17")
+        );
+        let without_a_column = serde_json::json!({
+            "attachment_id": report.attachment_id,
+            "dimensions": report.dimensions,
+            "position": serde_json::Value::Null,
+        });
+        assert!(
+            serde_json::from_value::<AttachmentViewportParams>(without_a_column).is_err(),
+            "every report states its column"
+        );
+    }
+
+    /// The answer says where the window landed, column and all, and names the window's revision.
+    #[test]
+    fn a_viewport_answer_names_where_the_window_landed_and_its_revision() {
+        let answer = AttachmentViewportResult {
+            geometry: GeometryState {
+                owner: Nullable::null(),
+                epoch: GeometryEpoch::new(4),
+                dimensions: Dimensions::new(80, 24),
+            },
+            presentation: TerminalPresentationMode::Viewport,
+            position: Nullable::some(ViewportPosition::Row(U64::new(512))),
+            column: U64::new(40),
+            window_revision: U64::new(9),
+        };
+        let reread: AttachmentViewportResult = read(&wire(&answer)).expect("the answer reads back");
+        assert_eq!(reread, answer);
+        let value = serde_json::to_value(&answer).expect("encodes");
+        assert_eq!(value["column"], serde_json::json!("40"));
+        assert_eq!(value["window_revision"], serde_json::json!("9"));
     }
 
     #[test]
