@@ -520,16 +520,19 @@ mod tests {
             self.opened.notify_all();
         }
 
-        /// Returns once the gate is open.
+        /// Returns once the gate is open, or after [`WATCHDOG`]: the answer it holds runs on a
+        /// blocking thread, which the runtime waits for as it shuts down, so a test that fails
+        /// with the gate shut still ends.
         fn pass(&self) {
-            let mut shut = self.shut.lock().expect("the gate");
+            let shut = self.shut.lock().expect("the gate");
             if *shut {
                 self.waiting
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
-            while *shut {
-                shut = self.opened.wait(shut).expect("the gate");
-            }
+            let _ = self
+                .opened
+                .wait_timeout_while(shut, WATCHDOG, |shut| *shut)
+                .expect("the gate");
         }
 
         fn waiting(&self) -> usize {
@@ -544,7 +547,9 @@ mod tests {
         /// At once, from the invitation as it stands.
         AtOnce,
         /// Only once the invitation has ended, as a host that a busy machine runs late does: a
-        /// question the relay asks while the invitation is on offer finds it over.
+        /// question the relay asks while the invitation is on offer finds it over. A question
+        /// still waiting after [`WATCHDOG`] is answered as the invitation stands, so a test that
+        /// fails before it ends the invitation still ends.
         AfterTheEnd,
     }
 
@@ -628,8 +633,9 @@ mod tests {
                 if !first && self.later == Answers::AfterTheEnd {
                     offer = self
                         .changed
-                        .wait_while(offer, |offer| *offer == RoomOffer::Open)
-                        .expect("the offer");
+                        .wait_timeout_while(offer, WATCHDOG, |offer| *offer == RoomOffer::Open)
+                        .expect("the offer")
+                        .0;
                 }
                 *offer
             };
@@ -647,16 +653,35 @@ mod tests {
         released: std::sync::Mutex<Vec<Instant>>,
         attached: std::sync::Mutex<Vec<Instant>>,
         rooms: std::sync::Mutex<Vec<(mpsc::Sender<ServiceFrame>, mpsc::Receiver<ClientFrame>)>>,
+        /// Whether the room answers an attach: while `false`, every attach waits.
+        answering: watch::Sender<bool>,
     }
 
     impl TestService {
+        /// A service whose room answers every attach at once.
         fn new(capacity: usize) -> Arc<Self> {
+            Self::build(capacity, true)
+        }
+
+        /// A service whose room answers an attach only once the test says so, with
+        /// [`Self::answer_attaches`].
+        fn holding_attaches(capacity: usize) -> Arc<Self> {
+            Self::build(capacity, false)
+        }
+
+        fn build(capacity: usize, answering: bool) -> Arc<Self> {
             Arc::new(Self {
                 capacity,
                 released: std::sync::Mutex::new(Vec::new()),
                 attached: std::sync::Mutex::new(Vec::new()),
                 rooms: std::sync::Mutex::new(Vec::new()),
+                answering: watch::Sender::new(answering),
             })
+        }
+
+        /// The room answers the attaches waiting for it, and every one after.
+        fn answer_attaches(&self) {
+            self.answering.send_replace(true);
         }
 
         fn released(&self) -> usize {
@@ -761,15 +786,21 @@ mod tests {
         ) -> BoxFuture<'static, kr_pairing::Result<RoomSocket>> {
             let (to_host, incoming) = mpsc::channel(self.capacity);
             let (outgoing, from_host) = mpsc::channel(self.capacity);
-            self.rooms
-                .lock()
-                .expect("the rooms")
-                .push((to_host, from_host));
+            // The attach is noted before the room, so a test that sees the room sees when.
             self.attached
                 .lock()
                 .expect("the attachments")
                 .push(Instant::now());
-            Box::pin(async move { Ok(RoomSocket { outgoing, incoming }) })
+            self.rooms
+                .lock()
+                .expect("the rooms")
+                .push((to_host, from_host));
+            let mut answering = self.answering.subscribe();
+            Box::pin(async move {
+                // A service the test has dropped holds nothing back.
+                let _ = answering.wait_for(|answering| *answering).await;
+                Ok(RoomSocket { outgoing, incoming })
+            })
         }
     }
 
@@ -792,6 +823,12 @@ mod tests {
     /// How often a test that needs two events in one order before a recheck runs its sequence
     /// again when the machine's scheduling put a recheck between them.
     const PHASE_ATTEMPTS: usize = 5;
+
+    /// The resolution of the runtime's timers: a timer fires once the runtime's clock has passed
+    /// the end of the millisecond its deadline falls in, and the clock passes its milliseconds in
+    /// order. So a test that has slept until one tick past an instant knows that every timer due
+    /// by that instant has fallen due, whether or not its task has run since.
+    const CLOCK_TICK: Duration = Duration::from_millis(1);
 
     /// Starts a relay for `host` over `service`, and returns it once it has attached.
     async fn relaying(
@@ -872,17 +909,22 @@ mod tests {
     /// before attaching again: the relay asks the host as the socket ends and releases the locator
     /// at once.
     ///
-    /// The host answers every question after the one the relay attaches on only once the
-    /// invitation has ended, as a busy machine can make it: a relay that asked again between
-    /// attaching and its socket's end would find the invitation over there, every time.
+    /// A relay that asked the host again between attaching and its socket's end would find the
+    /// invitation over there, every time: the room answers the attach only once a recheck due as
+    /// the relay attached has fallen due, which the relay takes before anything the room sends,
+    /// and the host answers every question after the one the relay attaches on only once the
+    /// invitation has ended, as a busy machine can make it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_socket_that_ends_after_its_invitation_is_released_at_once() {
         for attempt in 1..=PHASE_ATTEMPTS {
             let host = TestHost::answering(Vec::new(), OnStep::Keeps, Answers::AfterTheEnd);
-            let service = TestService::new(8);
+            let service = TestService::holding_attaches(8);
             let (relay, _stop) = relaying(&host, &service).await;
             let task = relay.id();
+            let attached = tokio::time::Instant::from_std(service.attached()[0]);
+            tokio::time::sleep_until(attached + CLOCK_TICK).await;
             host.end();
+            service.answer_attaches();
             service.hang_up();
             finished(relay).await;
             // The relay marks the socket's end before it asks the host. A recheck that found the
