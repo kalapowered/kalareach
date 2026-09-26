@@ -43,9 +43,9 @@
 //! which it can do after the service spent a code or rotated a refresh token. So such an answer to
 //! an exchange or a refresh, naming no OAuth error of the service's, is `OUTCOME_UNKNOWN`, and
 //! nothing sends the request again. A refresh whose answer was lost keeps the stored grant as it
-//! was: its next refresh rotates the token when the service never received the first, and ends the
-//! sign-in when it did, because the token it presents was spent and the new one was only in the
-//! lost answer. Nothing short of signing in again recovers that. A revocation, an identity read and
+//! was: its next refresh rotates the token when the first did not, and ends the sign-in when it did,
+//! because the token it presents was spent and the new one was only in the lost answer. Nothing
+//! short of signing in again recovers that. A revocation, an identity read and
 //! a usage read are safe to send again, so the same answer to one of them stays transient.
 //!
 //! # What is never rendered

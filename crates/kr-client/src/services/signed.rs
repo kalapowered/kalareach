@@ -57,6 +57,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
+use kr_protocol::authority::IdempotencyBehaviour;
 use kr_protocol::error::ErrorCode;
 use kr_protocol::method::Method;
 use kr_protocol::scalars::{AuthorisationKey, Nonce256, TimestampMs};
@@ -357,7 +358,7 @@ impl SignedService {
         let answer = self
             .send(path, method, body, request_limit, sending)
             .await?;
-        answer_of(&answer).map_err(Unanswered::Sent)
+        answer_of(&answer).map_err(|error| unanswered(method, answer.status, error))
     }
 
     /// Sends one signed request, signed now, that travels as `carriage` says, and returns what the
@@ -387,7 +388,7 @@ impl SignedService {
         let answer = self
             .send(path, method, body, request_limit, sending)
             .await?;
-        answer_of(&answer).map_err(Unanswered::Sent)
+        answer_of(&answer).map_err(|error| unanswered(method, answer.status, error))
     }
 
     /// Sends one signed request, signed now, whose success is content rather than a document, and
@@ -413,7 +414,8 @@ impl SignedService {
         let answer = self
             .send(path, method, body, request_limit, sending)
             .await?;
-        content_of(answer).map_err(Unanswered::Sent)
+        let status = answer.status;
+        content_of(answer).map_err(|error| unanswered(method, status, error))
     }
 
     /// The one path every request takes: the document, the token, the credential, the bound, and
@@ -863,11 +865,10 @@ fn classify(code: &str, status: u16) -> (ErrorCode, UserAction) {
 /// What a caller may do about it turns on one question: whether the request may have been carried
 /// out. A success status with an unreadable body is the dangerous case, because the service acted
 /// and this client cannot see what it did, so it is an unknown outcome and never retried
-/// automatically. A fault or a rate limit is transient, a gateway's 502 or 504 included: that can
-/// follow the service acting on the request, but every method this client carries is an idempotent
-/// read or keyed, and its service answers a repeat of a keyed write from what it decided the first
-/// time, so sending it again is safe. Anything else without an envelope never reached this
-/// service's own routes, which is a configuration between here and it.
+/// automatically. A fault or a rate limit is transient. A gateway's 502 or 504 is too, here: it can
+/// follow the service acting on the request, and [`unanswered`] decides by the method whether that
+/// makes the outcome unknown. Anything else without an envelope never reached this service's own
+/// routes, which is a configuration between here and it.
 fn unreadable(status: u16, what: impl Into<Shown>) -> ClientError {
     let code = if (200..300).contains(&status) {
         ErrorCode::OutcomeUnknown
@@ -880,6 +881,56 @@ fn unreadable(status: u16, what: impl Into<Shown>) -> ClientError {
     ClientError::refusal(
         code,
         crate::shown!("the service answered {} and {}", status, what.into()),
+    )
+}
+
+/// Why a request that left this device went unanswered, for a request of `method`.
+///
+/// A gateway in front of the service answers 502 or 504 when the service's answer did not reach it,
+/// which it can do after the service acted on the request. So an answer of either with no envelope
+/// of the service's is an unknown outcome, never sent again, unless a request of `method` is safe
+/// to send again ([`repeat_is_safe`]).
+fn unanswered(method: Method, status: u16, error: ClientError) -> Unanswered {
+    if matches!(status, 502 | 504) && !repeat_is_safe(method) {
+        return Unanswered::Sent(ClientError::refusal(
+            ErrorCode::OutcomeUnknown,
+            crate::shown!(
+                "a gateway answered with status {} and the service's own answer was lost, so \
+                 whether the service carried the request out is unknown",
+                status
+            ),
+        ));
+    }
+    Unanswered::Sent(error)
+}
+
+/// Whether a request of `method` may be sent again, signed afresh, after its answer was lost.
+///
+/// A read changes nothing. A write qualifies when every operation its method carries is answered,
+/// on a repeat under a fresh signature, without a second effect or a different one: a delivery by
+/// its envelope identifier, an acknowledgement by its position, a settings-sync request by the
+/// identity it carries and the receipt kept for it, a manifest by its generation and its enrolment
+/// revision, a retention change by its revision, and an upload by its object identity, its part
+/// numbers and its upload identifier. A deletion does not qualify, because the service keeps a
+/// deletion's first target only for the signature that asked for it and a later object may hold the
+/// identity by then; nor does the authority feed, whose delegation replaces the removal keys with
+/// nothing to tell a repeat from a later change. A method added later does not either, until it is
+/// shown to.
+fn repeat_is_safe(method: Method) -> bool {
+    matches!(
+        method.entry().idempotency,
+        IdempotencyBehaviour::IdempotentRead
+    ) || matches!(
+        method,
+        Method::MailboxDeliver
+            | Method::MailboxAcknowledge
+            | Method::SyncCompareExchange
+            | Method::BackupManifest
+            | Method::StorageRetentionSet
+            | Method::StorageUploadCreate
+            | Method::StorageUploadPart
+            | Method::StorageUploadComplete
+            | Method::StorageUploadAbort
     )
 }
 

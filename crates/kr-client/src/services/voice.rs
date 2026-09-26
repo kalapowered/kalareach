@@ -1163,6 +1163,15 @@ impl ManagedVoiceService for ManagedVoiceBroker {
     }
 }
 
+/// A start whose answer a gateway lost: the call may have started, so it is an unknown creation.
+fn lost_start() -> VoiceStart {
+    VoiceStart::CreationUnknown {
+        attempt_id: None,
+        message: "The answer to this start was lost on its way back, so the call may have started."
+            .to_owned(),
+    }
+}
+
 /// Reads the service's terms, and refuses a rate this client could not show a person.
 ///
 /// A start names the version of the rate a person was shown, so a quote that cannot be shown is
@@ -1260,18 +1269,25 @@ pub fn read_start_answer(answer: &ServiceHttpAnswer) -> VoiceStart {
         // A gateway in front of the service answers 502 or 504 when the service's answer did not
         // reach it, which it can say after the service started the call.
         if matches!(answer.status, 502 | 504) {
-            return VoiceStart::CreationUnknown {
-                attempt_id: None,
-                message: "The answer to this start was lost on its way back, so the call may \
-                          have started."
-                    .to_owned(),
-            };
+            return lost_start();
         }
         return refused(
             VoiceRefusalReason::Unrecognised,
             "The managed service answered something this client cannot read.".to_owned(),
         );
     };
+
+    // The service's own refusal names its code. An envelope without one, on the statuses a gateway
+    // gives when the service's answer did not reach it, is not the service's answer.
+    let refusal_named = !envelope.ok
+        && envelope
+            .error
+            .as_ref()
+            .and_then(|error| error.get("code"))
+            .is_some_and(serde_json::Value::is_string);
+    if matches!(answer.status, 502 | 504) && !refusal_named {
+        return lost_start();
+    }
 
     if envelope.ok {
         return match envelope
