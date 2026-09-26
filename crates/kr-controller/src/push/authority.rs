@@ -22,11 +22,10 @@ use kr_protocol::actor::ActorIngress;
 use kr_protocol::ids::EnvironmentId;
 use kr_protocol::method::Method;
 use kr_protocol::rights::ActionRight;
-use kr_protocol::sharing::GrantState;
 use kr_worker::history_filter::ViewerScope;
 
 use crate::grants::{AccessRequest, HostPolicy};
-use crate::service::net::lifetimes::GrantLifetimes;
+use crate::service::net::lifetimes::{Anchored, GrantLifetimes};
 use crate::sharing::SharingService;
 
 /// The grants this host issued, under its current policy, as a delivery rule's recipient
@@ -112,29 +111,25 @@ impl GrantedRecipients {
 }
 
 impl RecipientAuthority for GrantedRecipients {
+    /// Every lapse a clock decides here is written down where it is found, before the answer, as a
+    /// paired device's and a workflow's are, so a clock wound back before a restart or a reboot
+    /// cannot bring back what was refused: the end of the grant's own bound as its tombstone, and a
+    /// lapse found in UTC, the grant's own or a bound of the policy, as the floor it was found at. A
+    /// write that fails stays owed, and the host's next decision or its record task writes it.
     fn scope_for(&self, rule: &DeliveryRule) -> Option<RecipientScope> {
         let grant_id = rule.grant_id?;
         // A store this host cannot read is a grant this host cannot show, and a grant it cannot
         // show admits nothing.
         let record = self.sharing.grants().record(grant_id).ok()??;
-        // This host's reading of UTC through its floor, which the reading raises, so a clock
-        // wound back after this message does not revive the grant for the next one.
-        let now_ms = self.lifetimes.settled_utc_now();
-        if record.state(now_ms) != GrantState::Active {
+        // Revoked, or a proposal nobody has redeemed: neither admits anything, and no clock decides
+        // either.
+        if record.revoked_at_ms.is_some() || !record.is_active() {
             return None;
         }
-        // The grant's own bound in this boot, on the continuous clock as well as in UTC: an
-        // expiring grant this host cannot anchor, or one that ran out on either clock, admits
+        // The grant's anchor in this boot, taken the first time anything asks and read back after
+        // that, so what follows reads no store. An end already on record reads as over. An
+        // expiring grant this host cannot anchor, or whose end it cannot write down, admits
         // nothing.
-        if !self
-            .lifetimes
-            .stored_in_force(self.sharing.grants(), &record)
-            .ok()?
-        {
-            return None;
-        }
-        // The grant's anchor in this boot, which the question above took or read back, so what
-        // follows reads no store.
         let anchored = self.lifetimes.stored(self.sharing.grants(), &record).ok()?;
         let grant = &record.grant;
         #[cfg(test)]
@@ -143,19 +138,23 @@ impl RecipientAuthority for GrantedRecipients {
         // above. A copy taken earlier could hold a lease its cell no longer states, and the rights
         // a decision takes have to be those of the lease whose time it loads.
         let policy = self.policy.lock().ok()?;
-        // Both of the grant's deadlines again, at readings taken now the lock is held: the grant
-        // can have run out while this waited for it. The policy is decided at the same readings.
+        // Both clocks, read once the lock is held, so a bound that ran out while this waited for it
+        // is found, and everything below is decided at these readings. UTC is read through this
+        // host's floor, which the reading raises, so a clock wound back after this message does not
+        // revive the grant for the next one.
         let now_ms = self.lifetimes.settled_utc_now();
         let continuous_now = self.lifetimes.continuous_now();
-        if record.revoked_at_ms.is_some() || !record.is_active() {
-            return None;
-        }
-        if !anchored.holds_at(continuous_now) || !grant.expiry.is_valid_at(now_ms) {
-            // Run out while this waited. The end is owed its tombstone, as every end this host
-            // finds is, and it is written once the policy's lock is let go: a later boot reads
-            // the tombstone before it derives anything.
+        // The grant's own bound, on both of its clocks. An end found here is written down as every
+        // end this host finds is: as the grant's tombstone, once the policy's lock is let go, since a
+        // later boot reads the tombstone before it derives anything; and, when UTC found it, as the
+        // floor it was found at, which is written under the lock like every write of the policy.
+        let expired_in_utc = !grant.expiry.is_valid_at(now_ms);
+        if expired_in_utc || !anchored.holds_at(continuous_now) {
+            if expired_in_utc {
+                self.sharing.grants().record_floor(&policy);
+            }
             drop(policy);
-            if anchored != crate::service::net::lifetimes::Anchored::Over {
+            if anchored != Anchored::Over {
                 self.lifetimes.owe_stored_expiry(grant.grant_id);
                 self.lifetimes.settle_stored(self.sharing.grants());
             }
@@ -375,6 +374,79 @@ mod tests {
                 afresh.scope_for(&rule(Some(13))).is_some(),
                 runs_out.is_none(),
                 "and a host with no anchor for it answers as the record says"
+            );
+        }
+    }
+
+    /// A grant whose expiry UTC has passed admits nothing, and the end is written down as every end
+    /// this host finds is: as the grant's tombstone, and as the floor it was found at. So a host
+    /// that holds no anchor for the grant and whose wall clock reads before the expiry, as after a
+    /// reboot with the clock wound back, finds it ended too. Alike when the question is the first
+    /// in this boot and when an earlier one anchored the grant. The control: with UTC short of the
+    /// expiry, the question admits its recipient and nothing is written.
+    #[test]
+    fn a_grant_run_out_in_utc_is_written_down_with_the_floor_it_was_found_at() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        for (run_out, anchored_before) in
+            [(false, false), (false, true), (true, false), (true, true)]
+        {
+            let case = format!("run out {run_out}, anchored before {anchored_before}");
+            let sharing = Arc::new(SharingService::in_memory(host()).expect("a store"));
+            let mut expiring = grant(15, SessionSelector::Any, &[ActionRight::SessionView]);
+            expiring.expiry = GrantExpiry::At {
+                expires_at_ms: kr_protocol::scalars::TimestampMs::new(NOW + 1_000),
+            };
+            issued(&sharing, expiring, true);
+            let policy = personal();
+            let wall = Arc::new(AtomicU64::new(NOW));
+            let recipients = GrantedRecipients::at(
+                Arc::clone(&sharing),
+                Arc::clone(&policy),
+                environment(),
+                Arc::new(kr_transport::clock::ManualClock::new()),
+                {
+                    let wall = Arc::clone(&wall);
+                    move || wall.load(Ordering::SeqCst)
+                },
+            );
+            if anchored_before {
+                assert!(
+                    recipients.scope_for(&rule(Some(15))).is_some(),
+                    "in force when first asked: {case}"
+                );
+            }
+            if run_out {
+                wall.store(NOW + 1_000, Ordering::SeqCst);
+            }
+            assert_eq!(
+                recipients.scope_for(&rule(Some(15))).is_some(),
+                !run_out,
+                "{case}"
+            );
+            let tombstone = sharing
+                .grants()
+                .grant_expired_at(GrantId::new(uuid(15)))
+                .expect("the store reads");
+            assert_eq!(tombstone.is_some(), run_out, "the tombstone: {case}");
+            let floor = Arc::clone(policy.lock().expect("not poisoned").utc_floor());
+            assert_eq!(
+                floor.written() >= NOW + 1_000,
+                run_out,
+                "the floor the end was found at is written down: {case}"
+            );
+            assert!(!floor.is_owed(), "and nothing is left owed: {case}");
+            let afresh = GrantedRecipients::at(
+                Arc::clone(&sharing),
+                personal(),
+                environment(),
+                Arc::new(kr_transport::clock::ManualClock::new()),
+                move || NOW,
+            );
+            assert_eq!(
+                afresh.scope_for(&rule(Some(15))).is_some(),
+                !run_out,
+                "a host with no anchor for it and its clock wound back: {case}"
             );
         }
     }
