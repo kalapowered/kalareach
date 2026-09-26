@@ -285,22 +285,26 @@ fn refusal(status: u16, code: &str, message: &str) -> ServiceHttpAnswer {
 
 /// The settings-sync requests the protocol's vectors publish, by case: the `sync_requests` group of
 /// `fixtures/service/services.json`, which a service's contract reads too.
+///
+/// Each case has an identifier of its own. One that repeated an earlier one would take its place
+/// here, and no test would hold it to anything.
 fn published_requests() -> BTreeMap<String, serde_json::Value> {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../fixtures/service/services.json");
     let text = std::fs::read_to_string(&path).expect("the service vectors");
     let document: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
-    document["sync_requests"]["cases"]
+    let cases = document["sync_requests"]["cases"]
         .as_array()
-        .expect("the settings-sync requests")
-        .iter()
-        .map(|case| {
-            (
-                case["id"].as_str().expect("a case identifier").to_owned(),
-                case.clone(),
-            )
-        })
-        .collect()
+        .expect("the settings-sync requests");
+    let mut published = BTreeMap::new();
+    for case in cases {
+        let id = case["id"].as_str().expect("a case identifier");
+        assert!(
+            published.insert(id.to_owned(), case.clone()).is_none(),
+            "two published requests are both {id}"
+        );
+    }
+    published
 }
 
 /// The one member a request body names, and its fields.
@@ -316,12 +320,12 @@ fn one_member(body: &serde_json::Value) -> (&String, &serde_json::Map<String, se
 
 /// One field of a published request, read as the value a caller hands this client.
 fn published_field<T: serde::de::DeserializeOwned>(case: &serde_json::Value, field: &str) -> T {
+    let id = case["id"].as_str().expect("a case identifier");
     let (_, fields) = one_member(&case["json"]);
     let value = fields
         .get(field)
-        .unwrap_or_else(|| panic!("{}: the published request names no {field}", case["id"]));
-    serde_json::from_value(value.clone())
-        .unwrap_or_else(|error| panic!("{}: {field}: {error}", case["id"]))
+        .unwrap_or_else(|| panic!("{id}: the published request names no {field}"));
+    serde_json::from_value(value.clone()).unwrap_or_else(|error| panic!("{id}: {field}: {error}"))
 }
 
 /// Holds the last request `recorder` took to the published `case`: the member it names, every field
