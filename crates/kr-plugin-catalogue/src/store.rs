@@ -1732,11 +1732,15 @@ impl StagedPackage {
         drop(dir);
         #[cfg(test)]
         rename_pause::run();
-        entry
-            .staging
-            .dir
-            .rename(&entry.name, &packages.dir, name)
-            .map_err(|source| CatalogueError::storage(&destination, &source))?;
+        // On Windows a scanner can hold a file in the staged directory for a moment, and the rename
+        // of a directory is refused while anything below it is held; it is tried again for a
+        // bounded time. `kept` stays open through every attempt and the comparison after them.
+        kr_flush::retry_while_held(|| {
+            #[cfg(test)]
+            attempt_pause::run();
+            entry.staging.dir.rename(&entry.name, &packages.dir, name)
+        })
+        .map_err(|source| CatalogueError::storage(&destination, &source))?;
         entry.remove = false;
         let arrived = open_child(&packages.dir, &destination, Path::new(name), false)
             .and_then(|arrived| identity(&arrived));
@@ -2193,6 +2197,45 @@ pub(crate) mod kept_fault {
 
     pub(crate) fn fails() -> bool {
         FAILING.with(|failing| failing.replace(false))
+    }
+}
+
+/// What the unit tests run before each attempt to rename a staged directory into place, given
+/// the attempt's number from one, to act while the rename waits for a held file.
+#[cfg(test)]
+pub(crate) mod attempt_pause {
+    use std::cell::{Cell, RefCell};
+
+    type Then = Box<dyn FnMut(usize)>;
+
+    thread_local! {
+        static EACH: RefCell<Option<Then>> = const { RefCell::new(None) };
+        static COUNT: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Runs `then` before each attempt on this thread from now on, until [`clear`] is called.
+    #[cfg(windows)]
+    pub(crate) fn each(then: impl FnMut(usize) + 'static) {
+        COUNT.with(|count| count.set(0));
+        EACH.with(|each| *each.borrow_mut() = Some(Box::new(then)));
+    }
+
+    /// Stops running what [`each`] was given.
+    #[cfg(windows)]
+    pub(crate) fn clear() {
+        EACH.with(|each| *each.borrow_mut() = None);
+    }
+
+    pub(crate) fn run() {
+        let attempt = COUNT.with(|count| {
+            count.set(count.get() + 1);
+            count.get()
+        });
+        EACH.with(|each| {
+            if let Some(then) = each.borrow_mut().as_mut() {
+                then(attempt);
+            }
+        });
     }
 }
 
@@ -3636,6 +3679,132 @@ mod tests {
         assert_eq!(
             std::fs::read(activated.join("plugin.json")).expect("readable"),
             b"manifest"
+        );
+    }
+
+    /// Holds `file` with a handle that shares reading and writing but not its deletion, as a scanner
+    /// holds a file it has just seen written.
+    #[cfg(windows)]
+    fn hold_file_without_shared_deletion(file: &Path) -> std::fs::File {
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        /// Reading is shared with other handles.
+        const FILE_SHARE_READ: u32 = 0x0001;
+        /// Writing is shared; deleting is not.
+        const FILE_SHARE_WRITE: u32 = 0x0002;
+
+        std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(file)
+            .expect("the file is held")
+    }
+
+    /// KR-REQ-11.06: on Windows a staged directory cannot be renamed while a file in it is held
+    /// without its deletion shared, as a scanner holds a file it has just seen written. The
+    /// activation tries the rename again, and places the package once the file is let go.
+    #[cfg(windows)]
+    #[test]
+    fn a_package_whose_file_is_held_for_a_moment_is_placed_once_it_is_let_go() {
+        let (_directory, store) = store();
+        let digest = PayloadDigest::of(b"manifest");
+        let mut staged = store.stage_package(digest).expect("a staging directory");
+        staged
+            .write(&path("plugin.json"), b"manifest")
+            .expect("written");
+        let holding = hold_file_without_shared_deletion(&staged.path().join("plugin.json"));
+        let letting_go = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            drop(holding);
+        });
+        let attempts = std::rc::Rc::new(std::cell::Cell::new(0));
+        let counted = std::rc::Rc::clone(&attempts);
+        attempt_pause::each(move |attempt| counted.set(attempt));
+        let activated = owned(|permit| staged.activate(permit));
+        attempt_pause::clear();
+        letting_go.join().expect("let go");
+        let activated = activated.expect("placed once the file is let go");
+        assert!(
+            attempts.get() > 1,
+            "refused while the file was held: {}",
+            attempts.get()
+        );
+        assert_eq!(activated, store.package_dir(digest));
+        assert_eq!(
+            std::fs::read(activated.join("plugin.json")).expect("readable"),
+            b"manifest"
+        );
+    }
+
+    /// KR-REQ-11.06: a staged package with a file held past the bound the rename is tried again for
+    /// is not placed: the activation reports the refusal once the bound has passed, and nothing is
+    /// in `packages`.
+    #[cfg(windows)]
+    #[test]
+    fn a_package_whose_file_is_held_past_the_bound_is_not_placed() {
+        let (_directory, store) = store();
+        let digest = PayloadDigest::of(b"manifest");
+        let mut staged = store.stage_package(digest).expect("a staging directory");
+        staged
+            .write(&path("plugin.json"), b"manifest")
+            .expect("written");
+        let holding = hold_file_without_shared_deletion(&staged.path().join("plugin.json"));
+        let started = std::time::Instant::now();
+        let refused = owned(|permit| staged.activate(permit)).expect_err("not placed while held");
+        let took = started.elapsed();
+        drop(holding);
+        assert!(
+            matches!(&refused, CatalogueError::StorageUnavailable { detail }
+                if detail.ends_with("(os error 5)")),
+            "{refused:?}"
+        );
+        assert!(took >= kr_flush::HELD_RENAME_BOUND, "tried again: {took:?}");
+        assert!(!store.package_dir(digest).exists(), "nothing is placed");
+    }
+
+    /// KR-REQ-11.06: a directory put in the staged one's place while its rename waits for a held
+    /// file is refused and moved out again, as one put there before the first attempt is: the
+    /// directory that arrives is compared with the staged one, whose second handle stays open
+    /// through every attempt.
+    #[cfg(windows)]
+    #[test]
+    fn a_directory_put_in_the_staged_ones_place_while_its_rename_waits_is_refused() {
+        let (directory, store) = store();
+        let digest = PayloadDigest::of(b"manifest");
+        let mut staged = store.stage_package(digest).expect("a staging directory");
+        staged
+            .write(&path("plugin.json"), b"manifest")
+            .expect("written");
+        let name = staged.path().to_path_buf();
+        let moved = directory.path().join("moved");
+        let elsewhere = moved.clone();
+        let mut holding = Some(hold_file_without_shared_deletion(&name.join("plugin.json")));
+        attempt_pause::each(move |attempt| {
+            // Refused once while the file is held; before the second attempt the file is let go,
+            // the staged directory moved away and another of the same name put in its place.
+            if attempt == 2 {
+                drop(holding.take());
+                std::fs::rename(&name, &elsewhere).expect("the staged directory moved away");
+                std::fs::create_dir(&name).expect("another directory of the same name");
+                std::fs::write(name.join("plugin.json"), b"manifest").expect("with the same file");
+            }
+        });
+        let refused = owned(|permit| staged.activate(permit));
+        attempt_pause::clear();
+        let refused = refused.expect_err("not the directory that was staged and checked");
+        assert!(
+            matches!(&refused, CatalogueError::StorageUnavailable { detail }
+                if detail.contains("was not the directory that was staged and checked")),
+            "{refused:?}"
+        );
+        assert!(
+            !store.package_dir(digest).exists(),
+            "nothing is left where readers look"
+        );
+        assert_eq!(
+            std::fs::read(moved.join("plugin.json")).expect("readable"),
+            b"manifest",
+            "the staged directory is as it was"
         );
     }
 
