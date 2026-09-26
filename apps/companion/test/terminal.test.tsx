@@ -178,6 +178,67 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
     opened.mockRestore()
   })
 
+  it('keeps a piece inside its cells in a window one column wide', async () => {
+    const opened = vi.spyOn(Terminal.prototype, 'open')
+    const { port, controls } = fakeHost()
+    controls.holdTerminalViews()
+    open(port)
+    await waitFor(() => {
+      expect(controls.terminalViews).toHaveLength(1)
+    })
+    const narrow: TerminalScreen = {
+      ...terminalScreen(SESSION_MAIN, { columns: 1, rows: 1 }),
+      window: { columns: 1, rows: 1 },
+      lines: [
+        {
+          row: '1',
+          soft_wrapped: false,
+          truncated: false,
+          pieces: [{ ...piece(0, 'a\u{1ab0}'), cells: 1 }]
+        }
+      ],
+      cursor: null
+    }
+    act(() => {
+      controls.terminalViews[0]?.attach()
+      controls.terminalViews[0]?.show(narrow)
+    })
+    // The renderer holds two columns at the least, so there is a second column to draw into, and
+    // it stays blank.
+    expect((await drawn(renderer(opened)))[0]).toBe('a')
+    opened.mockRestore()
+  })
+
+  it('leaves out a piece that starts inside the one before it, and keeps that one whole', async () => {
+    const opened = vi.spyOn(Terminal.prototype, 'open')
+    const { port, controls } = fakeHost()
+    controls.holdTerminalViews()
+    open(port)
+    await waitFor(() => {
+      expect(controls.terminalViews).toHaveLength(1)
+    })
+    const overlapping: TerminalScreen = {
+      ...terminalScreen(SESSION_MAIN, { columns: 8, rows: 1 }),
+      window: { columns: 8, rows: 1 },
+      lines: [
+        {
+          row: '1',
+          soft_wrapped: false,
+          truncated: false,
+          // Native code never sends pieces that overlap; this state did not come from it.
+          pieces: [piece(0, 'abcdef'), { ...piece(2, '\u{e9}'), cells: 1 }, piece(7, 'g')]
+        }
+      ],
+      cursor: null
+    }
+    act(() => {
+      controls.terminalViews[0]?.attach()
+      controls.terminalViews[0]?.show(overlapping)
+    })
+    expect((await drawn(renderer(opened)))[0]).toBe('abcdef g')
+    opened.mockRestore()
+  })
+
   it('warns of cells left blank, rows cut short and a shortened screen', async () => {
     const { port, controls } = fakeHost()
     open(port)

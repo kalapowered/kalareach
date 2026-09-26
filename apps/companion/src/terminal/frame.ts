@@ -37,6 +37,9 @@ const NORMAL_BUFFER = `${ESC}[?1047l`
 const AUTOWRAP_OFF = `${ESC}[?7l`
 
 const CURSOR_HIDDEN = `${ESC}[?25l`
+
+/** The fewest columns xterm.js keeps, whatever size it is given. */
+const RENDERER_MINIMUM_COLUMNS = 2
 const CURSOR_SHOWN = `${ESC}[?25h`
 
 /**
@@ -154,25 +157,30 @@ function steadyCursor(style: number): number {
  * A piece never shows past its cells. The renderer measures text by its own width rules, which can
  * give a cluster more cells than the pinned width model native code placed it by: a mark the model
  * joins to its letter can take a cell of its own. So after a piece that is not printable ASCII,
- * everything from the end of its cells to the end of the line is erased, in this same write and
- * before anything is shown. The pieces after it on the line are drawn after the erase, left to
- * right, so they draw their own cells again, and a cell no piece covers stays blank. What the
- * renderer drew wider than the piece's cells is cut at its edge, and a wide glyph cut there is
+ * everything from the end of its cells to the end of the renderer's line is erased, in this same
+ * write and before anything is shown. `columns` is the renderer's own width, which can be more
+ * than the window's. Pieces are drawn left to right and a piece that starts inside the one before
+ * it is left out, as native code never sends one, so every erase starts in cells no earlier piece
+ * owns: each later piece draws its own cells after it, and a cell no piece covers stays blank. What
+ * the renderer drew wider than the piece's cells is cut at its edge, and a wide glyph cut there is
  * erased whole.
  */
-export function frameOf(screen: TerminalScreen): string {
+export function frameOf(screen: TerminalScreen, columns: number): string {
   let out = FULL_RESET + NORMAL_BUFFER + AUTOWRAP_OFF + CURSOR_HIDDEN
-  const columns = count(screen.window.columns)
   screen.lines.forEach((line, index) => {
     const pieces = [...line.pieces].sort((one, other) => count(one.column) - count(other.column))
+    // The first cell of the line no piece drawn so far owns.
+    let free = 0
     for (const piece of pieces) {
       const column = count(piece.column)
+      if (column < free) continue
       const cells = count(piece.cells)
+      free = column + cells
       const text = withinCells(drawableText(piece.text), cells)
       if (text.length === 0) continue
       out += `${ESC}[${index + 1};${column + 1}H${sgr(piece.rendition)}${text}`
-      if (!printableAscii(text) && column + cells < columns) {
-        out += `${ESC}[${index + 1};${column + cells + 1}H${ESC}[0m${ESC}[K`
+      if (!printableAscii(text) && free < columns) {
+        out += `${ESC}[${index + 1};${free + 1}H${ESC}[0m${ESC}[K`
       }
     }
   })
@@ -190,7 +198,8 @@ export function frameOf(screen: TerminalScreen): string {
  * when there is no screen.
  *
  * The renderer takes the window's size, so every piece lands inside it; the surface around it clips
- * a window larger than itself at its right and bottom edges.
+ * a window larger than itself at its right and bottom edges. A window one column wide is drawn in a
+ * renderer two columns wide, the fewest it keeps, and its second column stays blank.
  */
 export function paint(terminal: Terminal, screen: TerminalScreen | null): void {
   if (screen === null) {
@@ -198,10 +207,10 @@ export function paint(terminal: Terminal, screen: TerminalScreen | null): void {
     terminal.write(FULL_RESET + CURSOR_HIDDEN)
     return
   }
-  const columns = Math.max(1, count(screen.window.columns))
+  const columns = Math.max(RENDERER_MINIMUM_COLUMNS, count(screen.window.columns))
   const rows = Math.max(1, count(screen.window.rows))
   if (terminal.cols !== columns || terminal.rows !== rows) terminal.resize(columns, rows)
-  terminal.write(frameOf(screen))
+  terminal.write(frameOf(screen, terminal.cols))
 }
 
 /** A colour as the renderer's theme takes it. */

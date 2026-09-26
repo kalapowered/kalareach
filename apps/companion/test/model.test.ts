@@ -441,7 +441,7 @@ describe('the raw terminal', () => {
 
   it('draws a screen in one write: reset, the normal buffer, autowrap off, each piece placed, the cursor last', () => {
     const screen = terminalScreen('8a7b6c50-22bb-4c3d-8e4f-000000000102', { columns: 20, rows: 3 })
-    const written = frameOf(screen)
+    const written = frameOf(screen, 20)
     expect(written.startsWith('\u{1b}c\u{1b}[?1047l\u{1b}[?7l\u{1b}[?25l')).toBe(true)
     expect(written).toContain('\u{1b}[1;1H\u{1b}[0m$ pnpm -r build')
     // A cursor style that would blink is drawn steady.
