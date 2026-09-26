@@ -453,29 +453,6 @@ impl Debugs {
     /// and the types and `Debug`s its macros write where they are invoked.
     fn declare(&mut self, index: usize) {
         let tokens = self.sources[index].tokens.clone();
-        // The names the `Debug` trait and the two macros go by in this file, their own and any an
-        // import gives them.
-        let mut debug_words: BTreeSet<String> = BTreeSet::from(["Debug".to_owned()]);
-        let mut macro_words: BTreeMap<String, &'static str> = BTreeMap::from([
-            ("debug_as_name".to_owned(), "debug_as_name"),
-            ("debug_fields".to_owned(), "debug_fields"),
-        ]);
-        for import in &self.sources[index].imports {
-            match import.path.last().map(String::as_str) {
-                Some("Debug") => {
-                    debug_words.insert(import.local.clone());
-                }
-                Some(word @ ("debug_as_name" | "debug_fields")) => {
-                    let word = if word == "debug_as_name" {
-                        "debug_as_name"
-                    } else {
-                        "debug_fields"
-                    };
-                    macro_words.insert(import.local.clone(), word);
-                }
-                _ => {}
-            }
-        }
         let macros = macro_bodies(&tokens);
         let inside_macro = |at: usize| {
             macros
@@ -502,10 +479,15 @@ impl Debugs {
                 {
                     self.declare_alias(index, &tokens, at, scope);
                 }
-                Some(word)
-                    if debug_words.contains(word)
-                        && ident(tokens.get(at + 1)) == Some("for")
-                        && impl_of(&tokens, at) =>
+                // A trait is the `Debug` trait when its path, resolved where it is written, is
+                // that trait's, whatever name an import or a re-export gave it.
+                Some(_)
+                    if ident(tokens.get(at + 1)) == Some("for")
+                        && impl_of(&tokens, at)
+                        && self
+                            .named_at(index, scope, &path_ending_at(&tokens, at))
+                            .as_deref()
+                            == Some("std::fmt::Debug") =>
                 {
                     self.declare_by_hand(index, &tokens, at, scope, None);
                 }
@@ -516,11 +498,26 @@ impl Debugs {
         // the `Debug` each writes: the type's name alone, or the type's name and the fields named.
         if index < self.guarded {
             for at in 0..tokens.len() {
-                let which = ident(tokens.get(at)).and_then(|word| macro_words.get(word).copied());
-                if which.is_none() || !punct(tokens.get(at + 1), '!') {
+                if ident(tokens.get(at)).is_none() || !punct(tokens.get(at + 1), '!') {
                     continue;
                 }
                 let scope = self.sources[index].scope_at(at);
+                // A macro is one of the two when its path, resolved where it is invoked, is theirs.
+                // In the crate that exports them a bare name is theirs too, since no other macro
+                // may be defined outside the two files.
+                let segments = path_ending_at(&tokens, at);
+                let named = self.named_at(index, scope, &segments).or_else(|| {
+                    (self.sources[index].crate_name == "kr_client" && segments.len() == 1)
+                        .then(|| format!("kr_client::{}", segments[0]))
+                });
+                let which = match named.as_deref() {
+                    Some("kr_client::debug_as_name") => Some("debug_as_name"),
+                    Some("kr_client::debug_fields") => Some("debug_fields"),
+                    _ => None,
+                };
+                if which.is_none() {
+                    continue;
+                }
                 let line = tokens[at].line;
                 let parts = arguments(&tokens, at + 2).unwrap_or_default();
                 let written: Vec<(String, String)> = if which == Some("debug_as_name") {
@@ -792,6 +789,25 @@ impl Debugs {
     }
 }
 
+/// The path whose last segment is the word at `at`: `std::fmt::Debug` from its `Debug`.
+fn path_ending_at(tokens: &[Located], at: usize) -> Vec<String> {
+    let mut segments = Vec::new();
+    let Some(last) = ident(tokens.get(at)) else {
+        return segments;
+    };
+    segments.push(last.to_owned());
+    let mut index = at;
+    while index >= 3
+        && punct(tokens.get(index - 1), ':')
+        && punct(tokens.get(index - 2), ':')
+        && let Some(word) = ident(tokens.get(index - 3))
+    {
+        segments.insert(0, word.to_owned());
+        index -= 3;
+    }
+    segments
+}
+
 /// Each `macro_rules!` in `tokens`: its name and its body's braces.
 fn macro_bodies(tokens: &[Located]) -> Vec<(String, usize, usize)> {
     let mut found = Vec::new();
@@ -1060,7 +1076,8 @@ impl Debugs {
             return None;
         }
         if let Some(alias) = self.find(&self.type_aliases, &path) {
-            return self.carries(alias, carrying).or_else(arguments_carry);
+            let expanded = self.expand_alias(alias, written, &arguments);
+            return self.carries(&expanded, carrying);
         }
         if self.find(&self.declared, &path).is_some() {
             if let Some(why) = self.carrying(carrying, &path) {
@@ -1080,8 +1097,8 @@ impl Debugs {
             Some((_, Outside::Holds))
                 if SEQUENCES.contains(&path.as_str())
                     && arguments
-                    .iter()
-                    .any(|argument| matches!(argument.as_slice(), [one] if ident(Some(one)) == Some("u8"))) =>
+                        .iter()
+                        .any(|argument| self.is_byte(written, argument)) =>
             {
                 Some("bytes".to_owned())
             }
@@ -1089,6 +1106,126 @@ impl Debugs {
             None => Some(format!(
                 "{path}, a type from outside the workspace this reading does not list"
             )),
+        }
+    }
+
+    /// The full path a path written at `scope` of source `index` names.
+    fn named_at(&self, index: usize, scope: usize, segments: &[String]) -> Option<String> {
+        if segments.is_empty() {
+            return None;
+        }
+        let written = Written {
+            source: index,
+            scope,
+            generics: Vec::new(),
+            tokens: Vec::new(),
+        };
+        self.resolve(&written, segments)
+    }
+
+    /// A type alias as its use at `use_site` spells it: its parameters replaced by the arguments
+    /// given there, each written as the full path it names at the use site, so the whole reads the
+    /// same in the alias's own scope.
+    fn expand_alias(
+        &self,
+        alias: &Written,
+        use_site: &Written,
+        arguments: &[Vec<Located>],
+    ) -> Written {
+        let qualified: Vec<Vec<Located>> = arguments
+            .iter()
+            .map(|argument| self.qualified(use_site, argument))
+            .collect();
+        let mut tokens = Vec::with_capacity(alias.tokens.len());
+        for (at, located) in alias.tokens.iter().enumerate() {
+            let standalone = !(at > 0 && punct(alias.tokens.get(at - 1), ':'))
+                && !punct(alias.tokens.get(at + 1), ':');
+            match &located.token {
+                Token::Ident(word) if standalone => {
+                    match alias
+                        .generics
+                        .iter()
+                        .position(|parameter| parameter == word)
+                    {
+                        Some(position) if position < qualified.len() => {
+                            tokens.extend(qualified[position].iter().cloned());
+                        }
+                        _ => tokens.push(located.clone()),
+                    }
+                }
+                _ => tokens.push(located.clone()),
+            }
+        }
+        Written {
+            source: alias.source,
+            scope: alias.scope,
+            generics: Vec::new(),
+            tokens,
+        }
+    }
+
+    /// `tokens` with each path in them written as the full path it names at `written`'s place; a
+    /// path this reading cannot place is left as it is, and stays one it cannot place.
+    fn qualified(&self, written: &Written, tokens: &[Located]) -> Vec<Located> {
+        let mut out = Vec::with_capacity(tokens.len());
+        let mut at = 0;
+        while at < tokens.len() {
+            let starts = matches!(tokens[at].token, Token::Ident(_))
+                && !(at > 0 && punct(tokens.get(at - 1), ':'));
+            if !starts {
+                out.push(tokens[at].clone());
+                at += 1;
+                continue;
+            }
+            let (segments, after) = written_path(&tokens[at..]);
+            let line = tokens[at].line;
+            match self.resolve(written, &segments) {
+                Some(path) if !written.generics.contains(&segments[0]) => {
+                    for (position, segment) in path.split("::").enumerate() {
+                        if position > 0 {
+                            out.push(Located {
+                                token: Token::Punct(':'),
+                                line,
+                            });
+                            out.push(Located {
+                                token: Token::Punct(':'),
+                                line,
+                            });
+                        }
+                        out.push(Located {
+                            token: Token::Ident(segment.to_owned()),
+                            line,
+                        });
+                    }
+                }
+                _ => out.extend(tokens[at..at + after.max(1)].iter().cloned()),
+            }
+            at += after.max(1);
+        }
+        out
+    }
+
+    /// Whether a type written at `written`'s place is one byte, through any aliases.
+    fn is_byte(&self, written: &Written, tokens: &[Located]) -> bool {
+        let (segments, after) = written_path(tokens);
+        if segments.is_empty() {
+            return false;
+        }
+        let arguments: Vec<Vec<Located>> = if punct(tokens.get(after), '<') {
+            let close = angle_close(tokens, after).unwrap_or(tokens.len());
+            split_commas(&tokens[after + 1..close.min(tokens.len())])
+        } else if after == tokens.len() {
+            Vec::new()
+        } else {
+            return false;
+        };
+        match self.resolve(written, &segments).as_deref() {
+            Some("prim::u8") => true,
+            Some(path) => self.find(&self.type_aliases, path).is_some_and(|alias| {
+                let expanded = self.expand_alias(alias, written, &arguments);
+                self.is_byte(&expanded, &expanded.tokens)
+            }),
+            None => false,
         }
     }
 
@@ -2397,6 +2534,36 @@ fn each_debug_that_can_print_text_is_named_with_its_place() {
             "pub struct Wrapped(String);\nimpl std::ops::Deref for Wrapped {\n    type Target = str;\n    fn deref(&self) -> &str { &self.0 }\n}\npub struct Planted {\n    pub secret: Wrapped,\n}\nimpl std::fmt::Debug for Planted {\n    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n        formatter.write_str(&self.secret)\n    }\n}\n",
             11,
             "text written as it is",
+        ),
+        (
+            "bytes under an alias",
+            "type Byte = u8;\n#[derive(Debug)]\npub struct Planted(pub Vec<Byte>);\n",
+            2,
+            "bytes",
+        ),
+        (
+            "bytes under a generic alias",
+            "type Bytes<T> = Vec<T>;\n#[derive(Debug)]\npub struct Planted(pub Bytes<u8>);\n",
+            2,
+            "bytes",
+        ),
+        (
+            "bytes under an alias that a Debug written by hand formats",
+            "type Byte = u8;\npub struct Planted {\n    pub bytes: Vec<Byte>,\n}\nimpl std::fmt::Debug for Planted {\n    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n        formatter.debug_tuple(\"Planted\").field(&self.bytes).finish()\n    }\n}\n",
+            7,
+            "formats bytes",
+        ),
+        (
+            "the Debug trait under a name a re-export gives it",
+            "mod names {\n    pub use std::fmt::Debug as Shows;\n}\nuse names::Shows as D;\npub struct Planted {\n    pub text: String,\n}\nimpl D for Planted {\n    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n        formatter.debug_tuple(\"Planted\").field(&self.text).finish()\n    }\n}\n",
+            10,
+            "formats std::string::String",
+        ),
+        (
+            "a Debug macro where another is imported under its name elsewhere in the file",
+            "mod inner {\n    use kr_client::debug_as_name as debug_fields;\n}\npub struct Planted {\n    pub text: String,\n}\nkr_client::debug_fields!(Planted { text });\n",
+            7,
+            "formats std::string::String",
         ),
         (
             "a name that is not the program's words",
