@@ -45,6 +45,8 @@ Plugins:
 | [plugins/runtime.md](plugins/runtime.md) | Where a plugin component runs, what bounds it, its faults and its compiled-code cache, and the package that ships with the host |
 | [plugins/sdk.md](plugins/sdk.md) | Answering an application's approval from a declarative package |
 | [bridges/claude-code/README.md](bridges/claude-code/README.md) | The Claude Code bridge |
+| [bridges/gemini-cli/README.md](bridges/gemini-cli/README.md) | The Gemini CLI bridge |
+| [bridges/qoder-cli/README.md](bridges/qoder-cli/README.md) | The Qoder CLI bridge |
 
 The clients:
 
@@ -58,12 +60,20 @@ The clients:
 | [voice/client.md](voice/client.md) | Voice on the client: capture, playback, the capture gate and the device-owner confirmation |
 | [voice/media-stack-survey.md](voice/media-stack-survey.md) | The native media stack chosen for the voice client, and why |
 
+Conformance and performance:
+
+| Document | What it covers |
+| --- | --- |
+| [conformance/README.md](conformance/README.md) | The conformance report: running it, how a test names the identifiers it proves, outcomes and verdicts, the result it writes and the application matrix |
+| [performance/README.md](performance/README.md) | The reference host and the two configurations the performance targets are measured in, how each figure is taken and recorded, and where a release's figures come from |
+
 Releases:
 
 | Document | What it covers |
 | --- | --- |
 | [releases/packages.md](releases/packages.md) | How the generated protocol and plugin SDK packages are released and pinned, and the managed shell packages' update target |
 | [releases/windows-signing.md](releases/windows-signing.md) | How Windows executables and PowerShell packages are signed, and the identity behind the signatures |
+| [releases/platforms.md](releases/platforms.md) | The platforms and oldest releases a release runs on, where each executable is built, how each one's floor is read back, and the Linux distributions tested |
 
 The [repository README](../README.md) says how to build and test this repository, how it is
 released and how a host recovers.

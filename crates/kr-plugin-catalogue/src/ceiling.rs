@@ -13,7 +13,7 @@
 //! | The three default capabilities | Nobody; the enrolment already did |
 //! | Transcript tails, process observation, upstream actions | An explicit package or repository grant |
 //! | Raw terminal streams, terminal input, filesystem, network, decoding and answering approvals | An explicit installation grant |
-//! | A native bridge, which runs under the application's own permissions | An installation grant with the owner's confirmation, on every release |
+//! | A native bridge, which runs under the application's own permissions, or a command integration, which changes how the application runs | An installation grant with the owner's confirmation, on every release |
 //! | Anything the installation it replaces could not do, or, with nothing to replace, anything past the ceiling | The owner's confirmation of that exact package and grant, because an increase is not the old decision |
 //!
 //! The last row is why an installation is compared as a whole effective set, with [`effective`],
