@@ -412,8 +412,8 @@ jobs:
       # task and from the built executable as the shipping daemon starts a worker, the first-owner
       # pairing against a real control daemon on loopback, the contact skill's installation and
       # removal with the access reader it compares a replacement with, the directory secret store
-      # and the libsodium boundary, and the plugin catalogue's package store with the daemon's
-      # catalogue and plugin groups over it. "The attach client" means the part of it that runs
+      # and the libsodium boundary, the machine group record, and the plugin catalogue's package
+      # store with the daemon's catalogue and plugin groups over it. "The attach client" means the part of it that runs
       # here - `crates/kr-cli/tests/attach.rs` is a Unix file, so what passes is that crate's library
       # and its path tests rather than a real attachment. The contact tools run in
       # `crates/kr-cli/tests/contact_windows.rs`, beside the Unix suite, with the tool server
@@ -529,6 +529,14 @@ jobs:
       - name: Test the directory secret store and the libsodium boundary
         if: ${{ !cancelled() }}
         run: cargo test --locked -p kr-crypto
+
+      # The machine group record on this platform. A step renames a new record over the old one,
+      # which Windows refuses while another program, a scanner among them, holds the record
+      # without sharing its deletion; the rename is tried again for a bounded time, and a holder
+      # that outlasts it leaves the old record and the refusal reported.
+      - name: Test the machine group record
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p kr-controller --lib machine
 
       # The plugin catalogue's package store on this platform: a package staged in a directory of
       # its own is renamed into place whole once it is checked, repaired where it lies, and removed

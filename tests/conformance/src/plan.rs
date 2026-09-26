@@ -784,6 +784,18 @@ fn windows() -> Vec<Step> {
             "the directory secret store and the libsodium boundary",
             &["test", "--locked", "-p", "kr-crypto"],
         ),
+        qualified_only(
+            "the machine group record",
+            &[
+                "test",
+                "--locked",
+                "-p",
+                "kr-controller",
+                "--lib",
+                "machine",
+            ],
+            "machine",
+        ),
         Step::cargo(
             Group::Rust,
             "the plugin catalogue's package store",
