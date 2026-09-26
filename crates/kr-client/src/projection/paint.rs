@@ -1006,7 +1006,7 @@ impl<'a> Writer<'a> {
 }
 
 /// One piece of a run, at the canonical column a destination draws it in.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Placed {
     /// The text as the run holds it. [`drawable`] is what a destination is given of it.
     pub text: String,
@@ -1014,6 +1014,19 @@ pub struct Placed {
     pub column: u64,
     /// How many cells it occupies.
     pub cells: u64,
+}
+
+impl std::fmt::Debug for Placed {
+    /// How long its text is, where it goes and how many cells it covers. Never the text, which a
+    /// terminal showed.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Placed")
+            .field("text_bytes", &self.text.len())
+            .field("column", &self.column)
+            .field("cells", &self.cells)
+            .finish()
+    }
 }
 
 /// Where one run's text goes inside a window, and what could not go there.

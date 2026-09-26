@@ -959,6 +959,26 @@ mod cases {
         };
         #[cfg(feature = "terminal")]
         assert_unmarked("painted bytes", &debug_renderings(&painted));
+        #[cfg(feature = "terminal")]
+        {
+            let placed = crate::projection::paint::Placed {
+                text: MARKER.to_owned(),
+                column: 3,
+                cells: 14,
+            };
+            let placement = crate::projection::paint::Placement {
+                pieces: vec![placed.clone()],
+                ..crate::projection::paint::Placement::default()
+            };
+            assert_unmarked("a placed piece", &debug_renderings(&placed));
+            assert_unmarked("a placement", &debug_renderings(&placement));
+            renders_only(&placed, "Placed{text_bytes:14,column:3,cells:14}");
+            renders_only(
+                &placement,
+                "Placement{pieces:[Placed{text_bytes:14,column:3,cells:14}],clipped:false,\
+                 cells_clipped:0,run_replaced:false,clusters_replaced:0}",
+            );
+        }
 
         let subject = crate::uploads::Subject {
             environment_id: kr_protocol::ids::EnvironmentId::new(uuid(2)),
