@@ -1231,7 +1231,8 @@ pub fn terminal_view_move(
 /// The input is read as the page sends it, and anything else is refused before the view is asked.
 /// It answers once the view has taken the input, not once the program has: what the session
 /// answers reaches the page as the view's state. A wheel turn or keys the view may not write, since
-/// it does not control the program under the take they name, are refused, and nothing is written.
+/// it does not control the program under the take they name, are refused, and nothing is written;
+/// so is any input to a view that has ended.
 #[tauri::command]
 pub async fn terminal_view_input(
     views: State<'_, crate::terminal::TerminalViews>,

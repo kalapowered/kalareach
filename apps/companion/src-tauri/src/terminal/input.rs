@@ -52,6 +52,9 @@ pub const MAX_TURNS: u16 = 1024;
 /// What the command says when a view is sent a wheel turn or keys it may not write.
 const NOT_CONTROLLING: &str = "This view does not control the program.";
 
+/// What the command says when the view the page names has ended, or was never open.
+pub(super) const ENDED: &str = "This view has ended, and took nothing.";
+
 /// What the page says to a view, in the shape the page sends it.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]

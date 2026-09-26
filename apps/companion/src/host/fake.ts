@@ -2133,7 +2133,7 @@ function fakeTerminalView(
       input: (next) => {
         const input = readTerminalInput(next)
         if (typeof input === 'string') return refused('INVALID_ARGUMENT', input)
-        if (closed || ended) return Promise.resolve()
+        if (closed || ended) return refused('LEASE_LOST', 'This view has ended, and took nothing.')
         switch (input.kind) {
           case 'take':
           case 'release': {

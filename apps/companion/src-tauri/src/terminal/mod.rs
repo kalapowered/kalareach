@@ -148,33 +148,35 @@ impl TerminalViews {
     }
 
     /// Hands a view the person's `input`, and answers once its task has taken it: a take or a
-    /// release at once, and a wheel turn or keys once written, or refused because the view does not
-    /// control the program under the take they name. What the session answers reaches the page as
-    /// the view's state. A view that has ended takes nothing, and has nothing to refuse.
+    /// release at once, and a wheel turn or keys once they have their place in what the view sends
+    /// the session, ahead of anything it sends after them. The answer is the view's, not the
+    /// session's: what the session answers reaches the page as the view's state.
     ///
     /// # Errors
     ///
-    /// Returns why a wheel turn or keys may not be written.
+    /// Returns why the view did not take the input: a wheel turn or keys made under a take the view
+    /// does not control the program with, or a view that has ended or was never open.
     pub async fn input(&self, view: &str, input: Input) -> Result<(), String> {
+        let ended = || Err(input::ENDED.to_owned());
         let Ok(id) = view.parse::<u64>() else {
-            return Ok(());
+            return ended();
         };
         let (answer, answered) = tokio::sync::oneshot::channel();
         {
             let held = self.lock();
             let Some(entry) = held.get(&id) else {
-                return Ok(());
+                return ended();
             };
             if entry
                 .commands
                 .send(view::Command::Input(input, answer))
                 .is_err()
             {
-                return Ok(());
+                return ended();
             }
         }
-        // A task that ends before it answers drops the answer, and has ended with its view.
-        answered.await.unwrap_or(Ok(()))
+        // A task that ends before it answers drops the answer: its view has ended and took nothing.
+        answered.await.unwrap_or_else(|_| ended())
     }
 
     /// Closes a view and returns once its task has ended: it detaches, closes its link and publishes

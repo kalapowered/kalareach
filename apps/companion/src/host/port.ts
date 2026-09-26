@@ -1005,7 +1005,8 @@ export interface TerminalView {
   /**
    * Hands the view the person's input. Resolves once native code has taken it; a wheel turn or keys
    * the view may not write, since it does not control the program under the take they name, is
-   * refused with `LEASE_LOST`, and a shape native code does not read with `INVALID_ARGUMENT`.
+   * refused with `LEASE_LOST`, as is any input once the view has ended, and a shape native code
+   * does not read with `INVALID_ARGUMENT`.
    */
   input(input: TerminalInput): Promise<void>
   /** Closes the view. Resolves once it has ended: nothing it publishes arrives after. */

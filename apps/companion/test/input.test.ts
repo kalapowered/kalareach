@@ -160,4 +160,23 @@ describe('the scripted host reads input as native code does (KR-REQ-10.01)', () 
     const last = states.at(-1)
     expect(last !== undefined && last.state !== 'ended' ? last.control.state : null).toBe('controlling')
   })
+
+  it('refuses any input once the view has ended, as native code does, and records none of it', async () => {
+    const { port, controls } = fakeHost()
+    const view: TerminalView = await port.openTerminalView(SESSION_MAIN, { columns: 80, rows: 8 }, () => {})
+    await view.input({ kind: 'take', number: 1 })
+    await new Promise((resolve) => {
+      setTimeout(resolve, 0)
+    })
+    await view.close()
+    for (const input of [
+      { kind: 'keys', take: 1, keys: 'q' },
+      { kind: 'wheel', take: 1, column: 0, line: 0, turns: 1, shift: false, alt: false, control: false },
+      { kind: 'take', number: 2 },
+      { kind: 'release', number: 3 }
+    ] as const) {
+      await expect(view.input(input), input.kind).rejects.toMatchObject({ code: 'LEASE_LOST' })
+    }
+    expect(controls.terminalViews[0]?.inputs).toEqual([{ kind: 'take', number: 1 }])
+  })
 })

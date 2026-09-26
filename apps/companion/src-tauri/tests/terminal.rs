@@ -2406,6 +2406,68 @@ async fn closing_a_controlling_view_detaches_and_writes_nothing_after() {
     assert_eq!(detach.attachment_id.0, Some(holder));
 }
 
+/// Input to a view that has ended, closed by the page or by its link, or to a view that was never
+/// open, is refused as control that has ended, and nothing of it reaches a session: the page is
+/// never told that input was taken when it was not.
+#[tokio::test(flavor = "multi_thread")]
+async fn input_to_a_view_that_has_ended_or_was_never_open_is_refused() {
+    let refused_as_ended = |page: &Page, view: &str| {
+        for (what, answer) in [
+            ("keys", page.keys(view, 1, "q")),
+            ("a wheel turn", page.wheel(view, 1, 1, 1, 1)),
+            (
+                "a take",
+                page.input(view, json!({"kind": "take", "number": 2})),
+            ),
+            (
+                "a release",
+                page.input(view, json!({"kind": "release", "number": 3})),
+            ),
+        ] {
+            let refusal = answer.expect_err(what);
+            assert_eq!(code(&refusal), "LEASE_LOST", "{what}");
+            assert_eq!(
+                refusal["message"], "This view has ended, and took nothing.",
+                "{what}"
+            );
+        }
+    };
+    for ending in ["closed by the page", "its link lost"] {
+        let mut worker = ScriptedWorker::start(Challenge::Answered);
+        let page_view = Page::new(worker.paths());
+        let mut lease = WorkerLease::default();
+        let (view, mut link) = controlling(
+            &page_view,
+            &mut worker,
+            3,
+            &reporting(Mouse::Sgr),
+            &mut lease,
+        )
+        .await;
+        if ending == "closed by the page" {
+            page_view.close(&view);
+            let sent = link.closed().await;
+            assert_eq!(
+                sent.iter()
+                    .map(|call| call.method.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["session.detach"],
+                "{ending}"
+            );
+        } else {
+            drop(link);
+            page_view.newest(3, |state| state["state"] == "ended").await;
+        }
+        page_view.held_becomes(0).await;
+        refused_as_ended(&page_view, &view);
+    }
+    let worker = ScriptedWorker::start(Challenge::Answered);
+    let page_view = Page::new(worker.paths());
+    for view in ["99", "not a view"] {
+        refused_as_ended(&page_view, view);
+    }
+}
+
 /// An acquire answered after the person looked around gives the page nothing: the view releases
 /// the epoch it was handed, and control stays given back. Closing while an acquire is in flight
 /// detaches, which gives back whatever it took.
