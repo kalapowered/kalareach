@@ -596,6 +596,20 @@ mod tests {
                 .into_iter()
                 .collect();
         assert!(!super::reads_history_scopes(&other));
+
+        // A worker that read scopes naming approvals by an upstream's text says so with the first
+        // version alone, and is sent no scope; the version that names them by resource is read.
+        let statement = |capability: &str| -> CanonicalSet<CapabilityId> {
+            [CapabilityId::new(capability).expect("a capability identifier")]
+                .into_iter()
+                .collect()
+        };
+        assert!(!super::reads_history_scopes(&statement(
+            "forwarded.history-scope/1"
+        )));
+        assert!(super::reads_history_scopes(&statement(
+            "forwarded.history-scope/2"
+        )));
     }
 
     #[test]
