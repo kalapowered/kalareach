@@ -2500,7 +2500,10 @@ mod tests {
         let path = PathBuf::from(format!(
             "/home/someone/.config/systemd/user/{LABEL}.service"
         ));
+        // The file as the rendering rule shows it, which on Windows puts every name after the root
+        // in that platform's separator.
         let said = Shown::root(&path);
+        assert!(said.as_str().ends_with(&format!("{LABEL}.service")));
         assert_eq!(State::Matches.trouble(&said), None);
         for state in [
             State::Missing,
@@ -2511,8 +2514,7 @@ mod tests {
         ] {
             let trouble = state.trouble(&said).expect("a trouble");
             assert!(
-                trouble.as_str().contains(&path.display().to_string())
-                    && trouble.as_str().contains(SETUP_ACTION),
+                trouble.as_str().contains(said.as_str()) && trouble.as_str().contains(SETUP_ACTION),
                 "{}: {trouble}",
                 state.as_str()
             );
