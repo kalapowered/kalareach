@@ -1052,9 +1052,10 @@ async fn a_deleted_collection_stops_the_settings_archive_and_says_to_enrol_a_new
 /* -------------------------------------------------------------------------- */
 
 /// The settings archive holds the writer's and the producer's private keys, and its rendering
-/// names them by their identifiers.
+/// names neither a key nor a key's identifier, whose bytes it would print whole: it says the archive
+/// and where it stands.
 #[tokio::test]
-async fn a_settings_archive_renders_its_keys_by_their_identifiers() {
+async fn a_settings_archive_renders_neither_its_keys_nor_their_identifiers() {
     let owner = Owner::new();
     let archive = owner
         .enable()
@@ -1062,7 +1063,11 @@ async fn a_settings_archive_renders_its_keys_by_their_identifiers() {
         .expect("the settings writer is enabled");
     let shown = format!("{archive:?}");
     assert!(
-        shown.contains(&format!("{:?}", owner.device.0.key_id())),
+        shown.starts_with("SettingsArchive { collection: SettingsCollection { archive_id: "),
+        "{shown}"
+    );
+    assert!(
+        !shown.contains(&format!("{:?}", owner.device.0.key_id())),
         "{shown}"
     );
     assert!(!shown.contains("seed"), "{shown}");

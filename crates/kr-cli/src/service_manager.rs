@@ -1314,6 +1314,18 @@ mod platform {
     kr_client::debug_fields!(Loaded { pid });
 
     impl Loaded {
+        /// Everything read of the job, part by part, for the tests that hold the reading to what
+        /// launchd printed.
+        #[cfg(test)]
+        pub(super) fn parts(&self) -> String {
+            format!(
+                "{:?} {:?} {:?} {:?} {:?}",
+                self.path, self.program, self.arguments, self.working_directory, self.pid
+            )
+        }
+    }
+
+    impl Loaded {
         /// Reads what `launchctl print <domain>/<label>` printed for a loaded job.
         ///
         /// The job's own fields are at the first level of the description, one tab in; its
@@ -2858,7 +2870,8 @@ mod tests {
             platform::Loaded::read(printed),
             "reading is deterministic"
         );
-        let debug = format!("{loaded:?}");
+        assert_eq!(format!("{loaded:?}"), "Loaded { pid: Some(4242), .. }");
+        let debug = loaded.parts();
         for expected in [
             "/Users/someone/Library/LaunchAgents/kr-controller-test.plist",
             "/opt/kr/kr-controller",
@@ -2934,8 +2947,13 @@ mod tests {
                  what it runs",
             ),
         ] {
-            // The negative control: what launchd printed holds the marker.
-            assert!(format!("{job:?}").contains(MARKER), "{words}");
+            // The negative control: what launchd printed holds the marker, and the job read from
+            // it holds it too, though its rendering does not.
+            let platform::Job::Loaded(loaded) = &job else {
+                panic!("a job is held");
+            };
+            assert!(loaded.parts().contains(MARKER), "{words}");
+            renderings.push(format!("{job:?}"));
             let why = platform::loaded_as_written(&job, &written).expect_err("not as written");
             assert!(
                 why.as_str().starts_with(&prefix) && why.as_str().contains(words),
