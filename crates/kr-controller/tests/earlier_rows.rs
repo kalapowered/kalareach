@@ -6,7 +6,9 @@
 //! bytes under either element, while a set that names an approval by text names no resource of
 //! this host. So for each of the six stored payloads, the row an earlier build wrote naming nothing
 //! reads, and writes back, byte for byte; the row naming an approval by text admits nothing, and
-//! its refusal names the table and the row. Where a listing reads every row, one such row fails the
+//! its refusal names the table and the row. The one exception is a retained answer, which this
+//! host keeps as the bytes it was and gives back unchanged to a retry of its action: this build's
+//! typed read of it is what refuses it. Where a listing reads every row, one such row fails the
 //! whole listing, which is the answer that withholds.
 //!
 //! The rows are `fixtures/earlier-rows/rows.json`, encoded by the earlier build with its own types.
