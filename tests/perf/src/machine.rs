@@ -224,16 +224,17 @@ mod platform {
                     }
                     Err(error) => return Err(format!("read process {pid}'s status: {error}")),
                 };
-                rows.push(Row::Read(self.status(pid, &status, processors)?));
+                rows.push(self.status(pid, &status, processors)?);
             }
             Ok(rows)
         }
 
         /// A process's status line. The command name is the second field and may hold spaces and
         /// parentheses, so the fields are counted from after the last parenthesis, which ends it:
-        /// the parent is field 4, the process's user and system ticks 14 and 15, its threads 20,
-        /// and its start, in ticks since the machine started, 22.
-        fn status(&self, pid: u32, status: &str, processors: u32) -> Result<Process, String> {
+        /// the state is field 3, the parent 4, the process's user and system ticks 14 and 15, its
+        /// threads 20, and its start, in ticks since the machine started, 22. A process that has
+        /// ended and waits to be collected is listed as unread, as on macOS.
+        fn status(&self, pid: u32, status: &str, processors: u32) -> Result<Row, String> {
             let unread = || format!("process {pid}'s status reads `{}`", status.trim_end());
             let fields: Vec<&str> = status
                 .rsplit_once(')')
@@ -241,6 +242,9 @@ mod platform {
                 .1
                 .split_whitespace()
                 .collect();
+            if matches!(fields.first(), Some(&("Z" | "X" | "x"))) {
+                return Ok(Row::Unread { pid });
+            }
             let count = |number: usize| -> Result<u64, String> {
                 fields
                     .get(number - 3)
@@ -254,13 +258,13 @@ mod platform {
                 reason = "a tick count is far inside f64's exact range"
             )]
             let own = (count(14)? + count(15)?) as f64 / self.ticks_per_second;
-            Ok(Process {
+            Ok(Row::Read(Process {
                 pid,
                 parent,
                 start: count(22)?,
                 own,
                 lag: f64::from(threads.min(processors)) / self.clock_rate,
-            })
+            }))
         }
     }
 
@@ -368,12 +372,14 @@ mod platform {
             Ok((seconds, processors))
         }
 
-        /// Every process the kernel lists, read one at a time in the order listed. A process whose
-        /// task information cannot be read, another user's or one that has ended, is listed as
-        /// unread.
+        /// Every process the kernel lists, read one at a time. A process whose task information
+        /// cannot be read, another user's or one that has ended, is listed as unread.
         pub fn rows(&self, processors: u32) -> Result<Vec<Row>, String> {
-            let pids = pids_by_type(ProcFilter::All)
+            let mut pids = pids_by_type(ProcFilter::All)
                 .map_err(|error| format!("list the process table: {error}"))?;
+            // In identifier order, as Linux lists them, so that a parent older than its children
+            // is read before them.
+            pids.sort_unstable();
             let mut rows = Vec::with_capacity(pids.len());
             for pid in pids {
                 let Ok(signed) = i32::try_from(pid) else {
