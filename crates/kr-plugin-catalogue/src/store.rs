@@ -1313,12 +1313,17 @@ impl Store {
             let path = layout.staging.path.join(&name);
             match layout.staging.dir.create_dir(&name) {
                 Ok(()) => {
-                    let dir = open_child(&layout.staging.dir, &path, Path::new(&name), false)?;
-                    return Ok(StagedPackage {
-                        store: self.clone(),
+                    // From here the directory is removed again unless it is activated, whatever
+                    // happens next.
+                    let place = StagedPlace {
                         staging: layout.staging,
                         name,
+                    };
+                    let dir = open_child(&place.staging.dir, &path, Path::new(&place.name), false)?;
+                    return Ok(StagedPackage {
+                        store: self.clone(),
                         dir,
+                        place,
                         digest: manifest_digest,
                         written: BTreeMap::new(),
                     });
@@ -1561,14 +1566,37 @@ impl ReclaimPlan {
 pub struct StagedPackage {
     /// The store the package is staged in, whose directories are opened again before each write.
     store: Store,
-    /// The staging directory the package is staged in, and the name of its directory there.
-    staging: Area,
-    name: String,
-    /// The directory the package is staged into.
+    /// The directory the package is staged into, held open while it is staged.
+    ///
+    /// It is declared before `place`, so its handle is closed before the directory is removed: on
+    /// Windows the store opens a directory without sharing its deletion, and a directory held that
+    /// way can be neither removed nor renamed.
     dir: Area,
+    /// Where the directory is in staging, which removes it unless it is activated.
+    place: StagedPlace,
     /// The package's hash, which names its directory once it is activated.
     digest: PayloadDigest,
     written: BTreeMap<String, u64>,
+}
+
+/// A staged package's directory, by its name in the staging directory it was made in.
+#[derive(Debug)]
+struct StagedPlace {
+    staging: Area,
+    name: String,
+}
+
+impl Drop for StagedPlace {
+    /// Removes a staging directory nothing will activate, through the staging directory it was
+    /// made in.
+    ///
+    /// The directory is this attempt's own and nothing reads it, so an attempt that stops part way,
+    /// or whose activation was refused, leaves nothing behind. After an activation it has been
+    /// renamed into place and there is nothing here to remove. A removal that fails leaves a
+    /// directory no reader ever looks at, under a name no later attempt reuses.
+    fn drop(&mut self) {
+        let _ = self.staging.dir.remove_dir_all(&self.name);
+    }
 }
 
 impl StagedPackage {
@@ -1628,17 +1656,19 @@ impl StagedPackage {
     ///
     /// The staged package was checked as a whole before this. Where nothing is at the destination
     /// yet, the whole directory is renamed into place, so the package appears complete or not at
-    /// all. Where a package is already there, it failed its own check, and it is repaired where it
-    /// lies: each file that does not hold the checked bytes is replaced by a rename of its own. The
-    /// directory never disappears, a reader holding a file open keeps reading it, and a reader that
-    /// opens a file by name finds either the file that was there or the checked one. The name
-    /// alone never counts as the package.
+    /// all, and what arrives there is confirmed to be the directory that was staged. Where a
+    /// package is already there, it failed its own check, and it is repaired where it lies: each
+    /// file that does not hold the checked bytes is replaced by a rename of its own. The directory
+    /// never disappears, a reader holding a file open keeps reading it, and a reader that opens a
+    /// file by name finds either the file that was there or the checked one. The name alone never
+    /// counts as the package.
     ///
     /// # Errors
     ///
-    /// Returns [`CatalogueError::StorageUnavailable`] when nothing was changed, and
-    /// [`CatalogueError::PublicationUncertain`] when part of the package was replaced and the rest
-    /// could not be, or when a directory did not confirm a rename.
+    /// Returns [`CatalogueError::StorageUnavailable`] when nothing was changed, a directory put in
+    /// the staged one's place among it, and [`CatalogueError::PublicationUncertain`] when part of
+    /// the package was replaced and the rest could not be, or when a directory did not confirm a
+    /// rename.
     pub(crate) fn activate(self, _permit: &Permit) -> CatalogueResult<PathBuf> {
         // The store's directories are opened again here, just before the package moves from
         // staging into packages: what was opened when staging started says nothing about a link
@@ -1649,11 +1679,7 @@ impl StagedPackage {
         let destination = layout.packages.path.join(&name);
         match layout.packages.dir.symlink_metadata(&name) {
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
-                self.staging
-                    .dir
-                    .rename(&self.name, &layout.packages.dir, &name)
-                    .map_err(|source| CatalogueError::storage(&destination, &source))?;
-                flushed_after_publication(&layout.packages, &destination, NameKind::Directory)?;
+                self.move_into_place(&layout.packages, &name)?;
             }
             Err(source) => return Err(CatalogueError::storage(&destination, &source)),
             Ok(metadata) if metadata.is_dir() => self.repair_in_place(&layout.packages)?,
@@ -1667,6 +1693,68 @@ impl StagedPackage {
             }
         }
         Ok(destination)
+    }
+
+    /// Renames the staged directory into `packages` as `name`, and confirms that what arrived there
+    /// is the directory that was staged and checked.
+    ///
+    /// The staged directory's own handle is closed first. The store opens a directory without
+    /// sharing its deletion, which on Windows keeps anything, this store included, from renaming a
+    /// directory held that way. The rename then reaches the directory by its name in staging rather
+    /// than through a handle, so the directory that arrives in `packages` is compared with the one
+    /// staged by what identifies a directory on its volume whatever its name, read from the staged
+    /// directory's handle before it was closed. Anything else is moved out of `packages` again,
+    /// into staging, where taking the store's lock next removes it, and the activation is refused:
+    /// a directory put in the staged one's place is never left where readers look.
+    fn move_into_place(self, packages: &Area, name: &str) -> CatalogueResult<()> {
+        let Self { dir, place, .. } = self;
+        let destination = packages.path.join(name);
+        let staged = identity(&dir)?;
+        let staged_path = dir.path.clone();
+        drop(dir);
+        #[cfg(test)]
+        rename_pause::run();
+        place
+            .staging
+            .dir
+            .rename(&place.name, &packages.dir, name)
+            .map_err(|source| CatalogueError::storage(&destination, &source))?;
+        let arrived = open_child(&packages.dir, &destination, Path::new(name), false)
+            .and_then(|arrived| identity(&arrived));
+        if arrived.as_ref().is_ok_and(|arrived| *arrived == staged) {
+            return flushed_after_publication(packages, &destination, NameKind::Directory);
+        }
+        let refused = format!("{}.refused", place.name);
+        if let Err(source) = packages.dir.rename(name, &place.staging.dir, &refused) {
+            return Err(CatalogueError::PublicationUncertain {
+                detail: format!(
+                    "{} is not the directory that was staged and checked, and it could not be \
+                     moved out of place again: {source}",
+                    destination.display()
+                ),
+            });
+        }
+        // Moved out, and flushed so that a crash does not put it back where readers look.
+        flush_directory(packages, NameKind::Directory).map_err(|error| {
+            CatalogueError::PublicationUncertain {
+                detail: format!(
+                    "{} was not the directory that was staged and checked and was moved out of \
+                     place again, and its directory did not confirm that: {error}",
+                    destination.display()
+                ),
+            }
+        })?;
+        let what = match arrived {
+            Ok(_) => "another directory".to_owned(),
+            Err(error) => error.to_string(),
+        };
+        Err(CatalogueError::StorageUnavailable {
+            detail: format!(
+                "{} was not the directory that was staged and checked when it was renamed into \
+                 place ({what}), so it was moved out again and nothing was activated",
+                staged_path.display()
+            ),
+        })
     }
 
     /// Replaces, one rename at a time, every file of the package already in `packages` that does
@@ -1808,17 +1896,16 @@ impl StagedPackage {
     }
 }
 
-impl Drop for StagedPackage {
-    /// Removes a staging directory nothing will activate, through the staging directory it was
-    /// made in.
-    ///
-    /// The directory is this attempt's own and nothing reads it, so an attempt that stops part way,
-    /// or whose activation was refused, leaves nothing behind. After an activation it has been
-    /// renamed into place and there is nothing here to remove. A removal that fails leaves a
-    /// directory no reader ever looks at, under a name no later attempt reuses.
-    fn drop(&mut self) {
-        let _ = self.staging.dir.remove_dir_all(&self.name);
-    }
+/// What identifies a directory on its volume whatever its name: the volume's number and the
+/// directory's own number on it, as the operating system reports them for the handle.
+fn identity(directory: &Area) -> CatalogueResult<(u64, u64)> {
+    use cap_fs_ext::MetadataExt as _;
+
+    let metadata = directory
+        .dir
+        .dir_metadata()
+        .map_err(|source| CatalogueError::storage(&directory.path, &source))?;
+    Ok((metadata.dev(), metadata.ino()))
 }
 
 /// Writes a document and requires its rename to be durable before it returns.
@@ -1978,6 +2065,31 @@ pub(crate) mod index_pause {
     }
 
     /// Runs `then` once, the next time an index document is about to be opened on this thread.
+    pub(crate) fn once(then: impl FnOnce() + 'static) {
+        BEFORE.with(|before| *before.borrow_mut() = Some(Box::new(then)));
+    }
+
+    pub(crate) fn run() {
+        if let Some(then) = BEFORE.with(|before| before.borrow_mut().take()) {
+            then();
+        }
+    }
+}
+
+/// What the unit tests run after a staged package closed its directory's handle and before it
+/// renames the directory into place, to put another directory in the staged one's place.
+#[cfg(test)]
+pub(crate) mod rename_pause {
+    use std::cell::RefCell;
+
+    type Then = Box<dyn FnOnce()>;
+
+    thread_local! {
+        static BEFORE: RefCell<Option<Then>> = const { RefCell::new(None) };
+    }
+
+    /// Runs `then` once, the next time a staged package on this thread is about to be renamed
+    /// into place.
     pub(crate) fn once(then: impl FnOnce() + 'static) {
         BEFORE.with(|before| *before.borrow_mut() = Some(Box::new(then)));
     }
@@ -2197,6 +2309,54 @@ mod tests {
         assert_eq!(
             std::fs::read(activated.join("plugin.json")).expect("readable"),
             b"manifest"
+        );
+    }
+
+    /// KR-REQ-11.06: a staged package's activation renames its directory by its name in staging,
+    /// having closed the directory's own handle, so what arrives in `packages` is compared with the
+    /// directory that was staged and checked. A directory put in the staged one's place in that
+    /// moment, holding the very same file, is refused and moved out again: nothing is left where
+    /// readers look, the staged directory is left as it was, and taking the store's lock clears
+    /// what was moved out.
+    #[test]
+    fn a_directory_put_in_the_staged_ones_place_is_refused_and_not_left_in_place() {
+        let (directory, store) = store();
+        let digest = PayloadDigest::of(b"manifest");
+        let mut staged = store.stage_package(digest).expect("a staging directory");
+        staged
+            .write(&path("plugin.json"), b"manifest")
+            .expect("written");
+        let (name, moved) = (staged.path().to_path_buf(), directory.path().join("moved"));
+        let elsewhere = moved.clone();
+        rename_pause::once(move || {
+            std::fs::rename(&name, &elsewhere).expect("the staged directory is not held");
+            std::fs::create_dir(&name).expect("another directory of the same name");
+            std::fs::write(name.join("plugin.json"), b"manifest").expect("with the same file");
+        });
+
+        let refused = owned(|permit| staged.activate(permit))
+            .expect_err("not the directory that was staged and checked");
+        assert!(
+            matches!(&refused, CatalogueError::StorageUnavailable { detail }
+                if detail.contains("was not the directory that was staged and checked")),
+            "{refused:?}"
+        );
+        assert!(
+            !store.package_dir(digest).exists(),
+            "nothing is left where readers look"
+        );
+        assert_eq!(
+            std::fs::read(moved.join("plugin.json")).expect("readable"),
+            b"manifest",
+            "the staged directory is as it was"
+        );
+        let _lock = store.lock().expect("the store's lock");
+        assert_eq!(
+            std::fs::read_dir(store.root.join("staging"))
+                .expect("readable")
+                .count(),
+            0,
+            "what was moved out is cleared with the lock"
         );
     }
 
