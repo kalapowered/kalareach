@@ -878,39 +878,40 @@ async fn the_first_owner_is_not_confirmed_in_a_real_workers_session_without_its_
     let session_id = host.session().await;
     let environment = host.tree.environment();
     let mut terminal = WorkerTerminal::attach(&environment, session_id).await;
-    terminal.shown("PS ", "the session's shell prompts").await;
     let kr_path = kr();
     let roots = format!(
         "$env:KR_RUNTIME_DIR = '{}'; $env:KR_STATE_DIR = '{}'",
         host.tree.paths().runtime_root().display(),
         host.tree.paths().state_root().display()
     );
+    // Each marker is put together by the shell, so the line as typed, which the console echoes,
+    // does not hold it: only the shell's answer does, once `kr` has ended.
     terminal
         .type_line(&format!(
             "{roots}; Remove-Item Env:KR_SESSION, Env:KR_ATTACHMENT -ErrorAction SilentlyContinue; \
-             & '{}' pair invite --owner --direct; 'kr-exit-' + $LASTEXITCODE + '-end'",
+             & '{}' pair invite --owner --direct; ('KR' + 'EXIT') + $LASTEXITCODE + ('KR' + 'END')",
             kr_path.display()
         ))
         .await;
     let seen = terminal
-        .shown("-end", "kr runs in the session with its variables removed")
+        .shown("KREND", "kr runs in the session with its variables removed")
         .await;
     assert!(
         seen.contains(&format!("this process is inside session {session_id}")),
         "the session's worker recognised kr as its own: {seen}"
     );
     assert!(!seen.contains("Type pair"), "nothing was asked: {seen}");
-    assert!(!seen.contains("kr-exit-0-end"), "and kr refused: {seen}");
+    assert!(!seen.contains("KREXIT0KREND"), "and kr refused: {seen}");
 
     terminal
         .type_line(&format!(
             "$env:KR_SESSION = '{session_id}'; & '{}' pair invite --owner --direct; \
-             'kr-control-' + $LASTEXITCODE + '-done'",
+             ('KR' + 'CONTROL') + $LASTEXITCODE + ('KR' + 'DONE')",
             kr_path.display()
         ))
         .await;
     let seen = terminal
-        .shown("-done", "the control, with the variable in place")
+        .shown("KRDONE", "the control, with the variable in place")
         .await;
     assert!(
         seen.contains("KR_SESSION is set"),
