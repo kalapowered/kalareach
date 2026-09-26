@@ -104,11 +104,13 @@ export function styleOf(rendition: CellRendition, palette: PaletteState): CSSPro
     rendition.strikethrough ? 'line-through' : null,
     rendition.overline ? 'overline' : null
   ].filter((line) => line !== null)
+  const drawn = rendition.faint ? halfStrength(colour) : colour
+  // An underline in the default colour takes the text's, which invisible text does not show.
   const underlineColour = underlined
-    ? css(rendition.underline_colour, palette, rendition.invisible ? colour : undefined)
+    ? css(rendition.underline_colour, palette, rendition.invisible ? drawn : undefined)
     : undefined
   return {
-    color: rendition.invisible ? 'transparent' : rendition.faint ? halfStrength(colour) : colour,
+    color: rendition.invisible ? 'transparent' : drawn,
     backgroundColor: fill === background ? undefined : fill,
     fontWeight: rendition.bold ? 700 : undefined,
     fontStyle: rendition.italic ? 'italic' : undefined,

@@ -538,6 +538,14 @@ describe('the raw terminal', () => {
     expect(invisible.textDecorationColor).toBe('#dcdcda')
   })
 
+  it('draws the underline of faint, invisible text at the faint strength on a phone', () => {
+    const palette = terminalScreen('8a7b6c50-22bb-4c3d-8e4f-000000000101', { columns: 80, rows: 8 })
+      .palette
+    const style = styleOf({ ...PLAIN, faint: true, invisible: true, underline: 'single' }, palette)
+    expect(style.color).toBe('transparent')
+    expect(style.textDecorationColor).toBe('rgba(220, 220, 218, 0.5)')
+  })
+
   it('names what a screen warns of, in the words and the order both views show', () => {
     const whole = terminalScreen('8a7b6c50-22bb-4c3d-8e4f-000000000101', { columns: 80, rows: 8 })
     expect(warningsOf({ ...whole, replaced: 0 })).toEqual([])
