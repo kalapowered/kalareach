@@ -53,8 +53,12 @@ fn kr_req_12_07_an_installed_connector_is_read_from_its_package() {
         InstalledConnector::read(source.clone()).expect("the installed package is read");
     assert_eq!(connector.plugin_id().as_str(), "kalareach/claude-code");
     assert_eq!(connector.package_digest(), source.package_digest);
-    assert_eq!(connector.integration().command, fixture::COMMAND);
-    assert_eq!(connector.integration().flags, fixture::FLAGS);
+    let integration = connector
+        .integration()
+        .expect("the manifest declares the integration");
+    assert_eq!(integration.command, fixture::COMMAND);
+    assert_eq!(integration.flags, fixture::FLAGS);
+    assert!(integration.variables.is_empty());
     assert!(
         connector.table().decision_destination.as_ref().is_some(),
         "the table says how a relayed approval is answered"
@@ -201,21 +205,32 @@ fn a_command_two_packages_integrate_resolves_to_neither() {
     assert!(sources.for_command("claude").is_none());
 }
 
-/// An integration's command must be a command name one of the package's match rules recognises:
-/// a path is not one, and neither is another application's name.
+/// A manifest's integration names a command one of the package's match rules recognises: the
+/// package check refuses a path, another application's name and no name at all, and nothing is
+/// integrated from such a package.
 #[test]
 fn a_command_the_package_does_not_recognise_is_refused() {
     let store = Store::new("command");
-    let valid = store.package();
-    InstalledConnector::read(valid.clone()).expect("the package as installed is read");
+    InstalledConnector::read(store.package()).expect("the package as installed is read");
     for command in ["bin/claude", "/usr/local/bin/claude", "codex", ""] {
-        let mut source = valid.clone();
-        source.integration.command = command.to_owned();
-        let refusal = InstalledConnector::read(source).expect_err("refused");
+        let source = fixture::package(
+            &store.root,
+            Path::new("/opt/kalareach/bin/kr-hook"),
+            &fixture::Shape {
+                integration: Some(fixture::declaration(command, &fixture::FLAGS, &[])),
+                ..fixture::Shape::claude_code()
+            },
+        )
+        .expect("the package is written");
+        let refusal = InstalledConnector::read(source.clone()).expect_err("refused");
         assert!(
-            refusal.detail.contains("command name") || refusal.detail.contains("match rules"),
+            refusal.detail.contains("package check")
+                && refusal.detail.contains("integration_invalid"),
             "{command:?}: {}",
             refusal.detail
         );
+        let sources = ConnectorSources::new();
+        assert_eq!(sources.replace(vec![source]).len(), 1, "{command:?}");
+        assert!(sources.for_command(command).is_none(), "{command:?}");
     }
 }

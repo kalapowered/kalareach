@@ -563,7 +563,10 @@ impl CommandBackends {
             .sources
             .for_command(command)
             .ok_or_else(|| format!("no installed connector integrates {command:?}"))?;
-        if connector.integration().flags != request.integration.flags {
+        let declared = connector
+            .integration()
+            .ok_or_else(|| format!("no installed connector integrates {command:?}"))?;
+        if declared.flags != request.integration.flags {
             return Err(format!(
                 "the flags this session integrates {command:?} with are not the ones its installed \
                  connector declares"
@@ -608,7 +611,7 @@ impl CommandBackends {
             );
         }
         let backend = self
-            .create(request, invocation, added_at, connector)
+            .create(request, invocation, added_at, connector, &launcher)
             .map_err(|error| error.to_string())?;
         let answer = self.answer(&backend, request.prompt_generation, &launcher);
         backends.push(backend);
@@ -764,6 +767,7 @@ impl CommandBackends {
         invocation: Invocation,
         added_at: usize,
         connector: Arc<InstalledConnector>,
+        launcher: &Path,
     ) -> Result<Arc<Backend>> {
         let _entered = self.handle.enter();
         let application_instance_id =
@@ -785,7 +789,7 @@ impl CommandBackends {
             os_user: self.os_user.clone(),
         };
         let mut gateway = NativeGateway::bind(Arc::clone(&self.broker), &directory, launch)?;
-        if let Some(installed) = connector.installed_bridge() {
+        if let Some(installed) = connector.launch_bridge(launcher) {
             gateway = gateway.with_bridge(installed)?;
         }
         let gateway = Arc::new(gateway);

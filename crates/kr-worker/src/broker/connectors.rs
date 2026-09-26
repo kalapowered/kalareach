@@ -3,10 +3,10 @@
 //! A connector is a catalogue package that carries a `connector.json`: the table that says how an
 //! application's protocol frames, routes and classifies, and how a pending approval is answered.
 //! The worker takes one from the installed package and from nowhere else. The installation hands
-//! the worker what it installed (the package's hash, where its extracted copy is, the command the
-//! integration resolves, the native bridge the recipe put in place and the capabilities the
-//! installation granted), and [`InstalledConnector::read`] reads the table out of that copy and
-//! checks it before anything uses it.
+//! the worker what it installed (the package's hash, where its extracted copy is, the native
+//! bridge the recipe put in place and the capabilities the installation granted), and
+//! [`InstalledConnector::read`] reads the table and the command integration out of that copy and
+//! checks them before anything uses them.
 //!
 //! # What is checked, and what is not
 //!
@@ -18,7 +18,10 @@
 //! verifies the chain the signature covers.
 //!
 //! A table is never taken from what the installation says about it: only the file in the package
-//! directory, checked against the installed hash, is read.
+//! directory, checked against the installed hash, is read. The same holds for the command
+//! integration: the command, the flags it adds and the variables it sets are the verified
+//! manifest's own, which the owner confirmed with the release, and they apply only while the
+//! installation holds `command_integration.launch`.
 //!
 //! # Replacing the set
 //!
@@ -37,17 +40,21 @@ use kr_plugin_sdk::plugin::PluginManifest;
 use kr_protocol::broker::{DecodingTrust, OfferedDecision};
 use kr_protocol::ids::{PluginId, PublisherId, UpstreamMethod};
 use kr_protocol::scalars::{CanonicalSet, Digest256, TimestampMs, U64};
+use kr_protocol::session::EnvironmentVariable;
 
 use crate::broker::PackageIdentity;
 use crate::broker::bridge::{BridgeSurface, InstalledBridge};
 
-/// The command an integration resolves, and the flags it adds to an invocation of it.
+/// The command an integration resolves, the flags it adds to an invocation of it and the variables
+/// it sets for that invocation, as the verified manifest declares them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConnectorCommand {
     /// The command name a person types, with no directory.
     pub command: String,
-    /// The flags the integration adds, each one element of the argument vector.
+    /// The flags the integration adds, each one element of the argument vector, in order.
     pub flags: Vec<String>,
+    /// The variables the integration sets for the invocation, in order.
+    pub variables: Vec<EnvironmentVariable>,
 }
 
 /// The native bridge an installation put in place for a connector's application.
@@ -76,14 +83,15 @@ pub struct QualifiedExecutable {
 }
 
 /// What an installation hands the worker for one installed package that carries a connector.
+///
+/// It says nothing about the package's command integration: the worker reads that from the package
+/// itself.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConnectorSource {
     /// The installed package's hash, which is the digest of its manifest.
     pub package_digest: Digest256,
     /// Where the package's extracted copy is.
     pub package_dir: PathBuf,
-    /// The command the integration resolves, and its flags.
-    pub integration: ConnectorCommand,
     /// The native bridge the installation put in place, where it put one.
     pub bridge: Option<BridgeFacts>,
     /// The capabilities the installation granted, which bound what the package may do here.
@@ -115,6 +123,7 @@ pub struct InstalledConnector {
     manifest: PluginManifest,
     table: ConnectorManifest,
     package: PackageIdentity,
+    integration: Option<ConnectorCommand>,
 }
 
 impl InstalledConnector {
@@ -123,11 +132,11 @@ impl InstalledConnector {
     /// # Errors
     ///
     /// Returns [`ConnectorRefusal`] naming the first thing that does not hold: the package fails
-    /// the SDK's package check (a file that is not the bytes the manifest names, or a table for
-    /// another package, among them), its manifest does not hash to the installed hash, it carries
-    /// no table, no match rule of the package recognises the command the integration resolves,
-    /// the installation describes a native bridge the package does not declare or was not
-    /// granted, or its publisher is not one this host can record.
+    /// the SDK's package check (a file that is not the bytes the manifest names, a table for
+    /// another package, or a command integration the contract does not permit, among them), its
+    /// manifest does not hash to the installed hash, it carries no table, the installation
+    /// describes a native bridge the package does not declare or was not granted, or its
+    /// publisher is not one this host can record.
     pub fn read(source: ConnectorSource) -> Result<Self, ConnectorRefusal> {
         let validated = kr_plugin_sdk::validate::validate_package_directory(&source.package_dir);
         if !validated.report.is_valid() {
@@ -171,22 +180,6 @@ impl InstalledConnector {
         let table = package.connector.ok_or_else(|| {
             ConnectorRefusal::new(format!("{plugin_id} carries no connector table"))
         })?;
-        let command = &source.integration.command;
-        if command.is_empty() || command.contains('/') || command.contains('\\') {
-            return Err(ConnectorRefusal::new(format!(
-                "{plugin_id} integrates {command:?}, which is not a command name"
-            )));
-        }
-        if !package
-            .manifest
-            .match_rules
-            .iter()
-            .any(|rule| rule.executable.matches_path(command))
-        {
-            return Err(ConnectorRefusal::new(format!(
-                "{plugin_id} integrates {command:?}, which none of its match rules recognises"
-            )));
-        }
         if let Some(bridge) = source.bridge.as_ref() {
             if package.manifest.native_bridge.as_ref().is_none() {
                 return Err(ConnectorRefusal::new(format!(
@@ -225,11 +218,35 @@ impl InstalledConnector {
             publisher_id,
             package_digest: source.package_digest,
         };
+        // The package check has already held the declaration to the contract. It applies only
+        // while the installation holds the capability the owner confirmed it under.
+        let integration = package
+            .manifest
+            .command_integration
+            .as_ref()
+            .filter(|_| {
+                source
+                    .granted
+                    .contains(&PluginCapability::CommandIntegrationLaunch)
+            })
+            .map(|declared| ConnectorCommand {
+                command: declared.command.clone(),
+                flags: declared.flags.clone(),
+                variables: declared
+                    .variables
+                    .iter()
+                    .map(|variable| EnvironmentVariable {
+                        name: variable.name.clone(),
+                        value: variable.value.clone(),
+                    })
+                    .collect(),
+            });
         Ok(Self {
             source,
             manifest: package.manifest,
             table,
             package: identity,
+            integration,
         })
     }
 
@@ -265,10 +282,11 @@ impl InstalledConnector {
         &self.table
     }
 
-    /// Returns the command the integration resolves, and its flags.
+    /// Returns the command integration the verified manifest declares, where it declares one and
+    /// the installation holds `command_integration.launch`.
     #[must_use]
-    pub const fn integration(&self) -> &ConnectorCommand {
-        &self.source.integration
+    pub const fn integration(&self) -> Option<&ConnectorCommand> {
+        self.integration.as_ref()
     }
 
     /// Returns true when the installation granted this capability.
@@ -286,6 +304,17 @@ impl InstalledConnector {
             surfaces: bridge.surfaces.clone(),
             forwarder: bridge.forwarder.clone(),
         })
+    }
+
+    /// Returns the bridge a launch of this connector admits: the one the installation put in
+    /// place, where there is one.
+    ///
+    /// `launcher` is this installation's own `kr-hook`, the forwarder a bridge registered for the
+    /// launch alone is expected to run.
+    #[must_use]
+    pub fn launch_bridge(&self, launcher: &std::path::Path) -> Option<InstalledBridge> {
+        let _ = launcher;
+        self.installed_bridge()
     }
 
     /// Returns the version a signed qualification record names for an executable with this digest,
@@ -420,10 +449,20 @@ pub fn decoding_trust(connector: &InstalledConnector, now: TimestampMs) -> Optio
     })
 }
 
-/// The connectors this worker may launch and serve, by the command each integration resolves.
+/// The connectors this worker may launch and serve: every connector an installation handed over,
+/// and, by the command each integration resolves, the ones that integrate a command.
 #[derive(Debug, Default)]
 pub struct ConnectorSources {
-    by_command: RwLock<BTreeMap<String, Arc<InstalledConnector>>>,
+    held: RwLock<Held>,
+}
+
+/// One whole set, replaced at once.
+#[derive(Debug, Default)]
+struct Held {
+    /// Every connector read and not refused, whether or not it integrates a command.
+    connectors: Vec<Arc<InstalledConnector>>,
+    /// The connectors whose integration applies, by the command it resolves.
+    by_command: BTreeMap<String, Arc<InstalledConnector>>,
 }
 
 impl ConnectorSources {
@@ -436,45 +475,53 @@ impl ConnectorSources {
     /// Returns true while no connector has been handed over.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.by_command
+        self.held
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .connectors
             .is_empty()
     }
 
     /// Replaces the whole set with what the installation handed over now.
     ///
     /// Every source is read and checked; one that fails is left out and returned with its
-    /// reason. Two packages that integrate one command name are both left out, because nothing
+    /// reason. A connector that integrates no command is held for matching and resolves no
+    /// command. Two packages that integrate one command name are both left out, because nothing
     /// here can say which of them a person meant.
     pub fn replace(
         &self,
         sources: Vec<ConnectorSource>,
     ) -> Vec<(ConnectorSource, ConnectorRefusal)> {
         let mut refused = Vec::new();
-        let mut read: BTreeMap<String, Vec<InstalledConnector>> = BTreeMap::new();
+        let mut connectors = Vec::new();
+        let mut integrating: BTreeMap<String, Vec<InstalledConnector>> = BTreeMap::new();
         for source in sources {
             match InstalledConnector::read(source.clone()) {
-                Ok(connector) => read
-                    .entry(connector.integration().command.clone())
-                    .or_default()
-                    .push(connector),
+                Ok(connector) => match connector
+                    .integration()
+                    .map(|integration| integration.command.clone())
+                {
+                    Some(command) => integrating.entry(command).or_default().push(connector),
+                    None => connectors.push(Arc::new(connector)),
+                },
                 Err(refusal) => refused.push((source, refusal)),
             }
         }
         let mut by_command = BTreeMap::new();
-        for (command, mut connectors) in read {
-            if connectors.len() == 1 {
-                if let Some(connector) = connectors.pop() {
-                    by_command.insert(command, Arc::new(connector));
+        for (command, mut claimed) in integrating {
+            if claimed.len() == 1 {
+                if let Some(connector) = claimed.pop() {
+                    let connector = Arc::new(connector);
+                    connectors.push(Arc::clone(&connector));
+                    by_command.insert(command, connector);
                 }
                 continue;
             }
-            let packages: Vec<String> = connectors
+            let packages: Vec<String> = claimed
                 .iter()
                 .map(|connector| connector.plugin_id().to_string())
                 .collect();
-            for connector in connectors {
+            for connector in claimed {
                 refused.push((
                     connector.source.clone(),
                     ConnectorRefusal::new(format!(
@@ -486,18 +533,22 @@ impl ConnectorSources {
             }
         }
         *self
-            .by_command
+            .held
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = by_command;
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Held {
+            connectors,
+            by_command,
+        };
         refused
     }
 
     /// Returns the connector whose integration resolves this command name, where one does.
     #[must_use]
     pub fn for_command(&self, command: &str) -> Option<Arc<InstalledConnector>> {
-        self.by_command
+        self.held
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .by_command
             .get(command)
             .cloned()
     }
@@ -506,11 +557,12 @@ impl ConnectorSources {
     #[must_use]
     pub fn matching(&self, executable: &str) -> Option<Arc<InstalledConnector>> {
         let held = self
-            .by_command
+            .held
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut matching = held
-            .values()
+            .connectors
+            .iter()
             .filter(|connector| connector.matches_executable(executable));
         let first = matching.next().cloned();
         if matching.next().is_some() {
@@ -520,12 +572,14 @@ impl ConnectorSources {
     }
 }
 
-/// Builds a connector package the way the catalogue's store extracts one, for this host's tests.
+/// Builds connector packages the way the catalogue's store extracts one, for this host's tests.
 ///
-/// The package is Claude Code's shape: its Channels table with the decision destination that
-/// answers a relayed tool approval, the three bridge files core pins, and a manifest that names
-/// every file by digest. It is written under `root` as `packages/<hash>/`, and what comes back is
-/// the source an installation would hand over for it. It is compiled away in every shipped build.
+/// The packages are Claude Code's shape: its Channels table with the decision destination that
+/// answers a relayed tool approval, and a manifest that names every file by digest and declares the
+/// package's command integration. Claude Code's own also carries the three bridge files core pins;
+/// [`Shape`] gives the other shapes the tests need. A package is written under `root` as
+/// `packages/<hash>/`, and what comes back is the source an installation would hand over for it.
+/// It is compiled away in every shipped build.
 #[cfg(feature = "testing")]
 pub mod fixture {
     use std::collections::BTreeSet;
@@ -535,7 +589,7 @@ pub mod fixture {
     use kr_plugin_sdk::digest::PayloadDigest;
     use kr_protocol::scalars::Digest256;
 
-    use super::{BridgeFacts, ConnectorCommand, ConnectorSource};
+    use super::{BridgeFacts, ConnectorSource};
 
     /// The digest of the Claude Code executable the connector is qualified against, macOS arm64.
     pub const QUALIFIED_DIGEST: [u8; 32] = [
@@ -562,10 +616,111 @@ pub mod fixture {
         include_bytes!("../../../../fixtures/bridges/claude-code/mcp-servers.json");
     const PLUGIN: &[u8] =
         include_bytes!("../../../../fixtures/bridges/claude-code/plugin-manifest.json");
+    const QODER_FLAGS: &[u8] = include_bytes!("../../../../fixtures/bridges/qoder-cli/flags.json");
 
-    /// The package's Channels table.
+    /// What one test package is.
+    #[derive(Clone, Debug)]
+    pub struct Shape {
+        /// The package's name under the `kalareach` publisher, which its table names too.
+        pub plugin_name: &'static str,
+        /// The name a person reads.
+        pub display_name: &'static str,
+        /// The executable name the package's one match rule recognises.
+        pub executable: &'static str,
+        /// The manifest's `command_integration` member, where it carries one.
+        pub integration: Option<serde_json::Value>,
+        /// Whether the package installs Claude Code's native bridge and the installation put it
+        /// in place.
+        pub native_bridge: bool,
+        /// Whether the package ships a component.
+        pub component: bool,
+    }
+
+    impl Shape {
+        /// Claude Code's package: its channel's two flags, and its native bridge in place.
+        #[must_use]
+        pub fn claude_code() -> Self {
+            Self {
+                plugin_name: "claude-code",
+                display_name: "Claude Code",
+                executable: COMMAND,
+                integration: Some(declaration(COMMAND, &FLAGS, &[])),
+                native_bridge: true,
+                component: false,
+            }
+        }
+
+        /// A Gemini CLI package whose integration sets `GEMINI_CLI_NO_RELAUNCH=true` and adds
+        /// `flags`, with no bridge in place.
+        #[must_use]
+        pub fn gemini_cli(flags: &[&str]) -> Self {
+            Self {
+                plugin_name: "gemini-cli",
+                display_name: "Gemini CLI",
+                executable: "gemini",
+                integration: Some(declaration(
+                    "gemini",
+                    flags,
+                    &[("GEMINI_CLI_NO_RELAUNCH", "true")],
+                )),
+                native_bridge: false,
+                component: false,
+            }
+        }
+
+        /// A Qoder CLI package whose integration adds the two launch elements core pins, which
+        /// register the forwarder's hook, with no bridge in place.
+        #[must_use]
+        pub fn qoder_cli() -> Self {
+            let flags = qoder_flags();
+            let flags: Vec<&str> = flags.iter().map(String::as_str).collect();
+            Self {
+                plugin_name: "qoder-cli",
+                display_name: "Qoder CLI",
+                executable: "qodercli",
+                integration: Some(declaration("qodercli", &flags, &[])),
+                native_bridge: false,
+                component: false,
+            }
+        }
+    }
+
+    /// The two launch elements core pins for Qoder CLI: `--settings`, and its inline hooks.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the pinned file is not a list of text.
+    #[must_use]
+    pub fn qoder_flags() -> Vec<String> {
+        serde_json::from_slice(QODER_FLAGS).expect("the pinned flags are a list of text")
+    }
+
+    /// A manifest's `command_integration` member.
+    #[must_use]
+    pub fn declaration(
+        command: &str,
+        flags: &[&str],
+        variables: &[(&str, &str)],
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "command": command,
+            "flags": flags,
+            "variables": variables
+                .iter()
+                .map(|(name, value)| serde_json::json!({ "name": name, "value": value }))
+                .collect::<Vec<_>>(),
+            "grant_statement": "Starts the agent in KalaReach sessions with what its bridge needs."
+        })
+    }
+
+    /// Claude Code's Channels table.
     #[must_use]
     pub fn connector_json() -> String {
+        connector_json_for("kalareach/claude-code")
+    }
+
+    /// The Channels table, for the package `plugin_id`.
+    fn connector_json_for(plugin_id: &str) -> String {
         let path = |names: &[&str]| {
             serde_json::json!({
                 "segments": names
@@ -576,7 +731,7 @@ pub mod fixture {
         };
         let table = serde_json::json!({
             "manifest_version": 1,
-            "plugin_id": "kalareach/claude-code",
+            "plugin_id": plugin_id,
             "protocol": {
                 "name": "claude-code-channels",
                 "qualified_range": format!("={QUALIFIED_VERSION}"),
@@ -638,9 +793,14 @@ pub mod fixture {
         })
     }
 
-    /// The package's manifest, naming each file by the digest of `files`.
+    /// Claude Code's manifest, naming each file by the digest of `files`.
     #[must_use]
     pub fn manifest_json(files: &[(&str, &str, Vec<u8>)]) -> String {
+        manifest_for(&Shape::claude_code(), files)
+    }
+
+    /// The manifest of a package of `shape`, naming each file by the digest of `files`.
+    fn manifest_for(shape: &Shape, files: &[(&str, &str, Vec<u8>)]) -> String {
         let digest_of = |wanted: &str| {
             files
                 .iter()
@@ -658,22 +818,36 @@ pub mod fixture {
                 }]
             })
         };
-        let manifest = serde_json::json!({
+        let mut capabilities = vec![
+            serde_json::json!({ "capability": "metadata.match", "reason": format!("Recognise {}", shape.display_name) }),
+            serde_json::json!({ "capability": "presentation.declarative", "reason": "Show the session" }),
+            serde_json::json!({ "capability": "broker.semantic_events", "reason": "Read the hooks' observations" }),
+            serde_json::json!({ "capability": "upstream.action", "reason": "Deliver a message into the session" }),
+        ];
+        if shape.native_bridge {
+            capabilities.push(serde_json::json!({ "capability": "native_bridge.install", "reason": "Register the forwarder Claude Code starts" }));
+        }
+        capabilities.push(serde_json::json!({ "capability": "approval.decode", "reason": "Recognise a relayed tool approval" }));
+        capabilities.push(serde_json::json!({ "capability": "approval.respond", "reason": "Answer a relayed tool approval" }));
+        if shape.integration.is_some() {
+            capabilities.push(serde_json::json!({ "capability": "command_integration.launch", "reason": "Start the agent with the flags its bridge needs" }));
+        }
+        let mut manifest = serde_json::json!({
             "manifest_version": 1,
             "publisher_id": "kalareach",
-            "plugin_name": "claude-code",
+            "plugin_name": shape.plugin_name,
             "version": "0.3.0",
-            "display_name": "Claude Code",
-            "description": "Recognises Claude Code, observes it through hooks and answers its relayed tool approvals.",
-            "sdk_range": ">=0.1.1, <0.2.0",
+            "display_name": shape.display_name,
+            "description": format!("Recognises {}, observes it through hooks and answers its relayed tool approvals.", shape.display_name),
+            "sdk_range": ">=0.1.2, <0.2.0",
             "wit_range": ">=0.1.0, <0.2.0",
             "source": {
                 "repository": "https://github.com/kalapowered/kalareach-plugins",
-                "revision": "refs/tags/claude-code-0.3.0"
+                "revision": format!("refs/tags/{}-0.3.0", shape.plugin_name)
             },
             "match_rules": [{
-                "id": "claude-code-executable",
-                "executable": { "file_stem": "claude", "path_suffix": [], "version_range": null },
+                "id": format!("{}-executable", shape.plugin_name),
+                "executable": { "file_stem": shape.executable, "path_suffix": [], "version_range": null },
                 "distribution": null,
                 "confidence": "inferred"
             }],
@@ -685,15 +859,7 @@ pub mod fixture {
                 .iter()
                 .map(|(role, path, bytes)| payload(role, path, bytes))
                 .collect::<Vec<_>>(),
-            "capabilities": [
-                { "capability": "metadata.match", "reason": "Recognise Claude Code" },
-                { "capability": "presentation.declarative", "reason": "Show the session" },
-                { "capability": "broker.semantic_events", "reason": "Read the hooks' observations" },
-                { "capability": "upstream.action", "reason": "Deliver a message into the session" },
-                { "capability": "native_bridge.install", "reason": "Register the forwarder Claude Code starts" },
-                { "capability": "approval.decode", "reason": "Recognise a relayed tool approval" },
-                { "capability": "approval.respond", "reason": "Answer a relayed tool approval" }
-            ],
+            "capabilities": capabilities,
             "actions": [
                 {
                     "id": "prompt.send",
@@ -730,12 +896,15 @@ pub mod fixture {
                             "required": true
                         }]
                     },
-                    "description": "Answer the tool approval Claude Code is waiting on",
+                    "description": format!("Answer the tool approval {} is waiting on", shape.display_name),
                     "confirmation_required": false
                 }
             ],
             "attachments": null,
-            "native_bridge": {
+            "native_bridge": null
+        });
+        if shape.native_bridge {
+            manifest["native_bridge"] = serde_json::json!({
                 "application": "Claude Code",
                 "application_range": ">=2.1.234, <3.0.0",
                 "install": [
@@ -751,8 +920,11 @@ pub mod fixture {
                     { "type": "remove_file", "destination": "skills/kalareach-channels/.claude-plugin/plugin.json", "digest": digest_of("bridge/plugin-manifest.json") }
                 ],
                 "grant_statement": "Installs three registration files under your own Claude Code directory and one settings key; Claude Code then starts the KalaReach forwarder itself, under its own permissions and outside the KalaReach plugin sandbox, outside Wasmtime."
-            }
-        });
+            });
+        }
+        if let Some(integration) = &shape.integration {
+            manifest["command_integration"] = integration.clone();
+        }
         serde_json::to_string_pretty(&manifest).expect("a literal manifest encodes")
     }
 
@@ -770,14 +942,14 @@ pub mod fixture {
     /// component is the bytes the manifest names by digest and no more.
     pub const COMPONENT: &[u8] = &[0x00, 0x61, 0x73, 0x6d, 0x0d, 0x00, 0x01, 0x00];
 
-    /// Writes the package under `root` as the store extracts it, and returns what an installation
-    /// hands over for it, with every capability the package declares granted.
+    /// Writes Claude Code's package under `root` as the store extracts it, and returns what an
+    /// installation hands over for it, with every capability the package declares granted.
     ///
     /// # Errors
     ///
     /// Returns what writing a file returned.
     pub fn claude_code_package(root: &Path, forwarder: &Path) -> std::io::Result<ConnectorSource> {
-        write_package(root, forwarder, false)
+        package(root, forwarder, &Shape::claude_code())
     }
 
     /// Writes the same package with a Wasm component in it too, and returns what an installation
@@ -790,37 +962,58 @@ pub mod fixture {
         root: &Path,
         forwarder: &Path,
     ) -> std::io::Result<ConnectorSource> {
-        write_package(root, forwarder, true)
+        package(
+            root,
+            forwarder,
+            &Shape {
+                component: true,
+                ..Shape::claude_code()
+            },
+        )
     }
 
-    fn write_package(
+    /// Writes a package of `shape` under `root` as the store extracts it, and returns what an
+    /// installation hands over for it, with every capability the package declares granted and,
+    /// where the shape has one, the native bridge in place with `forwarder`.
+    ///
+    /// # Errors
+    ///
+    /// Returns what writing a file returned.
+    pub fn package(
         root: &Path,
         forwarder: &Path,
-        component: bool,
+        shape: &Shape,
     ) -> std::io::Result<ConnectorSource> {
+        let plugin_id = format!("kalareach/{}", shape.plugin_name);
         let mut files: Vec<(&str, &str, Vec<u8>)> = vec![
-            ("connector", "connector.json", connector_json().into_bytes()),
+            (
+                "connector",
+                "connector.json",
+                connector_json_for(&plugin_id).into_bytes(),
+            ),
             (
                 "presentation",
                 "presentation.json",
                 presentation_json().into_bytes(),
             ),
-            ("native_bridge", "bridge/hooks.json", HOOKS.to_vec()),
-            ("native_bridge", "bridge/mcp-servers.json", SERVERS.to_vec()),
-            (
+        ];
+        if shape.native_bridge {
+            files.push(("native_bridge", "bridge/hooks.json", HOOKS.to_vec()));
+            files.push(("native_bridge", "bridge/mcp-servers.json", SERVERS.to_vec()));
+            files.push((
                 "native_bridge",
                 "bridge/plugin-manifest.json",
                 PLUGIN.to_vec(),
-            ),
-        ];
-        if component {
+            ));
+        }
+        if shape.component {
             files.push((
                 "component",
                 kr_plugin_sdk::package::COMPONENT_FILE,
                 COMPONENT.to_vec(),
             ));
         }
-        let manifest = manifest_json(&files);
+        let manifest = manifest_for(shape, &files);
         let digest = PayloadDigest::of(manifest.as_bytes());
         let directory: PathBuf = root.join("packages").join(digest.to_string());
         std::fs::create_dir_all(directory.join("bridge"))?;
@@ -831,31 +1024,33 @@ pub mod fixture {
             directory.join(kr_plugin_sdk::package::MANIFEST_FILE),
             manifest.as_bytes(),
         )?;
+        let mut granted: BTreeSet<PluginCapability> = [
+            PluginCapability::MetadataMatch,
+            PluginCapability::DeclarativePresentation,
+            PluginCapability::BrokerSemanticEvents,
+            PluginCapability::UpstreamAction,
+            PluginCapability::ApprovalDecode,
+            PluginCapability::ApprovalRespond,
+        ]
+        .into_iter()
+        .collect();
+        if shape.native_bridge {
+            granted.insert(PluginCapability::NativeBridgeInstall);
+        }
+        if shape.integration.is_some() {
+            granted.insert(PluginCapability::CommandIntegrationLaunch);
+        }
         Ok(ConnectorSource {
             package_digest: Digest256::from_bytes(*digest.as_bytes()),
             package_dir: directory,
-            integration: ConnectorCommand {
-                command: COMMAND.to_owned(),
-                flags: FLAGS.iter().map(|flag| (*flag).to_owned()).collect(),
-            },
-            bridge: Some(BridgeFacts {
+            bridge: shape.native_bridge.then(|| BridgeFacts {
                 application: "claude-code".to_owned(),
                 surfaces: [BridgeSurface::Hook, BridgeSurface::Channel]
                     .into_iter()
                     .collect(),
                 forwarder: forwarder.to_path_buf(),
             }),
-            granted: [
-                PluginCapability::MetadataMatch,
-                PluginCapability::DeclarativePresentation,
-                PluginCapability::BrokerSemanticEvents,
-                PluginCapability::UpstreamAction,
-                PluginCapability::NativeBridgeInstall,
-                PluginCapability::ApprovalDecode,
-                PluginCapability::ApprovalRespond,
-            ]
-            .into_iter()
-            .collect::<BTreeSet<_>>(),
+            granted,
             qualified: Vec::new(),
         })
     }
