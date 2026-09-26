@@ -155,6 +155,7 @@ links to its document.
 | `agent.capabilities` | read | `local_ipc`, `paired_device`, `workflow` | What the bound agent can currently do, with its capability evidence. |  |
 | `agent.snapshot` | read | `local_ipc`, `paired_device`, `workflow` | A filtered snapshot of the bound agent's shared state. |  |
 | `agent.commands` | read | `local_ipc`, `paired_device`, `workflow` | The commands the bound agent advertises. |  |
+| `agent.approval.inspect` | read | `local_ipc` | What an installed decoder read of one approval request and the decisions it offered, with the request's original bytes and where it stands now. It records what the decoder said, not that the decoder read the request correctly. |  |
 
 ## Agent mutations
 

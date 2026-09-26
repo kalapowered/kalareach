@@ -170,7 +170,8 @@ pub(crate) const fn described_in(method: Method) -> Option<Section> {
         | Method::AgentPromptQueue
         | Method::AgentTurnSteer
         | Method::AgentTurnCancel
-        | Method::AgentApprovalRespond => None,
+        | Method::AgentApprovalRespond
+        | Method::AgentApprovalInspect => None,
 
         Method::DraftCreate | Method::DraftUpdate | Method::AgentDraftAddAttachment => {
             at(TRANSFER, "Attachments, drafts and insertion")
