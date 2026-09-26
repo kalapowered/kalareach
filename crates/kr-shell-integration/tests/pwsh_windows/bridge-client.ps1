@@ -19,8 +19,16 @@ param(
     [Parameter(Mandatory)][string]$ModuleDirectory,
     # Where to write what each step observed.
     [Parameter(Mandatory)][string]$Report,
-    # `exchange` collects the worker's answer to the event; `closed` waits for the worker to go.
-    [Parameter(Mandatory)][ValidateSet('exchange', 'closed')][string]$Mode
+    # `exchange` collects the worker's answer to the event; `closed` waits for the worker to go;
+    # `hello` sends the hello to a server that answers nothing and holds the connection until that
+    # server lets go, or reports that the client refused the endpoint; `evaluate` runs the module's
+    # check of an endpoint's owner and list over the descriptors in `Fixtures`, with no endpoint.
+    [Parameter(Mandatory)][ValidateSet('exchange', 'closed', 'hello', 'evaluate')][string]$Mode,
+    # One case per line: a name, a tab, and a security descriptor in SDDL in which `{me}` stands for
+    # this account.
+    [string]$Fixtures,
+    # Makes reading the endpoint's security descriptor fail, as one that cannot be read does.
+    [switch]$BreakDescriptorRead
 )
 
 Set-StrictMode -Version 3.0
@@ -39,6 +47,28 @@ function Stop-WithReason {
 
 . (Join-Path $ModuleDirectory 'KrCbor.ps1')
 . (Join-Path $ModuleDirectory 'KrBridge.ps1')
+
+if ($BreakDescriptorRead) {
+    function Read-KrPipeDescriptor { throw 'the descriptor read is broken for this case' }
+}
+
+if ($Mode -eq 'evaluate') {
+    if (-not (Get-Command Test-KrPipeDescriptor -ErrorAction SilentlyContinue)) {
+        Stop-WithReason 'the module has no check of an endpoint''s owner and list'
+    }
+    $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+    try {
+        $me = $identity.User.Value
+        $own = @($identity.User.Value, $identity.Owner.Value)
+    } finally { $identity.Dispose() }
+    foreach ($line in [System.IO.File]::ReadAllLines($Fixtures)) {
+        $case, $sddl = $line -split "`t", 2
+        $descriptor = [System.Security.AccessControl.RawSecurityDescriptor]::new($sddl.Replace('{me}', $me))
+        $refused = Test-KrPipeDescriptor $descriptor $own
+        if ($null -eq $refused) { Write-Report "$case accepted" } else { Write-Report "$case refused $refused" }
+    }
+    exit 0
+}
 
 $endpoint = $env:KR_SHELL_BRIDGE
 $secret = $env:KR_SHELL_BRIDGE_SECRET
@@ -72,7 +102,13 @@ $package = @{
 }
 
 $script:Kr.Socket = Connect-KrEndpoint $endpoint
-if ($null -eq $script:Kr.Socket) { Stop-WithReason "the endpoint refused the connection: $endpoint" }
+if ($null -eq $script:Kr.Socket) {
+    if ($Mode -eq 'hello') {
+        Write-Report 'refused'
+        exit 0
+    }
+    Stop-WithReason "the endpoint refused the connection: $endpoint"
+}
 Write-Report 'connected'
 
 $transcript = Get-KrTranscript $script:Kr.Identity $package.integration_version
@@ -83,6 +119,18 @@ if (-not (Send-KrFrame @{ hello = (New-KrHello $script:Kr.Identity $proof $packa
     Stop-WithReason 'the hello was not sent'
 }
 Write-Report 'hello sent'
+
+if ($Mode -eq 'hello') {
+    # The connection is held until the server lets go, so the server can read what was sent and
+    # read the client's context from the connection while the client is still on it.
+    $deadline = (Get-KrNowMs) + 30000
+    while (Receive-KrAvailable) {
+        if ((Get-KrNowMs) -gt $deadline) { Stop-WithReason 'the server never let go' }
+        [System.Threading.Thread]::Sleep(5)
+    }
+    Write-Report 'server gone'
+    exit 0
+}
 
 if (-not (Wait-KrHandshake)) { Stop-WithReason 'no handshake reply was read' }
 # The hint is written last so a reader of this file can anchor on the whole of it.
