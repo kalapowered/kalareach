@@ -1511,9 +1511,11 @@ mod tests {
         let expected = store.group().expect("reads the group").expected();
         let (arrived, arrival) = mpsc::channel();
         let (resume, resumed) = mpsc::channel();
+        // Held once its record's name has changed, still holding the record: held before its
+        // rename, it would come to the rename past its own deadline, with one attempt left.
         seam::register(
             &environment.record(),
-            Boundary::Flushed,
+            Boundary::Published,
             Interruption::Pause {
                 arrived,
                 resume: resumed,
@@ -1528,7 +1530,7 @@ mod tests {
             });
             arrival
                 .recv_timeout(WAIT)
-                .expect("the first step reached its publication");
+                .expect("the first step published its record");
             let (told, locking) = mpsc::channel();
             seam::watch_lock(&environment.record(), told.clone());
             seam::watch_lock(&environment.record(), told);
