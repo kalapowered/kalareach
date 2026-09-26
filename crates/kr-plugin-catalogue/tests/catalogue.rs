@@ -1746,6 +1746,148 @@ async fn kr_req_11_11_a_first_native_bridge_installs_with_the_owners_confirmatio
     );
 }
 
+/// Writes the example package at `version` into `directory`, asking for a command integration that
+/// adds `flags` to the example agent.
+fn integrating(directory: &std::path::Path, version: &str, flags: &[&str]) -> std::path::PathBuf {
+    let package = directory.join(version);
+    std::fs::create_dir_all(&package).expect("the package directory");
+    let mut manifest: serde_json::Value =
+        serde_json::from_str(&kr_plugin_sdk::example::example_manifest_json())
+            .expect("the example manifest");
+    manifest["version"] = serde_json::json!(version);
+    manifest["sdk_range"] = serde_json::json!(">=0.1.2, <0.2.0");
+    manifest["capabilities"]
+        .as_array_mut()
+        .expect("the example requests capabilities")
+        .push(serde_json::json!({
+            "capability": "command_integration.launch",
+            "reason": "Start the example agent with the flags its bridge needs"
+        }));
+    manifest["command_integration"] = serde_json::json!({
+        "command": "example-agent",
+        "flags": flags,
+        "variables": [],
+        "grant_statement": "Starts the example agent in KalaReach sessions with the flags its bridge needs"
+    });
+    let mut text = serde_json::to_string_pretty(&manifest).expect("the manifest serialises");
+    text.push('\n');
+    std::fs::write(package.join(kr_plugin_sdk::package::MANIFEST_FILE), text)
+        .expect("the manifest writes");
+    std::fs::write(
+        package.join(kr_plugin_sdk::package::PRESENTATION_FILE),
+        kr_plugin_sdk::example::example_presentation_json(),
+    )
+    .expect("the presentation writes");
+    package
+}
+
+/// Every release that asks for a command integration is the owner's decision, as a native
+/// bridge's is: the flags and variables are in the release, so a release that changes only a flag
+/// widens no grant and still installs only with the owner's confirmation of that release, and the
+/// installation stays where it was without it.
+#[tokio::test]
+async fn kr_req_11_11_a_release_that_changes_its_command_integration_asks_the_owner_again() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let packages = tempfile::tempdir().expect("a temporary directory");
+    let first = Generation::build(
+        home.path(),
+        GenerationSpec {
+            package: Some(integrating(
+                packages.path(),
+                "0.1.0",
+                &["--kalareach-channel", "first"],
+            )),
+            ..GenerationSpec::default()
+        },
+    )
+    .await;
+    let second = Generation::build(
+        &home.path().join("0.2.0"),
+        GenerationSpec {
+            generation: 2,
+            package: Some(integrating(
+                packages.path(),
+                "0.2.0",
+                &["--kalareach-channel", "second"],
+            )),
+            keys: Some(first.keys()),
+            ..GenerationSpec::default()
+        },
+    )
+    .await;
+    let mut catalogue = enrolled(
+        home.path(),
+        &first,
+        RepositoryBudgets::defaults(),
+        CapabilityCeiling::default_ceiling(),
+    )
+    .await;
+    catalogue.sync(&repository()).await.expect("generation 1");
+    let grant = [PluginCapability::CommandIntegrationLaunch];
+
+    let refusal = install_as(
+        &mut catalogue,
+        &repository(),
+        "0.1.0",
+        first.manifest_digest(),
+        &grant,
+        false,
+    )
+    .await
+    .expect_err("a command integration the owner did not confirm");
+    assert!(
+        matches!(refusal, CatalogueError::OwnerConfirmationRequired { .. }),
+        "{refusal:?}"
+    );
+    install_as(
+        &mut catalogue,
+        &repository(),
+        "0.1.0",
+        first.manifest_digest(),
+        &grant,
+        true,
+    )
+    .await
+    .expect("the owner confirmed this release and grant");
+
+    first.replace_with(&second);
+    catalogue.sync(&repository()).await.expect("generation 2");
+    let refusal = install_as(
+        &mut catalogue,
+        &repository(),
+        "0.2.0",
+        second.manifest_digest(),
+        &grant,
+        false,
+    )
+    .await
+    .expect_err("a release whose integration adds another flag is the owner's decision");
+    assert!(
+        matches!(refusal, CatalogueError::OwnerConfirmationRequired { .. }),
+        "{refusal:?}"
+    );
+    assert_eq!(
+        catalogue
+            .installation(environment(), &plugin())
+            .expect("readable")
+            .expect("installed")
+            .package_digest,
+        first.manifest_digest(),
+        "the installation stays on the release the owner confirmed"
+    );
+    let installed = install_as(
+        &mut catalogue,
+        &repository(),
+        "0.2.0",
+        second.manifest_digest(),
+        &grant,
+        true,
+    )
+    .await
+    .expect("the owner confirmed the new release");
+    assert_eq!(installed.package_digest, second.manifest_digest());
+}
+
 /// A release that may do more than the installed one installs with the owner's confirmation, and
 /// the installation stays on the release it was on without it: a release that newly asks for
 /// something its repository's ceiling already permits, and one granted something past the
