@@ -24,18 +24,19 @@
 //!   reading (`lag`), and never less than nothing. A process that first appears inside the stretch
 //!   started after the reading before it began, so all of its time is inside the stretch. Anything
 //!   else, a process whose row could not be read among it, counts as nothing.
-//! * Where a reading took a process's time thread by thread ([`Threads`]), the least is the same
-//!   difference taken for each thread read at both ends, a thread known by its identifier and start.
-//!   A thread that ends inside the stretch loses its time since the first reading, and one first
-//!   read inside it counts nothing, since a listing of a process's threads can miss one; either way
-//!   the least falls short of what the run used, never beyond it. One match needs more: a thread
+//! * Where a reading took a process's time thread by thread ([`Threads`]), the same difference is
+//!   also taken for each thread read at both ends, a thread known by its identifier and start, and
+//!   the process counts the larger of that sum and its whole difference, each being a least it can
+//!   have used. A thread that ends inside the stretch loses its time since the first reading from
+//!   the sum, and one first read inside it counts nothing, since a listing of a process's threads
+//!   can miss one; the whole difference keeps both, so threads that come and go, as a pool made for
+//!   each piece of work does, cost no more than the whole reading. One match needs more: a thread
 //!   other than the first that execs takes the first thread's identifier and start with its own,
 //!   older time. So the first thread counts only where the process's row at the stretch's first
 //!   reading gave it one thread, so that any later taker was created after that row, or where
 //!   another thread matched at the end had started before the first thread was read at the first
 //!   reading, since an exec after that read would have ended it before the end reading read it, and
-//!   the end reading reads the first thread first. A process read as a whole at one end and by
-//!   threads at the other counts nothing.
+//!   the end reading reads the first thread first.
 //!
 //! A window of five seconds can start anywhere between two readings, so the bound for the windows
 //! that start between two readings is the bound over the shortest run of readings that covers every
@@ -510,31 +511,30 @@ impl Tally {
                 continue;
             };
             if let Some(first) = times.iter().find(|time| time.reading == from) {
-                match (&first.threads, &latest.threads) {
-                    (None, None) => {
-                        let shown = latest.own - first.own;
-                        let kept = (shown - first.lag - rounding).max(0.0);
-                        least += kept;
-                        set_aside += shown - kept;
+                let shown = latest.own - first.own;
+                let whole = (shown - first.lag - rounding).max(0.0);
+                let (mut kept, mut aside) = (whole, shown - whole);
+                // Thread by thread where both ends took the threads: the larger least stands.
+                if let (Some(before), Some(after)) = (&first.threads, &latest.threads) {
+                    let (threads_kept, threads_aside) = threads_least(key.0, before, after);
+                    if threads_kept > kept {
+                        (kept, aside) = (threads_kept, threads_aside);
                     }
-                    (Some(before), Some(after)) => {
-                        let (kept, aside) = threads_least(key.0, before, after);
-                        least += kept;
-                        set_aside += aside;
-                    }
-                    // Read as a whole at one end and by threads at the other: the two are not the
-                    // same count, so neither end says what was used between them.
-                    _ => {}
                 }
+                least += kept;
+                set_aside += aside;
             } else if self
                 .appeared
                 .get(key)
                 .is_some_and(|&appeared| appeared > from && appeared <= latest.reading)
             {
-                least += match &latest.threads {
-                    Some(threads) => threads.each.iter().map(|thread| thread.own).sum(),
-                    None => latest.own,
-                };
+                let threads: f64 = latest
+                    .threads
+                    .iter()
+                    .flat_map(|threads| &threads.each)
+                    .map(|thread| thread.own)
+                    .sum();
+                least += latest.own.max(threads);
             }
         }
         (least, set_aside)
@@ -943,7 +943,7 @@ mod tests {
             pid,
             parent,
             start,
-            own: 0.0,
+            own: threads.iter().map(|&(_, own)| own).sum(),
             lag: 0.0,
             threads: Some(Threads {
                 alone: threads.len() == 1,
@@ -1003,13 +1003,28 @@ mod tests {
     }
 
     #[test]
-    fn a_process_read_whole_at_one_end_and_by_threads_at_the_other_counts_nothing() {
+    fn a_process_read_whole_at_one_end_and_by_threads_at_the_other_counts_its_whole_time() {
         let summary = tally(&[
             busy(0.0, 0.0, &[process(600, RUN, 20, 1.0)]),
             busy(2.0, 2.0, &[threaded(600, RUN, 20, &[(600, 3.0)])]),
         ])
         .unwrap();
-        assert!(close(summary.bound, 1.0), "{summary:?}");
+        assert!(close(summary.bound, 0.0), "{summary:?}");
+    }
+
+    #[test]
+    fn threads_that_come_and_go_inside_a_stretch_count_through_their_process() {
+        // A pool made for each piece of work: its threads start and end between readings, so no
+        // reading sees them, and only the process's whole time holds their two seconds.
+        let mut first = threaded(600, RUN, 20, &[(600, 1.0)]);
+        let mut last = threaded(600, RUN, 20, &[(600, 1.1)]);
+        for (row, own) in [(&mut first, 1.0), (&mut last, 3.1)] {
+            if let Row::Read(process) = row {
+                process.own = own;
+            }
+        }
+        let summary = tally(&[busy(0.0, 0.0, &[first]), busy(2.0, 2.1, &[last])]).unwrap();
+        assert!(close(summary.bound, 0.0), "{summary:?}");
     }
 
     #[test]

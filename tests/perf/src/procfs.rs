@@ -634,6 +634,26 @@ mod tests {
     }
 
     #[test]
+    fn a_pool_made_for_each_piece_of_work_counts_through_its_process() {
+        // The run's first thread moves by a tenth of a second while a pool it makes for each piece
+        // of work runs two seconds on threads no listing sees. The process's whole time holds both,
+        // less its one thread's tick.
+        let stand_in = StandIn::new(1);
+        stand_in.process(RUN, 1, OLD, 100, 1);
+        stand_in.thread(RUN, 'S', OLD, 1.0);
+        let summary = stretch(
+            &stand_in,
+            2.1,
+            || {},
+            || {
+                stand_in.process(RUN, 1, OLD, 310, 1);
+                stand_in.time(RUN, 1.1);
+            },
+        );
+        assert!(close(summary.bound, TICK / 2.0), "{summary:?}");
+    }
+
+    #[test]
     fn an_exec_by_another_thread_does_not_count_its_earlier_time() {
         // The first thread has used 1.0 s and a worker 10.0 s when the worker execs during the
         // first reading: it takes the first thread's identifier and start, and a helper it started
