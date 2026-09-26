@@ -910,12 +910,13 @@ fn unanswered(method: Method, status: u16, error: ClientError) -> Unanswered {
 /// on a repeat under a fresh signature, without a second effect or a different one: a delivery by
 /// its envelope identifier, an acknowledgement by its position, a settings-sync request by the
 /// identity it carries and the receipt kept for it, a manifest by its generation and its enrolment
-/// revision, a retention change by its revision, and an upload by its object identity, its part
-/// numbers and its upload identifier. A deletion does not qualify, because the service keeps a
-/// deletion's first target only for the signature that asked for it and a later object may hold the
-/// identity by then; nor does the authority feed, whose delegation replaces the removal keys with
-/// nothing to tell a repeat from a later change. A method added later does not either, until it is
-/// shown to.
+/// revision, a retention change by its revision, and an upload by its part numbers and its upload
+/// identifier. A creation signed afresh meets the object the first may have made and makes nothing
+/// more while that object is live; after its hold is released, it makes a new upload in place of
+/// the one that lapsed. A deletion does not qualify, because the service keeps a deletion's first
+/// target only for the signature that asked for it and a later object may hold the identity by
+/// then; nor does the authority feed, whose delegation replaces the removal keys with nothing to
+/// tell a repeat from a later change. A method added later does not either, until it is shown to.
 fn repeat_is_safe(method: Method) -> bool {
     matches!(
         method.entry().idempotency,
