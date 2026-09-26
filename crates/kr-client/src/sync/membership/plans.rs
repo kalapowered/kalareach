@@ -41,7 +41,7 @@ pub enum PlannedOperation {
 }
 
 /// One planned operation, as the owner is asked to confirm it and as it is handed back.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Plan {
     /// Which plan this is.
@@ -53,6 +53,12 @@ pub struct Plan {
     /// The SHA-256 of the canonical encoding of the three fields above under the plan domain.
     pub digest: Digest256,
 }
+
+crate::debug_fields!(Plan {
+    id,
+    operation,
+    expires_at_ms
+});
 
 /// Why a plan handed back was not consumed.
 #[derive(Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -75,7 +81,7 @@ pub enum PlanRefusal {
 crate::debug_as_display!(PlanRefusal);
 
 /// The plans waiting for the owner, for the life of this process.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub(crate) struct Plans {
     waiting: BTreeMap<[u8; 16], Plan>,
 }

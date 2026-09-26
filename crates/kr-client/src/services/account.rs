@@ -931,10 +931,11 @@ pub struct IssuedGrant {
 
 impl fmt::Debug for IssuedGrant {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let scopes: Shown = scope_summary(&self.scopes);
         formatter
             .debug_struct("IssuedGrant")
             .field("expires_in_seconds", &self.expires_in_seconds)
-            .field("scopes", &scope_summary(&self.scopes))
+            .field("scopes", &scopes)
             .finish_non_exhaustive()
     }
 }
@@ -1002,7 +1003,7 @@ pub enum UsageResource {
 }
 
 /// One line of usage.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct UsageLine {
     /// What it measures.
     pub resource: UsageResource,
@@ -1013,6 +1014,12 @@ pub struct UsageLine {
     /// The calendar month for a monthly resource, or none for a standing total.
     pub period: Option<String>,
 }
+
+crate::debug_fields!(UsageLine {
+    resource,
+    used_bytes,
+    allowance_bytes
+});
 
 /// What the account has used, and nothing about money.
 ///
@@ -1094,7 +1101,7 @@ impl fmt::Debug for ManagedAccountService {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ManagedAccountService")
-            .field("origin", &self.origin)
+            .field("origin", &Shown::address(&self.origin))
             .field("client", &self.client)
             .finish_non_exhaustive()
     }
@@ -1549,6 +1556,7 @@ pub struct StoredGrant {
 
 impl fmt::Debug for StoredGrant {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let scopes: Shown = scope_summary(&self.scopes);
         formatter
             .debug_struct("StoredGrant")
             // The grant's identifier is drawn like a secret and read back from the file, so it is
@@ -1556,7 +1564,7 @@ impl fmt::Debug for StoredGrant {
             .field("grant_id_bytes", &self.grant_id.len())
             .field("revision", &self.revision)
             .field("client", &self.client)
-            .field("scopes", &scope_summary(&self.scopes))
+            .field("scopes", &scopes)
             .finish_non_exhaustive()
     }
 }
@@ -1803,14 +1811,16 @@ impl fmt::Debug for AccountStatus {
                 email,
                 name,
                 scopes,
-                generation,
-            } => formatter
-                .debug_struct("SignedIn")
-                .field("email", &email.as_ref().map(|_| "<present>"))
-                .field("name", &name.as_ref().map(|_| "<present>"))
-                .field("scopes", &scope_summary(scopes))
-                .field("generation", generation)
-                .finish(),
+                ..
+            } => {
+                let scopes: Shown = scope_summary(scopes);
+                formatter
+                    .debug_struct("SignedIn")
+                    .field("email", &email.as_ref().map(|_| "<present>"))
+                    .field("name", &name.as_ref().map(|_| "<present>"))
+                    .field("scopes", &scopes)
+                    .finish_non_exhaustive()
+            }
         }
     }
 }
@@ -1853,7 +1863,7 @@ impl fmt::Debug for SignedInAccount {
         formatter
             .debug_struct("SignedInAccount")
             .field("client", &self.client)
-            .field("shared_lock", &self.shared_lock)
+            .field("shared_lock", &self.shared_lock.as_deref().map(Shown::root))
             .finish_non_exhaustive()
     }
 }
@@ -2321,7 +2331,7 @@ impl SignedInAccount {
 }
 
 /// Usage, with the generation of the grant it was read with.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct GrantUsage {
     /// The grant the figures belong to, as [`AccountStatus::SignedIn`] names it.
     pub generation: String,

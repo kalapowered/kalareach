@@ -157,9 +157,10 @@ impl fmt::Debug for AuthorityRequest<'_> {
     /// Which member was asked for. Never the record, which carries a signature, and never an
     /// announcement, which carries a sealed item.
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let member: &'static str = self.member();
         formatter
             .debug_struct("AuthorityRequest")
-            .field("member", &self.member())
+            .field("member", &member)
             .finish_non_exhaustive()
     }
 }
@@ -212,13 +213,13 @@ struct RejectBody {
 }
 
 /// Name the keys that may remove this host when the host itself cannot.
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 struct DelegateBody<'a> {
     owner_key_ids: &'a [KeyId],
 }
 
 /// Read one host's feed.
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 struct ReadBody {
     host_key_id: KeyId,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -228,7 +229,7 @@ struct ReadBody {
 }
 
 /// Remove this host, which ends the retention of everything addressed to it.
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 struct RemoveBody {
     host_key_id: KeyId,
 }
@@ -274,7 +275,7 @@ impl fmt::Debug for AuthorityFeedRecord {
 }
 
 /// What a device list shows about one host.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuthorityFeedSummary {
     /// The highest revision the host has issued, or null before it has issued one.
@@ -294,6 +295,13 @@ pub struct AuthorityFeedSummary {
     /// How often a device polls this feed while it is online.
     pub poll_interval_seconds: u32,
 }
+
+crate::debug_fields!(AuthorityFeedSummary {
+    authority_revision,
+    outstanding,
+    removed,
+    poll_interval_seconds
+});
 
 /// Where an announcement submitted beside a feed change ended up.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
@@ -315,7 +323,7 @@ pub enum AnnouncementPlacement {
 /// announcement after the record has committed and reports what became of it rather than failing
 /// the change. A host polls its feed in any case, so an announcement that did not arrive costs that
 /// interval rather than the revocation.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AnnouncementOutcome {
     /// Whether the sealed item reached the recipient's mailbox.
@@ -324,6 +332,8 @@ pub struct AnnouncementOutcome {
     #[serde(default)]
     pub declined_reason: Option<String>,
 }
+
+crate::debug_fields!(AnnouncementOutcome { mailbox });
 
 /// What every authority-feed member answers with.
 #[derive(Clone, PartialEq, Eq, Deserialize)]

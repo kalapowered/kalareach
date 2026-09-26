@@ -183,7 +183,7 @@ pub trait Ceremony: Send + Sync {
 }
 
 /// What a checked challenge approves, as the person is shown it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum Subject {
     /// Issuing an invitation.
     IssueInvitation {
@@ -207,6 +207,28 @@ pub enum Subject {
     EstablishClock,
     /// An action its caller described by class, rights and digest only.
     Described(DescribedAction),
+}
+
+impl std::fmt::Debug for Subject {
+    /// Which action it is, and an invitation's mode and kind of grant. Never an origin, a grant's
+    /// scopes, a candidate's description or an action's words, which are what a person typed or a
+    /// device sent.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::IssueInvitation {
+                mode, grant_kind, ..
+            } => formatter
+                .debug_struct("IssueInvitation")
+                .field("mode", mode)
+                .field("grant_kind", grant_kind)
+                .finish_non_exhaustive(),
+            Self::ConfirmDevice { .. } => formatter
+                .debug_struct("ConfirmDevice")
+                .finish_non_exhaustive(),
+            Self::EstablishClock => formatter.write_str("EstablishClock"),
+            Self::Described(_) => formatter.write_str("Described(..)"),
+        }
+    }
 }
 
 /// Why a challenge could not be checked.
@@ -615,7 +637,7 @@ fn shown(text: &str, limit: usize) -> String {
 }
 
 /// One challenge the host holds open, as this device checked it.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Listed {
     /// The challenge, exactly as a proof must answer it.
     pub request: OwnerConfirmationRequest,

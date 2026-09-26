@@ -31,7 +31,7 @@ use kr_protocol::scalars::{CanonicalSet, Nullable, U64};
 /// *content cursor* is the host's own durable position in what the session produced, so it is what
 /// survives a disconnect and what [`EventsSubscribeParams::from_cursor`] names. A reconnect
 /// therefore resumes from the content cursor and starts its sequences again from nothing.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct StreamCursors {
     received: BTreeMap<StreamId, EventSequence>,
     applied: BTreeMap<StreamId, EventSequence>,
@@ -45,6 +45,21 @@ pub struct StreamCursors {
     /// follows it. Keeping their first and last sequence is what lets an installed snapshot tell
     /// whether they continue it, instead of discarding them and treating the next one as a gap.
     since_discard: BTreeMap<StreamId, (EventSequence, EventSequence)>,
+}
+
+impl std::fmt::Debug for StreamCursors {
+    /// How many streams it follows in each way. Never a stream's identifier, which is the
+    /// host's text.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("StreamCursors")
+            .field("received", &self.received.len())
+            .field("applied", &self.applied.len())
+            .field("applied_cursor", &self.applied_cursor.len())
+            .field("needs_snapshot", &self.needs_snapshot.len())
+            .field("since_discard", &self.since_discard.len())
+            .finish()
+    }
 }
 
 impl StreamCursors {
@@ -329,7 +344,7 @@ impl crate::shown::Said for RestorationStep {
 crate::display_as_said!(RestorationStep);
 
 /// Drives one stream through the restoration order.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Restoration {
     stream_id: StreamId,
     step: RestorationStep,
@@ -440,9 +455,19 @@ impl Restoration {
 /// authorised revision while it evolves. The tracker keeps the latest revision of each action, so
 /// a client that reconnects can tell which of its actions are still unresolved, and never
 /// redispatches one whose receipt is incomplete.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct ReceiptTracker {
     receipts: BTreeMap<ActionId, Receipt>,
+}
+
+impl std::fmt::Debug for ReceiptTracker {
+    /// How many receipts it holds. Never a receipt, whose result is whatever the action returned.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ReceiptTracker")
+            .field("receipts", &self.receipts.len())
+            .finish()
+    }
 }
 
 impl ReceiptTracker {

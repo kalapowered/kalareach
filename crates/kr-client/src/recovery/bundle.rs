@@ -118,7 +118,7 @@ pub fn fresh_locator() -> Result<String> {
 /// comparison. One that is not answered leaves a question, and this is the store's record of that
 /// question and of what became of it. It is not a retry: nothing here sends anything again, and
 /// the caller decides what to do with the answer.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum LostWrite {
     /// The answer never arrived and nothing has ended the request.
     ///
@@ -145,12 +145,26 @@ pub enum LostWrite {
     },
 }
 
+impl std::fmt::Debug for LostWrite {
+    /// Where the lost write stands. Never the digest of what was sent.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unsettled { .. } => formatter.debug_struct("Unsettled").finish_non_exhaustive(),
+            Self::Applied => formatter.write_str("Applied"),
+            Self::Ended { retained } => formatter
+                .debug_struct("Ended")
+                .field("retained", retained)
+                .finish(),
+        }
+    }
+}
+
 /// Where this store last saw the bundle, and the bundle it authenticated there.
 ///
 /// The place and the content together or neither. A place without the content read there could
 /// not tell a second reading of that place from a fork, and content without its place gives a write
 /// nothing to compare against.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(super) struct Baseline {
     position: SyncPosition,
     pub(super) bundle: RecoveryBundle,
@@ -186,14 +200,16 @@ pub struct BundleStore {
 
 impl std::fmt::Debug for BundleStore {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let position: Option<crate::services::SyncPosition> = self.position();
+        let lost_write: Option<LostWrite> = self.lost_write();
         formatter
             .debug_struct("BundleStore")
             .field(
                 "service_origin",
                 &crate::shown::Shown::address(&self.context.service_origin),
             )
-            .field("position", &self.position())
-            .field("lost_write", &self.lost_write())
+            .field("position", &position)
+            .field("lost_write", &lost_write)
             .finish_non_exhaustive()
     }
 }
@@ -1289,7 +1305,6 @@ impl std::fmt::Debug for WriterEnabled {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("WriterEnabled")
-            .field("writer_key_id", &self.writer_key_id)
             .field(
                 "service_origin",
                 &crate::shown::Shown::address(&self.context.service_origin),
@@ -1639,8 +1654,7 @@ mod tests {
         };
         renders_only(
             &enabled,
-            "WriterEnabled{writer_key_id:KeyId(AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE),\
-             service_origin:\"<notprinted>\",bundle_revision:3,bundle_position:SyncPosition{\
+            "WriterEnabled{service_origin:\"<notprinted>\",bundle_revision:3,bundle_position:SyncPosition{\
              write_sequence:1,revision:Nullable(Some(SyncRevision(Uuid(\
              07070707-0707-0707-0707-070707070707)))),recovery:Nullable(None)},..}",
         );

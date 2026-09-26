@@ -261,15 +261,18 @@ impl std::fmt::Debug for Delivery {
     /// Where the delivery ends and how long it is, never the bytes: they are what a person typed or
     /// what a terminal showed.
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let (name, cursor, bytes) = match self {
-            Self::Bytes { cursor, bytes } => ("Bytes", cursor, bytes),
-            Self::Screen { cursor, bytes } => ("Screen", cursor, bytes),
-        };
-        formatter
-            .debug_struct(name)
-            .field("cursor", cursor)
-            .field("bytes", &bytes.len())
-            .finish()
+        match self {
+            Self::Bytes { cursor, bytes } => formatter
+                .debug_struct("Bytes")
+                .field("cursor", cursor)
+                .field("bytes", &bytes.len())
+                .finish(),
+            Self::Screen { cursor, bytes } => formatter
+                .debug_struct("Screen")
+                .field("cursor", cursor)
+                .field("bytes", &bytes.len())
+                .finish(),
+        }
     }
 }
 

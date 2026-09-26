@@ -161,10 +161,11 @@ impl std::fmt::Debug for ServiceHttpAnswer {
     /// The status, the class it falls in and how many bytes came back. Never the bytes: see this
     /// module's note on what is never rendered.
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let class: &'static str = status_class(self.status);
         formatter
             .debug_struct("ServiceHttpAnswer")
             .field("status", &self.status)
-            .field("class", &status_class(self.status))
+            .field("class", &class)
             .field("body_bytes", &self.body.len())
             .finish()
     }
@@ -210,7 +211,7 @@ pub trait ServiceSigner: Send + Sync + std::fmt::Debug {
 /* -------------------------------------------------------------------------- */
 
 /// The body of a lease request, in the one shape both representations come from.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RelayLeaseIssueBody {
     /// The endpoint that may send.
@@ -305,13 +306,12 @@ pub struct RelayRequestPayload {
 }
 
 impl std::fmt::Debug for RelayRequestPayload {
-    /// The method and the gateway it was addressed to. Never the nonce or the body digest, which
-    /// are the parts of a credential that belong to one request and to nothing else.
+    /// The gateway it was addressed to. Never the nonce or the body digest, which are the parts of
+    /// a credential that belong to one request and to nothing else.
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("RelayRequestPayload")
-            .field("method", &self.method)
-            .field("gateway_origin", &self.gateway_origin.as_str())
+            .field("gateway_origin", &self.gateway_origin)
             .finish_non_exhaustive()
     }
 }
@@ -348,12 +348,11 @@ pub struct RelayRequestSignature {
 }
 
 impl std::fmt::Debug for RelayRequestSignature {
-    /// The method and which kind of key signed. Never the signature, the public key or the payload
-    /// the signature covers.
+    /// Which kind of key signed. Never the signature, the public key or the payload the signature
+    /// covers.
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("RelayRequestSignature")
-            .field("method", &self.payload.method)
             .field("signer", &self.signer)
             .finish_non_exhaustive()
     }
@@ -370,13 +369,12 @@ pub struct SignedRelayRequest<T> {
 }
 
 impl<T> std::fmt::Debug for SignedRelayRequest<T> {
-    /// The method and which kind of key signed. The body is not rendered whatever it is, which is
-    /// also why this implementation asks nothing of `T`: a request body that could be printed is a
-    /// request body that will be.
+    /// Which kind of key signed. The body is not rendered whatever it is, which is also why this
+    /// implementation asks nothing of `T`: a request body that could be printed is a request body
+    /// that will be.
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("SignedRelayRequest")
-            .field("method", &self.signature.payload.method)
             .field("signer", &self.signature.signer)
             .finish_non_exhaustive()
     }
@@ -387,7 +385,7 @@ impl<T> std::fmt::Debug for SignedRelayRequest<T> {
 /* -------------------------------------------------------------------------- */
 
 /// What a principal has spent of its monthly relay allowance.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RelayAllowance {
     /// The allowance for the current period, in bytes.
@@ -403,7 +401,7 @@ pub struct RelayAllowance {
 }
 
 /// A warning the service raised about the allowance.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RelayWarning {
     /// The fraction of the allowance that had been used, in percent: 80 or 95.
@@ -426,7 +424,7 @@ pub struct RelayWarning {
 /// showing the account counts down to this.
 ///
 /// [`RelayLease::effective_deadline_ms`]: kr_protocol::relay::RelayLease::effective_deadline_ms
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RelayGraceRemainder {
     /// When the first exhaustion happened.
@@ -438,6 +436,11 @@ pub struct RelayGraceRemainder {
     /// Bytes left of the window, across every connection of this principal.
     pub remaining_bytes: U64,
 }
+
+crate::debug_fields!(RelayGraceRemainder {
+    remaining_ms,
+    remaining_bytes
+});
 
 /// A lease the service issued and installed.
 #[derive(Clone, PartialEq, Eq, Deserialize)]
@@ -480,8 +483,6 @@ impl std::fmt::Debug for RelayLeaseGrant {
             .debug_struct("RelayLeaseGrant")
             .field("lease_id", &self.lease.lease.lease_id)
             .field("relay_instance_id", &self.relay_instance_id)
-            .field("region", &self.region)
-            .field("payer", &self.payer)
             .field("reservation_id", &self.reservation_id)
             .field("installed", &self.installed.0.is_some())
             .finish_non_exhaustive()
@@ -489,7 +490,7 @@ impl std::fmt::Debug for RelayLeaseGrant {
 }
 
 /// Why no lease was issued, and what to do instead.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RelayLeaseRefusal {
     /// The principal that would have been billed.
@@ -508,6 +509,10 @@ pub struct RelayLeaseRefusal {
     #[serde(default)]
     pub retry_after_seconds: Option<u64>,
 }
+
+crate::debug_fields!(RelayLeaseRefusal {
+    retry_after_seconds
+});
 
 /// The answer to a lease request, as the service tags it.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
@@ -577,7 +582,7 @@ impl From<TaggedAnswer> for RelayLeaseAnswer {
 }
 
 /// What one reservation was charged.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RelaySettlement {
     /// The reservation.
@@ -591,6 +596,11 @@ pub struct RelaySettlement {
     /// When the reservation was settled, or null while it is still open.
     pub settled_at: Nullable<String>,
 }
+
+crate::debug_fields!(RelaySettlement {
+    bytes_receipted,
+    bytes_settled
+});
 
 /// What ending a lease did.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
@@ -613,12 +623,14 @@ pub struct RelayLeaseEnding {
 /* -------------------------------------------------------------------------- */
 
 /// The managed relay-lease client.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ManagedRelayLeaseService {
     origin: GatewayOrigin,
     http: Arc<dyn ServiceHttp>,
     signer: Arc<dyn ServiceSigner>,
 }
+
+crate::debug_fields!(ManagedRelayLeaseService { origin });
 
 impl ManagedRelayLeaseService {
     /// Builds a client against one gateway.
@@ -1004,17 +1016,14 @@ mod tests {
             },
             signature: credential(),
         };
-        renders_only(
-            &request,
-            r#"SignedRelayRequest{method:"relay.lease.issue",signer:Installation,..}"#,
-        );
+        renders_only(&request, r#"SignedRelayRequest{signer:Installation,..}"#);
         renders_only(
             &request.signature,
-            r#"RelayRequestSignature{method:"relay.lease.issue",signer:Installation,..}"#,
+            r#"RelayRequestSignature{signer:Installation,..}"#,
         );
         renders_only(
             &request.signature.payload,
-            r#"RelayRequestPayload{method:"relay.lease.issue",gateway_origin:"https://reach.kala.to",..}"#,
+            r#"RelayRequestPayload{gateway_origin:GatewayOrigin("https://reach.kala.to"),..}"#,
         );
 
         // An answer that succeeded and an answer that was refused. Both are reached by a
@@ -1065,8 +1074,6 @@ mod tests {
             concat!(
                 r#"RelayLeaseGrant{lease_id:RelayLeaseId(Uuid(11111111-1111-1111-1111-111111111111)),"#,
                 r#"relay_instance_id:RelayInstanceId(Uuid(44444444-4444-4444-4444-444444444444)),"#,
-                r#"region:RelayRegion("eu-central"),"#,
-                r#"payer:"installation:33333333-3333-3333-3333-333333333333","#,
                 r#"reservation_id:RelayReservationId(Uuid(22222222-2222-2222-2222-222222222222)),"#,
                 r#"installed:false,..}"#,
             ),

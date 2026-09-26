@@ -110,7 +110,8 @@ impl RoomRole<'_> {
 impl std::fmt::Debug for RoomRole<'_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // The control token is the reservation's whole authority, so it is never printed.
-        formatter.write_str(self.path())
+        let path: &'static str = self.path();
+        formatter.write_str(path)
     }
 }
 
@@ -320,10 +321,21 @@ fn room_reason(reason: &str) -> Shown {
 }
 
 /// Opens room sockets with one TLS configuration, directly or through one proxy.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct RoomConnector {
     tls: Arc<ClientConfig>,
     proxy: Option<ProxyUrl>,
+}
+
+impl std::fmt::Debug for RoomConnector {
+    /// Whether a proxy carries its sockets. Never the proxy's address, which can carry a user name
+    /// and a password, and never the TLS configuration.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RoomConnector")
+            .field("proxied", &self.proxy.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl RoomConnector {

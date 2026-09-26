@@ -143,7 +143,7 @@ impl fmt::Debug for ReadBody<'_> {
 }
 
 /// Acknowledge what the recipient has stored durably, so the service may remove it.
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 struct AcknowledgeBody<'a> {
     recipient_key: &'a StoredEnvelopeKey,
     through_sequence: U64,
@@ -162,12 +162,11 @@ pub struct MailboxClaimAnswer {
 }
 
 impl fmt::Debug for MailboxClaimAnswer {
-    /// Which challenge it answers. Never the value, which is what proves the mailbox is this
-    /// device's own.
+    /// That it answers a challenge. Never the value, which is what proves the mailbox is this
+    /// device's own, and never the challenge's key.
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("MailboxClaimAnswer")
-            .field("ephemeral_key", &self.ephemeral_key)
             .finish_non_exhaustive()
     }
 }
@@ -220,7 +219,7 @@ pub struct MailboxDelivery {
 }
 
 /// The challenge a read of an unclaimed mailbox is answered with.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MailboxChallenge {
     /// The service's ephemeral X25519 public key, for this challenge and for no other.
@@ -228,6 +227,8 @@ pub struct MailboxChallenge {
     /// When the challenge stops being answerable, in UTC milliseconds.
     pub expires_at_ms: U64,
 }
+
+crate::debug_fields!(MailboxChallenge { expires_at_ms });
 
 /// What a read is answered with while the mailbox is unclaimed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
@@ -1015,13 +1016,7 @@ mod tests {
         // rendering is held to the one field it may print. Exactly, rather than "does not contain
         // the value": the value renders as base64url, so looking for its bytes would pass
         // whatever the type printed.
-        renders_only(
-            &claim,
-            &format!(
-                "MailboxClaimAnswer{{ephemeral_key:{:?},..}}",
-                claim.ephemeral_key
-            ),
-        );
+        renders_only(&claim, "MailboxClaimAnswer{..}");
 
         let item = MailboxItem {
             sequence: U64::new(12),

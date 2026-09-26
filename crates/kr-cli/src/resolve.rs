@@ -65,13 +65,15 @@ impl SessionSelector {
 }
 
 /// One environment this host has a directory for.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct KnownEnvironment {
     /// The environment identity.
     pub environment_id: EnvironmentId,
     /// Its directories.
     pub paths: EnvironmentPaths,
 }
+
+kr_client::debug_fields!(KnownEnvironment { environment_id });
 
 /// Returns the environments this installation knows about.
 ///
@@ -314,7 +316,6 @@ pub async fn retained_session(
 }
 
 /// What the environment's daemon holds for a session that no descriptor names.
-#[derive(Debug)]
 pub enum Registered {
     /// The session has closed.
     Closed {

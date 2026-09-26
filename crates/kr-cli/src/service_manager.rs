@@ -177,7 +177,7 @@ fn target_said(manager: Manager, label: &str, domain: Option<&str>) -> Shown {
 }
 
 /// One definition of an environment's daemon, as this installation writes it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Definition {
     /// The manager it is for.
     pub manager: Manager,
@@ -247,7 +247,7 @@ fn target(manager: Manager, label: &str, domain: Option<&str>) -> String {
 }
 
 /// The record of the definition `kr host startup` wrote.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Record {
     /// The version of this record.
@@ -263,6 +263,8 @@ pub struct Record {
     /// What was written there.
     pub contents: String,
 }
+
+kr_client::debug_fields!(Record { version, manager });
 
 impl Record {
     /// What the manager calls the job or unit this record names.
@@ -349,10 +351,11 @@ impl Record {
 
 /// The service start's lock for one environment, held for as long as its holder looks at or
 /// changes the definition or the manager's job.
-#[derive(Debug)]
 pub struct Lock {
     _file: std::fs::File,
 }
+
+kr_client::debug_as_name!(Lock);
 
 /// Takes an environment's service lock for a change `kr host startup` makes, which holds it until
 /// the configuration document is written as well.
@@ -490,7 +493,6 @@ impl State {
 }
 
 /// A definition's file, and how a sentence names it and a file moved aside from it.
-#[derive(Debug)]
 enum Place<'a> {
     /// The file this installation writes the definition to, which kr derives from the home
     /// directory and the environment: a sentence says it whole.
@@ -574,7 +576,7 @@ fn state(path: &Path, record: Option<&Record>, expected: &Definition) -> State {
 }
 
 /// What moving a definition aside for a check found.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 enum Moved {
     /// Nothing was there.
     Nothing,
@@ -582,6 +584,17 @@ enum Moved {
     NotRegular,
     /// The file is at this name beside where it was.
     Aside(PathBuf),
+}
+
+impl std::fmt::Debug for Moved {
+    /// What was done with the file in the way. Never where it was put, which is a path.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Nothing => formatter.write_str("Nothing"),
+            Self::NotRegular => formatter.write_str("NotRegular"),
+            Self::Aside(_) => formatter.write_str("Aside(..)"),
+        }
+    }
 }
 
 /// Moves the regular file at `place` to a name of its own beside it, so that what is checked next
@@ -649,7 +662,7 @@ fn moved_is(aside: &Path, contents: &str) -> bool {
 }
 
 /// What the service start has on this host for an environment, for a person to read.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Inspection {
     /// The manager.
     pub manager: Manager,
@@ -744,7 +757,6 @@ pub fn inspect(
 }
 
 /// What `kr host startup --set service` did.
-#[derive(Debug)]
 pub struct Installed {
     /// What a person should know about what the manager holds.
     pub notes: Vec<String>,
@@ -855,7 +867,7 @@ fn publish(definition: &Definition) -> Result<()> {
 }
 
 /// What removing the service start's definition did.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct Removal {
     /// Every file removed.
     pub removed: Vec<PathBuf>,
@@ -931,7 +943,7 @@ pub struct Asked {
 
 /// A definition checked for a start request, with the environment's lock held until the request
 /// has been made.
-#[derive(Debug)]
+
 pub struct Verified {
     record: Record,
     expected: Definition,
@@ -1290,7 +1302,7 @@ mod platform {
     }
 
     /// A job launchd holds, as `launchctl print` describes it.
-    #[derive(Debug, Default, PartialEq, Eq)]
+    #[derive(Default, PartialEq, Eq)]
     pub(super) struct Loaded {
         path: Option<PathBuf>,
         program: Option<String>,
@@ -1298,6 +1310,8 @@ mod platform {
         working_directory: Option<String>,
         pid: Option<u32>,
     }
+
+    kr_client::debug_fields!(Loaded { pid });
 
     impl Loaded {
         /// Reads what `launchctl print <domain>/<label>` printed for a loaded job.
@@ -1841,7 +1855,7 @@ mod platform {
     const LOADED: &str = "loaded";
 
     /// What the user manager holds under one unit name, as `systemctl show` prints it.
-    #[derive(Debug, Default, PartialEq, Eq)]
+    #[derive(Default, PartialEq, Eq)]
     pub(super) struct Unit {
         pub(super) load_state: String,
         pub(super) fragment: Option<PathBuf>,

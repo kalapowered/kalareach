@@ -33,7 +33,7 @@ use crate::error::{CliError, Result};
 use crate::shown::named;
 
 /// What an import did, for a person and for `--json`.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Imported {
     /// Where the token was written.
     pub path: String,
@@ -49,6 +49,13 @@ pub struct Imported {
     /// True when it carries the scope managed voice needs.
     pub carries_voice_scope: bool,
 }
+
+kr_client::debug_fields!(Imported {
+    scopes,
+    unknown_scopes,
+    expires_at_ms,
+    carries_voice_scope
+});
 
 impl Imported {
     /// The lines a person reads.
@@ -84,7 +91,7 @@ impl Imported {
 /// The origin and the scopes are said as a diagnostic says them: the scheme, the host and the
 /// port, and the scopes this build knows by name with the others counted. A stored origin can carry
 /// a user name and a password in front of the host, and a scope is whatever the file said.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Held {
     /// Where this host reads its account token.
     pub path: String,
@@ -100,6 +107,12 @@ pub struct Held {
     #[serde(skip)]
     description: Option<String>,
 }
+
+kr_client::debug_fields!(Held {
+    imported,
+    scopes,
+    unknown_scopes
+});
 
 impl Held {
     /// What `path` holds, as `stored` read it.

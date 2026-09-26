@@ -429,10 +429,20 @@ struct RekeyBody<'a> {
 }
 
 /// List the shared collections whose newest record lists the signer.
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 struct MembershipsBody {
     #[serde(skip_serializing_if = "Option::is_none")]
     after: Option<String>,
+}
+
+impl fmt::Debug for MembershipsBody {
+    /// Whether the read continues from a position. Never the position, which is the service's text.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MembershipsBody")
+            .field("continues", &self.after.is_some())
+            .finish()
+    }
 }
 
 /// Write the recovery bundle at its locator, if the service still holds the revision the writer
@@ -453,10 +463,11 @@ impl fmt::Debug for BundleExchangeBody<'_> {
     /// What the object is, how long its stream is and whether the write names a revision. Never
     /// the stream.
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let ciphertext_bytes: usize = self.object.ciphertext.len();
         formatter
             .debug_struct("BundleExchangeBody")
             .field("kind", &self.kind)
-            .field("ciphertext_bytes", &self.object.ciphertext.len())
+            .field("ciphertext_bytes", &ciphertext_bytes)
             .field("expects_a_bundle", &self.expected_revision.is_some())
             .finish_non_exhaustive()
     }
@@ -2311,9 +2322,9 @@ fn reply(answer: Answer, write: bool) -> Result<Reply<serde_json::Value>> {
     match answer {
         Answer::Data(data) => Ok(Reply::Data(data)),
         Answer::Refused(refusal) => match refusal.code() {
-            "COLLECTION_ABSENT" => Ok(Reply::Absent),
-            "KEY_EPOCH_RETIRED" if write => Ok(Reply::Retired(retired_head(&refusal)?)),
-            "KEY_EPOCH_RETIRED" => Err(retired_where_no_write_was()),
+            Some("COLLECTION_ABSENT") => Ok(Reply::Absent),
+            Some("KEY_EPOCH_RETIRED") if write => Ok(Reply::Retired(retired_head(&refusal)?)),
+            Some("KEY_EPOCH_RETIRED") => Err(retired_where_no_write_was()),
             _ => Err(refusal.into_error()),
         },
     }
@@ -2322,7 +2333,7 @@ fn reply(answer: Answer, write: bool) -> Result<Reply<serde_json::Value>> {
 /// Whether an answer to a write is the refusal of an attempt signed before the collection's
 /// cutoff, which is an answer about that attempt rather than an error.
 fn signed_before_cutoff(answer: &Answer) -> bool {
-    matches!(answer, Answer::Refused(refusal) if refusal.code() == "SIGNED_BEFORE_CUTOFF")
+    matches!(answer, Answer::Refused(refusal) if refusal.code() == Some("SIGNED_BEFORE_CUTOFF"))
 }
 
 /// The collection's epoch and revision a retired refusal names, both of which it must name, once.
