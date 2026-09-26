@@ -555,10 +555,15 @@ impl Enrolment {
     /// The lease in force for the member `device_id` is bound to, at both readings, with its cell
     /// loaded once: the lease is decided from that snapshot and carried as it.
     ///
+    /// The snapshot has to state this lease. A policy copied before the cell moved on holds a
+    /// lease the cell no longer states, a renewal's or a replacement's having been published since,
+    /// and a copy cannot tell which rights the lease in force carries: its lease is taken as
+    /// ended, so no decision pairs one lease's rights with another's time.
+    ///
     /// # Errors
     ///
     /// Why there is none: the device is bound to nobody here, it holds no lease, or its lease has
-    /// ended on either clock.
+    /// ended on either clock or is no longer the one its cell states.
     pub fn lease_for_device(
         &self,
         device_id: DeviceId,
@@ -570,7 +575,9 @@ impl Enrolment {
             .installed(&binding.account_id, &binding.device_key)
             .ok_or(MemberLease::NoLease)?;
         let held = installed.bound();
-        if held.snapshot().ended_at(now, utc_ms) {
+        if held.snapshot().identity != BoundIdentity::Lease(installed.digest)
+            || held.snapshot().ended_at(now, utc_ms)
+        {
             Err(MemberLease::Expired)
         } else {
             Ok((installed, held))

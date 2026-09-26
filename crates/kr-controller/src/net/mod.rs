@@ -783,14 +783,7 @@ pub(crate) fn publish_offline_bound(
     use crate::grants::policy::BoundIdentity;
 
     let Some(offline) = offline else {
-        cell.publish(
-            BoundIdentity::Offline {
-                synchronised_at_ms: None,
-            },
-            None,
-            None,
-            false,
-        );
+        cell.publish(BoundIdentity::Unbounded, None, None, false);
         return;
     };
     let synchronised_at_ms = offline.last_synchronised_at_ms.as_ref().map(|at| at.get());

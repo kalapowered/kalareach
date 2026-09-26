@@ -111,9 +111,6 @@ impl RecipientAuthority for GrantedRecipients {
         // A store this host cannot read is a grant this host cannot show, and a grant it cannot
         // show admits nothing.
         let record = self.sharing.grants().record(grant_id).ok()??;
-        // The policy as it stands now, read once for this answer. A copy, so the lock is not held
-        // across the rest of the question.
-        let policy = self.policy.lock().ok()?.clone();
         // This host's reading of UTC through its floor, which the reading raises, so a clock
         // wound back after this message does not revive the grant for the next one.
         let now_ms = self.lifetimes.settled_utc_now();
@@ -131,6 +128,10 @@ impl RecipientAuthority for GrantedRecipients {
             return None;
         }
         let grant = &record.grant;
+        // The policy as it stands now, decided under its lock and after every read of a store
+        // above. A copy taken earlier could hold a lease its cell no longer states, and the rights
+        // a decision takes have to be those of the lease whose time it loads.
+        let policy = self.policy.lock().ok()?;
         if grant.authority_revision.get() > policy.authority_revision().get()
             || !grant.environment_selector.admits(self.environment_id)
         {
@@ -165,6 +166,7 @@ impl RecipientAuthority for GrantedRecipients {
                 now_ms,
             )
             .ok()?;
+        drop(policy);
         if !effective.rights.contains(&ActionRight::SessionView) {
             return None;
         }
@@ -321,15 +323,18 @@ mod tests {
             recipients.scope_for(&rule(Some(12))).is_some(),
             "a grant that reads no clock is untouched"
         );
-        policy
-            .lock()
-            .expect("not poisoned")
-            .set_offline_validity(Some(kr_protocol::sharing::OfflineValidityPolicy {
+        {
+            // Chosen and published, as a daemon publishes a policy it has written down.
+            let mut held = policy.lock().expect("not poisoned");
+            let before = held.clone();
+            held.set_offline_validity(Some(kr_protocol::sharing::OfflineValidityPolicy {
                 maximum_offline_ms: kr_protocol::scalars::DurationMs::new(60 * 60 * 1000),
                 last_synchronised_at_ms: Nullable::some(kr_protocol::scalars::TimestampMs::new(
                     NOW,
                 )),
             }));
+            held.publish_unanchored(&before);
+        }
         assert!(
             recipients.scope_for(&rule(Some(12))).is_none(),
             "a bounded offline validity reads the clock"

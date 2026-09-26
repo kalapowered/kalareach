@@ -69,6 +69,8 @@ pub enum BoundIdentity {
         /// When that synchronisation happened, in UTC milliseconds.
         synchronised_at_ms: Option<u64>,
     },
+    /// No offline bound: the owner chose none.
+    Unbounded,
 }
 
 /// One time bound on authority as it stands: which bound it is, when it ends on the continuous
@@ -623,14 +625,7 @@ pub struct HostPolicy {
 /// outside its bound from the moment it is chosen.
 fn offline_cell(offline: Option<&OfflineValidityPolicy>) -> Arc<BoundCell> {
     match offline {
-        None => BoundCell::new(
-            BoundIdentity::Offline {
-                synchronised_at_ms: None,
-            },
-            None,
-            None,
-            false,
-        ),
+        None => BoundCell::new(BoundIdentity::Unbounded, None, None, false),
         Some(offline) => {
             let synchronised_at_ms = offline.last_synchronised_at_ms.as_ref().map(|at| at.get());
             BoundCell::new(
@@ -1085,14 +1080,9 @@ impl HostPolicy {
     pub fn publish_unanchored(&self, previous: &Self) {
         self.publish_leases(previous);
         match self.offline.as_ref() {
-            None => self.offline_cell.publish(
-                BoundIdentity::Offline {
-                    synchronised_at_ms: None,
-                },
-                None,
-                None,
-                false,
-            ),
+            None => self
+                .offline_cell
+                .publish(BoundIdentity::Unbounded, None, None, false),
             Some(offline) => {
                 let synchronised_at_ms =
                     offline.last_synchronised_at_ms.as_ref().map(|at| at.get());
@@ -1213,11 +1203,20 @@ impl HostPolicy {
                 // the cloud dependency the default is written to avoid. It is decided from one load
                 // of its cell, in UTC here; the caller holds the decision to the same snapshot's
                 // continuous end.
+                // The snapshot has to state this policy's bound, measured from its synchronisation: a
+                // policy copied before the cell moved on is decided as outside it.
                 let offline = match self.offline.as_ref() {
                     Some(offline) if request.ingress != ActorIngress::LocalIpc => {
                         let held = HeldBound::load(&self.offline_cell);
                         let snapshot = held.snapshot();
-                        if snapshot.ended
+                        let this_bound = BoundIdentity::Offline {
+                            synchronised_at_ms: offline
+                                .last_synchronised_at_ms
+                                .as_ref()
+                                .map(|at| at.get()),
+                        };
+                        if snapshot.identity != this_bound
+                            || snapshot.ended
                             || snapshot
                                 .utc_deadline_ms
                                 .is_some_and(|deadline| now_ms >= deadline)
@@ -1478,12 +1477,14 @@ mod one_snapshot_of_each_bound {
         /// Presents a lease issued at `issued_ms` at the UTC reading `at_ms`, and publishes the
         /// policy that holds it.
         fn present(&mut self, issued_ms: u64, at_ms: u64) {
-            let lease = self.organisation.lease(
-                &self.account,
-                *self.key.public(),
-                issued_ms,
-                &[ActionRight::SessionView],
-            );
+            self.present_with(issued_ms, at_ms, &[ActionRight::SessionView]);
+        }
+
+        /// Presents a lease granting at most `rights`, as [`Self::present`] does.
+        fn present_with(&mut self, issued_ms: u64, at_ms: u64, rights: &[ActionRight]) {
+            let lease =
+                self.organisation
+                    .lease(&self.account, *self.key.public(), issued_ms, rights);
             let before = self.policy.clone();
             self.policy
                 .install_lease(LeasePresentation {
@@ -1511,6 +1512,15 @@ mod one_snapshot_of_each_bound {
 
         /// The member device's request at the UTC reading `at_ms`.
         fn decide(&self, at_ms: u64) -> Result<super::PolicyIntersection, Refusal> {
+            self.decide_under(&self.policy, at_ms)
+        }
+
+        /// The member device's request at the UTC reading `at_ms`, decided under `policy`.
+        fn decide_under(
+            &self,
+            policy: &HostPolicy,
+            at_ms: u64,
+        ) -> Result<super::PolicyIntersection, Refusal> {
             let request = AccessRequest {
                 method: Method::SessionList,
                 ingress: ActorIngress::PairedDevice,
@@ -1521,7 +1531,7 @@ mod one_snapshot_of_each_bound {
                 now_ms: at_ms,
                 continuous_now: self.clock.now(),
             };
-            self.policy.intersect(&self.grant, &request, at_ms)
+            policy.intersect(&self.grant, &request, at_ms)
         }
     }
 
@@ -1632,6 +1642,32 @@ mod one_snapshot_of_each_bound {
             decided.lease.map(|held| held.continuous_deadline()),
             Some(Some(renewed))
         );
+    }
+
+    /// A policy copied before its lease's cell moved on decides nothing from that lease. The copy
+    /// holds the old lease's rights and its cell states another lease's time, so pairing the two
+    /// would give the old lease's rights the new one's life. Once the old lease has ended, a copy
+    /// taken before a replacement that removed a right is refused, rather than answered with the
+    /// right the replacement removed.
+    #[test]
+    fn a_stale_copy_decides_nothing_from_a_lease_its_cell_no_longer_states() {
+        let mut leased = Leased::new();
+        let copy = leased.policy.clone();
+        // A replacement that removes the right, published through the device's cell.
+        leased.clock.advance(MINUTE);
+        leased.present_with(NOW_MS + 60_000, NOW_MS + 60_000, &[]);
+        // Past the old lease's continuous end, inside the replacement's, UTC inside both.
+        leased.clock.advance(MINUTE * 14 + Duration::from_secs(30));
+        assert_eq!(
+            leased.decide_under(&copy, NOW_MS + 60_000),
+            lease_expired(),
+            "the copy's lease is not the lease its cell states"
+        );
+        // The control: the policy in force decides from the replacement, its time and its rights.
+        let decided = leased
+            .decide(NOW_MS + 60_000)
+            .expect("the replacement answers");
+        assert!(decided.rights.is_empty(), "without the right it removed");
     }
 
     /// A renewal that does not narrow keeps the installed continuous deadline when its own
