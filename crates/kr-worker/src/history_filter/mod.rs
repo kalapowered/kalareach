@@ -612,20 +612,20 @@ impl HistoryFilter {
     /// Section 10 permits the exact *current* decisions an invitation names, not their earlier
     /// conversation. So a named approval is admitted however early it was recorded only while it
     /// can still be decided, pending or claimed; once it has ended it is an old record like any
-    /// other, and the ordinary bound decides. `name` is the resource the broker arbitrates for
-    /// this request, which is how a grant names it; a request with no such name is decided by the
-    /// bound alone.
+    /// other, and the ordinary bound decides. `resource_id` is the one resource the broker
+    /// arbitrates for the request, which is what a grant names; an upstream's own identifier would
+    /// not do, since two connections both call their first request `1`.
     ///
     /// # Errors
     ///
     /// Returns the reason the approval is outside this viewer's scope.
     pub fn admit_approval(
         &self,
-        name: Option<&PendingResourceId>,
+        resource_id: PendingResourceId,
         recorded_at_ms: u64,
         state: PendingState,
     ) -> std::result::Result<(), WithheldReason> {
-        let named = name.is_some_and(|name| self.scope.named_approvals.contains(name));
+        let named = self.scope.named_approvals.contains(&resource_id);
         if named && !state.is_terminal() && self.scope.session_view {
             return Ok(());
         }

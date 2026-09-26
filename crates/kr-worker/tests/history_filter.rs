@@ -424,7 +424,7 @@ fn a_named_question_is_permitted_and_previewed_although_it_predates_the_cutoff()
     // is decided by the filter's rule for a name a grant carries, while it is still pending.
     assert_eq!(filter.admit_question(named, 1_000), Ok(()));
     assert_eq!(
-        filter.admit_approval(Some(&approval), 1_000, PendingState::Pending),
+        filter.admit_approval(approval, 1_000, PendingState::Pending),
         Ok(())
     );
 
@@ -444,7 +444,7 @@ fn a_named_question_is_permitted_and_previewed_although_it_predates_the_cutoff()
         Err(WithheldReason::NotNamedByTheGrant)
     );
     assert_eq!(
-        filter.admit_approval(Some(&other_approval), 1_000, PendingState::Pending),
+        filter.admit_approval(other_approval, 1_000, PendingState::Pending),
         Err(WithheldReason::NotNamedByTheGrant)
     );
 
@@ -463,13 +463,14 @@ fn a_named_question_is_permitted_and_previewed_although_it_predates_the_cutoff()
 #[test]
 fn a_named_approval_is_excepted_only_while_it_is_current() {
     let named = approval_resource(0x73);
+    let unnamed = approval_resource(0x74);
     let before = CUTOFF_MS - 5_000;
     let filter = HistoryFilter::new(ViewerScope::from_grant(&grant(
         scope(Some(CUTOFF_MS), false, &[], std::slice::from_ref(&named)),
         &[ActionRight::SessionView],
     )));
     for state in PendingState::ALL.iter().copied() {
-        let decided = filter.admit_approval(Some(&named), before, state);
+        let decided = filter.admit_approval(named, before, state);
         if state.is_terminal() {
             assert_eq!(
                 decided,
@@ -480,17 +481,17 @@ fn a_named_approval_is_excepted_only_while_it_is_current() {
             assert_eq!(decided, Ok(()), "a current named approval: {state:?}");
         }
         assert_eq!(
-            filter.admit_approval(None, before, state),
+            filter.admit_approval(unnamed, before, state),
             Err(WithheldReason::NotNamedByTheGrant),
             "nothing names it: {state:?}"
         );
         assert_eq!(
-            filter.admit_approval(None, CUTOFF_MS, state),
+            filter.admit_approval(unnamed, CUTOFF_MS, state),
             Ok(()),
             "{state:?}"
         );
         assert_eq!(
-            filter.admit_approval(Some(&named), CUTOFF_MS + 1, state),
+            filter.admit_approval(named, CUTOFF_MS + 1, state),
             Ok(()),
             "{state:?}"
         );
@@ -501,15 +502,15 @@ fn a_named_approval_is_excepted_only_while_it_is_current() {
         &[ActionRight::SessionView],
     )));
     assert_eq!(
-        live_only.admit_approval(Some(&named), before, PendingState::Claimed),
+        live_only.admit_approval(named, before, PendingState::Claimed),
         Ok(())
     );
     assert_eq!(
-        live_only.admit_approval(Some(&named), before, PendingState::Expired),
+        live_only.admit_approval(named, before, PendingState::Expired),
         Err(WithheldReason::NotNamedByTheGrant)
     );
     assert_eq!(
-        live_only.admit_approval(None, CUTOFF_MS + 1, PendingState::Pending),
+        live_only.admit_approval(unnamed, CUTOFF_MS + 1, PendingState::Pending),
         Err(WithheldReason::NotNamedByTheGrant)
     );
 
@@ -518,7 +519,7 @@ fn a_named_approval_is_excepted_only_while_it_is_current() {
         &[ActionRight::FilesRead],
     )));
     assert_eq!(
-        blind.admit_approval(Some(&named), before, PendingState::Pending),
+        blind.admit_approval(named, before, PendingState::Pending),
         Err(WithheldReason::NoSessionView)
     );
 }

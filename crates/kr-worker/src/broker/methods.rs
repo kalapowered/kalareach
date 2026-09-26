@@ -961,11 +961,11 @@ impl Broker {
     ///
     /// The record is also held to the caller's history filter, at the moment the request arrived:
     /// section 10 admits content by when it was produced, and an interpretation written later
-    /// does not make an old request newly visible. A record the filter withholds is refused with
-    /// the same text as one this broker does not hold, so the answer does not say that a record
-    /// exists outside the caller's scope. A grant names approvals by upstream identifiers, which do
-    /// not pick out one recorded request, since two connections both call their first request
-    /// `1`, so no name a grant carries excepts a record here: the bound decides.
+    /// does not make an old request newly visible. A grant that names this resource reaches the
+    /// record however early the request arrived, while it can still be decided: pending, or
+    /// claimed by an answer on its way. Once it has ended, the bound decides, as for any other
+    /// record. A record the filter withholds is refused with the same text as one this broker does
+    /// not hold, so the answer does not say that a record exists outside the caller's scope.
     ///
     /// # Errors
     ///
@@ -996,7 +996,11 @@ impl Broker {
             return Err(unknown());
         }
         if filter
-            .admit_approval(None, resource.recorded_at.get(), resource.state)
+            .admit_approval(
+                params.resource_id,
+                resource.recorded_at.get(),
+                resource.state,
+            )
             .is_err()
         {
             return Err(unknown());
