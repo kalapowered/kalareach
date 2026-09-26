@@ -2657,7 +2657,7 @@ impl WorkerService {
         let outcome = match method {
             Method::SessionRead => self.session_read(&request.params),
             Method::EventsSnapshot => self.events_snapshot(state, &request.params),
-            Method::HistoryPage => self.history_page(state, &request.params),
+            Method::HistoryPage => self.history_page(state, &request.params, caller),
             Method::EventsSubscribe => self.events_subscribe(state, &request.params),
             Method::ActionRead => self.action_read(&caller.actor_id, &request.params),
             Method::InputWrite => self.input_write(state, &request.params, caller),
@@ -4624,7 +4624,29 @@ impl WorkerService {
         }
     }
 
-    fn history_page(&self, state: &ConnectionState, params: &ParamsValue) -> Result<ParamsValue> {
+    /// Serves `history.page`: the session's retained output, to the local owner alone.
+    ///
+    /// A page is a byte range and a grant's history scope is a moment in time, so nothing here can
+    /// narrow one to the other, and a host that cannot narrow content to a grant refuses it rather
+    /// than serving more than the grant allows. The daemon already refuses a paired device this
+    /// read; every caller but the local owner is refused here too, whichever socket it came in on,
+    /// a paired device in the daemon's own words.
+    fn history_page(
+        &self,
+        state: &ConnectionState,
+        params: &ParamsValue,
+        caller: &Caller,
+    ) -> Result<ParamsValue> {
+        if !caller.is_local_owner() {
+            let refused = if caller.ingress == ActorIngress::PairedDevice {
+                "a paired device"
+            } else {
+                "a caller acting under a grant"
+            };
+            return Err(WorkerError::PermissionDenied {
+                detail: format!("this host does not serve retained history to {refused}"),
+            });
+        }
         let params: HistoryPageParams = parse(params)?;
         let session = self.runtime.session();
         Self::check_session(&session, params.session_id)?;
