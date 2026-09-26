@@ -263,104 +263,281 @@ impl RegisteredTask {
         expected: &TaskDefinition,
         sid_of: impl Fn(&str) -> Option<String>,
     ) -> bool {
+        self.whose(expected, sid_of).is_none()
+    }
+
+    /// Why this is not `expected`'s environment's task, or `None` when it is: another account's
+    /// task, or this account's task for another environment.
+    ///
+    /// `sid_of` resolves an account's name to its identifier, for an export that names the
+    /// account rather than giving its identifier.
+    #[must_use]
+    pub fn whose(
+        &self,
+        expected: &TaskDefinition,
+        sid_of: impl Fn(&str) -> Option<String>,
+    ) -> Option<ForeignReason> {
         let user = self.user.trim();
         let same_user = if user.starts_with("S-1-") {
             user.eq_ignore_ascii_case(&expected.user)
         } else {
             sid_of(user).is_some_and(|sid| sid.eq_ignore_ascii_case(&expected.user))
         };
-        same_user && self.description.trim() == expected.description()
+        if !same_user {
+            return Some(ForeignReason::Account {
+                user: user.to_owned(),
+                description: self.description.trim().to_owned(),
+            });
+        }
+        (self.description.trim() != expected.description()).then(|| ForeignReason::Environment {
+            description: self.description.trim().to_owned(),
+        })
     }
 
     /// What makes this task something other than the one `expected` registers, if anything: its
     /// program, what it gives it, the directory, the settings a starter depends on, a trigger, or
     /// a logon this host does not register. Empty when it is the task this build expects.
     #[must_use]
-    pub fn differences(&self, expected: &TaskDefinition) -> Vec<String> {
+    pub fn differences(&self, expected: &TaskDefinition) -> Vec<Difference> {
         let mut differences = Vec::new();
         if !same_path(&self.command, &expected.starter) {
-            differences.push(format!(
-                "it runs {}, not {}",
-                self.command,
-                expected.starter.display()
-            ));
+            differences.push(Difference::Program {
+                found: self.command.clone(),
+                expected: expected.starter.clone(),
+            });
         }
         if self.arguments.trim() != expected.arguments {
-            differences.push(format!(
-                "it gives the starter {:?}, not {:?}",
-                self.arguments, expected.arguments
-            ));
+            differences.push(Difference::Arguments {
+                found: self.arguments.clone(),
+                expected: expected.arguments.clone(),
+            });
         }
         if !same_path(&self.working_directory, &expected.working_directory) {
-            differences.push(format!(
-                "it runs in {}, not {}",
-                self.working_directory,
-                expected.working_directory.display()
-            ));
+            differences.push(Difference::WorkingDirectory {
+                found: self.working_directory.clone(),
+                expected: expected.working_directory.clone(),
+            });
         }
         if self.actions != 1 {
-            differences.push(format!("it has {} actions, not one", self.actions));
+            differences.push(Difference::Actions(self.actions));
         }
         if self.triggered {
-            differences.push("it has a trigger, so it runs without being asked".to_owned());
+            differences.push(Difference::Triggered);
         }
         if self.logon != Some(expected.logon) {
-            differences.push(format!(
-                "it logs on as {}, not {}",
-                self.logon
-                    .map_or("something this host does not register", LogonType::as_str),
-                expected.logon.as_str()
-            ));
+            differences.push(Difference::Logon {
+                found: self.logon,
+                expected: expected.logon,
+            });
         }
         let run_level = self.run_level.trim();
         if !run_level.is_empty() && run_level != "LeastPrivilege" {
-            differences.push(format!(
-                "it runs at {run_level}, not with the least privilege"
-            ));
+            differences.push(Difference::RunLevel(run_level.to_owned()));
         }
-        for (differs, what) in [
-            (
-                self.disallow_start_on_batteries,
-                "it does not start on batteries",
-            ),
-            (
-                self.stop_going_on_batteries,
-                "it stops when the machine goes on batteries",
-            ),
-            (self.run_only_if_idle, "it waits for the machine to be idle"),
-            (
-                self.stop_on_idle_end,
-                "it stops when the machine stops being idle",
-            ),
-            (self.run_only_if_network, "it waits for a network"),
-            (!self.start_on_demand, "it may not be run when asked"),
+        for (differs, difference) in [
+            (self.disallow_start_on_batteries, Difference::NotOnBatteries),
+            (self.stop_going_on_batteries, Difference::StopsOnBatteries),
+            (self.run_only_if_idle, Difference::WaitsForIdle),
+            (self.stop_on_idle_end, Difference::StopsWhenBusy),
+            (self.run_only_if_network, Difference::WaitsForNetwork),
+            (!self.start_on_demand, Difference::NotOnDemand),
         ] {
             if differs {
-                differences.push(what.to_owned());
+                differences.push(difference);
             }
         }
         if self.multiple_instances.trim() != "Parallel" {
-            differences.push(format!(
-                "a second run while one is running is {:?}, not in parallel",
-                self.multiple_instances
-            ));
+            differences.push(Difference::NotParallel(self.multiple_instances.clone()));
         }
         if self.execution_time_limit.trim() != "PT0S" {
-            differences.push(format!(
-                "its runs are limited to {:?}",
-                self.execution_time_limit
-            ));
+            differences.push(Difference::TimeLimited(self.execution_time_limit.clone()));
         }
         if self.priority.trim() != "5" {
-            differences.push(format!(
-                "it runs at priority {:?}, not the normal 5",
-                self.priority
-            ));
+            differences.push(Difference::Priority(self.priority.clone()));
         }
         if !self.enabled {
-            differences.push("it is disabled".to_owned());
+            differences.push(Difference::Disabled);
         }
         differences
+    }
+}
+
+/// One way a registered task differs from the one this build registers.
+///
+/// What was read from the task is kept for the daemon's own record of a refused launch, which
+/// says it. A command that tells a person about it says only which of these it is, in its own
+/// words, and never what the task holds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Difference {
+    /// It runs another program than this installation's starter.
+    Program {
+        /// The program it runs, as it was read.
+        found: String,
+        /// This installation's starter.
+        expected: PathBuf,
+    },
+    /// It gives the starter other arguments.
+    Arguments {
+        /// What it gives, as it was read.
+        found: String,
+        /// What this build gives.
+        expected: String,
+    },
+    /// It runs in another directory than the environment's state directory.
+    WorkingDirectory {
+        /// Its directory, as it was read.
+        found: String,
+        /// The environment's state directory.
+        expected: PathBuf,
+    },
+    /// It has other than one action.
+    Actions(usize),
+    /// It has a trigger, so it runs without being asked.
+    Triggered,
+    /// It logs on another way than the one expected.
+    Logon {
+        /// How it logs on, when it is a way this host registers.
+        found: Option<LogonType>,
+        /// How the expected task logs on.
+        expected: LogonType,
+    },
+    /// It runs with more than the least privilege; the level, as it was read.
+    RunLevel(String),
+    /// It does not start on batteries.
+    NotOnBatteries,
+    /// It stops when the machine goes on batteries.
+    StopsOnBatteries,
+    /// It waits for the machine to be idle.
+    WaitsForIdle,
+    /// It stops when the machine stops being idle.
+    StopsWhenBusy,
+    /// It waits for a network.
+    WaitsForNetwork,
+    /// It may not be run when asked.
+    NotOnDemand,
+    /// A second run while one is running is not in parallel; the policy, as it was read.
+    NotParallel(String),
+    /// Its runs are limited in time; the limit, as it was read.
+    TimeLimited(String),
+    /// It runs at another priority than the normal 5; the priority, as it was read.
+    Priority(String),
+    /// It is disabled.
+    Disabled,
+}
+
+impl std::fmt::Display for Difference {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Program { found, expected } => {
+                write!(formatter, "it runs {found}, not {}", expected.display())
+            }
+            Self::Arguments { found, expected } => {
+                write!(
+                    formatter,
+                    "it gives the starter {found:?}, not {expected:?}"
+                )
+            }
+            Self::WorkingDirectory { found, expected } => {
+                write!(formatter, "it runs in {found}, not {}", expected.display())
+            }
+            Self::Actions(count) => write!(formatter, "it has {count} actions, not one"),
+            Self::Triggered => {
+                formatter.write_str("it has a trigger, so it runs without being asked")
+            }
+            Self::Logon { found, expected } => write!(
+                formatter,
+                "it logs on as {}, not {}",
+                found.map_or("something this host does not register", LogonType::as_str),
+                expected.as_str()
+            ),
+            Self::RunLevel(level) => {
+                write!(
+                    formatter,
+                    "it runs at {level}, not with the least privilege"
+                )
+            }
+            Self::NotOnBatteries => formatter.write_str("it does not start on batteries"),
+            Self::StopsOnBatteries => {
+                formatter.write_str("it stops when the machine goes on batteries")
+            }
+            Self::WaitsForIdle => formatter.write_str("it waits for the machine to be idle"),
+            Self::StopsWhenBusy => {
+                formatter.write_str("it stops when the machine stops being idle")
+            }
+            Self::WaitsForNetwork => formatter.write_str("it waits for a network"),
+            Self::NotOnDemand => formatter.write_str("it may not be run when asked"),
+            Self::NotParallel(policy) => write!(
+                formatter,
+                "a second run while one is running is {policy:?}, not in parallel"
+            ),
+            Self::TimeLimited(limit) => write!(formatter, "its runs are limited to {limit:?}"),
+            Self::Priority(priority) => {
+                write!(
+                    formatter,
+                    "it runs at priority {priority:?}, not the normal 5"
+                )
+            }
+            Self::Disabled => formatter.write_str("it is disabled"),
+        }
+    }
+}
+
+/// Why a task under an environment's name is not that environment's own.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ForeignReason {
+    /// This user cannot read it, so whose it is cannot be established; what the Task Scheduler
+    /// said.
+    Unreadable {
+        /// The Task Scheduler's own words.
+        said: String,
+    },
+    /// It runs as another account.
+    Account {
+        /// The account, as the export names it.
+        user: String,
+        /// Its description, as it was read.
+        description: String,
+    },
+    /// It runs as this user and belongs to another environment.
+    Environment {
+        /// Its description, as it was read.
+        description: String,
+    },
+}
+
+/// A task under an environment's name that is not that environment's own. It is never replaced
+/// or removed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Foreign {
+    /// The task's name.
+    pub name: String,
+    /// The environment the name was looked at for.
+    pub environment_id: EnvironmentId,
+    /// Why it is not that environment's.
+    pub reason: ForeignReason,
+}
+
+impl std::fmt::Display for Foreign {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.reason {
+            ForeignReason::Unreadable { said } => write!(
+                formatter,
+                "a task named {} is registered and this user cannot read it ({said})",
+                self.name
+            ),
+            ForeignReason::Account { user, description } => write!(
+                formatter,
+                "a task named {} is registered for {user} with the description {description:?}, \
+                 which is not this user's task for environment {}",
+                self.name, self.environment_id
+            ),
+            ForeignReason::Environment { description } => write!(
+                formatter,
+                "a task named {} is registered for this user with the description \
+                 {description:?}, which is not the task of environment {}",
+                self.name, self.environment_id
+            ),
+        }
     }
 }
 
@@ -507,10 +684,100 @@ pub enum Standing {
     Absent,
     /// A task has the name and is not this environment's: another account's, or another
     /// environment's whose identity shares the prefix. It is never replaced or removed.
-    Foreign(String),
+    Foreign(Foreign),
     /// The environment's own task, with what makes it other than the one this build registers:
     /// empty when it is exactly that one.
-    Owned(Vec<String>),
+    Owned(Vec<Difference>),
+}
+
+/// What the Task Scheduler was asked when it failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Asked {
+    /// To export one task.
+    Query,
+    /// To list every task this user can see.
+    List,
+    /// To register a task.
+    Register,
+    /// To remove a task.
+    Remove,
+}
+
+impl Asked {
+    /// What was asked, as a verb.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Query => "read",
+            Self::List => "list",
+            Self::Register => "register",
+            Self::Remove => "remove",
+        }
+    }
+}
+
+/// Why a look at, or a change to, an environment's task did not happen.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TaskError {
+    /// The task under the name is not this environment's own, and it is left as it is.
+    Foreign(Foreign),
+    /// The Task Scheduler could not be asked, or did not do what it was asked.
+    Scheduler {
+        /// What it was asked.
+        asked: Asked,
+        /// The exit code it gave, when it ran and gave one.
+        code: Option<i32>,
+        /// What went wrong, in the Task Scheduler's own words where it gave any.
+        detail: String,
+    },
+    /// The task was changed and did not read back as the one asked for, so the change was undone;
+    /// `undone` says whether undoing it worked.
+    ReadBack {
+        /// The task's name.
+        name: String,
+        /// How it differed, or `None` when it could not be found at all.
+        differences: Option<Vec<Difference>>,
+        /// Whether the change was undone.
+        undone: bool,
+    },
+    /// The lock every change to the task takes could not be taken.
+    Locked(String),
+    /// The definition could not be written where the Task Scheduler reads it.
+    Unwritten(String),
+}
+
+impl std::fmt::Display for TaskError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Foreign(foreign) => write!(formatter, "{foreign}, so it is left as it is"),
+            Self::Scheduler { detail, .. } | Self::Locked(detail) | Self::Unwritten(detail) => {
+                formatter.write_str(detail)
+            }
+            Self::ReadBack {
+                name,
+                differences: Some(differences),
+                undone,
+            } => write!(
+                formatter,
+                "{name} was changed and reads back differently ({}); the change was {}",
+                differences
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; "),
+                if *undone { "undone" } else { "not undone" }
+            ),
+            Self::ReadBack {
+                name,
+                differences: None,
+                undone,
+            } => write!(
+                formatter,
+                "{name} was changed and cannot be found; the change was {}",
+                if *undone { "undone" } else { "not undone" }
+            ),
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -519,7 +786,10 @@ pub use self::platform::{register, remove, run, standing};
 /// The calls to the Task Scheduler, through `schtasks.exe` from the system directory.
 #[cfg(windows)]
 mod platform {
-    use super::{RegisteredTask, Standing, TaskDefinition, decode_output};
+    use super::{
+        Asked, Foreign, ForeignReason, RegisteredTask, Standing, TaskDefinition, TaskError,
+        decode_output,
+    };
     use crate::supervision::{RunFailure, SERVICE_MANAGER_BOUND, command_within};
 
     /// The Task Scheduler's command, from the system directory and never from the search path.
@@ -531,13 +801,30 @@ mod platform {
     }
 
     /// Runs one Task Scheduler command within the service-manager bound.
-    fn schtasks_within(arguments: &[&str]) -> Result<std::process::Output, RunFailure> {
+    fn schtasks_within(
+        asked: Asked,
+        arguments: &[&str],
+    ) -> Result<std::process::Output, TaskError> {
         let program = schtasks();
         command_within(
             &program.display().to_string(),
             arguments,
             SERVICE_MANAGER_BOUND,
         )
+        .map_err(|failure| TaskError::Scheduler {
+            asked,
+            code: None,
+            detail: failure.detail(),
+        })
+    }
+
+    /// What a Task Scheduler command that ran and failed said.
+    fn refused(asked: Asked, what: &str, output: &std::process::Output) -> TaskError {
+        TaskError::Scheduler {
+            asked,
+            code: output.status.code(),
+            detail: format!("{what}: {}", decode_output(&output.stderr).trim()),
+        }
     }
 
     /// Reads where `definition`'s task stands: absent, another's, or this environment's own and how
@@ -547,45 +834,49 @@ mod platform {
     ///
     /// Returns what went wrong when the Task Scheduler could not be asked, or answered with
     /// something other than a task or its absence.
-    pub fn standing(definition: &TaskDefinition) -> Result<Standing, String> {
-        let output = schtasks_within(&["/Query", "/TN", &definition.name, "/XML"])
-            .map_err(|failure| failure.detail())?;
+    pub fn standing(definition: &TaskDefinition) -> Result<Standing, TaskError> {
+        read(definition).map(|(standing, _)| standing)
+    }
+
+    /// Reads where `definition`'s task stands, with the task as the Task Scheduler exports it when
+    /// this user can read it, and nothing otherwise.
+    fn read(definition: &TaskDefinition) -> Result<(Standing, String), TaskError> {
+        let output = schtasks_within(Asked::Query, &["/Query", "/TN", &definition.name, "/XML"])?;
+        let foreign = |reason| Foreign {
+            name: definition.name.clone(),
+            environment_id: definition.environment_id,
+            reason,
+        };
         if !output.status.success() {
             // Why it could not be read is said in the machine's own language, so it is not read.
             // The list of every task this user can see says whether the name is held at all.
-            let said = decode_output(&output.stderr);
+            let said = decode_output(&output.stderr).trim().to_owned();
             if !is_listed(&definition.name)? {
-                return Ok(Standing::Absent);
+                return Ok((Standing::Absent, String::new()));
             }
-            return Ok(Standing::Foreign(format!(
-                "a task named {} is registered and this user cannot read it ({})",
-                definition.name,
-                said.trim()
-            )));
+            return Ok((
+                Standing::Foreign(foreign(ForeignReason::Unreadable { said })),
+                String::new(),
+            ));
         }
-        let registered = RegisteredTask::parse(&decode_output(&output.stdout));
+        let exported = decode_output(&output.stdout);
+        let registered = RegisteredTask::parse(&exported);
         let sid_of = |name: &str| kr_ipc::starter::account_sid(name).ok();
-        if !registered.belongs_to(definition, sid_of) {
-            return Ok(Standing::Foreign(format!(
-                "a task named {} is registered for {} with the description {:?}, which is not \
-                 this user's task for environment {}",
-                definition.name,
-                registered.user.trim(),
-                registered.description.trim(),
-                definition.environment_id
-            )));
-        }
-        Ok(Standing::Owned(registered.differences(definition)))
+        let standing = match registered.whose(definition, sid_of) {
+            Some(reason) => Standing::Foreign(foreign(reason)),
+            None => Standing::Owned(registered.differences(definition)),
+        };
+        Ok((standing, exported))
     }
 
     /// Whether a task named `name` is in the Task Scheduler's root folder, as this user sees it.
-    fn is_listed(name: &str) -> Result<bool, String> {
-        let output = schtasks_within(&["/Query", "/FO", "CSV", "/NH"])
-            .map_err(|failure| failure.detail())?;
+    fn is_listed(name: &str) -> Result<bool, TaskError> {
+        let output = schtasks_within(Asked::List, &["/Query", "/FO", "CSV", "/NH"])?;
         if !output.status.success() {
-            return Err(format!(
-                "the Task Scheduler could not list its tasks: {}",
-                decode_output(&output.stderr).trim()
+            return Err(refused(
+                Asked::List,
+                "the Task Scheduler could not list its tasks",
+                &output,
             ));
         }
         let wanted = format!("\\{name}");
@@ -604,12 +895,16 @@ mod platform {
     /// `name`, whichever environment it serves: two environments whose identities share a prefix
     /// share the name, and a check of the task followed by a change to it holds only while no other
     /// change of this host's comes between them.
-    fn registration_lock(name: &str) -> Result<kr_ipc::starter::NamedLock, String> {
+    fn registration_lock(name: &str) -> Result<kr_ipc::starter::NamedLock, TaskError> {
         kr_ipc::starter::NamedLock::acquire(
             &format!("Global\\{name}-registration"),
             REGISTRATION_BOUND,
         )
-        .map_err(|error| format!("the registration of {name} could not be locked: {error}"))
+        .map_err(|error| {
+            TaskError::Locked(format!(
+                "the registration of {name} could not be locked: {error}"
+            ))
+        })
     }
 
     /// Registers `definition`, or brings this environment's own task back to it.
@@ -623,67 +918,35 @@ mod platform {
     ///
     /// Returns what went wrong: a foreign task, a registration the Task Scheduler refused, or a
     /// task that did not read back as the one registered.
-    pub fn register(definition: &TaskDefinition) -> Result<(), String> {
+    pub fn register(definition: &TaskDefinition) -> Result<(), TaskError> {
         let _lock = registration_lock(&definition.name)?;
         let replace = match standing(definition)? {
-            Standing::Foreign(detail) => return Err(format!("{detail}, so it is left as it is")),
+            Standing::Foreign(foreign) => return Err(TaskError::Foreign(foreign)),
             Standing::Owned(_) => true,
             Standing::Absent => false,
         };
-        if let Err(detail) = create_task(definition, replace) {
+        if let Err(error) = create(definition, &definition.xml(), replace) {
             // A creation refused because the name was taken meanwhile, by something that does not
             // take this lock, leaves that task as it is and says whose it is.
             return match standing(definition)? {
-                Standing::Foreign(foreign) => Err(format!("{foreign}, so it is left as it is")),
-                _ => Err(detail),
+                Standing::Foreign(foreign) => Err(TaskError::Foreign(foreign)),
+                _ => Err(error),
             };
         }
         match standing(definition)? {
             Standing::Owned(differences) if differences.is_empty() => Ok(()),
-            Standing::Owned(differences) => Err(format!(
-                "{} was registered and reads back differently: {}",
-                definition.name,
-                differences.join("; ")
-            )),
-            Standing::Absent => Err(format!(
-                "{} was registered and cannot be found",
-                definition.name
-            )),
-            Standing::Foreign(detail) => Err(detail),
+            Standing::Owned(differences) => Err(TaskError::ReadBack {
+                name: definition.name.clone(),
+                differences: Some(differences),
+                undone: false,
+            }),
+            Standing::Absent => Err(TaskError::ReadBack {
+                name: definition.name.clone(),
+                differences: None,
+                undone: false,
+            }),
+            Standing::Foreign(foreign) => Err(TaskError::Foreign(foreign)),
         }
-    }
-
-    /// Registers `definition` through the Task Scheduler.
-    ///
-    /// `replace` says the task under the name is this environment's own, found so under the
-    /// registration lock, and is replaced. Otherwise the name was free when it was looked at, and
-    /// the creation takes it only if it still is: a definition given as XML without `/F` is
-    /// registered as a new task and refused when the name is held, so a task something else made
-    /// in the meantime is never replaced.
-    pub(super) fn create_task(definition: &TaskDefinition, replace: bool) -> Result<(), String> {
-        let file = definition
-            .working_directory
-            .join(format!("{}.xml", definition.name));
-        let mut bytes = vec![0xff, 0xfe];
-        bytes.extend(definition.xml().encode_utf16().flat_map(u16::to_le_bytes));
-        kr_ipc::paths::write_owner_only_file(&file, &bytes)
-            .map_err(|error| format!("write the definition of {}: {error}", definition.name))?;
-        let file_text = file.display().to_string();
-        let mut arguments = vec!["/Create", "/TN", &definition.name, "/XML", &file_text];
-        if replace {
-            arguments.push("/F");
-        }
-        let created = schtasks_within(&arguments);
-        let _ = std::fs::remove_file(&file);
-        let output = created.map_err(|failure| failure.detail())?;
-        if !output.status.success() {
-            return Err(format!(
-                "the Task Scheduler did not register {}: {}",
-                definition.name,
-                decode_output(&output.stderr).trim()
-            ));
-        }
-        Ok(())
     }
 
     /// Removes this environment's own task, and says whether there was one.
@@ -695,23 +958,72 @@ mod platform {
     /// # Errors
     ///
     /// Returns what went wrong: a foreign task, or a removal the Task Scheduler refused.
-    pub fn remove(definition: &TaskDefinition) -> Result<bool, String> {
+    pub fn remove(definition: &TaskDefinition) -> Result<bool, TaskError> {
         let _lock = registration_lock(&definition.name)?;
         match standing(definition)? {
             Standing::Absent => return Ok(false),
-            Standing::Foreign(detail) => return Err(format!("{detail}, so it is left as it is")),
+            Standing::Foreign(foreign) => return Err(TaskError::Foreign(foreign)),
             Standing::Owned(_) => {}
         }
-        let output = schtasks_within(&["/Delete", "/TN", &definition.name, "/F"])
-            .map_err(|failure| failure.detail())?;
+        delete(definition)?;
+        Ok(true)
+    }
+
+    /// Registers `xml` under `definition`'s name, through the Task Scheduler.
+    ///
+    /// `replace` says the task under the name is this environment's own, found so under the
+    /// registration lock, and is replaced. Otherwise the name was free when it was looked at, and
+    /// the creation takes it only if it still is: a definition given as XML without `/F` is
+    /// registered as a new task and refused when the name is held, so a task something else made
+    /// in the meantime is never replaced.
+    fn create(definition: &TaskDefinition, xml: &str, replace: bool) -> Result<(), TaskError> {
+        let file = definition
+            .working_directory
+            .join(format!("{}.xml", definition.name));
+        let mut bytes = vec![0xff, 0xfe];
+        bytes.extend(xml.encode_utf16().flat_map(u16::to_le_bytes));
+        kr_ipc::paths::write_owner_only_file(&file, &bytes).map_err(|error| {
+            TaskError::Unwritten(format!(
+                "write the definition of {}: {error}",
+                definition.name
+            ))
+        })?;
+        let file_text = file.display().to_string();
+        let mut arguments = vec!["/Create", "/TN", &definition.name, "/XML", &file_text];
+        if replace {
+            arguments.push("/F");
+        }
+        let created = schtasks_within(Asked::Register, &arguments);
+        let _ = std::fs::remove_file(&file);
+        let output = created?;
         if !output.status.success() {
-            return Err(format!(
-                "the Task Scheduler did not remove {}: {}",
-                definition.name,
-                decode_output(&output.stderr).trim()
+            return Err(refused(
+                Asked::Register,
+                &format!("the Task Scheduler did not register {}", definition.name),
+                &output,
             ));
         }
-        Ok(true)
+        Ok(())
+    }
+
+    /// Registers `definition` through the Task Scheduler, as [`create`] does.
+    #[cfg(test)]
+    pub(super) fn create_task(definition: &TaskDefinition, replace: bool) -> Result<(), TaskError> {
+        create(definition, &definition.xml(), replace)
+    }
+
+    /// Removes the task under `definition`'s name, which the caller found to be this environment's
+    /// own under the registration lock.
+    fn delete(definition: &TaskDefinition) -> Result<(), TaskError> {
+        let output = schtasks_within(Asked::Remove, &["/Delete", "/TN", &definition.name, "/F"])?;
+        if !output.status.success() {
+            return Err(refused(
+                Asked::Remove,
+                &format!("the Task Scheduler did not remove {}", definition.name),
+                &output,
+            ));
+        }
+        Ok(())
     }
 
     /// Asks the Task Scheduler to run `definition`'s task once, now.
@@ -722,7 +1034,12 @@ mod platform {
     /// [`RunFailure::Failed`] when it was asked and did not start the run, which it may have begun
     /// first.
     pub fn run(definition: &TaskDefinition) -> Result<(), RunFailure> {
-        let output = schtasks_within(&["/Run", "/I", "/TN", &definition.name])?;
+        let program = schtasks();
+        let output = command_within(
+            &program.display().to_string(),
+            &["/Run", "/I", "/TN", &definition.name],
+            SERVICE_MANAGER_BOUND,
+        )?;
         if output.status.success() {
             return Ok(());
         }
@@ -904,7 +1221,11 @@ mod launching {
                         "the environment's task {} is not the one this installation registers ({}): \
                          {SETUP_ACTION} to repair it",
                         self.expected.name,
-                        differences.join("; ")
+                        differences
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join("; ")
                     ));
                 }
                 Ok(Standing::Absent) => {
@@ -912,10 +1233,10 @@ mod launching {
                         "the environment has no task to start workers: {SETUP_ACTION}"
                     ));
                 }
-                Ok(Standing::Foreign(detail)) => {
-                    return not_started(format!("{detail}: {SETUP_ACTION} for this environment"));
+                Ok(Standing::Foreign(foreign)) => {
+                    return not_started(format!("{foreign}: {SETUP_ACTION} for this environment"));
                 }
-                Err(detail) => return not_started(detail),
+                Err(error) => return not_started(error.to_string()),
             }
             let (Some(program), Some(working_directory)) =
                 (launch.program.to_str(), launch.working_directory.to_str())
@@ -1353,7 +1674,7 @@ pub mod testing {
         /// Returns what went wrong when the account, the session or the registration failed.
         pub fn register(environment: &EnvironmentPaths, starter: &Path) -> Result<Self, String> {
             let definition = definition(environment, starter)?;
-            register(&definition)?;
+            register(&definition).map_err(|error| error.to_string())?;
             Ok(Self { definition })
         }
 
@@ -1496,7 +1817,7 @@ mod tests {
         let definition = TaskDefinition::for_setup(USER, &host.environment(), &starter(&host));
         let read = RegisteredTask::parse(&definition.xml());
         assert!(read.belongs_to(&definition, |_| None));
-        assert_eq!(read.differences(&definition), Vec::<String>::new());
+        assert_eq!(read.differences(&definition), Vec::<Difference>::new());
         assert_eq!(read.logon, Some(LogonType::InteractiveToken));
     }
 
@@ -1542,7 +1863,7 @@ mod tests {
         );
         assert_eq!(
             read.differences(&definition),
-            Vec::<String>::new(),
+            Vec::<Difference>::new(),
             "a default left out and a path in another case are no difference"
         );
     }
@@ -1655,7 +1976,56 @@ mod tests {
         let definition = TaskDefinition::for_setup(USER, &host.environment(), &odd);
         let read = RegisteredTask::parse(&definition.xml());
         assert_eq!(read.command, odd.display().to_string());
-        assert_eq!(read.differences(&definition), Vec::<String>::new());
+        assert_eq!(read.differences(&definition), Vec::<Difference>::new());
+    }
+
+    /// A task that is not this environment's says why: another account's, or this account's for
+    /// another environment; one of this environment's own says nothing.
+    #[test]
+    fn a_task_that_is_not_the_environments_says_whose_it_is_not() {
+        let host = TempHost::create();
+        let ours = TaskDefinition::for_setup(USER, &host.environment(), &starter(&host));
+        let read = |definition: &TaskDefinition| RegisteredTask::parse(&definition.xml());
+        assert_eq!(read(&ours).whose(&ours, |_| None), None);
+        let account = TaskDefinition {
+            user: "S-1-5-21-1000-2000-3000-1002".to_owned(),
+            ..ours.clone()
+        };
+        assert!(matches!(
+            read(&account).whose(&ours, |_| None),
+            Some(ForeignReason::Account { .. })
+        ));
+        let environment = TaskDefinition {
+            environment_id: EnvironmentId::new(kr_ipc::new_uuid()),
+            ..ours.clone()
+        };
+        assert!(matches!(
+            read(&environment).whose(&ours, |_| None),
+            Some(ForeignReason::Environment { .. })
+        ));
+    }
+
+    /// Each difference is written for the daemon's own record as it always was: what was read and
+    /// what was expected.
+    #[test]
+    fn a_difference_is_written_with_what_was_read_for_the_daemons_record() {
+        let host = TempHost::create();
+        let definition = TaskDefinition::for_setup(USER, &host.environment(), &starter(&host));
+        let differences = RegisteredTask::parse(
+            &definition
+                .xml()
+                .replace("<Priority>5", "<Priority>7")
+                .replace("<LogonType>InteractiveToken", "<LogonType>S4U"),
+        )
+        .differences(&definition);
+        let written: Vec<String> = differences.iter().map(ToString::to_string).collect();
+        assert_eq!(
+            written,
+            [
+                "it logs on as S4U, not InteractiveToken",
+                "it runs at priority \"7\", not the normal 5"
+            ]
+        );
     }
 
     /// What the Task Scheduler prints is read whether it wrote UTF-16 or UTF-8.
