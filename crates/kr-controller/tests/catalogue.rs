@@ -1854,6 +1854,142 @@ async fn a_package_past_a_configured_package_limit_is_refused_by_name() {
     let _: wire::PluginInstallResult = ok(install().await);
 }
 
+/// A package already in the store is held to the limits in force as a fetched one is: installed,
+/// removed, a limit lowered and installed again, it is refused by the limit's name.
+#[tokio::test]
+async fn a_package_kept_in_the_store_is_held_to_the_limits_in_force() {
+    use kr_protocol::hostinfo::configuration::EnrolmentBudgets;
+    let defaults = EnrolmentBudgets::default();
+    for (name, budgets) in [
+        (
+            "package_bytes",
+            EnrolmentBudgets {
+                package_bytes: 1,
+                ..defaults
+            },
+        ),
+        (
+            "object_count",
+            EnrolmentBudgets {
+                object_count: 1,
+                ..defaults
+            },
+        ),
+        (
+            "expanded_pack_bytes",
+            EnrolmentBudgets {
+                expanded_pack_bytes: 1,
+                ..defaults
+            },
+        ),
+    ] {
+        let host = host();
+        let digest = installed(&host).await;
+        let _: wire::PluginRemoveResult = ok(host
+            .module
+            .write_frame_admitted(
+                &mutation(
+                    Method::PluginRemove,
+                    host.environment_id,
+                    &wire::PluginRemoveParams {
+                        environment_id: host.environment_id,
+                        plugin_id: plugin(),
+                    },
+                ),
+                Method::PluginRemove,
+                Some(host.confirmations()),
+            )
+            .await);
+        host.module.put_budgets_in_force(budgets);
+        let refused = refusal(
+            host.module
+                .write_frame_admitted(
+                    &mutation(
+                        Method::PluginInstall,
+                        host.environment_id,
+                        &install_params(&host, &digest),
+                    ),
+                    Method::PluginInstall,
+                    Some(host.confirmations()),
+                )
+                .await,
+        );
+        assert!(refused.message.contains(name), "{name}: {refused:?}");
+        let catalogue = host.module.catalogue().lock().await;
+        assert!(
+            catalogue
+                .installation(host.environment_id, &plugin())
+                .expect("readable")
+                .is_none(),
+            "{name}: nothing installed"
+        );
+    }
+}
+
+/// A synchronisation holds each entry's declared size to `expanded_pack_bytes` as well as to
+/// `package_bytes`, for an ordinary enrolment and for a full mirror: the generation is refused by
+/// the limit's name and none is activated.
+#[tokio::test]
+async fn a_synchronisation_holds_each_entry_to_the_extracted_limit() {
+    use kr_protocol::hostinfo::configuration::EnrolmentBudgets;
+    for mirror in [false, true] {
+        let host = host();
+        host.module.put_budgets_in_force(EnrolmentBudgets {
+            expanded_pack_bytes: 1,
+            full_offline_mirror: mirror,
+            ..EnrolmentBudgets::default()
+        });
+        let mut params = add_params(&host);
+        params.budgets.full_offline_mirror = mirror;
+        let _: wire::CatalogueAddResult = ok(host
+            .module
+            .write_frame_admitted(
+                &mutation(Method::CatalogueAdd, host.environment_id, &params),
+                Method::CatalogueAdd,
+                Some(host.confirmations()),
+            )
+            .await);
+        let refused = refusal(
+            host.module
+                .write_frame_admitted(
+                    &mutation(
+                        Method::CatalogueSync,
+                        host.environment_id,
+                        &wire::CatalogueSyncParams {
+                            environment_id: host.environment_id,
+                            catalogue_id: "development".to_owned(),
+                        },
+                    ),
+                    Method::CatalogueSync,
+                    Some(host.confirmations()),
+                )
+                .await,
+        );
+        assert!(
+            refused.message.contains("expanded_pack_bytes"),
+            "mirror {mirror}: {refused:?}"
+        );
+        let listed: wire::CatalogueListResult = ok(host
+            .module
+            .read_frame(
+                ActorIngress::LocalIpc,
+                &request(
+                    Method::CatalogueList,
+                    &wire::CatalogueListParams {
+                        environment_id: host.environment_id,
+                    },
+                ),
+                None,
+            )
+            .await);
+        assert_eq!(
+            listed.catalogues[0].generation,
+            Nullable::null(),
+            "mirror {mirror}: no generation activated"
+        );
+    }
+}
+
 /// Counts the workers gave at one admission revision are shown only while that is the revision
 /// the answer renders: a change committed after the workers answered leaves them unknown.
 #[tokio::test]

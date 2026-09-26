@@ -396,22 +396,32 @@ impl BudgetLedger {
         subject: &str,
     ) -> Result<(), ResourceLimit> {
         // What a package declares is held to `package_bytes`, and what it takes once extracted to
-        // `expanded_pack_bytes`; its files to `object_count` at both.
-        let (resource, limit) = match stage {
-            Stage::Declared => (Resource::PackageBytes, self.package.package_bytes),
-            Stage::Actual => (
+        // `expanded_pack_bytes`; its files to `object_count` at both. This format stores every file
+        // as it is, so the declared total is also the extracted size, and a declaration is held to
+        // both byte limits before anything is fetched.
+        let limits: &[(Resource, u64)] = match stage {
+            Stage::Declared => &[
+                (Resource::PackageBytes, self.package.package_bytes),
+                (
+                    Resource::ExpandedPackBytes,
+                    self.package.expanded_pack_bytes,
+                ),
+            ],
+            Stage::Actual => &[(
                 Resource::ExpandedPackBytes,
                 self.package.expanded_pack_bytes,
-            ),
+            )],
         };
-        if bytes > limit {
-            return Err(ResourceLimit {
-                resource,
-                limit,
-                requested: bytes,
-                stage,
-                subject: subject.to_owned(),
-            });
+        for &(resource, limit) in limits {
+            if bytes > limit {
+                return Err(ResourceLimit {
+                    resource,
+                    limit,
+                    requested: bytes,
+                    stage,
+                    subject: subject.to_owned(),
+                });
+            }
         }
         let file_limit = self.package.object_count;
         if files > file_limit {

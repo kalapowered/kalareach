@@ -536,7 +536,8 @@ pub fn effective(
         .unwrap_or_default();
     // Where this reading decided nothing, the budgets in force are the ones this host last
     // accepted, and no document in front of this report is their origin.
-    let (enrolment_source, enrolment_origin) = if !accepted.budgets.from_document {
+    let budgets_decided = accepted.budgets.from_document;
+    let (enrolment_source, enrolment_origin) = if !budgets_decided {
         (
             if enrolment.value == configuration::EnrolmentBudgets::default() {
                 configuration::ValueSource::Default
@@ -659,8 +660,12 @@ pub fn effective(
                         line = line.stated(", full offline mirror");
                     }
                     // Which of the eleven this host's configuration chose, so one budget raised
-                    // in a document cannot read as eleven budgets the owner set.
-                    if supplied_budgets.is_empty() {
+                    // in a document cannot read as eleven budgets the owner set. Where this
+                    // reading decided nothing, they are the budgets this host last accepted,
+                    // whatever they were.
+                    if !budgets_decided {
+                        line.stated("; the budgets this host last accepted")
+                    } else if supplied_budgets.is_empty() {
                         line.stated("; every budget is the default")
                     } else {
                         line.stated("; configured here: ")

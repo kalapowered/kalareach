@@ -1442,6 +1442,13 @@ async fn accepted_enrolment_budgets_survive_a_restart_over_a_document_that_decid
                 .is_some_and(|why| why.as_str().contains("last accepted")),
             "{state:?}: and says why: {ceiling:?}"
         );
+        assert!(
+            !ceiling
+                .value
+                .as_str()
+                .contains("every budget is the default"),
+            "{state:?}: retained budgets are not called defaults: {ceiling:?}"
+        );
         assert_eq!(
             controller.catalogue().budgets_in_force().metadata_bytes,
             MIB,

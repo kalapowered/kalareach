@@ -1651,9 +1651,13 @@ impl Catalogue {
         // A package already here is used only after every file its manifest declares is checked
         // where it lies. Its name is not the package: one that is incomplete or altered is fetched
         // again and replaced, and one this host cannot read is its disk's failure.
+        // The limits in force hold it as they hold a fetched one: a limit lowered since it was
+        // extracted refuses it here rather than letting a kept copy through.
+        let limits = ledger_of(store, enrolled, self.package_limits)?;
         if let Some(hash) = package_hash
             && let PackageCheck::Complete(package) = store.check_package(hash)?
         {
+            within_limits(store, &package, &limits, &format!("{plugin_id} {version}"))?;
             return Ok(*package);
         }
         let active = enrolled.active.ok_or_else(|| CatalogueError::NotFound {
@@ -1681,11 +1685,12 @@ impl Catalogue {
         let subject = format!("{} {}", entry.plugin_id, entry.version);
         // The same package reached through the entry: the entry is a signed statement about this
         // hash, and it has to agree with the manifest the hash names before anything relies on it.
+        extract::check_declared(&entry, &limits)?;
         if let PackageCheck::Complete(package) = store.check_package(entry.manifest_digest)? {
             extract::reconcile(&entry, package.manifest(), &subject)?;
+            within_limits(store, &package, &limits, &subject)?;
             return Ok(*package);
         }
-        extract::check_declared(&entry, &ledger_of(store, enrolled, self.package_limits)?)?;
 
         // The package is staged whole, beside everything the cache and the packages already here
         // hold, and what it still has to fetch is cached on the way. Room for both is made before
@@ -2693,6 +2698,31 @@ fn check_decided_under(
         }),
         _ => Ok(()),
     }
+}
+
+/// Holds a package already extracted to the package limits in force, by what its checked copy
+/// holds: the bytes its tree takes (and at least what its manifest declares) and its files, the
+/// manifest among them.
+fn within_limits(
+    store: &Store,
+    package: &ReadyPackage,
+    ledger: &BudgetLedger,
+    subject: &str,
+) -> CatalogueResult<()> {
+    let payloads = &package.manifest().payloads;
+    let declared = payloads.iter().fold(0u64, |total, payload| {
+        total.saturating_add(payload.size_bytes.get())
+    });
+    let extracted = store
+        .package_trees()?
+        .get(&package.digest())
+        .copied()
+        .unwrap_or(declared);
+    let files = u64::try_from(payloads.len())
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    ledger.check_package(extracted.max(declared), files, Stage::Declared, subject)?;
+    Ok(())
 }
 
 /// Returns what a sync or a fetch measures against: the enrolment's budgets and what its
