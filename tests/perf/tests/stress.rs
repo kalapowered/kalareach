@@ -112,6 +112,13 @@ const P99_BOUND: Duration = Duration::from_millis(15);
 /// How long every session is given to start writing, and any single wait for the host.
 const LIVENESS: Duration = Duration::from_secs(120);
 
+/// How long one keystroke's write, answer and echo may take together.
+const KEYSTROKE_LIVENESS: Duration = Duration::from_secs(10);
+
+/// The most the whole keystroke measurement may take: attaching, waiting for the root program to
+/// read and its opening output to stop, and the keystrokes themselves.
+const KEYSTROKES_BOUND: Duration = Duration::from_secs(3 * LIVENESS.as_secs());
+
 /// How many bytes a view has to have read before its session counts as writing: more than a
 /// prompt and a typed command make.
 const WRITING: u64 = 16 * 1024;
@@ -965,24 +972,36 @@ async fn keystrokes(
         let encoded = ParamsValue::from_typed(&params)
             .map_err(|error| format!("the write did not encode: {error}"))?;
         // Written rather than asked, because the answer and the echo arrive on the same connection
-        // in either order, and the figure is the time to the echo.
+        // in either order, and the figure is the time to the echo. One deadline covers the write
+        // and every frame after it, so a connection that keeps sending other frames cannot hold
+        // the measurement.
+        let deadline = tokio::time::Instant::now() + KEYSTROKE_LIVENESS;
+        let late = || {
+            format!(
+                "keystroke {sequence} was not written, answered and echoed within {KEYSTROKE_LIVENESS:?}"
+            )
+        };
         let started = Instant::now();
-        view.client
-            .writer()
-            .write_message(&ControlFrame::Request(Request {
-                request_id,
-                method: Method::InputWrite.into(),
-                method_version: MethodVersion::V1,
-                params: encoded,
-            }))
-            .await
-            .map_err(|error| format!("the write did not reach the worker: {error}"))?;
+        tokio::time::timeout_at(
+            deadline,
+            view.client
+                .writer()
+                .write_message(&ControlFrame::Request(Request {
+                    request_id,
+                    method: Method::InputWrite.into(),
+                    method_version: MethodVersion::V1,
+                    params: encoded,
+                })),
+        )
+        .await
+        .map_err(|_| late())?
+        .map_err(|error| format!("the write did not reach the worker: {error}"))?;
         let mut answered = false;
         let mut echoed = None;
         while !answered || echoed.is_none() {
-            let frame = tokio::time::timeout(Duration::from_secs(10), view.client.recv())
+            let frame = tokio::time::timeout_at(deadline, view.client.recv())
                 .await
-                .map_err(|_| format!("keystroke {sequence}'s answer or echo never arrived"))?
+                .map_err(|_| late())?
                 .map_err(|error| format!("the connection ended: {error}"))?;
             match frame {
                 ControlFrame::Response(response) if response.request_id == request_id => {
@@ -1242,7 +1261,16 @@ async fn stress(host: &Host, run: &mut Run) -> Result<Figures, String> {
                     .enable_all()
                     .build()
                     .map_err(|error| format!("a runtime for the keystrokes: {error}"))?
-                    .block_on(keystrokes(endpoint, target, session_id))
+                    .block_on(async {
+                        tokio::time::timeout(
+                            KEYSTROKES_BOUND,
+                            keystrokes(endpoint, target, session_id),
+                        )
+                        .await
+                        .map_err(|_| {
+                            format!("the keystrokes did not finish within {KEYSTROKES_BOUND:?}")
+                        })?
+                    })
             }));
         }
     }
@@ -1250,11 +1278,17 @@ async fn stress(host: &Host, run: &mut Run) -> Result<Figures, String> {
     let spent_after = process::processor_seconds(&all)?;
     let conditions = window.close();
     let received: Vec<u64> = readers.iter().map(Reader::bytes).collect();
+    // The thread bounds its own measurement; the wait for it is bounded too, so that cleanup runs
+    // whatever the thread does.
     let (samples, keystroke_conditions) = match latency {
-        Some(handle) => tokio::task::spawn_blocking(move || handle.join())
-            .await
-            .map_err(|error| format!("the keystrokes' thread: {error}"))?
-            .map_err(|_| "the keystrokes' thread panicked".to_owned())??,
+        Some(handle) => tokio::time::timeout(
+            KEYSTROKES_BOUND,
+            tokio::task::spawn_blocking(move || handle.join()),
+        )
+        .await
+        .map_err(|_| format!("the keystrokes' thread did not end within {KEYSTROKES_BOUND:?}"))?
+        .map_err(|error| format!("the keystrokes' thread: {error}"))?
+        .map_err(|_| "the keystrokes' thread panicked".to_owned())??,
         None => return Err("the keystrokes never started".to_owned()),
     };
 
