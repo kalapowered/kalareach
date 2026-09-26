@@ -540,8 +540,9 @@ mod tests {
         }
     }
 
-    /// When a relay test's host answers the relay's questions after its first, the one the relay
-    /// asks before it attaches.
+    /// How a relay test's host answers the relay's questions. The first, which the relay asks
+    /// before it attaches, is answered at once from the invitation as it stands; the others as
+    /// each variant says.
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Answers {
         /// At once, from the invitation as it stands.
@@ -551,6 +552,9 @@ mod tests {
         /// still waiting after [`WATCHDOG`] is answered as the invitation stands, so a test that
         /// fails before it ends the invitation still ends.
         AfterTheEnd,
+        /// At once, and the invitation runs out just after the first answer, as a deadline that
+        /// passes while the relay attaches does.
+        RunningOutAfterTheFirst,
     }
 
     /// A host a relay test controls: on offer until the test says otherwise, answering every step
@@ -560,7 +564,7 @@ mod tests {
         changed: std::sync::Condvar,
         replies: Vec<ClientFrame>,
         on_step: OnStep,
-        later: Answers,
+        answering: Answers,
         questions: std::sync::atomic::AtomicUsize,
         answers: std::sync::Mutex<Vec<(Instant, RoomOffer)>>,
         gate: Arc<Gate>,
@@ -571,13 +575,13 @@ mod tests {
             Self::answering(replies, on_step, Answers::AtOnce)
         }
 
-        fn answering(replies: Vec<ClientFrame>, on_step: OnStep, later: Answers) -> Arc<Self> {
+        fn answering(replies: Vec<ClientFrame>, on_step: OnStep, answering: Answers) -> Arc<Self> {
             Arc::new(Self {
                 offer: std::sync::Mutex::new(RoomOffer::Open),
                 changed: std::sync::Condvar::new(),
                 replies,
                 on_step,
-                later,
+                answering,
                 questions: std::sync::atomic::AtomicUsize::new(0),
                 answers: std::sync::Mutex::new(Vec::new()),
                 gate: Arc::new(Gate::default()),
@@ -592,6 +596,16 @@ mod tests {
         /// The invitation ends by itself: its deadline passes.
         fn end(&self) {
             self.set(RoomOffer::Lapsed);
+        }
+
+        /// When the host answered the relay's first question.
+        fn first_answered(&self) -> Instant {
+            self.answers
+                .lock()
+                .expect("the answers")
+                .first()
+                .expect("the relay asked")
+                .0
         }
 
         /// When the host first gave `answer` after `after`.
@@ -628,21 +642,22 @@ mod tests {
                 .questions
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
                 == 0;
-            let offer = {
+            let (at, offer) = {
                 let mut offer = self.offer.lock().expect("the offer");
-                if !first && self.later == Answers::AfterTheEnd {
+                if !first && self.answering == Answers::AfterTheEnd {
                     offer = self
                         .changed
                         .wait_timeout_while(offer, WATCHDOG, |offer| *offer == RoomOffer::Open)
                         .expect("the offer")
                         .0;
                 }
-                *offer
+                let answer = (Instant::now(), *offer);
+                if first && self.answering == Answers::RunningOutAfterTheFirst {
+                    *offer = RoomOffer::Lapsed;
+                }
+                answer
             };
-            self.answers
-                .lock()
-                .expect("the answers")
-                .push((Instant::now(), offer));
+            self.answers.lock().expect("the answers").push((at, offer));
             offer
         }
     }
@@ -905,6 +920,38 @@ mod tests {
         );
     }
 
+    /// An invitation that runs out just after the host answered the question its relay attaches
+    /// on ends its room within one recheck of running out, whether the room has answered the
+    /// attach or not: that question is the relay's first, and it asks again no later than one
+    /// recheck after it. The socket stays open and the owner's stop stays unsent, so only a
+    /// recheck can end the relay.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_invitation_that_runs_out_as_its_relay_attaches_ends_its_room_within_one_recheck() {
+        for answered in [true, false] {
+            let host =
+                TestHost::answering(Vec::new(), OnStep::Keeps, Answers::RunningOutAfterTheFirst);
+            let service = if answered {
+                TestService::new(8)
+            } else {
+                TestService::holding_attaches(8)
+            };
+            let (relay, _stop) = relaying(&host, &service).await;
+            finished(relay).await;
+            let attach = if answered { "answered" } else { "waiting" };
+            assert_eq!(service.released(), 1, "released, with the attach {attach}");
+            let late = service.released_at().duration_since(host.first_answered());
+            assert!(
+                late <= EXPIRY_RECHECK + SLACK,
+                "released {late:?} after the invitation ran out, with the attach {attach}"
+            );
+            assert_eq!(
+                service.attached().len(),
+                1,
+                "an ended invitation is not attached again"
+            );
+        }
+    }
+
     /// KR-REQ-10.33: a socket that ends after its invitation did is not followed by the pause
     /// before attaching again: the relay asks the host as the socket ends and releases the locator
     /// at once.
@@ -1164,5 +1211,24 @@ mod tests {
         assert_eq!(service.released(), 1);
         let late = service.released_at().duration_since(let_go);
         assert!(late <= SLACK, "released {late:?} after the host let it go");
+    }
+
+    /// A relay whose pairing service has gone while the owner's stop is still there to be sent
+    /// finds it gone at its next question, within one recheck, and releases the locator it still
+    /// holds the token for.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_relay_whose_host_has_gone_releases_within_one_recheck() {
+        let host = TestHost::new(Vec::new(), OnStep::Keeps);
+        let service = TestService::new(8);
+        let (relay, _stop) = relaying(&host, &service).await;
+        let gone = Instant::now();
+        drop(host);
+        finished(relay).await;
+        assert_eq!(service.released(), 1);
+        let late = service.released_at().duration_since(gone);
+        assert!(
+            late <= EXPIRY_RECHECK + SLACK,
+            "released {late:?} after the host went"
+        );
     }
 }
