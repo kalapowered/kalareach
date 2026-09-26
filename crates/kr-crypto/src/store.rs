@@ -661,15 +661,46 @@ fn mark_unconfirmed(marker: &Path) -> Result<()> {
     match builder.create(marker) {
         Ok(()) => Ok(()),
         // Another writer's marker, or one a call that stopped left there.
-        Err(error)
-            if error.kind() == std::io::ErrorKind::AlreadyExists
-                && std::fs::symlink_metadata(marker).is_ok_and(|found| found.is_dir()) =>
-        {
-            Ok(())
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            #[cfg(test)]
+            marker_race::run(marker);
+            if std::fs::symlink_metadata(marker).is_ok_and(|found| found.is_dir()) {
+                Ok(())
+            } else {
+                Err(CryptoError::SecretStore {
+                    message: format!("create {}: {error}", marker.display()),
+                })
+            }
         }
         Err(error) => Err(CryptoError::SecretStore {
             message: format!("create {}: {error}", marker.display()),
         }),
+    }
+}
+
+/// What the unit tests run when the marker a call is about to leave is there already, before the
+/// call looks at it, to take it away as another writer does once it has confirmed the directory.
+#[cfg(test)]
+pub(crate) mod marker_race {
+    use std::cell::RefCell;
+    use std::path::Path;
+
+    type Then = Box<dyn FnOnce(&Path)>;
+
+    thread_local! {
+        static BEFORE: RefCell<Option<Then>> = const { RefCell::new(None) };
+    }
+
+    /// Runs `then` with the marker's path once, the next time a call on this thread finds a marker
+    /// there already.
+    pub(crate) fn once(then: impl FnOnce(&Path) + 'static) {
+        BEFORE.with(|before| *before.borrow_mut() = Some(Box::new(then)));
+    }
+
+    pub(crate) fn run(marker: &Path) {
+        if let Some(then) = BEFORE.with(|before| before.borrow_mut().take()) {
+            then(marker);
+        }
     }
 }
 
@@ -1749,6 +1780,39 @@ mod tests {
                 secret
             );
         }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// KR-REQ-10.47: another writer's marker, which that writer takes away once it has confirmed
+    /// the directory, can go between this store's attempt to leave its own and its look at what is
+    /// there. The store then leaves its own marker again and goes on: while the directory above
+    /// refuses a flush the write is refused for that, and the directory stays marked; with nothing
+    /// held the secret is stored, and no marker is left.
+    #[test]
+    fn a_marker_another_writer_takes_away_meanwhile_is_left_again() {
+        let base = scratch_directory("marker-race");
+        let opened = open_store_in(&base).expect("a store in the named directory");
+        let name = SecretName::new("host/x").expect("a name");
+        let marker = marker_of(&base.join("host"));
+        std::fs::create_dir(&marker).expect("another writer's marker");
+        marker_race::once(|marker: &Path| std::fs::remove_dir(marker).expect("taken away"));
+        let refused = {
+            let _refused = FlushRefused::on(&base);
+            opened
+                .store
+                .set(&name, b"seed")
+                .expect_err("the directory is not confirmed while its flush is refused")
+        };
+        assert!(is_refused_flush(&refused), "the flush's refusal: {refused}");
+        assert!(
+            marked_unconfirmed(&base.join("host")),
+            "the directory stays marked"
+        );
+        opened
+            .store
+            .set(&name, b"seed")
+            .expect("with nothing held, the secret is stored");
+        assert!(!marker.exists(), "no marker is left once it is confirmed");
         let _ = std::fs::remove_dir_all(&base);
     }
 
