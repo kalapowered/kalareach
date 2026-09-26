@@ -1,0 +1,43 @@
+[package]
+name = "kr-privacy-integration"
+description = "Privacy mode enabled while sync, backup and notification work is at the services, against the web service itself"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+# A delivery credential travels as unpadded base64url in the header of the two gateway routes the
+# host has no client for: the forget a person asks for and the controls that are refused.
+base64.workspace = true
+# The digest a storage upload declares for its object, and the canonical encoding a settings object
+# is sealed in when a leg admits one without sending it.
+kr-cbor.workspace = true
+kr-client.workspace = true
+# The host's own gateway clients: the one that delivers a notification and the one that asks what
+# became of it. A notification the legs hold at the gateway is one the host itself delivered.
+kr-controller.workspace = true
+kr-crypto.workspace = true
+# The preview a delivered notification carries, sealed the way the host seals one.
+kr-delivery.workspace = true
+kr-protocol.workspace = true
+# The deployment, the run's own keys and identifiers, and the words a leg's leftovers are reported
+# in, so these legs reach a service the way the settings-sync legs do.
+kr-sync-integration = { path = "../sync" }
+# The account routes a person reaches through a browser: the sign-in, the authorisation and the
+# console. None of them is a managed-service call, so none goes through the client's transport.
+reqwest.workspace = true
+# Reading beside a local deployment, read-only, what it committed: the sign-in code its mail sink
+# kept and the challenge its push gateway sent through the provider.
+rusqlite = { workspace = true, features = ["bundled"] }
+serde_json.workspace = true
+# Where a leg's devices keep their stores: a directory on this machine's own disk, gone with the leg.
+tempfile.workspace = true
+tokio.workspace = true
+# The authorisation request's query and the token exchange's form.
+url.workspace = true
+
+[lints]
+workspace = true
