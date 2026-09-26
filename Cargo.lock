@@ -4752,6 +4752,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "kr-privacy-integration"
+version = "0.1.0"
+dependencies = [
+ "base64 0.23.1",
+ "kr-cbor",
+ "kr-client",
+ "kr-controller",
+ "kr-crypto",
+ "kr-delivery",
+ "kr-protocol",
+ "kr-sync-integration",
+ "reqwest",
+ "rusqlite",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "kr-project"
 version = "0.1.0"
 dependencies = [

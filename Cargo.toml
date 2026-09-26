@@ -34,6 +34,7 @@ members = [
     "tests/e2e/agents",
     "tests/e2e/m1b",
     "tests/integration/backup",
+    "tests/integration/privacy",
     "tests/integration/sync",
 ]
 
