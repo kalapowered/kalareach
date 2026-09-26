@@ -1901,7 +1901,7 @@ mod fixtures {
             "cursor": {"column": 4, "row": 1, "visible": true, "style": 2, "pending_wrap": false}
         });
         let styled = serde_json::json!({
-            "window": {"top_row": 5, "left_column": 0, "rows": 2, "columns": 12},
+            "window": {"top_row": 5, "left_column": 0, "rows": 3, "columns": 12},
             "rows": [
                 {"row": 5, "soft_wrapped": false, "runs": [
                     {"column": 0, "cells": 4, "text": "a\u{7}b\u{9b}cd"},
@@ -1909,7 +1909,9 @@ mod fixtures {
                     {"column": 9, "cells": 3, "text": "hij"}]},
                 {"row": 6, "soft_wrapped": false, "runs": [
                     {"column": 1, "cells": 4, "text": "link"},
-                    {"column": 6, "cells": 4, "text": "\u{1f468}\u{200d}\u{1f4bb}"}]}
+                    {"column": 6, "cells": 4, "text": "\u{1f468}\u{200d}\u{1f4bb}"}]},
+                {"row": 7, "soft_wrapped": false, "runs": [
+                    {"column": 0, "cells": 0, "text": "x\u{7}y\u{9b}z\u{1b}w"}]}
             ],
             "cursor": {"column": 11, "row": 1, "visible": false, "style": 5,
                        "pending_wrap": true}
@@ -1940,6 +1942,12 @@ mod fixtures {
         if let Some(row) = styled_screen.rows.get_mut(&(ProjectedBuffer::Primary, 6)) {
             row.runs[0].hyperlink = Nullable::some("https://example.com/a".to_owned());
             row.runs[1].hyperlink = Nullable::some("https://example.com/a".to_owned());
+        }
+        // Control characters inside a run whose cells are what the pinned model measures, so the
+        // run is placed rather than replaced: each control is a cluster of no cells of its own.
+        if let Some(row) = styled_screen.rows.get_mut(&(ProjectedBuffer::Primary, 7)) {
+            let measured = unicode::cells_for(&row.runs[0].text) as u64;
+            row.runs[0].cells = U64::new(measured);
         }
         vec![
             ("edges", edges_screen, edges_window),
@@ -2027,6 +2035,19 @@ mod fixtures {
         assert_eq!(comparison.runs_replaced, 2, "runs replaced");
         assert_eq!(comparison.clusters_replaced, 3, "clusters replaced");
         assert_eq!(comparison.cells_clipped, 8, "cells clipped");
+
+        // And the control characters inside a placed run never reach the destination: no bell,
+        // and no C1 control sequence introducer, which UTF-8 carries as two bytes.
+        let (_, styled, window) = placement_screens()
+            .into_iter()
+            .find(|(name, _, _)| *name == "styled")
+            .expect("the placement screen");
+        let bytes = install(&styled, window, Keyboard::EVERYTHING).bytes;
+        assert!(!bytes.contains(&0x07), "no bell reaches the destination");
+        assert!(
+            !bytes.windows(2).any(|pair| pair == [0xc2, 0x9b]),
+            "no C1 control reaches the destination"
+        );
     }
 
     /// The SHA-256 of each frame [`every_frame_is_the_bytes_the_painter_writes`] paints.
@@ -2067,10 +2088,10 @@ mod fixtures {
         "edges install-nothing e58e8464d05d2fd50f5aeb6474b048d407dbf2fa1893fa9f4b5c7cda4c424a78",
         "edges update 84479a9e5209613cdffb6b8bddab2ad6c76b701251add1aa0541fd978dc92fe2",
         "edges update-rows efd00f8c0b73b0530237a475a3410549d4ca056d5aef7efef7c0a8dbef60f615",
-        "styled install 82c7d2c3402bd28754ead1e1ed02b0b057520e738c68db0dd366bbd9c2700477",
-        "styled install-nothing 79d38c752fc87516cd2bc346e046785a76d2e95ef24f80fb3b82e9864e3b3a75",
-        "styled update f132e2a6a7ccc65f9aaf81ce9ba7c602964ddf4ad52a19350201d428f350929a",
-        "styled update-rows b81cbe6fe14730d6751af60ce9f5ec81eb50d07171d7e2978ff9936405596140",
+        "styled install c098012df4ff8efdeaa352e8176e113a6a9d9509a8e9c2b9413ed3879d78986b",
+        "styled install-nothing 621c30aaf3506f1e4e63cf2abc4c453f7305b0c229083ce722b225ebc96a693a",
+        "styled update d009c8fc97e0447edc9f427c715c6dfc719a49dac1dd9dfe4f0086c62c9e116d",
+        "styled update-rows 0f9af589d5e2dd7f7f8b5acfaceec5726f2db6ccb09adb0ca3981a7e3f392009",
     ];
 
     /// A screen with a scroll region of its own, and origin mode on.
