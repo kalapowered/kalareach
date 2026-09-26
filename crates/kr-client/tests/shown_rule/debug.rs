@@ -226,6 +226,10 @@ const DEBUG_FIELDS: &str = "kr_client::debug_fields";
 const DEBUG_AS_DISPLAY: &str = "kr_client::debug_as_display";
 const SHOWN_MACRO: &str = "kr_client::shown";
 
+/// The rule that keeps the name `Debug` from leading anywhere but the standard library's trait and
+/// derive in the two crates, which each place it finds says.
+const ONLY_STD_DEBUG: &str = "only the standard library's Debug may carry the name Debug";
+
 /// The library's macros, which the files that define what may be shown write: what each writes is
 /// read where it is used, or is theirs to decide.
 const LIBRARY_MACROS: [&str; 6] = [
@@ -814,7 +818,109 @@ impl Debugs {
         }
         if index < self.guarded {
             self.declare_used_macros(index, &tokens, &macros, file.as_deref());
+            self.hold_the_name_debug(index);
         }
+    }
+
+    /// Holds one file of the two crates to the rule that the name `Debug` is the standard
+    /// library's there, its trait and its derive, so that the name leads nowhere else through any
+    /// scope, glob, namespace or `cfg`. Recorded, under every set of conditions and in the files
+    /// that define what may be shown too: an item named `Debug`, written or in a macro's body; an
+    /// import renamed to `Debug`; and an import or a glob that gives the name anything else, or
+    /// that this reading cannot follow. This reading does not read values, so a glob that gives
+    /// the name only to a function, a constant or a static of another crate is not found; the
+    /// compiler never takes a value for a trait or a derive.
+    fn hold_the_name_debug(&mut self, index: usize) {
+        let source = &self.sources[index];
+        let tokens = &source.tokens;
+        let mut found = Vec::new();
+        for at in 1..tokens.len() {
+            if ident(tokens.get(at)) != Some("Debug") {
+                continue;
+            }
+            let item = match ident(tokens.get(at - 1)) {
+                Some(
+                    keyword @ ("struct" | "enum" | "union" | "trait" | "type" | "fn" | "const"
+                    | "static" | "mod"),
+                ) => format!("{keyword} Debug"),
+                _ if punct(tokens.get(at - 1), '!')
+                    && ident(tokens.get(at.wrapping_sub(2))) == Some("macro_rules") =>
+                {
+                    "macro_rules! Debug".to_owned()
+                }
+                _ => continue,
+            };
+            found.push((tokens[at].line, item, "an item named Debug".to_owned()));
+        }
+        for (position, import) in source.imports.iter().enumerate() {
+            if import.local != "Debug" {
+                continue;
+            }
+            let spelled = format!(
+                "{}{}",
+                if import.global { "::" } else { "" },
+                import.written.join("::")
+            );
+            if import.written.last().map(String::as_str) != Some("Debug") {
+                found.push((
+                    import.line,
+                    format!("use {spelled} as Debug"),
+                    "an import renamed to Debug".to_owned(),
+                ));
+                continue;
+            }
+            // An import's own path is read without it, as the compiler reads it.
+            let mut visiting = vec![format!("import {index} {position}")];
+            let what = match self.target(
+                index,
+                import.scope,
+                &import.written,
+                import.global,
+                &mut visiting,
+            ) {
+                Ok(path) if std_item(&path) == Some("Debug") => continue,
+                Ok(path) => format!("an import that gives Debug to {path}"),
+                Err(why) => format!("an import of Debug this reading cannot place: {why}"),
+            };
+            found.push((import.line, format!("use {spelled}"), what));
+        }
+        for (position, glob) in source.globs.iter().enumerate() {
+            let module = source.module_of(glob.scope).join("::");
+            let item = format!(
+                "use {}{}::*",
+                if glob.global { "::" } else { "" },
+                glob.written.join("::")
+            );
+            match self.through_glob(index, position, "Debug", Space::Any, &mut Vec::new()) {
+                Ok(given) => {
+                    for named in given {
+                        if named.reach.seen_from(&module) == Some(false)
+                            || std_item(&named.path) == Some("Debug")
+                        {
+                            continue;
+                        }
+                        found.push((
+                            glob.line,
+                            item.clone(),
+                            format!("a glob that can give Debug to {}", named.path),
+                        ));
+                    }
+                }
+                Err(why) => found.push((
+                    glob.line,
+                    item,
+                    format!("a glob whose Debug this reading cannot place: {why}"),
+                )),
+            }
+        }
+        let file = source.name.clone();
+        self.unplaced
+            .extend(found.into_iter().map(|(line, item, what)| Finding {
+                file: file.clone(),
+                line,
+                item,
+                what: format!("{what}; {ONLY_STD_DEBUG}"),
+            }));
     }
 
     /// Reads each macro a source of the two crates uses, placed where it is used: the library's
@@ -4752,6 +4858,69 @@ fn each_name_is_placed_where_the_compiler_places_it() {
             1,
             "an extern crate",
         ),
+        (
+            "a glob that gives Debug to a macro of the standard library, past which the outer name is the Debug trait",
+            "pub use std::line as Debug;\n",
+            "use std::fmt::Debug;\npub struct Leak(pub String);\nconst _: () = {\n    use kr_other::*;\n    impl Debug for Leak {\n        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n            formatter.debug_tuple(\"Leak\").field(&self.0).finish()\n        }\n    }\n};\n",
+            4,
+            "only the standard library's Debug may carry the name Debug",
+        ),
+        (
+            "a glob that gives Debug to a function of the standard library, past which the outer name is the Debug trait",
+            "pub use std::mem::drop as Debug;\n",
+            "use std::fmt::Debug;\npub struct Leak(pub String);\nconst _: () = {\n    use kr_other::*;\n    impl Debug for Leak {\n        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n            formatter.debug_tuple(\"Leak\").field(&self.0).finish()\n        }\n    }\n};\n",
+            4,
+            "only the standard library's Debug may carry the name Debug",
+        ),
+        (
+            "an import of another crate's Debug, whose trait a cfg can leave out, past which the outer name is the Debug trait",
+            "#[cfg(not(unix))]\npub trait Debug {\n    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result;\n}\n#[macro_export]\nmacro_rules! Debug {\n    () => {};\n}\n",
+            "use std::fmt::Debug;\npub struct Leak(pub String);\nconst _: () = {\n    use kr_other::Debug;\n    #[cfg(unix)]\n    impl Debug for Leak {\n        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n            formatter.debug_tuple(\"Leak\").field(&self.0).finish()\n        }\n    }\n};\n",
+            4,
+            "only the standard library's Debug may carry the name Debug",
+        ),
+        (
+            "an import renamed to Debug",
+            "pub trait Shows {}\n",
+            "#[allow(unused_imports)]\nuse kr_other::Shows as Debug;\n",
+            2,
+            "only the standard library's Debug may carry the name Debug",
+        ),
+        (
+            "a glob of an enum's variants, one of which is named Debug",
+            "",
+            "pub enum Level {\n    Debug,\n    Info,\n}\n#[allow(unused_imports)]\nuse Level::*;\n",
+            6,
+            "only the standard library's Debug may carry the name Debug",
+        ),
+        (
+            "a trait of the crate's own named Debug",
+            "",
+            "pub trait Debug {}\n",
+            1,
+            "only the standard library's Debug may carry the name Debug",
+        ),
+        (
+            "a trait named Debug under a module of the crate's own named std",
+            "",
+            "mod std {\n    pub mod fmt {\n        pub trait Debug {\n            fn fmt(&self) -> u64;\n        }\n    }\n}\npub struct Leak(pub String);\nimpl std::fmt::Debug for Leak {\n    fn fmt(&self) -> u64 {\n        0\n    }\n}\n",
+            3,
+            "only the standard library's Debug may carry the name Debug",
+        ),
+        (
+            "a macro of the crate's own named Debug",
+            "",
+            "#[allow(unused_macros)]\nmacro_rules! Debug {\n    () => {};\n}\n",
+            2,
+            "only the standard library's Debug may carry the name Debug",
+        ),
+        (
+            "a function of the crate's own named Debug",
+            "",
+            "#[allow(non_snake_case)]\npub fn Debug() {}\n",
+            2,
+            "only the standard library's Debug may carry the name Debug",
+        ),
     ];
     let missed: Vec<String> = cases
         .iter()
@@ -4787,11 +4956,6 @@ fn names_the_compiler_places_elsewhere_are_not_named() {
             "use kr_other::exports::*;\npub struct Leak(pub String);\nimpl names::Shows for Leak {\n    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n        formatter.debug_tuple(\"Leak\").field(&self.0).finish()\n    }\n}\n",
         ),
         (
-            "a trait of a module named std, by a path that is not global",
-            "",
-            "mod std {\n    pub mod fmt {\n        pub trait Debug {\n            fn fmt(&self) -> u64;\n        }\n    }\n}\npub struct Leak(pub String);\nimpl std::fmt::Debug for Leak {\n    fn fmt(&self) -> u64 {\n        0\n    }\n}\n",
-        ),
-        (
             "a trait around a glob that cannot give another crate's private import of the Debug trait",
             "pub trait Shows {\n    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result;\n}\npub mod hidden {\n    #[allow(unused_imports)]\n    use std::fmt::Debug as Shows;\n    pub fn open() {}\n}\n",
             "use kr_other::Shows;\npub struct Leak(pub String);\nconst _: () = {\n    use kr_other::hidden::*;\n    impl Shows for Leak {\n        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n            formatter.debug_tuple(\"Leak\").field(&self.0).finish()\n        }\n    }\n};\n",
@@ -4810,6 +4974,21 @@ fn names_the_compiler_places_elsewhere_are_not_named() {
             "the macros the two crates use from outside the library",
             "",
             "pub fn used() -> usize {\n    let value = serde_json::json!(null);\n    let pinned = std::pin::pin!(async {});\n    let _ = pinned;\n    let _ = format!(\"{}\", 1);\n    vec![value].len()\n}\n",
+        ),
+        (
+            "the standard library's Debug under its own name, by an import, a derive and a Debug written by hand",
+            "",
+            "use std::fmt::{self, Debug};\n#[derive(Debug)]\npub struct Counted(pub u64);\npub struct Named(pub u64);\nimpl Debug for Named {\n    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {\n        formatter.debug_tuple(\"Named\").field(&self.0).finish()\n    }\n}\n",
+        ),
+        (
+            "a glob and an import that give the standard library's Debug under its own name",
+            "pub mod names {\n    pub use std::fmt::Debug;\n}\npub use core::fmt::Debug;\n",
+            "use kr_other::Debug;\npub struct Counted(pub u64);\nconst _: () = {\n    use kr_other::names::*;\n    impl Debug for Counted {\n        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n            formatter.debug_tuple(\"Counted\").field(&self.0).finish()\n        }\n    }\n};\n",
+        ),
+        (
+            "a glob of the standard library's formatting module, which gives its own Debug",
+            "",
+            "pub struct Counted(pub u64);\nconst _: () = {\n    use std::fmt::*;\n};\n",
         ),
     ];
     let named: Vec<String> = cases
