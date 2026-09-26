@@ -3382,4 +3382,178 @@ mod tests {
             assert!(status.drift.is_empty(), "{agent} has no drift");
         }
     }
+
+    /// Where each agent's skills and configuration live under a user's home, name by name.
+    fn user_layout(agent: AgentTarget) -> (&'static [&'static str], &'static [&'static str]) {
+        match agent {
+            AgentTarget::Codex => (&[".agents", "skills"], &[".codex", "config.toml"]),
+            AgentTarget::ClaudeCode => (&[".claude", "skills"], &[".claude.json"]),
+            AgentTarget::Opencode => (
+                &[".config", "opencode", "skills"],
+                &[".config", "opencode", "opencode.json"],
+            ),
+            AgentTarget::GeminiCli => (&[".gemini", "skills"], &[".gemini", "settings.json"]),
+            AgentTarget::KimiCodeCli => (&[".kimi-code", "skills"], &[".kimi-code", "mcp.json"]),
+            AgentTarget::QoderCli => (&[".qoder", "skills"], &[".qoder", "settings.json"]),
+        }
+    }
+
+    /// KR-REQ-11.50: every path an installation records, reports and prints is spelled with one
+    /// separator, the platform's own, whichever agent it is for: the skill root, each file and
+    /// directory it wrote, and the configuration document. On macOS and Linux that is the spelling
+    /// it always had.
+    #[test]
+    fn every_path_an_installation_records_is_spelled_with_one_separator() {
+        let tree = Tree::create();
+        let installer = tree.installer();
+        let foreign = if cfg!(windows) { '/' } else { '\\' };
+        for agent in AgentTarget::ALL {
+            let params = params(*agent, InstallScope::User);
+            let installed = installer.install(&params).expect("installs");
+            let status = installer.status(&params).expect("reads");
+            let (skills, configuration) = user_layout(*agent);
+            let mut spelled = vec![installed.manifest.root.clone(), status.root.clone()];
+            spelled.extend(
+                installed
+                    .manifest
+                    .operations
+                    .iter()
+                    .chain(&status.removal)
+                    .map(|operation| operation.path().to_owned()),
+            );
+            spelled.extend(status.files.iter().map(|file| file.path.clone()));
+            let removed = installer.remove(&params).expect("removes");
+            spelled.extend(
+                removed
+                    .removed
+                    .iter()
+                    .map(|operation| operation.path().to_owned()),
+            );
+            for path in &spelled {
+                assert!(
+                    !path.contains(foreign),
+                    "{agent}: {path} is spelled with one separator"
+                );
+            }
+            let configured = installed
+                .manifest
+                .operations
+                .iter()
+                .find_map(|operation| match operation {
+                    ChangeOperation::AddConfigurationEntry { path, .. } => Some(path.clone()),
+                    _ => None,
+                })
+                .expect("a configuration entry");
+            if cfg!(unix) {
+                // The spelling a path joined in one piece has here, which is the one it always had.
+                let home = display(&tree.home());
+                assert_eq!(
+                    installed.manifest.root,
+                    format!("{home}/{}/{SKILL_NAME}", skills.join("/")),
+                    "{agent}"
+                );
+                assert_eq!(
+                    configured,
+                    format!("{home}/{}", configuration.join("/")),
+                    "{agent}"
+                );
+            }
+        }
+    }
+
+    /// Rewrites the paths in an installation's record the way an earlier build spelled them, which
+    /// joined two names at a time: each path under `from` is spelled under `to` instead. On
+    /// Windows that puts both separators into one path; elsewhere the two spellings are the same.
+    fn spell_record_under(
+        installer: &Installer,
+        params: &AgentToolsParams,
+        from: &Path,
+        to: &Path,
+    ) {
+        fn respell(value: &mut Value, from: &str, to: &str) {
+            match value {
+                Value::String(text) => {
+                    if let Some(rest) = text.strip_prefix(from) {
+                        *text = format!("{to}{rest}");
+                    }
+                }
+                Value::Array(items) => items.iter_mut().for_each(|item| respell(item, from, to)),
+                Value::Object(members) => members
+                    .values_mut()
+                    .for_each(|member| respell(member, from, to)),
+                _ => {}
+            }
+        }
+        let path = installer.record_path(params);
+        let mut record: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("the record"))
+                .expect("a record");
+        respell(&mut record, &display(from), &display(to));
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&record).expect("a record"),
+        )
+        .expect("rewrites the record");
+    }
+
+    /// A record an earlier build wrote, whose paths join two names at a time, is still this host's:
+    /// an installation that repairs it claims what it names rather than refusing it, and records
+    /// each path once, and a removal undoes everything it names. Paths are compared as paths.
+    #[test]
+    fn a_record_an_earlier_build_spelled_is_repaired_and_removed() {
+        let tree = Tree::create();
+        let installer = tree.installer();
+        let params = params(AgentTarget::GeminiCli, InstallScope::User);
+        let gemini = tree.home().join(".gemini");
+        let skill = gemini.join("skills").join(SKILL_NAME);
+        let respelled = |installer: &Installer| {
+            spell_record_under(
+                installer,
+                &params,
+                &gemini.join("skills"),
+                &tree.home().join(".gemini/skills"),
+            );
+            spell_record_under(
+                installer,
+                &params,
+                &gemini.join("settings.json"),
+                &tree.home().join(".gemini/settings.json"),
+            );
+        };
+
+        // A repair over the earlier spelling: one file is gone, and the rest are this host's.
+        installer.install(&params).expect("installs");
+        respelled(&installer);
+        std::fs::remove_file(skill.join("TOOLS.md")).expect("removes one file");
+        let repaired = installer.install(&params).expect("repairs");
+        assert!(repaired.unresolved.is_empty(), "{:?}", repaired.unresolved);
+        assert!(skill.join("TOOLS.md").is_file());
+        let recorded: Vec<PathBuf> = installer
+            .recorded(&params)
+            .expect("reads")
+            .expect("a record")
+            .manifest
+            .operations
+            .iter()
+            .map(|operation| PathBuf::from(operation.path()))
+            .collect();
+        let mut distinct = recorded.clone();
+        distinct.sort();
+        distinct.dedup();
+        assert_eq!(
+            distinct.len(),
+            recorded.len(),
+            "each path once: {recorded:?}"
+        );
+
+        // A removal from the earlier spelling.
+        respelled(&installer);
+        let removed = installer.remove(&params).expect("removes");
+        assert!(removed.retained.is_empty(), "{:?}", removed.retained);
+        assert!(!skill.exists(), "the skill is removed");
+        assert!(
+            !gemini.join("settings.json").exists(),
+            "the document this host created is removed with its entry"
+        );
+    }
 }
