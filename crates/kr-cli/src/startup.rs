@@ -124,10 +124,12 @@ const SETUP_ACTION: &str = "start the control daemon, kr-controller, for it, or,
                             start it, and `kr host startup --set standalone` starts it detached \
                             from the command";
 
-/// What a person does about an environment whose control daemon is not running: start one. Neither
-/// start is set up on this platform.
-#[cfg(not(unix))]
-const SETUP_ACTION: &str = resolve::SETUP_ACTION;
+/// What a person does about this installation's own environment when no daemon runs and nothing is
+/// chosen: start one, or choose the standalone start, which is this platform's.
+#[cfg(windows)]
+const SETUP_ACTION: &str = "start the control daemon, kr-controller, for it, or, for this \
+                            installation's own environment, choose how kr new starts one: `kr \
+                            host startup --set standalone` has this user's scheduled task start it";
 
 /// Runs `kr host startup`: shows what this environment chooses, or makes a choice as one validated
 /// edit of its configuration document.
@@ -166,37 +168,16 @@ pub fn run(paths: &HostPaths, arguments: &StartupArguments, json: bool) -> Resul
             })
             .transpose()?
     };
-    let mut notes = Vec::new();
-    let mut removal = service_manager::Removal::default();
-    if let Some(startup) = change {
-        #[cfg(not(unix))]
-        if let Some(startup) = startup {
-            return Err(CliError::Usage(shown!(
-                "the {} start is not set up on this platform; start the control daemon, \
-                 kr-controller, for this environment",
-                startup.as_str()
-            )));
-        }
-        let change = Change::ControllerStartup(startup);
-        // Refused before anything else is touched, so a document this build must not rewrite
-        // leaves the service manager's definition as it was too.
-        crate::doctor::configuration::validate(&environment.paths, &change)?;
-        // A first use of the environment, on a host where no daemon has run yet, as an edit of
-        // its document is: the record and the lock live in its state directory.
-        environment.paths.create()?;
-        // One change at a time, from the definition to the document: held until the document is
-        // written, so no other change or start request sees one without the other. The document's
-        // own lock is taken inside, after this one, as everywhere.
-        let held = service_manager::lock(&environment.paths)?;
-        if startup == Some(ControllerStartup::Service) {
-            notes = service_manager::install(&environment.paths, &held)?.notes;
-        } else {
-            removal = service_manager::remove(&environment.paths, &held)?;
-            notes.append(&mut removal.notes);
-        }
-        crate::doctor::configuration::apply(&environment.paths, &change)?;
-        drop(held);
-    }
+    let changed = match change {
+        Some(startup) => changed(&environment.paths, startup)?,
+        None => Changed::default(),
+    };
+    let Changed {
+        notes,
+        removal,
+        #[cfg(windows)]
+            task: task_changed,
+    } = changed;
     let chosen = Chosen::read(&environment.paths);
     let inspected = service_manager::inspect(
         &environment.paths,
@@ -207,6 +188,11 @@ pub fn run(paths: &HostPaths, arguments: &StartupArguments, json: bool) -> Resul
         Some(Err(why)) => (None, Some(why)),
         None => (None, None),
     };
+    #[cfg(windows)]
+    let task_report = windows::report(
+        &environment.paths,
+        chosen.controller == Some(ControllerStartup::Standalone),
+    );
     if json {
         let mut document = serde_json::json!({
             "ok": true,
@@ -225,6 +211,15 @@ pub fn run(paths: &HostPaths, arguments: &StartupArguments, json: bool) -> Resul
                 "definition_unestablished": unestablished.as_ref().map(Shown::as_str),
             },
         });
+        #[cfg(windows)]
+        {
+            if let Some(report) = &task_report {
+                document["startup"]["task"] = report.json();
+            }
+            if let Some(changed) = &task_changed {
+                document["task_change"] = changed.json();
+            }
+        }
         if !removal.removed.is_empty() || !removal.left.is_empty() {
             document["removed"] = serde_json::json!(
                 removal
@@ -250,6 +245,15 @@ pub fn run(paths: &HostPaths, arguments: &StartupArguments, json: bool) -> Resul
         crate::report::print_json(&document);
     } else {
         println!("{}", describe(&chosen, inspection.as_ref()));
+        #[cfg(windows)]
+        {
+            if let Some(changed) = &task_changed {
+                println!("{}", changed.describe(environment.environment_id));
+            }
+            if let Some(report) = &task_report {
+                println!("{}", report.describe());
+            }
+        }
         if let Some(why) = &unestablished {
             println!(
                 "what the service start has for this environment cannot be established: {why}"
@@ -266,6 +270,79 @@ pub fn run(paths: &HostPaths, arguments: &StartupArguments, json: bool) -> Resul
         }
     }
     Ok(())
+}
+
+/// What `kr host startup` changed.
+#[derive(Debug, Default)]
+struct Changed {
+    /// What a person should know about what the service manager holds.
+    notes: Vec<String>,
+    /// What removing the service start's definition did.
+    removal: service_manager::Removal,
+    /// What happened to the environment's scheduled task.
+    #[cfg(windows)]
+    task: Option<windows::TaskChanged>,
+}
+
+/// Makes `startup` this environment's choice, as one validated edit of its configuration
+/// document, with what each start keeps outside the document brought in line first.
+fn changed(environment: &EnvironmentPaths, startup: Option<ControllerStartup>) -> Result<Changed> {
+    #[cfg(windows)]
+    if startup == Some(ControllerStartup::Service) {
+        return Err(CliError::Usage(Shown::said(
+            "the service start is not set up on this platform, where the standalone start is: \
+             kr host startup --set standalone has this user's scheduled task start the control \
+             daemon",
+        )));
+    }
+    let change = Change::ControllerStartup(startup);
+    // Refused before anything else is touched, so a document this build must not rewrite
+    // leaves the service manager's definition as it was too.
+    crate::doctor::configuration::validate(environment, &change)?;
+    // A first use of the environment, on a host where no daemon has run yet, as an edit of
+    // its document is: the record and the lock live in its state directory.
+    environment.create()?;
+    // One change at a time, from the definition to the document: held until the document is
+    // written, so no other change or start request sees one without the other. The document's
+    // own lock is taken inside, after this one, as everywhere.
+    let held = service_manager::lock(environment)?;
+    let changed = changed_under(environment, startup, &change, &held)?;
+    drop(held);
+    Ok(changed)
+}
+
+/// Brings the service manager's definition in line with `startup`, then writes the document.
+#[cfg(unix)]
+fn changed_under(
+    environment: &EnvironmentPaths,
+    startup: Option<ControllerStartup>,
+    change: &Change,
+    held: &service_manager::Lock,
+) -> Result<Changed> {
+    let mut changed = Changed::default();
+    if startup == Some(ControllerStartup::Service) {
+        changed.notes = service_manager::install(environment, held)?.notes;
+    } else {
+        changed.removal = service_manager::remove(environment, held)?;
+        changed.notes.append(&mut changed.removal.notes);
+    }
+    crate::doctor::configuration::apply(environment, change)?;
+    Ok(changed)
+}
+
+/// Brings the environment's scheduled task in line with `startup`, then writes the document, and
+/// puts the task back as it was when the document is not written.
+#[cfg(windows)]
+fn changed_under(
+    environment: &EnvironmentPaths,
+    startup: Option<ControllerStartup>,
+    change: &Change,
+    _held: &service_manager::Lock,
+) -> Result<Changed> {
+    Ok(Changed {
+        task: Some(windows::change(environment, startup, change)?),
+        ..Changed::default()
+    })
 }
 
 /// What `kr host startup` tells a person.
@@ -290,8 +367,7 @@ fn describe(chosen: &Chosen, inspection: Option<&service_manager::Inspection>) -
             ))
         ),
         Some(ControllerStartup::Standalone) => left_over(format!(
-            "startup: standalone, from {} at revision {}: kr new starts this environment's control \
-             daemon itself when none is running",
+            "startup: standalone, from {} at revision {}: {STANDALONE_SAID}",
             chosen.document.display(),
             chosen.revision
         )),
@@ -301,14 +377,32 @@ fn describe(chosen: &Chosen, inspection: Option<&service_manager::Inspection>) -
             chosen.document.display(),
             chosen.state.as_str()
         )),
-        None => left_over(
-            "startup: none: kr new starts no control daemon, and says what to set up when none is \
-             running; kr host startup --set service has this user's service manager start it, and \
-             kr host startup --set standalone chooses the standalone start"
-                .to_owned(),
-        ),
+        None => left_over(NOTHING_CHOSEN.to_owned()),
     }
 }
+
+/// What the standalone start does, as `kr host startup` says it.
+#[cfg(unix)]
+const STANDALONE_SAID: &str =
+    "kr new starts this environment's control daemon itself when none is running";
+
+/// What the standalone start does, as `kr host startup` says it.
+#[cfg(windows)]
+const STANDALONE_SAID: &str = "kr new has this user's scheduled task for this environment start \
+                               its control daemon when none is running";
+
+/// What `kr host startup` says of an environment that chooses no start.
+#[cfg(unix)]
+const NOTHING_CHOSEN: &str = "startup: none: kr new starts no control daemon, and says what to set \
+                              up when none is running; kr host startup --set service has this \
+                              user's service manager start it, and kr host startup --set \
+                              standalone chooses the standalone start";
+
+/// What `kr host startup` says of an environment that chooses no start.
+#[cfg(windows)]
+const NOTHING_CHOSEN: &str = "startup: none: kr new starts no control daemon, and says what to set \
+                              up when none is running; kr host startup --set standalone chooses \
+                              the standalone start, in which this user's scheduled task starts it";
 
 /// A daemon this command started, or had its service manager start.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -829,6 +923,194 @@ impl Log {
     }
 }
 
+/// The standalone start's scheduled task, as this command says it.
+///
+/// What was read from the Task Scheduler or from a task is said in this command's own words: which
+/// way a task differs, never what it holds; that a task under the name is not this environment's,
+/// never whose it is; that the Task Scheduler refused, and its exit code, never what it printed.
+#[cfg(any(windows, test))]
+pub(crate) mod task {
+    use std::path::Path;
+
+    use kr_client::shown;
+    use kr_client::shown::Shown;
+    use kr_controller::supervision::windows::{
+        Difference, ForeignReason, LastResult, LogonType, Standing, TaskError, task_name,
+    };
+    use kr_protocol::ids::EnvironmentId;
+
+    /// What a person does to have the environment's task registered, or put right.
+    pub const SETUP_ACTION: &str = "run kr host startup --set standalone";
+
+    /// The task's name: `KalaReach-` and the first eight digits of the environment's identifier,
+    /// the name the Task Scheduler lists it under in its root folder. It is derived here from a
+    /// fixed name and an identifier, so it is said whole, as a path this program derived is.
+    pub fn name(environment_id: EnvironmentId) -> Shown {
+        todo!("not built yet")
+    }
+
+    /// One way the task differs from the one this installation registers.
+    pub fn difference(difference: &Difference) -> Shown {
+        todo!("not built yet")
+    }
+
+    /// Every way the task differs, one after another.
+    pub fn differences(differences: &[Difference]) -> Shown {
+        todo!("not built yet")
+    }
+
+    /// Why a task under the environment's name is not its own.
+    pub fn foreign(reason: &ForeignReason) -> &'static str {
+        todo!("not built yet")
+    }
+
+    /// Why a look at, or a change to, the environment's task did not happen.
+    pub fn error(error: &TaskError, environment_id: EnvironmentId) -> Shown {
+        todo!("not built yet")
+    }
+
+    /// How the task's last run ended, which is one result for all of its runs.
+    pub fn last_result(result: LastResult) -> Shown {
+        todo!("not built yet")
+    }
+
+    /// The word a report's `--json` form gives a last result.
+    pub fn last_result_word(result: LastResult) -> String {
+        todo!("not built yet")
+    }
+
+    /// What the environment's task is, read for a person: whose it is, whether it is the one this
+    /// installation registers, and whether a start can use it now.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct Report {
+        /// The environment.
+        pub environment_id: EnvironmentId,
+        /// Where its task stands, or why that could not be read.
+        pub standing: Result<Standing, TaskError>,
+        /// Whether the program the task runs, this installation's daemon, is there.
+        pub program_present: bool,
+        /// The login session this command runs in, when it could be read.
+        pub session: Option<u32>,
+        /// How the task's last run ended, when it could be read.
+        pub last_result: Option<LastResult>,
+    }
+
+    impl Report {
+        /// Whose the task is: `own`, `absent`, `foreign` or `unknown`.
+        pub fn ownership(&self) -> &'static str {
+            todo!("not built yet")
+        }
+
+        /// Whether the task is this environment's own, the one this installation registers, and
+        /// runs a program that is there.
+        pub fn usable(&self) -> bool {
+            todo!("not built yet")
+        }
+
+        /// Whose the task is, whether it is valid, and whether a start can use it, apart.
+        pub fn describe(&self) -> Shown {
+            todo!("not built yet")
+        }
+
+        /// The report as a command's `--json` output carries it.
+        pub fn json(&self) -> serde_json::Value {
+            todo!("not built yet")
+        }
+    }
+}
+
+/// What the environment's scheduled task is, for `kr doctor`: reported where the standalone start is
+/// chosen, and otherwise only where this environment's own task is still registered.
+#[cfg(windows)]
+pub(crate) fn task_report(environment: &EnvironmentPaths, selected: bool) -> Option<task::Report> {
+    windows::report(environment, selected)
+}
+
+/// The standalone start on Windows: this user's scheduled task for the environment, which the
+/// setup step registers and `kr new` runs.
+#[cfg(windows)]
+mod windows {
+    use std::path::Path;
+
+    use kr_client::shown;
+    use kr_client::shown::Shown;
+    use kr_controller::supervision::windows::{
+        self as scheduled, Standing, TaskChange, TaskDefinition,
+    };
+    use kr_ipc::paths::EnvironmentPaths;
+    use kr_protocol::hostinfo::configuration::{Change, ControllerStartup};
+
+    use super::task;
+    use crate::error::{CliError, Result};
+
+    /// The task this installation registers for `environment`: this user's, logging on where the
+    /// user is signed in, and running `program`, the daemon installed beside this command, as the
+    /// environment's starter.
+    fn definition(environment: &EnvironmentPaths, program: &Path) -> Result<TaskDefinition> {
+        let user = kr_ipc::starter::current_user_sid().map_err(|error| {
+            CliError::HostUnavailable(shown!(
+                "this account's security identifier could not be read: {}",
+                Shown::io(&error)
+            ))
+        })?;
+        Ok(TaskDefinition::for_setup(user, environment, program))
+    }
+
+    /// What `kr host startup` did to the environment's task.
+    #[derive(Debug)]
+    pub struct TaskChanged {
+        /// What changed.
+        change: TaskChange,
+        /// A task under the name that `--clear` left, and why.
+        left: Option<scheduled::TaskError>,
+    }
+
+    impl TaskChanged {
+        /// What was done, for a person.
+        pub fn describe(&self, environment_id: kr_protocol::ids::EnvironmentId) -> Shown {
+            todo!("not built yet")
+        }
+
+        /// What was done, as a command's `--json` output carries it.
+        pub fn json(&self) -> serde_json::Value {
+            serde_json::json!({
+                "change": match &self.change {
+                    TaskChange::Unchanged => "unchanged",
+                    TaskChange::Registered => "registered",
+                    TaskChange::Repaired { .. } => "repaired",
+                    TaskChange::Removed { .. } => "removed",
+                },
+                "left": self.left.is_some(),
+            })
+        }
+    }
+
+    /// Brings the environment's task in line with `startup` and then writes `change`, the
+    /// document's edit, with the environment's lock held by the caller.
+    ///
+    /// Choosing the standalone start registers the task, or repairs this environment's own; a task
+    /// under the name that is not this environment's is refused with nothing changed. Choosing
+    /// nothing removes this environment's own task, and a task it could not remove is reported and
+    /// left. Either way the task is changed first and the document second; a document that could
+    /// not be written has the task put back as it was: a task registered here removed, one
+    /// repaired or removed here registered again from what it was.
+    pub fn change(
+        environment: &EnvironmentPaths,
+        startup: Option<ControllerStartup>,
+        change: &Change,
+    ) -> Result<TaskChanged> {
+        todo!("not built yet")
+    }
+
+    /// Reads what the environment's task is, for `kr host startup` and `kr doctor`.
+    ///
+    /// Reported where the standalone start is chosen, and otherwise only where this environment's
+    /// own task is still registered, which nothing then uses.
+    pub fn report(environment: &EnvironmentPaths, selected: bool) -> Option<task::Report> {
+        todo!("not built yet")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -873,6 +1155,12 @@ mod tests {
             action.as_str().contains("kr host startup --set service")
                 && action.as_str().contains("kr host startup --set standalone"),
             "{action}"
+        );
+        #[cfg(windows)]
+        assert!(
+            action.as_str().contains("kr host startup --set standalone")
+                && !action.as_str().contains("--set service"),
+            "the one start this platform has: {action}"
         );
 
         kr_ipc::paths::write_owner_only_file(
@@ -1138,6 +1426,276 @@ mod tests {
             );
             assert_unmarked("a daemon's last line", &[said.into_string()]);
         }
+    }
+
+    /// Every finding about a task that was read from the Task Scheduler or from the task itself,
+    /// planted with the marker: none of the ways this command says a task repeats what it holds.
+    fn marked_findings() -> Vec<kr_controller::supervision::windows::Difference> {
+        use crate::shown::marker::MARKER;
+        use kr_controller::supervision::windows::{Difference, LogonType};
+
+        vec![
+            Difference::Program {
+                found: MARKER.to_owned(),
+                expected: std::path::PathBuf::from("kr-controller.exe"),
+            },
+            Difference::Arguments {
+                found: MARKER.to_owned(),
+                expected: "--starter".to_owned(),
+            },
+            Difference::WorkingDirectory {
+                found: MARKER.to_owned(),
+                expected: std::path::PathBuf::from("state"),
+            },
+            Difference::Actions(2),
+            Difference::Triggered,
+            Difference::Logon {
+                found: Some(LogonType::S4U),
+                expected: LogonType::InteractiveToken,
+            },
+            Difference::Logon {
+                found: None,
+                expected: LogonType::InteractiveToken,
+            },
+            Difference::RunLevel(MARKER.to_owned()),
+            Difference::NotOnBatteries,
+            Difference::StopsOnBatteries,
+            Difference::WaitsForIdle,
+            Difference::StopsWhenBusy,
+            Difference::WaitsForNetwork,
+            Difference::NotOnDemand,
+            Difference::NotParallel(MARKER.to_owned()),
+            Difference::TimeLimited(MARKER.to_owned()),
+            Difference::Priority(MARKER.to_owned()),
+            Difference::Disabled,
+        ]
+    }
+
+    /// KR-REQ-07.12: each way a task can differ from the one this installation registers is said
+    /// in this command's own words, one of its own for each, and never with what the task holds.
+    #[test]
+    fn each_way_a_task_differs_is_said_in_this_commands_words() {
+        use crate::shown::marker::assert_unmarked;
+
+        let findings = marked_findings();
+        let said: Vec<String> = findings
+            .iter()
+            .map(|finding| task::difference(finding).into_string())
+            .collect();
+        assert_unmarked("a task's differences", &said);
+        let distinct: std::collections::BTreeSet<&String> = said.iter().collect();
+        assert_eq!(distinct.len(), said.len(), "each is its own: {said:?}");
+        assert_eq!(
+            said[5], "it logs on as S4U, not InteractiveToken",
+            "a logon is said by the Task Scheduler's own name for it"
+        );
+        let daemon: Vec<String> = findings.iter().map(ToString::to_string).collect();
+        assert!(
+            daemon[0].contains(crate::shown::marker::MARKER),
+            "the negative control: the daemon's own record of a refused launch says what it read"
+        );
+    }
+
+    /// KR-REQ-07.12: `kr host startup` and `kr doctor` report whose the environment's scheduled task
+    /// is, whether it is the one this installation registers, and whether a start can use it now,
+    /// apart; the last result as one for all of the task's runs; and that the daemon it starts ends
+    /// when the user signs out. A task read from the Task Scheduler never has what it holds
+    /// repeated.
+    #[test]
+    fn a_task_is_reported_whose_valid_and_available_apart() {
+        use crate::shown::marker::{MARKER, assert_unmarked};
+        use kr_controller::supervision::windows::{
+            Asked, Foreign, ForeignReason, LastResult, Standing, TaskError,
+        };
+
+        let environment_id = kr_protocol::ids::EnvironmentId::new(kr_ipc::new_uuid());
+        let name = kr_controller::supervision::windows::task_name(environment_id);
+        let foreign = |reason| Foreign {
+            name: name.clone(),
+            environment_id,
+            reason,
+        };
+        let report = |standing, program_present, session, last_result| task::Report {
+            environment_id,
+            standing,
+            program_present,
+            session,
+            last_result,
+        };
+
+        let usable = report(
+            Ok(Standing::Owned(Vec::new())),
+            true,
+            Some(2),
+            Some(LastResult::Ended(0)),
+        );
+        assert!(usable.usable());
+        let said = usable.describe().into_string();
+        for part in [
+            name.as_str(),
+            "is this environment's own",
+            "it is the one this installation registers",
+            "you are signed in to login session 2",
+            "its last run succeeded, for all of its runs",
+            "signing out ends it and every session",
+        ] {
+            assert!(said.contains(part), "{part}: {said}");
+        }
+        let json = usable.json();
+        assert_eq!(json["ownership"], "own");
+        assert_eq!(json["valid"], true);
+        assert_eq!(json["program_present"], true);
+        assert_eq!(json["session"], 2);
+        assert_eq!(json["interactive"], true);
+        assert_eq!(json["last_result"], "0x00000000");
+        assert_eq!(json["ends_at_sign_out"], true);
+
+        let gone = report(Ok(Standing::Owned(Vec::new())), false, Some(0), None);
+        assert!(
+            !gone.usable(),
+            "a task whose program has gone cannot start the daemon"
+        );
+        let said = gone.describe().into_string();
+        assert!(said.contains("is not there"), "{said}");
+        assert!(said.contains("login session 0"), "{said}");
+        assert!(said.contains("its last result cannot be read"), "{said}");
+        assert_eq!(gone.json()["interactive"], false);
+
+        let stale = report(
+            Ok(Standing::Owned(marked_findings())),
+            true,
+            Some(1),
+            Some(LastResult::Ended(0x8007_10e0)),
+        );
+        assert!(!stale.usable());
+        let said = stale.describe().into_string();
+        assert!(
+            said.contains("it differs from the one this installation registers"),
+            "{said}"
+        );
+        assert!(
+            said.contains("kr host startup --set standalone repairs it"),
+            "{said}"
+        );
+        assert!(
+            said.contains("its last run ended with code 0x00000000800710e0"),
+            "{said}"
+        );
+        assert_eq!(stale.json()["valid"], false);
+        assert_eq!(stale.json()["last_result"], "0x800710e0");
+
+        let absent = report(Ok(Standing::Absent), true, Some(1), None);
+        assert_eq!(absent.ownership(), "absent");
+        assert!(
+            absent
+                .describe()
+                .as_str()
+                .contains("is not registered: run kr host startup --set standalone registers it")
+        );
+        let not_run = report(
+            Ok(Standing::Owned(Vec::new())),
+            true,
+            None,
+            Some(LastResult::NotRun),
+        );
+        assert!(
+            not_run
+                .describe()
+                .as_str()
+                .contains("it has not run since it was registered")
+        );
+        assert_eq!(not_run.json()["last_result"], "not_run");
+        assert_eq!(
+            report(
+                Ok(Standing::Owned(Vec::new())),
+                true,
+                None,
+                Some(LastResult::Running)
+            )
+            .json()["last_result"],
+            "running"
+        );
+
+        let mut renderings = Vec::new();
+        for reason in [
+            ForeignReason::Unreadable {
+                said: MARKER.to_owned(),
+            },
+            ForeignReason::Account {
+                user: MARKER.to_owned(),
+                description: MARKER.to_owned(),
+            },
+            ForeignReason::Environment {
+                description: MARKER.to_owned(),
+            },
+        ] {
+            let found = report(
+                Ok(Standing::Foreign(foreign(reason.clone()))),
+                true,
+                Some(1),
+                None,
+            );
+            assert_eq!(found.ownership(), "foreign");
+            let said = found.describe().into_string();
+            assert!(
+                said.contains("is not this environment's own")
+                    && said.contains("kr neither replaces nor removes it"),
+                "{said}"
+            );
+            renderings.push(said);
+            renderings.push(found.json().to_string());
+            renderings.push(
+                task::error(&TaskError::Foreign(foreign(reason)), environment_id).into_string(),
+            );
+        }
+        for error in [
+            TaskError::Scheduler {
+                asked: Asked::Register,
+                code: Some(1),
+                detail: MARKER.to_owned(),
+            },
+            TaskError::Scheduler {
+                asked: Asked::Query,
+                code: None,
+                detail: MARKER.to_owned(),
+            },
+            TaskError::ReadBack {
+                name: MARKER.to_owned(),
+                differences: Some(marked_findings()),
+                undone: true,
+            },
+            TaskError::ReadBack {
+                name: MARKER.to_owned(),
+                differences: None,
+                undone: false,
+            },
+            TaskError::Locked(MARKER.to_owned()),
+            TaskError::Unwritten(MARKER.to_owned()),
+        ] {
+            let unreadable = report(Err(error.clone()), true, Some(1), None);
+            assert_eq!(unreadable.ownership(), "unknown");
+            renderings.push(unreadable.describe().into_string());
+            renderings.push(unreadable.json().to_string());
+            let said = task::error(&error, environment_id).into_string();
+            assert!(said.contains(&name), "the task is named: {said}");
+            renderings.push(said);
+        }
+        renderings.push(stale.describe().into_string());
+        renderings.push(stale.json().to_string());
+        assert_unmarked("the environment's scheduled task", &renderings);
+        assert!(
+            task::error(
+                &TaskError::Scheduler {
+                    asked: Asked::Remove,
+                    code: Some(5),
+                    detail: MARKER.to_owned(),
+                },
+                environment_id
+            )
+            .as_str()
+            .contains("the Task Scheduler did not remove the scheduled task"),
+            "a refusal says what was asked and its exit code"
+        );
     }
 
     /// A way of starting this build does not know is refused by naming the ones it does, and what
