@@ -9,9 +9,9 @@
 //!
 //! This module is the host's and the owner's way in. It carries the seven members of
 //! `authority.sync` over [`SignedService`] and nothing else: it holds no feed state, decides no
-//! ordering and signs no record. [`kr_controller::grants::feed::AuthorityFeed`] is the host's
-//! record of what it has accepted, acknowledged and still owes, and it is what a caller drives with
-//! the answers from here.
+//! ordering and signs no record. The control daemon's `AuthorityFeed` is the host's record of what
+//! it has accepted, acknowledged and still owes, and it is what a caller drives with the answers
+//! from here.
 //!
 //! # Which feed a call reaches
 //!

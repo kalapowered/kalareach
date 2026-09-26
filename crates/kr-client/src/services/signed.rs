@@ -29,10 +29,10 @@
 //! # Content
 //!
 //! Managed storage carries ciphertext in both directions, and ciphertext is content rather than a
-//! document. A part's body is the ciphertext, so its signed request travels in a header beside it
-//! ([`Carriage::Header`]), and a read is answered with the ciphertext itself on a success
-//! ([`Content`]). Both go through the one call: the same token, the same credential, the same bound
-//! on the signed request and the same boundary between a request that left and one that did not.
+//! document. A part's body is the ciphertext, so its signed request travels in a header beside it,
+//! and a read is answered with the ciphertext itself on a success. Both go through the one call:
+//! the same token, the same credential, the same bound on the signed request and the same boundary
+//! between a request that left and one that did not.
 //!
 //! # Whether a request left
 //!
