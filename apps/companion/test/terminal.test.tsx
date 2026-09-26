@@ -138,7 +138,7 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
     opened.mockRestore()
   })
 
-  it('keeps each piece inside its cells when the renderer measures its text wider', async () => {
+  it("draws a mark in its letter's cell, and a character too wide for its cells as blank cells", async () => {
     const opened = vi.spyOn(Terminal.prototype, 'open')
     const { port, controls } = fakeHost()
     controls.holdTerminalViews()
@@ -150,8 +150,7 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
       ...terminalScreen(SESSION_MAIN, { columns: 6, rows: 2 }),
       window: { columns: 6, rows: 2 },
       lines: [
-        // A letter and a mark native code measures as one cell, which this renderer gives a cell of
-        // its own, then a blank cell and a letter.
+        // A letter and a mark in one cell, then a blank cell and a letter.
         {
           row: '1',
           soft_wrapped: false,
@@ -174,7 +173,9 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
     })
     // Nothing is drawn past a piece's cells: the blank cell after each stays blank, and what the
     // renderer could not fit is left out.
-    expect((await drawn(renderer(opened))).slice(0, 2)).toEqual(['a b', '  c'])
+    const terminal = renderer(opened)
+    expect((await drawn(terminal)).slice(0, 2)).toEqual(['a\u{1ab0} b', '  c'])
+    expect(terminal.buffer.active.getLine(0)?.getCell(0)?.getWidth()).toBe(1)
     opened.mockRestore()
   })
 
@@ -194,7 +195,7 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
           row: '1',
           soft_wrapped: false,
           truncated: false,
-          pieces: [{ ...piece(0, 'a\u{1ab0}'), cells: 1 }]
+          pieces: [{ ...piece(0, '\u{4e2d}'), cells: 1 }]
         }
       ],
       cursor: null
@@ -203,9 +204,9 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
       controls.terminalViews[0]?.attach()
       controls.terminalViews[0]?.show(narrow)
     })
-    // The renderer holds two columns at the least, so there is a second column to draw into, and
-    // it stays blank.
-    expect((await drawn(renderer(opened)))[0]).toBe('a')
+    // The renderer holds two columns at the least, so there is a second column a wide character
+    // could reach. The piece's one cell is a blank cell, and the second column holds nothing.
+    expect((await drawn(renderer(opened)))[0]).toBe(' ')
     opened.mockRestore()
   })
 
@@ -225,9 +226,9 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
           row: '1',
           soft_wrapped: false,
           truncated: false,
-          // The pinned model gives U+3248 one cell and this renderer two; the mark after it joins
-          // whatever cell the renderer last drew into.
-          pieces: [piece(0, 'x'), { ...piece(1, '\u{3248}\u{301}'), cells: 1 }]
+          // A character this renderer gives two cells, in a piece of one at the window's last
+          // column, with a mark after it.
+          pieces: [piece(0, 'x'), { ...piece(1, '\u{4e2d}\u{301}'), cells: 1 }]
         }
       ],
       cursor: null
@@ -236,8 +237,85 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
       controls.terminalViews[0]?.attach()
       controls.terminalViews[0]?.show(edge)
     })
-    // The x keeps its cell to itself, and the glyph that cannot be drawn in its one cell is not.
-    expect((await drawn(renderer(opened)))[0]).toBe('x')
+    // The x keeps its cell to itself, and the glyph that cannot be drawn in its one cell is a blank
+    // cell instead.
+    expect((await drawn(renderer(opened)))[0]).toBe('x ')
+    opened.mockRestore()
+  })
+
+  it('leaves no cell of no width, so every piece after it keeps its column', async () => {
+    const opened = vi.spyOn(Terminal.prototype, 'open')
+    const { port, controls } = fakeHost()
+    controls.holdTerminalViews()
+    open(port)
+    await waitFor(() => {
+      expect(controls.terminalViews).toHaveLength(1)
+    })
+    const line: TerminalScreen = {
+      ...terminalScreen(SESSION_MAIN, { columns: 4, rows: 1 }),
+      window: { columns: 4, rows: 1 },
+      lines: [
+        {
+          row: '1',
+          soft_wrapped: false,
+          truncated: false,
+          // A symbol an older table calls a mark, and a mark with no letter before it.
+          pieces: [
+            piece(0, 'x'),
+            { ...piece(1, '\u{6de}'), cells: 1 },
+            { ...piece(2, '\u{301}'), cells: 1 },
+            piece(3, 'y')
+          ]
+        }
+      ],
+      cursor: null
+    }
+    act(() => {
+      controls.terminalViews[0]?.attach()
+      controls.terminalViews[0]?.show(line)
+    })
+    const terminal = renderer(opened)
+    expect((await drawn(terminal))[0]).toBe('x\u{6de} y')
+    const row = terminal.buffer.active.getLine(0)
+    expect([0, 1, 2, 3].map((column) => row?.getCell(column)?.getWidth())).toEqual([1, 1, 1, 1])
+    opened.mockRestore()
+  })
+
+  it('draws a glyph narrower than its piece at its column, and fills the rest of its cells', async () => {
+    const opened = vi.spyOn(Terminal.prototype, 'open')
+    const { port, controls } = fakeHost()
+    controls.holdTerminalViews()
+    open(port)
+    await waitFor(() => {
+      expect(controls.terminalViews).toHaveLength(1)
+    })
+    const line: TerminalScreen = {
+      ...terminalScreen(SESSION_MAIN, { columns: 5, rows: 1 }),
+      window: { columns: 5, rows: 1 },
+      lines: [
+        {
+          row: '1',
+          soft_wrapped: false,
+          truncated: false,
+          // A symbol shown as a picture by its selector, which this renderer gives one cell, and an
+          // emoji that is a picture by default, which it gives two: both in pieces of two cells.
+          pieces: [
+            { ...piece(0, '\u{26a0}\u{fe0f}'), cells: 2 },
+            piece(2, 'z'),
+            { ...piece(3, '\u{1f44d}'), cells: 2 }
+          ]
+        }
+      ],
+      cursor: null
+    }
+    act(() => {
+      controls.terminalViews[0]?.attach()
+      controls.terminalViews[0]?.show(line)
+    })
+    const terminal = renderer(opened)
+    expect((await drawn(terminal))[0]).toBe('\u{26a0}\u{fe0f} z\u{1f44d}')
+    const row = terminal.buffer.active.getLine(0)
+    expect([0, 1, 2, 3].map((column) => row?.getCell(column)?.getWidth())).toEqual([1, 1, 1, 2])
     opened.mockRestore()
   })
 

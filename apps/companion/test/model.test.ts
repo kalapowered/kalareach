@@ -46,7 +46,8 @@ import {
 } from '../src/model/receipts'
 import { emptyControlState, evaluate, isRendered, visibilityOf } from '../src/model/controls'
 import { stretchesOf, styleOf } from '../src/terminal/cells'
-import { drawableText, frameOf, paint, REPLACEMENT, sgr } from '../src/terminal/frame'
+import { drawableText, frameOf, leftBlank, paint, REPLACEMENT, sgr } from '../src/terminal/frame'
+import { CELL_TABLE, cellsOf } from '../src/terminal/widths'
 import {
   clipping,
   describeProvenance,
@@ -441,7 +442,7 @@ describe('the raw terminal', () => {
 
   it('draws a screen in one write: reset, the normal buffer, autowrap off, each piece placed, the cursor last', () => {
     const screen = terminalScreen('8a7b6c50-22bb-4c3d-8e4f-000000000102', { columns: 20, rows: 3 })
-    const written = frameOf(screen, 20)
+    const written = frameOf(screen)
     expect(written.startsWith('\u{1b}c\u{1b}[?1047l\u{1b}[?7l\u{1b}[?25l')).toBe(true)
     expect(written).toContain('\u{1b}[1;1H\u{1b}[0m$ pnpm -r build')
     // A cursor style that would blink is drawn steady.
@@ -500,6 +501,51 @@ describe('the raw terminal', () => {
     }
     expect(stretchesOf(line).map((stretch) => stretch.text)).toEqual(['  ', ' ', 'bcd', 'g  '])
     expect(stretchesOf(line).map((stretch) => stretch.column)).toEqual([0, 2, 3, 6])
+  })
+
+  it("measures text in the cells the desktop's renderer gives it", () => {
+    const width = (text: string) => (CELL_TABLE.charProperties(text.codePointAt(0) ?? 0, 0) >> 1) & 3
+    expect(['a', '\u{301}', '\u{4e2d}', '\u{1f44d}', '\u{26a0}', '\u{6de}', '\u{3248}', '\u{e0a0}'].map(width)).toEqual([
+      1, 0, 2, 2, 1, 1, 1, 1
+    ])
+    expect(cellsOf('abc')).toBe(3)
+    // A mark joins the letter before it and takes no cell of its own.
+    expect(cellsOf('e\u{301}')).toBe(1)
+    expect(cellsOf('\u{4e2d}\u{301}')).toBe(2)
+    expect(cellsOf('\u{26a0}\u{fe0f}')).toBe(1)
+    // A mark with nothing before it would be a cell of no width: the text cannot be placed.
+    expect(cellsOf('\u{301}')).toBeNull()
+    expect(cellsOf('\u{301}a')).toBeNull()
+  })
+
+  it('draws a piece its text does not fit as blank cells, and counts it', () => {
+    const whole = terminalScreen('8a7b6c50-22bb-4c3d-8e4f-000000000101', { columns: 80, rows: 8 })
+    const at = (column: number, cells: number, text: string) => ({
+      column,
+      cells,
+      text,
+      rendition: PLAIN,
+      hyperlink: null
+    })
+    const screen = {
+      ...whole,
+      window: { columns: 8, rows: 1 },
+      lines: [
+        {
+          row: '1',
+          soft_wrapped: false,
+          truncated: false,
+          pieces: [at(0, 1, '\u{4e2d}'), at(1, 2, 'e\u{301}'), at(3, 1, '\u{301}'), at(4, 2, '\u{4e2d}')]
+        }
+      ],
+      cursor: null
+    }
+    const written = frameOf(screen)
+    expect(written).toContain('\u{1b}[1;1H\u{1b}[0m \u{1b}')
+    expect(written).toContain('\u{1b}[1;2H\u{1b}[0me\u{301} \u{1b}')
+    expect(written).toContain('\u{1b}[1;4H\u{1b}[0m \u{1b}')
+    expect(written).toContain('\u{1b}[1;5H\u{1b}[0m\u{4e2d}\u{1b}')
+    expect(leftBlank(screen)).toBe(2)
   })
 
   it('draws an underline on a phone in its own style and colour', () => {

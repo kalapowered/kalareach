@@ -442,6 +442,99 @@ test.describe('the raw terminal', () => {
     expect(column).toBe(2)
   })
 
+  test('keeps every piece on its own column in a line of wide, joined and unknown characters', async ({
+    page
+  }) => {
+    await openSession(page)
+    await page.getByRole('tab', { name: 'Terminal' }).click()
+    const surface = page.getByTestId('terminal-surface')
+    await expect(surface).toContainText('cargo test -p kr-client')
+    await page.evaluate(() => {
+      const plain = {
+        background: 'default',
+        blink: 'none',
+        bold: false,
+        faint: false,
+        foreground: 'default',
+        invisible: false,
+        italic: false,
+        overline: false,
+        reverse: false,
+        strikethrough: false,
+        underline: 'none',
+        underline_colour: 'default',
+        vertical_align: 'baseline'
+      } as const
+      const at = (column: number, cells: number, text: string, bold = false) => ({
+        column,
+        cells,
+        text,
+        rendition: { ...plain, bold },
+        hyperlink: null
+      })
+      window.krTestHost?.terminalViews[0]?.show({
+        dimensions: { columns: '12', rows: '1' },
+        window: { columns: 12, rows: 1 },
+        lines: [
+          {
+            row: '1',
+            soft_wrapped: false,
+            truncated: false,
+            // A symbol an older table calls a mark, a mark with nothing before it, a wide
+            // character and an emoji shown as a picture, then a bold e the renderer draws in a
+            // run of its own.
+            pieces: [
+              at(0, 1, 'x'),
+              at(1, 1, '\u{6de}'),
+              at(2, 1, '\u{301}'),
+              at(3, 2, '\u{4e2d}'),
+              at(5, 2, '\u{1f44d}'),
+              at(7, 1, 'e', true),
+              at(8, 1, 'y')
+            ]
+          }
+        ],
+        cursor: null
+      })
+    })
+    const row = surface.locator('.xterm-rows > div').first()
+    await expect(row).toContainText('y')
+    // How far the run holding the bold e starts from seven cells right of x, in a renderer twelve
+    // cells wide. The renderer measures a glyph it has not drawn before after drawing it once and
+    // then draws the line again, so this is read until the line has settled.
+    const offset = () =>
+      row.evaluate((element) => {
+        const screenBox = element.closest('.xterm-screen')?.getBoundingClientRect()
+        const runs = Array.from(element.querySelectorAll('span'))
+        const first = runs.find((run) => (run.textContent ?? '').startsWith('x'))
+        const bold = runs.find((run) => (run.textContent ?? '').startsWith('e'))
+        if (screenBox === undefined || first === undefined || bold === undefined) {
+          return Number.POSITIVE_INFINITY
+        }
+        const cell = screenBox.width / 12
+        return Math.abs(
+          bold.getBoundingClientRect().left - first.getBoundingClientRect().left - 7 * cell
+        )
+      })
+    await expect.poll(offset).toBeLessThan(1)
+  })
+
+  test('reports the same columns when only the height of its surface changes', async ({ page }) => {
+    await openSession(page)
+    await page.getByRole('tab', { name: 'Terminal' }).click()
+    const surface = page.getByTestId('terminal-surface')
+    await expect(surface).toContainText('cargo test -p kr-client')
+    const reported = () =>
+      page.evaluate(() => window.krTestHost?.terminalViews[0]?.grids.at(-1) ?? null)
+    const before = await reported()
+    if (before === null) throw new Error('the view reported no grid')
+    await surface.evaluate((element) => {
+      ;(element as HTMLElement).style.minHeight = '520px'
+    })
+    await expect.poll(async () => (await reported())?.rows).toBeGreaterThan(before.rows)
+    expect((await reported())?.columns).toBe(before.columns)
+  })
+
   test('gives the wheel to the application in control mode and takes it in view mode', async ({
     page
   }) => {

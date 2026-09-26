@@ -38,6 +38,7 @@ import {
   type ViewMode
 } from './modes'
 import { FALLBACK_GRID, useTerminalView } from './view'
+import { CELL_TABLE } from './widths'
 
 /** The base cell size before zoom. */
 const BASE_FONT_SIZE = 12
@@ -95,6 +96,10 @@ export function RawTerminal({
       scrollback: 0,
       allowProposedApi: true
     })
+    // The renderer lays text out with the view's own cell table, the one each frame is measured
+    // by, so every piece lands in exactly its cells.
+    created.unicode.register(CELL_TABLE)
+    created.unicode.activeVersion = CELL_TABLE.version
     const fit = new FitAddon()
     created.loadAddon(fit)
     created.open(element)

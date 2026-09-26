@@ -327,8 +327,11 @@ export interface FakeTerminalView {
   readonly attachment: AttachmentSummary
   /** Publishes that it attached, with no screen yet. */
   attach(): void
-  /** Publishes the session's screen at the view's newest grid, or `screen`. */
-  show(screen?: TerminalScreen): void
+  /**
+   * Publishes the session's screen at the view's newest grid, with any of its fields replaced by
+   * those `screen` gives.
+   */
+  show(screen?: Partial<TerminalScreen>): void
   /** Publishes that it waits for a screen, as after the host's reset. */
   wait(): void
   /** Publishes that it ended, for `reason`. */
@@ -1961,7 +1964,7 @@ function fakeTerminalView(
       publish({
         state: 'showing',
         attachment,
-        screen: screen ?? terminalScreen(sessionId, grids.at(-1) ?? grid)
+        screen: { ...terminalScreen(sessionId, grids.at(-1) ?? grid), ...screen }
       })
     },
     wait() {

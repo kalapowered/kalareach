@@ -13,7 +13,8 @@ import type { ITheme, Terminal } from '@xterm/xterm'
 
 import type { CellRendition, PaletteState, Rgb10 } from '@kalareach/protocol'
 
-import type { TerminalScreen } from '../host/port'
+import type { TerminalLine, TerminalScreen } from '../host/port'
+import { cellsOf } from './widths'
 
 /** The stand-in for a control character a piece should never have carried. */
 export const REPLACEMENT = '\u{FFFD}'
@@ -37,13 +38,10 @@ const NORMAL_BUFFER = `${ESC}[?1047l`
 const AUTOWRAP_OFF = `${ESC}[?7l`
 
 const CURSOR_HIDDEN = `${ESC}[?25l`
-
-/**
- * The columns the renderer holds past the window's right edge: as many as the widest cell it
- * draws, so the first character of a piece at the window's last column always fits.
- */
-const RENDERER_MARGIN = 2
 const CURSOR_SHOWN = `${ESC}[?25h`
+
+/** The fewest columns xterm.js keeps, whatever it is asked for. */
+const RENDERER_MINIMUM_COLUMNS = 2
 
 /**
  * A piece's text as the renderer is given it: every C0 control, DEL and C1 control replaced.
@@ -58,21 +56,6 @@ export function drawableText(text: string): string {
     drawn += code < 0x20 || (code >= 0x7f && code <= 0x9f) ? REPLACEMENT : scalar
   }
   return drawn
-}
-
-/** At most `cells` of `text`'s grapheme clusters, the most a piece of that many cells can hold. */
-function withinCells(text: string, cells: number): string {
-  const segments = [...new Intl.Segmenter(undefined, { granularity: 'grapheme' }).segment(text)]
-  if (segments.length <= cells) return text
-  return segments
-    .slice(0, Math.max(0, cells))
-    .map((each) => each.segment)
-    .join('')
-}
-
-/** Whether every scalar of `text` is printable ASCII, which every renderer draws a cell each. */
-function printableAscii(text: string): boolean {
-  return /^[\x20-\x7e]*$/.test(text)
 }
 
 /** A number the renderer is given, held to a byte whatever a malformed state carried. */
@@ -151,52 +134,63 @@ function steadyCursor(style: number): number {
   return 2
 }
 
+/** One piece as the renderer is given it: text that fills exactly the piece's cells. */
+interface Written {
+  readonly column: number
+  readonly text: string
+  readonly rendition: CellRendition
+  /** Whether the piece had text the renderer could not fit in its cells, so it is blank. */
+  readonly leftBlank: boolean
+}
+
+/**
+ * The pieces of one line as the renderer is given them, left to right, each filling exactly its
+ * cells.
+ *
+ * The renderer lays text out with the view's own cell table (`widths.ts`), and each piece is
+ * written straight after its own cursor placement and rendition, where the renderer has forgotten
+ * the character before. So `cellsOf` says exactly how many cells the renderer will give a piece's
+ * text, and a piece is written as its text followed by blank cells to its last cell when the text
+ * fits, and as blank cells alone when it does not or when its first character takes no cell. Every
+ * character then lands in the piece's own cells: none is drawn past them, none is dropped at the
+ * window's edge, no mark joins a character of another piece, and no cell of no width moves the
+ * rest of the line. A piece that starts inside the one before it is left out, as native code never
+ * sends one, and a piece is cut at the window's edge.
+ */
+function writtenOf(line: TerminalLine, columns: number): Written[] {
+  const written: Written[] = []
+  const pieces = [...line.pieces].sort((one, other) => count(one.column) - count(other.column))
+  // The first cell of the line no piece so far owns.
+  let free = 0
+  for (const piece of pieces) {
+    const column = count(piece.column)
+    if (column < free || column >= columns) continue
+    const cells = Math.min(count(piece.cells), columns - column)
+    free = column + cells
+    if (cells === 0) continue
+    const text = drawableText(piece.text)
+    const laid = text.length === 0 ? null : cellsOf(text)
+    written.push(
+      laid === null || laid > cells
+        ? { column, text: ' '.repeat(cells), rendition: piece.rendition, leftBlank: text.length > 0 }
+        : { column, text: text + ' '.repeat(cells - laid), rendition: piece.rendition, leftBlank: false }
+    )
+  }
+  return written
+}
+
 /**
  * Everything the renderer is written for one screen, in one write that begins with a full reset.
  *
  * One write, so a screen still waiting in the renderer can never be drawn over this one: the reset
  * clears whatever an earlier write left, in the order the writes were made.
- *
- * A piece never shows past its cells, whatever widths the renderer gives its text. The renderer
- * measures text by its own rules, which can give a cluster more cells than the pinned width model
- * native code placed it by (a mark the model joins to its letter can take a cell of its own, and a
- * character the model gives one cell can take two), and it can leak into another piece's cells in
- * only three ways. Each is closed here by construction:
- *
- * - To the left, by joining a mark to the cell before the one it is writing. It joins only to a
- *   character written in the same run of text, because its parser forgets the last character at
- *   every control sequence, and each piece is written after its own cursor placement and
- *   rendition. So a mark joins only to a character of its own piece.
- * - To the left, by dropping a character too wide for the last column and then joining the marks
- *   after it to the cell before. The renderer holds `RENDERER_MARGIN` columns past the window, the
- *   widest cell it draws, so the first character of a piece always fits and is never dropped.
- * - To the right, by drawing past the piece's last cell. After a piece that is not printable ASCII,
- *   everything from the end of its cells to the end of the renderer's line is erased, in this same
- *   write and before anything is shown; `columns` is the renderer's own width. Printable ASCII is
- *   a cell a character in every table.
- *
- * Pieces are drawn left to right, and a piece that starts inside the one before it is left out, as
- * native code never sends one, so every erase starts in cells no earlier piece owns: each later
- * piece draws its own cells after it, and a cell no piece covers stays blank. What the renderer
- * drew wider than a piece's cells is cut at its edge, and a wide glyph cut there is erased whole.
  */
-export function frameOf(screen: TerminalScreen, columns: number): string {
+export function frameOf(screen: TerminalScreen): string {
   let out = FULL_RESET + NORMAL_BUFFER + AUTOWRAP_OFF + CURSOR_HIDDEN
+  const columns = count(screen.window.columns)
   screen.lines.forEach((line, index) => {
-    const pieces = [...line.pieces].sort((one, other) => count(one.column) - count(other.column))
-    // The first cell of the line no piece drawn so far owns.
-    let free = 0
-    for (const piece of pieces) {
-      const column = count(piece.column)
-      if (column < free) continue
-      const cells = count(piece.cells)
-      free = column + cells
-      const text = withinCells(drawableText(piece.text), cells)
-      if (text.length === 0) continue
-      out += `${ESC}[${index + 1};${column + 1}H${sgr(piece.rendition)}${text}`
-      if (!printableAscii(text) && free < columns) {
-        out += `${ESC}[${index + 1};${free + 1}H${ESC}[0m${ESC}[K`
-      }
+    for (const piece of writtenOf(line, columns)) {
+      out += `${ESC}[${index + 1};${piece.column + 1}H${sgr(piece.rendition)}${piece.text}`
     }
   })
   out += `${ESC}[0m`
@@ -208,13 +202,22 @@ export function frameOf(screen: TerminalScreen, columns: number): string {
   return out
 }
 
+/** How many pieces of `screen` the renderer is given as blank cells because their text does not fit. */
+export function leftBlank(screen: TerminalScreen): number {
+  const columns = count(screen.window.columns)
+  return screen.lines.reduce(
+    (total, line) => total + writtenOf(line, columns).filter((piece) => piece.leftBlank).length,
+    0
+  )
+}
+
 /**
  * Replaces what `terminal` shows with `screen`, at the size of the screen's window, or clears it
  * when there is no screen.
  *
- * The renderer takes the window's rows and its columns with `RENDERER_MARGIN` more, which stay blank,
- * so every piece lands inside it; the surface around it clips a renderer larger than itself at its
- * right and bottom edges.
+ * The renderer takes the window's size, so every piece lands inside it; the surface around it clips
+ * a window larger than itself at its right and bottom edges. A window of one column is drawn in the
+ * two columns the renderer keeps at the least, and its second column stays blank.
  */
 export function paint(terminal: Terminal, screen: TerminalScreen | null): void {
   if (screen === null) {
@@ -222,10 +225,10 @@ export function paint(terminal: Terminal, screen: TerminalScreen | null): void {
     terminal.write(FULL_RESET + CURSOR_HIDDEN)
     return
   }
-  const columns = Math.max(1, count(screen.window.columns)) + RENDERER_MARGIN
+  const columns = Math.max(RENDERER_MINIMUM_COLUMNS, count(screen.window.columns))
   const rows = Math.max(1, count(screen.window.rows))
   if (terminal.cols !== columns || terminal.rows !== rows) terminal.resize(columns, rows)
-  terminal.write(frameOf(screen, terminal.cols))
+  terminal.write(frameOf(screen))
 }
 
 /** A colour as the renderer's theme takes it. */
