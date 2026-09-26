@@ -1637,9 +1637,38 @@ fn location(text: &str) -> Answer<url::Url> {
     url::Url::parse(text).map_err(|source| {
         ProtocolError::new(
             ErrorCode::InvalidArgument,
-            format!("{text} is not a repository location: {source}"),
+            format!(
+                "{} is not a repository location: {source}",
+                shown_location(text)
+            ),
         )
     })
+}
+
+/// Names a location a caller sent by its scheme and host alone.
+///
+/// A location can carry a user name and a token before its host, and a refusal is read by whoever
+/// the answer reaches, so nothing else of the text is repeated: where no scheme can be read, it is
+/// named as "the location".
+fn shown_location(text: &str) -> String {
+    let Some((scheme, rest)) = text.split_once("://") else {
+        return "the location".to_owned();
+    };
+    let is_scheme = scheme
+        .chars()
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic())
+        && scheme
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "+-.".contains(character));
+    if !is_scheme {
+        return "the location".to_owned();
+    }
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    format!("{scheme}://{host}")
 }
 
 fn decode_root(text: &str) -> Answer<Vec<u8>> {
@@ -2078,6 +2107,32 @@ mod tests {
             sync.confirmation,
             ConfirmationRequirement::WhenEnlargingAuthority
         );
+    }
+
+    /// A location a caller sent can carry a user name and a token before its host, so a refusal of
+    /// one names its scheme and host and nothing else of what was sent.
+    #[test]
+    fn a_refused_location_names_only_its_scheme_and_host() {
+        for (sent, shown) in [
+            (
+                "https://someone:s3cret-token@plugins.exa mple/metadata/",
+                "https://plugins.exa mple",
+            ),
+            (
+                "https://s3cret-token@plugins.example:99999/",
+                "https://plugins.example:99999",
+            ),
+            ("s3cret-token plugins.example", "the location"),
+        ] {
+            let refusal = location(sent).expect_err("not a location");
+            assert_eq!(refusal.code, ErrorCode::InvalidArgument);
+            assert!(
+                !refusal.message.contains("s3cret") && !refusal.message.contains("someone"),
+                "{}",
+                refusal.message
+            );
+            assert!(refusal.message.starts_with(shown), "{}", refusal.message);
+        }
     }
 
     #[test]
