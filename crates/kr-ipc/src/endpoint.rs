@@ -689,10 +689,16 @@ mod platform {
             };
         }
 
+        /// The error every read and write of a refused caller's connection returns.
+        ///
+        /// It carries the refusal itself, so that a reader which wraps it as a socket failure still
+        /// reports it under the permission code the refusal maps to ([`IpcError::code`]).
         fn refusal(detail: &str) -> std::io::Error {
             std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
-                format!("the endpoint's account or access policy could not be verified: {detail}"),
+                IpcError::PeerAccountRejected {
+                    detail: detail.to_owned(),
+                },
             )
         }
 
@@ -757,14 +763,29 @@ mod platform {
             // another account created first cannot impersonate this client in the moment before the
             // account check below refuses it.
             let deadline = tokio::time::Instant::now() + CONNECT_BUSY_WAIT;
+            let busy_until_the_deadline = || {
+                IpcError::socket(
+                    "connect",
+                    std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "every instance of the endpoint stayed busy until the deadline",
+                    ),
+                )
+            };
             let client = loop {
                 match ClientOptions::new().open(&path) {
                     Ok(client) => break client,
-                    Err(error)
-                        if error.raw_os_error() == Some(ERROR_PIPE_BUSY.cast_signed())
-                            && tokio::time::Instant::now() < deadline =>
-                    {
-                        tokio::time::sleep(BUSY_RETRY_PAUSE).await;
+                    Err(error) if error.raw_os_error() == Some(ERROR_PIPE_BUSY.cast_signed()) => {
+                        // The pause never runs past the deadline, and no attempt starts after it.
+                        let remaining =
+                            deadline.saturating_duration_since(tokio::time::Instant::now());
+                        if remaining.is_zero() {
+                            return Err(busy_until_the_deadline());
+                        }
+                        tokio::time::sleep(BUSY_RETRY_PAUSE.min(remaining)).await;
+                        if tokio::time::Instant::now() >= deadline {
+                            return Err(busy_until_the_deadline());
+                        }
                     }
                     Err(error) => return Err(IpcError::socket("connect", error)),
                 }

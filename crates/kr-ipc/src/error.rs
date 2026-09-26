@@ -166,8 +166,13 @@ impl IpcError {
 
     /// Returns the stable protocol code this failure is reported under.
     #[must_use]
-    pub const fn code(&self) -> ErrorCode {
+    pub fn code(&self) -> ErrorCode {
         match self {
+            // A connection whose caller was refused by its account fails its reads and writes with
+            // that refusal inside, and whatever wraps it as a socket failure keeps its code.
+            Self::Socket { source, .. } if carries_account_refusal(source) => {
+                ErrorCode::PermissionDenied
+            }
             Self::Io { .. } | Self::Socket { .. } | Self::IdentityUnavailable { .. } => {
                 ErrorCode::ResourceUnavailable
             }
@@ -194,5 +199,45 @@ impl IpcError {
     }
 }
 
+/// Whether an I/O failure is a connection's refusal of its caller by account, carried inside it.
+fn carries_account_refusal(source: &std::io::Error) -> bool {
+    source
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<IpcError>())
+        .is_some_and(|inner| matches!(inner, IpcError::PeerAccountRejected { .. }))
+}
+
 /// The result of a local IPC operation.
 pub type Result<T> = std::result::Result<T, IpcError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A caller refused by its account is reported under the permission code, whether it surfaces
+    /// directly or inside the socket failure a frame reader wraps it in; any other socket failure,
+    /// a plain permission denial included, keeps the code it had.
+    #[test]
+    fn an_account_refusal_keeps_its_code_inside_a_socket_failure() {
+        let refusal = || IpcError::PeerAccountRejected {
+            detail: "the caller runs as another account".to_owned(),
+        };
+        assert_eq!(refusal().code(), ErrorCode::PermissionDenied);
+
+        let wrapped = IpcError::socket(
+            "read",
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, refusal()),
+        );
+        assert_eq!(wrapped.code(), ErrorCode::PermissionDenied);
+        assert!(
+            wrapped.to_string().contains("another account"),
+            "the wrapped refusal still says why: {wrapped}"
+        );
+
+        let denied = IpcError::socket(
+            "read",
+            std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        );
+        assert_eq!(denied.code(), ErrorCode::ResourceUnavailable);
+    }
+}

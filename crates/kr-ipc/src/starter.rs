@@ -1547,6 +1547,10 @@ mod windows {
 
     /// Whether the client connected to `pipe` runs as the account this process runs as.
     ///
+    /// The calling thread must not already be impersonating anyone: the thread is restored with
+    /// `RevertToSelf`, which leaves it with this process's own token, not with a token it held
+    /// before. Every caller in this crate calls it from a runtime thread that never impersonates.
+    ///
     /// The client's token is read from the connection itself, by impersonating it only long enough
     /// to open the thread token; the impersonation is always undone before this returns. Because the
     /// token comes from the connection and not from a process looked up by identifier, a client whose
