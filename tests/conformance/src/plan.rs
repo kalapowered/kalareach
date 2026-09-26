@@ -750,6 +750,29 @@ fn windows() -> Vec<Step> {
                 "task_supervisor",
             ],
         ),
+        // kr new through the environment's scheduled task. The daemon the task starts keeps its
+        // keys in this machine's credential store, so these cases are ignored in an ordinary run
+        // and fail before anything is started unless KR_TEST_PLATFORM_SECRET_STORE=1 says the run
+        // may; the case that needs an account signed in nowhere is the test machine's.
+        Step {
+            needs: vec![SECRET_STORE_VARIABLE],
+            ..Step::cargo(
+                Group::Rust,
+                "the control daemon started through the environment's scheduled task",
+                &[
+                    "test",
+                    "--locked",
+                    "-p",
+                    "kr-cli",
+                    "--test",
+                    "startup_windows",
+                    "--",
+                    "--ignored",
+                    "--skip",
+                    "a_task_the_task_scheduler_does_not_start",
+                ],
+            )
+        },
         Step::cargo(
             Group::Rust,
             "the attention store",

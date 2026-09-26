@@ -619,6 +619,18 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo test --locked -p kr-controller --test task_supervisor
 
+      # kr new through the environment's scheduled task, as the standalone start runs it here: three
+      # first commands at once meet one daemon that serves every caller, the daemon is in none of
+      # the caller's jobs, and kr doctor reports the task. The daemon the task starts keeps its keys
+      # in this runner's credential store, which is why these cases are ignored in an ordinary run
+      # and the switch is set on this step alone; each case removes the keys its daemon kept. The
+      # case that needs an account signed in nowhere belongs to the Windows test machine.
+      - name: Start the control daemon through the environment's scheduled task
+        if: ${{ !cancelled() }}
+        env:
+          KR_TEST_PLATFORM_SECRET_STORE: "1"
+        run: cargo test --locked -p kr-cli --test startup_windows -- --ignored --skip a_task_the_task_scheduler_does_not_start
+
       # The environment feature store on this platform, among its tests the claim a controller of
       # the previous release wrote on it with its start in whole seconds, which the next owner
       # reads and replaces.
