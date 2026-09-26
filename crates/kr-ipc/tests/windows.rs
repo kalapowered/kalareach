@@ -16,7 +16,8 @@
 //! this crate's own tests in `src/paths.rs`, which run on this platform too.
 //!
 //! The boot identity every recorded worker, startup claim and owner confirmation is bound to is
-//! read here thousands of times over several seconds, and one boot gives one value.
+//! read here thousands of times over several seconds, and one boot gives one value: the kernel's
+//! boot counter and its System process's creation time, as .NET reads them by other means.
 
 #![cfg(windows)]
 
@@ -822,13 +823,69 @@ fn every_read_of_the_boot_identity_in_one_boot_gives_one_value() {
         }
         reads += 1;
     }
+    let shown: Vec<String> = identities
+        .iter()
+        .map(|identity| {
+            identity
+                .value
+                .as_slice()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect()
+        })
+        .collect();
     assert_eq!(
         identities.len(),
         1,
         "{reads} reads over {:?}, in {} seconds of the wall clock, gave these boot identities: \
-         {identities:?}",
+         {shown:?}",
         started.elapsed(),
         seconds.len()
+    );
+}
+
+/// Prints the kernel's boot counter, read straight from the page the kernel shares with every
+/// process, and the System process's creation time in hundreds of nanoseconds since 1601, one line
+/// each.
+///
+/// .NET reads the creation time by opening the process, not through the reader under test, and
+/// that takes an account that may open it: an administrator, as on the Windows test machine and the
+/// hosted Windows runners.
+const BOOT_RECORDS: &str = r"
+$ErrorActionPreference = 'Stop'
+$counter = [Runtime.InteropServices.Marshal]::ReadInt32([IntPtr]0x7FFE02C4)
+Write-Output ([BitConverter]::ToUInt32([BitConverter]::GetBytes($counter), 0))
+Write-Output ([Diagnostics.Process]::GetProcessById(4).StartTime.ToUniversalTime().ToFileTimeUtc())
+";
+
+/// The boot identity is the kernel's boot counter and the creation time it recorded for its System
+/// process, four and eight bytes, most significant first: the same two records .NET reads here by
+/// other means.
+#[test]
+fn the_boot_identity_is_the_kernels_boot_counter_and_system_process_creation_time() {
+    let host = TempHost::create();
+    let records = script(&host, "boot-records", BOOT_RECORDS);
+    let printed = output_of(&records, &[]);
+    let mut lines = printed.lines().map(str::trim);
+    let counter: u32 = lines
+        .next()
+        .and_then(|line| line.parse().ok())
+        .unwrap_or_else(|| panic!("PowerShell printed a boot counter: {printed:?}"));
+    let created: u64 = lines
+        .next()
+        .and_then(|line| line.parse().ok())
+        .unwrap_or_else(|| panic!("PowerShell printed a creation time: {printed:?}"));
+    let identity = kr_ipc::identity::boot_identity().expect("the kernel names this boot");
+    let mut expected = counter.to_be_bytes().to_vec();
+    expected.extend(created.to_be_bytes());
+    assert_eq!(
+        identity.source,
+        kr_protocol::identity::BootIdentitySource::BootTime
+    );
+    assert_eq!(
+        identity.value.as_slice(),
+        expected.as_slice(),
+        "the boot counter {counter} and the System process's creation time {created}"
     );
 }
 
