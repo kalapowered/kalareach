@@ -59,9 +59,12 @@ pub fn flush_directory(directory: &Path, kind: NameKind) -> std::io::Result<()> 
 /// How long [`retry_while_held`] goes on trying a rename again while another program holds a file
 /// it needs, counted on a monotonic clock from the first attempt.
 ///
-/// Where a scanner reads each new file, as Windows Defender's real-time protection does, a record
-/// just linked into place was seen held for up to about 1.3 seconds after its rename was first
-/// refused; this is a budget several times that.
+/// On a Windows machine where Defender's real-time protection reads each new file, 111 of 113
+/// refused replacements of a file that had just been given its name by a link were let through
+/// within 1.4 seconds of the first refusal, and 2 were still refused a minute later; files given
+/// their names by a rename were not seen held at all. This bound covers the first kind several
+/// times over. No bound covers the second, which is why a new file is given its name by
+/// [`publish_without_replacing`], not by a link.
 pub const HELD_RENAME_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Runs `rename`, which puts a file or a directory in place under its name, and on Windows runs it
@@ -131,6 +134,30 @@ fn retry_within(
     {
         let _ = bound;
         rename()
+    }
+}
+
+/// Gives the complete file `from` the name `to`, unless something is named `to` already: a first
+/// publication, which never replaces what another writer published first.
+///
+/// On Windows this is a rename that does not replace. A link does the same everywhere, but on
+/// Windows a file that has just been given a name by a link can be held by the system, where a
+/// scanner such as Defender reads it, for a minute and more (see [`HELD_RENAME_BOUND`]), and a
+/// rename over it is refused all that time. Elsewhere it is a link, and `from` keeps its name too
+/// until the caller removes it; on Windows `from` no longer names anything once this succeeds.
+///
+/// # Errors
+///
+/// Returns an error of kind [`std::io::ErrorKind::AlreadyExists`] when something is named `to`,
+/// and the operating system's error when the name cannot be given otherwise.
+pub fn publish_without_replacing(from: &Path, to: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        self::windows::move_without_replacing(from, to)
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::hard_link(from, to)
     }
 }
 
@@ -228,13 +255,14 @@ fn flush_held_through(
     self::windows::reopen_directory(directory, right)?.sync_all()
 }
 
-/// The one call this crate makes that has no safe form: opening a held directory again.
+/// The two calls this crate makes that have no safe form: opening a held directory again, and a
+/// rename that does not replace.
 #[cfg(windows)]
 mod windows {
     #![expect(
         unsafe_code,
-        reason = "opening a directory relative to a handle is a native call, which has no safe \
-                  interface"
+        reason = "opening a directory relative to a handle, and a rename that does not replace, are \
+                  native calls, which have no safe interface"
     )]
 
     use std::os::windows::io::{AsRawHandle as _, BorrowedHandle};
@@ -308,6 +336,36 @@ mod windows {
         // SAFETY: the status is the one the call returned; this only maps it to a Win32 code.
         let code = unsafe { RtlNtStatusToDosError(status) };
         Err(std::io::Error::from_raw_os_error(code.cast_signed()))
+    }
+
+    /// Renames `from` to `to` unless something is named `to`: `MoveFileExW` without the flag that
+    /// lets it replace, which answers ERROR_ALREADY_EXISTS then. The standard library's rename
+    /// always replaces.
+    ///
+    /// # Errors
+    ///
+    /// Returns the operating system's error when the rename is refused.
+    pub(super) fn move_without_replacing(
+        from: &std::path::Path,
+        to: &std::path::Path,
+    ) -> std::io::Result<()> {
+        use std::os::windows::ffi::OsStrExt as _;
+        use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
+
+        let wide = |path: &std::path::Path| {
+            path.as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect::<Vec<u16>>()
+        };
+        let (from, to) = (wide(from), wide(to));
+        // SAFETY: both names are NUL-terminated wide strings that live past the call, which reads
+        // them and keeps neither. With no flags the call moves a name on one volume and never
+        // replaces one.
+        if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), 0) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
     }
 }
 
@@ -485,6 +543,29 @@ mod tests {
         drop(unshared);
         flush_held_directory(&held, NameKind::File).expect("and with it gone, the flush is made");
         drop(held);
+    }
+
+    /// A first publication gives the file its name, and one to a name that is taken answers that
+    /// it exists and leaves both files as they were.
+    #[test]
+    fn a_publication_never_replaces_a_name_that_is_taken() {
+        let root = Scratch::new("publication");
+        let (first, second, name) = (
+            root.0.join("first"),
+            root.0.join("second"),
+            root.0.join("name"),
+        );
+        std::fs::write(&first, b"first").expect("the first file");
+        std::fs::write(&second, b"second").expect("the second file");
+        publish_without_replacing(&first, &name).expect("the name is free");
+        assert_eq!(std::fs::read(&name).expect("readable"), b"first");
+        // On Windows the name moved, since no link was made; elsewhere the file keeps both names
+        // until the caller removes one.
+        assert_eq!(first.exists(), !cfg!(windows), "{}", first.display());
+        let taken = publish_without_replacing(&second, &name).expect_err("the name is taken");
+        assert_eq!(taken.kind(), std::io::ErrorKind::AlreadyExists, "{taken}");
+        assert_eq!(std::fs::read(&name).expect("readable"), b"first");
+        assert_eq!(std::fs::read(&second).expect("readable"), b"second");
     }
 
     /// A rename that fails any other way than a hold is answered at once, after one attempt, on
