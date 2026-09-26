@@ -7,6 +7,12 @@
 //! What this proves is an operating-system identity, not human intent. Section 2 is explicit
 //! about the difference: a rights-enlarging owner operation still needs the owner-confirmation
 //! contract, because code already running under the user's account can open this socket too.
+//!
+//! Windows has no numeric account, so [`PeerIdentity::uid`] there is a placeholder (`0`) and
+//! [`PeerIdentity::authorise`] is not the account check; the account is proved from the connection
+//! itself in [`crate::endpoint`], the listener reading the connecting client's own token and a
+//! client the owner of the pipe it reached. A returned `PeerIdentity` on Windows therefore already
+//! belongs to this account: `uid: 0` means the verified local owner, not an unchecked default.
 
 use kr_protocol::local::LocalPeer;
 use kr_protocol::scalars::{Nullable, U64};
