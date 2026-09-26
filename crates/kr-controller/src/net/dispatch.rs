@@ -3468,7 +3468,7 @@ mod tests {
         ActionId, ActionWindowId, EnvironmentId, RequestId, SessionEpoch, SessionId,
     };
     use kr_protocol::method::{Method, MethodVersion};
-    use kr_protocol::scalars::{Nullable, Uuid};
+    use kr_protocol::scalars::{CanonicalSet, Nullable, Uuid};
 
     fn attach(claim_geometry: bool, requested: &[AttachmentCapability]) -> MutationRequest {
         let session_id = SessionId::new(Uuid::from_bytes([3; 16]));
@@ -4088,6 +4088,7 @@ mod tests {
     async fn answering_worker(
         answers: Answers,
         recorded: crate::service::a_close_a_worker_never_answers::Recorded,
+        stated: CanonicalSet<kr_protocol::ids::CapabilityId>,
     ) -> crate::service::a_close_a_worker_never_answers::Silent {
         use std::sync::Arc;
 
@@ -4115,6 +4116,7 @@ mod tests {
                     let endpoint_text = endpoint_text.clone();
                     let answers = Arc::clone(&answers);
                     let recorded = Arc::clone(&recorded);
+                    let stated = stated.clone();
                     tokio::spawn(async move {
                         let (mut reader, mut writer) = kr_ipc::framed::split(
                             connection,
@@ -4128,6 +4130,7 @@ mod tests {
                                 &endpoint_text,
                                 connection_id,
                                 &peer,
+                                &stated,
                             ) {
                                 Some(replies) => replies,
                                 None => {
@@ -4189,6 +4192,17 @@ mod tests {
             })
         })
         .await
+    }
+
+    /// What a worker of this build states in its answer to a hello: that it reads the history scope
+    /// a forwarded read carries.
+    fn reads_scopes() -> CanonicalSet<kr_protocol::ids::CapabilityId> {
+        [
+            kr_protocol::ids::CapabilityId::new(kr_protocol::local::FORWARDED_HISTORY_SCOPE)
+                .expect("a capability identifier"),
+        ]
+        .into_iter()
+        .collect()
     }
 
     /// The reads a worker was forwarded, in the order they arrived.
@@ -4339,6 +4353,7 @@ mod tests {
                 ParamsValue::from_typed(&QuestionReadResult { questions }).ok()
             }),
             Arc::clone(&recorded),
+            reads_scopes(),
         )
         .await;
         let controller = &world.controller;
@@ -4420,8 +4435,6 @@ mod tests {
     /// come back as the worker answered them. The session a subject names is the one the grant is
     /// checked against: a device whose grant does not admit it is refused before anything reaches
     /// the worker, as it is for a read that names its session at the top of its parameters.
-    /// `agent.snapshot` is refused by name, because the shared history filter does not cover an
-    /// agent's retained history, and nothing reaches the worker for it either.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_device_reads_an_agents_capabilities_and_commands_from_the_sessions_worker() {
         use std::sync::Arc;
@@ -4429,7 +4442,7 @@ mod tests {
         use kr_protocol::actor::ActorIngress;
         use kr_protocol::agent::{
             AgentBindingState, AgentCapabilitiesParams, AgentCapabilitiesResult, AgentCommand,
-            AgentCommandsParams, AgentCommandsResult, AgentSnapshotParams, AgentSubject,
+            AgentCommandsParams, AgentCommandsResult, AgentSubject,
         };
         use kr_protocol::error::ErrorCode;
 
@@ -4472,6 +4485,7 @@ mod tests {
                 })
             },
             Arc::clone(&recorded),
+            reads_scopes(),
         )
         .await;
         let controller = &world.controller;
@@ -4517,27 +4531,6 @@ mod tests {
             assert_eq!(read.actor.grant_id, Nullable::some(viewer.grant.grant_id));
         }
 
-        // The snapshot is refused by name, and nothing reaches the worker for it.
-        let read = device_request(
-            3,
-            Method::AgentSnapshot,
-            &AgentSnapshotParams {
-                subject,
-                from_node: Nullable::null(),
-            },
-        );
-        let snapshot = refusal(connection.read(&read).await);
-        assert_eq!(
-            snapshot.code,
-            ErrorCode::UnsupportedCapability,
-            "{snapshot:?}"
-        );
-        assert!(
-            snapshot.message.contains("agent.snapshot"),
-            "the refusal names the read: {snapshot:?}"
-        );
-        assert_eq!(forwarded_reads(&recorded).len(), 2);
-
         // A device whose grant sees another session is refused the subject in this one, and
         // nothing reaches the worker.
         let elsewhere = paired(controller, 14, |grant| {
@@ -4566,6 +4559,255 @@ mod tests {
             forwarded_reads(&recorded).len(),
             2,
             "a read the grant does not admit reaches no worker"
+        );
+        world.serving.abort();
+    }
+
+    /// KR-REQ-23.39 and KR-REQ-11.26 for the paired-device ingress: `agent.snapshot` and
+    /// `agent.approval.inspect` from a paired device go to the worker of the session their subject
+    /// names, under the device's own envelope and with the history scope of the grant the read was
+    /// decided under, and come back as the worker answered them: the worker is what narrows them.
+    /// A device whose grant lacks `session.view`, and one whose grant does not admit the subject's
+    /// session, are refused before anything reaches a worker.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_device_reads_an_agents_history_and_an_approval_record_under_its_grants_scope() {
+        use std::sync::Arc;
+
+        use kr_protocol::actor::ActorIngress;
+        use kr_protocol::agent::{
+            AgentApprovalInspectParams, AgentBindingState, AgentSnapshotEntry, AgentSnapshotParams,
+            AgentSnapshotResult, AgentSubject,
+        };
+        use kr_protocol::error::ErrorCode;
+        use kr_protocol::rights::ActionRight;
+        use kr_protocol::scalars::{TimestampMs, U64};
+
+        use crate::service::a_close_a_worker_never_answers as fake;
+
+        let snapshot = AgentSnapshotResult {
+            binding: AgentBindingState {
+                binding_revision: kr_protocol::ids::AgentBindingRevision::new(3),
+                thread_id: Nullable::null(),
+                turn_id: Nullable::null(),
+                profile_id: Nullable::null(),
+                mode: kr_protocol::broker::IntegrationMode::Gateway,
+                rich_mutations_suspended: false,
+                suspension_reason: Nullable::null(),
+            },
+            entries: vec![AgentSnapshotEntry {
+                node: U64::new(2),
+                kind: "message".to_owned(),
+                text: "said under the grant".to_owned(),
+                observed_at: TimestampMs::new(2_500),
+            }],
+            continuation: Nullable::null(),
+            history_gap: false,
+            withheld_entries: U64::new(1),
+        };
+        let recorded: fake::Recorded = Arc::default();
+        let world = answering_worker(
+            {
+                let snapshot = snapshot.clone();
+                Arc::new(move |request: &kr_protocol::envelope::Request| {
+                    match request.method.method()? {
+                        Method::AgentSnapshot => ParamsValue::from_typed(&snapshot).ok(),
+                        // The daemon passes a worker's answer on as it came, so any answer
+                        // stands for the record here.
+                        Method::AgentApprovalInspect => Some(ParamsValue::empty()),
+                        _ => None,
+                    }
+                })
+            },
+            Arc::clone(&recorded),
+            reads_scopes(),
+        )
+        .await;
+        let controller = &world.controller;
+        fake::acknowledged(controller, world.session_id);
+        let subject = AgentSubject {
+            session_id: world.session_id,
+            application_instance_id: kr_protocol::ids::ApplicationInstanceId::new(
+                Uuid::from_bytes([5; 16]),
+            ),
+        };
+        let reads = |first: u64| {
+            [
+                device_request(
+                    first,
+                    Method::AgentSnapshot,
+                    &AgentSnapshotParams {
+                        subject,
+                        from_node: Nullable::null(),
+                    },
+                ),
+                device_request(
+                    first + 1,
+                    Method::AgentApprovalInspect,
+                    &AgentApprovalInspectParams {
+                        subject,
+                        resource_id: kr_protocol::ids::PendingResourceId::new(Uuid::from_bytes(
+                            [6; 16],
+                        )),
+                    },
+                ),
+            ]
+        };
+
+        // A device whose grant reaches back to one moment and names nothing.
+        let viewer = paired(controller, 15, |grant| {
+            grant.history.lower_bound_ms = Nullable::some(TimestampMs::new(2_000));
+            grant.history.include_live_screen = false;
+        });
+        let connection = super::RemoteConnection::for_test(controller, viewer.clone());
+        let [snapshot_read, record_read] = reads(1);
+        assert_eq!(
+            answered::<AgentSnapshotResult>(connection.read(&snapshot_read).await),
+            snapshot
+        );
+        match connection.read(&record_read).await {
+            kr_protocol::envelope::ControlFrame::Response(kr_protocol::envelope::Response {
+                outcome: kr_protocol::envelope::Outcome::Ok(value),
+                ..
+            }) => assert_eq!(value, ParamsValue::empty()),
+            other => panic!("the record read was not answered: {other:?}"),
+        }
+        let forwarded = forwarded_reads(&recorded);
+        assert_eq!(
+            forwarded
+                .iter()
+                .map(|read| read.request.method.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                Method::AgentSnapshot.into(),
+                Method::AgentApprovalInspect.into()
+            ]
+        );
+        for read in &forwarded {
+            assert_eq!(read.actor.ingress, ActorIngress::PairedDevice);
+            assert_eq!(read.actor.device_id, Nullable::some(viewer.device_id));
+            assert_eq!(read.actor.grant_id, Nullable::some(viewer.grant.grant_id));
+            assert_eq!(
+                read.history.as_ref(),
+                Some(&viewer.grant.history),
+                "the grant's scope travels with {}",
+                read.request.method.as_str()
+            );
+        }
+
+        // Without session.view, and for a session the grant does not admit, nothing reaches the
+        // worker.
+        let blind = paired(controller, 16, |grant| {
+            grant.actions = grant
+                .actions
+                .iter()
+                .copied()
+                .filter(|right| *right != ActionRight::SessionView)
+                .collect();
+        });
+        let elsewhere = paired(controller, 17, |grant| {
+            grant.session_selector = kr_protocol::grant::SessionSelector::These {
+                session_ids: [SessionId::new(kr_ipc::new_uuid())].into_iter().collect(),
+            };
+        });
+        for (device, first) in [(blind, 3), (elsewhere, 5)] {
+            let connection = super::RemoteConnection::for_test(controller, device);
+            for read in reads(first) {
+                let refused = refusal(connection.read(&read).await);
+                assert_eq!(
+                    refused.code,
+                    ErrorCode::PermissionDenied,
+                    "{}: {refused:?}",
+                    read.method.as_str()
+                );
+            }
+        }
+        assert_eq!(
+            forwarded_reads(&recorded).len(),
+            2,
+            "a read the grant does not admit reaches no worker"
+        );
+        world.serving.abort();
+    }
+
+    /// A worker of an earlier build does not say that it reads a forwarded read's history scope,
+    /// and a frame with a member it does not know would end the link. So it is sent none: a
+    /// device's snapshot reaches it without a scope, which it refuses by itself, and the same link
+    /// serves the device's next read.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_worker_that_does_not_read_scopes_is_sent_none_and_serves_the_next_read() {
+        use std::sync::Arc;
+
+        use kr_protocol::agent::{
+            AgentBindingState, AgentCapabilitiesParams, AgentCapabilitiesResult,
+            AgentSnapshotParams, AgentSubject,
+        };
+
+        use crate::service::a_close_a_worker_never_answers as fake;
+
+        let capabilities = AgentCapabilitiesResult {
+            binding: AgentBindingState {
+                binding_revision: kr_protocol::ids::AgentBindingRevision::new(3),
+                thread_id: Nullable::null(),
+                turn_id: Nullable::null(),
+                profile_id: Nullable::null(),
+                mode: kr_protocol::broker::IntegrationMode::Gateway,
+                rich_mutations_suspended: false,
+                suspension_reason: Nullable::null(),
+            },
+            capabilities: kr_protocol::broker::CapabilityMap {
+                records: Vec::new(),
+            },
+        };
+        let recorded: fake::Recorded = Arc::default();
+        let world = answering_worker(
+            {
+                let capabilities = capabilities.clone();
+                Arc::new(move |request: &kr_protocol::envelope::Request| {
+                    match request.method.method()? {
+                        Method::AgentCapabilities => ParamsValue::from_typed(&capabilities).ok(),
+                        _ => None,
+                    }
+                })
+            },
+            Arc::clone(&recorded),
+            CanonicalSet::new(),
+        )
+        .await;
+        let controller = &world.controller;
+        fake::acknowledged(controller, world.session_id);
+        let subject = AgentSubject {
+            session_id: world.session_id,
+            application_instance_id: kr_protocol::ids::ApplicationInstanceId::new(
+                Uuid::from_bytes([5; 16]),
+            ),
+        };
+        let viewer = paired(controller, 18, |_| {});
+        let connection = super::RemoteConnection::for_test(controller, viewer);
+
+        let snapshot = device_request(
+            1,
+            Method::AgentSnapshot,
+            &AgentSnapshotParams {
+                subject,
+                from_node: Nullable::null(),
+            },
+        );
+        refusal(connection.read(&snapshot).await);
+        let next = device_request(
+            2,
+            Method::AgentCapabilities,
+            &AgentCapabilitiesParams { subject },
+        );
+        assert_eq!(
+            answered::<AgentCapabilitiesResult>(connection.read(&next).await),
+            capabilities,
+            "the link serves the next read"
+        );
+        let forwarded = forwarded_reads(&recorded);
+        assert_eq!(forwarded.len(), 2);
+        assert!(
+            forwarded.iter().all(|read| read.history.is_none()),
+            "a worker that does not read scopes is sent none"
         );
         world.serving.abort();
     }

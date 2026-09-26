@@ -1680,26 +1680,29 @@ mod tests {
     }
 
     /// KR-REQ-11.26: the record of what a decoder read is a read of the session under
-    /// `session.view` and the named-resource history rule, served on the local socket, and no
-    /// other ingress reaches it: this host applies no grant's history scope to the answer.
+    /// `session.view` and the named-resource history rule, served on the local socket and to a
+    /// paired device, whose grant's history scope travels with the read. No other ingress reaches
+    /// it.
     #[test]
-    fn an_approval_record_is_read_on_the_local_socket_under_the_named_resource_rule() {
+    fn an_approval_record_is_read_locally_and_by_a_paired_device_under_the_named_resource_rule() {
         let entry = entry("agent.approval.inspect");
         assert_eq!(entry.group, MethodGroup::AgentState);
         assert_eq!(entry.effect, EffectClass::Read);
         assert_eq!(entry.history_filter, HistoryFilter::NamedCurrentResources);
-        assert!(matches!(
-            decide(
-                "agent.approval.inspect",
-                MethodVersion::V1,
-                ActorIngress::LocalIpc
-            ),
-            AuthorityDecision::Listed(_)
-        ));
+        let served = [ActorIngress::LocalIpc, ActorIngress::PairedDevice];
+        for ingress in served {
+            assert!(
+                matches!(
+                    decide("agent.approval.inspect", MethodVersion::V1, ingress),
+                    AuthorityDecision::Listed(_)
+                ),
+                "{ingress:?}"
+            );
+        }
         for ingress in ActorIngress::ALL
             .iter()
             .copied()
-            .filter(|ingress| *ingress != ActorIngress::LocalIpc)
+            .filter(|ingress| !served.contains(ingress))
         {
             assert_eq!(
                 decide("agent.approval.inspect", MethodVersion::V1, ingress),
