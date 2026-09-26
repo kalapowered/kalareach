@@ -130,8 +130,10 @@ pub const FORWARDED_UTC_DEADLINE: &str = "forwarded.utc-deadline/1";
 ///
 /// A worker survives an upgrade of the daemon, the forwarded frames are closed schemas, and a
 /// worker ends the connection a frame it cannot read arrived on, so a worker of an earlier build is
-/// sent no scope at all. It refuses the reads a scope narrows by itself, as it always did.
-pub const FORWARDED_HISTORY_SCOPE: &str = "forwarded.history-scope/1";
+/// sent no scope at all. It refuses the reads a scope narrows by itself, as it always did. The
+/// version is the second: a scope names approvals by the broker's resource identity, and a worker
+/// that states only the first read them as an upstream's text, so it is sent none either.
+pub const FORWARDED_HISTORY_SCOPE: &str = "forwarded.history-scope/2";
 
 /// Returns true when a worker's statement says it reads a forwarded read's history scope
 /// ([`FORWARDED_HISTORY_SCOPE`]).
