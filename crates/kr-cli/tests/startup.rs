@@ -2398,8 +2398,8 @@ impl ServiceHost {
     }
 
     /// Establishes that the service manager started the daemon: its parent is the manager, it
-    /// leads a process group of its own outside the session this test runs in, it has no
-    /// controlling terminal, and it works in the environment's own directory.
+    /// leads a process group of its own in a session no terminal ends, it has no controlling
+    /// terminal, and it works in the environment's own directory.
     fn assert_started_by_the_manager(&self, pid: u32) {
         let (parent, name) = parent_of(pid);
         #[cfg(target_os = "macos")]
@@ -2421,6 +2421,19 @@ impl ServiceHost {
             process,
             "the daemon leads a process group of its own"
         );
+        // launchd runs every job in the session it leads as process 1, which no terminal ends. A
+        // test that a launchd job runs, as on a hosted runner, is in that session too, so the
+        // daemon's session is named here rather than compared with this test's.
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            rustix::process::getsid(Some(process))
+                .expect("its session")
+                .as_raw_nonzero()
+                .get(),
+            1,
+            "and is in launchd's own session, which no terminal ends"
+        );
+        #[cfg(not(target_os = "macos"))]
         assert_ne!(
             rustix::process::getsid(Some(process)).expect("its session"),
             rustix::process::getsid(None).expect("this test's session"),
