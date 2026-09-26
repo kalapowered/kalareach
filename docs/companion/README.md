@@ -67,6 +67,19 @@ A session fits a window as narrow as 320 px. Its actions move below its title, i
 and at the same size, a long name or directory wraps whole, and the terminal's badges and footer
 controls wrap inside the terminal.
 
+While a phone shows the terminal, the composer under it folds into the terminal's bar. The mode,
+the zoom and, in view mode, the four moves take one or two rows. The status takes two lines, one
+for the warnings and where the window is and one for what the mode does and how the host presents
+the view, each cut short until More shows all of it; a screen reader reads all of it either way.
+Then come the terminal keys, and the text field as one line with Send beside it. Attachments are
+added in the conversation. However much of the screen the keyboard covers, the terminal keeps at
+least four rows at its default size: when the composer needs more room than is left, it scrolls
+from the bottom, so the field and the keys stay in view above the keyboard. The host is told the
+grid the terminal's surface shows.
+
+A selection in either raw view takes the session's own selection colours. On the desktop a copy
+gives the selected pieces as lines laid out by their cells.
+
 ## The boundary
 
 The window is a WebView and the WebView is not trusted. Section 13 of the specification fixes what
