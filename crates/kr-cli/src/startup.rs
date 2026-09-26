@@ -830,9 +830,12 @@ async fn managed(
 /// is run. The starter takes the request and starts the daemon installed beside this command, with
 /// its output appended to the log; the Task Scheduler, not this command, is its creator, so it is
 /// in none of this command's jobs. The daemon inherits the environment the Task Scheduler gives the
-/// user, as every process a task starts does. A request no starter took by the time the command
-/// stops waiting is a task the Task Scheduler did not start: it starts one only in a session where
-/// the user is signed in.
+/// user, as every process a task starts does.
+///
+/// The start has one deadline: the request lapses when this command stops waiting, and the command
+/// withdraws it before it says why no daemon answered, so no daemon is started for it after the
+/// command has given up. A request no starter took is a task the Task Scheduler did not start: it
+/// starts one only in a session where the user is signed in.
 #[cfg(windows)]
 async fn standalone(
     _paths: &HostPaths,
@@ -840,11 +843,12 @@ async fn standalone(
     endpoint: &kr_ipc::paths::Endpoint,
     bounds: Bounds,
 ) -> Result<(LocalClient, Option<Started>)> {
+    let deadline = tokio::time::Instant::now() + bounds.start;
     let program = daemon_program()?;
     if !program.is_file() {
         return Err(CliError::HostUnavailable(shown!(
             "the standalone start runs the control daemon installed beside this command, {}, and \
-             there is none there",
+             there is none there; install kr again, then run kr host startup --set standalone",
             Shown::root(&program)
         )));
     }
@@ -852,16 +856,17 @@ async fn standalone(
     // Checked, and emptied when it has grown too large, before the starter opens it: the daemon
     // appends to it.
     let log = Log::open(&environment.state_dir().join(LOG_FILE))?;
-    let deadline = tokio::time::Instant::now() + bounds.start;
     let asking = environment.clone();
-    let asked = tokio::task::spawn_blocking(move || windows::ask(&asking, &program, bounds.start))
-        .await
-        .map_err(|error| {
-            CliError::Other(shown!(
-                "asking this user's scheduled task to start the control daemon failed: {}",
-                Shown::task(&error)
-            ))
-        })??;
+    let until = deadline.into_std();
+    let asked =
+        tokio::task::spawn_blocking(move || windows::ask(&asking, &program, until, bounds.start))
+            .await
+            .map_err(|error| {
+                CliError::Other(shown!(
+                    "asking this user's scheduled task to start the control daemon failed: {}",
+                    Shown::task(&error)
+                ))
+            })??;
     let started = Started {
         pid: None,
         start: ControllerStartup::Standalone,
@@ -871,23 +876,13 @@ async fn standalone(
         Ok(client) => return Ok((client, Some(started))),
         Err(last) => last,
     };
-    if !kr_ipc::starter::claim_taken(environment, asked.request) {
-        return Err(windows::not_taken(environment, bounds.start, asked.session));
-    }
-    let said = log.last_line().map_or_else(
-        || Shown::said("its log holds nothing since it started"),
-        |line| last_line_said(&line),
-    );
-    Err(unanswered(shown!(
-        "the control daemon this user's scheduled task {} started for environment {} did not \
-         answer within {} seconds: {}; {}; what it writes is in {}",
-        task::name(environment.environment_id()),
-        environment.environment_id(),
-        bounds.start.as_secs(),
-        last,
-        said,
-        Shown::root(&log.path)
-    )))
+    Err(windows::unanswered(
+        environment,
+        &asked,
+        bounds.start,
+        &last,
+        &log,
+    ))
 }
 
 /// The log a daemon the standalone start runs writes to, opened once and checked.
@@ -1378,6 +1373,7 @@ mod windows {
         self as scheduled, Standing, TaskChange, TaskDefinition,
     };
     use kr_ipc::paths::EnvironmentPaths;
+    use kr_ipc::starter::Withdrawal;
     use kr_protocol::hostinfo::configuration::{Change, ControllerStartup};
     use kr_protocol::scalars::Uuid;
 
@@ -1587,9 +1583,16 @@ mod windows {
     /// Checks the environment's task, leaves a request to start the daemon for its starter, and
     /// runs it, all under the environment's lock, which is let go before the command waits.
     ///
-    /// The request lapses `bound` from now: a starter the Task Scheduler runs later than that
-    /// starts nothing for it.
-    pub fn ask(environment: &EnvironmentPaths, program: &Path, bound: Duration) -> Result<Asked> {
+    /// The request lapses at `deadline`, when the command stops waiting: a starter the Task
+    /// Scheduler runs later than that starts nothing for it. A run the Task Scheduler did not make
+    /// has the request withdrawn at once; when a starter took it first, the command waits as for
+    /// a run that was made.
+    pub fn ask(
+        environment: &EnvironmentPaths,
+        program: &Path,
+        deadline: std::time::Instant,
+        bound: Duration,
+    ) -> Result<Asked> {
         let definition = definition(environment, program)?;
         let environment_id = environment.environment_id();
         let name = task::name(environment_id);
@@ -1633,8 +1636,23 @@ mod windows {
         }
         let boot = kr_ipc::identity::boot_identity().map_err(CliError::Ipc)?;
         let request = kr_ipc::new_uuid();
-        let lapses = kr_ipc::clock::boot_elapsed_ms()
-            .saturating_add(u64::try_from(bound.as_millis()).unwrap_or(u64::MAX));
+        // The continuous clock is read before what is left of the wait is measured, so the time
+        // between the two readings shortens the request's life rather than lengthening it.
+        let now = kr_ipc::clock::boot_elapsed_ms();
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        let Some(lapses) = kr_ipc::clock::transferred_deadline(now, left) else {
+            return Err(CliError::Unfinished {
+                code: kr_protocol::error::ErrorCode::EnvironmentUnavailable,
+                message: shown!(
+                    "checking the scheduled task {} for environment {} took the {} seconds kr new \
+                     waits for the control daemon, so no request was left for its starter and \
+                     the task was not run",
+                    name,
+                    environment_id,
+                    bound.as_secs()
+                ),
+            });
+        };
         kr_ipc::starter::leave_claim(
             environment,
             &kr_ipc::starter::StartClaim {
@@ -1645,23 +1663,30 @@ mod windows {
         )
         .map_err(CliError::Ipc)?;
         if let Err(failure) = scheduled::run(&definition) {
-            let asked = match failure {
-                kr_controller::supervision::RunFailure::NotRun(_) => {
-                    Shown::said("could not be asked to run it")
-                }
-                kr_controller::supervision::RunFailure::Failed(_) => Shown::said("did not run it"),
-            };
-            return Err(CliError::Unfinished {
-                code: kr_protocol::error::ErrorCode::EnvironmentUnavailable,
-                message: shown!(
-                    "the Task Scheduler {} the scheduled task {} for environment {}, so no control \
-                     daemon was started; schtasks /Query /TN {} shows what it holds",
-                    asked,
-                    name,
-                    environment_id,
-                    name
-                ),
-            });
+            // A run can fail after the Task Scheduler began it, and another command's run can
+            // have a starter take this request: only a request withdrawn before any starter took
+            // it has nothing started for it.
+            if let Ok(Withdrawal::Withdrawn) = kr_ipc::starter::withdraw_claim(environment, request)
+            {
+                let asked = match failure {
+                    kr_controller::supervision::RunFailure::NotRun(_) => {
+                        Shown::said("could not be asked to run")
+                    }
+                    kr_controller::supervision::RunFailure::Failed(_) => Shown::said("did not run"),
+                };
+                return Err(CliError::Unfinished {
+                    code: kr_protocol::error::ErrorCode::EnvironmentUnavailable,
+                    message: shown!(
+                        "the Task Scheduler {} the scheduled task {} for environment {}, and the \
+                         request this command left for its starter was withdrawn, so no control \
+                         daemon was started for it; schtasks /Query /TN {} shows what it holds",
+                        asked,
+                        name,
+                        environment_id,
+                        name
+                    ),
+                });
+            }
         }
         drop(held);
         Ok(Asked {
@@ -1670,9 +1695,56 @@ mod windows {
         })
     }
 
-    /// The failure of a start whose request no starter took: the Task Scheduler did not start the
-    /// task's starter, which it does only in a session where the user is signed in.
-    pub fn not_taken(
+    /// The failure of a start no daemon answered by the time the command stopped waiting.
+    ///
+    /// The request is withdrawn first, so what the failure says of it holds: a request no starter
+    /// took can no longer be taken, and nothing is started for it. One a starter took says only
+    /// that: a lapsed request is taken too, and a start can fail once it was admitted.
+    pub fn unanswered(
+        environment: &EnvironmentPaths,
+        asked: &Asked,
+        bound: Duration,
+        last: &Shown,
+        log: &super::Log,
+    ) -> CliError {
+        let environment_id = environment.environment_id();
+        let name = task::name(environment_id);
+        let said = log.last_line().map_or_else(
+            || Shown::said("its log holds nothing since the request was left"),
+            |line| super::last_line_said(&line),
+        );
+        match kr_ipc::starter::withdraw_claim(environment, asked.request) {
+            Ok(Withdrawal::Withdrawn) => not_taken(environment, bound, asked.session),
+            Ok(Withdrawal::Taken) => super::unanswered(shown!(
+                "the starter of this user's scheduled task {} took the request to start the \
+                 control daemon for environment {}, and no daemon answered within {} seconds: {}; \
+                 {}; what the daemon writes is in {}",
+                name,
+                environment_id,
+                bound.as_secs(),
+                *last,
+                said,
+                Shown::root(&log.path)
+            )),
+            Err(error) => super::unanswered(shown!(
+                "the scheduled task {} was run for environment {} and no control daemon answered \
+                 within {} seconds: {}; whether its starter took the request cannot be told: {}; \
+                 {}; what the daemon writes is in {}",
+                name,
+                environment_id,
+                bound.as_secs(),
+                *last,
+                Shown::ipc(&error),
+                said,
+                Shown::root(&log.path)
+            )),
+        }
+    }
+
+    /// The failure of a start whose request no starter took, and which was withdrawn: the Task
+    /// Scheduler did not start the task's starter, which it does only in a session where the user
+    /// is signed in.
+    fn not_taken(
         environment: &EnvironmentPaths,
         bound: Duration,
         session: Option<u32>,
@@ -1697,10 +1769,10 @@ mod windows {
             code: kr_protocol::error::ErrorCode::EnvironmentUnavailable,
             message: shown!(
                 "the scheduled task {} was run for environment {} and its starter did not take the \
-                 request to start the control daemon within {} seconds, so no daemon was started: \
-                 the task starts it only in a session where you are signed in{}; sign in to this \
-                 computer, at its console or over remote desktop, and run kr new again ({}, for \
-                 all of the task's runs)",
+                 request to start the control daemon within {} seconds, so the request was \
+                 withdrawn and no daemon was started for it: the task starts it only in a session \
+                 where you are signed in{}; sign in to this computer, at its console or over \
+                 remote desktop, and run kr new again ({}, for all of the task's runs)",
                 task::name(environment_id),
                 environment_id,
                 bound.as_secs(),

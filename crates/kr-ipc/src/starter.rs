@@ -252,16 +252,37 @@ pub fn take_claim(
     Ok(None)
 }
 
-/// Whether the claim for `request` has been taken: a starter created its taken marker.
+/// What withdrawing a claim found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Withdrawal {
+    /// No starter had taken the claim, and none can take it now: nothing is started for it.
+    Withdrawn,
+    /// A starter took the claim first. That says nothing of what the starter did with it: a
+    /// lapsed claim is taken and not acted on, and a start can fail after it was admitted.
+    Taken,
+}
+
+/// Withdraws the claim for `request`, as the command that left it does once it stops waiting for
+/// the start, or once the run meant to take it failed.
 ///
-/// A command that left a claim and ran the environment's task asks this to tell a task whose
-/// starter never ran from a daemon that was started and did not answer.
-#[must_use]
-pub fn claim_taken(environment: &EnvironmentPaths, request: Uuid) -> bool {
-    environment
+/// The command takes the claim itself, by creating its taken marker as a starter would. Only one
+/// creation of the marker succeeds, so either the command withdraws the claim and no starter can
+/// take it afterwards, or a starter took it first and the command learns so.
+///
+/// # Errors
+///
+/// Returns an error when the marker can be neither created nor found to exist.
+pub fn withdraw_claim(environment: &EnvironmentPaths, request: Uuid) -> Result<Withdrawal> {
+    let marker = environment
         .start_claims_dir()
-        .join(format!("{request}.{TAKEN}"))
-        .exists()
+        .join(format!("{request}.{TAKEN}"));
+    match crate::paths::create_new_owner_only_file(&marker, &[]) {
+        Ok(()) => Ok(Withdrawal::Withdrawn),
+        Err(IpcError::Io { source, .. }) if source.kind() == std::io::ErrorKind::AlreadyExists => {
+            Ok(Withdrawal::Taken)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// Reads one claim this host wrote.
@@ -2261,22 +2282,28 @@ mod tests {
         );
     }
 
-    /// A command that left a claim can tell whether a starter took it: not before one did, and
-    /// from then on for the rest of the boot, whether the claim was acted on or had lapsed.
+    /// A command withdraws the claim it left once it stops waiting: a claim no starter took is
+    /// withdrawn, and no starter takes it afterwards; one a starter took first is found taken,
+    /// whether the starter acted on it or it had lapsed.
     #[test]
-    fn a_claim_is_known_to_be_taken_once_a_starter_took_it() {
+    fn a_claim_is_withdrawn_unless_a_starter_took_it_first() {
         let host = TempHost::create();
         let environment = host.environment();
-        let left = claim(10_000);
-        assert!(
-            !claim_taken(&environment, left.request),
-            "no claim was left yet"
+        let unwanted = claim(10_000);
+        leave_claim(&environment, &unwanted).expect("the claim is left");
+        assert_eq!(
+            withdraw_claim(&environment, unwanted.request).expect("the claim is withdrawn"),
+            Withdrawal::Withdrawn
         );
-        leave_claim(&environment, &left).expect("the claim is left");
         assert!(
-            !claim_taken(&environment, left.request),
-            "no starter has taken it"
+            take_claim(&environment, &boot(1), 5_000)
+                .expect("the directory is read")
+                .is_none(),
+            "no starter takes a withdrawn claim"
         );
+
+        let live = claim(10_000);
+        leave_claim(&environment, &live).expect("the claim is left");
         let lapsed = claim(1_000);
         leave_claim(&environment, &lapsed).expect("a second claim is left");
         // A starter stops at the first claim it may act on; one that looks after it takes the
@@ -2284,16 +2311,21 @@ mod tests {
         let taken = take_claim(&environment, &boot(1), 5_000)
             .expect("the directory is read")
             .expect("the live claim is taken");
-        assert_eq!(taken.claim(), &left);
-        assert!(claim_taken(&environment, left.request), "the live one");
+        assert_eq!(taken.claim(), &live);
         assert!(
             take_claim(&environment, &boot(1), 5_000)
                 .expect("the directory is read")
                 .is_none(),
             "nothing else may be acted on"
         );
-        assert!(
-            claim_taken(&environment, lapsed.request),
+        assert_eq!(
+            withdraw_claim(&environment, live.request).expect("the marker is found"),
+            Withdrawal::Taken,
+            "the live one"
+        );
+        assert_eq!(
+            withdraw_claim(&environment, lapsed.request).expect("the marker is found"),
+            Withdrawal::Taken,
             "and the lapsed one, which was taken and not acted on"
         );
     }
