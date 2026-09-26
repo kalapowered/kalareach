@@ -530,25 +530,46 @@ impl ConnectorSources {
         sources: Vec<ConnectorSource>,
     ) -> Vec<(ConnectorSource, ConnectorRefusal)> {
         let mut refused = Vec::new();
-        let mut connectors = Vec::new();
-        let mut integrating: BTreeMap<String, Vec<InstalledConnector>> = BTreeMap::new();
+        let mut read = Vec::new();
         for source in sources {
             match InstalledConnector::read(source.clone()) {
-                Ok(connector) => match connector
-                    .integration()
-                    .map(|integration| integration.command.clone())
-                {
-                    Some(command) => integrating.entry(command).or_default().push(connector),
-                    None => connectors.push(Arc::new(connector)),
-                },
+                Ok(connector) => read.push(Arc::new(connector)),
                 Err(refusal) => refused.push((source, refusal)),
+            }
+        }
+        refused.extend(
+            self.replace_read(read)
+                .into_iter()
+                .map(|(connector, refusal)| (connector.source.clone(), refusal)),
+        );
+        refused
+    }
+
+    /// Replaces the whole set with connectors already read and checked.
+    ///
+    /// A connector that integrates no command is held for matching and resolves no command. Two
+    /// that integrate one command name are both left out and returned with the reason, because
+    /// nothing here can say which of them a person meant.
+    pub fn replace_read(
+        &self,
+        read: Vec<Arc<InstalledConnector>>,
+    ) -> Vec<(Arc<InstalledConnector>, ConnectorRefusal)> {
+        let mut refused = Vec::new();
+        let mut connectors = Vec::new();
+        let mut integrating: BTreeMap<String, Vec<Arc<InstalledConnector>>> = BTreeMap::new();
+        for connector in read {
+            match connector
+                .integration()
+                .map(|integration| integration.command.clone())
+            {
+                Some(command) => integrating.entry(command).or_default().push(connector),
+                None => connectors.push(connector),
             }
         }
         let mut by_command = BTreeMap::new();
         for (command, mut claimed) in integrating {
             if claimed.len() == 1 {
                 if let Some(connector) = claimed.pop() {
-                    let connector = Arc::new(connector);
                     connectors.push(Arc::clone(&connector));
                     by_command.insert(command, connector);
                 }
@@ -560,7 +581,7 @@ impl ConnectorSources {
                 .collect();
             for connector in claimed {
                 refused.push((
-                    connector.source.clone(),
+                    connector,
                     ConnectorRefusal::new(format!(
                         "{command:?} is integrated by {}, and one command resolves to one \
                          connector",

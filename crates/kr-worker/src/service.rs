@@ -209,6 +209,10 @@ pub struct WorkerService {
     attention_fence: Arc<crate::attention_fence::AttentionFence>,
     /// The trusted broker: the agent processes, their gateway and the resources it arbitrates.
     broker: Arc<crate::broker::Broker>,
+    /// The plugin admissions the control daemon handed this worker, as it read them.
+    plugin_admissions: Arc<crate::broker::catalogue::Admissions>,
+    /// The connectors those admissions carry, which the command backends resolve from.
+    connector_sources: Arc<crate::broker::connectors::ConnectorSources>,
     /// The frozen copies the connections of this worker are reading their recoveries out of.
     recoveries: crate::recovery::RecoveryCopies,
     build_id: kr_protocol::ids::BuildId,
@@ -418,6 +422,8 @@ impl WorkerService {
             journal_changes,
             attention_fence,
             broker,
+            plugin_admissions: Arc::new(crate::broker::catalogue::Admissions::new()),
+            connector_sources: Arc::new(crate::broker::connectors::ConnectorSources::new()),
             recoveries: crate::recovery::RecoveryCopies::new(),
             build_id: binding.build_id,
             #[cfg(feature = "testing")]
@@ -425,6 +431,112 @@ impl WorkerService {
             #[cfg(feature = "testing")]
             replacement_pause: Mutex::new(None),
         })
+    }
+
+    /// Holds the plugin admissions, and the connectors they carry, that this worker read before it
+    /// started its shell, so every later snapshot applies to them.
+    #[must_use]
+    pub fn with_plugin_admissions(
+        mut self,
+        admissions: Arc<crate::broker::catalogue::Admissions>,
+        sources: Arc<crate::broker::connectors::ConnectorSources>,
+    ) -> Self {
+        self.plugin_admissions = admissions;
+        self.connector_sources = sources;
+        self
+    }
+
+    /// Returns the plugin admissions this worker holds.
+    #[must_use]
+    pub fn plugin_admissions(&self) -> &Arc<crate::broker::catalogue::Admissions> {
+        &self.plugin_admissions
+    }
+
+    /// Returns the connectors the admissions carry.
+    #[must_use]
+    pub fn connector_sources(&self) -> &Arc<crate::broker::connectors::ConnectorSources> {
+        &self.connector_sources
+    }
+
+    /// Takes one part of a snapshot of plugin admissions on the control daemon's authority
+    /// connection, and applies the snapshot once every part has arrived: the answer is the
+    /// report's first part, and the rest follow it on this connection.
+    ///
+    /// Only the authority connection of the generation this connection proved hands this worker
+    /// admissions. A part out of order discards the snapshot it would belong to, and a snapshot
+    /// whose connection ends part way is never applied.
+    fn plugin_admissions_part(
+        &self,
+        state: &mut ConnectionState,
+        part: kr_protocol::admission::PluginAdmissions,
+    ) -> Option<ControlFrame> {
+        let refuse = |state: &mut ConnectionState, code: ErrorCode, message: &str| {
+            state.admissions_parts.clear();
+            Some(failure(
+                RequestId::new(0),
+                &ProtocolError::new(code, message),
+            ))
+        };
+        if state.client_kind != LocalClientKind::Controller
+            || state.controller_role != ControllerConnectionRole::Authority
+        {
+            return refuse(
+                state,
+                ErrorCode::PermissionDenied,
+                "only the control daemon's authority connection hands this worker its plugin \
+                 admissions",
+            );
+        }
+        if let Err(error) = self.check_authority(state) {
+            state.admissions_parts.clear();
+            return Some(failure(RequestId::new(0), &error.to_protocol_error()));
+        }
+        if part.environment_id != self.environment_id
+            || state.generation != Some(part.frame.generation)
+        {
+            return refuse(
+                state,
+                ErrorCode::PermissionDenied,
+                "these admissions name another environment, or another controller generation \
+                 than this connection proved",
+            );
+        }
+        let follows = match state.admissions_parts.last() {
+            None => part.part == 1,
+            Some(last) => {
+                last.frame == part.frame
+                    && last.parts == part.parts
+                    && part.part == last.part.saturating_add(1)
+            }
+        };
+        if !follows
+            || part.parts == 0
+            || part.part > part.parts
+            || part.parts > kr_protocol::limits::MAX_ADMISSION_PARTS
+        {
+            return refuse(
+                state,
+                ErrorCode::InvalidArgument,
+                "the parts of a snapshot of plugin admissions arrived out of order",
+            );
+        }
+        let complete = part.part == part.parts;
+        state.admissions_parts.push(part);
+        if !complete {
+            return None;
+        }
+        let parts = std::mem::take(&mut state.admissions_parts);
+        self.plugin_admissions
+            .apply(&parts, &self.connector_sources);
+        let session_id = self.runtime.session().id();
+        let mut report = self
+            .plugin_admissions
+            .report(session_id, self.broker.live_bindings())
+            .into_iter()
+            .map(|part| ControlFrame::PluginAdmissionsAck(Box::new(part)));
+        let first = report.next();
+        state.pending_report = report.collect();
+        first
     }
 
     /// Stops the next approval immediately before the broker admits it, for this host's own tests.
@@ -986,6 +1098,17 @@ impl WorkerService {
                 {
                     break;
                 }
+                // A report on plugin admissions longer than one frame follows its first part.
+                let mut report_written = true;
+                for part in std::mem::take(&mut state.pending_report) {
+                    if !write_frame(&writable, &writer, &part, &withdrawn, protected).await {
+                        report_written = false;
+                        break;
+                    }
+                }
+                if !report_written {
+                    break;
+                }
                 // A newly accepted attention connection states the privacy fence before anything
                 // else it carries. One whose statement cannot be written whole, or cannot name the
                 // journal's generation, is ended, and the next connection states the fence instead.
@@ -1397,6 +1520,7 @@ impl WorkerService {
             ControlFrame::AuthorityRevision(notice) => {
                 Some(self.acknowledge_revision(state, &notice))
             }
+            ControlFrame::PluginAdmissions(part) => self.plugin_admissions_part(state, *part),
             ControlFrame::Request(request) => {
                 // A source that asked to wait waits here: outside the session lock, outside the
                 // dispatch barrier and outside any transaction. Section 11 makes a long poll an
@@ -6115,6 +6239,10 @@ pub struct ConnectionState {
     pub pending_delivery: Option<(kr_protocol::ids::ActionId, crate::runtime::PendingDelivery)>,
     /// A generation challenge waiting to be sent after the current reply.
     pub pending_challenge: Option<ControlFrame>,
+    /// The parts of a snapshot of plugin admissions received so far, applied once all have come.
+    pub admissions_parts: Vec<kr_protocol::admission::PluginAdmissions>,
+    /// The parts of a report on plugin admissions still to be sent after the current reply.
+    pub pending_report: Vec<ControlFrame>,
     /// The first statement of a newly accepted attention connection, sent after the acceptance.
     pub pending_statement: Option<crate::attention_fence::Statement>,
     /// The screen a new subscription is drawn before live output resumes.
@@ -6172,6 +6300,8 @@ impl ConnectionState {
             pending_upstream: None,
             pending_delivery: None,
             pending_challenge: None,
+            admissions_parts: Vec::new(),
+            pending_report: Vec::new(),
             pending_statement: None,
             restoration: None,
             delivery: None,

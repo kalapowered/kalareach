@@ -182,8 +182,13 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
         return Err("the launch specification does not match the reservation".into());
     }
     // The first snapshot of plugin admissions follows the specification, in the parts it
-    // announced, before anything else does.
-    let _admissions = read_first_admissions(&mut reader, &specification).await?;
+    // announced, before anything else does. It is applied before the shell starts: each admitted
+    // package is read and checked here, and the connectors among them are what the shell's first
+    // command resolves against.
+    let first = read_first_admissions(&mut reader, &specification).await?;
+    let admissions = Arc::new(kr_worker::broker::catalogue::Admissions::new());
+    let sources = Arc::new(kr_worker::broker::connectors::ConnectorSources::new());
+    admissions.apply(&first, &sources);
     // Managed mode launches a KalaReach-qualified package: the exact binary its reader patch was
     // built into, with the flags that package declares. A shell no package qualifies is named
     // rather than silently substituted.
@@ -288,29 +293,32 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
     // created is reachable on it: section 7 lets a native startup prompt read input in its own
     // non-primary context while the profiles run, and a worker that only began serving afterwards
     // would be the deadlock that paragraph forbids.
-    let service = Arc::new(WorkerService::new(
-        Arc::clone(&runtime),
-        identity,
-        endpoint.clone(),
-        ServiceBinding {
-            environment_id,
-            boot_identity,
-            controller_public_key: specification.controller_public_key,
-            controller_generation: specification.controller_generation,
-            build_id: build_id(),
-            journal_path: Some(environment.journal_database(specification.session_id)),
-        },
-    )?);
-    // The backends an integrated invocation is given before it runs. The connectors they are
-    // established from arrive with the installation's hand-over; until one does, every resolve is
-    // answered as a bypass, and the invocation runs as typed.
+    let service = Arc::new(
+        WorkerService::new(
+            Arc::clone(&runtime),
+            identity,
+            endpoint.clone(),
+            ServiceBinding {
+                environment_id,
+                boot_identity,
+                controller_public_key: specification.controller_public_key,
+                controller_generation: specification.controller_generation,
+                build_id: build_id(),
+                journal_path: Some(environment.journal_database(specification.session_id)),
+            },
+        )?
+        .with_plugin_admissions(admissions, Arc::clone(&sources)),
+    );
+    // The backends an integrated invocation is given before it runs, established from the
+    // connectors the admissions carry; every later snapshot replaces them, and a resolve that finds
+    // none is answered as a bypass, so the invocation runs as typed.
     let _command_backends =
         service.install_command_backends(kr_worker::broker::commands::CommandBackendsConfig {
             session_id,
             environment_id,
             os_user: kr_worker::desktop::os_user(),
             runtime_dir: environment.runtime_dir().to_path_buf(),
-            sources: Arc::new(kr_worker::broker::connectors::ConnectorSources::new()),
+            sources,
             launcher: installed_launcher(),
         });
     let serving = tokio::spawn(Arc::clone(&service).serve(listener));

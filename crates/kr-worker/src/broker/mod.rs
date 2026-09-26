@@ -53,6 +53,7 @@ pub mod arbitration;
 pub mod attach;
 pub mod bridge;
 pub mod capability;
+pub mod catalogue;
 pub mod channels;
 pub mod commands;
 pub mod connectors;
@@ -239,6 +240,10 @@ pub struct Binding {
     /// Native forwarding is untouched by this. Section 11: "A Wasm fault disables the affected
     /// rich capabilities; it cannot stall or discard otherwise valid native traffic."
     pub rich_disabled: Option<String>,
+    /// The release this binding holds, where it was made from admissions.
+    pub release: Option<kr_protocol::admission::LiveRelease>,
+    /// True once the binding is due to end at its next admission boundary.
+    pub ending: bool,
 }
 
 impl Binding {
@@ -1396,9 +1401,35 @@ impl Broker {
                 trust,
                 actions: BTreeMap::new(),
                 rich_disabled: None,
+                release: None,
+                ending: false,
             },
         );
         Ok(())
+    }
+
+    /// Returns every live binding with the release it holds, for a report on plugin admissions.
+    ///
+    /// Only a binding made from admissions knows its release; one made from a test's own
+    /// descriptor is not a release this host's catalogue installed, and is not reported.
+    #[must_use]
+    pub fn live_bindings(&self) -> Vec<kr_protocol::admission::LiveBinding> {
+        self.state()
+            .bindings
+            .values()
+            .filter_map(|binding| {
+                binding
+                    .release
+                    .as_ref()
+                    .map(|release| kr_protocol::admission::LiveBinding {
+                        binding_id: binding.binding_id,
+                        application_instance_id: binding.application_instance_id,
+                        release: release.clone(),
+                        ending: binding.ending,
+                        component: Nullable::null(),
+                    })
+            })
+            .collect()
     }
 
     /// Returns the grants one binding holds.
