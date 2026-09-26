@@ -536,28 +536,36 @@ pub fn palette() -> PaletteState {
     }
 }
 
-/// A reset, at `generation`, of a window that has not changed since the view attached.
-pub fn reset(generation: u64, cursor: u64, reason: ProjectionResetReason) -> ProjectionReset {
+/// A reset, at `generation`, drawn for the view's window at `window_revision`: 0 until the window
+/// first changes, and one more at each change the host makes to it.
+pub fn reset(
+    generation: u64,
+    cursor: u64,
+    reason: ProjectionResetReason,
+    window_revision: u64,
+) -> ProjectionReset {
     ProjectionReset {
         projection_generation: U64::new(generation),
         cursor: U64::new(cursor),
         reason,
-        window_revision: U64::ZERO,
+        window_revision: U64::new(window_revision),
     }
 }
 
-/// A snapshot's header: a `columns` by `rows` session, the window at `top_row`.
+/// A snapshot's header: a `columns` by `rows` session, the window at `top_row`, drawn for the
+/// view's window at `window_revision`.
 pub fn snapshot(
     generation: u64,
     cursor: u64,
     columns: u64,
     rows: u64,
     top_row: u64,
+    window_revision: u64,
 ) -> ProjectionSnapshot {
     ProjectionSnapshot {
         projection_generation: U64::new(generation),
         output_cursor: U64::new(cursor),
-        window_revision: U64::ZERO,
+        window_revision: U64::new(window_revision),
         active_buffer: ProjectedBuffer::Primary,
         dimensions: Dimensions::new(columns, rows),
         viewport: viewport(top_row, columns, rows),
@@ -666,17 +674,29 @@ pub fn delta(
     }
 }
 
-/// A subscription's opening screen: its reset, its header and one page of `rows`.
-pub async fn screen(link: &mut Link, generation: u64, cursor: u64, rows: Vec<ProjectedRow>) {
+/// A subscription's opening screen, drawn for the view's window at `window_revision`: its reset,
+/// its header and one page of `rows`.
+pub async fn screen(
+    link: &mut Link,
+    generation: u64,
+    cursor: u64,
+    rows: Vec<ProjectedRow>,
+    window_revision: u64,
+) {
     let height = u64::try_from(rows.len()).unwrap_or(1);
     link.push(
         kr_protocol::projection::PROJECTION_RESET_EVENT,
-        &reset(generation, cursor, ProjectionResetReason::Attached),
+        &reset(
+            generation,
+            cursor,
+            ProjectionResetReason::Attached,
+            window_revision,
+        ),
     )
     .await;
     link.push(
         kr_protocol::projection::PROJECTION_SNAPSHOT_EVENT,
-        &snapshot(generation, cursor, 10, height, 0),
+        &snapshot(generation, cursor, 10, height, 0, window_revision),
     )
     .await;
     link.push(

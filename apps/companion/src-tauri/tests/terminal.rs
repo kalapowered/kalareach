@@ -238,7 +238,7 @@ async fn showing(page: &Page, worker: &mut ScriptedWorker, channel: u32) -> (Str
     let mut link = worker.link().await;
     link.attach().await;
     assert_eq!(page.state(channel, 0).await["state"], "waiting");
-    screen(&mut link, 1, 40, vec![row(0, "first"), row(1, "second")]).await;
+    screen(&mut link, 1, 40, vec![row(0, "first"), row(1, "second")], 0).await;
     let shown = page.state(channel, 1).await;
     assert_eq!(shown["state"], "showing");
     assert_eq!(text_of(&shown), vec!["first", "second"]);
@@ -276,7 +276,7 @@ async fn a_view_attaches_on_the_workers_endpoint_with_no_claim_and_no_profile() 
         waiting["attachment"]["presentation_reason"],
         "no_terminal_profile"
     );
-    screen(&mut link, 1, 40, vec![row(0, "hello")]).await;
+    screen(&mut link, 1, 40, vec![row(0, "hello")], 0).await;
     let shown = page.state(7, 1).await;
     assert_eq!(
         shown["attachment"], waiting["attachment"],
@@ -438,10 +438,10 @@ async fn a_snapshot_is_published_only_at_its_last_page() {
     assert_eq!(page.state(3, 0).await["state"], "waiting");
     link.push(
         PROJECTION_RESET_EVENT,
-        &reset(1, 40, ProjectionResetReason::Attached),
+        &reset(1, 40, ProjectionResetReason::Attached, 0),
     )
     .await;
-    link.push(PROJECTION_SNAPSHOT_EVENT, &snapshot(1, 40, 10, 2, 0))
+    link.push(PROJECTION_SNAPSHOT_EVENT, &snapshot(1, 40, 10, 2, 0, 0))
         .await;
     link.push(
         PROJECTION_ROWS_EVENT,
@@ -565,7 +565,7 @@ async fn what_cannot_be_applied_resubscribes_once() {
         link.answer(&subscribe, &scripted_worker::subscribed())
             .await;
         link.restart_stream();
-        screen(&mut link, 2, 80, vec![row(0, "fresh"), row(1, "screen")]).await;
+        screen(&mut link, 2, 80, vec![row(0, "fresh"), row(1, "screen")], 0).await;
         let shown = page_view.state(3, 3).await;
         assert_eq!(shown["state"], "showing", "{case}");
         assert_eq!(text_of(&shown), vec!["fresh", "screen"], "{case}");
@@ -586,12 +586,12 @@ async fn a_reset_waits_for_its_snapshot() {
     let (_view, mut link) = showing(&page_view, &mut worker, 3).await;
     link.push(
         PROJECTION_RESET_EVENT,
-        &reset(2, 60, ProjectionResetReason::BufferSwitch),
+        &reset(2, 60, ProjectionResetReason::BufferSwitch, 0),
     )
     .await;
     assert_eq!(page_view.state(3, 2).await["state"], "waiting");
     assert!(link.quiet_for(QUIET).await, "a reset sends nothing");
-    link.push(PROJECTION_SNAPSHOT_EVENT, &snapshot(2, 60, 10, 2, 0))
+    link.push(PROJECTION_SNAPSHOT_EVENT, &snapshot(2, 60, 10, 2, 0, 0))
         .await;
     link.push(
         PROJECTION_ROWS_EVENT,
@@ -613,7 +613,8 @@ async fn an_unchanged_size_sends_nothing() {
     assert_eq!(page_view.states(3).len(), 2, "and the screen stays");
 }
 
-/// Rapid sizes end at the newest, with one report outstanding at a time.
+/// Rapid sizes end at the newest, with one report outstanding at a time, and every report keeps the
+/// window at the live screen's first line and column.
 #[tokio::test(flavor = "multi_thread")]
 async fn rapid_sizes_end_at_the_newest_with_one_report_outstanding() {
     let mut worker = ScriptedWorker::start(Challenge::Answered);
@@ -627,14 +628,25 @@ async fn rapid_sizes_end_at_the_newest_with_one_report_outstanding() {
         asked.position.0, None,
         "the window stays on the live screen"
     );
+    assert_eq!(
+        asked.column,
+        kr_protocol::scalars::U64::ZERO,
+        "from its first column"
+    );
     page_view.resize(&view, 14, 4);
     page_view.resize(&view, 16, 5);
     assert!(link.quiet_for(QUIET).await, "one report at a time");
-    link.answer(&first, &viewport_answer()).await;
+    link.answer(&first, &viewport_answer(1)).await;
     let second = link.expect(Method::AttachmentViewport).await;
     let asked: AttachmentViewportParams = second.params();
     assert_eq!(asked.dimensions, Dimensions::new(16, 5), "the newest size");
-    link.answer(&second, &viewport_answer()).await;
+    assert_eq!(asked.position.0, None, "still on the live screen");
+    assert_eq!(
+        asked.column,
+        kr_protocol::scalars::U64::ZERO,
+        "still from its first column"
+    );
+    link.answer(&second, &viewport_answer(2)).await;
     assert!(link.quiet_for(QUIET).await);
 }
 
@@ -723,12 +735,12 @@ async fn an_accepted_size_recovers_whether_the_marker_comes_before_or_after_the_
         page_view.resize(&view, 12, 3);
         let report = link.expect(Method::AttachmentViewport).await;
         if !marker_first {
-            link.answer(&report, &viewport_answer()).await;
+            link.answer(&report, &viewport_answer(1)).await;
         }
         link.push("session.resync", &resync_marker(60)).await;
         let subscribe = link.expect(Method::EventsSubscribe).await;
         if marker_first {
-            link.answer(&report, &viewport_answer()).await;
+            link.answer(&report, &viewport_answer(1)).await;
         }
         link.answer(&subscribe, &scripted_worker::subscribed())
             .await;
@@ -738,6 +750,7 @@ async fn an_accepted_size_recovers_whether_the_marker_comes_before_or_after_the_
             2,
             60,
             vec![row(0, "wider"), row(1, "screen"), row(2, "now")],
+            1,
         )
         .await;
         let shown = page_view.state(3, 3).await;
@@ -753,7 +766,7 @@ async fn an_accepted_size_recovers_whether_the_marker_comes_before_or_after_the_
         let again = link.expect(Method::EventsSubscribe).await;
         link.answer(&again, &scripted_worker::subscribed()).await;
         link.restart_stream();
-        screen(&mut link, 3, 80, vec![row(0, "third")]).await;
+        screen(&mut link, 3, 80, vec![row(0, "third")], 1).await;
         assert_eq!(text_of(&page_view.state(3, 5).await), vec!["third"]);
     }
 }
@@ -778,7 +791,7 @@ async fn an_undecodable_reset_on_the_new_stream_still_opens_the_guard() {
     let again = link.expect(Method::EventsSubscribe).await;
     link.answer(&again, &scripted_worker::subscribed()).await;
     link.restart_stream();
-    screen(&mut link, 2, 60, vec![row(0, "recovered")]).await;
+    screen(&mut link, 2, 60, vec![row(0, "recovered")], 0).await;
     assert_eq!(text_of(&page_view.state(3, 3).await), vec!["recovered"]);
 }
 
@@ -798,7 +811,7 @@ async fn a_new_stream_that_opens_with_a_gap_installs_its_screen() {
         &json!({"requested_cursor": "10", "oldest_retained_cursor": "20"}),
     )
     .await;
-    screen(&mut link, 2, 60, vec![row(0, "after"), row(1, "a gap")]).await;
+    screen(&mut link, 2, 60, vec![row(0, "after"), row(1, "a gap")], 0).await;
     assert_eq!(
         text_of(&page_view.state(3, 3).await),
         vec!["after", "a gap"]
@@ -913,7 +926,7 @@ async fn closing_detaches_and_closes_the_link() {
     let view = page_view.open(worker.session_id, 10, 2, 3);
     let mut link = worker.link().await;
     let (attachment_id, _) = link.attach().await;
-    screen(&mut link, 1, 40, vec![row(0, "shown")]).await;
+    screen(&mut link, 1, 40, vec![row(0, "shown")], 0).await;
     page_view.state(3, 1).await;
     page_view.close(&view);
     assert_eq!(page_view.held(), 0, "a closed view is not held");
@@ -1119,8 +1132,8 @@ async fn one_views_states_never_reach_another_views_channel() {
     let _two = page_view.open(second.session_id, 10, 1, 6);
     let mut two = second.link().await;
     two.attach().await;
-    screen(&mut one, 1, 40, vec![row(0, "one")]).await;
-    screen(&mut two, 1, 40, vec![row(0, "two")]).await;
+    screen(&mut one, 1, 40, vec![row(0, "one")], 0).await;
+    screen(&mut two, 1, 40, vec![row(0, "two")], 0).await;
     assert_eq!(text_of(&page_view.state(5, 1).await), vec!["one"]);
     assert_eq!(text_of(&page_view.state(6, 1).await), vec!["two"]);
     assert_eq!(page_view.states(5).len(), 2);
@@ -1139,7 +1152,7 @@ async fn control_characters_never_reach_the_page() {
     let mut hostile = row(0, text);
     hostile.runs[0].cells =
         kr_protocol::scalars::U64::new(kr_term::unicode::cells_for(text) as u64);
-    screen(&mut link, 1, 40, vec![hostile]).await;
+    screen(&mut link, 1, 40, vec![hostile], 0).await;
     let shown = page_view.state(3, 1).await;
     let drawn = text_of(&shown).join("");
     assert!(
@@ -1152,7 +1165,9 @@ async fn control_characters_never_reach_the_page() {
     );
 }
 
-fn viewport_answer() -> kr_protocol::attachment::AttachmentViewportResult {
+/// The host's answer to an accepted size report: the window stays at the live screen's first line
+/// and column, and the report left it at `window_revision`.
+fn viewport_answer(window_revision: u64) -> kr_protocol::attachment::AttachmentViewportResult {
     kr_protocol::attachment::AttachmentViewportResult {
         geometry: kr_protocol::attachment::GeometryState {
             owner: kr_protocol::scalars::Nullable::null(),
@@ -1162,7 +1177,7 @@ fn viewport_answer() -> kr_protocol::attachment::AttachmentViewportResult {
         presentation: kr_protocol::attachment::TerminalPresentationMode::Viewport,
         position: kr_protocol::scalars::Nullable::null(),
         column: kr_protocol::scalars::U64::ZERO,
-        window_revision: kr_protocol::scalars::U64::ZERO,
+        window_revision: kr_protocol::scalars::U64::new(window_revision),
     }
 }
 
