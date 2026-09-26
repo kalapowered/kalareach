@@ -242,7 +242,7 @@ fn bind_decoder(broker: &Broker, binding_id: BrokerBindingId, package: &PackageI
         ..trust(&[permission_method()], true)
     };
     broker
-        .bind(
+        .bind_descriptor(
             binding_id,
             instance(2),
             package.plugin_id.clone(),
@@ -580,7 +580,7 @@ fn broker_recording(
         )
         .expect("the instance is registered");
     broker
-        .bind(
+        .bind_descriptor(
             binding(9),
             instance(2),
             PluginId::new("kalareach.codex").expect("valid"),
@@ -806,7 +806,7 @@ fn kr_req_11_25_decoding_trust_is_explicit_and_display_only_creates_no_approval(
         .register_instance(instance(2), IntegrationMode::Gateway, None, None)
         .expect("the instance is registered");
     let refusal = broker
-        .bind(
+        .bind_descriptor(
             binding(9),
             instance(2),
             PluginId::new("kalareach.codex").expect("valid"),
@@ -821,7 +821,7 @@ fn kr_req_11_25_decoding_trust_is_explicit_and_display_only_creates_no_approval(
 
     // And one package's trust is never another's: the record names the package it was granted to.
     let refusal = broker
-        .bind(
+        .bind_descriptor(
             binding(9),
             instance(2),
             PluginId::new("someone.else").expect("valid"),
@@ -863,7 +863,7 @@ fn kr_req_11_26_the_broker_checks_role_binding_generation_and_reuse_and_retains_
             )
             .expect("the instance is registered");
         broker
-            .bind(
+            .bind_descriptor(
                 binding(9),
                 instance(2),
                 PluginId::new("kalareach.codex").expect("valid"),
@@ -1050,7 +1050,7 @@ fn kr_req_11_25_a_component_packages_trust_is_derived_from_its_grants_and_record
             .register_instance(instance(2), IntegrationMode::NativeBridge, None, None)
             .expect("the instance is registered");
         broker
-            .bind(
+            .bind_descriptor(
                 binding(9),
                 instance(2),
                 package.plugin_id.clone(),
@@ -1137,7 +1137,7 @@ fn kr_req_11_26_a_method_outside_the_trust_stays_recorded_and_is_answered_native
         )
         .expect("the instance is registered");
     broker
-        .bind(
+        .bind_descriptor(
             binding(9),
             instance(2),
             package.plugin_id.clone(),
@@ -1274,7 +1274,7 @@ fn kr_req_11_26_on_a_live_connection_only_the_recording_packages_decoder_interpr
     let derived =
         decoding_trust(&connector, TimestampMs::new(1)).expect("approval.decode is granted");
     broker
-        .bind(
+        .bind_descriptor(
             binding(9),
             instance(2),
             package.plugin_id.clone(),
@@ -1287,7 +1287,7 @@ fn kr_req_11_26_on_a_live_connection_only_the_recording_packages_decoder_interpr
         .expect("the channel's package is bound");
     let foreign = other_package();
     broker
-        .bind(
+        .bind_descriptor(
             binding(10),
             instance(2),
             foreign.plugin_id.clone(),
@@ -1587,7 +1587,7 @@ async fn kr_req_11_26_a_connection_identifier_keeps_its_package_across_a_restart
 async fn kr_req_11_26_a_binding_identifier_keeps_its_package() {
     let foreign = other_package();
     let bind_as = |broker: &Broker, package: &PackageIdentity| {
-        broker.bind(
+        broker.bind_descriptor(
             binding(9),
             instance(2),
             package.plugin_id.clone(),
@@ -1713,7 +1713,7 @@ fn kr_req_11_25_withdrawing_a_grant_narrows_a_component_packages_trust_where_it_
         .register_instance(instance(2), IntegrationMode::NativeBridge, None, None)
         .expect("the instance is registered");
     broker
-        .bind(
+        .bind_descriptor(
             binding(9),
             instance(2),
             package.plugin_id.clone(),
@@ -1826,7 +1826,7 @@ fn component_decoded(connector: &InstalledConnector) -> (Broker, PendingResource
         )
         .expect("the launched instance is registered");
     broker
-        .bind(
+        .bind_descriptor(
             binding(9),
             instance(2),
             package.plugin_id.clone(),
@@ -3184,7 +3184,7 @@ async fn kr_req_11_37_a_committed_gap_records_what_happened_inside_it_and_restor
             )
             .expect("the instance is registered");
         broker
-            .bind(
+            .bind_descriptor(
                 binding(9),
                 instance(2),
                 PluginId::new("kalareach.codex").expect("valid"),

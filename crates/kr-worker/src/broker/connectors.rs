@@ -533,6 +533,8 @@ struct Held {
     connectors: Vec<Arc<InstalledConnector>>,
     /// The connectors whose integration applies, by the command it resolves.
     by_command: BTreeMap<String, Arc<InstalledConnector>>,
+    /// The frame of the admissions snapshot these came from, where one did.
+    frame: Option<kr_protocol::admission::FrameId>,
 }
 
 impl ConnectorSources {
@@ -555,7 +557,7 @@ impl ConnectorSources {
     /// Replaces the whole set with what the installation handed over now.
     ///
     /// Every source is read and checked; one that fails is left out and returned with its
-    /// reason. A connector that integrates no command is held for matching and resolves no
+    /// reason. A connector that integrates no command is held and resolves no
     /// command. Two packages that integrate one command name are both left out, because nothing
     /// here can say which of them a person meant.
     pub fn replace(
@@ -571,21 +573,23 @@ impl ConnectorSources {
             }
         }
         refused.extend(
-            self.replace_read(read)
+            self.replace_read(read, None)
                 .into_iter()
                 .map(|(connector, refusal)| (connector.source.clone(), refusal)),
         );
         refused
     }
 
-    /// Replaces the whole set with connectors already read and checked.
+    /// Replaces the whole set with connectors already read and checked, from the admissions
+    /// snapshot of `frame` where one handed them over.
     ///
-    /// A connector that integrates no command is held for matching and resolves no command. Two
+    /// A connector that integrates no command is held and resolves no command. Two
     /// that integrate one command name are both left out and returned with the reason, because
     /// nothing here can say which of them a person meant.
     pub fn replace_read(
         &self,
         read: Vec<Arc<InstalledConnector>>,
+        frame: Option<kr_protocol::admission::FrameId>,
     ) -> Vec<(Arc<InstalledConnector>, ConnectorRefusal)> {
         let mut refused = Vec::new();
         let mut connectors = Vec::new();
@@ -629,8 +633,29 @@ impl ConnectorSources {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Held {
             connectors,
             by_command,
+            frame,
         };
         refused
+    }
+
+    /// Returns the connector whose integration resolves this command name, where one does, with
+    /// the frame of the admissions snapshot it came from: what a binding made for its launch is
+    /// decided at.
+    #[must_use]
+    pub fn for_command_at(
+        &self,
+        command: &str,
+    ) -> Option<(
+        Arc<InstalledConnector>,
+        Option<kr_protocol::admission::FrameId>,
+    )> {
+        let held = self
+            .held
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        held.by_command
+            .get(command)
+            .map(|connector| (Arc::clone(connector), held.frame))
     }
 
     /// Returns the connector whose integration resolves this command name, where one does.
@@ -642,24 +667,6 @@ impl ConnectorSources {
             .by_command
             .get(command)
             .cloned()
-    }
-
-    /// Returns the connector whose match rules recognise this executable, where exactly one does.
-    #[must_use]
-    pub fn matching(&self, executable: &str) -> Option<Arc<InstalledConnector>> {
-        let held = self
-            .held
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut matching = held
-            .connectors
-            .iter()
-            .filter(|connector| connector.matches_executable(executable));
-        let first = matching.next().cloned();
-        if matching.next().is_some() {
-            return None;
-        }
-        first
     }
 }
 
@@ -708,6 +715,86 @@ pub mod fixture {
     const PLUGIN: &[u8] =
         include_bytes!("../../../../fixtures/bridges/claude-code/plugin-manifest.json");
     const QODER_FLAGS: &[u8] = include_bytes!("../../../../fixtures/bridges/qoder-cli/flags.json");
+
+    /// The example declarative package the committed development catalogue publishes: a manifest,
+    /// a presentation and two assets, and no connector table.
+    const DECLARATIVE: [(&str, &[u8]); 4] = [
+        (
+            kr_plugin_sdk::package::MANIFEST_FILE,
+            include_bytes!(
+                "../../../../fixtures/plugins/catalogue/development/targets/packages/kalareach/example-declarative/0.1.0/plugin.json"
+            ),
+        ),
+        (
+            "presentation.json",
+            include_bytes!(
+                "../../../../fixtures/plugins/catalogue/development/targets/packages/kalareach/example-declarative/0.1.0/presentation.json"
+            ),
+        ),
+        (
+            "README.md",
+            include_bytes!(
+                "../../../../fixtures/plugins/catalogue/development/targets/packages/kalareach/example-declarative/0.1.0/README.md"
+            ),
+        ),
+        (
+            "fixtures/visibility.json",
+            include_bytes!(
+                "../../../../fixtures/plugins/catalogue/development/targets/packages/kalareach/example-declarative/0.1.0/fixtures/visibility.json"
+            ),
+        ),
+    ];
+
+    /// Writes the example declarative package under `root` as the store extracts it, named
+    /// `plugin_name` and recognising an executable named `stem` by a rule of `confidence`, and
+    /// returns what an installation hands over for it, granting the three capabilities it asks
+    /// for. It carries no connector table, so it reads as a package and never as a connector.
+    ///
+    /// # Errors
+    ///
+    /// Returns what writing a file returned.
+    ///
+    /// # Panics
+    ///
+    /// When the committed manifest is not the example's, which a change to the fixture would make
+    /// it.
+    pub fn declarative_package(
+        root: &Path,
+        plugin_name: &str,
+        stem: &str,
+        confidence: kr_plugin_sdk::matching::MatchConfidence,
+    ) -> std::io::Result<ConnectorSource> {
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(DECLARATIVE[0].1).expect("the committed manifest is JSON");
+        manifest["plugin_name"] = serde_json::json!(plugin_name);
+        manifest["match_rules"][0]["executable"]["file_stem"] = serde_json::json!(stem);
+        manifest["match_rules"][0]["confidence"] =
+            serde_json::to_value(confidence).expect("a confidence encodes");
+        let manifest = serde_json::to_string_pretty(&manifest).expect("a manifest encodes");
+        let digest = PayloadDigest::of(manifest.as_bytes());
+        let directory = root.join("packages").join(digest.to_string());
+        std::fs::create_dir_all(directory.join("fixtures"))?;
+        std::fs::write(
+            directory.join(kr_plugin_sdk::package::MANIFEST_FILE),
+            manifest,
+        )?;
+        for (path, bytes) in &DECLARATIVE[1..] {
+            std::fs::write(directory.join(path), bytes)?;
+        }
+        Ok(ConnectorSource {
+            package_digest: Digest256::from_bytes(*digest.as_bytes()),
+            package_dir: directory,
+            bridge: None,
+            granted: [
+                PluginCapability::MetadataMatch,
+                PluginCapability::DeclarativePresentation,
+                PluginCapability::BrokerSemanticEvents,
+            ]
+            .into_iter()
+            .collect(),
+            qualified: Vec::new(),
+        })
+    }
 
     /// What one test package is.
     #[derive(Clone, Debug)]
@@ -1178,6 +1265,6 @@ mod tests {
         assert!(sources.for_command("claude").is_none());
         let refused = sources.replace(Vec::new());
         assert!(refused.is_empty());
-        assert!(sources.matching("/usr/local/bin/claude").is_none());
+        assert!(sources.is_empty());
     }
 }

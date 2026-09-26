@@ -54,6 +54,13 @@ pub const PRUNE_INTERVAL_MS: u64 = 60 * 60 * 1000;
 /// nothing and reading as a fence that named nothing.
 pub const MAX_HELD_REVOCATIONS: usize = 8;
 
+/// The host event kind that records a binding on a release its repository revoked.
+pub const ADAPTER_REVOKED: &str = "adapter.revoked";
+
+/// The host event kind that records that a session holds no binding on a package's revoked
+/// releases any more.
+pub const ADAPTER_CLEARED: &str = "adapter.cleared";
+
 /// One mutation being admitted.
 #[derive(Clone, Debug)]
 pub struct Submission {
@@ -901,6 +908,43 @@ impl Journal {
                     kind,
                     detail,
                     i64::try_from(effect.at).unwrap_or(i64::MAX),
+                    i64::try_from(now_ms.get()).unwrap_or(i64::MAX)
+                ],
+            )
+            .map_err(|error| faulted(&self.health, error))?;
+        self.attention_changes.notify_waiters();
+        Ok(())
+    }
+
+    /// Records one transition of a package's revocation state in this session, as a host event of
+    /// its own kind: [`ADAPTER_REVOKED`] once for a binding on a release its repository revoked,
+    /// with the warning a person reads, and [`ADAPTER_CLEARED`] once the session holds no binding
+    /// on that package's revoked releases. The package is the detail's first line and the words
+    /// the rest, so the transition and the package travel whether or not the words are served.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::JournalUnavailable`] when the write fails.
+    pub fn record_adapter_event(
+        &mut self,
+        plugin_id: &str,
+        transition: kr_protocol::attention::AdapterTransition,
+        text: &str,
+        output_cursor: u64,
+        now_ms: TimestampMs,
+    ) -> Result<()> {
+        let kind = match transition {
+            kr_protocol::attention::AdapterTransition::Revoked => ADAPTER_REVOKED,
+            kr_protocol::attention::AdapterTransition::Cleared => ADAPTER_CLEARED,
+        };
+        self.connection
+            .execute(
+                "INSERT INTO host_events (kind, detail, output_cursor, recorded_at_ms)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    kind,
+                    format!("{plugin_id}\n{text}"),
+                    i64::try_from(output_cursor).unwrap_or(i64::MAX),
                     i64::try_from(now_ms.get()).unwrap_or(i64::MAX)
                 ],
             )

@@ -301,14 +301,13 @@ impl WorkerService {
         &self,
         config: crate::broker::commands::CommandBackendsConfig,
     ) -> Arc<crate::broker::commands::CommandBackends> {
-        // A program the integrated route did not launch is adopted from the same connectors, by
+        // A program the integrated route did not launch is adopted from the same admissions, by
         // a watch of the terminal's foreground, and its adoption ends with the backends when the
         // session closes.
         #[cfg(unix)]
         let adoptions = Arc::new(
             crate::broker::adoption::Adoptions::new(
                 Arc::clone(&self.broker),
-                Arc::clone(&config.sources),
                 config.environment_id,
             )
             .with_views(Arc::downgrade(&self.runtime)),
@@ -441,9 +440,44 @@ impl WorkerService {
         admissions: Arc<crate::broker::catalogue::Admissions>,
         sources: Arc<crate::broker::connectors::ConnectorSources>,
     ) -> Self {
+        admissions.install_into(&self.broker, kr_ipc::now_ms());
         self.plugin_admissions = admissions;
         self.connector_sources = sources;
         self
+    }
+
+    /// Writes each adapter notice the broker queues to the session's journal, as it is queued,
+    /// for as long as this service lives.
+    async fn record_adapter_notices(
+        service: std::sync::Weak<Self>,
+        broker: Arc<crate::broker::Broker>,
+    ) {
+        loop {
+            broker.notices_waiting().await;
+            let Some(service) = service.upgrade() else {
+                return;
+            };
+            let notices = broker.take_notices();
+            if notices.is_empty() {
+                continue;
+            }
+            let mut session = service.runtime.session();
+            let cursor = session.output_cursor();
+            let now = kr_ipc::now_ms();
+            if let Some(journal) = session.journal_mut() {
+                for notice in notices {
+                    // A notice the journal refuses is its fault's to report; the next transition
+                    // of the same package is recorded when it comes.
+                    let _ = journal.record_adapter_event(
+                        notice.plugin_id.as_str(),
+                        notice.transition,
+                        &notice.text,
+                        cursor,
+                        now,
+                    );
+                }
+            }
+        }
     }
 
     /// Returns the plugin admissions this worker holds.
@@ -541,15 +575,20 @@ impl WorkerService {
                 return Some(failure(RequestId::new(0), &error.to_protocol_error()));
             }
             if let Some(prepared) = prepared {
-                self.plugin_admissions
-                    .publish(prepared, &self.connector_sources);
+                self.plugin_admissions.publish(
+                    prepared,
+                    &self.connector_sources,
+                    &self.broker,
+                    kr_ipc::now_ms(),
+                );
             }
         }
         let session_id = self.runtime.session().id();
-        let report = match self
-            .plugin_admissions
-            .report(session_id, self.broker.live_bindings())
-        {
+        let report = match self.plugin_admissions.report(
+            session_id,
+            self.broker.live_bindings(),
+            &self.broker.action_refusals(),
+        ) {
             Ok(report) => report,
             Err(why) => {
                 return Some(failure(
@@ -750,6 +789,12 @@ impl WorkerService {
         // ends and not at some later pass.
         let reclaiming = Arc::clone(&self);
         tokio::spawn(async move { reclaiming.reclaim_recoveries().await });
+        // The transitions of a package's revocation state go to the session's journal, which is
+        // where the attention source reads them from.
+        tokio::spawn(Self::record_adapter_notices(
+            Arc::downgrade(&self),
+            Arc::clone(&self.broker),
+        ));
         loop {
             let (connection, peer) = listener.accept().await?;
             // One session serves a bounded number of connections at once. Without a bound a caller

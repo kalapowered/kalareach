@@ -325,7 +325,7 @@ fn agent_broker_on(health: std::sync::Arc<JournalHealth>) -> Broker {
         .register_instance(instance(), IntegrationMode::Gateway, None, Some(managed()))
         .expect("the instance is registered");
     broker
-        .bind(
+        .bind_descriptor(
             binding(),
             instance(),
             PluginId::new("kalareach.codex").expect("valid"),
@@ -1213,7 +1213,7 @@ fn kr_req_11_31_a_disabled_provider_refuses_its_own_dispatch_beside_a_working_on
     // A second component, bound to the same instance and working perfectly.
     let other = BrokerBindingId::new(Uuid::from_bytes([11; 16]));
     broker
-        .bind(
+        .bind_descriptor(
             other,
             instance(),
             PluginId::new("kalareach.other").expect("valid"),

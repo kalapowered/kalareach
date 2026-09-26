@@ -367,7 +367,7 @@ fn prepare_broker(broker: &Arc<Broker>, rich: RichMethodTable) -> GatewayConnect
         .register_instance(instance(), IntegrationMode::Gateway, None, Some(managed()))
         .expect("the instance is registered");
     broker
-        .bind(
+        .bind_descriptor(
             binding(),
             instance(),
             PluginId::new("kalareach.codex").expect("valid"),
@@ -2192,7 +2192,7 @@ fn broker_expecting_this_process() -> (Arc<Broker>, ProcessStartIdentity) {
 #[cfg(unix)]
 fn bind_component(broker: &Broker) {
     broker
-        .bind(
+        .bind_descriptor(
             binding(),
             instance(),
             package(),

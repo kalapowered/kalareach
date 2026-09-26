@@ -51,6 +51,7 @@ pub mod adoption;
 pub mod agents;
 pub mod arbitration;
 pub mod attach;
+pub mod binder;
 pub mod bridge;
 pub mod capability;
 pub mod catalogue;
@@ -235,7 +236,8 @@ pub struct Binding {
     pub trust: Option<DecodingTrust>,
     /// The actions this package registered, by name.
     pub actions: BTreeMap<ActionName, RegisteredAction>,
-    /// True when a component fault has disabled this binding's rich capabilities.
+    /// Why this binding's rich capabilities are disabled, where they are: a component fault, a
+    /// revocation under the policy that disables at the next admission, or the binding's ending.
     ///
     /// Native forwarding is untouched by this. Section 11: "A Wasm fault disables the affected
     /// rich capabilities; it cannot stall or discard otherwise valid native traffic."
@@ -244,6 +246,15 @@ pub struct Binding {
     pub release: Option<kr_protocol::admission::LiveRelease>,
     /// True once the binding is due to end at its next admission boundary.
     pub ending: bool,
+    /// The admissions frame it was bound at, or last changed at, where it was made from them.
+    pub frame: Option<kr_protocol::admission::FrameId>,
+    /// The program it was bound to, where it was made from admissions.
+    pub executable: Option<crate::broker::ledger::BoundExecutable>,
+    /// The digest of its package's connector table, where the package has one.
+    pub connector_digest: Option<Digest256>,
+    /// True while its rich capabilities are disabled because the release it holds was revoked,
+    /// which a revocation that no longer stands lifts; a fault's disabling it does not.
+    pub revocation_disabled: bool,
 }
 
 impl Binding {
@@ -725,6 +736,17 @@ struct BrokerState {
     /// after a consumer's cursor is gone, rather than handing back a shorter history and letting
     /// the consumer believe it is complete.
     unrecorded_after: u64,
+    /// What the control daemon's admissions admit, as this worker read them: every binding made
+    /// from admissions is made from this, under this lock.
+    admitted: binder::Admitted,
+    /// The bindings forgotten whose rows the store has not removed yet.
+    owed_removals: std::collections::BTreeSet<BrokerBindingId>,
+    /// The adapter notices still to be written to the session's journal.
+    notices: Vec<binder::AdapterNotice>,
+    /// Each package with a binding on one of its revoked releases, with those bindings.
+    revoked: BTreeMap<PluginId, std::collections::BTreeSet<BrokerBindingId>>,
+    /// Why each admitted package's declared actions were refused, by package hash.
+    action_refusals: BTreeMap<Digest256, Vec<String>>,
 }
 
 /// The tables one installation was qualified with, as the installation pinned them.
@@ -750,6 +772,8 @@ pub struct PinnedTable {
 #[derive(Debug)]
 pub struct Broker {
     state: Mutex<BrokerState>,
+    /// Woken when an adapter notice may be waiting to be written to the session's journal.
+    notices_ready: tokio::sync::Notify,
     /// The connection a recovery writes the gap through, held by one recovery at a time.
     ///
     /// While the fence is up nothing that holds the broker's lock touches the store: the store is
@@ -800,6 +824,9 @@ impl Broker {
         health: std::sync::Arc<crate::persistence::fault::JournalHealth>,
     ) -> Result<Self> {
         let ledger = Ledger::open(journal_path, std::sync::Arc::clone(&health))?;
+        // Live authority ends with the process that held it: a binding an earlier process of this
+        // session left is not this process's, and its row goes before anything is decided.
+        ledger.remove_bindings_left()?;
         let recorder = journal_path
             .map(|path| Ledger::open(Some(path), std::sync::Arc::clone(&health)))
             .transpose()?;
@@ -879,7 +906,13 @@ impl Broker {
                 stream_generation,
                 continuous: std::collections::BTreeSet::new(),
                 unrecorded_after: 0,
+                admitted: binder::Admitted::default(),
+                owed_removals: std::collections::BTreeSet::new(),
+                notices: Vec::new(),
+                revoked: BTreeMap::new(),
+                action_refusals: BTreeMap::new(),
             }),
+            notices_ready: tokio::sync::Notify::new(),
             recorder: Mutex::new(recorder),
             #[cfg(feature = "testing")]
             recovery_pause: Mutex::new(None),
@@ -1274,9 +1307,9 @@ impl Broker {
                 state.tokens.withdraw(application_instance_id);
                 state.profiles.release(application_instance_id);
                 state.capabilities.forget(application_instance_id);
-                state.bindings.retain(|_, binding| {
-                    binding.application_instance_id != application_instance_id
-                });
+                state.forget_instance(application_instance_id, kr_ipc::now_ms());
+                drop(state);
+                self.notices_ready.notify_one();
                 StopOutcome {
                     instance_ended: true,
                     backend,
@@ -1312,14 +1345,18 @@ impl Broker {
         state.tokens.withdraw(application_instance_id);
         state.profiles.release(application_instance_id);
         state.capabilities.forget(application_instance_id);
-        state
-            .bindings
-            .retain(|_, binding| binding.application_instance_id != application_instance_id);
+        // An instance given back must not stay bound: its bindings go from memory at once, and
+        // their rows now or, where the store refuses, as soon as it takes writes again.
+        state.forget_instance(application_instance_id, kr_ipc::now_ms());
+        drop(state);
+        self.notices_ready.notify_one();
     }
 
     // -- bindings, grants and decoding trust --------------------------------------------------
 
-    /// Binds one component to one instance, with the grants and trust it was given.
+    /// Binds one component to one instance, with the grants and trust a test's own descriptor
+    /// gives it, for this host's own tests: a shipped build binds only what the admissions it holds
+    /// admit ([`Broker::bind`]).
     ///
     /// A binding identifier names one package for as long as it is bound: what its decoder
     /// interpreted carries that package's meaning. The same package may bind it again, which
@@ -1332,8 +1369,9 @@ impl Broker {
     /// grant it depends on is absent, [`BrokerError::InvalidArgument`] when the identifier is
     /// bound to another package, and [`BrokerError::LedgerUnavailable`] when the record cannot be
     /// written.
+    #[cfg(feature = "testing")]
     #[allow(clippy::too_many_arguments)]
-    pub fn bind(
+    pub fn bind_descriptor(
         &self,
         binding_id: BrokerBindingId,
         application_instance_id: ApplicationInstanceId,
@@ -1379,32 +1417,28 @@ impl Broker {
                 package.beside(&bound.package())
             )));
         }
-        let record = BindingRecord {
+        let binding = Binding {
             binding_id,
             application_instance_id,
-            grants: grants.clone(),
-            trust: trust.clone(),
-            bound_at: now,
+            plugin_id,
+            publisher_id,
+            package_digest,
+            grants,
+            trust,
+            actions: BTreeMap::new(),
+            rich_disabled: None,
+            release: None,
+            ending: false,
+            frame: None,
+            executable: None,
+            connector_digest: None,
+            revocation_disabled: false,
         };
+        let record = binding.record(now);
         state.stored(now, "binding a component", |ledger| {
             ledger.put_binding(&record)
         })?;
-        state.bindings.insert(
-            binding_id,
-            Binding {
-                binding_id,
-                application_instance_id,
-                plugin_id,
-                publisher_id,
-                package_digest,
-                grants,
-                trust,
-                actions: BTreeMap::new(),
-                rich_disabled: None,
-                release: None,
-                ending: false,
-            },
-        );
+        state.bindings.insert(binding_id, binding);
         Ok(())
     }
 
@@ -1468,11 +1502,9 @@ impl Broker {
             binding.trust.clone()
         };
         let record = BindingRecord {
-            binding_id,
-            application_instance_id: binding.application_instance_id,
             grants: grants.clone(),
             trust: trust.clone(),
-            bound_at: TimestampMs::new(0),
+            ..binding.record(TimestampMs::new(0))
         };
         state.stored(kr_ipc::now_ms(), "changing a grant", |ledger| {
             ledger.put_binding(&record)
@@ -1508,11 +1540,8 @@ impl Broker {
             ..trust
         });
         let record = BindingRecord {
-            binding_id,
-            application_instance_id: binding.application_instance_id,
-            grants: binding.grants.clone(),
             trust: trust.clone(),
-            bound_at: TimestampMs::new(0),
+            ..binding.record(TimestampMs::new(0))
         };
         state.stored(kr_ipc::now_ms(), "withdrawing an answer right", |ledger| {
             ledger.put_binding(&record)
@@ -4012,6 +4041,7 @@ impl BrokerState {
         }
         let finished = self.volatile.finish_recovery(generation)?;
         self.continuous.clear();
+        self.settle_owed_removals(now);
         Ok(finished)
     }
 

@@ -54,7 +54,7 @@ use crate::persistence::fault::JournalHealth;
 use crate::persistence::stores::ContentClass;
 
 /// The schema version this build reads.
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
 
 /// How long the ledger waits for another connection to finish writing, outside prompt mode.
 pub const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -75,6 +75,31 @@ pub struct BindingRecord {
     pub trust: Option<DecodingTrust>,
     /// When the binding was recorded.
     pub bound_at: TimestampMs,
+    /// The release it holds, where it was made from the admissions: the package, its publisher,
+    /// its version, its hash and the repository and enrolment it came through.
+    pub release: Option<kr_protocol::admission::LiveRelease>,
+    /// The admissions frame it was bound at, or last changed at.
+    pub frame: Option<kr_protocol::admission::FrameId>,
+    /// The program it was bound to, where it was made from the admissions.
+    pub executable: Option<BoundExecutable>,
+    /// The digest of the package's connector table as its verified manifest names it, where the
+    /// package has one.
+    pub connector_digest: Option<kr_protocol::scalars::Digest256>,
+}
+
+/// The program a binding was made for: where it was, the digest its bytes hashed to, and the
+/// version the signed record for that digest named when it was bound.
+///
+/// The version is the one at bind time. A later record for the same digest does not change it: a
+/// qualification update cannot turn a live binding into another version.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BoundExecutable {
+    /// The executable's path, as it was matched.
+    pub path: String,
+    /// The digest of its bytes.
+    pub digest: kr_protocol::scalars::Digest256,
+    /// The version a signed record named for that digest, where one did.
+    pub version: Option<String>,
 }
 
 /// One resource a restart found unresolved.
@@ -675,7 +700,11 @@ impl Ledger {
                      application_instance_id BLOB NOT NULL,
                      grants                  BLOB NOT NULL,
                      trust                   BLOB,
-                     bound_at_ms             INTEGER NOT NULL
+                     bound_at_ms             INTEGER NOT NULL,
+                     release                 BLOB,
+                     frame                   BLOB,
+                     executable              BLOB,
+                     connector_digest        BLOB
                  );
                  CREATE INDEX IF NOT EXISTS broker_bindings_by_instance
                      ON broker_bindings (application_instance_id);
@@ -820,18 +849,30 @@ impl Ledger {
         self.connection
             .execute(
                 "INSERT INTO broker_bindings
-                     (binding_id, application_instance_id, grants, trust, bound_at_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5)
+                     (binding_id, application_instance_id, grants, trust, bound_at_ms, release,
+                      frame, executable, connector_digest)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                  ON CONFLICT (binding_id) DO UPDATE SET
                      application_instance_id = excluded.application_instance_id,
-                     grants = excluded.grants,
-                     trust  = excluded.trust",
+                     grants           = excluded.grants,
+                     trust            = excluded.trust,
+                     release          = excluded.release,
+                     frame            = excluded.frame,
+                     executable       = excluded.executable,
+                     connector_digest = excluded.connector_digest",
                 params![
                     record.binding_id.get().as_bytes().as_slice(),
                     record.application_instance_id.get().as_bytes().as_slice(),
                     encode(&record.grants)?,
                     record.trust.as_ref().map(encode).transpose()?,
                     i64::try_from(record.bound_at.get()).unwrap_or(i64::MAX),
+                    record.release.as_ref().map(encode).transpose()?,
+                    record.frame.as_ref().map(encode).transpose()?,
+                    record.executable.as_ref().map(encode).transpose()?,
+                    record
+                        .connector_digest
+                        .as_ref()
+                        .map(|digest| digest.as_bytes().to_vec()),
                 ],
             )
             .map_err(|error| self.fault(error))?;
@@ -847,29 +888,15 @@ impl Ledger {
     pub fn binding(&self, binding_id: BrokerBindingId) -> Result<Option<BindingRecord>> {
         self.connection
             .query_row(
-                "SELECT application_instance_id, grants, trust, bound_at_ms
+                "SELECT binding_id, application_instance_id, grants, trust, bound_at_ms, release,
+                        frame, executable, connector_digest
                  FROM broker_bindings WHERE binding_id = ?1",
                 params![binding_id.get().as_bytes().as_slice()],
-                |row| {
-                    Ok((
-                        row.get::<_, Vec<u8>>(0)?,
-                        row.get::<_, Vec<u8>>(1)?,
-                        row.get::<_, Option<Vec<u8>>>(2)?,
-                        row.get::<_, i64>(3)?,
-                    ))
-                },
+                StoredBinding::read,
             )
             .optional()
             .map_err(|error| self.fault(error))?
-            .map(|(instance, grants, trust, bound_at)| {
-                Ok(BindingRecord {
-                    binding_id,
-                    application_instance_id: ApplicationInstanceId::new(uuid_from(&instance)?),
-                    grants: decode(&grants)?,
-                    trust: trust.as_deref().map(decode).transpose()?,
-                    bound_at: TimestampMs::new(u64::try_from(bound_at).unwrap_or(0)),
-                })
-            })
+            .map(StoredBinding::record)
             .transpose()
     }
 
@@ -885,36 +912,21 @@ impl Ledger {
         let mut statement = self
             .connection
             .prepare(
-                "SELECT binding_id, grants, trust, bound_at_ms FROM broker_bindings
+                "SELECT binding_id, application_instance_id, grants, trust, bound_at_ms, release,
+                        frame, executable, connector_digest
+                 FROM broker_bindings
                  WHERE application_instance_id = ?1 ORDER BY bound_at_ms, binding_id",
             )
             .map_err(|error| self.fault(error))?;
         let rows = statement
             .query_map(
                 params![application_instance_id.get().as_bytes().as_slice()],
-                |row| {
-                    Ok((
-                        row.get::<_, Vec<u8>>(0)?,
-                        row.get::<_, Vec<u8>>(1)?,
-                        row.get::<_, Option<Vec<u8>>>(2)?,
-                        row.get::<_, i64>(3)?,
-                    ))
-                },
+                StoredBinding::read,
             )
             .map_err(|error| self.fault(error))?
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|error| self.fault(error))?;
-        rows.into_iter()
-            .map(|(binding, grants, trust, bound_at)| {
-                Ok(BindingRecord {
-                    binding_id: BrokerBindingId::new(uuid_from(&binding)?),
-                    application_instance_id,
-                    grants: decode(&grants)?,
-                    trust: trust.as_deref().map(decode).transpose()?,
-                    bound_at: TimestampMs::new(u64::try_from(bound_at).unwrap_or(0)),
-                })
-            })
-            .collect()
+        rows.into_iter().map(StoredBinding::record).collect()
     }
 
     /// Removes one binding and everything that hangs from it.
@@ -933,6 +945,22 @@ impl Ledger {
             )
             .map_err(|error| self.fault(error))?;
         Ok(())
+    }
+
+    /// Removes every binding a previous process of this session left, and returns how many.
+    ///
+    /// A binding is live authority, and live authority ends with the process that held it: a
+    /// new process never takes an old one's back. The connections' packages stay, because they
+    /// record what a connection recorded requests under, which the end of a binding does not
+    /// change.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::LedgerUnavailable`] when the write fails.
+    pub fn remove_bindings_left(&self) -> Result<usize> {
+        self.connection
+            .execute("DELETE FROM broker_bindings", [])
+            .map_err(|error| self.fault(error))
     }
 
     // -- the decoder ledger -------------------------------------------------------------------
@@ -2034,6 +2062,58 @@ impl Ledger {
     }
 }
 
+/// One binding row as it was read, before its fields are decoded.
+struct StoredBinding {
+    binding: Vec<u8>,
+    instance: Vec<u8>,
+    grants: Vec<u8>,
+    trust: Option<Vec<u8>>,
+    bound_at: i64,
+    release: Option<Vec<u8>>,
+    frame: Option<Vec<u8>>,
+    executable: Option<Vec<u8>>,
+    connector_digest: Option<Vec<u8>>,
+}
+
+impl StoredBinding {
+    /// Reads the columns every binding query selects, in their order.
+    fn read(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            binding: row.get(0)?,
+            instance: row.get(1)?,
+            grants: row.get(2)?,
+            trust: row.get(3)?,
+            bound_at: row.get(4)?,
+            release: row.get(5)?,
+            frame: row.get(6)?,
+            executable: row.get(7)?,
+            connector_digest: row.get(8)?,
+        })
+    }
+
+    /// Decodes the row into the record it holds.
+    fn record(self) -> Result<BindingRecord> {
+        Ok(BindingRecord {
+            binding_id: BrokerBindingId::new(uuid_from(&self.binding)?),
+            application_instance_id: ApplicationInstanceId::new(uuid_from(&self.instance)?),
+            grants: decode(&self.grants)?,
+            trust: self.trust.as_deref().map(decode).transpose()?,
+            bound_at: TimestampMs::new(u64::try_from(self.bound_at).unwrap_or(0)),
+            release: self.release.as_deref().map(decode).transpose()?,
+            frame: self.frame.as_deref().map(decode).transpose()?,
+            executable: self.executable.as_deref().map(decode).transpose()?,
+            connector_digest: self
+                .connector_digest
+                .map(|bytes| {
+                    <[u8; 32]>::try_from(bytes.as_slice())
+                        .map(kr_protocol::scalars::Digest256::from_bytes)
+                        .map_err(|_| BrokerError::ledger("a stored digest is not thirty-two bytes"))
+                })
+                .transpose()?,
+        })
+    }
+}
+
 fn encode<T: serde::Serialize>(value: &T) -> Result<Vec<u8>> {
     kr_cbor::to_canonical_vec(value).map_err(BrokerError::ledger)
 }
@@ -2228,7 +2308,7 @@ mod tests {
     }
 
     #[test]
-    fn a_binding_keeps_its_grants_and_its_trust_across_a_reopen() {
+    fn a_binding_keeps_its_grants_its_trust_and_its_release_across_a_reopen() {
         let file = ledger_path();
         let record = BindingRecord {
             binding_id: binding(),
@@ -2239,6 +2319,27 @@ mod tests {
             ]),
             trust: Some(trust()),
             bound_at: TimestampMs::new(5),
+            release: Some(kr_protocol::admission::LiveRelease {
+                plugin_id: kr_protocol::ids::PluginId::new("kalareach/claude-code").expect("valid"),
+                publisher_id: kr_protocol::ids::PublisherId::new("kalareach").expect("valid"),
+                version: "0.3.0".to_owned(),
+                package_digest: Digest256::from_bytes([5; 32]),
+                origin: kr_protocol::admission::ReleaseOrigin {
+                    repository_id: "official".to_owned(),
+                    enrolment_key: "0123456789abcdef0123456789abcdef".to_owned(),
+                },
+            }),
+            frame: Some(kr_protocol::admission::FrameId {
+                generation: kr_protocol::ids::ControllerGeneration::new(2),
+                revision: kr_protocol::scalars::U64::new(7),
+                round: kr_protocol::scalars::U64::new(9),
+            }),
+            executable: Some(BoundExecutable {
+                path: "/usr/local/bin/claude".to_owned(),
+                digest: Digest256::from_bytes([3; 32]),
+                version: Some("2.1.278".to_owned()),
+            }),
+            connector_digest: Some(Digest256::from_bytes([6; 32])),
         };
         {
             let ledger =
@@ -2254,6 +2355,30 @@ mod tests {
         assert_eq!(read, record);
         assert!(read.grants.holds(BrokerGrant::ApprovalInterpreter));
         assert!(!read.grants.holds(BrokerGrant::UpstreamAction));
+        assert_eq!(
+            reopened.bindings_of(instance()).expect("the read succeeds"),
+            vec![record]
+        );
+    }
+
+    /// A ledger an earlier build wrote at schema version 6, whose binding table has none of the
+    /// columns a binding's release is recorded in, is refused by name rather than read.
+    #[test]
+    fn a_ledger_at_schema_version_six_is_refused_by_name() {
+        let file = ledger_path();
+        drop(Ledger::open(Some(&file), JournalHealth::shared()).expect("the ledger opens"));
+        rusqlite::Connection::open(&file)
+            .expect("the file opens")
+            .execute("UPDATE broker_schema SET version = 6", [])
+            .expect("an earlier build's version is written");
+        let refused = Ledger::open(Some(&file), JournalHealth::shared())
+            .expect_err("a version-6 ledger is refused");
+        assert!(
+            refused
+                .to_string()
+                .contains("this ledger is at schema version 6; this build reads 7"),
+            "{refused}"
+        );
     }
 
     #[test]
@@ -2614,6 +2739,10 @@ mod tests {
                 grants: BrokerGrants::granted([BrokerGrant::ApprovalInterpreter]),
                 trust: Some(trust()),
                 bound_at: TimestampMs::new(5),
+                release: None,
+                frame: None,
+                executable: None,
+                connector_digest: None,
             })
             .expect("the binding is written");
         ledger.remove_binding(binding()).expect("the binding goes");

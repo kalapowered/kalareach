@@ -395,7 +395,7 @@ async fn host() -> Host {
         )
         .expect("the instance is registered");
     broker
-        .bind(
+        .bind_descriptor(
             binding(),
             instance(),
             plugin(),

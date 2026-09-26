@@ -92,7 +92,6 @@ fn kr_req_12_07_an_installed_connector_is_read_from_its_package() {
     assert!(sources.replace(vec![source]).is_empty());
     assert!(sources.for_command("claude").is_some());
     assert!(sources.for_command("codex").is_none());
-    assert!(sources.matching("/opt/homebrew/bin/claude").is_some());
     assert!(
         sources.replace(Vec::new()).is_empty(),
         "an installation that hands over nothing leaves nothing integrated"
@@ -454,13 +453,13 @@ fn kr_req_12_07_a_withdrawn_integration_grant_keeps_the_connector_and_integrates
     let sources = ConnectorSources::new();
     assert!(sources.replace(vec![source]).is_empty());
     assert!(sources.for_command(fixture::COMMAND).is_none());
-    assert!(sources.matching("/usr/local/bin/claude").is_some());
+    assert!(!sources.is_empty(), "the connector is still held");
 }
 
-/// Connectors that declare no command integration are held for matching, however many there are,
+/// Connectors that declare no command integration are held, however many there are,
 /// and resolve no command.
 #[test]
-fn connectors_that_declare_no_integration_are_held_for_matching() {
+fn connectors_that_declare_no_integration_are_held_and_resolve_no_command() {
     let store = Store::new("undeclared");
     let claude = store.shaped(&fixture::Shape {
         integration: None,
@@ -479,18 +478,6 @@ fn connectors_that_declare_no_integration_are_held_for_matching() {
     assert!(!sources.is_empty());
     assert!(sources.for_command("claude").is_none());
     assert!(sources.for_command("codex").is_none());
-    assert_eq!(
-        sources
-            .matching("/usr/local/bin/claude")
-            .map(|connector| connector.plugin_id().to_string()),
-        Some("kalareach/claude-code".to_owned())
-    );
-    assert_eq!(
-        sources
-            .matching("/usr/local/bin/codex")
-            .map(|connector| connector.plugin_id().to_string()),
-        Some("kalareach/codex".to_owned())
-    );
 }
 
 /// KR-REQ-12.07: a manifest altered to declare other flags is not the installed package, whatever

@@ -49,6 +49,24 @@ const LIST_SLACK: usize = 8;
 /// The kind a notification is recorded under.
 const NOTIFICATION: &str = "notification";
 
+/// Reads a host event of an adapter kind: its transition, its package and its words.
+fn adapter_event(
+    event: &HostEvent,
+) -> Option<(
+    kr_protocol::attention::AdapterTransition,
+    kr_protocol::ids::PluginId,
+    &str,
+)> {
+    let transition = match event.kind.as_str() {
+        crate::journal::ADAPTER_REVOKED => kr_protocol::attention::AdapterTransition::Revoked,
+        crate::journal::ADAPTER_CLEARED => kr_protocol::attention::AdapterTransition::Cleared,
+        _ => return None,
+    };
+    let (plugin_id, text) = event.detail.split_once('\n')?;
+    let plugin_id = kr_protocol::ids::PluginId::new(plugin_id).ok()?;
+    Some((transition, plugin_id, text))
+}
+
 /// Whether a record's text is served now, under the privacy record read after it.
 ///
 /// Only while privacy mode is off, and only for a record that came after its source's head at the
@@ -147,9 +165,8 @@ pub fn page(
         if sequence > host_events_head {
             break;
         }
-        let text = serves(privacy.as_ref(), AttentionSource::HostEvents, sequence)
-            .then(|| clip(&event.detail));
-        let record = host_record(sequence, &event, text, key);
+        let served = serves(privacy.as_ref(), AttentionSource::HostEvents, sequence);
+        let record = host_record(sequence, &event, served, key);
         if !fits(
             &mut used,
             measure(&record),
@@ -248,18 +265,34 @@ pub fn fingerprint(key: &[u8; 32], said: &str) -> Digest256 {
     Digest256::from_bytes(*kr_crypto::kdf::hmac_sha256(&key, said.as_bytes()).as_bytes())
 }
 
+/// One host event as the page carries it. `served` is whether its words are served now; an
+/// adapter transition travels with its package whether or not they are, so a session whose words
+/// are withheld still raises and resolves what the transition is about.
 fn host_record(
     sequence: u64,
     event: &HostEvent,
-    text: Option<String>,
+    served: bool,
     key: &[u8; 32],
 ) -> AttentionHostRecord {
+    if let Some((transition, plugin_id, text)) = adapter_event(event) {
+        return AttentionHostRecord {
+            sequence: U64::new(sequence),
+            notification: false,
+            recorded_at_ms: event.recorded_at_ms,
+            text: Nullable(served.then(|| clip(text))),
+            fingerprint: Nullable::null(),
+            adapter: Nullable::some(kr_protocol::attention::AdapterNotice {
+                plugin_id,
+                transition,
+            }),
+        };
+    }
     let notification = event.kind == NOTIFICATION;
     AttentionHostRecord {
         sequence: U64::new(sequence),
         notification,
         recorded_at_ms: event.recorded_at_ms,
-        text: Nullable(text),
+        text: Nullable(served.then(|| clip(&event.detail))),
         fingerprint: Nullable(notification.then(|| fingerprint(key, &event.detail))),
         adapter: Nullable::null(),
     }

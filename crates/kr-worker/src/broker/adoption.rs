@@ -1,14 +1,19 @@
-//! Adoption: a program the integrated route did not launch, detected and observed.
+//! Adoption: a program the integrated route did not launch, detected, observed and bound.
 //!
 //! Section 12 keeps manual launches valid: they trigger the same detection and capability process,
 //! and detection never creates a gateway after the fact. A Claude Code started by absolute path,
 //! with its integration disabled, after a refused or retired launch, in a form the shell does not
 //! ask about, or from a shell that does not ask, is found here. While the terminal's foreground
 //! group is not the root shell's, each process in that group that the root shell started itself,
-//! that no instance of this broker holds, and whose executable an installed connector recognises is
-//! recorded as a native terminal instance with the profile it was observed running. It gets no
+//! that no instance of this broker holds, and whose executable an admitted package recognises is
+//! recorded as a native terminal instance with the profile it was observed running, and bound to
+//! that package in the same step. The package is the one the software development kit's rule
+//! selects among every package the admissions this worker holds admit, with nothing selected: an
+//! exact rule beats an inferred one, and two that both recognise it exactly adopt nothing. A package
+//! with no connector table is adopted and bound the same way. An adopted instance gets no
 //! registration, no endpoint and no credential, so none of its bridges is admitted, and its
-//! announcement says so. It is watched by its identity and ended when it exits.
+//! announcement says so. It is watched by its identity and ended when it exits. A bind the broker
+//! refuses leaves nothing adopted, and the next look tries again.
 //!
 //! A program takes the terminal when the root shell starts a command, and the session knows when
 //! that is likely: the input it accepts, the output it produces, and an invocation the shell's
@@ -48,7 +53,7 @@ use kr_protocol::root::CommandBypassReason;
 use kr_protocol::scalars::{Nullable, Uuid};
 
 use crate::broker::Broker;
-use crate::broker::connectors::ConnectorSources;
+use crate::broker::binder::MatchedExecutable;
 use crate::broker::image::HashedFiles;
 
 /// How often the foreground is looked at while a look is likely to find something: while a command
@@ -98,7 +103,6 @@ struct Adopted {
 /// session that closes, which ends every adoption under its own lock, is never entered afterwards.
 pub struct Adoptions {
     broker: Arc<Broker>,
-    sources: Arc<ConnectorSources>,
     environment_id: EnvironmentId,
     /// The executables already hashed, by identity, so a program adopted again costs a lookup.
     hashed: HashedFiles,
@@ -128,16 +132,11 @@ impl std::fmt::Debug for Adoptions {
 }
 
 impl Adoptions {
-    /// Builds one session's adoptions, from the connectors the installation handed over.
+    /// Builds one session's adoptions, from the admissions `broker` holds.
     #[must_use]
-    pub fn new(
-        broker: Arc<Broker>,
-        sources: Arc<ConnectorSources>,
-        environment_id: EnvironmentId,
-    ) -> Self {
+    pub fn new(broker: Arc<Broker>, environment_id: EnvironmentId) -> Self {
         Self {
             broker,
-            sources,
             environment_id,
             hashed: HashedFiles::default(),
             stopped: AtomicBool::new(false),
@@ -177,7 +176,7 @@ impl Adoptions {
     /// Looks at the foreground once, adopts each program it finds there, and returns what was
     /// adopted, which the session's views are told as it is recorded.
     ///
-    /// Nothing is looked at while no connector is installed, which is what could recognise a
+    /// Nothing is looked at while the admissions admit no package, which is what could recognise a
     /// program, or while the root shell's own group has the terminal, which is the shell at its
     /// prompt.
     #[must_use]
@@ -254,10 +253,10 @@ impl Adoptions {
         self.stopped.load(Ordering::SeqCst)
     }
 
-    /// Returns whether a look could adopt anything: a connector is installed to recognise a
-    /// program, and the session is still open.
+    /// Returns whether a look could adopt anything: a package is admitted to recognise a program,
+    /// and the session is still open.
     fn can_adopt(&self) -> bool {
-        !self.sources.is_empty() && !self.is_stopped()
+        self.broker.admits_any() && !self.is_stopped()
     }
 
     /// Returns whether this session holds an adoption, whose program's end is still to be found.
@@ -333,7 +332,7 @@ impl Adoptions {
             return None;
         }
         let executable = crate::questions::binding::executable_of(pid)?;
-        let connector = self.sources.matching(&executable)?;
+        let admitted = self.broker.admitted_match(&executable)?;
         // Asked only once the process runs the program: a launch registers the process that
         // presents itself before that process execs, so a program the integration launched is held
         // by now, and one it did not launch never will be.
@@ -373,8 +372,8 @@ impl Adoptions {
             binary: BinaryIdentity {
                 resolved_path: executable.clone(),
                 digest: hashed.digest,
-                version: connector
-                    .qualified_version(&hashed.digest)
+                version: admitted
+                    .version_of(&hashed.digest)
                     .unwrap_or("unknown")
                     .to_owned(),
                 distribution: "adopted".to_owned(),
@@ -388,7 +387,7 @@ impl Adoptions {
             ApplicationInstanceId::new(Uuid::from_bytes(*kr_ipc::new_uuid().as_bytes()));
         let summary = AgentInstanceSummary {
             application_instance_id,
-            plugin_id: Nullable::some(connector.plugin_id()),
+            plugin_id: Nullable::some(admitted.plugin_id.clone()),
             profile_id: Nullable::some(profile.profile_id.clone()),
             mode: IntegrationMode::NativeTerminal,
             bypass: Nullable(bypass_for(&executable, &foreground.answered)),
@@ -407,6 +406,25 @@ impl Adoptions {
                 .adopt_instance(profile, application_instance_id, None)
                 .is_err()
             {
+                return Vec::new();
+            }
+            // Adopted and bound in one step: a bind refused leaves nothing adopted.
+            let bound = self.broker.bind(
+                kr_protocol::ids::BrokerBindingId::new(kr_ipc::new_uuid()),
+                application_instance_id,
+                admitted.package_digest,
+                admitted.frame,
+                MatchedExecutable {
+                    path: executable.clone(),
+                    digest: hashed.digest,
+                },
+                now,
+            );
+            if bound.is_err() {
+                let _ = self.broker.end(
+                    application_instance_id,
+                    crate::broker::InstanceEnding::NativeExit,
+                );
                 return Vec::new();
             }
             adopted.insert(

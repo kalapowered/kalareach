@@ -187,6 +187,9 @@ struct Backend {
     root_shell: ProcessStartIdentity,
     established_at: Option<u64>,
     connector: Arc<InstalledConnector>,
+    /// The frame of the admissions snapshot the connector came from, which the launch's binding
+    /// is decided at.
+    frame: Option<kr_protocol::admission::FrameId>,
     lifecycle: Lifecycle,
     identity: tokio::sync::watch::Receiver<Option<std::result::Result<ExecutableIdentity, String>>>,
     /// Why a bridge of this instance was refused for the image its process runs, once one was:
@@ -561,9 +564,9 @@ impl CommandBackends {
             .typed
             .first()
             .ok_or_else(|| "the invocation names no command".to_owned())?;
-        let connector = self
+        let (connector, frame) = self
             .sources
-            .for_command(command)
+            .for_command_at(command)
             .ok_or_else(|| format!("no installed connector integrates {command:?}"))?;
         let declared = connector
             .integration()
@@ -630,7 +633,7 @@ impl CommandBackends {
             );
         }
         let backend = self
-            .create(request, invocation, added_at, connector, &launcher)
+            .create(request, invocation, added_at, connector, frame, &launcher)
             .map_err(|error| error.to_string())?;
         let answer = self.answer(&backend, request.prompt_generation, &launcher);
         backends.push(backend);
@@ -792,6 +795,7 @@ impl CommandBackends {
         invocation: Invocation,
         added_at: usize,
         connector: Arc<InstalledConnector>,
+        frame: Option<kr_protocol::admission::FrameId>,
         launcher: &Path,
     ) -> Result<Arc<Backend>> {
         let _entered = self.handle.enter();
@@ -851,6 +855,7 @@ impl CommandBackends {
             root_shell: request.root_shell.clone(),
             established_at,
             connector,
+            frame,
             lifecycle: Lifecycle::new(BackendState::Unbound),
             identity,
             image_refused: Mutex::new(None),
@@ -1500,6 +1505,26 @@ async fn admit_claimed<'a>(
     let registered = reservation
         .register(IntegrationMode::NativeBridge, Some(managed))
         .map_err(|refused| refused.error)?;
+    // The instance is bound to the package this backend was established from, at the frame it was
+    // decided at, from the admissions this worker holds. A package that left them since is refused
+    // here, and the launch fails as any failure here does: what it registered is given back, its
+    // binding with it, and the launcher runs what was typed.
+    let frame = backend
+        .frame
+        .ok_or_else(|| BrokerError::PreconditionFailed {
+            detail: "this backend's connector came from no admissions this worker holds".to_owned(),
+        })?;
+    broker.bind(
+        kr_protocol::ids::BrokerBindingId::new(kr_ipc::new_uuid()),
+        backend.application_instance_id,
+        backend.connector.package_digest(),
+        frame,
+        crate::broker::binder::MatchedExecutable {
+            path: backend.invocation.executable.clone(),
+            digest: identity.hashed.digest,
+        },
+        kr_ipc::now_ms(),
+    )?;
     // The directory the invocation was resolved in, for reading only and confined to its own
     // mount. The grant is the instance's, so it goes with the instance: a launch given back takes
     // it along, and so does the program's end. It is granted only when it is the directory the

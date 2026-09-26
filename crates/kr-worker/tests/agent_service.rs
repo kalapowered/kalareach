@@ -344,7 +344,7 @@ fn register(host: &Host, dispatch: Option<Arc<dyn UpstreamDispatch>>) {
         )
         .expect("the instance is registered");
     broker
-        .bind(
+        .bind_descriptor(
             binding(),
             instance(),
             PluginId::new("kalareach.codex").expect("valid"),
@@ -773,7 +773,7 @@ fn offer_approval<U: UpstreamDispatch + 'static>(
 ) -> kr_protocol::ids::PendingResourceId {
     let broker = host.service.broker();
     broker
-        .bind(
+        .bind_descriptor(
             binding(),
             instance(),
             PluginId::new("kalareach.codex").expect("valid"),
@@ -2118,7 +2118,7 @@ impl ServedChannel {
             Arc::new(InstalledConnector::read(source).expect("the installed package reads"));
         let package_binding = BrokerBindingId::new(Uuid::from_bytes([0x33; 16]));
         broker
-            .bind(
+            .bind_descriptor(
                 package_binding,
                 instance(),
                 connector.plugin_id(),

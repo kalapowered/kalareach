@@ -347,7 +347,7 @@ fn gateway_built(
         )
         .expect("the instance is registered");
     broker
-        .bind(
+        .bind_descriptor(
             binding(9),
             instance(2),
             PluginId::new("kalareach.codex").expect("valid"),
@@ -2212,7 +2212,7 @@ async fn kr_req_11_37_nothing_that_needs_its_record_is_taken_while_the_fence_is_
     assert_eq!(broker.mode(), GatewayMode::NativeOnlyVolatile);
 
     let bind = |at: u64| {
-        broker.bind(
+        broker.bind_descriptor(
             binding(10),
             instance(2),
             PluginId::new("kalareach.other").expect("valid"),

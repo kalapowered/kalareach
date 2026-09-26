@@ -3160,7 +3160,7 @@ mod tests {
             .register_instance(instance, IntegrationMode::Gateway, None, None)
             .expect("the instance is registered");
         broker
-            .bind(
+            .bind_descriptor(
                 binding,
                 instance,
                 kr_protocol::ids::PluginId::new("kalareach.codex").expect("valid"),

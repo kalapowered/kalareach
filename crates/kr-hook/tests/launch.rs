@@ -14,6 +14,7 @@
 //! | KR-REQ-12.07 | the backend and its registration exist before the program runs; a refused, timed-out, uncommitted or orphaned invocation runs as typed |
 //! | KR-REQ-05.09 | a launch is admitted by the kernel's account of its process, its parent and its start, and the backend's credential; the program's bridges only when it executes what was hashed |
 //! | KR-REQ-11.34 | the launched program's hooks are admitted against the registration the launch published |
+//! | KR-REQ-11.13 | a launched instance is bound, at its admission, to the connector its command resolved; a launch rolled back takes its binding with it, and an instance's end takes its own |
 
 #![cfg(unix)]
 
@@ -174,7 +175,6 @@ struct Shell {
     placed: Placed,
     runtime: tokio::runtime::Runtime,
     broker: Arc<Broker>,
-    sources: Arc<ConnectorSources>,
     backends: Arc<CommandBackends>,
     executable: PathBuf,
     other: PathBuf,
@@ -182,6 +182,8 @@ struct Shell {
     generation: std::sync::atomic::AtomicU64,
     /// The session whose attached view hears the launches' announcements, where one was made.
     view: Option<View>,
+    /// The admitted connector's package hash.
+    package_digest: kr_protocol::scalars::Digest256,
 }
 
 /// A session with one attached view, the way the worker delivers to its clients.
@@ -230,10 +232,19 @@ impl Shell {
             fixture::claude_code_package(&store, &placed.forwarder)
                 .expect("the package is written"),
         );
-        assert!(sources.replace(vec![source]).is_empty());
         let broker = Arc::new(
             Broker::open(None, session(), JournalHealth::shared()).expect("the broker opens"),
         );
+        // The connector is admitted, as the control daemon hands it over, and a launch binds it.
+        let admissions = kr_worker::broker::catalogue::Admissions::new();
+        let _ = kr_worker::broker::catalogue::testing::admit(
+            &admissions,
+            &sources,
+            &broker,
+            vec![kr_worker::broker::catalogue::testing::admitted(&source)],
+            1,
+        );
+        assert!(sources.for_command(fixture::COMMAND).is_some());
         // The host tree itself, so a backend's socket path stays inside the bound it has on macOS.
         let runtime_dir = placed.host.root().to_path_buf();
         let mut backends = CommandBackends::new(
@@ -265,17 +276,18 @@ impl Shell {
         }
         let reports = placed.host.root().join("reports");
         std::fs::create_dir_all(&reports).expect("a directory for reports");
+        let package_digest = source.package_digest;
         Self {
             placed,
             runtime,
             broker,
-            sources,
             backends,
             executable,
             other,
             reports,
             generation: std::sync::atomic::AtomicU64::new(1),
             view,
+            package_digest,
         }
     }
 
@@ -726,11 +738,24 @@ fn kr_req_12_07_a_launch_is_published_before_the_program_runs() {
         shell.broker.profile_of(instance).is_some(),
         "its profile was recorded when it presented itself"
     );
+    // KR-REQ-11.13: bound at its admission to the connector its command resolved.
+    let bound: Vec<_> = shell
+        .broker
+        .live_bindings()
+        .into_iter()
+        .filter(|live| live.application_instance_id == instance)
+        .collect();
+    assert_eq!(bound.len(), 1, "the launched instance is bound once");
+    assert_eq!(bound[0].release.package_digest, shell.package_digest);
     let (status, said) = finish(child);
     assert!(status.success(), "{said}");
     eventually("the instance ends with its program", || {
         shell.broker.binding_state(instance).is_err()
     });
+    assert!(
+        shell.broker.live_bindings().is_empty(),
+        "and its binding with it"
+    );
     eventually(
         "its endpoint, credential, registration and record go",
         || {
@@ -856,11 +881,20 @@ fn kr_req_12_07_a_launch_that_never_goes_is_rolled_back() {
     eventually("the registration is published on the admission", || {
         registration.exists()
     });
+    assert_eq!(
+        shell.broker.live_bindings().len(),
+        1,
+        "the admission bound the instance"
+    );
     let _ = held.kill();
     let _ = held.wait();
     eventually("and taken back when the launch does not go", || {
         !registration.exists()
     });
+    assert!(
+        shell.broker.live_bindings().is_empty(),
+        "its binding went with it"
+    );
 
     let child = shell.launch(&answer, "retry", &[]);
     let report = shell.report("retry");
@@ -1171,6 +1205,10 @@ fn kr_req_12_07_a_launch_rolled_back_after_its_line_ended_retires_its_backend() 
         let _ = held.kill();
         let _ = held.wait();
         eventually("the launch is rolled back", || !registration.exists());
+        assert!(
+            shell.broker.live_bindings().is_empty(),
+            "{case}: its binding went with it"
+        );
         let retry = format!("{case}-retry");
         let _ = finish(shell.launch(&answer, &retry, &[]));
         assert_typed(
@@ -1985,7 +2023,6 @@ fn kr_req_12_07_a_launch_an_adoption_and_their_ends_reach_a_view_in_order() {
     let mut other = stand_in(&shell.placed);
     let adoptions = kr_worker::broker::adoption::Adoptions::new(
         Arc::clone(&shell.broker),
-        Arc::clone(&shell.sources),
         EnvironmentId::new(Uuid::from_bytes([4; 16])),
     )
     .with_views(Arc::downgrade(&view.runtime));

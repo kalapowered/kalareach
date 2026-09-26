@@ -1148,6 +1148,142 @@ async fn a_fingerprint_is_the_same_across_privacy_transitions() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Adapter transitions
+// ---------------------------------------------------------------------------------------------
+
+/// Asks for pages from the start until one carries `wanted` host events, within the suite's bound.
+async fn page_of(link: &mut Link, wanted: usize) -> AttentionSourcePage {
+    let started = tokio::time::Instant::now();
+    loop {
+        let answered = page(link, sources(0, 0, 0)).await;
+        if answered.host_events.records.len() >= wanted {
+            return answered;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the page carries {} host events, not {wanted}",
+            answered.host_events.records.len()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// KR-REQ-25.22: a binding on a release its repository revoked is recorded in the session's
+/// journal as a host event of its own kind, which a page carries with its package and its
+/// transition and the warning a person reads. With privacy mode on the words are withheld and the
+/// transition still travels, so the item is raised and resolved all the same; once the session
+/// holds no binding on the package's revoked releases, that is recorded too. An application's
+/// notification with the very same words carries no transition.
+#[tokio::test]
+async fn an_adapter_transition_travels_with_its_package_whether_or_not_its_words_do() {
+    use kr_worker::broker::catalogue::testing::{self, Snapshot};
+
+    let host = host().await;
+    let packages = tempfile::tempdir().expect("a directory on the internal disk");
+    let source = kr_worker::broker::connectors::fixture::claude_code_package(
+        packages.path(),
+        std::path::Path::new("/opt/kalareach/bin/kr-hook"),
+    )
+    .expect("the package is written");
+    let package = testing::admitted(&source);
+    let broker = host.service.broker();
+    let admissions = host.service.plugin_admissions();
+    let sources_held = host.service.connector_sources();
+    let frame = testing::admit(admissions, sources_held, broker, vec![package.clone()], 1);
+    let instance = kr_protocol::ids::ApplicationInstanceId::new(kr_ipc::new_uuid());
+    broker
+        .register_instance(
+            instance,
+            kr_protocol::broker::IntegrationMode::NativeBridge,
+            None,
+            None,
+        )
+        .expect("the instance is registered");
+    broker
+        .bind(
+            kr_protocol::ids::BrokerBindingId::new(kr_ipc::new_uuid()),
+            instance,
+            package.package_digest,
+            frame,
+            kr_worker::broker::binder::MatchedExecutable {
+                path: "/usr/local/bin/claude".to_owned(),
+                digest: kr_protocol::scalars::Digest256::from_bytes([3; 32]),
+            },
+            kr_ipc::now_ms(),
+        )
+        .expect("the package is bound");
+
+    testing::hand_over(
+        admissions,
+        sources_held,
+        broker,
+        Snapshot {
+            releases: vec![kr_protocol::admission::ReleaseState {
+                revocation: Nullable::some(kr_protocol::admission::AdmissionRevocation {
+                    reason: "compromised".to_owned(),
+                    revoked_at: kr_protocol::scalars::TimestampMs::new(5),
+                    statement: "Do not run this release.".to_owned(),
+                }),
+                ..testing::release_of(&package)
+            }],
+            ..Snapshot::admitting(2, Vec::new())
+        },
+    );
+    let warning = format!(
+        "{} {} was revoked by its repository (compromised): Do not run this release.",
+        package.plugin_id, package.version
+    );
+    let mut link = daemon(&host, ControllerConnectionRole::Attention).await;
+    let revoked = page_of(&mut link, 1).await;
+    // Written after the transition, so it pages after it.
+    notify(&host, &warning);
+    let both = page_of(&mut link, 2).await;
+    let adapter = kr_protocol::attention::AdapterNotice {
+        plugin_id: package.plugin_id.clone(),
+        transition: kr_protocol::attention::AdapterTransition::Revoked,
+    };
+    assert_eq!(
+        revoked.host_events.records[0].adapter.0,
+        Some(adapter.clone())
+    );
+    assert!(!revoked.host_events.records[0].notification);
+    assert_eq!(host_texts(&revoked), vec![Some(warning.clone())]);
+    let notice = &both.host_events.records[1];
+    assert!(
+        notice.adapter.0.is_none(),
+        "an application's notification carries no transition, whatever it says"
+    );
+    assert!(notice.notification);
+    assert_eq!(notice.text.0.as_deref(), Some(said(&warning).as_str()));
+
+    enable_privacy(&host);
+    let withheld = page_of(&mut link, 2).await;
+    assert_eq!(
+        host_texts(&withheld),
+        vec![None, None],
+        "the words are withheld"
+    );
+    assert_eq!(
+        withheld.host_events.records[0].adapter.0,
+        Some(adapter),
+        "and the transition still travels"
+    );
+
+    let ended = broker.end(instance, kr_worker::broker::InstanceEnding::NativeExit);
+    assert!(ended.instance_ended);
+    let cleared = page_of(&mut link, 3).await;
+    assert_eq!(
+        cleared.host_events.records[2].adapter.0,
+        Some(kr_protocol::attention::AdapterNotice {
+            plugin_id: package.plugin_id.clone(),
+            transition: kr_protocol::attention::AdapterTransition::Cleared,
+        }),
+        "the session holds no binding on the revoked release any more"
+    );
+    assert_eq!(cleared.host_events.records[2].text.0, None);
+}
+
+// ---------------------------------------------------------------------------------------------
 // The journal's privacy record
 // ---------------------------------------------------------------------------------------------
 

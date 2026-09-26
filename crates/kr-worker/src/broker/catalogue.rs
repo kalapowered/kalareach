@@ -272,11 +272,57 @@ impl Admissions {
     }
 
     /// Applies a prepared snapshot where its frame is still above the one held: what each
-    /// installation grants is taken from this snapshot, and `sources` is replaced with the
-    /// admitted connectors, all under one lock, so two snapshots applied at once never leave one's
-    /// packages beside the other's connectors.
-    pub fn publish(&self, prepared: Prepared, sources: &ConnectorSources) -> Applied {
+    /// installation grants is taken from this snapshot, `sources` is replaced with the admitted
+    /// connectors, and the snapshot is installed in `broker`, which brings every live binding to
+    /// the state of the release it holds, all under one lock, so two snapshots applied at once
+    /// never leave one's packages beside the other's connectors or bindings.
+    pub fn publish(
+        &self,
+        prepared: Prepared,
+        sources: &ConnectorSources,
+        broker: &crate::broker::Broker,
+        now: kr_protocol::scalars::TimestampMs,
+    ) -> Applied {
         let mut held = self.held();
+        let applied = Self::publish_held(&mut held, prepared, sources);
+        if applied == Applied::Newer {
+            Self::install(&held, broker, now);
+        }
+        applied
+    }
+
+    /// Installs the snapshot held in `broker`: for the first snapshot, which this worker applies
+    /// before its broker exists.
+    pub fn install_into(
+        &self,
+        broker: &crate::broker::Broker,
+        now: kr_protocol::scalars::TimestampMs,
+    ) {
+        Self::install(&self.held(), broker, now);
+    }
+
+    /// Installs a held snapshot in `broker`, with every package it admits that this worker read.
+    fn install(
+        held: &Held,
+        broker: &crate::broker::Broker,
+        now: kr_protocol::scalars::TimestampMs,
+    ) {
+        let (Some(frame), Some(policy)) = (held.frame, held.policy) else {
+            return;
+        };
+        let packages = held
+            .packages
+            .iter()
+            .filter_map(|package| {
+                let read = held.read.get(&package.package_digest)?.as_ref().ok()?;
+                Some((package.clone(), read.clone()))
+            })
+            .collect();
+        broker.install_admissions(frame, policy, packages, held.releases.clone(), now);
+    }
+
+    /// Applies a prepared snapshot to what is held where its frame is above the one held.
+    fn publish_held(held: &mut Held, prepared: Prepared, sources: &ConnectorSources) -> Applied {
         if held.frame.is_some_and(|held| prepared.frame <= held) {
             return Applied::Older;
         }
@@ -297,7 +343,7 @@ impl Admissions {
             })
             .collect();
         // A refusal of this kind belongs to this snapshot alone: the next one reads again.
-        for (connector, refusal) in sources.replace_read(connectors) {
+        for (connector, refusal) in sources.replace_read(connectors, Some(prepared.frame)) {
             read.insert(connector.package_digest(), Err(refusal.detail));
         }
         held.frame = Some(prepared.frame);
@@ -310,10 +356,11 @@ impl Admissions {
     }
 
     /// Prepares and applies a snapshot at once, where nothing else can be waiting: the first
-    /// snapshot, read before this worker serves any connection.
+    /// snapshot, read before this worker serves any connection and before its broker exists,
+    /// which [`Self::install_into`] then installs it in.
     pub fn apply(&self, parts: &[PluginAdmissions], sources: &ConnectorSources) -> Applied {
         match self.prepare(parts) {
-            Some(prepared) => self.publish(prepared, sources),
+            Some(prepared) => Self::publish_held(&mut self.held(), prepared, sources),
             None => Applied::Older,
         }
     }
@@ -329,6 +376,7 @@ impl Admissions {
         &self,
         session_id: SessionId,
         bindings: Vec<LiveBinding>,
+        action_refusals: &BTreeMap<Digest256, Vec<String>>,
     ) -> Result<Vec<PluginAdmissionsAck>, String> {
         let mut held = self.held();
         held.report_seq = held.report_seq.saturating_add(1);
@@ -341,15 +389,30 @@ impl Admissions {
         let refusals: Vec<PackageRefusal> = held
             .read
             .iter()
-            .filter_map(|(digest, read)| {
-                read.as_ref().err().map(|why| {
-                    let (detail, detail_cut) = cut(why, MAX_REPORT_DETAIL_BYTES);
-                    PackageRefusal {
-                        package_digest: *digest,
-                        detail,
-                        detail_cut,
-                    }
-                })
+            .filter_map(|(digest, read)| match read {
+                Err(why) => Some((*digest, why.clone())),
+                // A package read and bound whose declared actions could not all be registered is
+                // named too, with each action refused.
+                Ok(_) => action_refusals
+                    .get(digest)
+                    .filter(|refused| !refused.is_empty())
+                    .map(|refused| {
+                        (
+                            *digest,
+                            format!(
+                                "some of its declared actions were not registered: {}",
+                                refused.join("; ")
+                            ),
+                        )
+                    }),
+            })
+            .map(|(digest, why)| {
+                let (detail, detail_cut) = cut(&why, MAX_REPORT_DETAIL_BYTES);
+                PackageRefusal {
+                    package_digest: digest,
+                    detail,
+                    detail_cut,
+                }
             })
             .collect();
         drop(held);
@@ -546,6 +609,170 @@ fn derive(
     Ok(ReadPackage::Declarative(Arc::new(checked.manifest.clone())))
 }
 
+/// Admissions for packages this host's own tests wrote, handed over the way the control daemon
+/// hands a worker its admissions. Compiled away in every shipped build.
+#[cfg(feature = "testing")]
+pub mod testing {
+    use super::*;
+
+    /// What an installation hands over for one package a test wrote: its identity read from its
+    /// verified manifest, and its grants, its bridge and its builds as the source names them.
+    ///
+    /// # Panics
+    ///
+    /// When the package does not pass its check, which a test that wrote it wrote wrongly.
+    #[must_use]
+    pub fn admitted(source: &ConnectorSource) -> AdmittedPackage {
+        let checked = InstalledConnector::check(&source.package_dir, source.package_digest)
+            .expect("the package a test wrote passes its check");
+        let manifest = &checked.manifest;
+        AdmittedPackage {
+            plugin_id: kr_protocol::ids::PluginId::new(manifest.plugin_id().to_string())
+                .expect("a plugin identifier"),
+            publisher_id: kr_protocol::ids::PublisherId::new(manifest.publisher_id.as_str())
+                .expect("a publisher identifier"),
+            version: manifest.version.to_string(),
+            package_digest: source.package_digest,
+            origin: kr_protocol::admission::ReleaseOrigin {
+                repository_id: "official".to_owned(),
+                enrolment_key: "0123456789abcdef0123456789abcdef".to_owned(),
+            },
+            package_dir: source.package_dir.display().to_string(),
+            grants: source
+                .granted
+                .iter()
+                .map(|capability| capability.as_str().to_owned())
+                .collect(),
+            bridge: source.bridge.as_ref().map_or_else(
+                kr_protocol::scalars::Nullable::null,
+                |bridge| {
+                    kr_protocol::scalars::Nullable::some(kr_protocol::admission::AdmittedBridge {
+                        application: bridge.application.clone(),
+                        surfaces: bridge
+                            .surfaces
+                            .iter()
+                            .map(|surface| surface.as_str().to_owned())
+                            .collect(),
+                        forwarder: bridge.forwarder.display().to_string(),
+                    })
+                },
+            ),
+            builds: source
+                .qualified
+                .iter()
+                .map(|qualified| kr_protocol::admission::AdmittedBuild {
+                    executable_digest: qualified.digest,
+                    version: qualified.version.clone(),
+                })
+                .collect(),
+            component: kr_protocol::scalars::Nullable::null(),
+        }
+    }
+
+    /// The state a snapshot gives an admitted release: not revoked, capped at the installation's
+    /// grants, and not ending.
+    #[must_use]
+    pub fn release_of(package: &AdmittedPackage) -> ReleaseState {
+        ReleaseState {
+            plugin_id: package.plugin_id.clone(),
+            package_digest: package.package_digest,
+            origin: package.origin.clone(),
+            revocation: kr_protocol::scalars::Nullable::null(),
+            grant_cap: package.grants.clone(),
+            ends_at_next_boundary: false,
+        }
+    }
+
+    /// One snapshot as a test hands it over: at round `round` of revision `round` of the
+    /// controller generation 1.
+    #[derive(Clone, Debug)]
+    pub struct Snapshot {
+        /// Its round and its revision.
+        pub round: u64,
+        /// The administrator's revocation policy.
+        pub policy: RevocationPolicy,
+        /// The packages it admits.
+        pub packages: Vec<AdmittedPackage>,
+        /// The state of each release it covers.
+        pub releases: Vec<ReleaseState>,
+    }
+
+    impl Snapshot {
+        /// A snapshot admitting `packages`, with the state [`release_of`] gives each, under the
+        /// policy that only warns.
+        #[must_use]
+        pub fn admitting(round: u64, packages: Vec<AdmittedPackage>) -> Self {
+            let releases = packages.iter().map(release_of).collect();
+            Self {
+                round,
+                policy: RevocationPolicy::WarnOnly,
+                packages,
+                releases,
+            }
+        }
+
+        /// Its frame.
+        #[must_use]
+        pub fn frame(&self) -> FrameId {
+            FrameId {
+                generation: ControllerGeneration::new(1),
+                revision: U64::new(self.round),
+                round: U64::new(self.round),
+            }
+        }
+    }
+
+    /// Hands a worker one snapshot, applied as the worker applies every snapshot, and returns its
+    /// frame.
+    ///
+    /// # Panics
+    ///
+    /// When the snapshot's round is not above the frame held.
+    pub fn hand_over(
+        admissions: &Admissions,
+        sources: &ConnectorSources,
+        broker: &crate::broker::Broker,
+        snapshot: Snapshot,
+    ) -> FrameId {
+        let frame = snapshot.frame();
+        let parts = vec![PluginAdmissions {
+            environment_id: kr_protocol::ids::EnvironmentId::new(kr_protocol::scalars::Uuid::NIL),
+            frame,
+            part: 1,
+            parts: 1,
+            policy: snapshot.policy,
+            packages: snapshot.packages,
+            releases: snapshot.releases,
+        }];
+        let prepared = admissions
+            .prepare(&parts)
+            .expect("the snapshot is above the frame held");
+        admissions.publish(prepared, sources, broker, kr_ipc::now_ms());
+        frame
+    }
+
+    /// Hands a worker one snapshot admitting `packages` ([`Snapshot::admitting`]), and returns its
+    /// frame.
+    ///
+    /// # Panics
+    ///
+    /// When `round` is not above the frame held.
+    pub fn admit(
+        admissions: &Admissions,
+        sources: &ConnectorSources,
+        broker: &crate::broker::Broker,
+        packages: Vec<AdmittedPackage>,
+        round: u64,
+    ) -> FrameId {
+        hand_over(
+            admissions,
+            sources,
+            broker,
+            Snapshot::admitting(round, packages),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -630,14 +857,14 @@ mod tests {
         let session = SessionId::new(kr_protocol::scalars::Uuid::NIL);
         let _ = per_part;
         let many = admissions
-            .report(session, bindings(70 * 1024))
+            .report(session, bindings(70 * 1024), &BTreeMap::new())
             .map(|parts| parts.len());
         assert!(
             matches!(&many, Err(why) if why.contains("parts")),
             "{many:?}"
         );
         let fits = admissions
-            .report(session, bindings(1024))
+            .report(session, bindings(1024), &BTreeMap::new())
             .expect("within the bound");
         assert!(fits.len() <= MAX_ADMISSION_PARTS as usize);
         assert!(
@@ -802,7 +1029,11 @@ mod tests {
         assert!(sources.for_command("gemini").is_none());
         assert!(admissions.admitted(gemini.package_digest).is_none());
         let refusals = admissions
-            .report(SessionId::new(kr_protocol::scalars::Uuid::NIL), Vec::new())
+            .report(
+                SessionId::new(kr_protocol::scalars::Uuid::NIL),
+                Vec::new(),
+                &BTreeMap::new(),
+            )
             .expect("a report")
             .into_iter()
             .flat_map(|part| part.refusals)
@@ -845,7 +1076,16 @@ mod tests {
             admissions.apply(&snapshot(3, Vec::new()), &sources),
             Applied::Newer
         );
-        assert_eq!(admissions.publish(older, &sources), Applied::Older);
+        let broker = crate::broker::Broker::open(
+            None,
+            SessionId::new(kr_protocol::scalars::Uuid::NIL),
+            crate::persistence::fault::JournalHealth::shared(),
+        )
+        .expect("the broker opens");
+        assert_eq!(
+            admissions.publish(older, &sources, &broker, kr_ipc::now_ms()),
+            Applied::Older
+        );
         assert_eq!(admissions.frame().map(|frame| frame.round.get()), Some(3));
         assert!(sources.for_command(fixture::COMMAND).is_none());
         assert!(admissions.prepare(&snapshot(3, Vec::new())).is_none());
@@ -893,12 +1133,16 @@ mod tests {
         let bound = per_part * MAX_ADMISSION_PARTS as usize;
         let admissions = Admissions::new();
         let made = admissions
-            .report(session, (0..bound).map(binding).collect())
+            .report(session, (0..bound).map(binding).collect(), &BTreeMap::new())
             .expect("a report of the bound is made");
         assert_eq!(made.len(), MAX_ADMISSION_PARTS as usize);
         assert!(made.iter().all(|part| part.parts == MAX_ADMISSION_PARTS));
         let refused = admissions
-            .report(session, (0..=bound).map(binding).collect())
+            .report(
+                session,
+                (0..=bound).map(binding).collect(),
+                &BTreeMap::new(),
+            )
             .map(|parts| parts.len());
         assert!(
             matches!(&refused, Err(why) if why.contains("parts")),

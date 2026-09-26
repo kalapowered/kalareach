@@ -129,7 +129,7 @@ impl Package {
     /// approval interpreter, with the trust its grants give.
     fn bind(&self, broker: &Broker, number: u8) {
         broker
-            .bind(
+            .bind_descriptor(
                 binding(number),
                 instance(number),
                 self.connector.plugin_id(),
@@ -778,7 +778,7 @@ async fn kr_req_12_18_a_plugin_answer_is_refused_before_its_marker_for_what_it_c
     // Another package bound to the same instance, with an answer action of its own.
     let other = kr_protocol::ids::PluginId::new("kalareach/other").expect("valid");
     broker
-        .bind(
+        .bind_descriptor(
             binding(9),
             instance(2),
             other.clone(),
@@ -1129,7 +1129,7 @@ async fn kr_req_12_18_only_the_channels_own_package_interprets_what_it_relays() 
         }
     });
     broker
-        .bind(
+        .bind_descriptor(
             binding(9),
             instance(2),
             package.connector.plugin_id(),

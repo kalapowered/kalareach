@@ -11,16 +11,18 @@
 //! | Row | What proves it |
 //! | --- | --- |
 //! | KR-REQ-12.07 | a program the root shell ran that the integration did not launch is adopted as a native terminal instance with no process record, with the bypass its line was answered with, its bridges refused, and ended when it exits; a program the integration launched is not adopted; a view that installs the session's list and applies the announcements after it holds each instance once; the watch finds a program the root shell starts from a typed line within two seconds of it running, at once or after four silent seconds, and its end within two seconds of its exit, and looks when the integration asks about an invocation or reports a command starting |
+//! | KR-REQ-11.13 | an adopted program is bound in the same step to the admitted package that recognises it, for the program found running, and the binding ends with it; a program two packages recognise exactly is adopted by neither, and an exact rule is selected over an inferred one; a package with no connector table adopts and binds what it recognises |
 //! | KR-PERF-003 | a session nothing is happening in reads its terminal's foreground on no more than one interval in four, less often the longer it stays quiet, before and after its own traffic, and after an adopted program has ended |
 
 #![cfg(unix)]
 
 use std::os::unix::process::CommandExt as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
+use kr_plugin_sdk::matching::MatchConfidence;
 use kr_protocol::broker::IntegrationMode;
 use kr_protocol::identity::ProcessStartIdentity;
 use kr_protocol::ids::{ApplicationInstanceId, SessionId};
@@ -29,7 +31,8 @@ use kr_protocol::root::CommandBypassReason;
 use kr_protocol::scalars::{Digest256, Nullable, TimestampMs, U64, Uuid};
 use kr_worker::broker::Broker;
 use kr_worker::broker::adoption::{ADOPTED_REFUSAL, Adoptions, Foreground};
-use kr_worker::broker::connectors::{ConnectorSources, fixture};
+use kr_worker::broker::catalogue::{Admissions, testing};
+use kr_worker::broker::connectors::{ConnectorSource, ConnectorSources, fixture};
 use kr_worker::broker::process::{BrokerTransport, Credential, ManagedProcess, TransportHandle};
 use kr_worker::persistence::JournalHealth;
 
@@ -61,64 +64,108 @@ fn session() -> SessionId {
     SessionId::new(Uuid::from_bytes([1; 16]))
 }
 
-/// A host tree with the Claude Code connector installed, the stand-in placed as `claude`, and one
+/// A host tree with packages admitted, the stand-in placed under the name they recognise, and one
 /// session's adoptions on a broker of its own.
 struct Setup {
     host: kr_ipc::testing::TempHost,
     broker: Arc<Broker>,
     adoptions: Adoptions,
     program: PathBuf,
+    /// The first package admitted.
     plugin_id: kr_protocol::ids::PluginId,
+    /// Every package admitted, in the order it was written.
+    packages: Vec<ConnectorSource>,
+    admissions: Admissions,
+    sources: ConnectorSources,
 }
 
 impl Setup {
+    /// The Claude Code connector admitted, and the stand-in placed as `claude`.
     fn new() -> Self {
+        Self::with(fixture::COMMAND, |store, bin| {
+            vec![fixture::claude_code_package(store, &bin.join("kr-hook")).expect("the package")]
+        })
+    }
+
+    /// The packages `packages` writes in the store admitted, and the stand-in placed as `name`.
+    fn with(name: &str, packages: impl FnOnce(&Path, &Path) -> Vec<ConnectorSource>) -> Self {
         let host = kr_ipc::testing::TempHost::create();
         let bin = host.root().join("bin");
         std::fs::create_dir_all(&bin).expect("a bin directory");
-        let program = bin.join(fixture::COMMAND);
+        let program = bin.join(name);
         kr_ipc::testing::place_program(
             &std::env::current_exe().expect("this test's own binary"),
             &program,
         );
         let store = host.root().join("store");
         std::fs::create_dir_all(&store).expect("a store");
-        let sources = Arc::new(ConnectorSources::new());
-        let source =
-            fixture::claude_code_package(&store, &bin.join("kr-hook")).expect("the package");
-        assert!(
-            sources.replace(vec![source]).is_empty(),
-            "the connector is installed"
-        );
-        let plugin_id = sources
-            .for_command(fixture::COMMAND)
-            .expect("the connector")
-            .plugin_id();
+        let packages = packages(&store, &bin);
         let broker = Arc::new(
             Broker::open(None, session(), JournalHealth::shared()).expect("the broker opens"),
         );
-        let adoptions = Adoptions::new(Arc::clone(&broker), sources, host.environment_id());
+        let admissions = Admissions::new();
+        let sources = ConnectorSources::new();
+        let admitted: Vec<_> = packages.iter().map(testing::admitted).collect();
+        let plugin_id = admitted[0].plugin_id.clone();
+        // The packages are admitted, as the control daemon hands them over.
+        let _ = testing::admit(&admissions, &sources, &broker, admitted, 1);
+        let adoptions = Adoptions::new(Arc::clone(&broker), host.environment_id());
         Self {
             host,
             broker,
             adoptions,
             program,
             plugin_id,
+            packages,
+            admissions,
+            sources,
         }
+    }
+
+    /// Hands over the next snapshot, at `round`, admitting the packages `admitted` names by
+    /// their place in [`Setup::packages`].
+    fn admit_only(&self, round: u64, admitted: &[usize]) {
+        let _ = testing::admit(
+            &self.admissions,
+            &self.sources,
+            &self.broker,
+            admitted
+                .iter()
+                .map(|index| testing::admitted(&self.packages[*index]))
+                .collect(),
+            round,
+        );
+    }
+
+    /// The package one adopted instance is bound to, where it is bound.
+    fn bound_to(&self, instance: ApplicationInstanceId) -> Option<Digest256> {
+        self.broker
+            .live_bindings()
+            .into_iter()
+            .find(|live| live.application_instance_id == instance)
+            .map(|live| live.release.package_digest)
     }
 
     /// Starts the stand-in as this process's own child, in a process group of its own.
     fn start(&self) -> Started {
-        let child = Command::new(&self.program)
+        self.start_telling(None)
+    }
+
+    /// The same, the stand-in writing to `running` once it runs.
+    fn start_telling(&self, running: Option<&Path>) -> Started {
+        let mut command = Command::new(&self.program);
+        command
             .args(["--exact", "the_stand_in_program", "--test-threads", "1"])
             .env(STAND_IN, "60")
             .current_dir(self.host.root())
             .process_group(0)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("the stand-in starts");
+            .stderr(Stdio::null());
+        if let Some(running) = running {
+            command.env(STAND_IN_RUNNING, running);
+        }
+        let child = command.spawn().expect("the stand-in starts");
         let process = kr_ipc::identity::process_start_identity(child.id())
             .expect("the stand-in is identified");
         Started { child, process }
@@ -221,6 +268,27 @@ fn kr_req_12_07_a_program_the_integration_did_not_launch_is_adopted_without_a_la
         "the kernel's argument vector"
     );
     assert!(setup.broker.binding_state(instance).is_ok());
+    // KR-REQ-11.13: adopted and bound in one step, to the package that recognised it, for the
+    // program it was found running.
+    assert_eq!(
+        setup.bound_to(instance),
+        Some(setup.packages[0].package_digest),
+        "the adopted instance is bound to the package that recognised it"
+    );
+    let bound = setup
+        .broker
+        .live_bindings()
+        .into_iter()
+        .find(|live| live.application_instance_id == instance)
+        .expect("bound");
+    assert_eq!(
+        setup
+            .broker
+            .binding_record(bound.binding_id)
+            .and_then(|record| record.executable)
+            .map(|executable| executable.path),
+        Some(profile.binary.resolved_path.clone())
+    );
 
     assert!(
         setup.adoptions.look(&foreground).is_empty(),
@@ -237,6 +305,122 @@ fn kr_req_12_07_a_program_the_integration_did_not_launch_is_adopted_without_a_la
         setup.broker.binding_state(instance).is_err(),
         "the instance ended with its program"
     );
+    assert!(
+        setup.broker.live_bindings().is_empty(),
+        "and its binding with it"
+    );
+}
+
+/// KR-REQ-11.13: a program two admitted packages both recognise exactly is adopted by neither,
+/// because the software development kit's rule selects neither and the host does not pick one on
+/// their behalf. With one of them no longer admitted, the one left is selected over a package that
+/// only infers the program, and the program is adopted and bound to it.
+#[test]
+fn kr_req_11_13_a_program_two_packages_recognise_exactly_is_adopted_by_neither() {
+    let setup = Setup::with(fixture::COMMAND, |store, bin| {
+        vec![
+            fixture::claude_code_package(store, &bin.join("kr-hook")).expect("the package"),
+            fixture::declarative_package(
+                store,
+                "claude-one",
+                fixture::COMMAND,
+                MatchConfidence::Exact,
+            )
+            .expect("the package"),
+            fixture::declarative_package(
+                store,
+                "claude-two",
+                fixture::COMMAND,
+                MatchConfidence::Exact,
+            )
+            .expect("the package"),
+        ]
+    });
+    let running = setup.host.root().join("running");
+    let started = setup.start_telling(Some(&running));
+    let deadline = std::time::Instant::now() + LIVENESS;
+    while !std::fs::read_to_string(&running).is_ok_and(|said| !said.is_empty()) {
+        assert!(std::time::Instant::now() < deadline, "the stand-in runs");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let foreground = Setup::foreground(&started, Vec::new());
+
+    // Running the program the packages recognise, and looked at for two seconds.
+    let looking = std::time::Instant::now() + Duration::from_secs(2);
+    while std::time::Instant::now() < looking {
+        assert!(
+            setup.adoptions.look(&foreground).is_empty(),
+            "two exact matches adopt nothing"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(setup.broker.live_bindings().is_empty());
+
+    setup.admit_only(2, &[0, 1]);
+    let told = setup.adopt(&foreground);
+    assert_eq!(
+        told.len(),
+        1,
+        "adopted once one exact match is left: {told:?}"
+    );
+    assert_eq!(
+        told[0]
+            .plugin_id
+            .as_ref()
+            .map(ToString::to_string)
+            .as_deref(),
+        Some("kalareach/claude-one"),
+        "an exact rule is selected over an inferred one"
+    );
+    assert_eq!(
+        setup.bound_to(told[0].application_instance_id),
+        Some(setup.packages[1].package_digest)
+    );
+    started.end();
+}
+
+/// KR-REQ-11.13: a package with no connector table recognises and adopts a program the way a
+/// connector does, as a native terminal instance with no registration, and binds it, with no
+/// decoding trust.
+#[test]
+fn kr_req_11_13_a_package_with_no_connector_table_adopts_and_binds_what_it_recognises() {
+    let setup = Setup::with("example-agent", |store, _| {
+        vec![
+            fixture::declarative_package(
+                store,
+                "example-declarative",
+                "example-agent",
+                MatchConfidence::Exact,
+            )
+            .expect("the package"),
+        ]
+    });
+    let started = setup.start();
+    let told = setup.adopt(&Setup::foreground(&started, Vec::new()));
+    assert_eq!(told.len(), 1, "the stand-in is adopted: {told:?}");
+    assert_eq!(told[0].plugin_id.as_ref(), Some(&setup.plugin_id));
+    assert_eq!(told[0].mode, IntegrationMode::NativeTerminal);
+    let instance = told[0].application_instance_id;
+    assert_eq!(
+        setup.bound_to(instance),
+        Some(setup.packages[0].package_digest),
+        "and bound to the package"
+    );
+    let bound = setup
+        .broker
+        .live_bindings()
+        .into_iter()
+        .find(|live| live.application_instance_id == instance)
+        .and_then(|live| setup.broker.binding_record(live.binding_id))
+        .expect("bound");
+    assert!(
+        bound.trust.is_none(),
+        "a package with no table decodes nothing"
+    );
+    assert!(bound.connector_digest.is_none());
+    started.end();
+    assert_eq!(setup.adoptions.sweep().len(), 1, "its end is found");
+    assert!(setup.broker.live_bindings().is_empty());
 }
 
 /// KR-REQ-12.07: a program the shell ran as typed is adopted with the reason its line was
