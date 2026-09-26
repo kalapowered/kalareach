@@ -545,6 +545,18 @@ mod platform {
     /// How long a busy connect pauses between attempts.
     const BUSY_RETRY_PAUSE: Duration = Duration::from_millis(20);
 
+    /// How long the listener waits for a caller's opening bytes before it gives up on it.
+    ///
+    /// The caller's account is read from the connection by impersonating it, which the platform
+    /// allows once the caller has sent something the listener has read. Every caller sends its
+    /// opening frame straight away, so this bounds the wait for that frame; a caller that connects
+    /// and says nothing is refused rather than allowed to hold the serial accept loop for ever.
+    const CLIENT_HELLO_WAIT: Duration = Duration::from_secs(30);
+
+    /// The most of a caller's opening bytes the listener reads before authenticating it. The bytes
+    /// are replayed to the reader, so a larger opening simply continues from the stream.
+    const HELLO_PEEK: usize = 8192;
+
     #[derive(Debug)]
     pub(super) struct Listener {
         inner: interprocess::local_socket::tokio::Listener,
@@ -583,16 +595,39 @@ mod platform {
         }
 
         pub(super) async fn accept(&self) -> Result<(super::Connection, PeerIdentity)> {
-            let stream = self
+            use tokio::io::AsyncReadExt as _;
+
+            let mut stream = self
                 .inner
                 .accept()
                 .await
                 .map_err(|error| IpcError::socket("accept", error))?;
-            // Prove the connected client runs as this account before it is handed to a reader, and
-            // before any frame is parsed. The client's token is read from the connection itself, so
-            // a client that has exited and whose identifier was reused cannot be taken for this
-            // account. A caller of another account is a `PeerRejected`-like refusal the accept loop
-            // drops without ceasing to serve the owner.
+            // Read the caller's opening bytes so its account can be read from a connection it has
+            // used: the platform impersonates a named-pipe client only once it has sent something the
+            // server has read. Every caller sends its opening frame first; a caller that connects and
+            // says nothing is refused rather than allowed to hold the serial accept loop. The bytes
+            // are kept and replayed to the reader, so this is still before any frame is parsed.
+            let mut prebuffer = vec![0_u8; HELLO_PEEK];
+            let read =
+                match tokio::time::timeout(CLIENT_HELLO_WAIT, stream.read(&mut prebuffer)).await {
+                    Ok(Ok(read)) => read,
+                    Ok(Err(error)) => return Err(IpcError::socket("accept", error)),
+                    Err(_elapsed) => {
+                        return Err(IpcError::PeerAccountRejected {
+                            detail: "the caller sent nothing to authenticate against".to_owned(),
+                        });
+                    }
+                };
+            if read == 0 {
+                return Err(IpcError::PeerAccountRejected {
+                    detail: "the caller closed before it identified itself".to_owned(),
+                });
+            }
+            prebuffer.truncate(read);
+            // Prove the caller runs as this account, from the connection itself, so a caller whose
+            // process has exited and whose identifier was reused cannot be taken for this account. A
+            // caller of another account is a `PeerRejected`-like refusal the accept loop drops
+            // without ceasing to serve the owner.
             let this_account = match &stream {
                 PipeServer::NamedPipe(pipe) => {
                     crate::starter::pipe_client_is_this_user(pipe.as_handle())
@@ -604,7 +639,11 @@ mod platform {
                     detail: "the caller runs as another account".to_owned(),
                 });
             }
-            let connection = Connection::Server(stream);
+            let connection = Connection::Server {
+                stream,
+                prebuffer,
+                delivered: 0,
+            };
             let peer = connection.peer()?;
             Ok((super::Connection(connection), peer))
         }
@@ -625,7 +664,15 @@ mod platform {
         /// The connecting side: a client opened for identification only.
         Client(NamedPipeClient),
         /// The accepting side, produced by the listener.
-        Server(PipeServer),
+        Server {
+            /// The accepted pipe stream.
+            stream: PipeServer,
+            /// The opening bytes read to authenticate the caller, replayed to the reader before the
+            /// stream so nothing the caller sent is lost.
+            prebuffer: Vec<u8>,
+            /// How much of `prebuffer` has been handed to the reader.
+            delivered: usize,
+        },
     }
 
     impl Connection {
@@ -663,7 +710,7 @@ mod platform {
                 // Windows reports the peer's process, not a numeric user. The listener has already
                 // proved the caller is this account, so the identity carried here is that process
                 // and the owning user this endpoint belongs to.
-                Self::Server(stream) => {
+                Self::Server { stream, .. } => {
                     let credentials = stream
                         .peer_creds()
                         .map_err(|source| IpcError::PeerUnknown { source })?;
@@ -693,7 +740,22 @@ mod platform {
         ) -> Poll<std::io::Result<()>> {
             match self.get_mut() {
                 Self::Client(client) => Pin::new(client).poll_read(context, buffer),
-                Self::Server(stream) => Pin::new(stream).poll_read(context, buffer),
+                Self::Server {
+                    stream,
+                    prebuffer,
+                    delivered,
+                } => {
+                    // Hand back the opening bytes read to authenticate the caller before reading on
+                    // from the stream, so the reader sees the caller's whole opening intact.
+                    if *delivered < prebuffer.len() {
+                        let remaining = &prebuffer[*delivered..];
+                        let take = remaining.len().min(buffer.remaining());
+                        buffer.put_slice(&remaining[..take]);
+                        *delivered += take;
+                        return Poll::Ready(Ok(()));
+                    }
+                    Pin::new(stream).poll_read(context, buffer)
+                }
             }
         }
     }
@@ -706,7 +768,7 @@ mod platform {
         ) -> Poll<std::io::Result<usize>> {
             match self.get_mut() {
                 Self::Client(client) => Pin::new(client).poll_write(context, bytes),
-                Self::Server(stream) => Pin::new(stream).poll_write(context, bytes),
+                Self::Server { stream, .. } => Pin::new(stream).poll_write(context, bytes),
             }
         }
 
@@ -716,7 +778,7 @@ mod platform {
         ) -> Poll<std::io::Result<()>> {
             match self.get_mut() {
                 Self::Client(client) => Pin::new(client).poll_flush(context),
-                Self::Server(stream) => Pin::new(stream).poll_flush(context),
+                Self::Server { stream, .. } => Pin::new(stream).poll_flush(context),
             }
         }
 
@@ -726,7 +788,7 @@ mod platform {
         ) -> Poll<std::io::Result<()>> {
             match self.get_mut() {
                 Self::Client(client) => Pin::new(client).poll_shutdown(context),
-                Self::Server(stream) => Pin::new(stream).poll_shutdown(context),
+                Self::Server { stream, .. } => Pin::new(stream).poll_shutdown(context),
             }
         }
     }
