@@ -137,9 +137,9 @@ fn kr_req_10_51_an_earlier_waiting_attempt_reads_unchanged_or_is_refused_by_name
     );
 
     let (_directory, store) = holding("named", "attempt.json");
-    let refused = store
-        .waiting_attempt()
-        .expect_err("the attempt names an approval by text");
+    let Err(refused) = store.waiting_attempt() else {
+        panic!("the attempt names an approval by text");
+    };
     assert_eq!(refused.kind, FailureKind::StoreFailed);
     let said = refused.detail.as_str();
     assert!(
