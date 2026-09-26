@@ -44,6 +44,15 @@
 //! both stay the errors the service named: the upload may still take the next part, and a caller
 //! that wants it ended asks the service to abandon it, whose answer is the explicit state.
 //!
+//! A retention change has one of its own, named by its reason as well as its code, because every
+//! service shares `CONFLICT`. With the reason `retention_changed`, it is a change decided against a
+//! revision the record has left: nothing was changed, and the refusal carries the retention as it
+//! stands, which is [`RetentionAnswer::Stale`], for the caller to show and decide again against. A
+//! change sent again after its answer was lost meets it too, and learns what the first one made. A
+//! conflict that does not carry those members as the contract states them stays the error the
+//! service named, a view to refresh: it still says nothing was changed, so it is never an unknown
+//! outcome.
+//!
 //! # What is never rendered
 //!
 //! A part carries ciphertext and a read answers with it, so the types that hold either write their
@@ -63,7 +72,7 @@ use serde::{Deserialize, Serialize};
 use super::account::{AccountTokenSource, BACKUP_WRITE_SCOPE};
 use super::relay::{ServiceHttp, ServiceSigner};
 use super::signed::{
-    AccountAuthorisation, Answer, Carriage, Content, SignedService, Unanswered, malformed,
+    AccountAuthorisation, Answer, Carriage, Content, Refusal, SignedService, Unanswered, malformed,
     unreadable_answer,
 };
 use super::{ServiceFuture, StorageService};
@@ -493,6 +502,36 @@ pub struct RetentionSet {
     pub revision: u64,
 }
 
+/// One principal's retention as it stands: whether backup storage is on, the retention the service
+/// applies, and the revision the next change names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RetentionState {
+    /// Whether backup storage is on.
+    pub backup: BackupState,
+    /// The retention the service applies.
+    pub retention: RetentionPolicy,
+    /// The revision the record is at, which the next change names.
+    pub revision: u64,
+}
+
+/// What a retention change was answered: the change, or the retention as it stands when the change
+/// was decided against a revision the record has left.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RetentionAnswer {
+    /// The service made the change, or it asked for what was already so.
+    Done(RetentionSet),
+    /// The change was decided against a revision the record has left, so nothing was changed.
+    ///
+    /// A caller shows `current` and decides again against it: the same change naming its revision
+    /// is made unless the retention changes again. A change sent again after its answer was lost is
+    /// answered this way too, and `current` is then what that change left, unless another has
+    /// landed since.
+    Stale {
+        /// The retention as it stands.
+        current: RetentionState,
+    },
+}
+
 /// What creating an upload answered.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UploadCreated {
@@ -738,11 +777,33 @@ enum SetState {
 
 /// What `storage.retention.set` answers.
 #[derive(Deserialize)]
-struct RetentionAnswer {
+struct RetentionSetAnswer {
     state: SetState,
     backup: BackupState,
     retention: RetentionPolicy,
     revision: u64,
+}
+
+/// Why a retention change was refused as a conflict: the one reason this client reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ConflictReason {
+    RetentionChanged,
+}
+
+/// What a retention change's conflict carries beside its code and message.
+#[derive(Deserialize)]
+struct RetentionChangedAnswer {
+    reason: ConflictReason,
+    current: RetentionStateAnswer,
+}
+
+/// The retention as it stands, as the service writes it.
+#[derive(Deserialize)]
+struct RetentionStateAnswer {
+    backup: BackupState,
+    retention: RetentionPolicy,
+    revision: U64,
 }
 
 /// A created upload's state, which is always `created`.
@@ -971,7 +1032,7 @@ impl ManagedStorageService {
         })
     }
 
-    async fn set_retention(&self, change: &RetentionChange) -> Result<RetentionSet> {
+    async fn set_retention(&self, change: &RetentionChange) -> Result<RetentionAnswer> {
         if let Some(snapshots) = change.daily_snapshots
             && !(1..=MAX_DAILY_SNAPSHOTS).contains(&snapshots)
         {
@@ -986,18 +1047,23 @@ impl ManagedStorageService {
             daily_snapshots: change.daily_snapshots,
             expected_revision: counter("a retention revision", change.expected_revision)?,
         };
-        let answer: RetentionAnswer = read(
-            self.ask(STORAGE_RETENTION_PATH, Method::StorageRetentionSet, &body)
-                .await?
-                .data()?,
-            "what a retention change answered",
-        )?;
-        Ok(RetentionSet {
+        let data = match self
+            .ask(STORAGE_RETENTION_PATH, Method::StorageRetentionSet, &body)
+            .await?
+        {
+            Answer::Data(data) => data,
+            Answer::Refused(refusal) if refusal.code() == "CONFLICT" => {
+                return stale_retention(refusal);
+            }
+            Answer::Refused(refusal) => return Err(refusal.into_error()),
+        };
+        let answer: RetentionSetAnswer = read(data, "what a retention change answered")?;
+        Ok(RetentionAnswer::Done(RetentionSet {
             changed: answer.state == SetState::Set,
             backup: answer.backup,
             retention: answer.retention,
             revision: answer.revision,
-        })
+        }))
     }
 
     async fn create_upload(&self, upload: &NewUpload) -> Result<ArchiveAnswer<UploadCreated>> {
@@ -1260,7 +1326,10 @@ impl StorageService for ManagedStorageService {
         Box::pin(self.status())
     }
 
-    fn set_retention<'a>(&'a self, change: &'a RetentionChange) -> ServiceFuture<'a, RetentionSet> {
+    fn set_retention<'a>(
+        &'a self,
+        change: &'a RetentionChange,
+    ) -> ServiceFuture<'a, RetentionAnswer> {
         Box::pin(self.set_retention(change))
     }
 
@@ -1388,6 +1457,30 @@ fn upload_answer(answer: Answer) -> Result<ArchiveAnswer<serde_json::Value>> {
             "NOT_FOUND" => Ok(ArchiveAnswer::UploadGone),
             _ => Err(refusal.into_error()),
         },
+    }
+}
+
+/// Reads a retention change's conflict as the retention as it stands, when the refusal carries it
+/// for the reason this client reads.
+///
+/// A conflict for another reason, or one whose members this client cannot read, stays the error the
+/// service named, which is a view to refresh. It is not an unknown outcome, as an answer this client
+/// cannot read would be: the code alone says nothing was changed.
+fn stale_retention(refusal: Refusal) -> Result<RetentionAnswer> {
+    let carried =
+        refusal.members::<RetentionChangedAnswer>("what a stale change's refusal carried");
+    match carried {
+        Ok(RetentionChangedAnswer {
+            reason: ConflictReason::RetentionChanged,
+            current,
+        }) => Ok(RetentionAnswer::Stale {
+            current: RetentionState {
+                backup: current.backup,
+                retention: current.retention,
+                revision: current.revision.get(),
+            },
+        }),
+        Err(_) => Err(refusal.into_error()),
     }
 }
 
@@ -1595,7 +1688,7 @@ mod tests {
                 },
             }),
         );
-        held_to_the_rule::<RetentionAnswer>(
+        held_to_the_rule::<RetentionSetAnswer>(
             "what a retention change answered",
             &serde_json::json!({
                 "state": "set",

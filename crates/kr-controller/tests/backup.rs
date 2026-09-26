@@ -13,7 +13,7 @@ use kr_client::retry::UserAction;
 use kr_client::services::{
     ArchiveAnswer, BackupManifestService, BackupState, CollectionSummary, Enrolled,
     FetchedGeneration, GenerationSummary, NewUpload, ObjectDeleted, ObjectRange, PartStored,
-    PartTable, Published, RetentionChange, RetentionPolicy, RetentionSet, ServiceFuture,
+    PartTable, Published, RetentionAnswer, RetentionChange, RetentionPolicy, ServiceFuture,
     StorageLimits, StoragePrincipal, StorageService, StorageStatus, StorageUsage, StoredObject,
     UploadAborted, UploadCompleted, UploadCreated, UploadId, UploadPart, WriterSummary,
 };
@@ -6545,7 +6545,7 @@ impl StorageService for Web {
     fn set_retention<'a>(
         &'a self,
         _change: &'a RetentionChange,
-    ) -> ServiceFuture<'a, RetentionSet> {
+    ) -> ServiceFuture<'a, RetentionAnswer> {
         Box::pin(async { Err(not_scripted()) })
     }
 
