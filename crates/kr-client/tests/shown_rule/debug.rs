@@ -510,6 +510,8 @@ struct Debugs {
     declared: BTreeMap<String, Vec<Declared>>,
     /// Each type alias by full path, with every definition it has.
     type_aliases: BTreeMap<String, Vec<Written>>,
+    /// Every trait some crate defines, by full path.
+    traits: BTreeSet<String>,
     by_hand: Vec<ByHand>,
     known: Known,
     plain: BTreeSet<String>,
@@ -581,7 +583,6 @@ impl Debugs {
         }
         let mut modules = BTreeMap::new();
         let mut macros = BTreeMap::new();
-        let mut always_macros = BTreeSet::new();
         let mut macro_use = BTreeSet::new();
         for (index, source) in sources.iter().enumerate() {
             for (scope, entry) in source.scopes.iter().enumerate() {
@@ -601,11 +602,9 @@ impl Debugs {
             for (name, open, _) in macro_bodies(tokens) {
                 // `macro_rules`, `!` and the name come before the body.
                 let exported = attributed(open - 3, "macro_export");
-                let path = format!("{}::{name}", source.crate_name);
-                if exported && !item_conditional(tokens, open - 3) {
-                    always_macros.insert(path.clone());
-                }
-                *macros.entry(path).or_insert(false) |= exported;
+                *macros
+                    .entry(format!("{}::{name}", source.crate_name))
+                    .or_insert(false) |= exported;
             }
             for at in 0..tokens.len() {
                 if ident(tokens.get(at)) == Some("extern")
@@ -623,10 +622,11 @@ impl Debugs {
             crates,
             modules,
             macros,
-            always_macros,
+            always_macros: BTreeSet::new(),
             macro_use,
             declared: BTreeMap::new(),
             type_aliases: BTreeMap::new(),
+            traits: BTreeSet::new(),
             by_hand: Vec::new(),
             known,
             plain: BTreeSet::new(),
@@ -637,6 +637,7 @@ impl Debugs {
             placed: std::cell::RefCell::new(BTreeMap::new()),
             expanding: std::cell::Cell::new(0),
         };
+        debugs.always_macros = debugs.exported_always();
         for index in 0..debugs.sources.len() {
             debugs.declare_types(index);
         }
@@ -689,15 +690,30 @@ impl Debugs {
                 {
                     self.declare_alias(index, &tokens, at, scope);
                 }
+                Some("trait") => {
+                    if let Some(name) = ident(tokens.get(at + 1)) {
+                        let path = self.sources[index].defined_path(scope, name);
+                        self.traits.insert(path);
+                    }
+                }
                 _ => {}
             }
         }
         for (invoked, scope, expanded) in self.expansions(index, &tokens, &macros) {
             for item in 0..expanded.len() {
-                if matches!(ident(expanded.get(item)), Some("struct" | "enum" | "union"))
-                    && ident(expanded.get(item + 1)).is_some()
-                {
-                    self.declare_type(index, &expanded, item, scope, Some(invoked));
+                match ident(expanded.get(item)) {
+                    Some("struct" | "enum" | "union")
+                        if ident(expanded.get(item + 1)).is_some() =>
+                    {
+                        self.declare_type(index, &expanded, item, scope, Some(invoked));
+                    }
+                    Some("trait") => {
+                        if let Some(name) = ident(expanded.get(item + 1)) {
+                            let path = self.sources[index].defined_path(scope, name);
+                            self.traits.insert(path);
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -1715,6 +1731,30 @@ fn std_spelled(path: &str) -> String {
         .map_or_else(|| path.to_owned(), |rest| format!("std::{rest}"))
 }
 
+/// The namespace a name is looked up in: the compiler keeps types, traits and modules apart from
+/// macros, so a name can be one of each at once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Space {
+    /// Types, traits, modules and crates: every name of a path but its last, and the last of a
+    /// type's or a trait's.
+    Types,
+    /// Macros, attributes and derives.
+    Macros,
+    /// Either: the last name of an import, which brings whatever it names.
+    Any,
+}
+
+impl Kind {
+    /// The namespace the last name of a path read as this is looked up in.
+    fn space(self) -> Space {
+        match self {
+            Kind::Type | Kind::Trait => Space::Types,
+            Kind::Macro | Kind::Attribute | Kind::Derive => Space::Macros,
+            Kind::Import => Space::Any,
+        }
+    }
+}
+
 impl Debugs {
     /// The full path of the item the path `segments`, written at `scope` of source `index`, names,
     /// placed as the compiler places it, or why this reading cannot place it. A path written from
@@ -1723,11 +1763,13 @@ impl Debugs {
     /// The first name is the innermost scope's that gives it: by an item or an import of its own,
     /// or else through its globs, then the scopes around it, then a crate or the prelude. Each
     /// name after it is the one the module reached gives, by an item or an import of its own, or
-    /// else through its globs. An import's path is read where the import is written. A glob gives
-    /// what its module sees: another crate's item only when it and each glob on the way are
-    /// public. Where a glob may or may not give a name, every way the compiler could place it has
-    /// to agree; a name given twice, a module this reading cannot find, and a glob of a module
-    /// outside the workspace whose names it cannot list leave the path unplaced.
+    /// else through its globs. Every name but the last is looked up among types, traits and
+    /// modules, and the last in the namespace `kind` names. An import's path is read where the
+    /// import is written. A glob gives what its module sees: another crate's item only when it and
+    /// each glob on the way are public. Where a glob may or may not give a name, every way the
+    /// compiler could place it has to agree; a name given twice, a module this reading cannot
+    /// find, and a glob of a module outside the workspace whose names it cannot list leave the path
+    /// unplaced.
     fn place(
         &self,
         index: usize,
@@ -1788,16 +1830,33 @@ impl Debugs {
                 }
             }
         };
+        self.walk(start, rest, kind.space(), visiting)
+    }
+
+    /// The item the names `rest` lead to, one after another, from the module or item `start`: every
+    /// name but the last among types, traits and modules, and the last in `space`.
+    fn walk(
+        &self,
+        start: String,
+        rest: &[String],
+        space: Space,
+        visiting: &mut Vec<String>,
+    ) -> Result<String, Why> {
         let mut path = start;
-        for name in rest {
-            path = self.one(&path, name, visiting)?;
+        for (position, name) in rest.iter().enumerate() {
+            let space = if position + 1 == rest.len() {
+                space
+            } else {
+                Space::Types
+            };
+            path = self.one(&path, name, space, visiting)?;
         }
         Ok(std_spelled(&path))
     }
 
     /// What the first name of a path leads to where it is written: the first of `scopes`, the
-    /// innermost first, that gives the name, by its own items and imports before any glob; past
-    /// them, a crate or the prelude.
+    /// innermost first, that gives the name in the namespace it is looked up in, by its own items
+    /// and imports before any glob; past them, a crate or the prelude.
     fn first_name(
         &self,
         index: usize,
@@ -1810,7 +1869,8 @@ impl Debugs {
         let Some((&scope, outer)) = scopes.split_first() else {
             return self.beyond(index, name, single, kind);
         };
-        let given = self.explicit(index, scope, name, visiting)?;
+        let space = if single { kind.space() } else { Space::Types };
+        let given = self.explicit(index, scope, name, space, visiting)?;
         if given.iter().any(|named| named.present) {
             return one_of(&given, name).map(Some);
         }
@@ -1824,7 +1884,7 @@ impl Debugs {
             if glob.scope != scope {
                 continue;
             }
-            for named in self.through_glob(index, position, name, visiting)? {
+            for named in self.through_glob(index, position, name, space, visiting)? {
                 match named.reach.seen_from(&module) {
                     Some(true) if !glob.conditional => candidates.push((named.path, true)),
                     Some(false) => {}
@@ -1898,15 +1958,33 @@ impl Debugs {
         })
     }
 
-    /// What `scope` of source `index` gives under `name` by its own items and imports, each with
-    /// where it may be seen from.
+    /// The namespaces the item at the full path `path` is in: types, traits and modules, macros,
+    /// or, for an item this reading does not read, either.
+    fn namespaces(&self, path: &str) -> (bool, bool) {
+        let types = self.declared.contains_key(path)
+            || self.type_aliases.contains_key(path)
+            || self.modules.contains_key(path)
+            || self.traits.contains(path);
+        let macros = self.macros.contains_key(path);
+        if types || macros {
+            (types, macros)
+        } else {
+            (true, true)
+        }
+    }
+
+    /// What `scope` of source `index` gives under `name` in `space` by its own items and imports,
+    /// each with where it may be seen from.
     fn explicit(
         &self,
         index: usize,
         scope: usize,
         name: &str,
+        space: Space,
         visiting: &mut Vec<String>,
     ) -> Result<Vec<Named>, Why> {
+        let wants_types = space != Space::Macros;
+        let wants_macros = space != Space::Types;
         let source = &self.sources[index];
         let module = source.module_of(scope).join("::");
         let mut given = Vec::new();
@@ -1922,8 +2000,14 @@ impl Debugs {
             visiting.push(key);
             let target = self.target(index, scope, &import.written, import.global, visiting);
             visiting.pop();
+            let path = target?;
+            // An import brings its item in the item's own namespaces.
+            let (types, macros) = self.namespaces(&path);
+            if !(types && wants_types || macros && wants_macros) {
+                continue;
+            }
             given.push(Named {
-                path: target?,
+                path,
                 reach: if import.conditional {
                     Reach::Unsure
                 } else {
@@ -1945,13 +2029,15 @@ impl Debugs {
         } else {
             Reach::Unsure
         };
-        if source.definitions.contains(&key) {
+        if wants_types && source.definitions.contains(&key) {
             given.push(Named {
                 path: defined,
                 reach: item_reach.clone(),
                 present: always,
             });
-        } else if self.declared.contains_key(&defined) || self.type_aliases.contains_key(&defined) {
+        } else if wants_types
+            && (self.declared.contains_key(&defined) || self.type_aliases.contains_key(&defined))
+        {
             // A type a macro declares here, whose visibility and conditions this reading does not
             // read.
             given.push(Named {
@@ -1970,7 +2056,7 @@ impl Debugs {
                     && !other.block
                     && other.module.last().is_some_and(|last| last == name)
             });
-        if declares_module {
+        if wants_types && declares_module {
             let path = format!("{module}::{name}");
             // A module file whose own `cfg` this reading cannot decide can be left out as well.
             let file_conditional = self.modules.get(&path).is_some_and(|scopes| {
@@ -1986,7 +2072,11 @@ impl Debugs {
             });
         }
         let exported = format!("{module}::{name}");
-        if scope == 0 && source.module.len() == 1 && self.macros.get(&exported) == Some(&true) {
+        if wants_macros
+            && scope == 0
+            && source.module.len() == 1
+            && self.macros.get(&exported) == Some(&true)
+        {
             let present = self.always_macros.contains(&exported);
             given.push(Named {
                 path: exported,
@@ -2001,13 +2091,14 @@ impl Debugs {
         Ok(given)
     }
 
-    /// What the glob at `position` of source `index` gives under `name`, before the scope the glob
-    /// is written in decides what it sees.
+    /// What the glob at `position` of source `index` gives under `name` in `space`, before the
+    /// scope the glob is written in decides what it sees.
     fn through_glob(
         &self,
         index: usize,
         position: usize,
         name: &str,
+        space: Space,
         visiting: &mut Vec<String>,
     ) -> Result<Vec<Named>, Why> {
         // A glob's own path is read without it.
@@ -2019,19 +2110,20 @@ impl Debugs {
         let glob = &self.sources[index].globs[position];
         let given = self
             .target(index, glob.scope, &glob.written, glob.global, visiting)
-            .and_then(|module| self.member(&module, name, visiting));
+            .and_then(|module| self.member(&module, name, space, visiting));
         visiting.pop();
         given
     }
 
-    /// What the module at the full path `module` gives under `name`: its own items and imports,
-    /// or else what its globs give it, each with where it may be seen from. A module outside the
-    /// workspace gives the item its path names, which this reading cannot say is there unless it
-    /// is one this reading acts on.
+    /// What the module at the full path `module` gives under `name` in `space`: its own items and
+    /// imports, or else what its globs give it, each with where it may be seen from. A module
+    /// outside the workspace gives the item its path names, which this reading cannot say is there
+    /// unless it is one this reading acts on.
     fn member(
         &self,
         module: &str,
         name: &str,
+        space: Space,
         visiting: &mut Vec<String>,
     ) -> Result<Vec<Named>, Why> {
         let full = std_spelled(&format!("{module}::{name}"));
@@ -2057,8 +2149,10 @@ impl Debugs {
                     present: true,
                 }]);
             }
-            // A type of the workspace, whose variants an import can name.
+            // A type of the workspace, whose variants an import can name: they are types, not
+            // macros.
             return match self.declared.get(module) {
+                Some(_) if space == Space::Macros => Ok(Vec::new()),
                 Some(definitions) => {
                     let variant = |declared: &Declared, always: bool| {
                         declared.shapes.iter().any(|shape| {
@@ -2088,7 +2182,7 @@ impl Debugs {
                 None => Err(format!("{module}, a module this reading cannot find")),
             };
         };
-        let key = format!("member {full}");
+        let key = format!("member {full} {space:?}");
         if visiting.contains(&key) {
             // A cycle of globs gives nothing more.
             return Ok(Vec::new());
@@ -2099,7 +2193,7 @@ impl Debugs {
         // leads to is there only under some conditions.
         let mut each = Vec::new();
         for &(index, scope) in scopes {
-            match self.module_member(index, scope, module, name, visiting) {
+            match self.module_member(index, scope, module, name, space, visiting) {
                 Ok(named) => each.push(named),
                 Err(why) => {
                     visiting.pop();
@@ -2144,9 +2238,10 @@ impl Debugs {
         scope: usize,
         module: &str,
         name: &str,
+        space: Space,
         visiting: &mut Vec<String>,
     ) -> Result<Vec<Named>, Why> {
-        let given = self.explicit(index, scope, name, visiting)?;
+        let given = self.explicit(index, scope, name, space, visiting)?;
         if given.iter().any(|named| named.present) {
             return Ok(given);
         }
@@ -2162,7 +2257,7 @@ impl Debugs {
             } else {
                 reach(glob.visibility, module)
             };
-            for named in self.through_glob(index, position, name, visiting)? {
+            for named in self.through_glob(index, position, name, space, visiting)? {
                 // A glob takes what its module sees, and gives it on no further than itself.
                 if named.reach.seen_from(module) != Some(false) {
                     found.push(Named {
@@ -2176,9 +2271,15 @@ impl Debugs {
         Ok(found)
     }
 
-    /// The one item the module `module` gives under `name`, where a path names it there.
-    fn one(&self, module: &str, name: &str, visiting: &mut Vec<String>) -> Result<String, Why> {
-        let given = self.member(module, name, visiting)?;
+    /// The one item the module `module` gives under `name` in `space`, where a path names it there.
+    fn one(
+        &self,
+        module: &str,
+        name: &str,
+        space: Space,
+        visiting: &mut Vec<String>,
+    ) -> Result<String, Why> {
+        let given = self.member(module, name, space, visiting)?;
         one_of(&given, &format!("{module}::{name}"))
     }
 
@@ -2196,31 +2297,94 @@ impl Debugs {
             let Some((krate, rest)) = path.split_first() else {
                 return Err("an import this reading cannot read".to_owned());
             };
-            let mut placed = krate.clone();
-            for name in rest {
-                placed = self.one(&placed, name, visiting)?;
-            }
-            return Ok(std_spelled(&placed));
+            return self.walk(krate.clone(), rest, Space::Any, visiting);
         }
         self.place_from(index, scope, path, Kind::Import, visiting)
     }
 
-    /// Where the full path `path` leads through every re-export, or `path` itself when this
-    /// reading cannot follow it.
+    /// Where the full path `path` of a type leads through every re-export, or `path` itself when
+    /// this reading cannot follow it.
     fn canonical(&self, path: &str) -> String {
-        let segments: Vec<&str> = path.split("::").collect();
+        let segments: Vec<String> = path.split("::").map(ToOwned::to_owned).collect();
         let Some((first, rest)) = segments.split_first() else {
             return path.to_owned();
         };
-        let mut placed = (*first).to_owned();
-        let mut visiting = Vec::new();
-        for name in rest {
-            match self.one(&placed, name, &mut visiting) {
-                Ok(next) => placed = next,
-                Err(_) => return path.to_owned(),
+        self.walk(first.clone(), rest, Space::Types, &mut Vec::new())
+            .unwrap_or_else(|_| path.to_owned())
+    }
+
+    /// Whether the module at the full path `module` is there under every set of conditions: a
+    /// crate's root, or a module one declaration of which no `cfg` this reading cannot decide can
+    /// leave out, in a module that is there too.
+    fn present_module(&self, module: &str) -> bool {
+        let Some((parent, name)) = module.rsplit_once("::") else {
+            return true;
+        };
+        let Some(scopes) = self.modules.get(module) else {
+            return false;
+        };
+        let declared_in = |index: usize, scope: usize| {
+            self.sources[index]
+                .always
+                .contains(&(scope, name.to_owned()))
+        };
+        self.present_module(parent)
+            && scopes.iter().any(|&(index, scope)| {
+                match self.sources[index].scopes[scope].parent {
+                    // An inline module, declared in the scope around it.
+                    Some(around) => declared_in(index, around),
+                    // A module file, not left out by its own `#![cfg(…)]`, declared in its parent.
+                    None => {
+                        !self.sources[index].conditional
+                            && self.modules.get(parent).is_some_and(|declaring| {
+                                declaring
+                                    .iter()
+                                    .any(|&(at, at_scope)| declared_in(at, at_scope))
+                            })
+                    }
+                }
+            })
+    }
+
+    /// The exported macros that are at their crate's root under every set of conditions: each
+    /// exported by a `#[macro_export]` of its own, not one `cfg_attr` gives, and written where no
+    /// `cfg` this reading cannot decide can leave it out, through every module around it.
+    fn exported_always(&self) -> BTreeSet<String> {
+        let mut always = BTreeSet::new();
+        for source in &self.sources {
+            let tokens = &source.tokens;
+            for (name, open, _) in macro_bodies(tokens) {
+                // `macro_rules`, `!` and the name come before the body.
+                let at = open - 3;
+                let exported = (before_item(tokens, at)..at).any(|index| {
+                    punct(tokens.get(index), '#')
+                        && punct(tokens.get(index + 1), '[')
+                        && ident(tokens.get(index + 2)) == Some("macro_export")
+                });
+                if !exported || item_conditional(tokens, at) {
+                    continue;
+                }
+                let mut scope = source.scope_at(at);
+                let mut present = true;
+                while let Some(around) = source.scopes[scope].parent {
+                    let entry = &source.scopes[scope];
+                    // A macro written in a block is there only when the item around it is.
+                    let declared = !entry.block
+                        && entry.module.last().is_some_and(|module| {
+                            source.always.contains(&(around, module.clone()))
+                        });
+                    if !declared {
+                        present = false;
+                        break;
+                    }
+                    scope = around;
+                }
+                if present && self.present_module(&source.module.join("::")) {
+                    always.insert(format!("{}::{name}", source.crate_name));
+                }
             }
         }
-        std_spelled(&placed)
+        always
     }
 }
 
@@ -2739,15 +2903,28 @@ struct Reading<'a> {
 type Refused = (usize, Why);
 
 impl Debugs {
-    /// Reads one `Debug` written by hand, and says the first thing it formats that may carry text.
+    /// Reads one `Debug` written by hand, and says the first thing it formats that may carry text:
+    /// every `fn fmt` of the `impl`, since `cfg` can put any of them in force.
     fn read_by_hand(&self, hand: &ByHand, carrying: &Carrying) -> Result<(), Refused> {
         let tokens = &hand.tokens;
-        let refuse = |why: &str| (hand.line, why.to_owned());
-        let at = (0..tokens.len())
-            .find(|&at| {
+        let bodies: Vec<usize> = (0..tokens.len())
+            .filter(|&at| {
                 ident(tokens.get(at)) == Some("fn") && ident(tokens.get(at + 1)) == Some("fmt")
             })
-            .ok_or_else(|| refuse("a body this reading cannot find"))?;
+            .collect();
+        if bodies.is_empty() {
+            return Err((hand.line, "a body this reading cannot find".to_owned()));
+        }
+        for at in bodies {
+            self.read_fmt(hand, carrying, at)?;
+        }
+        Ok(())
+    }
+
+    /// Reads the `fn fmt` at `at` of a `Debug` written by hand.
+    fn read_fmt(&self, hand: &ByHand, carrying: &Carrying, at: usize) -> Result<(), Refused> {
+        let tokens = &hand.tokens;
+        let refuse = |why: &str| (hand.line, why.to_owned());
         let open = at + 2;
         let close =
             closing(tokens, open).ok_or_else(|| refuse("a body this reading cannot find"))?;
@@ -4539,6 +4716,34 @@ fn each_name_is_placed_where_the_compiler_places_it() {
             "mod names {\n    pub use std::fmt::Debug as Shows;\n}\npub struct Leak(pub String);\nconst _: () = {\n    use kr_other::*;\n    impl names::Shows for Leak {\n        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n            formatter.debug_tuple(\"Leak\").field(&self.0).finish()\n        }\n    }\n};\n",
             7,
             "a trait this reading cannot place",
+        ),
+        (
+            "a macro a glob gives under the Debug trait's name, where the compiler looks for a trait",
+            "#[macro_export]\nmacro_rules! Debug {\n    () => {};\n}\n",
+            "use std::fmt::Debug;\npub struct Leak(pub String);\nconst _: () = {\n    use kr_other::*;\n    impl Debug for Leak {\n        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n            formatter.debug_tuple(\"Leak\").field(&self.0).finish()\n        }\n    }\n};\n",
+            7,
+            "formats std::string::String",
+        ),
+        (
+            "a macro exported under some conditions only, which a glob gives under the Debug trait's name",
+            "#[cfg_attr(not(unix), macro_export)]\nmacro_rules! Debug {\n    () => {};\n}\n",
+            "use std::fmt::Debug;\npub struct Leak(pub String);\nconst _: () = {\n    use kr_other::*;\n    #[cfg(unix)]\n    impl Debug for Leak {\n        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n            formatter.debug_tuple(\"Leak\").field(&self.0).finish()\n        }\n    }\n};\n",
+            8,
+            "formats std::string::String",
+        ),
+        (
+            "a module a cfg(test) inside it leaves out, past which the outer name is the Debug trait",
+            "pub mod names {\n    #![cfg(test)]\n    pub trait Shows {\n        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result;\n    }\n}\n",
+            "mod names {\n    pub use std::fmt::Debug as Shows;\n}\npub struct Leak(pub String);\nconst _: () = {\n    use kr_other::*;\n    impl names::Shows for Leak {\n        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n            formatter.debug_tuple(\"Leak\").field(&self.0).finish()\n        }\n    }\n};\n",
+            7,
+            "a trait this reading cannot place",
+        ),
+        (
+            "a Debug written by hand with one fmt for each platform, the second of which formats text",
+            "",
+            "pub struct Leak(pub String);\nimpl std::fmt::Debug for Leak {\n    #[cfg(not(unix))]\n    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n        formatter.write_str(\"safe\")\n    }\n    #[cfg(unix)]\n    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n        formatter.debug_tuple(\"Leak\").field(&self.0).finish()\n    }\n}\n",
+            9,
+            "formats std::string::String",
         ),
         (
             "an extern crate",
