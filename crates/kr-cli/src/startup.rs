@@ -1011,6 +1011,26 @@ impl Log {
     }
 }
 
+/// Writes `prior` back as this environment's choice when a write that failed left another one, and
+/// says where the choice stands.
+///
+/// A write can fail after the new document was published: the file is replaced by a rename, and
+/// the flush of its directory that follows can fail. So the document is read again, and a choice
+/// that is not the prior one is written back as an edit, under the document's own lock, and read
+/// again.
+#[cfg(any(windows, test))]
+fn restore_choice(environment: &EnvironmentPaths, prior: Option<ControllerStartup>) -> Shown {
+    if Chosen::read(environment).controller == prior {
+        return Shown::said("startup.controller is as it was");
+    }
+    let _ = crate::doctor::configuration::apply(environment, &Change::ControllerStartup(prior));
+    if Chosen::read(environment).controller == prior {
+        Shown::said("startup.controller was written back as it was")
+    } else {
+        Shown::said("startup.controller is not as it was; run kr host startup to see it")
+    }
+}
+
 /// The standalone start's scheduled task, as this command says it.
 ///
 /// What was read from the Task Scheduler or from a task is said in this command's own words: which
@@ -1023,7 +1043,7 @@ pub(crate) mod task {
     use kr_client::shown;
     use kr_client::shown::Shown;
     use kr_controller::supervision::windows::{
-        Difference, ForeignReason, LastResult, LogonType, Standing, TaskError, task_name,
+        Difference, ForeignReason, LastResult, LogonType, ReadBack, Standing, TaskError, task_name,
     };
     use kr_protocol::ids::EnvironmentId;
 
@@ -1121,26 +1141,28 @@ pub(crate) mod task {
                 asked.as_str(),
                 name
             ),
-            TaskError::ReadBack {
-                differences: Some(differences),
-                undone,
-                ..
-            } => shown!(
-                "the scheduled task {} was changed and does not read back as it was asked to be ({}); \
-                 the change was {}",
-                name,
-                self::differences(differences),
-                if *undone { "undone" } else { "not undone" }
-            ),
-            TaskError::ReadBack {
-                differences: None,
-                undone,
-                ..
-            } => shown!(
-                "the scheduled task {} was changed and cannot be found; the change was {}",
-                name,
-                if *undone { "undone" } else { "not undone" }
-            ),
+            TaskError::ReadBack { found, undone, .. } => {
+                let found = match found {
+                    ReadBack::Differs(differences) => {
+                        shown!(
+                            "reads back differently ({})",
+                            self::differences(differences)
+                        )
+                    }
+                    ReadBack::Gone => Shown::said("cannot be found"),
+                    ReadBack::Foreign(foreign) => shown!(
+                        "now reads back as a task that is not this environment's own: {}",
+                        self::foreign(&foreign.reason)
+                    ),
+                    ReadBack::Unread(_) => Shown::said("could not be read back"),
+                };
+                shown!(
+                    "the scheduled task {} was changed and {}; the change was {}",
+                    name,
+                    found,
+                    if *undone { "undone" } else { "not undone" }
+                )
+            }
             TaskError::Locked(_) => shown!(
                 "another change to the scheduled task {} held it for longer than the wait, or its \
                  lock could not be taken",
@@ -1416,23 +1438,25 @@ mod windows {
         let program = super::daemon_program()?;
         let definition = definition(environment, &program)?;
         let environment_id = environment.environment_id();
-        let changed = if startup == Some(ControllerStartup::Standalone) {
-            if !program.is_file() {
-                return Err(CliError::Usage(shown!(
-                    "the standalone start runs the control daemon installed beside this command, \
-                     {}, and there is none there; nothing was changed",
-                    Shown::root(&program)
-                )));
-            }
-            let change = scheduled::set_up(&definition).map_err(|error| {
-                CliError::Usage(shown!(
-                    "{}; nothing was changed",
-                    task::error(&error, environment_id)
-                ))
-            })?;
+        let standalone = startup == Some(ControllerStartup::Standalone);
+        if standalone && !program.is_file() {
+            return Err(CliError::Usage(shown!(
+                "the standalone start runs the control daemon installed beside this command, {}, \
+                 and there is none there; nothing was changed",
+                Shown::root(&program)
+            )));
+        }
+        // Held until the document is written or the task is put back, so another environment
+        // whose task shares the name cannot change it in between.
+        let registration = scheduled::registration(&definition)
+            .map_err(|error| refused(&error, environment_id))?;
+        let changed = if standalone {
+            let change = registration
+                .set_up()
+                .map_err(|error| refused(&error, environment_id))?;
             TaskChanged { change, left: None }
         } else {
-            match scheduled::clear(&definition) {
+            match registration.clear() {
                 Ok(change) => TaskChanged { change, left: None },
                 Err(error) => TaskChanged {
                     change: TaskChange::Unchanged,
@@ -1444,7 +1468,7 @@ mod windows {
         if let Err(error) = crate::doctor::configuration::apply(environment, change) {
             return Err(put_back(
                 environment,
-                &definition,
+                &registration,
                 &changed.change,
                 prior,
                 &error,
@@ -1453,24 +1477,38 @@ mod windows {
         Ok(changed)
     }
 
-    /// The failure of a document write whose task change was undone, or could not be.
+    /// The failure of a change to the environment's task, which says whether the task is as it
+    /// was.
+    fn refused(
+        error: &scheduled::TaskError,
+        environment_id: kr_protocol::ids::EnvironmentId,
+    ) -> CliError {
+        let said = task::error(error, environment_id);
+        match error {
+            scheduled::TaskError::Locked(_) => {
+                CliError::HostUnavailable(shown!("{}; nothing was changed", said))
+            }
+            _ if error.changed_nothing() => {
+                CliError::Usage(shown!("{}; nothing was changed", said))
+            }
+            _ => CliError::HostUnavailable(said),
+        }
+    }
+
+    /// The failure of a document write, with the task put back as it was, or what could not be.
     ///
-    /// The document is replaced whole or not at all, so a write that failed leaves the prior
-    /// choice; it is read again to be sure, and a choice that differs is said.
+    /// The prior choice is written back where the failed write left another one, and the task is
+    /// put back under the registration the change was made under, which is still held.
     fn put_back(
         environment: &EnvironmentPaths,
-        definition: &TaskDefinition,
+        registration: &scheduled::Registration<'_>,
         change: &TaskChange,
         prior: Option<ControllerStartup>,
         error: &CliError,
     ) -> CliError {
         let environment_id = environment.environment_id();
-        let choice = if super::Chosen::read(environment).controller == prior {
-            Shown::said("startup.controller is as it was")
-        } else {
-            Shown::said("startup.controller is not as it was; run kr host startup to see it")
-        };
-        match scheduled::undo(definition, change) {
+        let choice = super::restore_choice(environment, prior);
+        match registration.undo(change) {
             Ok(()) => CliError::Usage(shown!(
                 "{}; the scheduled task {} is as it was, and {}",
                 *error,
@@ -2196,13 +2234,28 @@ mod tests {
             },
             TaskError::ReadBack {
                 name: MARKER.to_owned(),
-                differences: Some(marked_findings()),
+                found: kr_controller::supervision::windows::ReadBack::Differs(marked_findings()),
                 undone: true,
             },
             TaskError::ReadBack {
                 name: MARKER.to_owned(),
-                differences: None,
+                found: kr_controller::supervision::windows::ReadBack::Gone,
                 undone: false,
+            },
+            TaskError::ReadBack {
+                name: MARKER.to_owned(),
+                found: kr_controller::supervision::windows::ReadBack::Unread(MARKER.to_owned()),
+                undone: false,
+            },
+            TaskError::ReadBack {
+                name: MARKER.to_owned(),
+                found: kr_controller::supervision::windows::ReadBack::Foreign(foreign(
+                    ForeignReason::Account {
+                        user: MARKER.to_owned(),
+                        description: MARKER.to_owned(),
+                    },
+                )),
+                undone: true,
             },
             TaskError::Locked(MARKER.to_owned()),
             TaskError::Unwritten(MARKER.to_owned()),
@@ -2230,6 +2283,44 @@ mod tests {
             .as_str()
             .contains("the Task Scheduler did not remove the scheduled task"),
             "a refusal says what was asked and its exit code"
+        );
+    }
+
+    /// KR-REQ-07.12: a write of the document that failed after it published the new choice, as a
+    /// write whose directory could not be flushed after its rename does, has the prior choice
+    /// written back, and says so; a failed write that published nothing leaves the choice as it
+    /// was.
+    #[test]
+    fn a_choice_a_failed_write_published_is_written_back() {
+        let host = kr_ipc::testing::TempHost::create();
+        let environment = host.environment();
+        assert_eq!(
+            restore_choice(&environment, None).as_str(),
+            "startup.controller is as it was"
+        );
+        // What a write that renamed its file into place and then failed leaves.
+        crate::doctor::configuration::apply(
+            &environment,
+            &Change::ControllerStartup(Some(ControllerStartup::Standalone)),
+        )
+        .expect("the new choice is published");
+        assert_eq!(
+            restore_choice(&environment, None).as_str(),
+            "startup.controller was written back as it was"
+        );
+        assert_eq!(Chosen::read(&environment).controller, None);
+        crate::doctor::configuration::apply(
+            &environment,
+            &Change::ControllerStartup(Some(ControllerStartup::Service)),
+        )
+        .expect("another choice is published");
+        assert_eq!(
+            restore_choice(&environment, Some(ControllerStartup::Standalone)).as_str(),
+            "startup.controller was written back as it was"
+        );
+        assert_eq!(
+            Chosen::read(&environment).controller,
+            Some(ControllerStartup::Standalone)
         );
     }
 

@@ -58,29 +58,37 @@ const STARTUP_TITLE: &str =
 pub const TASK_CHECK: &str = "startup-task";
 
 /// What the standalone start's check examines on Windows.
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 const TASK_TITLE: &str = "The scheduled task kr new has start the daemon";
 
-/// The standalone start's check on Windows, when there is anything of it to report: whose the
-/// environment's scheduled task is, whether it is the one this installation registers, and that the
-/// daemon it starts runs only while the user is signed in.
+/// The standalone start's check on Windows, when there is anything of it to report.
 ///
 /// An environment that neither chooses the standalone start nor has a task of its own registered
 /// gets no check.
 #[cfg(windows)]
 fn startup_check(environment: &kr_ipc::paths::EnvironmentPaths) -> Option<DoctorCheck> {
-    use kr_controller::supervision::windows::Standing;
     use kr_protocol::hostinfo::configuration::ControllerStartup;
-    use kr_protocol::hostinfo::export::Sentence;
 
     let chosen = crate::startup::Chosen::read(environment);
     let selected = chosen.controller == Some(ControllerStartup::Standalone);
     let report = crate::startup::task_report(environment, selected)?;
+    Some(task_check(&report, selected))
+}
+
+/// The standalone start's check from what its scheduled task is: whose it is, whether it is the
+/// one this installation registers, and, apart, where a start can use it (the login session this
+/// command runs in) and the task's last result, which is one for all of its runs; and that the
+/// daemon it starts runs only while the user is signed in.
+#[cfg(any(windows, test))]
+fn task_check(report: &crate::startup::task::Report, selected: bool) -> DoctorCheck {
+    use kr_controller::supervision::windows::{LastResult, Standing};
+    use kr_protocol::hostinfo::export::Sentence;
+
     let task = Sentence::new()
         .stated("the scheduled task of environment ")
-        .identifier(&environment.environment_id());
+        .identifier(&report.environment_id);
     if !selected {
-        return Some(DoctorCheck::new(
+        return DoctorCheck::new(
             TASK_CHECK,
             TASK_TITLE,
             DoctorStatus::Warning,
@@ -92,13 +100,12 @@ fn startup_check(environment: &kr_ipc::paths::EnvironmentPaths) -> Option<Doctor
                 "run kr host startup --clear to remove it, or kr host startup --set standalone to \
                  use it",
             ),
-        ));
+        );
     }
     let (status, found, remedy) = match &report.standing {
         _ if report.usable() => (
             DoctorStatus::Ok,
-            " is this environment's own and the one this installation registers; the daemon it \
-             starts runs only while you are signed in, so signing out ends it and every session",
+            " is this environment's own and the one this installation registers",
             None,
         ),
         Ok(Standing::Owned(differences)) if differences.is_empty() => (
@@ -128,7 +135,29 @@ fn startup_check(environment: &kr_ipc::paths::EnvironmentPaths) -> Option<Doctor
             Some("run kr host startup to see why"),
         ),
     };
-    Some(DoctorCheck::new(
+    let session = match report.session {
+        Some(0) => Sentence::new().stated(
+            "; this command runs in no interactive session (login session 0), so whether you \
+             are signed in elsewhere is not known here",
+        ),
+        Some(session) => Sentence::new()
+            .stated("; you are signed in to login session ")
+            .number(u64::from(session))
+            .stated(", where the task can start the daemon"),
+        None => Sentence::new().stated("; this command's login session cannot be read"),
+    };
+    let last = match report.last_result {
+        Some(LastResult::NotRun) => {
+            Sentence::new().stated("; it has not run since it was registered")
+        }
+        Some(LastResult::Running) => Sentence::new().stated("; a run of it is under way"),
+        Some(LastResult::Ended(0)) => Sentence::new().stated("; its last run succeeded"),
+        Some(LastResult::Ended(code)) => Sentence::new()
+            .stated("; its last run ended with code ")
+            .number(u64::from(code)),
+        None => Sentence::new().stated("; its last result cannot be read"),
+    };
+    DoctorCheck::new(
         TASK_CHECK,
         TASK_TITLE,
         status,
@@ -137,9 +166,15 @@ fn startup_check(environment: &kr_ipc::paths::EnvironmentPaths) -> Option<Doctor
             .term("standalone")
             .stated(": ")
             .sentence(&task)
-            .stated(found),
+            .stated(found)
+            .sentence(&session)
+            .sentence(&last)
+            .stated(
+                ", for all of its runs; the daemon it starts runs only while you are signed in, so \
+                 signing out ends it and every session",
+            ),
         remedy,
-    ))
+    )
 }
 
 /// The service start's check, when there is anything of it to report.

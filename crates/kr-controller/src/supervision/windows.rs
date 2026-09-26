@@ -548,8 +548,8 @@ impl std::fmt::Display for Foreign {
 /// Whether two Windows paths name the same place.
 ///
 /// Case and the separator do not matter there, and neither does the verbatim prefix a resolved
-/// path carries. Where both name something that is there, they are also compared as the file
-/// system resolves them, so a short name and its long form are the same place.
+/// path carries. Where both are absolute and name something that is there, they are also compared
+/// as the file system resolves them, so a short name and its long form are the same place.
 fn same_path(written: &str, expected: &Path) -> bool {
     let normal = |path: &Path| {
         without_verbatim_prefix(path.to_path_buf())
@@ -562,6 +562,11 @@ fn same_path(written: &str, expected: &Path) -> bool {
     let written = Path::new(written.trim());
     if normal(written) == normal(expected) {
         return true;
+    }
+    // A relative path would be resolved against this process's own directory, which is not where
+    // the Task Scheduler runs anything, so only a path that names its place in full is resolved.
+    if !written.is_absolute() || !expected.is_absolute() {
+        return false;
     }
     match (
         std::fs::canonicalize(written),
@@ -837,13 +842,13 @@ pub enum TaskError {
         /// What went wrong, in the Task Scheduler's own words where it gave any.
         detail: String,
     },
-    /// The task was changed and did not read back as the one asked for, so the change was undone;
-    /// `undone` says whether undoing it worked.
+    /// The task was changed and did not read back as the one asked for, so the change was undone
+    /// as far as it could be; `undone` says whether it was.
     ReadBack {
         /// The task's name.
         name: String,
-        /// How it differed, or `None` when it could not be found at all.
-        differences: Option<Vec<Difference>>,
+        /// What the task read back as.
+        found: ReadBack,
         /// Whether the change was undone.
         undone: bool,
     },
@@ -851,6 +856,33 @@ pub enum TaskError {
     Locked(String),
     /// The definition could not be written where the Task Scheduler reads it.
     Unwritten(String),
+}
+
+impl TaskError {
+    /// Whether the task is as it was before the call that failed: a refusal before any change,
+    /// or a change that was undone.
+    #[must_use]
+    pub const fn changed_nothing(&self) -> bool {
+        match self {
+            Self::ReadBack { undone, .. } => *undone,
+            Self::Foreign(_) | Self::Scheduler { .. } | Self::Locked(_) | Self::Unwritten(_) => {
+                true
+            }
+        }
+    }
+}
+
+/// What a task read back as after a change, when it was not the task the change asked for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReadBack {
+    /// The environment's own task, differing as listed.
+    Differs(Vec<Difference>),
+    /// No task under the name.
+    Gone,
+    /// A task under the name that is not the environment's own.
+    Foreign(Foreign),
+    /// The task could not be read back at all, and why.
+    Unread(String),
 }
 
 impl std::fmt::Display for TaskError {
@@ -862,29 +894,67 @@ impl std::fmt::Display for TaskError {
             }
             Self::ReadBack {
                 name,
-                differences: Some(differences),
+                found,
                 undone,
-            } => write!(
-                formatter,
-                "{name} was changed and reads back differently ({}); the change was {}",
-                differences
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join("; "),
-                if *undone { "undone" } else { "not undone" }
-            ),
-            Self::ReadBack {
-                name,
-                differences: None,
-                undone,
-            } => write!(
-                formatter,
-                "{name} was changed and cannot be found; the change was {}",
-                if *undone { "undone" } else { "not undone" }
-            ),
+            } => {
+                match found {
+                    ReadBack::Differs(differences) => write!(
+                        formatter,
+                        "{name} was changed and reads back differently ({})",
+                        differences
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    )?,
+                    ReadBack::Gone => write!(formatter, "{name} was changed and cannot be found")?,
+                    ReadBack::Foreign(foreign) => {
+                        write!(
+                            formatter,
+                            "{name} was changed and now reads back as {foreign}"
+                        )?;
+                    }
+                    ReadBack::Unread(detail) => {
+                        write!(
+                            formatter,
+                            "{name} was changed and could not be read back: {detail}"
+                        )?;
+                    }
+                }
+                write!(
+                    formatter,
+                    "; the change was {}",
+                    if *undone { "undone" } else { "not undone" }
+                )
+            }
         }
     }
+}
+
+/// What a change to a task comes to once the task has been read back: the change, when the task
+/// is the one asked for; otherwise the change undone by `revert` as far as it can be, and a refusal
+/// that says what was found and whether it was undone. A read-back that fails is a task not known
+/// to be the one asked for, so it is undone too.
+#[cfg(any(windows, test))]
+fn settle(
+    name: &str,
+    change: TaskChange,
+    read_back: Result<Standing, TaskError>,
+    revert: impl FnOnce(&TaskChange) -> Result<(), TaskError>,
+) -> Result<TaskChange, TaskError> {
+    let found = match read_back {
+        Ok(Standing::Owned(differences)) if differences.is_empty() => return Ok(change),
+        Ok(Standing::Owned(differences)) => ReadBack::Differs(differences),
+        Ok(Standing::Absent) => ReadBack::Gone,
+        Ok(Standing::Foreign(foreign)) => ReadBack::Foreign(foreign),
+        Err(error) => ReadBack::Unread(error.to_string()),
+    };
+    let undone = revert(&change).is_ok();
+    Err(TaskError::ReadBack {
+        name: name.to_owned(),
+        found,
+        undone,
+    })
 }
 
 /// How the task's last run ended, for all of its runs together: the Task Scheduler keeps one
@@ -959,7 +1029,9 @@ fn csv_fields(line: &str) -> Vec<String> {
 }
 
 #[cfg(windows)]
-pub use self::platform::{clear, last_result, register, remove, run, set_up, standing, undo};
+pub use self::platform::{
+    Registration, clear, last_result, register, registration, remove, run, set_up, standing, undo,
+};
 
 /// The calls to the Task Scheduler, through `schtasks.exe` from the system directory.
 #[cfg(windows)]
@@ -1085,140 +1157,187 @@ mod platform {
         })
     }
 
-    /// Registers `definition`, or brings this environment's own task back to it.
+    /// The lock every change to one task name takes, held with the environment's definition for
+    /// as long as a change and the undoing of it last.
     ///
-    /// # Errors
-    ///
-    /// Returns what went wrong, as [`set_up`] does.
-    pub fn register(definition: &TaskDefinition) -> Result<(), TaskError> {
-        set_up(definition).map(drop)
+    /// Two environments whose identities share a prefix share the name. A command that may have to
+    /// undo a change, because what it does next can fail, holds this until it knows it will not
+    /// have to, so no other change under the name comes between the change and its undoing.
+    #[derive(Debug)]
+    pub struct Registration<'a> {
+        definition: &'a TaskDefinition,
+        _lock: kr_ipc::starter::NamedLock,
     }
 
-    /// Registers `definition` for its environment and says what that changed, so the change can be
-    /// undone.
-    ///
-    /// A task of the same name that is not this environment's is refused and left as it is. This
-    /// environment's own task is left as it is when it is already `definition`, and registered
-    /// again when it differs, its prior form kept as the Task Scheduler exported it. A name no
-    /// task holds is taken only while it is still free. The definition is written to a UTF-16
-    /// file in the environment's owner-only state directory for the Task Scheduler to read, and
-    /// removed again. The task is read back afterwards and must be exactly `definition`; one that
-    /// is not has its change undone, and the refusal says so.
+    /// Takes the lock every change to `definition`'s task name takes.
     ///
     /// # Errors
     ///
-    /// Returns what went wrong: a foreign task, a registration the Task Scheduler refused, or a
-    /// task that did not read back as the one registered.
-    pub fn set_up(definition: &TaskDefinition) -> Result<TaskChange, TaskError> {
-        let _lock = registration_lock(&definition.name)?;
-        let (found, exported) = read(definition)?;
-        let change = match found {
-            Standing::Foreign(foreign) => return Err(TaskError::Foreign(foreign)),
-            Standing::Owned(differences) if differences.is_empty() => {
-                return Ok(TaskChange::Unchanged);
-            }
-            Standing::Owned(_) => {
-                create(definition, &definition.xml(), true)?;
-                TaskChange::Repaired { prior: exported }
-            }
-            Standing::Absent => {
-                if let Err(error) = create(definition, &definition.xml(), false) {
-                    // A creation refused because the name was taken meanwhile, by something that
-                    // does not take this lock, leaves that task as it is and says whose it is.
-                    return match standing(definition)? {
-                        Standing::Foreign(foreign) => Err(TaskError::Foreign(foreign)),
-                        _ => Err(error),
-                    };
-                }
-                TaskChange::Registered
-            }
-        };
-        let differences = match standing(definition)? {
-            Standing::Owned(differences) if differences.is_empty() => return Ok(change),
-            Standing::Owned(differences) => Some(differences),
-            Standing::Absent => None,
-            Standing::Foreign(foreign) => return Err(TaskError::Foreign(foreign)),
-        };
-        let undone = revert(definition, &change).is_ok();
-        Err(TaskError::ReadBack {
-            name: definition.name.clone(),
-            differences,
-            undone,
+    /// Returns [`TaskError::Locked`] when another change keeps it past the bound, or it cannot be
+    /// taken.
+    pub fn registration(definition: &TaskDefinition) -> Result<Registration<'_>, TaskError> {
+        Ok(Registration {
+            definition,
+            _lock: registration_lock(&definition.name)?,
         })
+    }
+
+    impl Registration<'_> {
+        /// Registers the definition for its environment and says what that changed, so the
+        /// change can be undone.
+        ///
+        /// A task of the same name that is not this environment's is refused and left as it is.
+        /// This environment's own task is left as it is when it is already the definition, and
+        /// registered again when it differs, its prior form kept as the Task Scheduler exported
+        /// it. A name no task holds is taken only while it is still free. The definition is
+        /// written to a UTF-16 file in the environment's owner-only state directory for the Task
+        /// Scheduler to read, and removed again. The task is read back afterwards and must be
+        /// exactly the definition; one that is not, or that cannot be read back, has its change
+        /// undone, and the refusal says whether it was.
+        ///
+        /// # Errors
+        ///
+        /// Returns what went wrong: a foreign task, a registration the Task Scheduler refused, or
+        /// a task that did not read back as the one registered.
+        pub fn set_up(&self) -> Result<TaskChange, TaskError> {
+            let definition = self.definition;
+            let (found, exported) = read(definition)?;
+            let change = match found {
+                Standing::Foreign(foreign) => return Err(TaskError::Foreign(foreign)),
+                Standing::Owned(differences) if differences.is_empty() => {
+                    return Ok(TaskChange::Unchanged);
+                }
+                Standing::Owned(_) => {
+                    create(definition, &definition.xml(), true)?;
+                    TaskChange::Repaired { prior: exported }
+                }
+                Standing::Absent => {
+                    if let Err(error) = create(definition, &definition.xml(), false) {
+                        // A creation refused because the name was taken meanwhile, by something
+                        // that does not take this lock, leaves that task as it is and says whose
+                        // it is.
+                        return match standing(definition)? {
+                            Standing::Foreign(foreign) => Err(TaskError::Foreign(foreign)),
+                            _ => Err(error),
+                        };
+                    }
+                    TaskChange::Registered
+                }
+            };
+            super::settle(&definition.name, change, standing(definition), |change| {
+                self.undo(change)
+            })
+        }
+
+        /// Removes this environment's own task and says what that changed, its prior form kept
+        /// as the Task Scheduler exported it so the removal can be undone.
+        ///
+        /// A task of the same name that is not this environment's is refused and left as it is.
+        /// Removing a task leaves every process it started running: only ending a run would end
+        /// them, and this host never ends one.
+        ///
+        /// # Errors
+        ///
+        /// Returns what went wrong: a foreign task, or a removal the Task Scheduler refused.
+        pub fn clear(&self) -> Result<TaskChange, TaskError> {
+            let definition = self.definition;
+            let (found, exported) = read(definition)?;
+            match found {
+                Standing::Absent => return Ok(TaskChange::Unchanged),
+                Standing::Foreign(foreign) => return Err(TaskError::Foreign(foreign)),
+                Standing::Owned(_) => {}
+            }
+            delete(definition)?;
+            Ok(TaskChange::Removed { prior: exported })
+        }
+
+        /// Undoes `change`, which [`Self::set_up`] or [`Self::clear`] made: a task registered
+        /// where there was none is removed, and a task repaired or removed is put back as it was
+        /// exported.
+        ///
+        /// Whatever is under the name now is checked first: a task that is not this environment's
+        /// own is never replaced or removed, and one that is gone is put back only while the name
+        /// is free.
+        ///
+        /// # Errors
+        ///
+        /// Returns what went wrong: a foreign task under the name, or a change the Task Scheduler
+        /// refused.
+        pub fn undo(&self, change: &TaskChange) -> Result<(), TaskError> {
+            let definition = self.definition;
+            let found = standing(definition)?;
+            if let Standing::Foreign(foreign) = found {
+                return Err(TaskError::Foreign(foreign));
+            }
+            match change {
+                TaskChange::Unchanged => Ok(()),
+                TaskChange::Registered => match found {
+                    Standing::Owned(_) => delete(definition),
+                    _ => Ok(()),
+                },
+                TaskChange::Repaired { prior } | TaskChange::Removed { prior } => {
+                    create(definition, prior, matches!(found, Standing::Owned(_)))?;
+                    match standing(definition)? {
+                        Standing::Owned(_) => Ok(()),
+                        Standing::Foreign(foreign) => Err(TaskError::Foreign(foreign)),
+                        Standing::Absent => Err(TaskError::ReadBack {
+                            name: definition.name.clone(),
+                            found: super::ReadBack::Gone,
+                            undone: false,
+                        }),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Registers `definition`, or brings this environment's own task back to it, as
+    /// [`Registration::set_up`] does.
+    ///
+    /// # Errors
+    ///
+    /// Returns what went wrong, as [`Registration::set_up`] does.
+    pub fn register(definition: &TaskDefinition) -> Result<(), TaskError> {
+        registration(definition)?.set_up().map(drop)
+    }
+
+    /// Registers `definition` and says what that changed, holding the registration for the change
+    /// alone, as [`Registration::set_up`] does.
+    ///
+    /// # Errors
+    ///
+    /// Returns what went wrong, as [`Registration::set_up`] does.
+    pub fn set_up(definition: &TaskDefinition) -> Result<TaskChange, TaskError> {
+        registration(definition)?.set_up()
     }
 
     /// Removes this environment's own task, and says whether there was one.
     ///
     /// # Errors
     ///
-    /// Returns what went wrong, as [`clear`] does.
+    /// Returns what went wrong, as [`Registration::clear`] does.
     pub fn remove(definition: &TaskDefinition) -> Result<bool, TaskError> {
         clear(definition).map(|change| matches!(change, TaskChange::Removed { .. }))
     }
 
-    /// Removes this environment's own task and says what that changed, its prior form kept as the
-    /// Task Scheduler exported it so the removal can be undone.
-    ///
-    /// A task of the same name that is not this environment's is refused and left as it is.
-    /// Removing a task leaves every process it started running: only ending a run would end them,
-    /// and this host never ends one.
+    /// Removes this environment's own task and says what that changed, holding the registration
+    /// for the removal alone, as [`Registration::clear`] does.
     ///
     /// # Errors
     ///
-    /// Returns what went wrong: a foreign task, or a removal the Task Scheduler refused.
+    /// Returns what went wrong, as [`Registration::clear`] does.
     pub fn clear(definition: &TaskDefinition) -> Result<TaskChange, TaskError> {
-        let _lock = registration_lock(&definition.name)?;
-        let (found, exported) = read(definition)?;
-        match found {
-            Standing::Absent => return Ok(TaskChange::Unchanged),
-            Standing::Foreign(foreign) => return Err(TaskError::Foreign(foreign)),
-            Standing::Owned(_) => {}
-        }
-        delete(definition)?;
-        Ok(TaskChange::Removed { prior: exported })
+        registration(definition)?.clear()
     }
 
-    /// Undoes `change`, which [`set_up`] or [`clear`] made for `definition`'s environment: a task
-    /// registered where there was none is removed, and a task repaired or removed is put back as it
-    /// was exported.
-    ///
-    /// Whatever is under the name now is checked first: a task that is not this environment's own
-    /// is never replaced or removed, and one that is gone is put back only while the name is free.
+    /// Undoes `change`, holding the registration for the undoing alone, as
+    /// [`Registration::undo`] does.
     ///
     /// # Errors
     ///
-    /// Returns what went wrong: a foreign task under the name, or a change the Task Scheduler
-    /// refused.
+    /// Returns what went wrong, as [`Registration::undo`] does.
     pub fn undo(definition: &TaskDefinition, change: &TaskChange) -> Result<(), TaskError> {
-        let _lock = registration_lock(&definition.name)?;
-        revert(definition, change)
-    }
-
-    /// Undoes `change` while the registration lock is held.
-    fn revert(definition: &TaskDefinition, change: &TaskChange) -> Result<(), TaskError> {
-        let found = standing(definition)?;
-        if let Standing::Foreign(foreign) = found {
-            return Err(TaskError::Foreign(foreign));
-        }
-        match change {
-            TaskChange::Unchanged => Ok(()),
-            TaskChange::Registered => match found {
-                Standing::Owned(_) => delete(definition),
-                _ => Ok(()),
-            },
-            TaskChange::Repaired { prior } | TaskChange::Removed { prior } => {
-                create(definition, prior, matches!(found, Standing::Owned(_)))?;
-                match standing(definition)? {
-                    Standing::Owned(_) => Ok(()),
-                    Standing::Foreign(foreign) => Err(TaskError::Foreign(foreign)),
-                    Standing::Absent => Err(TaskError::ReadBack {
-                        name: definition.name.clone(),
-                        differences: None,
-                        undone: false,
-                    }),
-                }
-            }
-        }
+        registration(definition)?.undo(change)
     }
 
     /// Registers `xml` under `definition`'s name, through the Task Scheduler.
@@ -2283,6 +2402,96 @@ mod tests {
                 .expect("another program is refused")
                 .contains("not this installation's starter")
         );
+    }
+
+    /// A change that reads back as asked is the change. One that reads back otherwise, or that
+    /// cannot be read back at all, is undone as far as it can be, and the refusal says what was
+    /// found and whether the undoing worked, which is whether anything is left changed.
+    #[test]
+    fn a_change_not_read_back_as_asked_is_undone_and_says_whether_it_was() {
+        let host = TempHost::create();
+        let definition = TaskDefinition::for_setup(USER, &host.environment(), &starter(&host));
+        let name = definition.name.as_str();
+        assert_eq!(
+            settle(
+                name,
+                TaskChange::Registered,
+                Ok(Standing::Owned(Vec::new())),
+                |_| panic!("a change read back as asked is not undone"),
+            ),
+            Ok(TaskChange::Registered)
+        );
+        let mut undone = Vec::new();
+        let unread = settle(
+            name,
+            TaskChange::Registered,
+            Err(TaskError::Scheduler {
+                asked: Asked::Query,
+                code: None,
+                detail: "the query timed out".to_owned(),
+            }),
+            |change| {
+                undone.push(change.clone());
+                Ok(())
+            },
+        )
+        .expect_err("a task that cannot be read back is not known to be as asked");
+        assert_eq!(undone, [TaskChange::Registered], "so the change is undone");
+        assert!(matches!(
+            &unread,
+            TaskError::ReadBack {
+                found: ReadBack::Unread(_),
+                undone: true,
+                ..
+            }
+        ));
+        assert!(unread.changed_nothing());
+        let prior = TaskChange::Repaired {
+            prior: definition.xml(),
+        };
+        let differs = settle(
+            name,
+            prior,
+            Ok(Standing::Owned(vec![Difference::Disabled])),
+            |_| Err(TaskError::Locked("held".to_owned())),
+        )
+        .expect_err("a task that reads back otherwise is refused");
+        assert!(matches!(
+            &differs,
+            TaskError::ReadBack {
+                found: ReadBack::Differs(_),
+                undone: false,
+                ..
+            }
+        ));
+        assert!(
+            !differs.changed_nothing(),
+            "a change that could not be undone is left changed"
+        );
+        assert!(differs.to_string().contains("the change was not undone"));
+        assert!(matches!(
+            settle(name, TaskChange::Registered, Ok(Standing::Absent), |_| Ok(
+                ()
+            )),
+            Err(TaskError::ReadBack {
+                found: ReadBack::Gone,
+                undone: true,
+                ..
+            })
+        ));
+    }
+
+    /// A relative command is never taken for this installation's program, even where it would
+    /// resolve to it from this process's own directory: the Task Scheduler does not run anything
+    /// there. An absolute alias of the same file is the same place.
+    #[test]
+    fn a_relative_command_is_not_taken_for_this_installations_program() {
+        let directory = std::env::current_dir().expect("this test's directory");
+        let manifest = directory.join("Cargo.toml");
+        assert!(manifest.is_file(), "the test runs in its crate's directory");
+        assert!(!same_path("Cargo.toml", &manifest));
+        let alias = directory.join("src").join("..").join("Cargo.toml");
+        assert!(same_path(&alias.display().to_string(), &manifest));
     }
 
     /// A path resolved on Windows is named without its verbatim prefix, a network path as a

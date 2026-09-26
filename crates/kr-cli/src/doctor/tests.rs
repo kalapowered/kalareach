@@ -555,3 +555,93 @@ fn entry_names(bytes: &[u8]) -> Vec<String> {
     }
     names
 }
+
+/// KR-REQ-07.12: the standalone start's check says whose the environment's scheduled task is and
+/// whether it is the one this installation registers, and apart from that where a start can use
+/// it and the task's last result, one for all of its runs; the same task seen from an interactive
+/// session and from session 0, or with another last result, is said differently. A task that is
+/// not usable fails with its remedy, and a task nothing chooses any more is a warning.
+#[test]
+fn the_standalone_starts_check_says_whose_valid_and_available_apart() {
+    use kr_controller::supervision::windows::{Difference, LastResult, Standing};
+
+    use crate::startup::task::Report;
+
+    let environment_id = kr_protocol::ids::EnvironmentId::new(kr_ipc::new_uuid());
+    let report = |standing, program_present, session, last_result| Report {
+        environment_id,
+        standing,
+        program_present,
+        session,
+        last_result,
+    };
+    let signed_in = task_check(
+        &report(
+            Ok(Standing::Owned(Vec::new())),
+            true,
+            Some(2),
+            Some(LastResult::Ended(0)),
+        ),
+        true,
+    );
+    assert_eq!(signed_in.id(), TASK_CHECK);
+    assert_eq!(signed_in.status, DoctorStatus::Ok);
+    for part in [
+        &format!("the scheduled task of environment {environment_id}"),
+        "is this environment's own and the one this installation registers",
+        "you are signed in to login session 2, where the task can start the daemon",
+        "its last run succeeded, for all of its runs",
+        "signing out ends it and every session",
+    ] {
+        assert!(
+            signed_in.detail().contains(part),
+            "{part}: {}",
+            signed_in.detail()
+        );
+    }
+    let services = task_check(
+        &report(
+            Ok(Standing::Owned(Vec::new())),
+            true,
+            Some(0),
+            Some(LastResult::Ended(0x8007_10e0)),
+        ),
+        true,
+    );
+    assert_eq!(services.status, DoctorStatus::Ok);
+    assert!(
+        services
+            .detail()
+            .contains("this command runs in no interactive session (login session 0)")
+            && services
+                .detail()
+                .contains("its last run ended with code 2147946720"),
+        "{}",
+        services.detail()
+    );
+    assert_ne!(signed_in.detail(), services.detail());
+    for (standing, program_present, remedy) in [
+        (Ok(Standing::Absent), true, "to register it"),
+        (
+            Ok(Standing::Owned(vec![Difference::Disabled])),
+            true,
+            "to repair it",
+        ),
+        (Ok(Standing::Owned(Vec::new())), false, "install kr again"),
+    ] {
+        let failed = task_check(&report(standing, program_present, Some(1), None), true);
+        assert_eq!(failed.status, DoctorStatus::Failed);
+        assert!(
+            failed.remedy().unwrap_or_default().contains(remedy),
+            "{remedy}: {:?}",
+            failed.remedy()
+        );
+        assert!(failed.detail().contains("its last result cannot be read"));
+    }
+    let unused = task_check(
+        &report(Ok(Standing::Owned(Vec::new())), true, Some(1), None),
+        false,
+    );
+    assert_eq!(unused.status, DoctorStatus::Warning);
+    assert!(unused.detail().contains("nothing uses it"));
+}
