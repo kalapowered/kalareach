@@ -93,12 +93,22 @@ pub const HELD_RENAME_BOUND: std::time::Duration = std::time::Duration::from_sec
 /// Returns `rename`'s error: the last refusal once the bound has passed, and any other error at
 /// once.
 pub fn retry_while_held(rename: impl FnMut() -> std::io::Result<()>) -> std::io::Result<()> {
-    retry_within(HELD_RENAME_BOUND, rename)
+    retry_while_held_until(std::time::Instant::now() + HELD_RENAME_BOUND, rename)
 }
 
-/// [`retry_while_held`] with the bound given, which the tests shorten.
-fn retry_within(
-    bound: std::time::Duration,
+/// [`retry_while_held`] until a deadline the caller took, for a caller whose rename is one part of
+/// an operation that as a whole ends within one bound.
+///
+/// Such a caller takes its deadline as the operation starts, one [`HELD_RENAME_BOUND`] away, and
+/// what it waits for before the rename, a lock among it, spends the same bound. The first attempt
+/// is made whenever this is called, even once the deadline has passed, because a rename nothing
+/// holds is made at once; no later attempt starts after the deadline.
+///
+/// # Errors
+///
+/// As [`retry_while_held`], with the deadline in place of the bound.
+pub fn retry_while_held_until(
+    deadline: std::time::Instant,
     mut rename: impl FnMut() -> std::io::Result<()>,
 ) -> std::io::Result<()> {
     #[cfg(windows)]
@@ -112,19 +122,18 @@ fn retry_within(
                     || code == ERROR_ACCESS_DENIED.cast_signed()
             })
         };
-        let started = Instant::now();
         let mut pause = Duration::from_millis(2);
         loop {
             let refused = match rename() {
                 Err(error) if held(&error) => error,
                 answer => return answer,
             };
-            let left = bound.saturating_sub(started.elapsed());
+            let left = deadline.saturating_duration_since(Instant::now());
             if !left.is_zero() {
                 std::thread::sleep(pause.min(left));
             }
-            // A pause cut short at the bound ends past it: no attempt starts once it has passed.
-            if started.elapsed() >= bound {
+            // A pause cut short at the deadline ends past it: no attempt starts once it has passed.
+            if Instant::now() >= deadline {
                 return Err(refused);
             }
             pause = pause.saturating_mul(2).min(Duration::from_millis(200));
@@ -132,7 +141,7 @@ fn retry_within(
     }
     #[cfg(not(windows))]
     {
-        let _ = bound;
+        let _ = deadline;
         rename()
     }
 }
@@ -723,6 +732,62 @@ mod tests {
         publish_without_replacing(&verbatim(&second), &verbatim(&other))
             .expect("given by verbatim names");
         assert_eq!(std::fs::read(&other).expect("readable"), b"second");
+    }
+
+    /// [`retry_while_held_until`] with a deadline one `bound` from now, as [`retry_while_held`]
+    /// takes one [`HELD_RENAME_BOUND`] from now. These tests shorten it.
+    fn retry_within(
+        bound: std::time::Duration,
+        rename: impl FnMut() -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        retry_while_held_until(std::time::Instant::now() + bound, rename)
+    }
+
+    /// A deadline that has already passed still has the rename made once, which succeeds where
+    /// nothing holds what it needs, and is not made again after a refusal.
+    #[test]
+    fn a_rename_is_made_once_after_its_deadline() {
+        let passed = std::time::Instant::now();
+        let mut attempts = 0;
+        retry_while_held_until(passed, || {
+            attempts += 1;
+            Ok(())
+        })
+        .expect("made at once");
+        assert_eq!(attempts, 1);
+
+        let mut attempts = 0;
+        let refused = retry_while_held_until(passed, || {
+            attempts += 1;
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        });
+        assert_eq!(
+            refused.expect_err("refused").kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(attempts, 1);
+    }
+
+    /// On Windows a hold met after the deadline is answered with its refusal at once: nothing is
+    /// tried again.
+    #[cfg(windows)]
+    #[test]
+    fn a_hold_met_after_the_deadline_is_not_tried_again() {
+        use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
+
+        let passed = std::time::Instant::now();
+        let mut attempts = 0;
+        let refused = retry_while_held_until(passed, || {
+            attempts += 1;
+            Err(std::io::Error::from_raw_os_error(
+                ERROR_SHARING_VIOLATION.cast_signed(),
+            ))
+        });
+        assert_eq!(
+            refused.expect_err("refused").raw_os_error(),
+            Some(ERROR_SHARING_VIOLATION.cast_signed())
+        );
+        assert_eq!(attempts, 1);
     }
 
     /// A rename that fails any other way than a hold is answered at once, after one attempt, on

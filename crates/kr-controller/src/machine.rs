@@ -16,9 +16,16 @@
 //! state is created again.
 //!
 //! The store keeps no copy of the record. Every step reads the record, checks the precondition the
-//! owner approved against it and publishes a whole new record, holding one lock per process while
-//! it does; the singleton lock keeps every other process out. A step is therefore never checked
-//! against anything but the record on disk.
+//! owner approved against it and publishes a whole new record, holding the record in this process
+//! while it does; the singleton lock keeps every other process out. A step is therefore never
+//! checked against anything but the record on disk.
+//!
+//! Every call that holds the record, an open and a step, takes one deadline as it starts,
+//! [`kr_flush::HELD_RENAME_BOUND`] away, and spends it on waiting for the record and on its
+//! publication both. Windows can hold a record a publication replaces for a moment, and the
+//! publication tries its rename again until the deadline; a call queued behind it waits only until
+//! its own deadline, so it answers within one bound however many calls came before it. A call whose
+//! deadline passes before it holds the record writes nothing and says that another change held it.
 //!
 //! A new record is written to a temporary file in the same directory, flushed, renamed over the
 //! record, and the directory is flushed after it. The record's name holds a whole record
@@ -29,7 +36,8 @@
 //! replaces a record that exists.
 
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex, PoisonError};
+use std::time::Instant;
 
 use kr_flush::{NameKind, flush_directory};
 use kr_ipc::paths::EnvironmentPaths;
@@ -56,13 +64,31 @@ const TEMPORARY_SUFFIX: &str = ".tmp";
 /// The largest record this store reads. A record is a few hundred bytes.
 const MAX_RECORD_LEN: u64 = 4096;
 
-/// Serialises every read, check and write of a record in this process.
+/// The records a call of this process holds, which serialises every read, check and write of a
+/// record in this process.
 ///
 /// The singleton lock keeps a second daemon away from the environment. This keeps two callers in
 /// one daemon from each reading the same revision and each writing the one after it. It also covers
 /// the first creation and the removal of leftover temporary files, so opening the store never
-/// removes the temporary file of a publication that is about to be renamed into place.
-static WRITER: Mutex<()> = Mutex::new(());
+/// removes the temporary file of a publication that is about to be renamed into place. A call holds
+/// its own record only, so it never waits for another environment's, and it waits for its own with
+/// a deadline ([`MachineStore::writer`]).
+static WRITING: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// Signalled each time a call lets its record go, so the calls waiting for one look again.
+static LET_GO: Condvar = Condvar::new();
+
+/// A record one call holds in [`WRITING`], let go when the call ends, however it ends.
+struct Holding(PathBuf);
+
+impl Drop for Holding {
+    fn drop(&mut self) {
+        let mut writing = WRITING.lock().unwrap_or_else(PoisonError::into_inner);
+        writing.retain(|record| *record != self.0);
+        drop(writing);
+        LET_GO.notify_all();
+    }
+}
 
 /// One environment's machine group, as its record states it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -185,9 +211,11 @@ impl MachineStore {
     ///
     /// Returns [`ControllerError::PermissionDenied`] when `lock` is not this environment's
     /// singleton lock, and a storage failure when the record cannot be created, or exists and is
-    /// damaged or belongs to another environment. A record that is refused is left as it is: a
-    /// group minted over it would be a change the owner never approved.
+    /// damaged or belongs to another environment, or when another change held the record for as
+    /// long as this call could wait. A record that is refused is left as it is: a group minted over
+    /// it would be a change the owner never approved.
     pub fn open(lock: &SingletonLock, paths: &EnvironmentPaths, now_ms: u64) -> Result<Self> {
+        let deadline = Instant::now() + kr_flush::HELD_RENAME_BOUND;
         let store = Self {
             environment_id: paths.environment_id(),
             directory: paths.state_dir().to_path_buf(),
@@ -195,10 +223,10 @@ impl MachineStore {
             lock: paths.singleton_lock(),
         };
         store.check_lock(lock)?;
-        let _writer = store.writer();
+        let _holding = store.writer(deadline, "open the machine group record")?;
         store.remove_leftovers();
         if store.read()?.is_none() {
-            store.mint(now_ms)?;
+            store.mint(now_ms, deadline)?;
         }
         store.group()?;
         Ok(store)
@@ -264,7 +292,8 @@ impl MachineStore {
     ///
     /// Returns `DRAFT_CONFLICT` when the record is no longer the one `expected` names,
     /// [`ControllerError::PermissionDenied`] when `lock` is not this environment's, a storage
-    /// failure when the new record could not be published (the old one stands), and
+    /// failure when the new record could not be published (the old one stands) or another change
+    /// held the record for as long as this step could wait (nothing was written), and
     /// `OUTCOME_UNKNOWN` when it was published but the directory holding it could not be flushed.
     pub fn split(
         &self,
@@ -285,8 +314,9 @@ impl MachineStore {
         approval: &Approval,
         now_ms: u64,
     ) -> Result<MachineGroup> {
+        let deadline = Instant::now() + kr_flush::HELD_RENAME_BOUND;
         self.check_lock(lock)?;
-        let _writer = self.writer();
+        let _holding = self.writer(deadline, "write the machine group record")?;
         let current = self.group()?;
         if current.expected() != expected {
             return Err(ControllerError::Refused {
@@ -324,7 +354,7 @@ impl MachineStore {
             revision,
             change,
         };
-        self.publish(&record)?;
+        self.publish(&record, deadline)?;
         Ok(record)
     }
 
@@ -383,8 +413,9 @@ impl MachineStore {
     /// Windows that is a rename, not a link, because a record given its name by a link can be held
     /// by the system for a minute and more, and the first step's rename over it refused all that
     /// time. A first start that stopped before the name was given left only a temporary file, which
-    /// the next open removes before it mints again.
-    fn mint(&self, now_ms: u64) -> Result<()> {
+    /// the next open removes before it mints again. The name is tried again until `deadline`, the
+    /// open's own.
+    fn mint(&self, now_ms: u64, deadline: Instant) -> Result<()> {
         let record = MachineGroup {
             environment_id: self.environment_id,
             machine_id: new_machine_id(),
@@ -397,7 +428,7 @@ impl MachineStore {
             .stage(&temporary, &bytes)
             .and_then(|()| self.passed(Boundary::Flushed))
             .and_then(|()| {
-                kr_flush::retry_while_held(|| {
+                kr_flush::retry_while_held_until(deadline, || {
                     kr_flush::publish_without_replacing(&temporary, &self.record)
                 })
             });
@@ -424,16 +455,18 @@ impl MachineStore {
     }
 
     /// Replaces the record with `record`, whole.
-    fn publish(&self, record: &MachineGroup) -> Result<()> {
+    fn publish(&self, record: &MachineGroup, deadline: Instant) -> Result<()> {
         let bytes = encode(record, &self.record)?;
         let temporary = self.temporary();
         // On Windows another program can hold the record it just saw written, and a rename over it
-        // is refused while it does; the rename is tried again for a bounded time.
+        // is refused while it does; the rename is tried again until the step's own deadline.
         let staged = self
             .stage(&temporary, &bytes)
             .and_then(|()| self.passed(Boundary::Flushed))
             .and_then(|()| {
-                kr_flush::retry_while_held(|| std::fs::rename(&temporary, &self.record))
+                kr_flush::retry_while_held_until(deadline, || {
+                    std::fs::rename(&temporary, &self.record)
+                })
             });
         if let Err(error) = staged {
             // Nothing was published: the record is still the one this step read.
@@ -503,18 +536,35 @@ impl MachineStore {
         }
     }
 
-    /// Takes this process's writer lock.
-    fn writer(&self) -> std::sync::MutexGuard<'static, ()> {
-        // A test learns here that a caller has come to the lock, and whether somebody else holds
-        // it. A lock that is free is taken and let go at once by the look; a poisoned one is free.
+    /// Holds this record for one call, `operation`, waiting while another call of this process
+    /// holds it, and no longer than until `deadline`.
+    ///
+    /// The wait sleeps until a call lets a record go or the deadline passes, whichever comes first.
+    /// A call still waiting at its deadline has read and written nothing, and answers a storage
+    /// failure that says another change held the record.
+    fn writer(&self, deadline: Instant, operation: &'static str) -> Result<Holding> {
+        let writing = WRITING.lock().unwrap_or_else(PoisonError::into_inner);
+        // A test learns here that a caller has come to the record, and whether another call holds
+        // it.
         #[cfg(test)]
-        seam::locking(
-            &self.record,
-            matches!(WRITER.try_lock(), Err(std::sync::TryLockError::WouldBlock)),
-        );
-        WRITER
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        seam::locking(&self.record, writing.contains(&self.record));
+        let (mut writing, _) = LET_GO
+            .wait_timeout_while(
+                writing,
+                deadline.saturating_duration_since(Instant::now()),
+                |writing| writing.contains(&self.record),
+            )
+            .unwrap_or_else(PoisonError::into_inner);
+        if writing.contains(&self.record) {
+            return Err(storage(
+                operation,
+                &self.record,
+                "another change to it held it for as long as this one could wait, so this one \
+                 wrote nothing",
+            ));
+        }
+        writing.push(self.record.clone());
+        Ok(Holding(self.record.clone()))
     }
 
     /// Says a publication of this record has passed `boundary`. A test stops or holds one here.
