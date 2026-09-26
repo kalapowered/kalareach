@@ -103,7 +103,11 @@ pub use crate::trust::{MetadataVersions, VerifiedGeneration};
 use crate::authority::committed;
 
 /// The suite's own generations, signed in memory, for the tests that reach inside a publication.
+///
+/// These tests use a few of the suite's helpers; the suite itself uses the rest, and is where a
+/// helper nothing calls is reported.
 #[cfg(test)]
+#[allow(dead_code)]
 #[path = "../tests/support/mod.rs"]
 mod test_support;
 

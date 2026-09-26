@@ -8,8 +8,6 @@
 //! which is what makes the suite a qualification of that client's actual behaviour rather than of
 //! a reimplementation that agrees with the code under test by construction.
 
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
