@@ -39,7 +39,7 @@ use std::collections::BTreeSet;
 
 use kr_protocol::gateway::PendingState;
 use kr_protocol::grant::{Grant, HistoryScope};
-use kr_protocol::ids::{ApprovalRequestId, QuestionId};
+use kr_protocol::ids::{PendingResourceId, QuestionId};
 use kr_protocol::rights::ActionRight;
 use kr_protocol::sharing::LiveScreenPreview;
 
@@ -317,8 +317,8 @@ pub struct ViewerScope {
     include_live_screen: bool,
     /// Current questions this viewer's grant names explicitly.
     named_questions: BTreeSet<QuestionId>,
-    /// Current approval requests it names explicitly.
-    named_approvals: BTreeSet<ApprovalRequestId>,
+    /// Current approvals it names explicitly, by the broker's resource identity.
+    named_approvals: BTreeSet<PendingResourceId>,
     /// Whether it carries `session.view`.
     session_view: bool,
     /// Whether it carries `files.read`, which attachment and file bytes need on their own.
@@ -397,7 +397,7 @@ impl ViewerScope {
             lower_bound_ms: history.lower_bound_ms.as_ref().map(|bound| bound.get()),
             include_live_screen: history.include_live_screen,
             named_questions: history.named_questions.iter().copied().collect(),
-            named_approvals: history.named_approvals.iter().cloned().collect(),
+            named_approvals: history.named_approvals.iter().copied().collect(),
             session_view,
             files_read: false,
             unrestricted: false,
@@ -612,15 +612,16 @@ impl HistoryFilter {
     /// Section 10 permits the exact *current* decisions an invitation names, not their earlier
     /// conversation. So a named approval is admitted however early it was recorded only while it
     /// can still be decided, pending or claimed; once it has ended it is an old record like any
-    /// other, and the ordinary bound decides. `name` is how the viewer's grant would name this
-    /// request; a request with no name a grant can use is decided by the bound alone.
+    /// other, and the ordinary bound decides. `name` is the resource the broker arbitrates for
+    /// this request, which is how a grant names it; a request with no such name is decided by the
+    /// bound alone.
     ///
     /// # Errors
     ///
     /// Returns the reason the approval is outside this viewer's scope.
     pub fn admit_approval(
         &self,
-        name: Option<&ApprovalRequestId>,
+        name: Option<&PendingResourceId>,
         recorded_at_ms: u64,
         state: PendingState,
     ) -> std::result::Result<(), WithheldReason> {

@@ -172,11 +172,11 @@ impl SharingService {
                 ));
             }
         }
-        for approval_id in &request.selection.named_approvals {
+        for resource_id in &request.selection.named_approvals {
             if !request
                 .named_approvals
                 .iter()
-                .any(|preview| preview.approval_request_id == *approval_id)
+                .any(|preview| preview.resource_id == *resource_id)
             {
                 return Err(ControllerError::InvalidArgument(
                     "this invitation names an approval the issuer was not shown".to_owned(),
@@ -200,7 +200,7 @@ impl SharingService {
             if !request
                 .selection
                 .named_approvals
-                .contains(&preview.approval_request_id)
+                .contains(&preview.resource_id)
             {
                 return Err(ControllerError::InvalidArgument(
                     "this invitation previews an approval it does not name".to_owned(),

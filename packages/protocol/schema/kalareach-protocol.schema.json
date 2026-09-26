@@ -14006,9 +14006,9 @@
           "description": "The earliest content this grant may see. Null means no retained history at all."
         },
         "named_approvals": {
-          "description": "Current approval requests named explicitly, on the same terms.",
+          "description": "Current approvals named explicitly, on the same terms, each by the identity of the one\nresource the broker arbitrates for it.\n\nAn upstream's own request identifier does not pick out one request: two connections both\ncall their first request `1`. A resource identity names exactly one.",
           "items": {
-            "$ref": "#/$defs/ApprovalRequestId"
+            "$ref": "#/$defs/PendingResourceId"
           },
           "type": "array",
           "uniqueItems": true
@@ -17666,15 +17666,15 @@
     },
     "NamedApprovalPreview": {
       "additionalProperties": false,
-      "description": "One current approval request an invitation names explicitly.",
+      "description": "One current approval an invitation names explicitly.",
       "properties": {
-        "approval_request_id": {
-          "$ref": "#/$defs/ApprovalRequestId",
-          "description": "The approval request."
-        },
         "created_at_ms": {
           "$ref": "#/$defs/TimestampMs",
           "description": "When it was created, which may be before the history cursor."
+        },
+        "resource_id": {
+          "$ref": "#/$defs/PendingResourceId",
+          "description": "The one resource the broker arbitrates for the approval, which is what the grant names."
         },
         "summary": {
           "description": "What the upstream is asking to do.",
@@ -17682,7 +17682,7 @@
         }
       },
       "required": [
-        "approval_request_id",
+        "resource_id",
         "summary",
         "created_at_ms"
       ],
@@ -27656,9 +27656,9 @@
           "type": "boolean"
         },
         "named_approvals": {
-          "description": "Current approval requests this invitation names explicitly.",
+          "description": "Current approvals this invitation names explicitly, by the broker's resource identity.",
           "items": {
-            "$ref": "#/$defs/ApprovalRequestId"
+            "$ref": "#/$defs/PendingResourceId"
           },
           "type": "array",
           "uniqueItems": true

@@ -32,8 +32,8 @@ use serde::{Deserialize, Serialize};
 use crate::action::RevocationBarrier;
 use crate::grant::{Grant, HistoryScope};
 use crate::ids::{
-    ApprovalRequestId, AuthorityRevision, DeviceId, DeviceKeyRevision, EnvironmentId, GrantId,
-    InvitationId, QuestionId, QuestionRevision, SessionId,
+    AuthorityRevision, DeviceId, DeviceKeyRevision, EnvironmentId, GrantId, InvitationId,
+    PendingResourceId, QuestionId, QuestionRevision, SessionId,
 };
 use crate::pairing::OwnerConfirmationProof;
 use crate::rights::ActionRight;
@@ -183,8 +183,8 @@ pub struct RoleSelection {
     pub include_question_respond: bool,
     /// Current questions this invitation names explicitly.
     pub named_questions: CanonicalSet<QuestionId>,
-    /// Current approval requests this invitation names explicitly.
-    pub named_approvals: CanonicalSet<ApprovalRequestId>,
+    /// Current approvals this invitation names explicitly, by the broker's resource identity.
+    pub named_approvals: CanonicalSet<PendingResourceId>,
 }
 
 impl RoleSelection {
@@ -361,12 +361,12 @@ pub struct NamedQuestionPreview {
     pub created_at_ms: TimestampMs,
 }
 
-/// One current approval request an invitation names explicitly.
+/// One current approval an invitation names explicitly.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct NamedApprovalPreview {
-    /// The approval request.
-    pub approval_request_id: ApprovalRequestId,
+    /// The one resource the broker arbitrates for the approval, which is what the grant names.
+    pub resource_id: PendingResourceId,
     /// What the upstream is asking to do.
     pub summary: String,
     /// When it was created, which may be before the history cursor.

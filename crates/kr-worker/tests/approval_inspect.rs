@@ -595,16 +595,13 @@ fn scoped<T: serde::Serialize>(
 }
 
 /// A grant's history scope reaching back to `lower_bound_ms` (none: no retained history), naming
-/// the approvals it names by their text.
-fn reach(lower_bound_ms: Option<u64>, named_approvals: &[&str]) -> HistoryScope {
+/// the approvals it names by the resource the broker arbitrates for each.
+fn reach(lower_bound_ms: Option<u64>, named_approvals: &[PendingResourceId]) -> HistoryScope {
     HistoryScope {
         lower_bound_ms: Nullable(lower_bound_ms.map(TimestampMs::new)),
         include_live_screen: true,
         named_questions: kr_protocol::scalars::CanonicalSet::new(),
-        named_approvals: named_approvals
-            .iter()
-            .map(|name| kr_protocol::ids::ApprovalRequestId::new(*name).expect("an identifier"))
-            .collect(),
+        named_approvals: named_approvals.iter().copied().collect(),
     }
 }
 
@@ -1385,52 +1382,6 @@ async fn kr_req_11_26_a_device_reads_the_approval_records_its_grants_scope_reach
             );
         }
     }
-}
-
-/// A grant's named approvals are upstream text identifiers, and an upstream's identifier does not
-/// pick out one recorded request: two connections both call their first request `1`. So no name a
-/// grant carries excepts a broker's record from the bound. A pending record older than the bound
-/// stays withheld even when the grant names its upstream identifier and its resource's own text;
-/// the control is the same grant reaching back far enough, which reads it.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_broker_record_past_the_bound_stays_withheld_whatever_text_the_grant_names() {
-    let host = host().await;
-    let resource_id = offer(&host, &request_frame(11, 0));
-    let mut daemon = daemon(&host).await;
-    let resource_text = resource_id.to_string();
-    let names = ["11", resource_text.as_str()];
-    let inspect = |request_id: u64, history: HistoryScope| {
-        scoped(
-            Method::AgentApprovalInspect,
-            &params(&host, instance(), resource_id),
-            request_id,
-            device(),
-            history,
-        )
-    };
-
-    let withheld = refusal(
-        exchange(
-            &mut daemon,
-            inspect(81, reach(Some(RECORDED_AT.get() + 1), &names)),
-        )
-        .await,
-    );
-    assert_eq!(withheld.code, ErrorCode::StaleSession, "{withheld:?}");
-    assert_eq!(
-        host.service
-            .broker()
-            .decoding(resource_id)
-            .expect("the ledger reads")
-            .map(|entry| entry.upstream_request_id),
-        Some(UpstreamRequestId::new("11").expect("an identifier")),
-        "the grant names the record's own upstream identifier"
-    );
-
-    let record: AgentApprovalInspectResult =
-        answered(exchange(&mut daemon, inspect(82, reach(Some(0), &names))).await);
-    assert_eq!(record.state, PendingState::Pending);
-    assert_eq!(record.resource_id, resource_id);
 }
 
 /// The scope is decided before the size of the answer: a record outside the scope is answered as
