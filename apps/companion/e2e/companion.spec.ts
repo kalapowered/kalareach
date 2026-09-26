@@ -940,7 +940,16 @@ test.describe("moving a raw view's window", () => {
     await page.getByRole('tab', { name: 'Terminal' }).click()
     const terminal = page.getByTestId('mobile-terminal')
     await expect(page.getByTestId('mobile-terminal-line').first()).toContainText('$ cargo')
+    // Control mode leaves the browser its own way with the text; view mode's text is not selectable,
+    // so neither a press nor a long press starts a selection there.
+    const selectable = () =>
+      terminal.evaluate((element) => {
+        const style = getComputedStyle(element)
+        return (style.getPropertyValue('user-select') || style.getPropertyValue('-webkit-user-select')) !== 'none'
+      })
+    expect(await selectable()).toBe(true)
     await page.getByRole('button', { name: 'Look around' }).click()
+    expect(await selectable()).toBe(false)
     // The terminal's text selected, as a drag in control mode leaves it, and from here on every
     // selection and every native drag the browser starts counted.
     await page.evaluate(() => {
