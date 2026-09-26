@@ -460,13 +460,42 @@ fn cfg_compiles_without_test(tokens: &[Located], open: usize) -> Option<bool> {
 }
 
 /// Whether the attribute whose `[` is at `open` is a `cfg` this reading cannot decide without
-/// `test`: the item it is on is compiled under some conditions and not under others.
+/// `test`, or a `cfg_attr` that can give one: the item it is on is compiled under some conditions
+/// and not under others.
 fn cfg_is_conditional(tokens: &[Located], open: usize) -> bool {
-    if ident(tokens.get(open + 1)) != Some("cfg") || !punct(tokens.get(open + 2), '(') {
+    closing(tokens, open).is_some_and(|close| attribute_conditional(&tokens[open + 1..close]))
+}
+
+/// [`cfg_is_conditional`] for an attribute's contents, the tokens inside its brackets.
+fn attribute_conditional(contents: &[Located]) -> bool {
+    if !punct(contents.get(1), '(') {
         return false;
     }
-    let mut at = open + 3;
-    without_test(tokens, &mut at) == Truth::Unknown
+    match ident(contents.first()) {
+        Some("cfg") => {
+            let mut at = 2;
+            without_test(contents, &mut at) == Truth::Unknown
+        }
+        // `cfg_attr(predicate, attribute, …)`: a `cfg` among the attributes it gives, unless the
+        // predicate cannot hold without `test`.
+        Some("cfg_attr") => {
+            let parts = arguments(contents, 1).unwrap_or_default();
+            let Some((predicate, given)) = parts.split_first() else {
+                return false;
+            };
+            let mut at = 0;
+            without_test(predicate, &mut at) != Truth::False
+                && given.iter().any(|part| attribute_conditional(part))
+        }
+        _ => false,
+    }
+}
+
+/// Whether the item whose keyword is at `at` names its module's file with `#[path]`, directly or
+/// through `cfg_attr`.
+fn names_its_file(tokens: &[Located], at: usize) -> bool {
+    (before_item(tokens, at)..at)
+        .any(|index| ident(tokens.get(index)) == Some("path") && punct(tokens.get(index + 1), '='))
 }
 
 /// Whether the item whose keyword is at `at` has a `cfg` this reading cannot decide among the
@@ -691,6 +720,8 @@ struct Source {
     scopes: Vec<Scope>,
     /// The modules it declares in files of their own, and whether each is test code.
     children: Vec<(String, bool)>,
+    /// The modules it declares whose file a `#[path]` names, which this reading does not read.
+    moved_children: BTreeSet<String>,
     /// The names each scope imports.
     imports: Vec<Import>,
     /// The modules each scope imports everything from.
@@ -1022,6 +1053,7 @@ fn read_source(
             block: false,
         }],
         children: Vec::new(),
+        moved_children: BTreeSet::new(),
         imports: Vec::new(),
         globs: Vec::new(),
         definitions: BTreeSet::new(),
@@ -1092,6 +1124,9 @@ fn read_source(
             None
         };
         if let Some(module) = module {
+            if names_its_file(&all, index) {
+                source.moved_children.insert(module.clone());
+            }
             source.children.push((module, attributes_test || file_test));
         }
         if skipped {
@@ -1281,6 +1316,11 @@ fn read_crate(
             path.with_extension("")
         };
         for (child, child_test) in &source.children {
+            // A module whose file a `#[path]` names is not read at its default place, where
+            // another file can stand; the rendering rule names the attribute.
+            if source.moved_children.contains(child) {
+                continue;
+            }
             let flat = directory.join(format!("{child}.rs"));
             let nested = directory.join(child).join("mod.rs");
             let found = if flat.exists() {
