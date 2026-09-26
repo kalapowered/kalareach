@@ -483,7 +483,8 @@ pub enum VoiceStart {
     /// creation is not idempotent, so asking again could pay for a second call while the first is
     /// still running. What a caller may do is tell the person and let them ask again.
     CreationUnknown {
-        /// The attempt, for a later reconciliation to name. Absent when the service recorded none.
+        /// The attempt, for a later reconciliation to name. Absent when the service recorded none,
+        /// or named none this client could read.
         attempt_id: Option<String>,
         /// What a person is told.
         message: String,
@@ -1163,6 +1164,17 @@ impl ManagedVoiceService for ManagedVoiceBroker {
     }
 }
 
+/// A start the service answered with a success this client cannot read: the call may be running,
+/// so it is an unknown creation.
+fn unreadable_start(attempt_id: Option<String>) -> VoiceStart {
+    VoiceStart::CreationUnknown {
+        attempt_id,
+        message: "The managed service answered this start with something this client cannot \
+                  read, so the call may have started."
+            .to_owned(),
+    }
+}
+
 /// A start whose answer a gateway lost: the call may have started, so it is an unknown creation.
 fn lost_start() -> VoiceStart {
     VoiceStart::CreationUnknown {
@@ -1251,9 +1263,14 @@ fn data_of(answer: &ServiceHttpAnswer) -> Result<serde_json::Value> {
 /// from [`ManagedVoiceService::start`] so a caller holding an answer from anywhere, a recorded
 /// exchange or a self-hosted broker, reads it the same way.
 ///
-/// An answer this client cannot read is a refusal for a reason it does not know, which nothing
-/// asks again for. A text that names one member twice anywhere is one of those
-/// ([`super::json::read`]): which call is running, or why none is, would depend on the reader.
+/// A success this client cannot read is an unknown creation: the service answers a start with
+/// success once it has created the call and holds its reservation, so a call may be running behind
+/// it. That is an `ok` answer whose call this client cannot read, which names the attempt where the
+/// call names one that can be read, and a success status whose body is not the service's envelope.
+/// Any other answer this client cannot read is a refusal for a reason it does not know, which
+/// nothing asks again for either. A text that names one member twice anywhere is one this client
+/// cannot read ([`super::json::read`]): which call is running, or why none is, would depend on the
+/// reader.
 #[must_use]
 pub fn read_start_answer(answer: &ServiceHttpAnswer) -> VoiceStart {
     #[derive(Deserialize)]
@@ -1270,6 +1287,11 @@ pub fn read_start_answer(answer: &ServiceHttpAnswer) -> VoiceStart {
         // reach it, which it can say after the service started the call.
         if matches!(answer.status, 502 | 504) {
             return lost_start();
+        }
+        // A success status says the service answered the start, and it answers success once the
+        // call exists.
+        if (200..300).contains(&answer.status) {
+            return unreadable_start(None);
         }
         return refused(
             VoiceRefusalReason::Unrecognised,
@@ -1290,15 +1312,16 @@ pub fn read_start_answer(answer: &ServiceHttpAnswer) -> VoiceStart {
     }
 
     if envelope.ok {
-        return match envelope
-            .data
-            .and_then(|data| serde_json::from_value::<VoiceSession>(data).ok())
-        {
-            Some(session) => VoiceStart::Started(Box::new(session)),
-            None => refused(
-                VoiceRefusalReason::Unrecognised,
-                "The managed service answered a call this client cannot read.".to_owned(),
-            ),
+        let data = envelope.data.unwrap_or(serde_json::Value::Null);
+        // The one member a later reconciliation names the attempt by, read on its own. The text
+        // named no member twice, so it is the only one there is.
+        let attempt_id = data
+            .get("attemptId")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        return match serde_json::from_value::<VoiceSession>(data) {
+            Ok(session) => VoiceStart::Started(Box::new(session)),
+            Err(_) => unreadable_start(attempt_id),
         };
     }
 
