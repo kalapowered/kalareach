@@ -1314,7 +1314,7 @@ fn an_upstream_identifier_never_becomes_a_kalareach_identifier() {
 /// KR-REQ-06.02: a mutation naming any session epoch but the current one, 1, is refused as stale.
 /// A worker states the clock floor it maps, by the floor's identity, in its answer to every hello,
 /// so a control daemon can tell whether it decides UTC deadlines from the daemon's own floor. A
-/// worker that maps none states none.
+/// worker that maps none states no floor, whatever else it states about itself.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_worker_states_the_clock_floor_it_maps_in_its_hello() {
     let identity = std::sync::Mutex::new(None);
@@ -1347,7 +1347,13 @@ async fn a_worker_states_the_clock_floor_it_maps_in_its_hello() {
     // The control: a worker that maps no floor states none.
     let unfloored = host().await;
     let client = cli(&unfloored).await;
-    assert!(client.acknowledgement().capabilities.is_empty());
+    let stated = &client.acknowledgement().capabilities;
+    assert!(
+        stated.iter().all(|capability| !capability
+            .as_str()
+            .starts_with(kr_protocol::local::UTC_FLOOR_PREFIX)),
+        "a worker that maps no floor states none: {stated:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
