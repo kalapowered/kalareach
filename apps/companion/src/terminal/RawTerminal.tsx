@@ -72,6 +72,7 @@ import {
   dragTo,
   releaseDrag,
   restartDrag,
+  restWithin,
   WHEEL_AT_REST,
   wheelTurn,
   type Cells,
@@ -359,6 +360,22 @@ export function RawTerminal({
     const layer = dragLayer.current
     if (layer !== null) layer.style.transform = ''
   }, [cellWidth, cellHeight])
+
+  // A limit the window reaches takes the wheel's part of a cell toward it as the room is drawn,
+  // whatever reached it, so the window leaving the limit before the next turn does not bring it back.
+  const roomUp = room?.up ?? null
+  const roomDown = room?.down ?? null
+  const roomToLeft = room?.left ?? null
+  const roomToRight = room?.right ?? null
+  useLayoutEffect(() => {
+    if (roomUp === null || roomDown === null || roomToLeft === null || roomToRight === null) return
+    wheelRest.current = restWithin(wheelRest.current, {
+      up: roomUp,
+      down: roomDown,
+      left: roomToLeft,
+      right: roomToRight
+    })
+  }, [roomUp, roomDown, roomToLeft, roomToRight])
 
   // The grid goes to the host whenever the surface or the cell size changes: at once, and then as
   // the surface is resized.

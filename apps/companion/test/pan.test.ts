@@ -16,6 +16,7 @@ import {
   resisted,
   restartDrag,
   roomLeft,
+  restWithin,
   STILL,
   WHEEL_AT_REST,
   wheelTurn,
@@ -134,6 +135,12 @@ describe('a wheel', () => {
     const reaching = wheelTurn(WHEEL_AT_REST, { across: 12, down: 0 }, cell, { ...atTheRight, right: 1 })
     expect(reaching.send).toEqual({ across: 1, down: 0 })
     expect(reaching.rest).toEqual({ across: 0, down: 0 })
+  })
+
+  it('drops, of a part it carries, only what points past a limit of the room', () => {
+    const room: TerminalRoom = { up: 0, down: 3, left: 2, right: 0 }
+    expect(restWithin({ across: 4, down: -6 }, room)).toEqual({ across: 0, down: 0 })
+    expect(restWithin({ across: -4, down: 6 }, room)).toEqual({ across: -4, down: 6 })
   })
 
   it('drops a part it carries that another move has since put past a limit', () => {

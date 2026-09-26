@@ -221,6 +221,22 @@ export interface WheelRest {
 /** A wheel that has not turned. */
 export const WHEEL_AT_REST: WheelRest = { across: 0, down: 0 }
 
+/** Whether a part of a cell points past a limit, with `before` cells of room back and `after` ahead. */
+function pastLimit(part: number, before: number, after: number): boolean {
+  return (part > 0 && after <= 0) || (part < 0 && before <= 0)
+}
+
+/**
+ * `rest` without the part that points past a limit of `room`: a limit the window reaches takes the
+ * part carried toward it, whatever reached it, and the part that points into the room stays.
+ */
+export function restWithin(rest: WheelRest, room: TerminalRoom): WheelRest {
+  return {
+    across: pastLimit(rest.across, room.left, room.right) ? 0 : rest.across,
+    down: pastLimit(rest.down, room.up, room.down) ? 0 : rest.down
+  }
+}
+
 /**
  * One turn of the wheel: `pixels` more of the window's movement, in cells of `cell`, held to
  * `room`. The part short of a whole cell is carried to the next turn, unless it points past a limit
@@ -233,12 +249,10 @@ export function wheelTurn(
   cell: CellSize,
   room: TerminalRoom
 ): { readonly send: Cells; readonly rest: WheelRest } {
-  // Whether a part points past a limit, with `before` cells of room back and `after` ahead.
-  const pastLimit = (part: number, before: number, after: number): boolean =>
-    (part > 0 && after <= 0) || (part < 0 && before <= 0)
   // A part carried toward a limit that something else has since reached is gone.
-  const across = (pastLimit(rest.across, room.left, room.right) ? 0 : rest.across) + pixels.across
-  const down = (pastLimit(rest.down, room.up, room.down) ? 0 : rest.down) + pixels.down
+  const carried = restWithin(rest, room)
+  const across = carried.across + pixels.across
+  const down = carried.down + pixels.down
   const wholeAcross = cell.width > 0 ? whole(across / cell.width) : 0
   const wholeDown = cell.height > 0 ? whole(down / cell.height) : 0
   const send = within({ across: wholeAcross, down: wholeDown }, room)

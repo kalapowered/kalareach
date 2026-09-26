@@ -877,6 +877,57 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
     ])
   })
 
+  it("drops a wheel's part of a cell once a limit is reached, though the buttons leave it before the next turn", async () => {
+    const person = userEvent.setup()
+    const { port, controls } = fakeHost()
+    controls.holdTerminalMoves()
+    open(port)
+    await screen.findByTestId('palette-provenance')
+    await person.click(screen.getByRole('tab', { name: 'View' }))
+    // A session wider than the view, with one column of room to the right.
+    act(() => {
+      controls.terminalViews[0]?.show({
+        window: { rows: 8, columns: 70, column: 9, line: 0, above: 0 },
+        room: { up: 0, down: 0, left: 9, right: 1 }
+      })
+    })
+    // Half a column to the right; the buttons take the window to the right limit and back again.
+    wheel({ deltaX: 4 })
+    await person.click(screen.getByRole('button', { name: 'Move the window right' }))
+    await person.click(screen.getByRole('button', { name: 'Move the window left' }))
+    // The half went at the limit, so another half moves nothing.
+    wheel({ deltaX: 4 })
+    expect(controls.terminalViews[0]?.moves).toEqual([
+      { number: 1, across: 1, down: 0 },
+      { number: 2, across: -10, down: 0 }
+    ])
+  })
+
+  it("drops a wheel's part of a cell once a limit is reached, though the host's screens leave it before the next turn", async () => {
+    const person = userEvent.setup()
+    const { port, controls } = fakeHost()
+    controls.holdTerminalMoves()
+    open(port)
+    await screen.findByTestId('palette-provenance')
+    await person.click(screen.getByRole('tab', { name: 'View' }))
+    const at = (column: number) =>
+      act(() => {
+        controls.terminalViews[0]?.show({
+          window: { rows: 8, columns: 70, column, line: 0, above: 0 },
+          room: { up: 0, down: 0, left: column, right: 10 - column }
+        })
+      })
+    at(9)
+    // Half a column to the right; the host's screens hold the window at the right limit, then give
+    // it a column of room again.
+    wheel({ deltaX: 4 })
+    at(10)
+    at(9)
+    // The half went at the limit, so another half moves nothing.
+    wheel({ deltaX: 4 })
+    expect(controls.terminalViews[0]?.moves).toEqual([])
+  })
+
   it('keeps an ended view ended when a move it took before the end is answered after it', async () => {
     const person = userEvent.setup()
     const { port, controls } = fakeHost()
