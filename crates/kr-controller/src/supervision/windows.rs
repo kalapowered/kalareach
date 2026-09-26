@@ -719,6 +719,50 @@ pub fn decode_output(bytes: &[u8]) -> String {
     String::from_utf8_lossy(body).into_owned()
 }
 
+/// The process that reached a launch, as the daemon reads it from the launch pipe.
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy, Debug)]
+struct Reaching<'a> {
+    /// Its identifier.
+    pid: u32,
+    /// The executable it runs.
+    image: &'a Path,
+    /// Whether it runs as this daemon's account.
+    same_user: bool,
+    /// The login session it runs in.
+    session: u32,
+}
+
+/// Why the process that reached a launch is not handed it, if it is not: it must run this
+/// installation's `starter`, as this daemon's account, in this daemon's login `session`. A starter
+/// the Task Scheduler ran in another session of the user is refused, and nothing is created, so
+/// no worker lands in a session whose sign-out would not be the daemon's.
+#[cfg(any(windows, test))]
+fn starter_refusal(reaching: &Reaching<'_>, starter: &Path, session: u32) -> Option<String> {
+    if !same_path(&reaching.image.display().to_string(), starter) {
+        return Some(format!(
+            "process {} reached the launch running {}, not this installation's starter {}",
+            reaching.pid,
+            reaching.image.display(),
+            starter.display()
+        ));
+    }
+    if !reaching.same_user {
+        return Some(format!(
+            "process {} reached the launch as another account",
+            reaching.pid
+        ));
+    }
+    if reaching.session != session {
+        return Some(format!(
+            "the starter runs in login session {}, not this daemon's {session}: the Task \
+             Scheduler ran it where another session of this user is signed in",
+            reaching.session
+        ));
+    }
+    None
+}
+
 /// Where an environment's task stands.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Standing {
@@ -1319,7 +1363,7 @@ mod launching {
     use kr_protocol::ids::EnvironmentId;
     use serde::{Deserialize, Serialize};
 
-    use super::{Standing, TaskDefinition, run, same_path, standing};
+    use super::{Standing, TaskDefinition, run, standing};
     use crate::supervision::{
         LaunchOutcome, RunFailure, ServiceLaunch, WorkerLaunch, WorkerSupervisor,
     };
@@ -1630,26 +1674,17 @@ mod launching {
             let peer = stream
                 .peer()
                 .map_err(|error| format!("the process that reached the launch: {error}"))?;
-            if !same_path(&peer.image.display().to_string(), &self.expected.starter) {
-                return Err(format!(
-                    "process {} reached the launch running {}, not this installation's starter {}",
-                    peer.pid,
-                    peer.image.display(),
-                    self.expected.starter.display()
-                ));
-            }
-            if !peer.same_user {
-                return Err(format!(
-                    "process {} reached the launch as another account",
-                    peer.pid
-                ));
-            }
-            if peer.session != session {
-                return Err(format!(
-                    "the starter runs in login session {}, not this daemon's {session}: the Task \
-                     Scheduler ran it where another session of this user is signed in",
-                    peer.session
-                ));
+            if let Some(refusal) = super::starter_refusal(
+                &super::Reaching {
+                    pid: peer.pid,
+                    image: &peer.image,
+                    same_user: peer.same_user,
+                    session: peer.session,
+                },
+                &self.expected.starter,
+                session,
+            ) {
+                return Err(refusal);
             }
             let hello: StarterHello = stream
                 .receive(Instant::now() + EXCHANGE_BOUND)
@@ -2213,6 +2248,41 @@ mod tests {
                 "case {index} is one difference: {differences:?}"
             );
         }
+    }
+
+    /// The daemon hands a launch only to this installation's starter, running as its own account
+    /// in its own login session: a starter the Task Scheduler ran in another session of the user,
+    /// another program, or another account is refused, and nothing is created.
+    #[test]
+    fn a_launch_is_refused_to_a_starter_in_another_session_or_of_another_program_or_account() {
+        let host = TempHost::create();
+        let ours = starter(&host);
+        fn reaching(image: &Path, same_user: bool, session: u32) -> Reaching<'_> {
+            Reaching {
+                pid: 4242,
+                image,
+                same_user,
+                session,
+            }
+        }
+        assert_eq!(starter_refusal(&reaching(&ours, true, 2), &ours, 2), None);
+        let elsewhere = starter_refusal(&reaching(&ours, true, 3), &ours, 2)
+            .expect("a starter in another session is refused");
+        assert!(
+            elsewhere.contains("login session 3, not this daemon's 2"),
+            "{elsewhere}"
+        );
+        assert!(
+            starter_refusal(&reaching(&ours, false, 2), &ours, 2)
+                .expect("another account's process is refused")
+                .contains("as another account")
+        );
+        let other = host.root().join("other.exe");
+        assert!(
+            starter_refusal(&reaching(&other, true, 2), &ours, 2)
+                .expect("another program is refused")
+                .contains("not this installation's starter")
+        );
     }
 
     /// A path resolved on Windows is named without its verbatim prefix, a network path as a
