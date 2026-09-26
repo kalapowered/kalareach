@@ -19,14 +19,37 @@ use crate::sodium;
 /// There is no way to sign anything else with this module. A `&[u8]` would let a caller sign a
 /// fragment of a message or a diagnostic rendering, which section 23 forbids; a value of this type
 /// is either built from a domain and its elements or checked against the domain it claims.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SigningTranscript(Vec<u8>);
+#[derive(Clone, PartialEq, Eq)]
+pub struct SigningTranscript {
+    /// The domain the array starts with, which every constructor is given.
+    domain: String,
+    /// `CBOR([domain, element, ...])`, exactly as it is signed.
+    bytes: Vec<u8>,
+}
+
+/// A transcript is shown as its domain and how many bytes it holds.
+///
+/// What is signed is not secret, but it is whatever the elements carry, and a rendering is not
+/// the place to decide what that may be. The domain says which kind of transcript it is, and the
+/// length is enough to tell two of a kind apart in a diagnostic.
+impl std::fmt::Debug for SigningTranscript {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SigningTranscript")
+            .field("domain", &self.domain)
+            .field("bytes", &self.bytes.len())
+            .finish()
+    }
+}
 
 impl SigningTranscript {
     /// Builds `CBOR([domain, element, ...])`.
     #[must_use]
     pub fn from_elements(domain: &str, elements: Vec<CanonicalValue>) -> Self {
-        Self(kr_cbor::encode(&signing_value(domain, elements)))
+        Self {
+            domain: domain.to_owned(),
+            bytes: kr_cbor::encode(&signing_value(domain, elements)),
+        }
     }
 
     /// Builds `CBOR([domain, value])` from one serialisable wire object.
@@ -64,19 +87,22 @@ impl SigningTranscript {
                 what: "the domain of a signing transcript",
             });
         }
-        Ok(Self(bytes))
+        Ok(Self {
+            domain: domain.to_owned(),
+            bytes,
+        })
     }
 
     /// Returns the exact bytes that are signed.
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
-        &self.0
+        &self.bytes
     }
 
     /// Returns the SHA-256 of those bytes.
     #[must_use]
     pub fn digest(&self) -> Digest256 {
-        Digest256::from_bytes(kr_cbor::sha256(&self.0))
+        Digest256::from_bytes(kr_cbor::sha256(&self.bytes))
     }
 }
 
