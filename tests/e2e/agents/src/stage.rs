@@ -732,9 +732,9 @@ pub struct AgentProcess {
 ///
 /// The screen must not show `ready` before the command is typed, so a screen left from an earlier
 /// program is never read as this one's. Before the command is typed, the PATH the shell searches is
-/// checked; once the agent draws its first screen, the image every process beneath the shell maps
-/// is recorded and checked, the launch must have run `expected`, and the session is watched from
-/// then to the end of the part ([`Provenance`]).
+/// checked and the session is watched from then to the end of the part; once the agent draws its
+/// first screen, the image every process beneath the shell maps is recorded and checked, and the
+/// launch must have run `expected` in the way its build list names ([`Provenance`]).
 ///
 /// # Panics
 ///
@@ -762,6 +762,7 @@ pub fn launch(
     provenance
         .check_path(command)
         .unwrap_or_else(|why| panic!("{why}"));
+    provenance.watch(session.root_shell.clone());
     session.window.type_text(format!("{line}\r").as_bytes());
     let _ = session
         .window
@@ -782,7 +783,6 @@ pub fn launch(
             provenance
                 .verify_launch(&found, session.root_shell.pid.get(), expected, line)
                 .unwrap_or_else(|why| panic!("{why}"));
-            provenance.watch(session.root_shell.clone());
             return found;
         }
         assert!(

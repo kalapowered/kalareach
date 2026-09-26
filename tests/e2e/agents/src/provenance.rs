@@ -3,19 +3,23 @@
 //! A part tests the pinned build only when its sessions ran nothing else, and three things are
 //! checked. The session's shell searches the run's link to the installed build, the run's links to
 //! the runtimes the build needs, and the system's own directories, and nothing another installation
-//! keeps on a person's PATH. Each launch runs the pinned file: a native build's own process maps
-//! it; a runtime's process runs it as its script, or starts a process that maps it; and a build
-//! installed from a wheel runs the code the harness compared with the wheel before the run. And
-//! from the first launch to the end of the part, the processes beneath each session an agent was
-//! launched in are looked at every [`SAMPLE_INTERVAL`]: each new process, and each whose command
-//! line changed, has the executable image it maps read, with its file's SHA-256, and the image must
-//! lie in the build's own directory, a runtime's, the run's own, the managed shell's or the
-//! system's. The newer build's directory counts only in the upgrade part. A process that starts
-//! and ends between two looks is not seen, and one that ended before its image was read is named.
-//! A session that searched another PATH, launched anything but the pinned file, or ran an image
-//! from anywhere else did not test the pinned build: the part stops, and the record names what ran.
+//! keeps on a person's PATH. Each launch runs the pinned file in the way its build list names
+//! ([`Launch`]): a native build's own process maps it; a runtime starts a process that maps it; a
+//! runtime's first argument is it; or a runtime loads the installation the harness compared with
+//! the pinned wheel. And from just before each launch to the end of the part's sessions, the
+//! processes beneath each session an agent is launched in are looked at every
+//! [`SAMPLE_INTERVAL`], and once more when the part's own steps end: each process's executable
+//! image, as the kernel maps it, is read on every look, so an image that changes under the same
+//! process is seen too, and each image is hashed through one handle whose device and inode are the
+//! mapped ones and that did not change while it was read. Every image must lie in the build's own
+//! directory, a runtime's, the run's own, the managed shell's or the system's; the newer build's
+//! directory counts only in the upgrade part. A process that starts and ends between two looks is
+//! not seen, and one that ended before its image was read is named. A session that searched another
+//! PATH, launched anything but the pinned file, ran an image from anywhere else, or could not be
+//! looked at did not test the pinned build: the part stops, and the record names why.
 
 use std::collections::BTreeMap;
+use std::io::Read;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -31,8 +35,8 @@ use kr_protocol::identity::ProcessStartIdentity;
 use serde::Serialize;
 use serde_json::json;
 
-use crate::build::{Build, Newer};
-use crate::stage::{AgentProcess, text_image};
+use crate::build::{Build, Launch, Newer};
+use crate::stage::AgentProcess;
 
 /// How a part's failure begins when its session ran something other than the build under test.
 /// The harness records such a part as not run, with the rest of the line as its reason.
@@ -69,9 +73,10 @@ pub struct Expected {
     pub file: PathBuf,
     /// Its SHA-256, lower-case hexadecimal.
     pub sha256: String,
-    /// Whether the agent's own process maps that file, as a native build's does, rather than a
-    /// runtime that runs it.
-    pub native: bool,
+    /// How the launch reaches it.
+    pub launch: Launch,
+    /// Where the build is installed, with links resolved.
+    pub prefix: PathBuf,
 }
 
 impl Expected {
@@ -81,7 +86,8 @@ impl Expected {
         Self {
             file: resolved(&build.pinned_file()),
             sha256: build.sha256.clone(),
-            native: build.runtime.is_empty(),
+            launch: build.launch,
+            prefix: resolved(&build.prefix),
         }
     }
 
@@ -91,15 +97,9 @@ impl Expected {
         Self {
             file: resolved(&newer.prefix.join(&newer.pinned)),
             sha256: newer.sha256.clone(),
-            native: build.runtime.is_empty(),
+            launch: build.launch,
+            prefix: resolved(&newer.prefix),
         }
-    }
-
-    /// Whether the build is a wheel, whose installed code the harness compares with it.
-    fn is_wheel(&self) -> bool {
-        self.file
-            .extension()
-            .is_some_and(|extension| extension == "whl")
     }
 }
 
@@ -108,9 +108,11 @@ impl Expected {
 pub struct Executed {
     /// The image, as the kernel mapped it, with links resolved.
     pub image: String,
-    /// Its file's SHA-256, read from the file whose inode the process maps.
+    /// Its SHA-256, read through a handle on the file the process maps.
     pub sha256: String,
-    /// The inode the process maps, which the file hashed has.
+    /// The device and inode the process maps.
+    pub device: u64,
+    /// See `device`.
     pub inode: u64,
     /// Where it lies: `build`, `newer build`, `runtime`, `run`, `shell`, `system`, or `elsewhere`.
     pub from: &'static str,
@@ -120,15 +122,22 @@ pub struct Executed {
     pub command: String,
 }
 
+/// What `lsof` says one process maps: its executable first, then every other text mapping.
+#[derive(Clone, Debug)]
+struct Mapping {
+    image: PathBuf,
+    device: u64,
+    inode: u64,
+    mapped: Vec<PathBuf>,
+}
+
 /// What has been seen so far.
 #[derive(Default)]
 struct Seen {
-    /// Every process whose image was read, with the command line it had then.
-    processes: BTreeMap<ProcessStartIdentity, String>,
-    /// Every image read, by path and inode.
-    executed: BTreeMap<(PathBuf, u64), Executed>,
-    /// The digest of each pinned file checked, by path.
-    pinned: BTreeMap<PathBuf, String>,
+    /// Every process whose image was read, with the device and inode it mapped then.
+    processes: BTreeMap<ProcessStartIdentity, (u64, u64)>,
+    /// Every image read, by device and inode.
+    executed: BTreeMap<(u64, u64), Executed>,
     /// Processes that ended before their image was read, by command line.
     unread: Vec<String>,
     /// What each launch ran.
@@ -258,23 +267,26 @@ impl Provenance {
     /// Returns why, beginning with [`NOT_PINNED`], when one maps an image from anywhere else, or
     /// its image cannot be read while it runs.
     pub fn record(&self, processes: &[AgentProcess]) -> Result<(), String> {
+        let mappings = mappings(&pids_of(processes))?;
         let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
         for process in processes {
-            if let Some(executed) = self.inspect(&mut seen, &process.identity, &process.command)? {
+            let mapping = mapping_of(&mappings, &process.identity);
+            if let Some(executed) =
+                self.inspect(&mut seen, &process.identity, &process.command, mapping)?
+            {
                 elsewhere(&executed)?;
             }
         }
         Ok(())
     }
 
-    /// Checks that one launch ran `expected`: the agent's own process, the shell's child, maps the
-    /// pinned file when the build is native and a runtime's image otherwise, and the pinned file is
-    /// reached, by a process that maps it, by a runtime that names it as its script, or, for a
-    /// wheel, by the code the harness compared with it. Records what it found under `what`.
+    /// Checks that one launch ran `expected` in the way its build list names, and records what it
+    /// found under `what`. The agent's own process is the shell's child.
     ///
     /// # Errors
     ///
-    /// Returns why, beginning with [`NOT_PINNED`], when the launch ran anything else.
+    /// Returns why, beginning with [`NOT_PINNED`], when the launch ran anything else, or what it
+    /// ran cannot be shown.
     pub fn verify_launch(
         &self,
         processes: &[AgentProcess],
@@ -282,48 +294,63 @@ impl Provenance {
         expected: &Expected,
         what: &str,
     ) -> Result<(), String> {
+        let mappings = mappings(&pids_of(processes))?;
         let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
         let own = processes
             .iter()
             .find(|process| u64::from(process.parent) == shell)
             .ok_or_else(|| format!("{NOT_PINNED} {what}: the shell started no process"))?;
+        let own_mapping = mapping_of(&mappings, &own.identity);
         let own_image = self
-            .inspect(&mut seen, &own.identity, &own.command)?
+            .inspect(&mut seen, &own.identity, &own.command, own_mapping)?
             .ok_or_else(|| {
                 format!(
                     "{NOT_PINNED} {what}: the agent's process ({}) ended before its image was read",
                     own.command
                 )
             })?;
-        if expected.native {
-            if Path::new(&own_image.image) != expected.file || own_image.sha256 != expected.sha256 {
-                return Err(format!(
-                    "{NOT_PINNED} {what}: the agent's process maps {} (sha256 {}), not {} (sha256 {})",
-                    own_image.image,
-                    own_image.sha256,
-                    expected.file.display(),
-                    expected.sha256
-                ));
-            }
-        } else if own_image.from != "runtime" {
+        if expected.launch != Launch::Native && own_image.from != "runtime" {
             return Err(format!(
                 "{NOT_PINNED} {what}: the agent's process maps {}, which is not the build's runtime",
                 own_image.image
             ));
         }
-        let reached = if expected.native {
-            "the agent's own process maps it".to_owned()
-        } else {
-            let mut mapped = None;
-            for process in processes {
-                if let Some(executed) =
-                    self.inspect(&mut seen, &process.identity, &process.command)?
-                    && Path::new(&executed.image) == expected.file
+        let reached = match expected.launch {
+            Launch::Native => {
+                if Path::new(&own_image.image) != expected.file
+                    || own_image.sha256 != expected.sha256
                 {
-                    mapped = Some((process, executed));
+                    return Err(format!(
+                        "{NOT_PINNED} {what}: the agent's process maps {} (sha256 {}), not {} \
+                         (sha256 {})",
+                        own_image.image,
+                        own_image.sha256,
+                        expected.file.display(),
+                        expected.sha256
+                    ));
                 }
+                "the agent's own process maps it".to_owned()
             }
-            if let Some((process, executed)) = mapped {
+            Launch::Child => {
+                let mut mapped = None;
+                for process in processes
+                    .iter()
+                    .filter(|process| process.identity != own.identity)
+                {
+                    let mapping = mapping_of(&mappings, &process.identity);
+                    if let Some(executed) =
+                        self.inspect(&mut seen, &process.identity, &process.command, mapping)?
+                        && Path::new(&executed.image) == expected.file
+                    {
+                        mapped = Some((process, executed));
+                    }
+                }
+                let (process, executed) = mapped.ok_or_else(|| {
+                    format!(
+                        "{NOT_PINNED} {what}: no process the runtime started maps {}",
+                        expected.file.display()
+                    )
+                })?;
                 if executed.sha256 != expected.sha256 {
                     return Err(format!(
                         "{NOT_PINNED} {what}: process {} maps {} with sha256 {}, not {}",
@@ -334,17 +361,20 @@ impl Provenance {
                     ));
                 }
                 format!(
-                    "process {} ({}) maps it",
+                    "process {} ({}), started by the runtime, maps it",
                     process.identity.pid.get(),
                     process.command
                 )
-            } else if let Some(process) = processes.iter().find(|process| {
-                process
-                    .command
-                    .split_whitespace()
-                    .any(|word| word.starts_with('/') && resolved(Path::new(word)) == expected.file)
-            }) {
-                let digest = pinned_digest(&mut seen, &expected.file)?;
+            }
+            Launch::Script => {
+                let script = own.command.split_whitespace().nth(1).unwrap_or_default();
+                if !script.starts_with('/') || resolved(Path::new(script)) != expected.file {
+                    return Err(format!(
+                        "{NOT_PINNED} {what}: the runtime's first argument is {script:?}, not {}",
+                        expected.file.display()
+                    ));
+                }
+                let digest = hash_file(&expected.file)?;
                 if digest != expected.sha256 {
                     return Err(format!(
                         "{NOT_PINNED} {what}: {} has sha256 {digest}, not {}",
@@ -352,18 +382,31 @@ impl Provenance {
                         expected.sha256
                     ));
                 }
-                format!("the runtime runs it as its script: {}", process.command)
-            } else if expected.is_wheel() {
-                "the runtime runs the installed code the harness compared with the wheel".to_owned()
-            } else {
-                return Err(format!(
-                    "{NOT_PINNED} {what}: no process of the agent maps or names {}",
-                    expected.file.display()
-                ));
+                format!("the runtime's first argument is it: {}", own.command)
+            }
+            Launch::Wheel => {
+                let installed = expected.prefix.join("lib");
+                let loaded = own_mapping
+                    .into_iter()
+                    .flat_map(|mapping| mapping.mapped.iter())
+                    .map(|path| resolved(path))
+                    .find(|path| path.starts_with(&installed))
+                    .ok_or_else(|| {
+                        format!(
+                            "{NOT_PINNED} {what}: the runtime maps nothing of the installation at {}",
+                            expected.prefix.display()
+                        )
+                    })?;
+                format!(
+                    "the runtime loads the installation the harness compared with the wheel, \
+                     mapping {}",
+                    loaded.display()
+                )
             }
         };
         seen.launches.push(json!({
             "what": what,
+            "launch": expected.launch,
             "file": expected.file,
             "sha256": expected.sha256,
             "agent_process": {
@@ -381,10 +424,10 @@ impl Provenance {
     /// Looks at the processes beneath `root` from now until [`Provenance::stop`], at every
     /// [`SAMPLE_INTERVAL`] of [`Provenance::sample_until_stopped`].
     pub fn watch(&self, root: ProcessStartIdentity) {
-        self.roots
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(root);
+        let mut roots = self.roots.lock().unwrap_or_else(PoisonError::into_inner);
+        if !roots.contains(&root) {
+            roots.push(root);
+        }
     }
 
     /// Looks at the watched sessions' processes until [`Provenance::stop`] is called.
@@ -396,6 +439,11 @@ impl Provenance {
                 std::thread::sleep(Duration::from_millis(25));
             }
         }
+    }
+
+    /// Looks at the watched sessions' processes once, now.
+    pub fn sample_now(&self) {
+        self.sample();
     }
 
     /// Ends [`Provenance::sample_until_stopped`].
@@ -435,7 +483,9 @@ impl Provenance {
         })
     }
 
-    /// One look at every watched session's processes.
+    /// One look at every watched session's processes: the process table, each process beneath a
+    /// session, a process not seen before taken only once its parent holds, and then every one's
+    /// mapped image, read in one call so an image that changed under a known process is seen.
     fn sample(&self) {
         let roots = self
             .roots
@@ -458,9 +508,20 @@ impl Provenance {
                 return;
             }
         };
+        let mut found: Vec<(ProcessStartIdentity, String)> = Vec::new();
         for root in roots {
-            if !matches!(process_state(&root), ProcessState::Running) {
-                continue;
+            match process_state(&root) {
+                ProcessState::Running => {}
+                ProcessState::Ended => continue,
+                ProcessState::Unknown { detail } => {
+                    problem(
+                        &mut seen,
+                        format!(
+                            "{NOT_PINNED} whether a watched session's shell runs is not established: {detail}"
+                        ),
+                    );
+                    continue;
+                }
             }
             let mut under = vec![root];
             while let Some(parent) = under.pop() {
@@ -468,50 +529,82 @@ impl Provenance {
                     continue;
                 };
                 for entry in table.iter().filter(|entry| entry.parent == parent_pid) {
-                    let ProcessQuery::Present(identity) = query_process(entry.pid) else {
-                        continue;
-                    };
-                    // A number read from the table can name another process by the time it is
-                    // looked up: a process not looked at before is taken as this session's only
-                    // once its parent, read again under its own start identity, is the one it was
-                    // found under, and that parent still runs. Its image is read after that, so
-                    // what it maps is its own.
-                    if seen.processes.get(&identity) != Some(&entry.command) {
-                        if !still_beneath(&identity, &parent) {
+                    let identity = match query_process(entry.pid) {
+                        ProcessQuery::Present(identity) => identity,
+                        ProcessQuery::Gone => continue,
+                        ProcessQuery::CannotEstablish(error) => {
+                            problem(
+                                &mut seen,
+                                format!(
+                                    "{NOT_PINNED} process {} beneath a session could not be identified: {error}",
+                                    entry.pid
+                                ),
+                            );
                             continue;
                         }
-                        if let Err(why) =
-                            self.inspect(&mut seen, &identity, &entry.command).and_then(
-                                |executed| executed.map_or(Ok(()), |executed| elsewhere(&executed)),
-                            )
-                        {
-                            problem(&mut seen, why);
+                    };
+                    // A number read from the table can name another process by the time it is
+                    // looked up: a process not seen before is taken as this session's only once its
+                    // parent, read again under its own start identity, is the one it was found
+                    // under, and that parent still runs.
+                    if !seen.processes.contains_key(&identity) {
+                        match beneath_parent(&identity, &parent) {
+                            Ok(true) => {}
+                            Ok(false) => continue,
+                            Err(why) => {
+                                problem(&mut seen, why);
+                                continue;
+                            }
                         }
                     }
+                    found.push((identity.clone(), entry.command.clone()));
                     under.push(identity);
                 }
             }
         }
+        let pids: Vec<u32> = found
+            .iter()
+            .filter_map(|(identity, _)| u32::try_from(identity.pid.get()).ok())
+            .collect();
+        let mappings = match mappings(&pids) {
+            Ok(mappings) => mappings,
+            Err(why) => {
+                problem(&mut seen, why);
+                return;
+            }
+        };
+        for (identity, command) in found {
+            let mapping = mapping_of(&mappings, &identity);
+            match self.inspect(&mut seen, &identity, &command, mapping) {
+                Ok(Some(executed)) => {
+                    if let Err(why) = elsewhere(&executed) {
+                        problem(&mut seen, why);
+                    }
+                }
+                Ok(None) => {}
+                Err(why) => problem(&mut seen, why),
+            }
+        }
     }
 
-    /// Reads the image `identity` maps, with its file's digest, and notes it; nothing when the
-    /// process ended before its image was read.
+    /// Notes the image `identity` maps, as `mapping` read it, hashing an image not seen before;
+    /// nothing when the process ended before its image was read.
     fn inspect(
         &self,
         seen: &mut Seen,
         identity: &ProcessStartIdentity,
         command: &str,
+        mapping: Option<&Mapping>,
     ) -> Result<Option<Executed>, String> {
-        let pid = u32::try_from(identity.pid.get())
-            .map_err(|_| format!("{NOT_PINNED} process {} has no number", identity.pid.get()))?;
-        let read = text_image(pid);
-        // The number still names the process only while that start holds it: the image read in
-        // between is that process's.
+        let pid = identity.pid.get();
+        // The number named the process while its start held it: what was read in between is that
+        // process's.
         match process_state(identity) {
             ProcessState::Running => {}
             ProcessState::Ended => {
-                seen.unread.push(command.to_owned());
-                seen.processes.insert(identity.clone(), command.to_owned());
+                if !seen.processes.contains_key(identity) {
+                    seen.unread.push(command.to_owned());
+                }
                 return Ok(None);
             }
             ProcessState::Unknown { detail } => {
@@ -520,41 +613,27 @@ impl Provenance {
                 ));
             }
         }
-        let (path, inode) = read.map_err(|why| {
-            format!("{NOT_PINNED} the image of process {pid} ({command}) could not be read: {why}")
+        let mapping = mapping.ok_or_else(|| {
+            format!("{NOT_PINNED} the image of process {pid} ({command}) could not be read while it runs")
         })?;
-        let image = resolved(&path);
-        let key = (image.clone(), inode);
+        let key = (mapping.device, mapping.inode);
         let executed = if let Some(executed) = seen.executed.get(&key) {
             executed.clone()
         } else {
-            let on_disk = std::fs::metadata(&image)
-                .map(|metadata| metadata.ino())
-                .map_err(|error| {
-                    format!(
-                        "{NOT_PINNED} process {pid} maps {}, which cannot be read: {error}",
-                        image.display()
-                    )
-                })?;
-            if on_disk != inode {
-                return Err(format!(
-                    "{NOT_PINNED} process {pid} ({command}) maps inode {inode} at {}, and the file there \
-                     now is inode {on_disk}, so what it runs cannot be hashed",
-                    image.display()
-                ));
-            }
+            let image = resolved(&mapping.image);
             let executed = Executed {
                 image: image.display().to_string(),
-                sha256: sha256_of(&image)?,
-                inode,
+                sha256: hash_mapped(&image, mapping.device, mapping.inode)?,
+                device: mapping.device,
+                inode: mapping.inode,
                 from: self.place_of(&image),
-                pid: identity.pid.get(),
+                pid,
                 command: command.to_owned(),
             };
             seen.executed.insert(key, executed.clone());
             executed
         };
-        seen.processes.insert(identity.clone(), command.to_owned());
+        seen.processes.insert(identity.clone(), key);
         Ok(Some(executed))
     }
 
@@ -596,20 +675,157 @@ fn elsewhere(executed: &Executed) -> Result<(), String> {
     Ok(())
 }
 
-/// Whether `identity` still runs beneath `parent`, which still runs.
-fn still_beneath(identity: &ProcessStartIdentity, parent: &ProcessStartIdentity) -> bool {
-    matches!(process_state(parent), ProcessState::Running)
-        && matches!(describe(identity), Ok(Some(described)) if u64::from(described.parent) == parent.pid.get())
+/// Whether `identity` still runs beneath `parent`, which still runs: `Ok(false)` when it has
+/// ended or its number now names a process with another parent.
+fn beneath_parent(
+    identity: &ProcessStartIdentity,
+    parent: &ProcessStartIdentity,
+) -> Result<bool, String> {
+    let described = describe(identity).map_err(|why| {
+        format!(
+            "{NOT_PINNED} process {} beneath a session could not be described: {why}",
+            identity.pid.get()
+        )
+    })?;
+    let Some(described) = described else {
+        return Ok(false);
+    };
+    match process_state(parent) {
+        ProcessState::Running => Ok(u64::from(described.parent) == parent.pid.get()),
+        ProcessState::Ended => Ok(false),
+        ProcessState::Unknown { detail } => Err(format!(
+            "{NOT_PINNED} whether the parent of process {} runs is not established: {detail}",
+            identity.pid.get()
+        )),
+    }
 }
 
-/// The digest of a pinned file, read once.
-fn pinned_digest(seen: &mut Seen, file: &Path) -> Result<String, String> {
-    if let Some(digest) = seen.pinned.get(file) {
-        return Ok(digest.clone());
+/// The processes' numbers.
+fn pids_of(processes: &[AgentProcess]) -> Vec<u32> {
+    processes
+        .iter()
+        .filter_map(|process| u32::try_from(process.identity.pid.get()).ok())
+        .collect()
+}
+
+/// The mapping `lsof` read for a process, by its number.
+fn mapping_of<'m>(
+    mappings: &'m BTreeMap<u32, Mapping>,
+    identity: &ProcessStartIdentity,
+) -> Option<&'m Mapping> {
+    u32::try_from(identity.pid.get())
+        .ok()
+        .and_then(|pid| mappings.get(&pid))
+}
+
+/// What each of `pids` maps, as one `lsof` reads it: the executable first, its device and inode,
+/// then every other text mapping. A process that has ended is absent.
+fn mappings(pids: &[u32]) -> Result<BTreeMap<u32, Mapping>, String> {
+    let mut found = BTreeMap::new();
+    if pids.is_empty() {
+        return Ok(found);
     }
-    let digest = sha256_of(file)?;
-    seen.pinned.insert(file.to_path_buf(), digest.clone());
+    let list = pids
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut lsof = Command::new("/usr/sbin/lsof");
+    lsof.args(["-a", "-p", &list, "-d", "txt", "-FpDin"])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin:/usr/sbin");
+    // It exits 1 when one of the processes has gone; what it printed is still read.
+    let output = output_within(lsof, LIVENESS).map_err(|why| {
+        format!("{NOT_PINNED} the processes' images could not be read: lsof {why}")
+    })?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut pid = None;
+    let mut device = None;
+    let mut inode = None;
+    for line in text.lines() {
+        let (field, value) = line.split_at(line.len().min(1));
+        match field {
+            "p" => {
+                pid = value.parse::<u32>().ok();
+                device = None;
+                inode = None;
+            }
+            "D" => device = u64::from_str_radix(value.trim_start_matches("0x"), 16).ok(),
+            "i" => inode = value.parse::<u64>().ok(),
+            "n" => {
+                let Some(pid) = pid else { continue };
+                let path = PathBuf::from(value);
+                match found.get_mut(&pid) {
+                    None => {
+                        if let (Some(device), Some(inode)) = (device, inode) {
+                            found.insert(
+                                pid,
+                                Mapping {
+                                    image: path,
+                                    device,
+                                    inode,
+                                    mapped: Vec::new(),
+                                },
+                            );
+                        }
+                    }
+                    Some(mapping) => mapping.mapped.push(path),
+                }
+                device = None;
+                inode = None;
+            }
+            _ => {}
+        }
+    }
+    Ok(found)
+}
+
+/// A mapped image's SHA-256, read through one handle on the file whose device and inode the
+/// process maps, which must not change while it is read.
+fn hash_mapped(file: &Path, device: u64, inode: u64) -> Result<String, String> {
+    let (digest, held) = hash_handle(file)?;
+    if held != (device, inode) {
+        return Err(format!(
+            "{NOT_PINNED} {} is device {} inode {} now, not the device {device} inode {inode} the \
+             process maps, so what it runs cannot be hashed",
+            file.display(),
+            held.0,
+            held.1
+        ));
+    }
     Ok(digest)
+}
+
+/// A file's SHA-256, read through one handle.
+fn hash_file(file: &Path) -> Result<String, String> {
+    hash_handle(file).map(|(digest, _)| digest)
+}
+
+/// Reads a file through one handle, requiring its size and modification time not to change while
+/// it is read, and returns its SHA-256 with the device and inode the handle holds.
+fn hash_handle(file: &Path) -> Result<(String, (u64, u64)), String> {
+    let unreadable =
+        |error: std::io::Error| format!("{NOT_PINNED} {} cannot be read: {error}", file.display());
+    let mut handle = std::fs::File::open(file).map_err(unreadable)?;
+    let before = handle.metadata().map_err(unreadable)?;
+    let mut bytes = Vec::with_capacity(usize::try_from(before.len()).unwrap_or(0));
+    handle.read_to_end(&mut bytes).map_err(unreadable)?;
+    let after = handle.metadata().map_err(unreadable)?;
+    if u64::try_from(bytes.len()).ok() != Some(before.len())
+        || after.len() != before.len()
+        || after.mtime() != before.mtime()
+        || after.mtime_nsec() != before.mtime_nsec()
+    {
+        return Err(format!(
+            "{NOT_PINNED} {} changed while it was read",
+            file.display()
+        ));
+    }
+    let digest: String = kr_cbor::sha256(&bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    Ok((digest, (before.dev(), before.ino())))
 }
 
 /// Where a runtime's installation lies: the directory above the one its executable is in, with
@@ -625,21 +841,4 @@ fn runtime_root(executable: &Path) -> PathBuf {
 /// A path with its links resolved, or as written when it cannot be.
 fn resolved(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
-}
-
-/// A file's SHA-256, lower-case hexadecimal.
-fn sha256_of(file: &Path) -> Result<String, String> {
-    let mut shasum = Command::new("/usr/bin/shasum");
-    shasum
-        .args(["-a", "256"])
-        .arg(file)
-        .env_clear()
-        .env("PATH", "/usr/bin:/bin");
-    let output = output_within(shasum, LIVENESS).map_err(|why| format!("shasum {why}"))?;
-    String::from_utf8_lossy(&output.stdout)
-        .split_whitespace()
-        .next()
-        .filter(|digest| digest.len() == 64)
-        .map(str::to_owned)
-        .ok_or_else(|| format!("shasum named no digest for {}", file.display()))
 }

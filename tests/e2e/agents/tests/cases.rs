@@ -3,10 +3,13 @@
 //! Each test is one part, runs on a stage of its own (its own directory on the internal disk, its
 //! own host, its own owner device with fresh keys, the agent's package installed on that device's
 //! confirmation) and starts the agent the way a person does, by typing its command at the prompt
-//! of a managed shell. It checks the part's property, then runs a control that breaks the property
-//! on purpose and requires the same check to fail, so a check that could not fail is not reported
-//! as one that passed. It closes what it opened, requires the closing check to find nothing left,
-//! and only then appends its outcome to the result file.
+//! of a managed shell. It checks the part's property, then runs a control. For 5a, 6a and 14.03a
+//! the control breaks the property on purpose and the same check must then fail, so a check that
+//! could not fail is not reported as one that passed. For 2b and 8a no control can break the
+//! property on a host that binds no connector, so the control shows that the same connection's
+//! accepted path works, and the evidence says `breaks_property: false` and why. Each test closes
+//! what it opened, requires the closing check to find nothing left, and only then appends its
+//! outcome to the result file.
 //!
 //! The parts drive terminals, process identities and signals the way a Unix host has them, so the
 //! suite is built for Unix hosts alone.
@@ -122,46 +125,51 @@ fn on_stage(part: &str, body: impl FnOnce(&mut Stage<'_, '_>) -> Ending) {
         &inputs.generation,
         &inputs.build.package,
     );
-    // The sessions an agent is launched in are watched from the launch to the end of the part, by
-    // a thread of their own; it stops when the part ends, however it ends.
-    let ending = std::thread::scope(|scope| {
+    // The sessions an agent is launched in are watched from just before the launch until they have
+    // ended, by a thread of their own, with one more look when the part's own steps end; the
+    // thread stops when the part ends, however it ends.
+    let outcome = std::thread::scope(|scope| {
         let _stop = StopSampling(&provenance);
         let _sampler = scope.spawn(|| provenance.sample_until_stopped());
-        let mut stage = Stage {
-            build: &inputs.build,
-            run: &run,
-            host: &host,
-            owner: &mut owner,
-            runtime: &runtime,
-            shell: &shell,
-            installed: &installed,
-            provenance: &provenance,
+        let ending = {
+            let mut stage = Stage {
+                build: &inputs.build,
+                run: &run,
+                host: &host,
+                owner: &mut owner,
+                runtime: &runtime,
+                shell: &shell,
+                installed: &installed,
+                provenance: &provenance,
+            };
+            body(&mut stage)
         };
-        body(&mut stage)
+        provenance.sample_now();
+        for session in &ending.sessions {
+            session.remote.close();
+        }
+        owner.close(&runtime);
+        let stopped = host.stop();
+        match ending.replacement {
+            // The host's own daemon was killed on purpose, and its stop says so. What else went
+            // wrong there is what the closing check below finds still running.
+            Some(replacement) => replacement
+                .stop()
+                .unwrap_or_else(|why| panic!("the replacement daemon: {why}")),
+            None => stopped.unwrap_or_else(|why| panic!("the host did not stop cleanly: {why}")),
+        }
+        for mut session in ending.sessions {
+            let _ = session.window.exit_code(LIVENESS);
+        }
+        ending.outcome
     });
-    for session in &ending.sessions {
-        session.remote.close();
-    }
-    owner.close(&runtime);
-    let stopped = host.stop();
-    match ending.replacement {
-        // The host's own daemon was killed on purpose, and its stop says so. What else went wrong
-        // there is what the closing check below finds still running.
-        Some(replacement) => replacement
-            .stop()
-            .unwrap_or_else(|why| panic!("the replacement daemon: {why}")),
-        None => stopped.unwrap_or_else(|why| panic!("the host did not stop cleanly: {why}")),
-    }
-    for mut session in ending.sessions {
-        let _ = session.window.exit_code(LIVENESS);
-    }
     let checked = run
         .closing_check()
         .unwrap_or_else(|left| panic!("still running after part {part}: {left}"));
     println!("{checked}");
     drop(keychain);
     provenance.finish().unwrap_or_else(|why| panic!("{why}"));
-    let mut outcome = ending.outcome;
+    let mut outcome = outcome;
     if let Some(evidence) = outcome.evidence.as_object_mut() {
         evidence.insert("provenance".to_owned(), provenance.evidence());
         evidence.insert(
@@ -497,9 +505,12 @@ fn runs_its_build(identity: &ProcessStartIdentity, file: &Path, inode: u64) -> R
 }
 
 /// KR-REQ-12.32, case 2, part 2b: an agent on its terminal route is advertised no typed capability,
-/// and every typed action a device sends for it is refused, with the code for an application
-/// instance the host does not hold, while nothing it carried reaches the agent. The control is
-/// terminal input under the input lease, which the same device's connection delivers.
+/// and every typed action a device sends for it is refused while nothing it carried reaches the
+/// agent: the agent mutations and the package's actions with the code for an application instance
+/// the host does not hold, the reads as ones a device is not served, and the attachment request
+/// before any instance is looked at, which says nothing about the route. The control, which does
+/// not break the property, is terminal input under the input lease, which the same device's
+/// connection delivers.
 #[test]
 fn an_agent_on_its_terminal_route_is_advertised_no_typed_capability_and_every_typed_action_is_refused()
  {

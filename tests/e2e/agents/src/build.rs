@@ -57,6 +57,22 @@ pub struct Newer {
     pub ready: String,
 }
 
+/// How a launch of the build reaches its pinned file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Launch {
+    /// The agent's own process, the shell's child, maps the pinned executable.
+    Native,
+    /// The agent's own process is a runtime that starts a process mapping the pinned executable.
+    Child,
+    /// The agent's own process is a runtime whose first argument is the pinned script.
+    Script,
+    /// The agent's own process is a runtime that loads the code installed from the pinned wheel,
+    /// which the harness compares with the wheel, with the launcher that names that installation's
+    /// interpreter.
+    Wheel,
+}
+
 /// The build under test.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -79,6 +95,8 @@ pub struct Build {
     pub sha256: String,
     /// The command a person types, found through `bin` under the prefix.
     pub command: String,
+    /// How a launch reaches the pinned file.
+    pub launch: Launch,
     /// The arguments typed after it, with `{port}` where a server's loopback port goes.
     #[serde(default)]
     pub arguments: Vec<String>,
