@@ -1241,14 +1241,45 @@ public static class KrSecondAccount
 }
 "#;
 
+/// A helper process a test started, ended when the test is done with it, however the test ends.
+///
+/// A helper left running keeps open the handles it inherited from the test, among them the test
+/// run's own output, and whatever reads that output then waits for it for ever. So a helper is
+/// ended on every path out of the test, a failed assertion included.
+struct Helper(Option<std::process::Child>);
+
+impl Helper {
+    fn start(command: &mut std::process::Command) -> Self {
+        Self(Some(command.spawn().expect("the helper starts")))
+    }
+
+    /// Waits for the helper to end by itself.
+    fn wait(mut self) -> std::process::ExitStatus {
+        self.0
+            .take()
+            .expect("the helper is running")
+            .wait()
+            .expect("the helper is waited for")
+    }
+}
+
+impl Drop for Helper {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
 /// Starts [`AS_SECOND_ACCOUNT`] in `role` against the pipe `name`, reporting into `status`.
-fn start_as_second(host: &TempHost, role: &str, name: &str, status: &Path) -> std::process::Child {
+fn start_as_second(host: &TempHost, role: &str, name: &str, status: &Path) -> Helper {
     let helper = script(host, "as-second-account", AS_SECOND_ACCOUNT);
-    powershell_running(&helper, &[role, name, &status.display().to_string()])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("the helper starts")
+    Helper::start(
+        powershell_running(&helper, &[role, name, &status.display().to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null()),
+    )
 }
 
 /// Waits until `path` holds a line equal to `token`, or fails after [`PATIENCE`] with what it held.
@@ -1352,7 +1383,7 @@ async fn a_client_refuses_a_server_of_another_account_and_the_host_bind_fails() 
         .controller_endpoint()
         .expect("an endpoint");
     let status = host.root().join("a-status.txt");
-    let mut helper = start_as_second(&host, "server", &endpoint.as_text(), &status);
+    let _helper = start_as_second(&host, "server", &endpoint.as_text(), &status);
     waited_for(&status, "ready").await;
 
     // The host cannot take a name another account already holds, so it does not start on it, and it
@@ -1377,8 +1408,6 @@ async fn a_client_refuses_a_server_of_another_account_and_the_host_bind_fails() 
 
     // Nothing the client would have sent the host reached the other account.
     waited_for(&status, "received=0").await;
-    let _ = helper.kill();
-    let _ = helper.wait();
 }
 
 /// KR-REQ-23.10, KR-REQ-02.07: a listener refuses a caller of another account by that account, even
@@ -1400,7 +1429,7 @@ async fn a_listener_refuses_a_caller_of_another_account_and_serves_the_owner() {
     let listener = Listener::bind_with_access_list(&endpoint, "D:P(A;;GA;;;WD)")
         .expect("binds a widely-listed endpoint");
     let status = host.root().join("b-status.txt");
-    let mut helper = start_as_second(&host, "client", &endpoint.as_text(), &status);
+    let _helper = start_as_second(&host, "client", &endpoint.as_text(), &status);
     waited_for(&status, "connected").await;
 
     let (mut foreign, _) = tokio::time::timeout(PATIENCE, listener.accept())
@@ -1433,8 +1462,6 @@ async fn a_listener_refuses_a_caller_of_another_account_and_serves_the_owner() {
         b"owner",
         "the same listener goes on serving the owner"
     );
-    let _ = helper.kill();
-    let _ = helper.wait();
 }
 
 /// KR-REQ-23.10: bytes a caller of another account sent before its process ended are never handed
@@ -1451,12 +1478,11 @@ async fn bytes_left_by_a_caller_of_another_account_that_has_gone_reach_no_reader
     let listener = Listener::bind_with_access_list(&endpoint, "D:P(A;;GA;;;WD)")
         .expect("binds a widely-listed endpoint");
     let status = host.root().join("g-status.txt");
-    let mut helper = start_as_second(&host, "client-exit", &endpoint.as_text(), &status);
+    let helper = start_as_second(&host, "client-exit", &endpoint.as_text(), &status);
     // Explicitly after the caller has sent its byte and its process has ended.
     let ended = tokio::task::spawn_blocking(move || helper.wait())
         .await
-        .expect("the wait finishes")
-        .expect("the helper ends");
+        .expect("the wait finishes");
     assert!(ended.success(), "the helper ended normally");
     wait_for_line(&status, "connected");
 
@@ -1552,14 +1578,14 @@ async fn the_client_lets_a_server_identify_it_but_never_act_as_it() {
         .expect("a short name");
     let status = host.root().join("level-status.txt");
     let observer = script(&host, "impersonation-level", IMPERSONATION_LEVEL);
-    let mut child = powershell_running(
-        &observer,
-        &[&endpoint.as_text(), &status.display().to_string()],
-    )
-    .stdout(std::process::Stdio::null())
-    .stderr(std::process::Stdio::null())
-    .spawn()
-    .expect("the observer starts");
+    let _observer = Helper::start(
+        powershell_running(
+            &observer,
+            &[&endpoint.as_text(), &status.display().to_string()],
+        )
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null()),
+    );
     waited_for(&status, "ready").await;
 
     let mut client = Connection::connect(&endpoint)
@@ -1576,7 +1602,6 @@ async fn the_client_lets_a_server_identify_it_but_never_act_as_it() {
         level, "level=Identification",
         "the server may identify the client and nothing more"
     );
-    let _ = child.wait();
 }
 
 /// KR-REQ-23.10: a caller whose account cannot be read from the connection, because it opened the
