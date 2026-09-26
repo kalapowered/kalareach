@@ -3080,4 +3080,49 @@ mod tests {
         .await;
         kept_its_last_call(&run, "a fresh connection turned away at the call");
     }
+
+    /// An attempt says its stage and when it expires, and never the verification value, a host's
+    /// name or what the host said.
+    #[test]
+    fn an_attempt_says_its_stage_and_never_what_it_was_told() {
+        const MARKER: &str = "kr-marker-7c1e";
+        assert_eq!(format!("{:?}", AttemptState::Idle), "Idle");
+        assert_eq!(
+            format!(
+                "{:?}",
+                AttemptState::Working {
+                    stage: Stage::ReachingService
+                }
+            ),
+            "Working { stage: ReachingService }"
+        );
+        let awaiting = AttemptState::AwaitingApproval {
+            value: MARKER.to_owned(),
+            expires_at_ms: Some(1),
+            rights: Vec::new(),
+            authority: MARKER.to_owned(),
+            grant_expires_at_ms: None,
+        };
+        assert_eq!(
+            format!("{awaiting:?}"),
+            "AwaitingApproval { expires_at_ms: Some(1), rights: [], grant_expires_at_ms: None, .. }"
+        );
+        let reconnecting = AttemptState::Reconnecting {
+            value: Some(MARKER.to_owned()),
+            expires_at_ms: None,
+        };
+        assert_eq!(
+            format!("{reconnecting:?}"),
+            "Reconnecting { expires_at_ms: None, .. }"
+        );
+        let paired = AttemptState::Paired {
+            host: HostView {
+                name: Some(MARKER.to_owned()),
+                owner: true,
+                authority: MARKER.to_owned(),
+                grant_expires_at_ms: None,
+            },
+        };
+        assert_eq!(format!("{paired:?}"), "Paired { .. }");
+    }
 }

@@ -898,4 +898,18 @@ mod tests {
             vec![ActionId::new(Uuid::from_bytes([3; 16]))]
         );
     }
+
+    /// Cursors and receipts say how many streams and receipts they hold, and never a stream's
+    /// identifier or a receipt's result.
+    #[test]
+    fn cursors_and_receipts_say_how_many_and_never_what() {
+        assert_eq!(
+            format!("{:?}", StreamCursors::default()),
+            "StreamCursors { received: 0, applied: 0, applied_cursor: 0, needs_snapshot: 0, since_discard: 0 }"
+        );
+        assert_eq!(
+            format!("{:?}", ReceiptTracker::default()),
+            "ReceiptTracker { receipts: 0 }"
+        );
+    }
 }

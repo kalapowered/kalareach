@@ -2717,4 +2717,113 @@ mod tests {
             );
         }
     }
+
+    /// Each control event and each start says which it is and its numbers, and never what the
+    /// service or the provider wrote.
+    #[test]
+    fn a_control_event_and_a_start_render_only_what_they_are() {
+        use crate::services::rendering::{NEVER_RENDERED, renders_only};
+
+        let text = || NEVER_RENDERED.to_owned();
+        for (event, expected) in [
+            (
+                VoiceControlEvent::Ready {
+                    call_id: text(),
+                    delegations: vec![text()],
+                },
+                "Ready{delegations:1,..}",
+            ),
+            (
+                VoiceControlEvent::HeartbeatAcknowledged {
+                    remaining_seconds: 5,
+                },
+                "HeartbeatAcknowledged{remaining_seconds:5}",
+            ),
+            (
+                VoiceControlEvent::ContextAccepted { id: text() },
+                "ContextAccepted{..}",
+            ),
+            (
+                VoiceControlEvent::ContextAdmitted {
+                    id: text(),
+                    note: text(),
+                },
+                "ContextAdmitted{..}",
+            ),
+            (
+                VoiceControlEvent::ContextRefused {
+                    id: text(),
+                    reason: text(),
+                    message: text(),
+                },
+                "ContextRefused{..}",
+            ),
+            (
+                VoiceControlEvent::Usage {
+                    seconds: 7,
+                    provisional: true,
+                },
+                "Usage{seconds:7,provisional:true}",
+            ),
+            (
+                VoiceControlEvent::Closed {
+                    reason: text(),
+                    seconds: 9,
+                    provisional: false,
+                },
+                "Closed{seconds:9,provisional:false,..}",
+            ),
+            (
+                VoiceControlEvent::Notice {
+                    notice: text(),
+                    message: text(),
+                },
+                "Notice{..}",
+            ),
+            (
+                VoiceControlEvent::Delegation {
+                    delegation_id: text(),
+                    offset_ms: 11,
+                },
+                "Delegation{offset_ms:11,..}",
+            ),
+            (
+                VoiceControlEvent::Unknown { frame_type: text() },
+                "Unknown{..}",
+            ),
+        ] {
+            renders_only(&event, expected);
+        }
+        let rate = VoiceRateQuote {
+            version: text(),
+            minor_units_per_second: text(),
+            minimum_seconds: 60,
+            currency: text(),
+        };
+        renders_only(
+            &VoiceStart::RateChanged {
+                rate,
+                message: text(),
+                call_id: Some(text()),
+            },
+            "RateChanged{rate:VoiceRateQuote{minimum_seconds:60,..},..}",
+        );
+        renders_only(
+            &VoiceStart::CreationUnknown {
+                attempt_id: Some(text()),
+                message: text(),
+            },
+            "CreationUnknown{..}",
+        );
+        renders_only(
+            &VoiceStart::Refused(Box::new(VoiceRefusal {
+                reason: VoiceRefusalReason::InvalidRequest,
+                message: text(),
+                alternatives: vec![text()],
+                attempt_id: Some(text()),
+                call_id: None,
+            })),
+            "Refused(VoiceRefusal{reason:InvalidRequest,..})",
+        );
+    }
 }

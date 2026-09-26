@@ -988,4 +988,26 @@ mod tests {
             ActionName::new("repository.delete").expect("a literal action name")
         );
     }
+
+    /// A hidden or disabled control says why, and never the fact or the reason the package wrote.
+    #[test]
+    fn a_hidden_or_disabled_control_says_why_and_never_the_packages_words() {
+        const MARKER: &str = "kr-marker-7c1e";
+        let unknown = Hidden::UnknownFact {
+            fact: MARKER.to_owned(),
+        };
+        assert_eq!(format!("{unknown:?}"), "UnknownFact { .. }");
+        let disabled = NotInvocable::Disabled {
+            because: Hidden::PredicateFalse,
+            reason: Some(MARKER.to_owned()),
+        };
+        assert_eq!(
+            format!("{disabled:?}"),
+            "Disabled { because: PredicateFalse, reason: Some(\"<present>\") }"
+        );
+        assert_eq!(
+            format!("{:?}", NotInvocable::Hidden(Hidden::PredicateFalse)),
+            "Hidden(PredicateFalse)"
+        );
+    }
 }
