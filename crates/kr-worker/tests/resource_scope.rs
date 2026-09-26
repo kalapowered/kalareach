@@ -1779,9 +1779,11 @@ fn told_as(events: &[AgentResourceEvent]) -> Vec<(PendingResourceId, PendingStat
 /// consulted nor changed. The shown approval's transition of another run whose resource cannot be
 /// read, and its end, are withheld, and the approval is still shown afterwards; a recent request's
 /// transition of another run is told and does not make the request shown. A transition of the
-/// snapshot's own run at its position is dropped however shown its resource is. The transitions
-/// are handed to the session as the delivery hands it every one, since this host's broker runs one
-/// stream; the owner and a read without a scope are told every one.
+/// snapshot's own run at its position is dropped however shown its resource is, and it changes
+/// nothing either: after the shown approval's covered end, a transition of that approval whose
+/// resource cannot be read still reaches the view. The transitions are handed to the session as the
+/// delivery hands it every one, since this host's broker runs one stream; the owner and a read
+/// without a scope are told every one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_10_51_a_transition_of_another_run_is_decided_by_the_filter_alone() {
     let host = host().await;
@@ -1831,11 +1833,21 @@ async fn kr_req_10_51_a_transition_of_another_run_is_decided_by_the_filter_alone
             None,
         ),
         (
-            transition(&host, named, PendingState::Claimed, generation, position),
+            transition(&host, named, PendingState::Resolved, generation, position),
             Some(&approval),
         ),
         (
-            transition(&host, last, PendingState::Pending, generation, position + 6),
+            transition(
+                &host,
+                named,
+                PendingState::Claimed,
+                generation,
+                position + 6,
+            ),
+            None,
+        ),
+        (
+            transition(&host, last, PendingState::Pending, generation, position + 7),
             Some(&last_request),
         ),
     ];
@@ -1846,14 +1858,15 @@ async fn kr_req_10_51_a_transition_of_another_run_is_decided_by_the_filter_alone
     }
 
     let phone = views.phone.told_through(last).await;
-    let expected: Vec<AgentResourceEvent> = [2, 3, 6]
+    let expected: Vec<AgentResourceEvent> = [2, 3, 6, 7]
         .into_iter()
         .map(|index| sent[index].0.clone())
         .collect();
     assert_eq!(
         told_as(&phone),
         told_as(&expected),
-        "the device is told the shown approval's own run, and the recent request of another run"
+        "the device is told the shown approval's own run after the snapshot, and the recent \
+         request of another run"
     );
     let every: Vec<AgentResourceEvent> = sent.iter().map(|(event, _)| event.clone()).collect();
     for control in [&mut views.owner, &mut views.unscoped] {
