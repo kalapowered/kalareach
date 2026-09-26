@@ -579,7 +579,7 @@ impl NetworkHost {
                     let Some(answer) = remote.answer(frame).await else {
                         break;
                     };
-                    if !remote.output().send(&answer).await {
+                    if !remote.write_answer(answer).await {
                         break;
                     }
                 }
@@ -919,6 +919,20 @@ pub(crate) fn offline_anchor(
 pub(crate) struct DeviceDecision {
     /// The decision itself.
     pub decided: crate::config::ceilings::Decided,
+}
+
+impl DeviceDecision {
+    /// Every time bound the decision was taken under besides the grant's own, each as the
+    /// snapshot it loaded, with its cell.
+    pub(crate) fn bounds(&self) -> Vec<crate::grants::policy::HeldBound> {
+        let permitted = &self.decided.permitted;
+        permitted
+            .lease
+            .iter()
+            .chain(permitted.offline.iter())
+            .cloned()
+            .collect()
+    }
 }
 
 /// How often this host writes down what its wall clock reads.
@@ -2461,7 +2475,7 @@ pub(crate) mod tests {
     }
 
     /// The cell of the lease the member device of `grant` holds in `organisation`.
-    fn member_cell(
+    pub(super) fn member_cell(
         controller: &Controller,
         organisation: &crate::grants::organisation::testing::TestOrganisation,
         grant: &Grant,
@@ -2623,9 +2637,48 @@ pub(crate) mod tests {
         drop(restarted);
     }
 
+    /// Presents a renewal for the member device of `grant` in `organisation`, issued at `issued_ms`
+    /// and read at the same moment, and writes the policy holding it down.
+    pub(super) fn renew_member(
+        controller: &Controller,
+        organisation: &crate::grants::organisation::testing::TestOrganisation,
+        grant: &Grant,
+        issued_ms: u64,
+    ) -> crate::error::Result<
+        std::result::Result<
+            crate::grants::organisation::LeaseInstalled,
+            crate::grants::LeaseRefused,
+        >,
+    > {
+        let binding = controller
+            .policy()
+            .enrolment(organisation.organisation_id)
+            .and_then(|enrolment| enrolment.binding(grant.recipient_device_id).cloned())
+            .expect("the device is bound");
+        let lease = organisation.lease(
+            &binding.account_id,
+            binding.device_key,
+            issued_ms,
+            &[ActionRight::SessionView],
+        );
+        controller.update_policy(|policy| {
+            policy.install_lease(crate::grants::organisation::LeasePresentation {
+                lease: &lease,
+                device_id: grant.recipient_device_id,
+                proven_key: &binding.device_key,
+                reading: Some(super::devices::ObservedUtc {
+                    now: TimestampMs::new(issued_ms),
+                    behind_ms: 0,
+                }),
+                now: controller.clock.now(),
+                generation: controller.generation(),
+            })
+        })
+    }
+
     /// Enrols `controller` in `organisation` at `now` and installs a lease issued then for a member
     /// on a device of its own, which binds it. Returns that device's organisation grant.
-    fn leased_member(
+    pub(super) fn leased_member(
         controller: &Controller,
         organisation: &crate::grants::organisation::testing::TestOrganisation,
         now: u64,

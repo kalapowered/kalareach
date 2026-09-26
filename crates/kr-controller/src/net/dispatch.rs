@@ -69,6 +69,7 @@ use super::devices::DeviceRecord;
 use super::proxy::{RELAY_QUEUED_BYTES, RelayBudget, Relayed, Vouched, WorkerProxy};
 use crate::config::ceilings::CeilingRefusal;
 use crate::error::{ControllerError, Result};
+use crate::grants::policy::{BoundIdentity, HeldBound, Stands};
 use crate::service::Controller;
 
 /// Why a claim on an action's identity did not succeed.
@@ -200,11 +201,15 @@ impl FrameSink for ControlStream {
 /// the next decision or the network's record task. A clock wound back after the poll refused
 /// therefore gives nothing back: not to the batch decided again, and not to a connection that comes
 /// after this one.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct RelayGrant {
     epoch: u64,
     until: Option<kr_transport::clock::ContinuousInstant>,
     lapses_at_ms: Option<u64>,
+    /// The bounds the decision loaded, each with its cell: the batch holds only while every cell
+    /// still publishes the snapshot it was decided under, and neither of that snapshot's deadlines
+    /// has passed. A renewal publishes a new snapshot, so the batch is decided again under it.
+    under: Vec<HeldBound>,
 }
 
 impl RelayGrant {
@@ -227,12 +232,44 @@ impl RelayGrant {
                 return false;
             }
         }
-        true
+        bounds_hold(controller, &self.under, HeldBound::holds_as_decided)
     }
 }
 
+/// Whether every bound in `under` still holds by `judge`, reading each clock once, and never
+/// waiting: a check inside a poll takes no lock and calls no store. A bound found ended owes only
+/// what a lapse owes today, which the next step outside the poll writes: in UTC, the floor the
+/// reading raised; on the continuous clock, for the offline bound, the time it has spent.
+fn bounds_hold(
+    controller: &Controller,
+    under: &[HeldBound],
+    judge: impl Fn(&HeldBound, kr_transport::clock::ContinuousInstant, u64) -> Stands,
+) -> bool {
+    if under.is_empty() {
+        return true;
+    }
+    let now = controller.clock.now();
+    let settled = controller.settled_utc_now();
+    for held in under {
+        match judge(held, now, settled) {
+            Stands::Holds => {}
+            Stands::Moved => return false,
+            Stands::EndedInUtc => {
+                controller.keep_lapse(settled);
+                return false;
+            }
+            Stands::EndedOnTheContinuousClock => {
+                if matches!(held.snapshot().identity, BoundIdentity::Offline { .. }) {
+                    controller.owe_offline_time();
+                }
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// What a relayed batch is written under.
-#[derive(Clone, Copy)]
 struct Relaying<'a> {
     /// The decision that allowed it.
     grant: RelayGrant,
@@ -294,6 +331,9 @@ struct Authorisation {
     /// left. A wall clock stepped afterwards cannot lengthen it, and the continuous clock is the
     /// one every other deadline on this host is measured on.
     grant_deadline: Option<kr_transport::clock::ContinuousInstant>,
+    /// When this connection's grant ends in UTC milliseconds, its expiry, when it has one. Read
+    /// against this host's reading of UTC through its floor, which the reading raises.
+    grant_expires_at_ms: Option<u64>,
     /// Set the first time the grant is found to have run out. It never comes back.
     expired: AtomicBool,
     /// Set once the expiry above has been written down, so it is written once.
@@ -319,24 +359,34 @@ impl Authorisation {
         self.note_expiry();
     }
 
-    /// Returns whether this connection's grant still has time on it.
+    /// Returns whether this connection's grant still has time on it, on both of its clocks: its
+    /// anchor on the continuous clock, and its expiry at this host's reading of UTC.
     ///
-    /// Nothing but a clock read and two atomics, because this is also what decides at every
-    /// attempt to write a frame: a decision made inside a poll cannot wait on a lock or a
-    /// database. Writing the expiry down is [`Self::note_expiry`], which the checks that can
-    /// afford it call.
+    /// Nothing but clock reads and atomics, because this is also what decides at every attempt to
+    /// write a frame: a decision made inside a poll cannot wait on a lock or a database. Writing
+    /// the expiry down is [`Self::note_expiry`], which the checks that can afford it call, and an
+    /// expiry found in UTC also leaves the floor it was found at owed its record, which the next
+    /// step that may write writes.
     fn has_time_left(&self) -> bool {
         if self.expired.load(Ordering::Acquire) {
             return false;
         }
-        let Some(deadline) = self.grant_deadline else {
-            return true;
-        };
-        if self.controller.clock.now() < deadline {
-            return true;
+        if self
+            .grant_deadline
+            .is_some_and(|deadline| self.controller.clock.now() >= deadline)
+        {
+            self.expired.store(true, Ordering::Release);
+            return false;
         }
-        self.expired.store(true, Ordering::Release);
-        false
+        if let Some(expires_at_ms) = self.grant_expires_at_ms {
+            let settled = self.controller.settled_utc_now();
+            if settled >= expires_at_ms {
+                self.controller.keep_lapse(settled);
+                self.expired.store(true, Ordering::Release);
+                return false;
+            }
+        }
+        true
     }
 
     /// Hands an expiry this connection has observed to the host, and tries to write it.
@@ -408,19 +458,27 @@ impl RemoteOutput {
     ///   the watch below. A revocation that withdraws one closes the connection itself, which is
     ///   what stops a frame that is already waiting.
     pub async fn send(&self, frame: &ControlFrame) -> bool {
-        self.write(frame, None).await == Written::Sent
+        self.write(frame, &[], None).await == Written::Sent
     }
 
-    /// Writes one frame, and, for a batch a subscription carries, the decision that allowed it.
+    /// Writes one frame under the time bounds it was decided under, `under`, and, for a batch a
+    /// subscription carries, the decision that allowed it.
     ///
-    /// A response answers a request that was decided when it arrived, so it is written under the
-    /// connection's own authority alone. A relayed batch is written under its decision as well, at
-    /// every point [`Self::send`] reads the connection's: after the turn, after the writer, at
+    /// A response answers a request that was decided when it arrived, under the connection's own
+    /// authority and the bounds its decision loaded, each read from its cell as it stands when the
+    /// response is written: a renewal published meanwhile lets it go, and a bound that has ended
+    /// stops it. A relayed batch is written under its decision as well. Both are read at every
+    /// point [`Self::send`] reads the connection's authority: after the turn, after the writer, at
     /// every attempt to hand bytes over, and in the watch while the write waits, which also takes
-    /// the whole decision again. A decision that stops holding before the first byte goes leaves
-    /// nothing in pieces, so the batch is decided again; once bytes are moving the connection ends
-    /// with it.
-    async fn write(&self, frame: &ControlFrame, relaying: Option<Relaying<'_>>) -> Written {
+    /// a batch's whole decision again. A decision or a bound that stops holding before the first
+    /// byte goes leaves nothing in pieces, so the frame is answered again; once bytes are moving the
+    /// connection ends with it.
+    async fn write(
+        &self,
+        frame: &ControlFrame,
+        under: &[HeldBound],
+        relaying: Option<Relaying<'_>>,
+    ) -> Written {
         let _turn = self.turn.lock().await;
         if self.has_withdrawn() {
             return Written::Withdrawn;
@@ -433,9 +491,10 @@ impl RemoteOutput {
             return Written::Withdrawn;
         }
         let decided = || {
-            relaying
-                .as_ref()
-                .is_none_or(|relaying| relaying.grant.holds(&self.authority.controller))
+            bounds_hold(&self.authority.controller, under, HeldBound::stands_at)
+                && relaying
+                    .as_ref()
+                    .is_none_or(|relaying| relaying.grant.holds(&self.authority.controller))
         };
         if !decided() {
             return Written::Undecided;
@@ -450,7 +509,7 @@ impl RemoteOutput {
             }
             admitted
         };
-        let redecide = relaying.map(|relaying| relaying.redecide);
+        let redecide = relaying.as_ref().map(|relaying| relaying.redecide);
         let written = tokio::select! {
             written = self.sink.send_while(frame, &admits) => written,
             () = self.authority_lost(&decided, redecide) => {
@@ -740,6 +799,33 @@ impl Unserved {
     }
 }
 
+/// One request of this connection's as the host decided it: what was asked, and the decision,
+/// which carries the time bounds the request stands on. What is cut from the decision ends by
+/// them, and the answer is written under them.
+#[derive(Clone, Debug)]
+struct Asked {
+    session_id: Option<SessionId>,
+    entry: &'static MethodEntry,
+    claims_geometry: bool,
+    decision: super::DeviceDecision,
+}
+
+/// The answer to one frame from the device, with the decision its request was taken under when the
+/// request got that far ([`RemoteConnection::write_answer`]).
+#[derive(Debug)]
+pub struct Answered {
+    frame: ControlFrame,
+    asked: Option<Asked>,
+}
+
+impl Answered {
+    /// The frame this answers with.
+    #[must_use]
+    pub const fn frame(&self) -> &ControlFrame {
+        &self.frame
+    }
+}
+
 /// What one authorised remote connection is serving.
 pub struct RemoteConnection {
     controller: Arc<Controller>,
@@ -785,6 +871,10 @@ impl RemoteConnection {
     ) -> Self {
         let authority = Arc::new(Authorisation {
             grant_deadline,
+            grant_expires_at_ms: match device.grant.expiry {
+                kr_protocol::grant::GrantExpiry::At { expires_at_ms } => Some(expires_at_ms.get()),
+                kr_protocol::grant::GrantExpiry::Never => None,
+            },
             controller: Arc::clone(&controller),
             device_id: device.device_id,
             devices: Arc::clone(&records.devices),
@@ -838,6 +928,16 @@ impl RemoteConnection {
             fn close(&self) {}
         }
 
+        Self::for_test_writing_to(controller, device, Box::new(Nowhere))
+    }
+
+    /// A connection for `device` that writes to `sink`, registered at the revision in force.
+    #[cfg(test)]
+    fn for_test_writing_to(
+        controller: &Arc<Controller>,
+        device: DeviceRecord,
+        sink: Box<dyn FrameSink>,
+    ) -> Self {
         let connection_id = ConnectionId::new(kr_ipc::new_uuid());
         controller.admitted_table().insert(
             connection_id,
@@ -848,6 +948,7 @@ impl RemoteConnection {
         );
         let authority = Arc::new(Authorisation {
             grant_deadline: None,
+            grant_expires_at_ms: None,
             controller: Arc::clone(controller),
             device_id: device.device_id,
             devices: Arc::clone(controller.devices()),
@@ -869,10 +970,7 @@ impl RemoteConnection {
             ),
             device,
             connection_id,
-            output: Arc::new(RemoteOutput::writing_to(
-                Box::new(Nowhere),
-                Arc::clone(&authority),
-            )),
+            output: Arc::new(RemoteOutput::writing_to(sink, Arc::clone(&authority))),
             authority,
             proxy: tokio::sync::Mutex::new(None),
             notifications,
@@ -927,10 +1025,11 @@ impl RemoteConnection {
     /// Returns `None` for a frame that does not belong on this ingress, which ends the connection:
     /// the union is closed so that a receiver can name what arrived, and naming it is only worth
     /// anything if it then refuses it.
-    pub async fn answer(&self, frame: ControlFrame) -> Option<ControlFrame> {
-        match frame {
-            ControlFrame::Request(request) => Some(self.read(&request).await),
-            ControlFrame::Mutation(mutation) => Some(self.mutate(&mutation).await),
+    pub async fn answer(&self, frame: ControlFrame) -> Option<Answered> {
+        let mut asked = None;
+        let frame = match frame {
+            ControlFrame::Request(request) => self.read_decided(&request, &mut asked).await,
+            ControlFrame::Mutation(mutation) => self.mutate_decided(&mutation, &mut asked).await,
             // A host does not call a client, and none of the daemon's own local frames belongs on
             // a network ingress. They are named rather than swept up, so a variant added later has
             // to be decided here.
@@ -961,12 +1060,131 @@ impl RemoteConnection {
             | ControlFrame::AttentionText(_)
             | ControlFrame::AttentionTextAnswer(_)
             | ControlFrame::AttentionBarrier(_)
-            | ControlFrame::AttentionBarrierAcknowledged(_) => None,
+            | ControlFrame::AttentionBarrierAcknowledged(_) => return None,
+        };
+        Some(Answered { frame, asked })
+    }
+
+    /// Writes one answer under the time bounds its request was decided under, and returns whether
+    /// the connection goes on.
+    ///
+    /// Each bound is read from its cell as it stands when the answer is written, so a renewal
+    /// published while the answer waited lets it go. When one has ended before any of the answer
+    /// went, a membership lease or an offline bound that ran out, the request is decided again as
+    /// things stand and its refusal is the answer: once a lease has lapsed every
+    /// organisation-mediated response is refused, while the transport stays connected. The
+    /// refusal is the decision's own, so a lapse the clock decided is stated only once the floor
+    /// it stood on is on record.
+    pub async fn write_answer(&self, answered: Answered) -> bool {
+        let Answered { frame, asked } = answered;
+        let Some(mut asked) = asked else {
+            return self.output.send(&frame).await;
+        };
+        let Some(request_id) = answered_request(&frame) else {
+            return self.output.send(&frame).await;
+        };
+        for _ in 0..RELAY_DECISIONS {
+            match self
+                .output
+                .write(&frame, &asked.decision.bounds(), None)
+                .await
+            {
+                Written::Sent => return true,
+                Written::Withdrawn => return false,
+                Written::Undecided => {}
+            }
+            match self.ask(asked.session_id, asked.entry, asked.claims_geometry) {
+                Ok(again) => asked = again,
+                Err(error) => return self.output.send(&failure(request_id, error)).await,
+            }
+        }
+        self.output
+            .send(&failure(request_id, authority_kept_moving()))
+            .await
+    }
+
+    /// Decides this device's request through the one intersection ([`Self::check_grant`]), and
+    /// keeps what was asked with the decision.
+    fn ask(
+        &self,
+        session_id: Option<SessionId>,
+        entry: &'static MethodEntry,
+        claims_geometry: bool,
+    ) -> std::result::Result<Asked, ProtocolError> {
+        let decision = self.check_grant(session_id, entry, claims_geometry)?;
+        Ok(Asked {
+            session_id,
+            entry,
+            claims_geometry,
+            decision,
+        })
+    }
+
+    /// When the authority `asked` was decided under runs out on the continuous clock: the earliest
+    /// of the grant's anchored deadline, its expiry in UTC, and both deadlines of every bound the
+    /// decision loaded, each UTC deadline converted at this host's reading of UTC through its
+    /// floor, the reading raising it. A copy cut from the decision ends by this.
+    ///
+    /// # Errors
+    ///
+    /// When one of them has passed already, the request is decided again and this is that
+    /// decision's refusal, so a lapse is stated only as a decision states it. A decision that
+    /// holds again, because a renewal was published while this waited, is asked again.
+    fn authority_until(
+        &self,
+        asked: &Asked,
+    ) -> std::result::Result<Option<kr_transport::clock::ContinuousInstant>, ProtocolError> {
+        let now = self.controller.clock.now();
+        let settled = self.controller.settled_utc_now();
+        let bounds = asked.decision.bounds();
+        let grant_expiry = match self.device.grant.expiry {
+            kr_protocol::grant::GrantExpiry::At { expires_at_ms } => Some(expires_at_ms.get()),
+            kr_protocol::grant::GrantExpiry::Never => None,
+        };
+        let mut until: Option<kr_transport::clock::ContinuousInstant> = None;
+        let mut passed = false;
+        let mut bound_by = |deadline: kr_transport::clock::ContinuousInstant| {
+            passed |= now >= deadline;
+            until = Some(until.map_or(deadline, |earliest| earliest.min(deadline)));
+        };
+        for deadline in self
+            .authority
+            .grant_deadline
+            .into_iter()
+            .chain(bounds.iter().filter_map(HeldBound::continuous_deadline))
+        {
+            bound_by(deadline);
+        }
+        for end in grant_expiry
+            .into_iter()
+            .chain(bounds.iter().filter_map(HeldBound::utc_deadline_ms))
+        {
+            // A deadline beyond what the continuous clock can represent bounds nothing it can
+            // measure; one at or before the reading has passed.
+            let left = end.saturating_sub(settled);
+            match now.checked_add(std::time::Duration::from_millis(left)) {
+                Some(deadline) => bound_by(deadline),
+                None if left == 0 => bound_by(now),
+                None => {}
+            }
+        }
+        if !passed {
+            return Ok(until);
+        }
+        match self.check_grant(asked.session_id, asked.entry, asked.claims_geometry) {
+            Err(refusal) => Err(refusal),
+            Ok(_) => Err(authority_kept_moving()),
         }
     }
 
-    /// Serves one read.
+    /// Serves one read, for a test that asks for no more than the answer.
+    #[cfg(test)]
     async fn read(&self, request: &Request) -> ControlFrame {
+        self.read_decided(request, &mut None).await
+    }
+
+    /// Serves one read, and keeps the decision it was taken under in `asked`.
+    async fn read_decided(&self, request: &Request, asked: &mut Option<Asked>) -> ControlFrame {
         let entry = match self.admit(request.method.as_str(), request.method_version) {
             Ok(entry) => entry,
             Err(error) => return failure(request.request_id, error),
@@ -994,9 +1212,11 @@ impl RemoteConnection {
         let named = session_of(&request.params, entry).ok();
         // A read never claims geometry: the condition on `terminal.geometry` is about a request
         // that claims or adds a claim, and only a mutation does either.
-        if let Err(error) = self.check_grant(named, entry, false) {
-            return failure(request.request_id, error);
-        }
+        let decided = match self.ask(named, entry, false) {
+            Ok(decided) => decided,
+            Err(error) => return failure(request.request_id, error),
+        };
+        *asked = Some(decided.clone());
         // The daemon's own reads are served as this device, not as the daemon: a module that keeps
         // its own subjects decides them against the actor that asked, and a read served under the
         // host's own principal would be answered about the host's own objects.
@@ -1039,11 +1259,11 @@ impl RemoteConnection {
             }
             DeviceRead::Receipt => match self.host_receipt(request).await {
                 Some(answer) => answer,
-                None => self.proxied_read(request, entry, validated).await,
+                None => self.proxied_read(request, entry, validated, &decided).await,
             },
-            DeviceRead::Worker => self.proxied_read(request, entry, validated).await,
+            DeviceRead::Worker => self.proxied_read(request, entry, validated, &decided).await,
             DeviceRead::Questions => {
-                let answer = self.proxied_read(request, entry, validated).await;
+                let answer = self.proxied_read(request, entry, validated, &decided).await;
                 self.narrow_questions(request, answer)
             }
             DeviceRead::Workflow => {
@@ -1115,8 +1335,18 @@ impl RemoteConnection {
         answer
     }
 
-    /// Serves one mutation.
+    /// Serves one mutation, for a test that asks for no more than the answer.
+    #[cfg(test)]
     async fn mutate(&self, mutation: &MutationRequest) -> ControlFrame {
+        self.mutate_decided(mutation, &mut None).await
+    }
+
+    /// Serves one mutation, and keeps the decision it was taken under in `asked`.
+    async fn mutate_decided(
+        &self,
+        mutation: &MutationRequest,
+        asked: &mut Option<Asked>,
+    ) -> ControlFrame {
         // Section 9 measures a requested lifetime from *receipt* time, so it is read here, before
         // the first thing that can wait. Everything between this and the envelope check can take
         // time — the registry's lock, a retained lookup, a worker's answer about a receipt — and
@@ -1153,14 +1383,16 @@ impl RemoteConnection {
         let actor_id = self.device.principal();
         // The rights this request was decided with: the grant as this host's policy and its
         // configured ceiling leave it. They are what the worker is told the host checked.
-        let rights = match self.check_grant(
+        let decided = match self.ask(
             mutation.target.session_id.as_ref().copied(),
             entry,
             claims_geometry(mutation),
         ) {
-            Ok(decision) => decision.decided.permitted.rights,
+            Ok(decided) => decided,
             Err(error) => return failure(mutation.request_id, error),
         };
+        *asked = Some(decided.clone());
+        let rights = decided.decision.decided.permitted.rights.clone();
         // Every store that retains an action is asked in turn, in the order the local ingress asks
         // them: the daemon's own reservations first, then the project service's own record. A
         // project mutation's receipt lives with the project service, so a retry of one that lost
@@ -1238,7 +1470,7 @@ impl RemoteConnection {
         // admitted it has expired, and answers a duplicate from a still-authorised actor from that
         // receipt without dispatching anything: so the receipt is asked for before the window is
         // considered, and a reused identifier carrying a different payload is refused here.
-        match self.retained_remotely(mutation, validated).await {
+        match self.retained_remotely(mutation, validated, &decided).await {
             Ok(Some(answered)) => {
                 return match self.admitted_to_answer(validated) {
                     Ok(()) => answered,
@@ -1263,7 +1495,7 @@ impl RemoteConnection {
             }
             Err(RouteRefusal::Conflict(error)) => return failure(mutation.request_id, error),
         }
-        let accepted = match self.check_envelope(mutation, entry, received_at) {
+        let accepted = match self.check_envelope(mutation, entry, received_at, &decided) {
             Ok(accepted) => accepted,
             Err(error) => return failure(mutation.request_id, error),
         };
@@ -2064,6 +2296,7 @@ impl RemoteConnection {
         request: &Request,
         entry: &'static MethodEntry,
         validated: AuthorityRevision,
+        asked: &Asked,
     ) -> ControlFrame {
         // A read that names its session goes to that session's worker. `action.read` names an
         // action rather than a session, and an action's receipt lives in the journal of whichever
@@ -2084,7 +2317,7 @@ impl RemoteConnection {
             Err(error) => return failure(request.request_id, error),
         };
         let envelope = self.envelope(validated);
-        let authority = match self.authority_deadline() {
+        let authority = match self.authority_deadline(asked) {
             Ok(authority) => authority,
             Err(error) => return failure(request.request_id, error),
         };
@@ -2298,6 +2531,7 @@ impl RemoteConnection {
         &self,
         mutation: &MutationRequest,
         validated: AuthorityRevision,
+        asked: &Asked,
     ) -> std::result::Result<Option<ControlFrame>, RouteRefusal> {
         let actor_id = self.device.principal();
         let Some(routed) = self
@@ -2357,7 +2591,9 @@ impl RemoteConnection {
             })?,
         };
         let envelope = self.envelope(validated);
-        let authority = self.authority_deadline().map_err(RouteRefusal::Conflict)?;
+        let authority = self
+            .authority_deadline(asked)
+            .map_err(RouteRefusal::Conflict)?;
         let Ok(response) = proxy.forward_read(&request, &envelope, authority).await else {
             // The link failed, not the lookup. The ordinary path decides what happens next.
             return Ok(None);
@@ -2454,23 +2690,24 @@ impl RemoteConnection {
         }
     }
 
-    /// Returns when the authority behind this connection's requests runs out.
+    /// The deadline a read or raw input forwarded under `asked` carries to its worker, as a
+    /// remaining duration: when the authority it was decided under runs out
+    /// ([`Self::authority_until`]), or null for authority that does not expire.
     ///
-    /// On the machine's own continuous clock, which is the clock the worker reads, and shortened
-    /// rather than lengthened by a pause between the two readings. A read carries no accepted
-    /// deadline of its own, and raw input is a read: without this, a batch admitted a moment
-    /// before the grant expired could still be written to the application after it. Null when the
-    /// grant does not expire.
+    /// # Errors
+    ///
+    /// The refusal the request is decided again to, when that authority has run out.
     fn authority_deadline(
         &self,
+        asked: &Asked,
     ) -> std::result::Result<kr_protocol::scalars::Nullable<kr_protocol::scalars::U64>, ProtocolError>
     {
-        let Some(deadline) = self.authority.grant_deadline else {
+        let Some(deadline) = self.authority_until(asked)? else {
             return Ok(kr_protocol::scalars::Nullable::null());
         };
         // Null means "this authority does not expire", so a deadline that has already passed can
-        // never be sent as null: that would forward expired authority as unlimited authority. It
-        // is a refusal instead, and this connection is fenced with it.
+        // never be sent as null: that would forward expired authority as unlimited authority. One
+        // that passed between the two readings is decided again, and refused as that decides.
         let remaining = crate::service::remaining_deadline(
             &*self.controller.shared_clock,
             &*self.controller.clock,
@@ -2478,13 +2715,9 @@ impl RemoteConnection {
             None,
         )
         .ok_or_else(|| {
-            // Nothing is left of the deadline, which is this grant having run out: the latch is
-            // set here because that is the observation, and the record follows it.
-            self.authority.expire();
-            ProtocolError::new(
-                ErrorCode::PermissionDenied,
-                "this device's grant has run out",
-            )
+            self.authority_until(asked)
+                .err()
+                .unwrap_or_else(authority_kept_moving)
         })?;
         Ok(kr_protocol::scalars::Nullable(Some(remaining)))
     }
@@ -2606,7 +2839,7 @@ impl RemoteConnection {
                 grant,
                 redecide: &redecide,
             };
-            match self.output.write(frame, Some(relaying)).await {
+            match self.output.write(frame, &[], Some(relaying)).await {
                 Written::Sent => return true,
                 Written::Undecided => {}
                 Written::Withdrawn => break,
@@ -2637,8 +2870,9 @@ impl RemoteConnection {
                 .permitted
                 .offline
                 .as_ref()
-                .and_then(crate::grants::policy::HeldBound::continuous_deadline),
+                .and_then(HeldBound::continuous_deadline),
             lapses_at_ms: decision.decided.lapses_at_ms,
+            under: decision.bounds(),
         })
     }
 
@@ -2660,6 +2894,7 @@ impl RemoteConnection {
         mutation: &MutationRequest,
         entry: &'static MethodEntry,
         received_at: kr_transport::clock::ContinuousInstant,
+        asked: &Asked,
     ) -> std::result::Result<AcceptedDeadline, ProtocolError> {
         mutation
             .target
@@ -2784,6 +3019,9 @@ impl RemoteConnection {
                 "the subject preconditions are a map of the facts the caller depends on",
             ));
         }
+        // The authority the request was decided under bounds the deadline it is accepted with, on
+        // both of each bound's clocks.
+        let authority = self.authority_until(asked)?;
         self.windows
             .accept_at(
                 &mutation.action_window_id,
@@ -2791,7 +3029,7 @@ impl RemoteConnection {
                 self.controller.boot_epoch,
                 received_at,
                 mutation.requested_ttl_ms,
-                self.authority.grant_deadline,
+                authority,
             )
             .map_err(|refusal| {
                 ProtocolError::new(ErrorCode::PermissionDenied, window_refusal_detail(refusal))
@@ -3139,6 +3377,24 @@ fn failure(request_id: RequestId, error: ProtocolError) -> ControlFrame {
         request_id,
         outcome: Outcome::Error(error),
     })
+}
+
+/// The request an answer answers, when it answers one.
+const fn answered_request(frame: &ControlFrame) -> Option<RequestId> {
+    match frame {
+        ControlFrame::Response(response) => Some(response.request_id),
+        ControlFrame::Receipt(receipt) => Some(receipt.request_id),
+        _ => None,
+    }
+}
+
+/// What a request is told when the time bounds it was decided under ran out and came back while it
+/// waited, a renewal published after a lapse: nothing was done under them, and it is asked again.
+fn authority_kept_moving() -> ProtocolError {
+    ProtocolError::new(
+        ErrorCode::ResourceUnavailable,
+        "the authority this request was decided under changed while it waited; ask again",
+    )
 }
 
 /// Returns the sentence a caller is given when a window cannot first-admit a request.
@@ -4325,7 +4581,11 @@ mod write_boundary {
     use kr_protocol::ids::{ActorId, ConnectionId, DeviceId};
     use kr_protocol::scalars::{DurationMs, Nullable};
 
+    use kr_protocol::method::Method;
+
     use super::{Authorisation, FrameSink, RelayGrant, Relaying, RemoteOutput, Written};
+    use crate::grants::organisation::testing::TestOrganisation;
+    use crate::grants::policy::{HeldBound, Stands};
     use crate::service::Controller;
 
     /// How long a test waits for a write to start waiting before it fails. A write that returns
@@ -4450,6 +4710,7 @@ mod write_boundary {
                 device_id: DeviceId::new(kr_ipc::new_uuid()),
                 connection_id,
                 grant_deadline: None,
+                grant_expires_at_ms: None,
                 expired: AtomicBool::new(false),
                 recorded: AtomicBool::new(false),
             }),
@@ -4462,6 +4723,7 @@ mod write_boundary {
             epoch: controller.authority_epoch(),
             until: None,
             lapses_at_ms: None,
+            under: Vec::new(),
         }
     }
 
@@ -4513,7 +4775,7 @@ mod write_boundary {
             redecide: &redecide,
         };
         assert_eq!(
-            output.write(&batch(), Some(relaying)).await,
+            output.write(&batch(), &[], Some(relaying)).await,
             Written::Sent,
             "with nothing moving, the batch goes"
         );
@@ -4529,7 +4791,7 @@ mod write_boundary {
             grant: decided_now(&controller),
             redecide: &redecide,
         };
-        let (written, ()) = tokio::join!(output.write(&frame, Some(relaying)), async {
+        let (written, ()) = tokio::join!(output.write(&frame, &[], Some(relaying)), async {
             stream.waited(1).await;
             lapse_the_offline_bound(&controller);
             stream.writer.add_permits(1);
@@ -4562,7 +4824,7 @@ mod write_boundary {
             grant: decided_now(&controller),
             redecide: &redecide,
         };
-        let (written, ()) = tokio::join!(output.write(&frame, Some(relaying)), async {
+        let (written, ()) = tokio::join!(output.write(&frame, &[], Some(relaying)), async {
             stream.waited(1).await;
             lapse_the_offline_bound(&controller);
         });
@@ -4591,7 +4853,7 @@ mod write_boundary {
                 grant: decided_now(&controller),
                 redecide: &redecide,
             };
-            let (written, ()) = tokio::join!(output.write(&frame, Some(relaying)), async {
+            let (written, ()) = tokio::join!(output.write(&frame, &[], Some(relaying)), async {
                 // Once for the writer, and once for the peer.
                 stream.waited(2).await;
                 lapse_the_offline_bound(&controller);
@@ -4631,10 +4893,11 @@ mod write_boundary {
                     .now()
                     .checked_add(Duration::from_millis(30)),
                 lapses_at_ms: None,
+                under: Vec::new(),
             },
             redecide: &redecide,
         };
-        let (written, ()) = tokio::join!(output.write(&frame, Some(relaying)), async {
+        let (written, ()) = tokio::join!(output.write(&frame, &[], Some(relaying)), async {
             stream.waited(1).await;
             continuous.advance(Duration::from_millis(60));
             stream.writer.add_permits(1);
@@ -4661,7 +4924,7 @@ mod write_boundary {
             grant: decided_now(&controller),
             redecide: &redecide,
         };
-        let (written, ()) = tokio::join!(output.write(&frame, Some(relaying)), async {
+        let (written, ()) = tokio::join!(output.write(&frame, &[], Some(relaying)), async {
             stream.waited(1).await;
             allowed.store(false, Ordering::Release);
         });
@@ -4697,10 +4960,11 @@ mod write_boundary {
                     epoch: controller.authority_epoch(),
                     until: None,
                     lapses_at_ms: Some(lapses_at_ms),
+                    under: Vec::new(),
                 },
                 redecide: &redecide,
             };
-            let (written, ()) = tokio::join!(output.write(&frame, Some(relaying)), async {
+            let (written, ()) = tokio::join!(output.write(&frame, &[], Some(relaying)), async {
                 stream.waited(if peer_stops_reading { 2 } else { 1 }).await;
                 // Another request is decided at a reading past the moment, which raises the floor.
                 controller
@@ -4818,6 +5082,7 @@ mod write_boundary {
                     epoch: controller.authority_epoch(),
                     until: None,
                     lapses_at_ms: Some(lapses_at_ms),
+                    under: Vec::new(),
                 },
                 redecide: &redecide,
             };
@@ -4825,7 +5090,7 @@ mod write_boundary {
             // Longer than the helper below may take to let the batch go, and far shorter than the
             // decision's write waits for the store.
             let written = async {
-                tokio::time::timeout(WAIT_BOUND * 2, output.write(&frame, Some(relaying)))
+                tokio::time::timeout(WAIT_BOUND * 2, output.write(&frame, &[], Some(relaying)))
                     .await
                     .unwrap_or_else(|_| {
                         panic!(
@@ -4914,10 +5179,11 @@ mod write_boundary {
                 epoch: controller.authority_epoch(),
                 until: None,
                 lapses_at_ms: Some(lapses_at_ms),
+                under: Vec::new(),
             },
             redecide: &redecide,
         };
-        let (written, ()) = tokio::join!(output.write(&frame, Some(relaying)), async {
+        let (written, ()) = tokio::join!(output.write(&frame, &[], Some(relaying)), async {
             stream.waited(1).await;
             // Nothing but the boundary reads the wall clock from here.
             wall.store(lapses_at_ms + 200, Ordering::SeqCst);
@@ -5010,10 +5276,11 @@ mod write_boundary {
                     .as_ref()
                     .and_then(crate::grants::policy::HeldBound::continuous_deadline),
                 lapses_at_ms: None,
+                under: Vec::new(),
             },
             redecide: &redecide,
         };
-        let (written, ()) = tokio::join!(output.write(&frame, Some(relaying)), async {
+        let (written, ()) = tokio::join!(output.write(&frame, &[], Some(relaying)), async {
             stream.waited(1).await;
             continuous.advance(Duration::from_millis(400));
             stream.writer.add_permits(1);
@@ -5033,5 +5300,426 @@ mod write_boundary {
         );
         drop(output);
         drop(controller);
+    }
+
+    /// A recording of every frame a connection hands its stream, each after the stream's own check.
+    #[derive(Debug, Default)]
+    struct Recording(std::sync::Mutex<Vec<ControlFrame>>);
+
+    impl Recording {
+        fn frames(&self) -> Vec<ControlFrame> {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+    }
+
+    impl FrameSink for Arc<Recording> {
+        fn send_while<'a>(
+            &'a self,
+            frame: &'a ControlFrame,
+            admits: &'a (dyn Fn() -> bool + Send + Sync),
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = kr_transport::Result<bool>> + Send + 'a>,
+        > {
+            Box::pin(async move {
+                if !admits() {
+                    return Ok(false);
+                }
+                self.0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(frame.clone());
+                Ok(true)
+            })
+        }
+
+        fn close(&self) {}
+    }
+
+    /// The record of the paired device a grant was issued to.
+    fn record_for(grant: &kr_protocol::grant::Grant) -> crate::service::net::devices::DeviceRecord {
+        crate::service::net::devices::DeviceRecord {
+            device_id: grant.recipient_device_id,
+            endpoint_id: kr_protocol::scalars::EndpointKey::from_bytes([7; 32]),
+            device_key_revision: kr_protocol::ids::DeviceKeyRevision::new(1),
+            authorisation: kr_protocol::scalars::AuthorisationKey::from_bytes([8; 32]),
+            stored_envelope: None,
+            notification_preview: None,
+            device_name: kr_protocol::pairing::DeviceName::new("A phone").expect("a name"),
+            platform: kr_protocol::pairing::DevicePlatform::Ios,
+            grant: grant.clone(),
+            paired_at_ms: kr_protocol::scalars::TimestampMs::new(1),
+            revoked_at_ms: None,
+            committed_invitation_id: None,
+            expired_at_ms: None,
+        }
+    }
+
+    /// A member device of a new organisation named by `byte`, bound to a lease installed at `now`,
+    /// and its grant and a connection of its own, with that connection's decision of a session
+    /// listing.
+    fn member(
+        controller: &Arc<Controller>,
+        byte: u8,
+        now: u64,
+    ) -> (
+        TestOrganisation,
+        kr_protocol::grant::Grant,
+        super::RemoteConnection,
+        super::Asked,
+    ) {
+        let organisation = TestOrganisation::new(byte, now - 60 * 60 * 1000);
+        let (grant, _) = super::super::tests::leased_member(controller, &organisation, now);
+        let connection = super::RemoteConnection::for_test(controller, record_for(&grant));
+        let asked = connection
+            .ask(None, Method::SessionList.entry(), false)
+            .expect("the lease answers for the member's grant");
+        (organisation, grant, connection, asked)
+    }
+
+    /// Runs the frame gate's check of `under` by `judge` on a thread of its own, and fails the test
+    /// when it has not answered within [`WAIT_BOUND`].
+    fn gate(
+        controller: &Arc<Controller>,
+        under: &[HeldBound],
+        judge: fn(&HeldBound, kr_transport::clock::ContinuousInstant, u64) -> Stands,
+    ) -> bool {
+        let (answer, answered) = std::sync::mpsc::channel();
+        let controller = Arc::clone(controller);
+        let under = under.to_vec();
+        std::thread::spawn(move || {
+            let _ = answer.send(super::bounds_hold(&controller, &under, judge));
+        });
+        answered
+            .recv_timeout(WAIT_BOUND)
+            .expect("the gate answers without waiting")
+    }
+
+    /// A frame gate reads one snapshot of each bound, and never waits for the writer publishing the
+    /// next. With a lease's renewal stopped after its snapshot is built and before the swap, the gate
+    /// reads the snapshot in force, which has ended; stopped after the swap, it reads the renewal. The
+    /// writer holds the policy's lock throughout, and the store is held with every write made to
+    /// wait an hour for it, so a gate that took the lock or called the store could not answer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_frame_gate_reads_one_snapshot_and_never_waits_for_its_writer() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let (continuous, wall, clocks) = super::super::tests::manual_clocks();
+        let controller = super::super::tests::daemon_on(&temp, clocks).await;
+        let now = wall.load(Ordering::SeqCst);
+        let (organisation, grant, _connection, asked) = member(&controller, 0x41, now);
+        let under = asked.decision.bounds();
+        assert!(
+            gate(&controller, &under, HeldBound::stands_at),
+            "the lease holds"
+        );
+
+        // Past the lease's end on the continuous clock, a renewal is presented.
+        continuous.advance(Duration::from_secs(15 * 60));
+        let (built, stopped) = std::sync::mpsc::channel();
+        let (swap, swapping) = std::sync::mpsc::channel::<()>();
+        let (swapped, swap_seen) = std::sync::mpsc::channel();
+        let (finish, finishing) = std::sync::mpsc::channel::<()>();
+        let writer = {
+            let controller = Arc::clone(&controller);
+            let grant = grant.clone();
+            std::thread::spawn(move || {
+                crate::grants::policy::publishing::stop_before_the_swap(move || {
+                    let _ = built.send(());
+                    let _ = swapping.recv();
+                });
+                crate::grants::policy::publishing::stop_after_the_swap(move || {
+                    let _ = swapped.send(());
+                    let _ = finishing.recv();
+                });
+                super::super::tests::renew_member(&controller, &organisation, &grant, now + 1_000)
+            })
+        };
+        stopped
+            .recv_timeout(WAIT_BOUND)
+            .expect("the renewal built its snapshot");
+        controller
+            .sharing()
+            .grants()
+            .wait_for_storage_up_to(Duration::from_secs(3_600))
+            .expect("every write waits an hour for the store");
+        let storage = rusqlite::Connection::open(temp.environment().registry_database())
+            .expect("opens the registry");
+        storage
+            .execute_batch("BEGIN IMMEDIATE;")
+            .expect("storage is held");
+
+        assert!(
+            !gate(&controller, &under, HeldBound::stands_at),
+            "before the swap the gate reads the snapshot in force, which has ended"
+        );
+        swap.send(()).expect("the writer waits");
+        swap_seen
+            .recv_timeout(WAIT_BOUND)
+            .expect("the renewal swapped its snapshot in");
+        assert!(
+            gate(&controller, &under, HeldBound::stands_at),
+            "after the swap it reads the renewal"
+        );
+        assert!(
+            !gate(&controller, &under, HeldBound::holds_as_decided),
+            "and a batch decided under the old snapshot is decided again"
+        );
+        finish.send(()).expect("the writer waits");
+        storage.execute_batch("ROLLBACK;").expect("storage is free");
+        writer
+            .join()
+            .expect("the writer ends")
+            .expect("the renewal is written down")
+            .expect("the renewal installs");
+        drop(controller);
+    }
+
+    /// A response is written under the lease its request was decided under, as the lease stands
+    /// when it is written. Held at the writer past the lease's end on the continuous clock, it is not
+    /// written, and the connection stands, because the grant has not lapsed. A renewal published
+    /// before that end lets it go.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_response_is_written_under_its_lease_as_it_stands() {
+        for renewed in [false, true] {
+            let temp = kr_ipc::testing::TempHost::create();
+            let (continuous, wall, clocks) = super::super::tests::manual_clocks();
+            let controller = super::super::tests::daemon_on(&temp, clocks).await;
+            let now = wall.load(Ordering::SeqCst);
+            let (organisation, grant, _connection, asked) = member(&controller, 0x42, now);
+            let under = asked.decision.bounds();
+            if renewed {
+                continuous.advance(Duration::from_secs(60));
+                super::super::tests::renew_member(&controller, &organisation, &grant, now + 60_000)
+                    .expect("written down")
+                    .expect("the renewal installs");
+            }
+            let stream = HeldStream::new(false);
+            let output = output(&controller, &stream);
+            let frame = batch();
+            let (written, ()) = tokio::join!(output.write(&frame, &under, None), async {
+                stream.waited(1).await;
+                // Fifteen and a half minutes after the first lease: past its end, and inside the
+                // renewal's.
+                continuous.advance(Duration::from_secs(if renewed {
+                    14 * 60 + 30
+                } else {
+                    15 * 60 + 30
+                }));
+                stream.writer.add_permits(1);
+            });
+            if renewed {
+                assert_eq!(written, Written::Sent, "the renewal lets it go");
+                assert_eq!(stream.reached(), vec![Reached::Whole]);
+            } else {
+                assert_eq!(written, Written::Undecided, "past the lease's end");
+                assert!(stream.reached().is_empty());
+                assert!(!stream.closed(), "the connection stands");
+                assert!(output.authority.has_time_left(), "the grant has not lapsed");
+            }
+            drop(controller);
+        }
+    }
+
+    /// A response is not written once this host's reading of UTC reaches its lease's signed expiry,
+    /// although the lease's continuous deadline is ahead, and the floor that reading raised is
+    /// owed its record. With the floor short of the expiry, it goes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_response_is_not_written_once_the_floor_reaches_its_leases_expiry() {
+        for reached in [false, true] {
+            let temp = kr_ipc::testing::TempHost::create();
+            let (_continuous, wall, clocks) = super::super::tests::manual_clocks();
+            let controller = super::super::tests::daemon_on(&temp, clocks).await;
+            let now = wall.load(Ordering::SeqCst);
+            let (_organisation, _grant, _connection, asked) = member(&controller, 0x43, now);
+            let under = asked.decision.bounds();
+            let expires_at_ms = under[0].utc_deadline_ms().expect("a signed expiry");
+            let stream = HeldStream::new(false);
+            let output = output(&controller, &stream);
+            let frame = batch();
+            let (written, ()) = tokio::join!(output.write(&frame, &under, None), async {
+                stream.waited(1).await;
+                controller.utc_floor().observe(if reached {
+                    expires_at_ms
+                } else {
+                    expires_at_ms - 1
+                });
+                stream.writer.add_permits(1);
+            });
+            if reached {
+                assert_eq!(written, Written::Undecided);
+                assert!(stream.reached().is_empty());
+                assert!(
+                    controller.utc_floor().is_owed(),
+                    "the lapse is owed its record"
+                );
+            } else {
+                assert_eq!(written, Written::Sent);
+                assert!(!controller.utc_floor().is_owed());
+            }
+            drop(controller);
+        }
+    }
+
+    /// A relayed batch is held to the snapshot its decision loaded: a publication in the lease's
+    /// cell has the batch decided again, although nothing ended and the epoch did not move. With
+    /// nothing published, it goes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_relayed_batch_is_decided_again_once_its_lease_publishes_anew() {
+        for published in [false, true] {
+            let temp = kr_ipc::testing::TempHost::create();
+            let (_continuous, wall, clocks) = super::super::tests::manual_clocks();
+            let controller = super::super::tests::daemon_on(&temp, clocks).await;
+            let now = wall.load(Ordering::SeqCst);
+            let (organisation, grant, _connection, asked) = member(&controller, 0x44, now);
+            let cell = super::super::tests::member_cell(&controller, &organisation, &grant);
+            let stream = HeldStream::new(false);
+            let output = output(&controller, &stream);
+            let frame = batch();
+            let redecide = || true;
+            let relaying = Relaying {
+                grant: RelayGrant {
+                    epoch: controller.authority_epoch(),
+                    until: None,
+                    lapses_at_ms: None,
+                    under: asked.decision.bounds(),
+                },
+                redecide: &redecide,
+            };
+            let (written, ()) = tokio::join!(output.write(&frame, &[], Some(relaying)), async {
+                stream.waited(1).await;
+                if published {
+                    let held = cell.load();
+                    cell.publish(
+                        held.identity,
+                        held.continuous_deadline,
+                        held.utc_deadline_ms.map(|end| end + 60_000),
+                        false,
+                    );
+                }
+                stream.writer.add_permits(1);
+            });
+            assert_eq!(
+                written,
+                if published {
+                    Written::Undecided
+                } else {
+                    Written::Sent
+                }
+            );
+            drop(controller);
+        }
+    }
+
+    /// What is cut from a decision ends by the earliest of every bound it was decided under, on
+    /// both clocks: the lease's continuous deadline, and its signed expiry converted at this host's
+    /// reading of UTC, so a request decided a second before the lease's expiry is bounded a second
+    /// out. Once one has passed, the request is decided again and refused.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_copy_ends_by_the_earliest_bound_it_was_decided_under() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let (_continuous, wall, clocks) = super::super::tests::manual_clocks();
+        let controller = super::super::tests::daemon_on(&temp, clocks).await;
+        let now = wall.load(Ordering::SeqCst);
+        let (_organisation, _grant, connection, asked) = member(&controller, 0x45, now);
+        let lease = asked.decision.bounds()[0].clone();
+        assert_eq!(
+            connection.authority_until(&asked).expect("in force"),
+            lease.continuous_deadline(),
+            "with UTC far from the expiry, the lease's continuous deadline bounds it"
+        );
+
+        let expires_at_ms = lease.utc_deadline_ms().expect("a signed expiry");
+        wall.store(expires_at_ms - 1_000, Ordering::SeqCst);
+        let bound = controller
+            .clock
+            .now()
+            .checked_add(Duration::from_millis(1_000))
+            .expect("a second out");
+        assert!(
+            connection
+                .authority_until(&asked)
+                .expect("in force")
+                .is_some_and(|until| until <= bound),
+            "a second before the expiry, a second out at most"
+        );
+
+        wall.store(expires_at_ms, Ordering::SeqCst);
+        let refused = connection
+            .authority_until(&asked)
+            .expect_err("the lease has run out in UTC");
+        assert!(
+            refused.message.contains("lease"),
+            "decided again, and refused as the lease: {refused:?}"
+        );
+        drop(controller);
+    }
+
+    /// An answer whose lease ran out before it was written is answered with the refusal its
+    /// request is decided to now, and the connection stands. With the lease live, the answer itself
+    /// goes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_answer_whose_lease_ran_out_is_answered_with_its_refusal() {
+        for lapsed in [false, true] {
+            let temp = kr_ipc::testing::TempHost::create();
+            let (continuous, wall, clocks) = super::super::tests::manual_clocks();
+            let controller = super::super::tests::daemon_on(&temp, clocks).await;
+            let now = wall.load(Ordering::SeqCst);
+            let (_organisation, grant, _connection, _asked) = member(&controller, 0x46, now);
+            let recording = Arc::new(Recording::default());
+            let connection = super::RemoteConnection::for_test_writing_to(
+                &controller,
+                record_for(&grant),
+                Box::new(Arc::clone(&recording)),
+            );
+            let answered = connection
+                .answer(ControlFrame::Request(kr_protocol::envelope::Request {
+                    request_id: kr_protocol::ids::RequestId::new(1),
+                    method: Method::SessionList.into(),
+                    method_version: kr_protocol::method::MethodVersion::V1,
+                    params: kr_protocol::envelope::ParamsValue::from_typed(
+                        &kr_protocol::session::SessionListParams {
+                            environment_id: Nullable::null(),
+                            include_closed: false,
+                        },
+                    )
+                    .expect("encodes"),
+                }))
+                .await
+                .expect("an answer");
+            assert!(
+                matches!(
+                    answered.frame(),
+                    ControlFrame::Response(kr_protocol::envelope::Response {
+                        outcome: kr_protocol::envelope::Outcome::Ok(_),
+                        ..
+                    })
+                ),
+                "the listing was answered: {:?}",
+                answered.frame()
+            );
+            if lapsed {
+                continuous.advance(Duration::from_secs(15 * 60 + 30));
+            }
+            assert!(
+                connection.write_answer(answered).await,
+                "the connection stands"
+            );
+            let written = recording.frames();
+            assert_eq!(written.len(), 1, "one answer");
+            match &written[0] {
+                ControlFrame::Response(kr_protocol::envelope::Response {
+                    outcome: kr_protocol::envelope::Outcome::Error(refusal),
+                    ..
+                }) => assert!(lapsed, "refused while the lease holds: {refusal:?}"),
+                ControlFrame::Response(kr_protocol::envelope::Response {
+                    outcome: kr_protocol::envelope::Outcome::Ok(_),
+                    ..
+                }) => assert!(!lapsed, "the listing went past the lease's end"),
+                other => panic!("not an answer: {other:?}"),
+            }
+            drop(controller);
+        }
     }
 }

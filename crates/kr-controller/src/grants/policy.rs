@@ -184,10 +184,15 @@ impl BoundCell {
         if self.0.load().states(&next) {
             return;
         }
-        self.0.store(Arc::new(BoundSnapshot {
+        let next = Arc::new(BoundSnapshot {
             version: BOUND_VERSIONS.fetch_add(1, Ordering::SeqCst),
             ..next
-        }));
+        });
+        #[cfg(test)]
+        publishing::before_the_swap();
+        self.0.store(next);
+        #[cfg(test)]
+        publishing::after_the_swap();
     }
 
     /// Ends the bound: a restrictive change dropped or withdrew it.
@@ -298,7 +303,7 @@ fn judged(snapshot: &BoundSnapshot, now: ContinuousInstant, utc_ms: u64) -> Stan
     }
 }
 
-/// Where this host's own tests stop a reader between two loads.
+/// Where this host's own tests stop a publication, or a reader between two loads.
 #[cfg(test)]
 pub(crate) mod publishing {
     use std::cell::RefCell;
@@ -306,6 +311,8 @@ pub(crate) mod publishing {
     type Hook = Box<dyn FnMut()>;
 
     thread_local! {
+        static BEFORE_THE_SWAP: RefCell<Option<Hook>> = RefCell::new(None);
+        static AFTER_THE_SWAP: RefCell<Option<Hook>> = RefCell::new(None);
         static AFTER_A_LOAD: RefCell<Option<Hook>> = RefCell::new(None);
     }
 
@@ -316,8 +323,27 @@ pub(crate) mod publishing {
         }
     }
 
+    pub(super) fn before_the_swap() {
+        run(&BEFORE_THE_SWAP);
+    }
+
+    pub(super) fn after_the_swap() {
+        run(&AFTER_THE_SWAP);
+    }
+
     pub(super) fn after_a_load() {
         run(&AFTER_A_LOAD);
+    }
+
+    /// Runs `hook` once, on this thread, the next time a publication has built its snapshot and
+    /// not yet swapped it in.
+    pub(crate) fn stop_before_the_swap(hook: impl FnMut() + 'static) {
+        BEFORE_THE_SWAP.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    /// Runs `hook` once, on this thread, the next time a publication has swapped its snapshot in.
+    pub(crate) fn stop_after_the_swap(hook: impl FnMut() + 'static) {
+        AFTER_THE_SWAP.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
     }
 
     /// Runs `hook` once, on this thread, the next time a reader has loaded a cell.
