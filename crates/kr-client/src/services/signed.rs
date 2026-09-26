@@ -1661,6 +1661,67 @@ mod tests {
         }
     }
 
+    /// KR-REQ-23.57: the service answers `INTERNAL` when it failed while it handled a request,
+    /// which it can do after it acted on it. So for a request that is not safe to send again, a
+    /// write of the authority feed or a deletion, it is an unknown outcome, which nothing sends
+    /// again. The refusal is still the service's answer, code and words. The controls: on a read,
+    /// and on a write that is safe to send again, it stays the transient failure it was.
+    #[tokio::test]
+    async fn kr_req_23_57_an_internal_failure_of_a_request_not_safe_to_repeat_leaves_its_outcome_unknown()
+     {
+        let internal = |status| ServiceHttpAnswer {
+            status,
+            body: br#"{"ok":false,"error":{"code":"INTERNAL","message":"The service failed."}}"#
+                .to_vec(),
+        };
+        for method in [Method::AuthoritySync, Method::StorageObjectDelete] {
+            for status in [500, 502, 503] {
+                let wire = Wire::answering(Ok(internal(status)));
+                let refusal = match dispatched(&service(&wire), method).await {
+                    Ok(Answer::Refused(refusal)) => refusal,
+                    other => panic!("{method:?} {status}: the service's refusal: {other:?}"),
+                };
+                assert_eq!(refusal.code(), "INTERNAL");
+                let error = refusal.into_error();
+                assert_eq!(
+                    error.code(),
+                    ErrorCode::OutcomeUnknown,
+                    "{method:?} {status}"
+                );
+                assert_eq!(
+                    error
+                        .decision(crate::retry::RequestClass::IdempotentRead)
+                        .recovery,
+                    crate::retry::Recovery::QueryOutcome,
+                    "{method:?} {status}"
+                );
+                assert!(
+                    error.to_string().contains("The service failed."),
+                    "{method:?} {status}: {error}"
+                );
+                assert_eq!(wire.requests(), 1, "{method:?} {status}: sent once");
+            }
+        }
+        for method in [
+            Method::MailboxRead,
+            Method::StorageObjectRead,
+            Method::MailboxDeliver,
+            Method::StorageUploadPart,
+            Method::SyncCompareExchange,
+        ] {
+            let wire = Wire::answering(Ok(internal(500)));
+            let error = match dispatched(&service(&wire), method).await {
+                Ok(Answer::Refused(refusal)) => refusal.into_error(),
+                other => panic!("{method:?}: the service's refusal: {other:?}"),
+            };
+            assert_eq!(
+                (error.code(), error.user_action()),
+                (ErrorCode::UpstreamUnavailable, UserAction::Wait),
+                "{method:?}"
+            );
+        }
+    }
+
     /// From the moment the transport is given a request, whatever goes wrong may have happened
     /// after the service received it: a transport that fails, and an answer this client cannot
     /// read. A refusal the service named is an answer, sent and answered.
