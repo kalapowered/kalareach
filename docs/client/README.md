@@ -292,10 +292,13 @@ anything.
   result and a call abandoned part way all leave the plan refusing to reserve again. Nobody knows
   whether the host holds a transfer for it, so uploading the same file a second time is the
   person's decision.
-- A lane has a reader of its own for as long as it lives, as a session does, which applies each
-  window the host renews the moment it arrives. So a lane that sat idle, however long and behind
-  however many keepalives, sends under the window the host renewed meanwhile rather than one that
-  expired.
+- A lane has a reader of its own for as long as it lives, as a session does. It applies each window
+  the host renews the moment it arrives, ends the lane at an answer to a call the lane never made,
+  and when it stops, a write the host is no longer reading stops with it. Which window a call
+  carries is decided by time: the host renews a window when half its validity has passed, so a call
+  carries a window the lane received less than half its validity ago, and otherwise waits for the
+  renewal. A lane whose window runs out with no renewal has lost its connection, and the upload
+  opens another.
 - `ChunkLane::read_chunk` hands back a downloaded chunk only when it is exactly the chunk
   `download.begin` described: its index, its length and its digest. Checking the whole file and
   writing it to a destination belong to whoever publishes the download.
