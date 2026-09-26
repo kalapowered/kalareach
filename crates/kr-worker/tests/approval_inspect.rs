@@ -21,7 +21,8 @@ use kr_ipc::verify::{ControllerIdentity, WorkerIdentity};
 use kr_protocol::actor::{ActorEnvelope, ActorIngress};
 use kr_protocol::agent::{
     AgentApprovalInspectParams, AgentApprovalInspectResult, AgentApprovalRespondParams,
-    AgentCapabilitiesParams, AgentMutationTarget, AgentSnapshotParams, AgentSubject,
+    AgentCapabilitiesParams, AgentMutationTarget, AgentSnapshotParams, AgentSnapshotResult,
+    AgentSubject,
 };
 use kr_protocol::broker::{
     BrokerGrant, BrokerGrants, DecodedProjection, DecodingTrust, IntegrationMode, OfferedDecision,
@@ -69,6 +70,12 @@ const DECODED_AT: TimestampMs = TimestampMs::new(3);
 
 /// The deadline the upstream put on its request: far enough ahead that answering it is possible.
 const DEADLINE: TimestampMs = TimestampMs::new(4_102_444_800_000);
+
+/// When the agent said something a grant issued later does not reach back to.
+const SAID_EARLY: TimestampMs = TimestampMs::new(1_000);
+
+/// When the agent said something later.
+const SAID_LATER: TimestampMs = TimestampMs::new(3_000);
 
 fn build() -> BuildId {
     BuildId::new("kr-test/0").expect("a build identifier")
@@ -1052,4 +1059,112 @@ async fn a_read_under_a_grant_is_refused_with_its_reason_and_the_local_owner_is_
     let record: AgentApprovalInspectResult = value.to_typed().expect("the record decodes");
     assert_eq!(record.resource_id, resource_id);
     assert_eq!(record.decoding.projection.decisions, offered());
+}
+
+/// Records two things the agent said, one early and one later, in the instance's history.
+fn converse(host: &Host) {
+    let broker = host.service.broker();
+    broker
+        .observe(instance(), "message", "said early", SAID_EARLY)
+        .expect("observed");
+    broker
+        .observe(instance(), "message", "said later", SAID_LATER)
+        .expect("observed");
+}
+
+/// The texts of a snapshot's entries, in order.
+fn said(snapshot: &AgentSnapshotResult) -> Vec<&str> {
+    snapshot
+        .entries
+        .iter()
+        .map(|entry| entry.text.as_str())
+        .collect()
+}
+
+fn snapshot_params(host: &Host) -> AgentSnapshotParams {
+    AgentSnapshotParams {
+        subject: subject(host.session_id, instance()),
+        from_node: Nullable::null(),
+    }
+}
+
+/// Section 10's history rule narrows the grant a caller acts under, and a caller the control daemon
+/// vouches for on its own local socket can act under one as well as a paired device can. An agent
+/// snapshot forwarded for such a caller is not the local owner's whole history: the grant's scope
+/// does not reach this worker with the read, so nothing the agent said reaches the caller, and the
+/// refusal says why. The local owner, forwarded under no grant or on the worker's own socket,
+/// reads the whole history as before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_snapshot_forwarded_for_a_local_caller_under_a_grant_carries_none_of_the_history() {
+    let host = host().await;
+    converse(&host);
+    let mut daemon = daemon(&host).await;
+
+    let under_a_grant = exchange(
+        &mut daemon,
+        forwarded(
+            Method::AgentSnapshot,
+            &snapshot_params(&host),
+            51,
+            local(true),
+        ),
+    )
+    .await;
+    if let Outcome::Ok(value) = &under_a_grant {
+        let snapshot: AgentSnapshotResult = value.to_typed().expect("the snapshot decodes");
+        panic!(
+            "a caller under a grant whose scope never reached the worker read the history: {:?}",
+            said(&snapshot)
+        );
+    }
+    let Outcome::Error(error) = under_a_grant else {
+        panic!("the snapshot is refused: {under_a_grant:?}");
+    };
+    assert_eq!(error.code, ErrorCode::UnsupportedCapability);
+    assert!(
+        error.message.contains("history scope"),
+        "the refusal says why: {}",
+        error.message
+    );
+    assert!(
+        !error.message.contains("said"),
+        "the refusal carries nothing of the history: {}",
+        error.message
+    );
+
+    // The local owner the daemon vouches for, acting under no grant, reads the whole history.
+    let forwarded_owner = exchange(
+        &mut daemon,
+        forwarded(
+            Method::AgentSnapshot,
+            &snapshot_params(&host),
+            52,
+            local(false),
+        ),
+    )
+    .await;
+    let Outcome::Ok(value) = forwarded_owner else {
+        panic!("the local owner reads the snapshot: {forwarded_owner:?}");
+    };
+    let snapshot: AgentSnapshotResult = value.to_typed().expect("the snapshot decodes");
+    assert_eq!(said(&snapshot), ["said early", "said later"]);
+    assert_eq!(snapshot.withheld_entries, U64::new(0));
+
+    // And so does the owner on the worker's own socket.
+    let mut owner = within(
+        "a local connection",
+        LocalClient::connect(&host.endpoint, LocalClientKind::Cli, build()),
+    )
+    .await
+    .expect("connects");
+    let value = within(
+        "the worker's answer",
+        owner.request(Method::AgentSnapshot, &snapshot_params(&host)),
+    )
+    .await
+    .expect("the worker answers")
+    .expect("the owner reads the snapshot on the worker's own socket");
+    let snapshot: AgentSnapshotResult = value.to_typed().expect("the snapshot decodes");
+    assert_eq!(said(&snapshot), ["said early", "said later"]);
+    assert_eq!(snapshot.withheld_entries, U64::new(0));
 }
