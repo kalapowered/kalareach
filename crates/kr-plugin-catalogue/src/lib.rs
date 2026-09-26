@@ -1479,14 +1479,24 @@ impl Catalogue {
             }
         }
 
-        // Everything the mirror will hold, including what it already holds, against the budget.
-        let held = store.cached_payloads()?;
+        // What this pass has seen with its own eyes, verified where it lay, before anything is
+        // counted: a copy under a payload's name is held only when its bytes are the payload's, so
+        // one of the declared size and other bytes is fetched again and counted as such. Hashing
+        // each object once a sync is the cost of the guarantee; hashing it twice is not, and the
+        // store is locked for the whole pass.
+        let mut verified_here: BTreeSet<PayloadDigest> = BTreeSet::new();
+        for (digest, (_, length)) in &wanted {
+            if store.holds_payload(*digest, *length)? {
+                verified_here.insert(*digest);
+            }
+        }
+        // Everything the mirror still has to fetch, by the sizes the generation signs: against
+        // what this synchronisation may still transfer, and against the budget, before anything
+        // is removed to make room for it.
         let needed: u64 = wanted
             .iter()
-            .filter(|(digest, _)| !held.contains_key(*digest))
+            .filter(|(digest, _)| !verified_here.contains(*digest))
             .fold(0u64, |total, (_, (_, size))| total.saturating_add(*size));
-        // What it still has to fetch, by the sizes the generation signs, against what this
-        // synchronisation may still transfer, before anything is removed to make room for it.
         verified.check_transfer(needed, "the full offline mirror")?;
         let mirror_set: BTreeSet<PayloadDigest> = wanted.keys().copied().collect();
         reclaim(
@@ -1500,14 +1510,9 @@ impl Catalogue {
             &mirror_set,
         )?;
 
-        // What this pass has seen with its own eyes, either verified where it lay or written
-        // here. Hashing each object once a sync is the cost of the guarantee; hashing it twice is
-        // not, and the store is locked for the whole pass.
-        let mut verified_here: BTreeSet<PayloadDigest> = BTreeSet::new();
         let mut fetched = 0usize;
         for (digest, (target, length)) in &wanted {
-            if store.holds_payload(*digest, *length)? {
-                verified_here.insert(*digest);
+            if verified_here.contains(digest) {
                 continue;
             }
             let ledger = ledger_of(store, enrolled, self.package_limits)?;

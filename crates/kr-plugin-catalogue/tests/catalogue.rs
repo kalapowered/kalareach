@@ -2471,6 +2471,74 @@ async fn the_transfer_limit_refuses_the_index_and_a_mirror_by_their_signed_sizes
     }
 }
 
+/// A full mirror counts a payload it holds only when the payload is intact: a copy of the declared
+/// size whose bytes are not the payload is fetched again, so it counts toward the transfer limit
+/// before anything is fetched or removed, and a limit it would pass refuses the mirror at the
+/// declared stage. Within the limit the mirror fetches it and holds it intact.
+#[tokio::test]
+async fn a_mirror_counts_a_corrupt_copy_it_holds_toward_the_transfer_limit() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let generation = Generation::build(home.path(), GenerationSpec::default()).await;
+    let mut budgets = RepositoryBudgets::defaults();
+    budgets.full_offline_mirror = true;
+    let mut catalogue = enrolled(
+        home.path(),
+        &generation,
+        budgets,
+        CapabilityCeiling::default_ceiling(),
+    )
+    .await;
+    let metered = Metered::default();
+    catalogue.set_transport(Arc::new(metered.clone()));
+    catalogue.sync(&repository()).await.expect("mirrored");
+
+    // What a synchronisation that holds every payload already transfers: its metadata and index.
+    let (before, fetches) = (metered.total(), metered.fetches("/packages/"));
+    catalogue
+        .sync(&repository())
+        .await
+        .expect("again, with every payload held");
+    assert_eq!(metered.fetches("/packages/"), fetches, "no payload fetched");
+    let again = metered.total() - before;
+
+    // One payload held at its declared size, and not its bytes.
+    let store = catalogue.store(&repository()).expect("enrolled");
+    let (digest, size) = payloads_of(&generation)
+        .into_iter()
+        .next()
+        .expect("a payload");
+    std::fs::write(
+        store.payload_path(digest),
+        vec![0u8; usize::try_from(size).expect("a size")],
+    )
+    .expect("writable");
+    assert!(!store.holds_payload(digest, size).expect("readable"));
+
+    catalogue.set_transfer_limit(again + size - 1);
+    let refusal = catalogue
+        .sync(&repository())
+        .await
+        .expect_err("the corrupt copy is fetched again, past the limit");
+    let CatalogueError::ResourceLimit(limit) = &refusal else {
+        panic!("{refusal:?}");
+    };
+    assert_eq!(limit.resource, Resource::TransferBytes);
+    assert_eq!(
+        limit.stage,
+        Stage::Declared,
+        "refused before anything is fetched"
+    );
+    assert_eq!(limit.requested, again + size);
+    assert_eq!(metered.fetches("/packages/"), fetches, "no payload fetched");
+
+    catalogue.set_transfer_limit(u64::MAX);
+    catalogue
+        .sync(&repository())
+        .await
+        .expect("within the limit");
+    assert!(store.holds_payload(digest, size).expect("readable"));
+}
+
 /// Reads the local repository, and records every address fetched with the bytes its answer
 /// delivered.
 #[derive(Clone, Debug, Default)]
@@ -2491,11 +2559,17 @@ impl Metered {
 
     /// Returns true when an address whose path holds `part` was fetched.
     fn fetched(&self, part: &str) -> bool {
+        self.fetches(part) > 0
+    }
+
+    /// Returns how many fetches were of an address whose path holds `part`.
+    fn fetches(&self, part: &str) -> usize {
         self.delivered
             .lock()
             .expect("the list")
             .iter()
-            .any(|(url, _)| url.path().contains(part))
+            .filter(|(url, _)| url.path().contains(part))
+            .count()
     }
 }
 
