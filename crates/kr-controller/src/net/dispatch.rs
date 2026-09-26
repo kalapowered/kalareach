@@ -57,7 +57,7 @@ use kr_protocol::envelope::{
 };
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::ids::{AuthorityRevision, ConnectionId, DeviceId, RequestId, SessionId};
-use kr_protocol::method::Method;
+use kr_protocol::method::{Method, MethodGroup};
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::CanonicalSet;
 use kr_protocol::session::SessionListResult;
@@ -670,9 +670,11 @@ enum DeviceRead {
     /// performed it, and the catalogue's are answered here; any other goes to the session whose
     /// journal holds it.
     Receipt,
-    /// Forwarded to the worker of the session the read names, under this device's envelope, and
-    /// answered there by the rules the worker holds a paired device's envelope to: the state
-    /// recovery reads, raw input, and the two agent reads that carry no retained history.
+    /// Forwarded to the worker of the session the read names, under this device's envelope and
+    /// with its grant's history scope, and answered there by the rules the worker holds a paired
+    /// device's envelope to: the state recovery reads, raw input, and the agent reads. The worker
+    /// holds the two that carry retained content, an agent's snapshot and an approval's record,
+    /// to that scope through section 10's shared filter.
     Worker,
     /// `question.read`: forwarded like [`Self::Worker`], and the answer narrowed to the grant's
     /// history scope ([`RemoteConnection::narrow_questions`]).
@@ -739,14 +741,15 @@ impl DeviceRead {
             | Method::HistoryPage
             | Method::InputWrite
             | Method::AgentCapabilities
-            | Method::AgentCommands => Self::Worker,
+            | Method::AgentSnapshot
+            | Method::AgentCommands
+            | Method::AgentApprovalInspect => Self::Worker,
             Method::QuestionRead => Self::Questions,
             Method::WorkflowRead => Self::Workflow,
             Method::VoiceContext | Method::VoicePrepare => Self::Voice,
             Method::PairStatus | Method::OwnerConfirmationPending => Self::Pairing,
             Method::GrantList => Self::Grants,
             Method::SessionDescribe => Self::Refused(Unserved::Description),
-            Method::AgentSnapshot => Self::Refused(Unserved::AgentHistory),
             Method::UploadStatus | Method::DownloadBegin | Method::DownloadChunk => {
                 Self::Refused(Unserved::Transfer)
             }
@@ -763,11 +766,6 @@ enum Unserved {
     /// `session.describe`. This host runs no description service, so it has no description to
     /// give anybody; the name, metadata and verified state of a session are `session.read`'s.
     Description,
-    /// `agent.snapshot`. Section 10 narrows a grant's history in one place, the shared host-side
-    /// history filter, and an agent's retained history is not one of the surfaces that filter
-    /// narrows, so answering would give a device more than its grant covers. The session's worker
-    /// refuses a forwarded snapshot for the same reason.
-    AgentHistory,
     /// `upload.status`, `download.begin` and `download.chunk`. A transfer's chunks travel on an
     /// attachment-chunk stream, a stream kind of its own with its own frame bound, and this host
     /// opens no such stream on a network connection, so no transfer with a device can complete: a
@@ -782,10 +780,6 @@ impl Unserved {
             Self::Description => {
                 "this host runs no description service, and session.read and session.list carry \
                  each session's metadata and verified state"
-            }
-            Self::AgentHistory => {
-                "the shared history filter that holds an answer to a grant's lower bound does not \
-                 reach an agent's retained history"
             }
             Self::Transfer => {
                 "a transfer's chunks travel on an attachment-chunk stream, and this host opens \
@@ -2321,7 +2315,15 @@ impl RemoteConnection {
             Ok(authority) => authority,
             Err(error) => return failure(request.request_id, error),
         };
-        match proxy.forward_read(request, &envelope, authority).await {
+        match proxy
+            .forward_read(
+                request,
+                &envelope,
+                authority,
+                Some(&self.device.grant.history),
+            )
+            .await
+        {
             Ok(response) => ControlFrame::Response(Response {
                 request_id: request.request_id,
                 outcome: response.outcome,
@@ -2594,7 +2596,15 @@ impl RemoteConnection {
         let authority = self
             .authority_deadline(asked)
             .map_err(RouteRefusal::Conflict)?;
-        let Ok(response) = proxy.forward_read(&request, &envelope, authority).await else {
+        let Ok(response) = proxy
+            .forward_read(
+                &request,
+                &envelope,
+                authority,
+                Some(&self.device.grant.history),
+            )
+            .await
+        else {
             // The link failed, not the lookup. The ordinary path decides what happens next.
             return Ok(None);
         };
@@ -3274,7 +3284,7 @@ fn claims_geometry(mutation: &MutationRequest) -> bool {
 /// request goes to and which session its grant is checked against, and parsing the whole thing
 /// here would mean two places that have to agree on every parameter of every method.
 ///
-/// A request names its session at the top of its parameters, except the three agent reads, which
+/// A request names its session at the top of its parameters, except the agent-state reads, which
 /// name the exact instance they are about as a subject that carries its session. That session is
 /// the one the worker answers for, so it is the one the grant is checked against and the request
 /// routed by; a read whose session was looked for anywhere else would be decided without one.
@@ -3291,14 +3301,13 @@ fn session_of(
     let kr_cbor::CanonicalValue::Map(map) = params.as_value() else {
         return Err(named());
     };
-    let carried = match entry.method {
-        Method::AgentCapabilities | Method::AgentSnapshot | Method::AgentCommands => {
-            match map.get("subject") {
-                Some(kr_cbor::CanonicalValue::Map(subject)) => subject.get("session_id"),
-                _ => None,
-            }
+    let carried = if entry.group == MethodGroup::AgentState {
+        match map.get("subject") {
+            Some(kr_cbor::CanonicalValue::Map(subject)) => subject.get("session_id"),
+            _ => None,
         }
-        _ => map.get("session_id"),
+    } else {
+        map.get("session_id")
     };
     let Some(kr_cbor::CanonicalValue::Bytes(bytes)) = carried else {
         return Err(named());

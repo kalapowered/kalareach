@@ -31,21 +31,35 @@ pub const MAX_RETAINED_ENTRIES: usize = 4096;
 
 /// What one actor may see of an instance's history.
 ///
-/// The shared host-side filter is not this crate's: section 23 gives every agent read a
-/// `GrantLowerBound` history filter, and one shared implementation serves every subsystem. This
-/// is the seam it plugs into, so the agent reads are written against the contract now and pick up
-/// the real filter without changing.
+/// Section 23 gives every agent read a `GrantLowerBound` history filter, and section 10 has one
+/// shared host-side implementation serve every subsystem. This is the seam it plugs into: the
+/// shared filter ([`crate::history_filter::HistoryFilter`]) decides each entry by when it was
+/// observed, on the semantic-snapshot surface.
 pub trait HistoryFilter {
     /// Returns true when this actor may see the entry at this cursor.
     fn admits(&self, cursor: StreamCursor, entry: &AgentSnapshotEntry) -> bool;
 }
 
+/// The shared host-side filter, deciding an entry by the moment it was observed.
+///
+/// A replay asks it before an entry spends any of the page's budget, so what it withholds is
+/// counted rather than paid for, and an entry is placed at its own time rather than at the time
+/// of the read.
+impl HistoryFilter for crate::history_filter::HistoryFilter {
+    fn admits(&self, _cursor: StreamCursor, entry: &AgentSnapshotEntry) -> bool {
+        self.admit_at(
+            crate::history_filter::Surface::SemanticSnapshot,
+            entry.observed_at.get(),
+        )
+        .is_ok()
+    }
+}
+
 /// A filter that admits everything from one cursor onwards.
 ///
-/// It is the lower bound a grant carries and nothing else, which is the part of the shared filter
-/// this crate can decide on its own. Everything else the real filter does is additional
-/// restriction, so an answer this one admits is a superset of the answer the real one gives, and
-/// the count of what was withheld is what tells a reader so.
+/// It decides by position in the log rather than by time, so it is not how a grant's scope is
+/// applied: that is the shared filter's, by the moment each entry was observed. It serves a reader
+/// that wants a range of the log by position.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GrantLowerBound {
     /// The earliest cursor this actor's grant reaches.
@@ -264,6 +278,71 @@ mod tests {
         // An adapter that is up to date sees no gap.
         let current = log.replay(Some(log.first_retained()), &EverythingAdmitted);
         assert!(!current.history_gap);
+    }
+
+    /// The shared filter decides each entry by the moment it was observed, before the entry spends
+    /// any of the page's budget: what it withholds before, between and after what it keeps is
+    /// counted on the page that examined it and never paid for, a withheld entry does not advance
+    /// the checkpoint, a continuation names the first kept entry that did not fit, and a page the
+    /// filter withholds wholly is an empty answer that says how much it withheld.
+    #[test]
+    fn the_shared_filter_decides_by_when_an_entry_was_observed_before_the_page_budget() {
+        use kr_protocol::grant::HistoryScope;
+        use kr_protocol::scalars::{CanonicalSet, Nullable};
+
+        use crate::history_filter::{HistoryFilter as Shared, ViewerScope};
+
+        let reaching_back_to = |bound: u64| {
+            Shared::new(ViewerScope::from_history(
+                &HistoryScope {
+                    lower_bound_ms: Nullable::some(TimestampMs::new(bound)),
+                    include_live_screen: true,
+                    named_questions: CanonicalSet::new(),
+                    named_approvals: CanonicalSet::new(),
+                },
+                true,
+            ))
+        };
+        let nodes = |replay: &Replay| {
+            replay
+                .entries
+                .iter()
+                .map(|entry| entry.node.get())
+                .collect::<Vec<_>>()
+        };
+        // Two kept entries too large to share a page, with withheld entries of the same size
+        // before and between them and a small one after, out of time order the way a clock
+        // stepped backwards leaves them.
+        let large = "x".repeat(9 * 1024 * 1024);
+        let mut log = SemanticLog::new();
+        log.append("message", large.clone(), TimestampMs::new(1_000));
+        log.append("message", large.clone(), TimestampMs::new(2_500));
+        log.append("message", large.clone(), TimestampMs::new(1_500));
+        log.append("message", large, TimestampMs::new(3_000));
+        log.append("message", "said before, last", TimestampMs::new(1_200));
+        let filter = reaching_back_to(2_000);
+
+        let first = log.replay(None, &filter);
+        assert_eq!(nodes(&first), [2]);
+        assert_eq!(first.withheld, 2, "the withheld entries this page examined");
+        assert_eq!(
+            first.consumed,
+            StreamCursor::new(2),
+            "a withheld entry does not advance the checkpoint"
+        );
+        assert!(first.continuation.is_some());
+        assert_eq!(first.resume_at, Some(StreamCursor::new(4)));
+
+        let next = log.replay(Some(StreamCursor::new(3)), &filter);
+        assert_eq!(nodes(&next), [4]);
+        assert_eq!(next.withheld, 1);
+        assert!(next.continuation.is_none());
+
+        let nothing = log.replay(None, &reaching_back_to(10_000));
+        assert!(nothing.entries.is_empty());
+        assert_eq!(nothing.withheld, 5);
+        assert_eq!(nothing.consumed, StreamCursor::new(0));
+        assert!(nothing.continuation.is_none());
     }
 
     #[test]

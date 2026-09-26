@@ -31,11 +31,14 @@
 //!
 //! A caller builds one [`ViewerScope`] from the grant the host already checked, then asks this
 //! module. Nothing constructs a scope from a role, a label or a capability: [`ViewerScope::owner`]
-//! is the local owner's own authority, and [`ViewerScope::from_grant`] is the only other way in.
+//! is the local owner's own authority, and [`ViewerScope::from_history`] is the only other way in:
+//! [`ViewerScope::from_grant`] builds on it, and a worker builds on it from the scope the control
+//! daemon sends with a forwarded read, since a worker holds no grants of its own.
 
 use std::collections::BTreeSet;
 
-use kr_protocol::grant::Grant;
+use kr_protocol::gateway::PendingState;
+use kr_protocol::grant::{Grant, HistoryScope};
 use kr_protocol::ids::{ApprovalRequestId, QuestionId};
 use kr_protocol::rights::ActionRight;
 use kr_protocol::sharing::LiveScreenPreview;
@@ -370,20 +373,33 @@ impl ViewerScope {
 
     /// The scope a grant gives its holder.
     ///
-    /// The one place a grant becomes a scope. Everything the filter decides comes from here.
+    /// The grant's history scope, with the two rights the filter reads taken from the grant
+    /// itself.
     #[must_use]
     pub fn from_grant(grant: &Grant) -> Self {
         Self {
-            lower_bound_ms: grant
-                .history
-                .lower_bound_ms
-                .as_ref()
-                .map(|bound| bound.get()),
-            include_live_screen: grant.history.include_live_screen,
-            named_questions: grant.history.named_questions.iter().copied().collect(),
-            named_approvals: grant.history.named_approvals.iter().cloned().collect(),
-            session_view: grant.permits(ActionRight::SessionView),
             files_read: grant.permits(ActionRight::FilesRead),
+            ..Self::from_history(&grant.history, grant.permits(ActionRight::SessionView))
+        }
+    }
+
+    /// The scope a grant's history scope gives, where `session_view` says whether the grant
+    /// carries `session.view`.
+    ///
+    /// The one place a history scope becomes a viewer's scope, and everything the filter decides
+    /// comes from here. A worker builds one from the scope the control daemon sends with a
+    /// forwarded read, knowing `session.view` from the rights the daemon checked for the method.
+    /// File bytes need `files.read` of their own, which a scope alone never carries, so a scope
+    /// built here reads none.
+    #[must_use]
+    pub fn from_history(history: &HistoryScope, session_view: bool) -> Self {
+        Self {
+            lower_bound_ms: history.lower_bound_ms.as_ref().map(|bound| bound.get()),
+            include_live_screen: history.include_live_screen,
+            named_questions: history.named_questions.iter().copied().collect(),
+            named_approvals: history.named_approvals.iter().cloned().collect(),
+            session_view,
+            files_read: false,
             unrestricted: false,
         }
     }
@@ -591,20 +607,28 @@ impl HistoryFilter {
             })
     }
 
-    /// Decides about one current approval request, on the same terms as a question.
+    /// Decides about one approval request, which an invitation may name while it is current.
+    ///
+    /// Section 10 permits the exact *current* decisions an invitation names, not their earlier
+    /// conversation. So a named approval is admitted however early it was recorded only while it
+    /// can still be decided, pending or claimed; once it has ended it is an old record like any
+    /// other, and the ordinary bound decides. `name` is how the viewer's grant would name this
+    /// request; a request with no name a grant can use is decided by the bound alone.
     ///
     /// # Errors
     ///
     /// Returns the reason the approval is outside this viewer's scope.
     pub fn admit_approval(
         &self,
-        approval_request_id: &ApprovalRequestId,
-        created_at_ms: u64,
+        name: Option<&ApprovalRequestId>,
+        recorded_at_ms: u64,
+        state: PendingState,
     ) -> std::result::Result<(), WithheldReason> {
-        if self.scope.named_approvals.contains(approval_request_id) && self.scope.session_view {
+        let named = name.is_some_and(|name| self.scope.named_approvals.contains(name));
+        if named && !state.is_terminal() && self.scope.session_view {
             return Ok(());
         }
-        self.admit_at(Surface::LoadedConversation, created_at_ms)
+        self.admit_at(Surface::LoadedConversation, recorded_at_ms)
             .map_err(|reason| match reason {
                 WithheldReason::BeforeHistoryBound
                 | WithheldReason::NoRetainedHistory

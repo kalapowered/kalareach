@@ -959,14 +959,23 @@ impl Broker {
     /// hold are refused with one text, so a caller that names a resource wrongly learns nothing
     /// about which of the three it named.
     ///
+    /// The record is also held to the caller's history filter, at the moment the request arrived:
+    /// section 10 admits content by when it was produced, and an interpretation written later
+    /// does not make an old request newly visible. A record the filter withholds is refused with
+    /// the same text as one this broker does not hold, so the answer does not say that a record
+    /// exists outside the caller's scope. A grant names approvals by upstream identifiers, which do
+    /// not pick out one recorded request, since two connections both call their first request
+    /// `1`, so no name a grant carries excepts a record here: the bound decides.
+    ///
     /// # Errors
     ///
-    /// Returns [`BrokerError::UnknownSubject`] for a session this worker does not serve and for a
-    /// resource the instance has no interpreted record of, and [`BrokerError::LedgerUnavailable`]
-    /// when the ledger cannot be read.
+    /// Returns [`BrokerError::UnknownSubject`] for a session this worker does not serve, for a
+    /// resource the instance has no interpreted record of and for a record the filter withholds,
+    /// and [`BrokerError::LedgerUnavailable`] when the ledger cannot be read.
     pub fn inspect_approval(
         &self,
         params: &AgentApprovalInspectParams,
+        filter: &crate::history_filter::HistoryFilter,
     ) -> Result<AgentApprovalInspectResult> {
         self.check_subject(&params.subject)?;
         let unknown = || {
@@ -984,6 +993,12 @@ impl Broker {
                 .ok_or_else(unknown)?,
         };
         if resource.application_instance_id != params.subject.application_instance_id {
+            return Err(unknown());
+        }
+        if filter
+            .admit_approval(None, resource.recorded_at.get(), resource.state)
+            .is_err()
+        {
             return Err(unknown());
         }
         let decoding = state

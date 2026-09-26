@@ -21,6 +21,7 @@ use kr_protocol::actor::ActorEnvelope;
 use kr_protocol::envelope::{
     ControlEvent, ControlFrame, MutationRequest, ParamsValue, Request, Response,
 };
+use kr_protocol::grant::HistoryScope;
 use kr_protocol::ids::{RequestId, SessionId};
 use kr_protocol::local::{
     ControllerConnectionRole, ForwardedMutation, ForwardedRequest, LocalClientKind,
@@ -182,6 +183,13 @@ pub struct WorkerProxy {
     waiters: Arc<std::sync::Mutex<Waiters>>,
     reader: tokio::task::JoinHandle<()>,
     next_request: AtomicU64,
+    /// Whether the worker said, in its answer to this link's hello, that it reads the history
+    /// scope a forwarded read carries.
+    ///
+    /// A worker survives an upgrade of this daemon, a forwarded frame is a closed schema, and a
+    /// worker ends the link a frame it cannot read arrived on. So a worker that did not say so is
+    /// sent no scope, and it refuses the reads a scope narrows by itself.
+    reads_history_scopes: bool,
 }
 
 /// Whom this link owes an answer, and whether it can still give one.
@@ -262,7 +270,9 @@ impl WorkerProxy {
             })
             .await?;
 
-        let (reader, writer, _acknowledgement) = client.into_halves();
+        let (reader, writer, acknowledgement) = client.into_halves();
+        let reads_history_scopes =
+            kr_protocol::local::reads_history_scopes(&acknowledgement.capabilities);
         let waiters: Arc<std::sync::Mutex<Waiters>> =
             Arc::new(std::sync::Mutex::new(Waiters::default()));
         let reader = tokio::spawn(read_loop(
@@ -279,6 +289,7 @@ impl WorkerProxy {
             waiters,
             reader,
             next_request: AtomicU64::new(1),
+            reads_history_scopes,
         }))
     }
 
@@ -334,6 +345,10 @@ impl WorkerProxy {
 
     /// Forwards one admitted read and returns what the worker answered.
     ///
+    /// `history` is the history scope of the grant the read was decided under, which the worker
+    /// holds what it retains to. It goes only to a worker that said, in its answer to this link's
+    /// hello, that it reads one.
+    ///
     /// # Errors
     ///
     /// As [`Self::forward_mutation`].
@@ -342,6 +357,7 @@ impl WorkerProxy {
         request: &Request,
         actor: &ActorEnvelope,
         authority_deadline_boot_ms: Nullable<U64>,
+        history: Option<&HistoryScope>,
     ) -> Result<Response> {
         let request_id = self.next_request_id();
         let mut forwarded = request.clone();
@@ -350,7 +366,7 @@ impl WorkerProxy {
             request: forwarded,
             actor: actor.clone(),
             authority_deadline_boot_ms,
-            history: None,
+            history: history.filter(|_| self.reads_history_scopes).cloned(),
         }));
         // A read is a read whichever way the worker answered it, so the marker means nothing here.
         Ok(self.call(request_id, &frame).await?.response)
