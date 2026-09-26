@@ -122,12 +122,13 @@ pub struct Executed {
     pub command: String,
 }
 
-/// What `lsof` says one process maps: its executable first, then every other text mapping.
+/// What `lsof` says one process maps: its executable, the first file it lists, with the device
+/// and inode it listed for it, then every other text mapping.
 #[derive(Clone, Debug)]
 struct Mapping {
     image: PathBuf,
-    device: u64,
-    inode: u64,
+    device: Option<u64>,
+    inode: Option<u64>,
     mapped: Vec<PathBuf>,
 }
 
@@ -616,16 +617,23 @@ impl Provenance {
         let mapping = mapping.ok_or_else(|| {
             format!("{NOT_PINNED} the image of process {pid} ({command}) could not be read while it runs")
         })?;
-        let key = (mapping.device, mapping.inode);
+        let (Some(device), Some(inode)) = (mapping.device, mapping.inode) else {
+            return Err(format!(
+                "{NOT_PINNED} the image of process {pid} ({command}), {}, was listed without its \
+                 device or inode",
+                mapping.image.display()
+            ));
+        };
+        let key = (device, inode);
         let executed = if let Some(executed) = seen.executed.get(&key) {
             executed.clone()
         } else {
             let image = resolved(&mapping.image);
             let executed = Executed {
                 image: image.display().to_string(),
-                sha256: hash_mapped(&image, mapping.device, mapping.inode)?,
-                device: mapping.device,
-                inode: mapping.inode,
+                sha256: hash_mapped(&image, device, inode)?,
+                device,
+                inode,
                 from: self.place_of(&image),
                 pid,
                 command: command.to_owned(),
@@ -739,78 +747,117 @@ fn mappings(pids: &[u32]) -> Result<BTreeMap<u32, Mapping>, String> {
         format!("{NOT_PINNED} the processes' images could not be read: lsof {why}")
     })?;
     let text = String::from_utf8_lossy(&output.stdout);
-    let mut pid = None;
-    let mut device = None;
-    let mut inode = None;
+    // Each process begins with `p`, each of its files with `f`; a file's device, inode and name
+    // follow its `f`, and any of them can be absent. The first file of a process is its
+    // executable, whatever it lacks.
+    let mut pid: Option<u32> = None;
+    let mut file: Option<(Option<u64>, Option<u64>, Option<PathBuf>)> = None;
+    let close = |pid: Option<u32>,
+                 file: Option<(Option<u64>, Option<u64>, Option<PathBuf>)>,
+                 found: &mut BTreeMap<u32, Mapping>| {
+        let (Some(pid), Some((device, inode, Some(path)))) = (pid, file) else {
+            return;
+        };
+        match found.get_mut(&pid) {
+            None => {
+                found.insert(
+                    pid,
+                    Mapping {
+                        image: path,
+                        device,
+                        inode,
+                        mapped: Vec::new(),
+                    },
+                );
+            }
+            Some(mapping) => mapping.mapped.push(path),
+        }
+    };
     for line in text.lines() {
         let (field, value) = line.split_at(line.len().min(1));
         match field {
             "p" => {
+                close(pid, file.take(), &mut found);
                 pid = value.parse::<u32>().ok();
-                device = None;
-                inode = None;
             }
-            "D" => device = u64::from_str_radix(value.trim_start_matches("0x"), 16).ok(),
-            "i" => inode = value.parse::<u64>().ok(),
-            "n" => {
-                let Some(pid) = pid else { continue };
-                let path = PathBuf::from(value);
-                match found.get_mut(&pid) {
-                    None => {
-                        if let (Some(device), Some(inode)) = (device, inode) {
-                            found.insert(
-                                pid,
-                                Mapping {
-                                    image: path,
-                                    device,
-                                    inode,
-                                    mapped: Vec::new(),
-                                },
-                            );
-                        }
-                    }
-                    Some(mapping) => mapping.mapped.push(path),
+            "f" => {
+                close(pid, file.take(), &mut found);
+                file = Some((None, None, None));
+            }
+            "D" => {
+                if let Some(file) = file.as_mut() {
+                    file.0 = u64::from_str_radix(value.trim_start_matches("0x"), 16).ok();
                 }
-                device = None;
-                inode = None;
+            }
+            "i" => {
+                if let Some(file) = file.as_mut() {
+                    file.1 = value.parse::<u64>().ok();
+                }
+            }
+            "n" => {
+                if let Some(file) = file.as_mut() {
+                    file.2 = Some(PathBuf::from(value));
+                }
             }
             _ => {}
         }
     }
+    close(pid, file.take(), &mut found);
     Ok(found)
 }
 
 /// A mapped image's SHA-256, read through one handle on the file whose device and inode the
 /// process maps, which must not change while it is read.
 fn hash_mapped(file: &Path, device: u64, inode: u64) -> Result<String, String> {
-    let (digest, held) = hash_handle(file)?;
-    if held != (device, inode) {
-        return Err(format!(
-            "{NOT_PINNED} {} is device {} inode {} now, not the device {device} inode {inode} the \
-             process maps, so what it runs cannot be hashed",
-            file.display(),
-            held.0,
-            held.1
-        ));
-    }
-    Ok(digest)
+    hash_handle(file, Some((device, inode)))
 }
 
 /// A file's SHA-256, read through one handle.
 fn hash_file(file: &Path) -> Result<String, String> {
-    hash_handle(file).map(|(digest, _)| digest)
+    hash_handle(file, None)
 }
 
-/// Reads a file through one handle, requiring its size and modification time not to change while
-/// it is read, and returns its SHA-256 with the device and inode the handle holds.
-fn hash_handle(file: &Path) -> Result<(String, (u64, u64)), String> {
-    let unreadable =
-        |error: std::io::Error| format!("{NOT_PINNED} {} cannot be read: {error}", file.display());
-    let mut handle = std::fs::File::open(file).map_err(unreadable)?;
-    let before = handle.metadata().map_err(unreadable)?;
+/// Reads a regular file through one handle and returns its SHA-256. The file is opened without
+/// waiting, so a path that has become a pipe or a device cannot hold the reader; the handle must
+/// hold a regular file, the device and inode `wanted` names when it names one, before anything is
+/// read; no more than its size is read; and its size and modification time must not change while
+/// it is read.
+fn hash_handle(file: &Path, wanted: Option<(u64, u64)>) -> Result<String, String> {
+    use rustix::fs::{Mode, OFlags};
+    let unreadable = |error: &dyn std::fmt::Display| {
+        format!("{NOT_PINNED} {} cannot be read: {error}", file.display())
+    };
+    let descriptor = rustix::fs::open(
+        file,
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC | OFlags::NOCTTY,
+        Mode::empty(),
+    )
+    .map_err(|error| unreadable(&error))?;
+    let handle = std::fs::File::from(descriptor);
+    let before = handle.metadata().map_err(|error| unreadable(&error))?;
+    if !before.file_type().is_file() {
+        return Err(format!(
+            "{NOT_PINNED} {} is not a regular file, so what it holds cannot be hashed",
+            file.display()
+        ));
+    }
+    if let Some((device, inode)) = wanted
+        && (before.dev(), before.ino()) != (device, inode)
+    {
+        return Err(format!(
+            "{NOT_PINNED} {} is device {} inode {} now, not the device {device} inode {inode} the \
+             process maps, so what it runs cannot be hashed",
+            file.display(),
+            before.dev(),
+            before.ino()
+        ));
+    }
     let mut bytes = Vec::with_capacity(usize::try_from(before.len()).unwrap_or(0));
-    handle.read_to_end(&mut bytes).map_err(unreadable)?;
-    let after = handle.metadata().map_err(unreadable)?;
+    (&handle)
+        .take(before.len().saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| unreadable(&error))?;
+    let after = handle.metadata().map_err(|error| unreadable(&error))?;
     if u64::try_from(bytes.len()).ok() != Some(before.len())
         || after.len() != before.len()
         || after.mtime() != before.mtime()
@@ -821,11 +868,10 @@ fn hash_handle(file: &Path) -> Result<(String, (u64, u64)), String> {
             file.display()
         ));
     }
-    let digest: String = kr_cbor::sha256(&bytes)
+    Ok(kr_cbor::sha256(&bytes)
         .iter()
         .map(|byte| format!("{byte:02x}"))
-        .collect();
-    Ok((digest, (before.dev(), before.ino())))
+        .collect())
 }
 
 /// Where a runtime's installation lies: the directory above the one its executable is in, with

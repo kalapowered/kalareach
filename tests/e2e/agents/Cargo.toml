@@ -30,8 +30,8 @@ serde_json.workspace = true
 tokio.workspace = true
 
 [target.'cfg(unix)'.dependencies]
-# Signals by recorded process.
-rustix = { workspace = true, features = ["process"] }
+# Signals by recorded process, and opening a mapped file without waiting on it.
+rustix = { workspace = true, features = ["fs", "process"] }
 
 [lints]
 workspace = true
