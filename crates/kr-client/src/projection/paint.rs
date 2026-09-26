@@ -750,71 +750,17 @@ impl<'a> Writer<'a> {
 
     /// Draws one run, returning whether any of it lay outside the window.
     fn run(&mut self, run: &CellRun, line: u32) -> bool {
-        let start = run.column.get();
-        let cells = run.cells.get();
-        let end = start.saturating_add(cells);
-        let left = self.window.left_column;
-        let right = left.saturating_add(u64::from(self.window.columns));
-        if end <= left || start >= right {
-            self.comparison.cells_clipped = self.comparison.cells_clipped.saturating_add(cells);
-            return true;
-        }
-        let clipped = start < left || end > right;
-        if clipped {
-            let outside = left.saturating_sub(start) + end.saturating_sub(right);
-            self.comparison.cells_clipped = self.comparison.cells_clipped.saturating_add(outside);
-        }
-
-        // The width the profile's pinned model gives this text, against the cell span the session
-        // says it occupies. A disagreement means the text cannot be placed at canonical positions,
-        // and drawing it anyway is what would move everything after it.
-        let measured = unicode::cells_for(&run.text) as u64;
-        let mut painted: Vec<(String, u64, u64)> = Vec::new();
-        if measured == cells {
-            let mut column = start;
-            for cluster in clusters(&run.text) {
-                let cluster_end = column.saturating_add(cluster.cells);
-                if cluster.cells == 0 {
-                    // A cluster of no cells belongs to a cell that is already on the screen, and a
-                    // projection has no way to say "add this to what is there". It is counted
-                    // rather than written where a destination would attach it to a neighbour.
-                    self.comparison.clusters_replaced += 1;
-                    continue;
-                }
-                if cluster_end <= left || column >= right {
-                    column = cluster_end;
-                    continue;
-                }
-                if column < left || cluster_end > right {
-                    // The window's edge falls inside this cluster. Half a wide character is not a
-                    // narrower character: the destination would place it somewhere of its own
-                    // choosing. A space for each cell of it that is inside keeps every later cell
-                    // on its own column.
-                    let inside = cluster_end.min(right).saturating_sub(column.max(left));
-                    self.comparison.clusters_replaced += 1;
-                    painted.push((
-                        " ".repeat(usize::try_from(inside).unwrap_or(0)),
-                        column.max(left),
-                        inside,
-                    ));
-                } else {
-                    painted.push((cluster.text.to_owned(), column, cluster.cells));
-                }
-                column = cluster_end;
-            }
-        } else {
-            // Replaced, not dropped: the cells still belong to this run, and leaving them empty
-            // would let the next run's absolute address be the only thing holding the row together.
+        let placement = place(run, self.window);
+        self.comparison.cells_clipped = self
+            .comparison
+            .cells_clipped
+            .saturating_add(placement.cells_clipped);
+        if placement.run_replaced {
             self.comparison.runs_replaced += 1;
-            let inside = end.min(right).saturating_sub(start.max(left));
-            painted.push((
-                " ".repeat(usize::try_from(inside).unwrap_or(0)),
-                start.max(left),
-                inside,
-            ));
         }
-        if painted.is_empty() {
-            return clipped;
+        self.comparison.clusters_replaced += placement.clusters_replaced;
+        if placement.pieces.is_empty() {
+            return placement.clipped;
         }
 
         self.rendition(run.rendition);
@@ -834,24 +780,26 @@ impl<'a> Writer<'a> {
         // next placement is made rather than assumed. Plain single-cell ASCII is the one advance
         // every terminal agrees about, so a span of it costs one placement and not one per cell.
         let mut believed: Option<u64> = None;
-        for (text, column, cells) in painted {
+        for Placed {
+            text,
+            column,
+            cells,
+        } in placement.pieces
+        {
             if believed != Some(column) {
                 let Some(destination) = self.window_column(column) else {
                     continue;
                 };
                 self.place(line, destination);
             }
-            // Filtered by scalar, never by byte: a continuation byte of a multi-byte scalar
-            // shares its numeric range with the C1 controls, and a byte filter would take the
-            // second half of every non-ASCII character.
-            for scalar in text.chars().filter(|scalar| !scalar.is_control()) {
+            for scalar in drawable(&text) {
                 let mut buffer = [0_u8; 4];
                 self.out
                     .extend_from_slice(scalar.encode_utf8(&mut buffer).as_bytes());
             }
             believed = predictable(&text).then(|| column.saturating_add(cells));
         }
-        clipped
+        placement.clipped
     }
 
     fn cursor(&mut self, region: Option<Region>) {
@@ -1057,6 +1005,123 @@ impl<'a> Writer<'a> {
     }
 }
 
+/// One piece of a run, at the canonical column a destination draws it in.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Placed {
+    /// The text as the run holds it. [`drawable`] is what a destination is given of it.
+    pub text: String,
+    /// The canonical column of its first cell.
+    pub column: u64,
+    /// How many cells it occupies.
+    pub cells: u64,
+}
+
+/// Where one run's text goes inside a window, and what could not go there.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Placement {
+    /// The pieces inside the window, left to right: one per cluster, or one blank piece for a run
+    /// whose text could not be placed.
+    pub pieces: Vec<Placed>,
+    /// Whether any of the run lay outside the window.
+    pub clipped: bool,
+    /// How many of the run's cells lie outside the window.
+    pub cells_clipped: u64,
+    /// Whether the run's text disagreed with its cell span, so its cells inside the window are
+    /// blank.
+    pub run_replaced: bool,
+    /// Clusters the window's edge cut, and marks with no base of their own: none of them drawn.
+    pub clusters_replaced: usize,
+}
+
+/// Places one run inside a window, the way this renderer draws it into every destination.
+///
+/// This is the renderer's own rule, shared so that a client drawing a held screen by other means
+/// puts every canonical cell where a terminal painted by [`install`] and [`update`] has it. Each
+/// cluster goes at its own column. A run whose text the pinned model measures at another width
+/// than its cell span is replaced by blank cells, because text that cannot be placed at canonical
+/// positions would move everything after it. A cluster the window's edge cuts is blank for each of
+/// its cells inside, and a cluster of no cells is counted and not drawn.
+#[must_use]
+pub fn place(run: &CellRun, window: Window) -> Placement {
+    let start = run.column.get();
+    let cells = run.cells.get();
+    let end = start.saturating_add(cells);
+    let left = window.left_column;
+    let right = left.saturating_add(u64::from(window.columns));
+    let mut placement = Placement::default();
+    if end <= left || start >= right {
+        placement.clipped = true;
+        placement.cells_clipped = cells;
+        return placement;
+    }
+    placement.clipped = start < left || end > right;
+    if placement.clipped {
+        placement.cells_clipped = left.saturating_sub(start) + end.saturating_sub(right);
+    }
+
+    // The width the profile's pinned model gives this text, against the cell span the session
+    // says it occupies. A disagreement means the text cannot be placed at canonical positions,
+    // and drawing it anyway is what would move everything after it.
+    let measured = unicode::cells_for(&run.text) as u64;
+    if measured == cells {
+        let mut column = start;
+        for cluster in clusters(&run.text) {
+            let cluster_end = column.saturating_add(cluster.cells);
+            if cluster.cells == 0 {
+                // A cluster of no cells belongs to a cell that is already on the screen, and a
+                // projection has no way to say "add this to what is there". It is counted rather
+                // than written where a destination would attach it to a neighbour.
+                placement.clusters_replaced += 1;
+                continue;
+            }
+            if cluster_end <= left || column >= right {
+                column = cluster_end;
+                continue;
+            }
+            if column < left || cluster_end > right {
+                // The window's edge falls inside this cluster. Half a wide character is not a
+                // narrower character: the destination would place it somewhere of its own
+                // choosing. A space for each cell of it that is inside keeps every later cell on
+                // its own column.
+                let inside = cluster_end.min(right).saturating_sub(column.max(left));
+                placement.clusters_replaced += 1;
+                placement.pieces.push(Placed {
+                    text: " ".repeat(usize::try_from(inside).unwrap_or(0)),
+                    column: column.max(left),
+                    cells: inside,
+                });
+            } else {
+                placement.pieces.push(Placed {
+                    text: cluster.text.to_owned(),
+                    column,
+                    cells: cluster.cells,
+                });
+            }
+            column = cluster_end;
+        }
+    } else {
+        // Replaced, not dropped: the cells still belong to this run, and leaving them empty would
+        // let the next run's absolute address be the only thing holding the row together.
+        placement.run_replaced = true;
+        let inside = end.min(right).saturating_sub(start.max(left));
+        placement.pieces.push(Placed {
+            text: " ".repeat(usize::try_from(inside).unwrap_or(0)),
+            column: start.max(left),
+            cells: inside,
+        });
+    }
+    placement
+}
+
+/// The text a destination is given of a piece: every scalar but the control characters.
+///
+/// Filtered by scalar, never by byte: a continuation byte of a multi-byte scalar shares its
+/// numeric range with the C1 controls, and a byte filter would take the second half of every
+/// non-ASCII character.
+pub fn drawable(text: &str) -> impl Iterator<Item = char> + '_ {
+    text.chars().filter(|scalar| !scalar.is_control())
+}
+
 /// Whether every terminal will advance by exactly this text's own cell count.
 ///
 /// Plain ASCII of one cell each: no terminal disagrees about those. Anything else may be clustered
@@ -1160,6 +1225,106 @@ pub fn row_encodes_exactly(row: &ProjectedRow) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn run_of(column: u64, cells: u64, text: &str) -> CellRun {
+        CellRun {
+            column: kr_protocol::scalars::U64::new(column),
+            cells: kr_protocol::scalars::U64::new(cells),
+            text: text.to_owned(),
+            rendition: CellRendition::PLAIN,
+            hyperlink: kr_protocol::scalars::Nullable::null(),
+        }
+    }
+
+    fn window(left_column: u64, columns: u32) -> Window {
+        Window {
+            top_row: 0,
+            left_column,
+            rows: 1,
+            columns,
+        }
+    }
+
+    fn pieces(placement: &Placement) -> Vec<(&str, u64, u64)> {
+        placement
+            .pieces
+            .iter()
+            .map(|piece| (piece.text.as_str(), piece.column, piece.cells))
+            .collect()
+    }
+
+    /// KR-REQ-08.40: each cluster of a run is placed at its own canonical column, whatever its
+    /// width, so a destination that measures one of them differently moves nothing after it.
+    #[test]
+    fn a_run_of_mixed_widths_places_each_cluster_at_its_own_column() {
+        let placement = place(&run_of(3, 5, "a\u{4e2d}b\u{301}c"), window(0, 20));
+        assert_eq!(
+            pieces(&placement),
+            vec![
+                ("a", 3, 1),
+                ("\u{4e2d}", 4, 2),
+                ("b\u{301}", 6, 1),
+                ("c", 7, 1)
+            ]
+        );
+        assert!(!placement.clipped);
+        assert!(!placement.run_replaced);
+        assert_eq!(placement.clusters_replaced, 0);
+        assert_eq!(placement.cells_clipped, 0);
+    }
+
+    /// A run whose text the pinned model measures at another width than its cells is replaced by
+    /// blank cells, counted, rather than drawn somewhere else.
+    #[test]
+    fn a_run_whose_text_disagrees_with_its_cells_is_blank_and_counted() {
+        let placement = place(&run_of(2, 5, "abc"), window(0, 20));
+        assert_eq!(pieces(&placement), vec![("     ", 2, 5)]);
+        assert!(placement.run_replaced);
+    }
+
+    /// A mark with no base in its run occupies no cell and becomes no piece, and it is counted.
+    #[test]
+    fn a_cluster_of_no_cells_is_counted_and_produces_no_piece() {
+        let placement = place(&run_of(0, 2, "\u{301}xy"), window(0, 20));
+        assert_eq!(pieces(&placement), vec![("x", 0, 1), ("y", 1, 1)]);
+        assert_eq!(placement.clusters_replaced, 1);
+        assert!(!placement.run_replaced);
+    }
+
+    /// A wide cluster the window's edge cuts becomes a blank cell for each of its cells inside the
+    /// window, at either edge, and the cells outside are counted.
+    #[test]
+    fn a_wide_cluster_cut_by_the_windows_edge_is_blank_inside_it() {
+        let left = place(&run_of(0, 4, "\u{4e2d}\u{4e2d}"), window(1, 3));
+        assert_eq!(pieces(&left), vec![(" ", 1, 1), ("\u{4e2d}", 2, 2)]);
+        assert_eq!(left.clusters_replaced, 1);
+        assert_eq!(left.cells_clipped, 1);
+        assert!(left.clipped);
+
+        let right = place(&run_of(1, 3, "a\u{4e2d}"), window(0, 3));
+        assert_eq!(pieces(&right), vec![("a", 1, 1), (" ", 2, 1)]);
+        assert_eq!(right.clusters_replaced, 1);
+        assert_eq!(right.cells_clipped, 1);
+    }
+
+    /// A run wholly outside the window is clipped and nothing else: its text is not measured, so
+    /// a disagreement there is not counted as a replacement.
+    #[test]
+    fn a_run_outside_the_window_is_clipped_and_not_measured() {
+        let placement = place(&run_of(12, 4, "far away"), window(0, 10));
+        assert!(placement.pieces.is_empty());
+        assert!(placement.clipped);
+        assert_eq!(placement.cells_clipped, 4);
+        assert!(!placement.run_replaced);
+    }
+
+    /// The text a destination is given has no control character in it, filtered by scalar so that
+    /// a multi-byte scalar is never cut.
+    #[test]
+    fn drawable_text_keeps_every_scalar_but_the_controls() {
+        let drawn: String = drawable("a\u{7}\u{e9}\u{9b}b\u{1b}c").collect();
+        assert_eq!(drawn, "a\u{e9}bc");
+    }
 
     #[test]
     fn a_cluster_keeps_its_combining_marks() {
