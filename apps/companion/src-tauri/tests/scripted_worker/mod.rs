@@ -705,3 +705,148 @@ pub async fn screen(
     )
     .await;
 }
+
+/// A screen of a session with the view's window placed on it: what the host installs for a window
+/// a report moved, or one the session's own change put somewhere.
+#[derive(Clone, Copy, Debug)]
+pub struct Frame {
+    /// The projection's generation and the output cursor it stands at.
+    pub generation: u64,
+    pub cursor: u64,
+    /// The revision of the view's window this screen is drawn for.
+    pub revision: u64,
+    /// The session's size.
+    pub columns: u64,
+    pub rows: u64,
+    /// The window's size.
+    pub window_columns: u64,
+    pub window_rows: u64,
+    /// The row the window starts at.
+    pub top_row: u64,
+    /// The live screen's first row.
+    pub live_top: u64,
+    /// The first column the window shows.
+    pub column: u64,
+    /// The oldest row the session still keeps.
+    pub oldest: u64,
+    /// Which buffer is showing.
+    pub buffer: ProjectedBuffer,
+}
+
+impl Frame {
+    /// A window of `window` columns and rows on a session of `session`, at the live screen's first
+    /// line and column, drawn for revision 0, with `history` rows kept above the live screen.
+    pub fn live(session: (u64, u64), window: (u64, u64), history: u64) -> Self {
+        Self {
+            generation: 1,
+            cursor: 40,
+            revision: 0,
+            columns: session.0,
+            rows: session.1,
+            window_columns: window.0.min(session.0),
+            window_rows: window.1.min(session.1),
+            top_row: history,
+            live_top: history,
+            column: 0,
+            oldest: 0,
+            buffer: ProjectedBuffer::Primary,
+        }
+    }
+
+    /// The same session, the window at line `line` of the live screen and column `column`.
+    pub fn at(self, line: u64, column: u64) -> Self {
+        Self {
+            top_row: self.live_top + line,
+            column,
+            ..self
+        }
+    }
+
+    /// The same session, the window starting at history row `row` and column `column`.
+    pub fn in_history(self, row: u64, column: u64) -> Self {
+        Self {
+            top_row: row,
+            column,
+            ..self
+        }
+    }
+
+    /// The same window, drawn for `revision`.
+    pub fn revision(self, revision: u64) -> Self {
+        Self { revision, ..self }
+    }
+
+    /// The window as the header and an update carry it.
+    pub fn viewport(&self) -> ProjectedViewport {
+        ProjectedViewport {
+            top_row: U64::new(self.top_row),
+            screen_top_row: U64::new(self.live_top),
+            rows: U64::new(self.window_rows),
+            left_column: U64::new(self.column),
+            columns: U64::new(self.window_columns),
+        }
+    }
+
+    /// The window's rows, each the letters of the alphabet across the session's width and named by
+    /// its own row, so what a view draws says which rows and columns its window holds.
+    pub fn rows(&self) -> Vec<ProjectedRow> {
+        (self.top_row..self.top_row + self.window_rows)
+            .map(|id| {
+                let text: String = (0..self.columns)
+                    .map(|column| char::from(b'a' + u8::try_from(column % 26).unwrap_or(0)))
+                    .collect();
+                row(id, &text)
+            })
+            .collect()
+    }
+}
+
+/// Pushes `frame` as a subscription or a reinstallation opens: its reset, its header and one page
+/// of its window's rows.
+pub async fn frame(link: &mut Link, frame: &Frame) {
+    link.push(
+        kr_protocol::projection::PROJECTION_RESET_EVENT,
+        &reset(
+            frame.generation,
+            frame.cursor,
+            ProjectionResetReason::Attached,
+            frame.revision,
+        ),
+    )
+    .await;
+    let mut header = snapshot(
+        frame.generation,
+        frame.cursor,
+        frame.columns,
+        frame.rows,
+        frame.top_row,
+        frame.revision,
+    );
+    header.viewport = frame.viewport();
+    header.active_buffer = frame.buffer;
+    header.oldest_retained_row = U64::new(frame.oldest);
+    link.push(kr_protocol::projection::PROJECTION_SNAPSHOT_EVENT, &header)
+        .await;
+    let mut rows = page(frame.generation, frame.cursor, frame.rows(), false);
+    rows.buffer = frame.buffer;
+    rows.oldest_retained_row = U64::new(frame.oldest);
+    link.push(kr_protocol::projection::PROJECTION_ROWS_EVENT, &rows)
+        .await;
+}
+
+/// An update from `base` to `next` that leaves `frame`'s window as it is and rewrites no row.
+pub fn frame_delta(frame: &Frame, base: u64, next: u64) -> ProjectionDelta {
+    let mut update = delta(
+        frame.generation,
+        base,
+        next,
+        1,
+        1,
+        frame.top_row,
+        Vec::new(),
+    );
+    update.viewport = frame.viewport();
+    update.buffer = frame.buffer;
+    update.oldest_retained_row = U64::new(frame.oldest);
+    update
+}

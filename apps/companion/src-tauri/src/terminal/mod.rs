@@ -14,10 +14,12 @@
 //! | --- | --- |
 //! | [`self`] | The views each page holds open, and the rule that ends them when the page loads again |
 //! | [`screen`] | The shape the page draws: a view's state, its screen, lines and pieces |
-//! | `view` | One view's task: the link, the attachment, the projection and the size reports |
+//! | `view` | One view's task: the link, the attachment, the projection and the reports |
+//! | `window` | Where a view's window is, the moves the page makes and the reports they owe |
 
 pub mod screen;
 mod view;
+mod window;
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -28,6 +30,7 @@ use kr_protocol::ids::SessionId;
 use kr_protocol::session::Dimensions;
 
 pub use screen::TerminalViewState;
+pub use window::Move;
 
 /// Where the host's session descriptors are, found when a view opens.
 ///
@@ -128,6 +131,16 @@ impl TerminalViews {
         };
         if let Some(entry) = self.lock().get(&id) {
             let _ = entry.commands.send(view::Command::Resize(dimensions));
+        }
+    }
+
+    /// Tells a view the page moved its window. A view that has ended takes nothing.
+    pub fn move_window(&self, view: &str, asked: Move) {
+        let Ok(id) = view.parse::<u64>() else {
+            return;
+        };
+        if let Some(entry) = self.lock().get(&id) {
+            let _ = entry.commands.send(view::Command::Move(asked));
         }
     }
 

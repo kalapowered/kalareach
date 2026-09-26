@@ -26,6 +26,8 @@ pub enum TerminalViewState {
     Waiting {
         /// The attachment, as the host summarised it when the view attached.
         attachment: AttachmentSummary,
+        /// The newest of the page's moves it may take as settled.
+        settled: u64,
     },
     /// Attached, with a complete screen.
     Showing {
@@ -33,6 +35,8 @@ pub enum TerminalViewState {
         attachment: AttachmentSummary,
         /// The part of the screen the view shows.
         screen: TerminalScreen,
+        /// The newest of the page's moves it may take as settled.
+        settled: u64,
     },
     /// The view has ended, and why, in the host's words or the link's.
     Ended {
@@ -46,8 +50,10 @@ pub enum TerminalViewState {
 pub struct TerminalScreen {
     /// The session's own size.
     pub dimensions: Dimensions,
-    /// The size of the window the host drew for this view, from the live screen's top left.
-    pub window: WindowSize,
+    /// The window the host drew for this view: its size, and where it starts.
+    pub window: Window,
+    /// How far the window can still move each way.
+    pub room: Room,
     /// Exactly the window's rows, top to bottom.
     pub lines: Vec<TerminalLine>,
     /// The cursor, or nothing when it is outside the window.
@@ -60,13 +66,32 @@ pub struct TerminalScreen {
     pub replaced: u64,
 }
 
-/// A window's size, in cells.
+/// The window the host drew for a view: its size in cells, and where it starts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-pub struct WindowSize {
+pub struct Window {
     /// How many rows it shows.
     pub rows: u32,
     /// How many columns it shows.
     pub columns: u32,
+    /// The first canonical column it shows.
+    pub column: u64,
+    /// The line of the live screen it starts at; 0 in the history.
+    pub line: u64,
+    /// How many rows above the live screen's first line it starts; 0 on the live screen.
+    pub above: u64,
+}
+
+/// How many cells a window can still move each way before it reaches a limit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct Room {
+    /// Rows up, back into the history.
+    pub up: u64,
+    /// Rows down, as far as the live screen's last line that still fills the window.
+    pub down: u64,
+    /// Columns to the left.
+    pub left: u64,
+    /// Columns to the right, as far as the last that still fills the window.
+    pub right: u64,
 }
 
 /// One line of the window.
@@ -170,15 +195,49 @@ pub fn of(screen: &Screen) -> TerminalScreen {
             line
         })
         .collect();
+    let (window, room) = placed(screen, top, rows, left, columns);
     TerminalScreen {
         dimensions: screen.dimensions,
-        window: WindowSize { rows, columns },
+        window,
+        room,
         lines,
         cursor: cursor(screen, top, rows, left, columns),
         palette: screen.palette.clone(),
         degraded: screen.degraded,
         replaced,
     }
+}
+
+/// Where a window of `rows` by `columns` starting at row `top` and column `left` is on `screen`, and
+/// how far it can still move: up to the oldest row the session keeps, down to the live screen's
+/// last line that still fills the window, and across to the last column that still fills it.
+fn placed(screen: &Screen, top: u64, rows: u32, left: u64, columns: u32) -> (Window, Room) {
+    let live_top = screen.viewport.screen_top_row.get();
+    let (line, above) = if top >= live_top {
+        (top - live_top, 0)
+    } else {
+        (0, live_top - top)
+    };
+    let canonical_rows = screen.dimensions.rows.get();
+    let canonical_columns = screen.dimensions.columns.get();
+    let last_top =
+        live_top.saturating_add(canonical_rows.saturating_sub(u64::from(rows).min(canonical_rows)));
+    let last_column = canonical_columns.saturating_sub(u64::from(columns).min(canonical_columns));
+    (
+        Window {
+            rows,
+            columns,
+            column: left,
+            line,
+            above,
+        },
+        Room {
+            up: top.saturating_sub(screen.oldest_retained_row),
+            down: last_top.saturating_sub(top),
+            left,
+            right: last_column.saturating_sub(left),
+        },
+    )
 }
 
 /// Places one run on a desktop: the client library's renderer's own rule, and its control filter.
@@ -354,18 +413,22 @@ fn cursor(screen: &Screen, top: u64, rows: u32, left: u64, columns: u32) -> Opti
     })
 }
 
-/// The state a view is in while it holds `screen`, or waits for one.
+/// The state a view is in while it holds `screen`, or waits for one, with the newest of the page's
+/// moves it may take as settled.
 pub(crate) fn state_of(
     attachment: &AttachmentSummary,
     screen: Option<&Screen>,
+    settled: u64,
 ) -> TerminalViewState {
     match screen {
         Some(screen) => TerminalViewState::Showing {
             attachment: attachment.clone(),
             screen: of(screen),
+            settled,
         },
         None => TerminalViewState::Waiting {
             attachment: attachment.clone(),
+            settled,
         },
     }
 }

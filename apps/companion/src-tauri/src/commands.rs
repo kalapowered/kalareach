@@ -49,9 +49,10 @@ pub const NAMED_COMMANDS: &[(&str, Option<Method>)] = &[
     ("session_create", Some(Method::SessionCreate)),
     ("session_close", Some(Method::SessionClose)),
     // The raw terminal view. Its attachment is made on the session's own worker, from native
-    // code: the page names a session and a size, never a method.
+    // code: the page names a session, a size and the moves it makes, never a method.
     ("terminal_view_open", None),
     ("terminal_view_resize", None),
+    ("terminal_view_move", None),
     ("terminal_view_close", None),
     // Input.
     ("input_acquire", Some(Method::InputAcquire)),
@@ -148,8 +149,9 @@ pub const NATIVE_METHODS: &[(&str, &[Method])] = &[
             Method::OwnerConfirmationComplete,
         ],
     ),
-    // A view attaches, subscribes, reports its size and detaches on the session's worker. The
-    // page supplies a session and a grid; what reaches the worker is built here.
+    // A view attaches, subscribes, reports its size and its window's place and detaches on the
+    // session's worker. The page supplies a session, a grid and its moves; what reaches the worker
+    // is built here.
     (
         "terminal_view_open",
         &[
@@ -160,6 +162,7 @@ pub const NATIVE_METHODS: &[(&str, &[Method])] = &[
         ],
     ),
     ("terminal_view_resize", &[Method::AttachmentViewport]),
+    ("terminal_view_move", &[Method::AttachmentViewport]),
     ("terminal_view_close", &[Method::SessionDetach]),
 ];
 
@@ -179,6 +182,7 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static
         session_close,
         terminal_view_open,
         terminal_view_resize,
+        terminal_view_move,
         terminal_view_close,
         input_acquire,
         input_release,
@@ -1199,6 +1203,30 @@ pub fn terminal_view_resize(
     Ok(())
 }
 
+/// Moves an open view's window, as move `number` of the page's: by `across` columns and `down` rows,
+/// or, with `live`, back to the live screen. The page numbers its moves in the order it makes them.
+#[tauri::command]
+pub fn terminal_view_move(
+    views: State<'_, crate::terminal::TerminalViews>,
+    view: String,
+    number: u64,
+    across: i64,
+    down: i64,
+    live: bool,
+) -> Result<()> {
+    let asked = if live {
+        crate::terminal::Move::Live { number }
+    } else {
+        crate::terminal::Move::Pan {
+            number,
+            across,
+            down,
+        }
+    };
+    views.move_window(&view, asked);
+    Ok(())
+}
+
 /// Closes a view: it detaches, closes its link and publishes nothing more.
 #[tauri::command]
 pub async fn terminal_view_close(
@@ -1437,10 +1465,11 @@ mod tests {
                 "account_sign_out",
                 "account_status",
                 "account_usage",
-                // The raw terminal view's three. The view attaches on the session's own worker,
+                // The raw terminal view's four. The view attaches on the session's own worker,
                 // which the control daemon does not proxy for this computer, so the page names a
-                // session and a size and native code makes every call.
+                // session, a size and its moves, and native code makes every call.
                 "terminal_view_close",
+                "terminal_view_move",
                 "terminal_view_open",
                 "terminal_view_resize",
             ])
@@ -1518,6 +1547,14 @@ mod tests {
         assert_eq!(
             performing(Method::SessionDetach),
             BTreeSet::from(["terminal_view_close", "terminal_view_open"])
+        );
+        assert_eq!(
+            performing(Method::AttachmentViewport),
+            BTreeSet::from([
+                "terminal_view_move",
+                "terminal_view_open",
+                "terminal_view_resize"
+            ])
         );
     }
 

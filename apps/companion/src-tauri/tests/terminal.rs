@@ -26,8 +26,8 @@ use kr_protocol::projection::{
 use kr_protocol::recovery::{EventStream, EventsSubscribeParams};
 use kr_protocol::session::Dimensions;
 use scripted_worker::{
-    Challenge, Link, ScriptedWorker, WATCHDOG, delta, page as rows_page, reset, row, screen,
-    snapshot,
+    Challenge, Frame, Link, ScriptedWorker, WATCHDOG, delta, frame, frame_delta, page as rows_page,
+    reset, row, screen, snapshot,
 };
 use serde_json::{Value, json};
 use tauri::Manager as _;
@@ -72,6 +72,7 @@ impl Page {
             .invoke_handler(tauri::generate_handler![
                 companion_tauri::commands::terminal_view_open,
                 companion_tauri::commands::terminal_view_resize,
+                companion_tauri::commands::terminal_view_move,
                 companion_tauri::commands::terminal_view_close,
             ]);
         let app = companion_tauri::terminal::install(
@@ -462,7 +463,15 @@ async fn a_snapshot_is_published_only_at_its_last_page() {
     let shown = page.state(3, 1).await;
     assert_eq!(shown["state"], "showing");
     assert_eq!(text_of(&shown), vec!["top", "bottom"]);
-    assert_eq!(shown["screen"]["window"], json!({"rows": 2, "columns": 10}));
+    assert_eq!(
+        shown["screen"]["window"],
+        json!({"rows": 2, "columns": 10, "column": 0, "line": 0, "above": 0})
+    );
+    assert_eq!(
+        shown["screen"]["room"],
+        json!({"up": 0, "down": 0, "left": 0, "right": 0}),
+        "a window that holds the whole session has nowhere to move"
+    );
     assert_eq!(
         shown["screen"]["dimensions"],
         json!({"columns": "10", "rows": "2"})
@@ -614,7 +623,8 @@ async fn an_unchanged_size_sends_nothing() {
 }
 
 /// Rapid sizes end at the newest, with one report outstanding at a time, and every report keeps the
-/// window at the live screen's first line and column.
+/// window at the live screen's first line and column. A report is settled by the screen its answer
+/// names, which for a new size is the next subscription's first, so the newest size goes then.
 #[tokio::test(flavor = "multi_thread")]
 async fn rapid_sizes_end_at_the_newest_with_one_report_outstanding() {
     let mut worker = ScriptedWorker::start(Challenge::Answered);
@@ -637,6 +647,16 @@ async fn rapid_sizes_end_at_the_newest_with_one_report_outstanding() {
     page_view.resize(&view, 16, 5);
     assert!(link.quiet_for(QUIET).await, "one report at a time");
     link.answer(&first, &viewport_answer(1)).await;
+    assert!(
+        link.quiet_for(QUIET).await,
+        "an answer alone does not settle a new size"
+    );
+    link.push("session.resync", &resync_marker(60)).await;
+    let subscribe = link.expect(Method::EventsSubscribe).await;
+    link.answer(&subscribe, &scripted_worker::subscribed())
+        .await;
+    link.restart_stream();
+    screen(&mut link, 2, 60, vec![row(0, "at"), row(1, "twelve")], 1).await;
     let second = link.expect(Method::AttachmentViewport).await;
     let asked: AttachmentViewportParams = second.params();
     assert_eq!(asked.dimensions, Dimensions::new(16, 5), "the newest size");
@@ -1187,4 +1207,629 @@ fn resync_marker(cursor: u64) -> Value {
         "cursor": cursor.to_string(),
         "oldest_retained_cursor": "0",
     })
+}
+
+// ---- The window moves ------------------------------------------------------------------------
+
+impl Page {
+    /// Moves `view`'s window by `across` columns and `down` rows, as the page's move `number`.
+    fn pan(&self, view: &str, number: u64, across: i64, down: i64) {
+        self.invoke(
+            "main",
+            "terminal_view_move",
+            json!({"view": view, "number": number, "across": across, "down": down, "live": false}),
+        )
+        .expect("the move is taken");
+    }
+
+    /// Brings `view`'s window back to the live screen, as the page's move `number`.
+    fn live(&self, view: &str, number: u64) {
+        self.invoke(
+            "main",
+            "terminal_view_move",
+            json!({"view": view, "number": number, "across": 0, "down": 0, "live": true}),
+        )
+        .expect("the return is taken");
+    }
+
+    /// The newest state `channel` has been sent, once it is one `holds` accepts.
+    async fn newest(&self, channel: u32, holds: impl Fn(&Value) -> bool) -> Value {
+        tokio::time::timeout(WATCHDOG, async {
+            loop {
+                if let Some(state) = self.states(channel).last()
+                    && holds(state)
+                {
+                    return state.clone();
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "a state on channel {channel} within the watchdog; the newest was {:?}",
+                self.states(channel).last()
+            )
+        })
+    }
+}
+
+/// A view of `at`'s window size, attached and showing `at`.
+async fn panned(
+    page: &Page,
+    worker: &mut ScriptedWorker,
+    channel: u32,
+    at: &Frame,
+) -> (String, Link) {
+    let view = page.open(
+        worker.session_id,
+        at.window_columns,
+        at.window_rows,
+        channel,
+    );
+    let mut link = worker.link().await;
+    link.attach().await;
+    frame(&mut link, at).await;
+    page.newest(channel, |state| state["state"] == "showing")
+        .await;
+    (view, link)
+}
+
+/// The view's next viewport report, and what it asks for.
+async fn report(link: &mut Link) -> (scripted_worker::Call, AttachmentViewportParams) {
+    let call = link.expect(Method::AttachmentViewport).await;
+    let asked: AttachmentViewportParams = call.params();
+    (call, asked)
+}
+
+/// Whether a state tells the page its moves up to `number` are settled.
+fn settled(state: &Value, number: u64) -> bool {
+    state["settled"].as_u64() == Some(number)
+}
+
+/// Where a published screen says its window is: its column, its line, and how far above the live
+/// screen it starts.
+fn place(state: &Value) -> (u64, u64, u64) {
+    let window = &state["screen"]["window"];
+    (
+        window["column"].as_u64().expect("a column"),
+        window["line"].as_u64().expect("a line"),
+        window["above"].as_u64().expect("a distance above"),
+    )
+}
+
+fn line_position(line: u64) -> Option<kr_protocol::attachment::ViewportPosition> {
+    Some(kr_protocol::attachment::ViewportPosition::Line(
+        kr_protocol::scalars::U64::new(line),
+    ))
+}
+
+fn row_position(row: u64) -> Option<kr_protocol::attachment::ViewportPosition> {
+    Some(kr_protocol::attachment::ViewportPosition::Row(
+        kr_protocol::scalars::U64::new(row),
+    ))
+}
+
+fn above_position(rows: u64) -> Option<kr_protocol::attachment::ViewportPosition> {
+    Some(kr_protocol::attachment::ViewportPosition::Above(
+        kr_protocol::scalars::U64::new(rows),
+    ))
+}
+
+/// A session of 20 columns and 6 rows, with 30 rows kept above its live screen, and a view of 10
+/// by 2 at its live screen's first line.
+fn wide_session() -> Frame {
+    Frame::live((20, 6), (10, 2), 30)
+}
+
+/// KR-REQ-08.75: a move goes from where the window is, at the size the view last reported, and is
+/// settled by the screen its answer names: the page is told only with that screen, which says
+/// where the window now is and how far it can still go.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_move_goes_from_where_the_window_is_and_settles_on_its_named_screen() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page_view = Page::new(worker.paths());
+    let at = wide_session();
+    let (view, mut link) = panned(&page_view, &mut worker, 3, &at).await;
+    page_view.pan(&view, 1, 3, 0);
+    let (call, asked) = report(&mut link).await;
+    assert_eq!(
+        asked.dimensions,
+        Dimensions::new(10, 2),
+        "the size last reported"
+    );
+    assert_eq!(asked.position.0, None, "still the live screen's first line");
+    assert_eq!(asked.column.get(), 3);
+    link.answer(&call, &viewport_answer(1)).await;
+    assert!(
+        link.quiet_for(QUIET).await,
+        "one report at a time, and none owed"
+    );
+    assert!(
+        !settled(page_view.states(3).last().expect("a state"), 1),
+        "an answer alone settles nothing the page draws"
+    );
+    frame(&mut link, &at.at(0, 3).revision(1)).await;
+    let moved = page_view.newest(3, |state| settled(state, 1)).await;
+    assert_eq!(moved["state"], "showing");
+    assert_eq!(place(&moved), (3, 0, 0));
+    assert_eq!(
+        moved["screen"]["room"],
+        json!({"up": 30, "down": 4, "left": 3, "right": 7})
+    );
+    assert_eq!(text_of(&moved)[0], "defghijklm", "columns 3 to 12");
+}
+
+/// A repaint of the old place, queued before the report, is not the report's screen: it is drawn,
+/// and the move stays unsettled until the screen its answer names arrives.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_older_repaint_does_not_settle_a_move() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page_view = Page::new(worker.paths());
+    let at = wide_session();
+    let (view, mut link) = panned(&page_view, &mut worker, 3, &at).await;
+    page_view.pan(&view, 1, 2, 0);
+    let (call, _) = report(&mut link).await;
+    let before = page_view.states(3).len();
+    let mut repaint = at;
+    repaint.generation = 2;
+    frame(&mut link, &repaint).await;
+    let drawn = page_view
+        .newest(3, |state| {
+            page_view.states(3).len() > before && state["state"] == "showing"
+        })
+        .await;
+    assert_eq!(place(&drawn), (0, 0, 0), "the repaint is drawn where it is");
+    assert!(settled(&drawn, 0), "and settles nothing");
+    link.answer(&call, &viewport_answer(1)).await;
+    assert!(link.quiet_for(QUIET).await);
+    assert!(settled(page_view.states(3).last().expect("a state"), 0));
+    frame(&mut link, &at.at(0, 2).revision(1)).await;
+    let moved = page_view.newest(3, |state| settled(state, 1)).await;
+    assert_eq!(place(&moved), (2, 0, 0));
+}
+
+/// A screen drawn for an earlier revision than the newest answer is drawn, but it never moves the
+/// record of where the window is: the next move goes from where the named screen put the window.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_older_screen_after_the_answer_never_moves_the_record() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page_view = Page::new(worker.paths());
+    let at = wide_session();
+    let (view, mut link) = panned(&page_view, &mut worker, 3, &at).await;
+    page_view.pan(&view, 1, 4, 0);
+    let (call, _) = report(&mut link).await;
+    link.answer(&call, &viewport_answer(1)).await;
+    frame(&mut link, &at.at(0, 4).revision(1)).await;
+    page_view.newest(3, |state| settled(state, 1)).await;
+    let mut late = at;
+    late.generation = 2;
+    frame(&mut link, &late).await;
+    page_view
+        .newest(3, |state| {
+            state["state"] == "showing" && place(state) == (0, 0, 0)
+        })
+        .await;
+    page_view.pan(&view, 2, 1, 0);
+    let (_, asked) = report(&mut link).await;
+    assert_eq!(
+        asked.column.get(),
+        5,
+        "from the named screen's column 4, not the late 0"
+    );
+}
+
+/// A screen that arrives before its report's answer might be that report's, so it waits for the
+/// answer and is drawn with it; once a report has its answer, its screen is drawn as it comes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_screen_before_its_answer_is_drawn_with_the_answer() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page_view = Page::new(worker.paths());
+    let at = wide_session();
+    let (view, mut link) = panned(&page_view, &mut worker, 3, &at).await;
+    page_view.pan(&view, 1, 2, 0);
+    let (call, _) = report(&mut link).await;
+    frame(&mut link, &at.at(0, 2).revision(1)).await;
+    tokio::time::sleep(QUIET).await;
+    assert_eq!(
+        page_view.states(3).last().expect("a state")["state"],
+        "waiting",
+        "its reset is told, and the screen, newer than any answer, waits for the answer"
+    );
+    link.answer(&call, &viewport_answer(1)).await;
+    let moved = page_view.newest(3, |state| settled(state, 1)).await;
+    assert_eq!(moved["state"], "showing");
+    assert_eq!(place(&moved), (2, 0, 0));
+
+    page_view.pan(&view, 2, 1, 0);
+    let (call, asked) = report(&mut link).await;
+    assert_eq!(asked.column.get(), 3);
+    link.answer(&call, &viewport_answer(2)).await;
+    frame(&mut link, &at.at(0, 3).revision(2)).await;
+    let again = page_view.newest(3, |state| settled(state, 2)).await;
+    assert_eq!(
+        place(&again),
+        (3, 0, 0),
+        "drawn as it came, its answer already heard"
+    );
+}
+
+/// A screen that was waiting for its answer and was then discarded, by the host's reset or by the
+/// view's own recovery, settles its report inside the view; the page hears of the move only with
+/// the next frame, which holds it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_screen_discarded_before_its_answer_is_told_with_the_next_frame() {
+    for recovery in [false, true] {
+        let mut worker = ScriptedWorker::start(Challenge::Answered);
+        let page_view = Page::new(worker.paths());
+        let at = wide_session();
+        let (view, mut link) = panned(&page_view, &mut worker, 3, &at).await;
+        page_view.pan(&view, 1, 2, 0);
+        let (call, _) = report(&mut link).await;
+        frame(&mut link, &at.at(0, 2).revision(1)).await;
+        let mut next = at.at(0, 2).revision(1);
+        next.generation = 2;
+        if recovery {
+            link.push("session.resync", &resync_marker(60)).await;
+            let subscribe = link.expect(Method::EventsSubscribe).await;
+            let waiting = page_view
+                .newest(3, |state| state["state"] == "waiting")
+                .await;
+            assert!(settled(&waiting, 0), "recovery {recovery}");
+            link.answer(&call, &viewport_answer(1)).await;
+            link.answer(&subscribe, &scripted_worker::subscribed())
+                .await;
+            tokio::time::sleep(QUIET).await;
+            assert!(
+                settled(page_view.states(3).last().expect("a state"), 0),
+                "recovery {recovery}: no frame holds the move yet"
+            );
+            link.restart_stream();
+        } else {
+            link.push(
+                PROJECTION_RESET_EVENT,
+                &reset(2, 60, ProjectionResetReason::BufferSwitch, 1),
+            )
+            .await;
+            let waiting = page_view
+                .newest(3, |state| state["state"] == "waiting")
+                .await;
+            assert!(settled(&waiting, 0), "recovery {recovery}");
+            link.answer(&call, &viewport_answer(1)).await;
+            tokio::time::sleep(QUIET).await;
+            assert!(
+                settled(page_view.states(3).last().expect("a state"), 0),
+                "recovery {recovery}: no frame holds the move yet"
+            );
+        }
+        frame(&mut link, &next).await;
+        let moved = page_view.newest(3, |state| settled(state, 1)).await;
+        assert_eq!(moved["state"], "showing", "recovery {recovery}");
+        assert_eq!(place(&moved), (2, 0, 0), "recovery {recovery}");
+        let _ = view;
+    }
+}
+
+/// A new size goes with where the window is, and is settled by the next subscription's first
+/// screen, from which the moves made meanwhile go.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_size_change_settles_on_the_next_subscriptions_first_screen() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page_view = Page::new(worker.paths());
+    let at = wide_session().at(0, 3);
+    let (view, mut link) = panned(&page_view, &mut worker, 3, &at).await;
+    page_view.resize(&view, 12, 2);
+    let (call, asked) = report(&mut link).await;
+    assert_eq!(asked.dimensions, Dimensions::new(12, 2));
+    assert_eq!(
+        (asked.position.0, asked.column.get()),
+        (None, 3),
+        "where the window is"
+    );
+    page_view.pan(&view, 1, 1, 0);
+    link.answer(&call, &viewport_answer(1)).await;
+    link.push("session.resync", &resync_marker(60)).await;
+    let subscribe = link.expect(Method::EventsSubscribe).await;
+    link.answer(&subscribe, &scripted_worker::subscribed())
+        .await;
+    assert!(
+        link.quiet_for(QUIET).await,
+        "nothing goes while the screen is asked for"
+    );
+    link.restart_stream();
+    let mut wider = at.revision(1);
+    wider.window_columns = 12;
+    frame(&mut link, &wider).await;
+    let (_, asked) = report(&mut link).await;
+    assert_eq!(asked.dimensions, Dimensions::new(12, 2));
+    assert_eq!(asked.column.get(), 4, "the move goes from the new screen");
+}
+
+/// The host brought a window in the history back to the live screen while the view was taking a
+/// new screen: that screen names the host's change, and the moves made meanwhile go from the live
+/// screen.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_buffer_switch_during_a_resynchronisation_takes_the_record_to_the_live_screen() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page_view = Page::new(worker.paths());
+    let history = wide_session().in_history(20, 0);
+    let (view, mut link) = panned(&page_view, &mut worker, 3, &history).await;
+    link.push("session.resync", &resync_marker(60)).await;
+    let subscribe = link.expect(Method::EventsSubscribe).await;
+    page_view.pan(&view, 1, 0, -2);
+    link.answer(&subscribe, &scripted_worker::subscribed())
+        .await;
+    link.restart_stream();
+    frame(&mut link, &wide_session().revision(1)).await;
+    let (_, asked) = report(&mut link).await;
+    assert_eq!(
+        asked.position.0,
+        above_position(2),
+        "two rows above the live screen"
+    );
+}
+
+/// The session gave its oldest rows up while the view was taking a new screen, which shows the
+/// window from the oldest row left at the same revision: the moves made meanwhile go from there.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_eviction_during_a_resynchronisation_moves_the_record_to_the_oldest_row() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page_view = Page::new(worker.paths());
+    let history = wide_session().in_history(5, 0);
+    let (view, mut link) = panned(&page_view, &mut worker, 3, &history).await;
+    link.push("session.resync", &resync_marker(60)).await;
+    let subscribe = link.expect(Method::EventsSubscribe).await;
+    page_view.pan(&view, 1, 0, 3);
+    link.answer(&subscribe, &scripted_worker::subscribed())
+        .await;
+    link.restart_stream();
+    let mut evicted = wide_session().in_history(10, 0);
+    evicted.oldest = 10;
+    frame(&mut link, &evicted).await;
+    let (_, asked) = report(&mut link).await;
+    assert_eq!(
+        asked.position.0,
+        row_position(13),
+        "from the oldest row left"
+    );
+}
+
+/// A move the window cannot make at the top of the history is spent and takes nothing with it:
+/// the move back after it goes from where the window is.
+#[tokio::test(flavor = "multi_thread")]
+async fn reversing_moves_at_the_top_of_the_history_with_a_report_outstanding() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page_view = Page::new(worker.paths());
+    let history = wide_session().in_history(2, 0);
+    let (view, mut link) = panned(&page_view, &mut worker, 3, &history).await;
+    page_view.pan(&view, 1, 0, -5);
+    let (call, asked) = report(&mut link).await;
+    assert_eq!(asked.position.0, row_position(0), "held at the oldest row");
+    page_view.pan(&view, 2, 0, -3);
+    page_view.pan(&view, 3, 0, 4);
+    assert!(link.quiet_for(QUIET).await, "one report at a time");
+    link.answer(&call, &viewport_answer(1)).await;
+    frame(&mut link, &wide_session().in_history(0, 0).revision(1)).await;
+    let (_, asked) = report(&mut link).await;
+    assert_eq!(
+        asked.position.0,
+        row_position(4),
+        "the spent move took nothing with it"
+    );
+    page_view.newest(3, |state| settled(state, 2)).await;
+}
+
+/// The same at the live screen's last line that still fills the window.
+#[tokio::test(flavor = "multi_thread")]
+async fn reversing_moves_at_the_live_screens_last_line_with_a_report_outstanding() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page_view = Page::new(worker.paths());
+    let at = wide_session().at(3, 0);
+    let (view, mut link) = panned(&page_view, &mut worker, 3, &at).await;
+    page_view.pan(&view, 1, 0, 3);
+    let (call, asked) = report(&mut link).await;
+    assert_eq!(asked.position.0, line_position(4), "held at the last line");
+    page_view.pan(&view, 2, 0, 2);
+    page_view.pan(&view, 3, 0, -1);
+    link.answer(&call, &viewport_answer(1)).await;
+    frame(&mut link, &wide_session().at(4, 0).revision(1)).await;
+    let (_, asked) = report(&mut link).await;
+    assert_eq!(asked.position.0, line_position(3));
+}
+
+/// The same at both edges of a grid wider than the view.
+#[tokio::test(flavor = "multi_thread")]
+async fn reversing_moves_at_both_column_limits_with_a_report_outstanding() {
+    for (from, first, beyond, back, limit, then) in [(1, -3, -2, 4, 0, 4), (9, 3, 1, -2, 10, 8)] {
+        let mut worker = ScriptedWorker::start(Challenge::Answered);
+        let page_view = Page::new(worker.paths());
+        let at = wide_session().at(0, from);
+        let (view, mut link) = panned(&page_view, &mut worker, 3, &at).await;
+        page_view.pan(&view, 1, first, 0);
+        let (call, asked) = report(&mut link).await;
+        assert_eq!(asked.column.get(), limit, "held at the edge");
+        page_view.pan(&view, 2, beyond, 0);
+        page_view.pan(&view, 3, back, 0);
+        link.answer(&call, &viewport_answer(1)).await;
+        frame(&mut link, &wide_session().at(0, limit).revision(1)).await;
+        let (_, asked) = report(&mut link).await;
+        assert_eq!(asked.column.get(), then, "from {from}");
+    }
+}
+
+/// The alternate buffer numbers its own rows and keeps no history: a move up from its first line
+/// is spent, and nothing is sent.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_alternate_buffer_keeps_no_history_to_move_into() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page_view = Page::new(worker.paths());
+    let mut alternate = Frame::live((20, 6), (10, 2), 0);
+    alternate.buffer = kr_protocol::projection::ProjectedBuffer::Alternate;
+    let (view, mut link) = panned(&page_view, &mut worker, 3, &alternate).await;
+    let shown = page_view
+        .newest(3, |state| state["state"] == "showing")
+        .await;
+    assert_eq!(shown["screen"]["room"]["up"], 0);
+    page_view.pan(&view, 1, 0, -3);
+    assert!(link.quiet_for(QUIET).await, "nothing to send");
+    page_view.newest(3, |state| settled(state, 1)).await;
+}
+
+/// Output that scrolls the live screen between a screen and the report sent from it: a move from
+/// the history onto the live screen is measured from the newest live screen the view holds.
+#[tokio::test(flavor = "multi_thread")]
+async fn output_between_a_screen_and_its_report_moves_the_live_screen_it_is_measured_from() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page_view = Page::new(worker.paths());
+    let history = wide_session().in_history(25, 0);
+    let (view, mut link) = panned(&page_view, &mut worker, 3, &history).await;
+    let mut scrolled = history;
+    scrolled.live_top = 33;
+    link.push(PROJECTION_DELTA_EVENT, &frame_delta(&scrolled, 40, 50))
+        .await;
+    page_view
+        .newest(3, |state| state["screen"]["room"]["down"] == json!(12))
+        .await;
+    page_view.pan(&view, 1, 0, 10);
+    let (_, asked) = report(&mut link).await;
+    assert_eq!(
+        asked.position.0,
+        line_position(2),
+        "row 35, the third line of the live screen"
+    );
+}
+
+/// A refused move changes nothing and is settled at once; the newer size that waited behind it
+/// goes next, with where the window is.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_move_while_a_newer_size_waits() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page_view = Page::new(worker.paths());
+    let at = wide_session().at(0, 1);
+    let (view, mut link) = panned(&page_view, &mut worker, 3, &at).await;
+    page_view.pan(&view, 1, 2, 0);
+    let (call, _) = report(&mut link).await;
+    page_view.resize(&view, 12, 2);
+    link.refuse(&call, "that window is not one this session shows")
+        .await;
+    page_view.newest(3, |state| settled(state, 1)).await;
+    let (_, asked) = report(&mut link).await;
+    assert_eq!(asked.dimensions, Dimensions::new(12, 2));
+    assert_eq!(asked.column.get(), 1, "where the window still is");
+}
+
+/// While the view takes a new screen it holds no record of where the window is, so a move waits
+/// for that screen and goes from it.
+#[tokio::test(flavor = "multi_thread")]
+async fn moves_during_a_recovery_wait_for_the_record() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page_view = Page::new(worker.paths());
+    let at = wide_session();
+    let (view, mut link) = panned(&page_view, &mut worker, 3, &at).await;
+    link.push("session.resync", &resync_marker(60)).await;
+    let subscribe = link.expect(Method::EventsSubscribe).await;
+    page_view.pan(&view, 1, 2, 0);
+    assert!(link.quiet_for(QUIET).await, "no record to move from");
+    link.answer(&subscribe, &scripted_worker::subscribed())
+        .await;
+    link.restart_stream();
+    frame(&mut link, &at.at(0, 1)).await;
+    let (_, asked) = report(&mut link).await;
+    assert_eq!(asked.column.get(), 3, "from the new screen's column");
+}
+
+/// A return brings a window in the history back to the live screen's first line at its column,
+/// leaves a window on the live screen where it is, and waits for a move still in flight.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_return_brings_the_history_back_and_leaves_the_live_screen_where_it_is() {
+    // From the history.
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page_view = Page::new(worker.paths());
+    let history = wide_session().in_history(20, 3);
+    let (view, mut link) = panned(&page_view, &mut worker, 3, &history).await;
+    page_view.live(&view, 1);
+    let (call, asked) = report(&mut link).await;
+    assert_eq!((asked.position.0, asked.column.get()), (None, 3));
+    link.answer(&call, &viewport_answer(1)).await;
+    frame(&mut link, &wide_session().at(0, 3).revision(1)).await;
+    let back = page_view.newest(3, |state| settled(state, 1)).await;
+    assert_eq!(place(&back), (3, 0, 0));
+
+    // From the live screen: nothing to send, and settled at once.
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page_view = Page::new(worker.paths());
+    let (view, mut link) = panned(&page_view, &mut worker, 3, &wide_session().at(2, 3)).await;
+    page_view.live(&view, 1);
+    assert!(
+        link.quiet_for(QUIET).await,
+        "a live window stays where it is"
+    );
+    page_view.newest(3, |state| settled(state, 1)).await;
+
+    // Behind a move into the history that is still in flight.
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page_view = Page::new(worker.paths());
+    let (view, mut link) = panned(&page_view, &mut worker, 3, &wide_session()).await;
+    page_view.pan(&view, 1, 0, -5);
+    let (call, asked) = report(&mut link).await;
+    assert_eq!(asked.position.0, above_position(5));
+    page_view.live(&view, 2);
+    assert!(link.quiet_for(QUIET).await, "the return waits its turn");
+    link.answer(&call, &viewport_answer(1)).await;
+    frame(&mut link, &wide_session().in_history(25, 0).revision(1)).await;
+    let (_, asked) = report(&mut link).await;
+    assert_eq!(asked.position.0, None, "then back to the live screen");
+}
+
+/// A view that ends with moves outstanding publishes its end, which settles them all, and sends
+/// nothing more.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_view_ending_with_moves_outstanding_publishes_its_end() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page_view = Page::new(worker.paths());
+    let (view, mut link) = panned(&page_view, &mut worker, 3, &wide_session()).await;
+    page_view.pan(&view, 1, 2, 0);
+    let _ = report(&mut link).await;
+    page_view.pan(&view, 2, 1, 0);
+    link.push(
+        kr_protocol::session::SESSION_CLOSED_EVENT,
+        &json!({"session_id": worker.session_id.to_string()}),
+    )
+    .await;
+    let ended = page_view.newest(3, |state| state["state"] == "ended").await;
+    assert_eq!(ended["reason"], "This session has closed.");
+    assert!(link.closed().await.is_empty(), "nothing more is sent");
+}
+
+/// KR-REQ-08.75: every screen says where its window starts and how far it can still move: from
+/// the history and from a line of the live screen.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_screen_says_where_its_window_is_and_how_far_it_can_move() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page_view = Page::new(worker.paths());
+    let mut kept = wide_session().in_history(25, 4);
+    kept.oldest = 10;
+    let (_view, _link) = panned(&page_view, &mut worker, 3, &kept).await;
+    let shown = page_view
+        .newest(3, |state| state["state"] == "showing")
+        .await;
+    assert_eq!(place(&shown), (4, 0, 5));
+    assert_eq!(
+        shown["screen"]["room"],
+        json!({"up": 15, "down": 9, "left": 4, "right": 6})
+    );
+
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page_view = Page::new(worker.paths());
+    let mut live = wide_session().at(3, 0);
+    live.oldest = 10;
+    let (_view, _link) = panned(&page_view, &mut worker, 3, &live).await;
+    let shown = page_view
+        .newest(3, |state| state["state"] == "showing")
+        .await;
+    assert_eq!(place(&shown), (0, 3, 0));
+    assert_eq!(
+        shown["screen"]["room"],
+        json!({"up": 23, "down": 1, "left": 0, "right": 10})
+    );
 }

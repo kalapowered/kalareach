@@ -7,16 +7,16 @@
 //! would let an answer to another call arrive first, and would keep the page's own close waiting on
 //! the host.
 //!
-//! The window stays on the live screen. The view reports only its size: one report at a time, the
-//! newest measurement sent once the last report is answered, and a size equal to the one last sent
-//! not sent at all.
+//! The view reports its size and where the page moved its window, one report at a time, through
+//! [`WindowReports`]: each report is settled by the screen its answer names, and the page is told a
+//! move is settled only with a screen that holds it.
 
 use kr_client::projection::{Applied, Projection, decode, is_projection_event};
 use kr_client::shown::Shown;
 use kr_ipc::client::LocalClient;
 use kr_protocol::attachment::{
     AttachMode, AttachmentCapability, AttachmentSummary, AttachmentViewportParams,
-    SessionAttachParams, SessionAttachResult, SessionDetachParams,
+    AttachmentViewportResult, SessionAttachParams, SessionAttachResult, SessionDetachParams,
 };
 use kr_protocol::envelope::{
     ActionTarget, ControlFrame, MutationRequest, Notification, Outcome, ParamsValue, Request,
@@ -32,12 +32,15 @@ use kr_protocol::worker::WorkerDescriptor;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use super::screen::{TerminalViewState, state_of};
+use super::window::{Answer, WindowReports};
 use super::{Locate, Publish};
 
 /// What the page asks of a view once it is open.
 pub(super) enum Command {
     /// The page's grid is now this size.
     Resize(Dimensions),
+    /// The page moved the window.
+    Move(super::window::Move),
     /// The page is done with the view.
     Close,
 }
@@ -76,8 +79,8 @@ pub(super) async fn run(
     mut commands: UnboundedReceiver<Command>,
     publish: &Publish,
 ) {
-    // The newest size the page measured, which may change while the view is opening.
-    let mut wanted = dimensions;
+    // The window's reports, which take the page's sizes and moves while the view is opening too.
+    let mut window = WindowReports::new(dimensions);
     let opened = {
         let opening = open(locate, session_id, dimensions);
         tokio::pin!(opening);
@@ -85,7 +88,8 @@ pub(super) async fn run(
             tokio::select! {
                 biased;
                 command = commands.recv() => match command {
-                    Some(Command::Resize(size)) => wanted = size,
+                    Some(Command::Resize(size)) => window.measured(size),
+                    Some(Command::Move(asked)) => window.take(asked),
                     // A close while the view opens cancels the open. The link goes with it, and a
                     // closed connection detaches whatever the attach had made.
                     Some(Command::Close) | None => return,
@@ -108,13 +112,14 @@ pub(super) async fn run(
         attachment: opened.attached.attachment,
         projection: Projection::new(),
         next_request: LOOP_REQUESTS,
-        wanted,
-        last_sent: dimensions,
-        report: None,
+        window,
         resubscription: None,
         replaced_stream: false,
         recoveries: 0,
         showing: false,
+        held: false,
+        drawn: None,
+        told: 0,
         publish: publish.clone(),
     };
     view.publish_state();
@@ -277,12 +282,8 @@ struct View {
     attachment: AttachmentSummary,
     projection: Projection,
     next_request: u64,
-    /// The newest size the page measured.
-    wanted: Dimensions,
-    /// The size of the last report sent, or of the attach before any.
-    last_sent: Dimensions,
-    /// The report waiting for its answer.
-    report: Option<RequestId>,
+    /// Where the window is, and the reports it owes.
+    window: WindowReports,
     /// The resubscription waiting for its answer.
     resubscription: Option<RequestId>,
     /// Whether the stream a resubscription replaced is still being dropped: until the new stream's
@@ -292,6 +293,12 @@ struct View {
     recoveries: u32,
     /// Whether the page was last told of a screen.
     showing: bool,
+    /// Whether the screen the view holds waits for its report's answer before the page is told.
+    held: bool,
+    /// The revision of the window the screen the page draws was drawn for.
+    drawn: Option<u64>,
+    /// The newest of its moves the page was last told is settled.
+    told: u64,
     publish: Publish,
 }
 
@@ -304,10 +311,12 @@ enum Next {
 impl View {
     /// Reads the link and the page's commands until the view ends.
     async fn serve(&mut self, commands: &mut UnboundedReceiver<Command>) -> Ending {
-        if let Some(ended) = self.report_if_needed().await {
-            return ended;
-        }
         loop {
+            // What goes next is asked after every event, so nothing owed waits on an event that
+            // does not come.
+            if let Some(ended) = self.dispatch().await {
+                return ended;
+            }
             let next = tokio::select! {
                 // The page first: a close is answered before anything more is read or drawn.
                 biased;
@@ -316,8 +325,12 @@ impl View {
             };
             let ended = match next {
                 Next::Command(Some(Command::Resize(size))) => {
-                    self.wanted = size;
-                    self.report_if_needed().await
+                    self.window.measured(size);
+                    None
+                }
+                Next::Command(Some(Command::Move(asked))) => {
+                    self.window.take(asked);
+                    None
                 }
                 Next::Command(Some(Command::Close) | None) => Some(Ending::CLOSED),
                 Next::Frame(Ok(ControlFrame::Notification(notification))) => {
@@ -367,6 +380,7 @@ impl View {
             // A reset waits for the snapshot that follows it. Asking again would loop, because
             // every subscription opens with a reset of its own.
             Applied::Reset(_) => {
+                self.held = false;
                 self.waiting();
                 None
             }
@@ -374,11 +388,21 @@ impl View {
             Applied::Installing => None,
             Applied::Installed => {
                 self.recoveries = 0;
-                self.show();
+                // The screen settles what it can first, and only then is it weighed whether the
+                // page may draw it yet.
+                if let Some(screen) = self.projection.screen() {
+                    self.window.installed(screen);
+                    self.held = self.window.holds(screen.window_revision);
+                }
+                if !self.held {
+                    self.show();
+                }
                 None
             }
             Applied::Updated(_) => {
-                self.show();
+                if !self.held {
+                    self.show();
+                }
                 None
             }
             Applied::Refused(_) => self.recover().await,
@@ -386,12 +410,28 @@ impl View {
     }
 
     async fn response(&mut self, response: Response) -> Option<Ending> {
-        if self.report == Some(response.request_id) {
-            // Accepted or refused, the report is answered: the newest measurement goes if it
-            // differs from the size sent. A refused size is not sent again until another is
-            // measured, and a size measured meanwhile is not lost.
-            self.report = None;
-            return self.report_if_needed().await;
+        if self.window.is_in_flight(response.request_id) {
+            // A refusal settles the report and changes nothing; an acceptance settles it once a
+            // screen naming its revision has arrived, whichever came first. A screen that waited
+            // for this answer is drawn now, with what the answer settled.
+            let answer = match response.outcome {
+                Outcome::Ok(value) => {
+                    value
+                        .to_typed::<AttachmentViewportResult>()
+                        .map_or(Answer::Refused, |result| Answer::Accepted {
+                            window_revision: result.window_revision.get(),
+                        })
+                }
+                Outcome::Error(_) => Answer::Refused,
+            };
+            self.window.answered(answer);
+            if self.held {
+                self.held = false;
+                self.show();
+            } else {
+                self.tell();
+            }
+            return None;
         }
         if self.resubscription == Some(response.request_id) {
             self.resubscription = None;
@@ -414,6 +454,8 @@ impl View {
         }
         self.recoveries += 1;
         self.projection.discard();
+        self.held = false;
+        self.window.recovering();
         self.waiting();
         let mut streams = CanonicalSet::new();
         streams.insert(EventStream::Output);
@@ -447,28 +489,26 @@ impl View {
         None
     }
 
-    /// Sends the newest measurement, when nothing is outstanding and it differs from the size last
-    /// sent. The window stays on the live screen from its first line and column, so a report names
-    /// no position and the first column.
-    async fn report_if_needed(&mut self) -> Option<Ending> {
-        if self.report.is_some() || self.wanted == self.last_sent {
-            return None;
+    /// Sends the report the window owes now, if any, and tells the page of the moves that settled
+    /// without one.
+    async fn dispatch(&mut self) -> Option<Ending> {
+        if let Some(sending) = self.window.next(self.projection.screen()) {
+            let params = AttachmentViewportParams {
+                attachment_id: self.attachment.attachment_id,
+                dimensions: sending.dimensions,
+                position: Nullable(sending.position),
+                column: U64::new(sending.column),
+            };
+            let request_id = self.next_id();
+            if !self
+                .mutation(request_id, Method::AttachmentViewport, &params)
+                .await
+            {
+                return Some(Ending::lost());
+            }
+            self.window.sent(request_id);
         }
-        let params = AttachmentViewportParams {
-            attachment_id: self.attachment.attachment_id,
-            dimensions: self.wanted,
-            position: Nullable::null(),
-            column: U64::ZERO,
-        };
-        let request_id = self.next_id();
-        if !self
-            .mutation(request_id, Method::AttachmentViewport, &params)
-            .await
-        {
-            return Some(Ending::lost());
-        }
-        self.report = Some(request_id);
-        self.last_sent = self.wanted;
+        self.tell();
         None
     }
 
@@ -533,7 +573,25 @@ impl View {
         self.publish_state();
     }
 
-    fn publish_state(&self) {
-        (self.publish)(state_of(&self.attachment, self.projection.screen()));
+    /// Tells the page of moves that have settled since it was last told, when the screen it draws
+    /// holds them. A screen that waits for its answer is not the page's yet, so nothing is told
+    /// with it.
+    fn tell(&mut self) {
+        if !self.held && self.window.told(self.drawn) != self.told {
+            self.publish_state();
+        }
+    }
+
+    fn publish_state(&mut self) {
+        let screen = if self.showing {
+            self.projection.screen()
+        } else {
+            None
+        };
+        if let Some(screen) = screen {
+            self.drawn = Some(screen.window_revision);
+        }
+        self.told = self.window.told(self.drawn);
+        (self.publish)(state_of(&self.attachment, screen, self.told));
     }
 }
