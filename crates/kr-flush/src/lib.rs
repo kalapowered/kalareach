@@ -378,7 +378,7 @@ mod windows {
     ///
     /// Returns an error of kind [`std::io::ErrorKind::InvalidInput`] for a name that holds a NUL
     /// or is empty.
-    fn native_name(path: &std::path::Path) -> std::io::Result<Vec<u16>> {
+    pub(super) fn native_name(path: &std::path::Path) -> std::io::Result<Vec<u16>> {
         use std::os::windows::ffi::OsStrExt as _;
 
         /// The length from which the standard library prefixes a name: some calls stop at 248
@@ -642,19 +642,62 @@ mod tests {
             held.push("\0suffix");
             PathBuf::from(held)
         };
-        for (from, to) in [
+        #[cfg_attr(not(windows), expect(unused_mut, reason = "only Windows adds cases"))]
+        let mut cases = vec![
             (with_nul(&first), name.clone()),
             (first.clone(), with_nul(&name)),
-        ] {
+        ];
+        // A verbatim name goes to the native call as it is, without the standard library's
+        // conversion, which refuses a NUL on its own.
+        #[cfg(windows)]
+        {
+            let verbatim = |path: &Path| PathBuf::from(format!(r"\\?\{}", path.display()));
+            cases.push((with_nul(&verbatim(&first)), verbatim(&name)));
+            cases.push((verbatim(&first), with_nul(&verbatim(&name))));
+        }
+        for (from, to) in cases {
             let refused = publish_without_replacing(&from, &to).expect_err("a NUL in a name");
             assert_eq!(
                 refused.kind(),
                 std::io::ErrorKind::InvalidInput,
                 "{refused}"
             );
+            assert_eq!(std::fs::read(&first).expect("readable"), b"first");
+            assert!(!name.exists(), "nothing was given the name");
         }
-        assert_eq!(std::fs::read(&first).expect("readable"), b"first");
-        assert!(!name.exists(), "nothing was given the name");
+    }
+
+    /// On Windows a name reaches the native call the way the standard library gives names to its
+    /// own: a verbatim name as it is, any other made absolute, and from 248 characters with its
+    /// NUL given the verbatim prefix that lifts the old limit, for a drive, a share and a device.
+    #[cfg(windows)]
+    #[test]
+    fn a_name_is_given_to_windows_as_the_standard_library_gives_it() {
+        let native = |name: &str| {
+            let wide = self::windows::native_name(Path::new(name)).expect("a name");
+            assert_eq!(wide.last(), Some(&0), "{name}");
+            String::from_utf16(&wide[..wide.len() - 1]).expect("the name")
+        };
+        let long = "a".repeat(300);
+        assert_eq!(native(r"C:\short\name"), r"C:\short\name");
+        assert_eq!(native(&format!(r"C:\{long}")), format!(r"\\?\C:\{long}"));
+        assert_eq!(
+            native(&format!(r"\\server\share\{long}")),
+            format!(r"\\?\UNC\server\share\{long}")
+        );
+        assert_eq!(
+            native(&format!(r"\\.\C:\{long}")),
+            format!(r"\\?\C:\{long}")
+        );
+        for verbatim in [r"\\?\C:\x", r"\??\C:\x"] {
+            assert_eq!(native(verbatim), verbatim);
+        }
+        // The prefix begins where the name and its NUL reach 248 characters.
+        let under = format!(r"C:\{}", "a".repeat(243));
+        assert_eq!(under.len(), 246);
+        assert_eq!(native(&under), under);
+        let at = format!(r"C:\{}", "a".repeat(244));
+        assert_eq!(native(&at), format!(r"\\?\{at}"));
     }
 
     /// On Windows a file is given its name where the names run past the old limit of 260
