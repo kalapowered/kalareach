@@ -616,10 +616,18 @@ fn a_read_costs_the_same_whatever_the_history_holds() {
         let mut elapsed = 0.0;
         for _ in 0..READS {
             now_ms += 1;
-            assert!(
-                shallow_engine.at_ground(),
-                "the read has to end where a sequence ends, or the clear would cancel one"
-            );
+            if !shallow_engine.at_ground() {
+                // Recorded before the run ends, as every verdict here is: a clear in the middle of
+                // a sequence would cancel it, and nothing timed after that is this measurement.
+                let mut lines = host_lines();
+                lines.extend([
+                    format!("  read              {} bytes", read.len()),
+                    "  verdict           not valid: the read does not end where a sequence ends"
+                        .to_owned(),
+                ]);
+                report("KR-PERF-007 read cost against history depth", &lines);
+                panic!("the read has to end where a sequence ends, or the clear would cancel one");
+            }
             shallow_engine.feed(b"\x1b[3J", now_ms);
             shallow_engine
                 .lane_mut()
