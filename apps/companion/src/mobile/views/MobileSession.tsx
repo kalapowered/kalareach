@@ -18,7 +18,7 @@
  * the browser its own way with the text.
  */
 
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { flushSync } from 'react-dom'
 
 import { useApp } from '../../app/state'
@@ -45,6 +45,7 @@ import {
 import { renderMarkdown } from '../../markdown/render'
 import type { TerminalGrid, TerminalRoom, TerminalScreen } from '../../host/port'
 import { leftBlankOnPhone, stretchesOf, styleOf } from '../../terminal/cells'
+import { selectionRule } from '../../terminal/frame'
 import {
   ATTACHING,
   placeOf,
@@ -817,6 +818,7 @@ function RawTerminal({
   }
 
   const palette = screen?.palette
+  const gridName = useId()
   return (
     <div
       className="m-terminal"
@@ -902,6 +904,7 @@ function RawTerminal({
       <div ref={dragLayer}>
         <pre
           className="m-terminal-grid"
+          data-terminal-grid={gridName}
           style={{
             transform: `translate(${-shift.across * (cell?.width ?? 0)}px, ${
               -shift.down * (cell?.height ?? 0)
@@ -915,6 +918,8 @@ function RawTerminal({
           >
             {'M'.repeat(PROBE_CELLS)}
           </span>
+          {/* Selected text takes the session's selection colours, as it does on the desktop. */}
+          {palette ? <style data-terminal-selection="">{selectionRule(gridName, palette)}</style> : null}
           {screen && palette
             ? screen.lines.map((line, index) => (
                 <span key={`${index}-${line.row}`} data-testid="mobile-terminal-line">

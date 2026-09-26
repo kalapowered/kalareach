@@ -1,5 +1,5 @@
 /**
- * Placing a view's screen on the desktop's grid.
+ * Placing a view's screen on the desktop's grid, and the selection colours both grids share.
  *
  * The screen arrives as cells: lines of pieces, each with its column, its cells and its rendition.
  * The desktop draws each piece as a box of its own at its canonical cells: at its column, exactly
@@ -154,7 +154,16 @@ export function cursorColourOf(palette: PaletteState): string {
   return hex(palette.cursor)
 }
 
-/** The palette's colours for selected text. */
-export function selectionOf(palette: PaletteState): { readonly background: string; readonly foreground: string } {
-  return { background: hex(palette.selection_background), foreground: hex(palette.selection_foreground) }
+/**
+ * The rule that colours a selection in one grid in the palette's selection colours, as the
+ * terminal the session came from shows a selection. The desktop's grid and the phone's each carry
+ * it, each named by `grid`, the value of its own `data-terminal-grid`, so a grid never takes
+ * another grid's colours and nothing outside a grid takes them at all. A name is a React
+ * identifier; one with any other character could reach outside the selector, so it colours nothing.
+ */
+export function selectionRule(grid: string, palette: PaletteState): string {
+  if (!/^[\w-]+$/.test(grid)) return ''
+  const background = hex(palette.selection_background)
+  const foreground = hex(palette.selection_foreground)
+  return `[data-terminal-grid="${grid}"] ::selection { background-color: ${background}; color: ${foreground}; }`
 }

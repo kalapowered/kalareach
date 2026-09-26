@@ -571,6 +571,48 @@ test.describe('the raw terminal', () => {
     ])
   })
 
+  // The same copy as a person makes it: a selection made with the pointer, copied with the keyboard.
+  // Chromium's clipboard is read back. A page under test cannot read WebKit's, so there the text the
+  // copy put on its clipboard data is read as the copy leaves it.
+  test('copies a selection made with the pointer when the keyboard copies it', async ({
+    page,
+    context,
+    browserName
+  }) => {
+    if (browserName === 'chromium') await context.grantPermissions(['clipboard-read', 'clipboard-write'])
+    await openSession(page)
+    await page.getByRole('tab', { name: 'Terminal' }).click()
+    await expect(page.getByTestId('terminal-surface')).toContainText('cargo test -p kr-client')
+    await page.evaluate(() => {
+      window.addEventListener('copy', (event) => {
+        Object.assign(window, { krCopied: event.clipboardData?.getData('text/plain') ?? null })
+      })
+    })
+    const piece = (line: number) =>
+      page.locator(`[data-testid="terminal-piece"][data-line="${line}"][data-column="0"]`)
+    const from = await piece(0).boundingBox()
+    const to = await piece(2).boundingBox()
+    if (from === null || to === null) throw new Error('the pieces are not laid out')
+    await page.mouse.move(from.x + 1, from.y + from.height / 2)
+    await page.mouse.down()
+    await page.mouse.move(to.x + to.width - 1, to.y + to.height / 2, { steps: 8 })
+    await page.mouse.up()
+    expect(await page.evaluate(() => getSelection()?.toString() ?? '')).not.toBe('')
+
+    await page.keyboard.press('ControlOrMeta+c')
+    const copied = [
+      '$ cargo test -p kr-client',
+      '   Compiling kr-client v0.1.0',
+      '    Finished test profile in 12.4s'
+    ].join('\n')
+    await expect
+      .poll(() => page.evaluate(() => (window as unknown as { krCopied?: string | null }).krCopied))
+      .toBe(copied)
+    if (browserName === 'chromium') {
+      expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(copied)
+    }
+  })
+
   test('opens its view at the grid its surface holds, with no size report after', async ({ page }) => {
     await openSession(page)
     await page.getByRole('tab', { name: 'Terminal' }).click()
@@ -785,6 +827,75 @@ test.describe('how the host presents a raw view', () => {
     })
     await expect(page.getByTestId('terminal-position')).toContainText('Showing columns 1–')
     await page.screenshot({ path: shotFor('terminal-zoom-13.18'), fullPage: true })
+  })
+})
+
+// KR-REQ-13.08: the phone's grid and the desktop's colour a selection in the session's own selection
+// colours, as the terminal the session came from shows one, and the rest of the page keeps the
+// application's.
+test.describe("a raw view's selection", () => {
+  const SESSION_MAIN = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
+
+  /** The scripted session's selection colours: #315e4a behind #ffffff. */
+  const SESSION = { background: 'rgb(49, 94, 74)', colour: 'rgb(255, 255, 255)' }
+
+  /** Where a screenshot for this browser goes, so each engine keeps its own. */
+  const shotFor = (name: string): string => shot(`${name}-${test.info().project.name}`)
+
+  /** Opens the harness in one colour mode, whatever the system's. */
+  async function inTheme(page: Page, theme: 'light' | 'dark'): Promise<void> {
+    await page.addInitScript((mode) => {
+      localStorage.setItem('kalareach-theme', mode)
+    }, theme)
+  }
+
+  /** The colours a selection takes on `locator`'s element, as the browser resolves them. */
+  const selected = (locator: Locator) =>
+    locator.evaluate((element) => {
+      const style = getComputedStyle(element, '::selection')
+      return { background: style.backgroundColor, colour: style.color }
+    })
+
+  for (const theme of ['light', 'dark'] as const) {
+    test(`the phone's grid selects in the session's colours and the page in its own, ${theme}, at 320 px`, async ({
+      page
+    }) => {
+      await inTheme(page, theme)
+      await page.setViewportSize({ width: 320, height: 720 })
+      await page.goto(`/harness.html?surface=ios&session=${SESSION_MAIN}`)
+      const heading = page.locator('.m-topbar h1')
+      await expect(heading).toBeVisible()
+      // The application's own selection colours, before a terminal is drawn.
+      const own = await selected(heading)
+      expect(own).not.toEqual(SESSION)
+
+      await page.getByRole('tab', { name: 'Terminal' }).click()
+      const piece = page.getByTestId('mobile-terminal-line').first().locator('[data-cells]').first()
+      await expect(piece).toHaveText('$ cargo test -p kr-client')
+      await piece.evaluate((element) => {
+        getSelection()?.selectAllChildren(element)
+      })
+      expect(await selected(piece)).toEqual(SESSION)
+      // Everything outside the grid keeps the application's colours.
+      expect(await selected(heading)).toEqual(own)
+      expect(await selected(page.getByRole('tab', { name: 'Terminal' }))).toEqual(own)
+      await expect(page.locator('html')).toHaveAttribute('data-theme', theme)
+      await page.screenshot({ path: shotFor(`terminal-selection-13.08-phone-320-${theme}`), fullPage: true })
+    })
+  }
+
+  test("the desktop's grid selects in the same colours and the page in its own", async ({ page }) => {
+    await openSession(page)
+    const own = await selected(page.getByRole('tab', { name: 'Terminal' }))
+    expect(own).not.toEqual(SESSION)
+    await page.getByRole('tab', { name: 'Terminal' }).click()
+    const piece = page.locator('[data-testid="terminal-piece"][data-line="0"][data-column="0"]')
+    await expect(piece).toHaveText('$ cargo test -p kr-client')
+    await piece.evaluate((element) => {
+      getSelection()?.selectAllChildren(element)
+    })
+    expect(await selected(piece)).toEqual(SESSION)
+    expect(await selected(page.getByRole('tab', { name: 'Terminal' }))).toEqual(own)
   })
 })
 

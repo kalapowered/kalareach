@@ -215,6 +215,40 @@ describe("the phone's raw terminal view (KR-REQ-08.02, 13.18)", () => {
     expect(screen.getByTestId('mobile-terminal')).toHaveAttribute('aria-busy', 'false')
   })
 
+  it("colours a selection in the session's selection colours, and a new palette's replace them", async () => {
+    const { port, controls } = fakeHost()
+    await onTerminal(port)
+    await waitFor(() => {
+      expect(screen.getAllByTestId('mobile-terminal-line')).toHaveLength(8)
+    })
+    const grid = screen.getByTestId('mobile-terminal').querySelector<HTMLElement>('.m-terminal-grid')
+    const name = grid?.getAttribute('data-terminal-grid') ?? ''
+    expect(name).not.toBe('')
+    /** Every selection rule the grid carries. */
+    const rules = () =>
+      Array.from(grid?.querySelectorAll('style[data-terminal-selection]') ?? []).map((rule) => rule.textContent)
+    // One rule, for this grid alone, in the palette's selection colours.
+    expect(rules()).toHaveLength(1)
+    expect(rules()[0]).toContain(`[data-terminal-grid="${name}"] ::selection`)
+    expect(rules()[0]).toContain('background-color: #315e4a')
+    expect(rules()[0]).toContain('color: #ffffff')
+
+    const palette = terminalScreen(SESSION_MAIN, { columns: 80, rows: 8 }).palette
+    act(() => {
+      controls.terminalViews[0]?.show({
+        palette: {
+          ...palette,
+          selection_background: { red: 0x12, green: 0x34, blue: 0x56 },
+          selection_foreground: { red: 0xfe, green: 0xdc, blue: 0xba }
+        }
+      })
+    })
+    expect(rules()).toHaveLength(1)
+    expect(rules()[0]).toContain('background-color: #123456')
+    expect(rules()[0]).toContain('color: #fedcba')
+    expect(rules()[0]).not.toContain('#315e4a')
+  })
+
   it('says it is attaching before its view has attached, and draws nothing', async () => {
     const { port, controls } = fakeHost()
     controls.holdTerminalViews()

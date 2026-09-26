@@ -224,9 +224,13 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
     open(port)
     await screen.findByTestId('palette-provenance')
     const grid = screen.getByTestId('terminal-grid')
-    const rule = document.querySelector('style[data-terminal-selection]')?.textContent ?? ''
-    expect(grid.classList.contains('kr-terminal-grid')).toBe(true)
-    expect(rule).toContain('.kr-terminal-grid ::selection')
+    const name = grid.getAttribute('data-terminal-grid') ?? ''
+    const rules = Array.from(grid.querySelectorAll('style[data-terminal-selection]'))
+    // One rule, for this grid alone: a grid never takes another grid's colours.
+    expect(name).not.toBe('')
+    expect(rules).toHaveLength(1)
+    const rule = rules[0]?.textContent ?? ''
+    expect(rule).toContain(`[data-terminal-grid="${name}"] ::selection`)
     expect(rule).toContain('background-color: #315e4a')
     expect(rule).toContain('color: #ffffff')
   })

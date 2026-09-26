@@ -29,6 +29,7 @@
 import {
   useCallback,
   useEffect,
+  useId,
   useLayoutEffect,
   useRef,
   useState,
@@ -51,7 +52,7 @@ import {
   foregroundOf,
   placedCursor,
   placedPieces,
-  selectionOf,
+  selectionRule,
   type PlacedCursor
 } from './frame'
 import {
@@ -179,10 +180,10 @@ function Grid({
   const columns = count(screen.window.columns)
   const rows = count(screen.window.rows)
   const pieces = placedPieces(screen)
-  const selection = selectionOf(palette)
+  const name = useId()
   return (
     <div
-      className="kr-terminal-grid"
+      data-terminal-grid={name}
       data-testid="terminal-grid"
       data-columns={columns}
       data-rows={rows}
@@ -227,9 +228,7 @@ function Grid({
         </span>
       ))}
       {/* Selected text takes the session's selection colours, as the terminal it came from shows it. */}
-      <style data-terminal-selection="">
-        {`.kr-terminal-grid ::selection { background-color: ${selection.background}; color: ${selection.foreground}; }`}
-      </style>
+      <style data-terminal-selection="">{selectionRule(name, palette)}</style>
       {cursor === null ? null : (
         <span
           data-testid="terminal-cursor"
