@@ -943,7 +943,6 @@ pub struct Asked {
 
 /// A definition checked for a start request, with the environment's lock held until the request
 /// has been made.
-
 pub struct Verified {
     record: Record,
     expected: Definition,
