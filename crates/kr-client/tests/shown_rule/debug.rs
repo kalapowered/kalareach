@@ -445,6 +445,8 @@ impl Shape {
 struct Shape {
     name: String,
     members: Vec<Member>,
+    /// Whether a `cfg` this reading cannot decide can leave the variant out.
+    conditional: bool,
 }
 
 /// One struct, enum or union some crate declares. A path can have several, one for each set of
@@ -498,6 +500,9 @@ struct Debugs {
     /// Every macro a crate of the workspace writes, by full path, and whether it exports it at its
     /// crate's root.
     macros: BTreeMap<String, bool>,
+    /// The exported macros one of whose definitions no `cfg` this reading cannot decide can leave
+    /// out.
+    always_macros: BTreeSet<String>,
     /// The crates that take macros from another crate with `#[macro_use]`, where a macro's single
     /// name can be one this reading does not list.
     macro_use: BTreeSet<String>,
@@ -576,6 +581,7 @@ impl Debugs {
         }
         let mut modules = BTreeMap::new();
         let mut macros = BTreeMap::new();
+        let mut always_macros = BTreeSet::new();
         let mut macro_use = BTreeSet::new();
         for (index, source) in sources.iter().enumerate() {
             for (scope, entry) in source.scopes.iter().enumerate() {
@@ -595,9 +601,11 @@ impl Debugs {
             for (name, open, _) in macro_bodies(tokens) {
                 // `macro_rules`, `!` and the name come before the body.
                 let exported = attributed(open - 3, "macro_export");
-                *macros
-                    .entry(format!("{}::{name}", source.crate_name))
-                    .or_insert(false) |= exported;
+                let path = format!("{}::{name}", source.crate_name);
+                if exported && !item_conditional(tokens, open - 3) {
+                    always_macros.insert(path.clone());
+                }
+                *macros.entry(path).or_insert(false) |= exported;
             }
             for at in 0..tokens.len() {
                 if ident(tokens.get(at)) == Some("extern")
@@ -615,6 +623,7 @@ impl Debugs {
             crates,
             modules,
             macros,
+            always_macros,
             macro_use,
             declared: BTreeMap::new(),
             type_aliases: BTreeMap::new(),
@@ -1181,7 +1190,9 @@ impl Debugs {
                 let close = closing(tokens, cursor).unwrap_or(tokens.len());
                 let mut variant = cursor + 1;
                 while variant < close {
+                    let mut conditional = false;
                     while punct(tokens.get(variant), '#') {
+                        conditional |= cfg_is_conditional(tokens, variant + 1);
                         variant = attribute_end(tokens, variant).unwrap_or(close);
                     }
                     let Some(variant_name) = ident(tokens.get(variant)).map(ToOwned::to_owned)
@@ -1205,6 +1216,7 @@ impl Debugs {
                     shapes.push(Shape {
                         name: variant_name,
                         members,
+                        conditional,
                     });
                     while variant < close && !punct(tokens.get(variant), ',') {
                         variant += 1;
@@ -1223,6 +1235,7 @@ impl Debugs {
                 shapes.push(Shape {
                     name: name.clone(),
                     members,
+                    conditional: false,
                 });
             }
         }
@@ -1974,10 +1987,15 @@ impl Debugs {
         }
         let exported = format!("{module}::{name}");
         if scope == 0 && source.module.len() == 1 && self.macros.get(&exported) == Some(&true) {
+            let present = self.always_macros.contains(&exported);
             given.push(Named {
                 path: exported,
-                reach: Reach::Everywhere,
-                present: true,
+                reach: if present {
+                    Reach::Everywhere
+                } else {
+                    Reach::Unsure
+                },
+                present,
             });
         }
         Ok(given)
@@ -2041,21 +2059,32 @@ impl Debugs {
             }
             // A type of the workspace, whose variants an import can name.
             return match self.declared.get(module) {
-                Some(definitions) => Ok(definitions
-                    .iter()
-                    .any(|declared| {
-                        declared
-                            .shapes
-                            .iter()
-                            .any(|shape| shape.name == name && shape.name != declared.name)
-                    })
-                    .then(|| Named {
-                        path: full.clone(),
-                        reach: Reach::Everywhere,
-                        present: true,
-                    })
-                    .into_iter()
-                    .collect()),
+                Some(definitions) => {
+                    let variant = |declared: &Declared, always: bool| {
+                        declared.shapes.iter().any(|shape| {
+                            shape.name == name
+                                && shape.name != declared.name
+                                && !(always && shape.conditional)
+                        })
+                    };
+                    // A variant a `cfg` can leave out, or one another definition of the enum
+                    // lacks, is there under some conditions only.
+                    let present = definitions.iter().all(|declared| variant(declared, true));
+                    Ok(definitions
+                        .iter()
+                        .any(|declared| variant(declared, false))
+                        .then(|| Named {
+                            path: full.clone(),
+                            reach: if present {
+                                Reach::Everywhere
+                            } else {
+                                Reach::Unsure
+                            },
+                            present,
+                        })
+                        .into_iter()
+                        .collect())
+                }
                 None => Err(format!("{module}, a module this reading cannot find")),
             };
         };
@@ -2689,6 +2718,9 @@ struct Binding {
     from: usize,
     to: usize,
     written: Option<Written>,
+    /// Whether a `cfg` this reading cannot decide can leave the `let` out, and an earlier binding
+    /// of the name stay in force.
+    removable: bool,
 }
 
 /// One `Debug` written by hand, being read.
@@ -2785,10 +2817,13 @@ impl Reading<'_> {
 
     /// The binding of `name` in force at `at`, the innermost first.
     fn binding(&self, name: &str, at: usize) -> Option<&Binding> {
-        self.bindings
+        let latest = self
+            .bindings
             .iter()
             .filter(|binding| binding.name == name && binding.from <= at && at <= binding.to)
-            .max_by_key(|binding| binding.from)
+            .max_by_key(|binding| binding.from)?;
+        // A binding a `cfg` can leave out may not be the one in force: the name has no one type.
+        (!latest.removable).then_some(latest)
     }
 
     /// Records every name a `match`, a `let` or an `if let` binds, with where it is in force.
@@ -2832,61 +2867,74 @@ impl Reading<'_> {
                     }
                 }
                 Some("let") => {
-                    let Some(equals) = (at + 1..body.len()).find(|&equals| {
-                        (punct(body.get(equals), '=') && !punct(body.get(equals + 1), '='))
-                            || punct(body.get(equals), ';')
-                    }) else {
-                        continue;
-                    };
-                    let conditional =
-                        at > 0 && matches!(ident(body.get(at - 1)), Some("if" | "while"));
-                    let end = (equals..body.len())
-                        .find(|&end| {
-                            (punct(body.get(end), ';')
-                                || (conditional && punct(body.get(end), '{')))
-                                && depth_between(body, equals, end) == 0
-                        })
-                        .unwrap_or(body.len() - 1);
-                    let value = &body[equals + 1..end];
-                    let scrutinee = self.place_type(value, at).ok();
-                    let (from, to) = if conditional {
-                        (end, closing(body, end).unwrap_or(body.len() - 1))
-                    } else {
-                        (end, enclosing_close(body, at))
-                    };
-                    let mut pattern = &body[at + 1..equals];
-                    // A type written on the binding is its type.
-                    if let Some(colon) = pattern
-                        .iter()
-                        .position(|located| located.token == Token::Punct(':'))
-                    {
-                        let written = self.written_at(at, &pattern[colon + 1..]);
-                        pattern = &pattern[..colon];
-                        if let Some(name) = single_binding(pattern) {
-                            self.bindings.push(Binding {
-                                name,
-                                from,
-                                to,
-                                written: Some(written),
-                            });
-                            continue;
-                        }
-                    }
-                    if conditional {
-                        self.bind_pattern(pattern, scrutinee.as_ref(), from, to);
-                    } else if let Some(name) = single_binding(pattern) {
-                        self.bindings.push(Binding {
-                            name,
-                            from,
-                            to,
-                            written: scrutinee,
-                        });
-                    } else {
-                        self.bind_unknown(pattern, from, to);
+                    let bound = self.bindings.len();
+                    let removable = (before_item(body, at)..at).any(|index| {
+                        punct(body.get(index), '#') && cfg_is_conditional(body, index + 1)
+                    });
+                    self.bind_let(at);
+                    for binding in &mut self.bindings[bound..] {
+                        binding.removable = removable;
                     }
                 }
                 _ => {}
             }
+        }
+    }
+
+    /// Records the names the `let` at `at` binds.
+    fn bind_let(&mut self, at: usize) {
+        let body = self.body;
+        let Some(equals) = (at + 1..body.len()).find(|&equals| {
+            (punct(body.get(equals), '=') && !punct(body.get(equals + 1), '='))
+                || punct(body.get(equals), ';')
+        }) else {
+            return;
+        };
+        let conditional = at > 0 && matches!(ident(body.get(at - 1)), Some("if" | "while"));
+        let end = (equals..body.len())
+            .find(|&end| {
+                (punct(body.get(end), ';') || (conditional && punct(body.get(end), '{')))
+                    && depth_between(body, equals, end) == 0
+            })
+            .unwrap_or(body.len() - 1);
+        let value = &body[equals + 1..end];
+        let scrutinee = self.place_type(value, at).ok();
+        let (from, to) = if conditional {
+            (end, closing(body, end).unwrap_or(body.len() - 1))
+        } else {
+            (end, enclosing_close(body, at))
+        };
+        let mut pattern = &body[at + 1..equals];
+        // A type written on the binding is its type.
+        if let Some(colon) = pattern
+            .iter()
+            .position(|located| located.token == Token::Punct(':'))
+        {
+            let written = self.written_at(at, &pattern[colon + 1..]);
+            pattern = &pattern[..colon];
+            if let Some(name) = single_binding(pattern) {
+                self.bindings.push(Binding {
+                    name,
+                    from,
+                    to,
+                    written: Some(written),
+                    removable: false,
+                });
+                return;
+            }
+        }
+        if conditional {
+            self.bind_pattern(pattern, scrutinee.as_ref(), from, to);
+        } else if let Some(name) = single_binding(pattern) {
+            self.bindings.push(Binding {
+                name,
+                from,
+                to,
+                written: scrutinee,
+                removable: false,
+            });
+        } else {
+            self.bind_unknown(pattern, from, to);
         }
     }
 
@@ -2905,6 +2953,7 @@ impl Reading<'_> {
                 from,
                 to,
                 written: scrutinee.cloned(),
+                removable: false,
             });
             return;
         }
@@ -2966,6 +3015,7 @@ impl Reading<'_> {
                 from,
                 to,
                 written,
+                removable: false,
             });
         }
     }
@@ -2988,6 +3038,7 @@ impl Reading<'_> {
                     from,
                     to,
                     written: None,
+                    removable: false,
                 });
             }
         }
@@ -3168,6 +3219,24 @@ impl Reading<'_> {
         let mut at = 0;
         while at < body.len() {
             let word = ident(body.get(at));
+            // A macro this reading does not know can give a name the body uses a binding of its
+            // own, `let $name = …`: the body is read only with the macros this reading knows.
+            if let Some(name) = word
+                && punct(body.get(at + 1), '!')
+                && matches!(
+                    body.get(at + 2).map(|located| &located.token),
+                    Some(Token::Punct('(' | '[' | '{'))
+                )
+                && !KEYWORDS.contains(&name)
+                && !self
+                    .placed_at(at, &path_ending_at(body, at), Kind::Macro)
+                    .is_ok_and(|path| macro_read(&path))
+            {
+                return Err(self.refuse(
+                    at,
+                    format!("the macro {name}!, which this reading does not read"),
+                ));
+            }
             if word == Some(self.formatter.as_str()) && punct(body.get(at + 1), '.') {
                 let end = self.read_chain(at)?;
                 used.insert(at);
@@ -3780,24 +3849,33 @@ fn no_debug_in_either_crate_prints_text_that_arrived() {
 /// What the `Debug` rule finds in one control file of a command-line crate, beside the claims and
 /// the failures every control can use, with `other` as a crate of the workspace it does not hold.
 fn debug_findings_in(label: &str, text: &str, other: &str) -> Vec<Finding> {
-    let scratch = Scratch::files(
-        label,
-        &[
-            ("crates/kr-cli/Cargo.toml", "[package]\nname = \"kr-cli\"\n"),
-            (
-                "crates/kr-cli/src/lib.rs",
-                "mod control;\nmod error;\nmod shown;\n",
-            ),
-            ("crates/kr-cli/src/shown.rs", SHOWN_CONTROL),
-            ("crates/kr-cli/src/error.rs", ERRORS_CONTROL),
-            ("crates/kr-cli/src/control.rs", text),
-            (
-                "crates/kr-other/Cargo.toml",
-                "[package]\nname = \"kr-other\"\n",
-            ),
-            ("crates/kr-other/src/lib.rs", other),
-        ],
-    );
+    debug_findings_among(label, text, other, &[])
+}
+
+/// [`debug_findings_in`], with `more` files beside the other crate's root.
+fn debug_findings_among(
+    label: &str,
+    text: &str,
+    other: &str,
+    more: &[(&str, &str)],
+) -> Vec<Finding> {
+    let mut files = vec![
+        ("crates/kr-cli/Cargo.toml", "[package]\nname = \"kr-cli\"\n"),
+        (
+            "crates/kr-cli/src/lib.rs",
+            "mod control;\nmod error;\nmod shown;\n",
+        ),
+        ("crates/kr-cli/src/shown.rs", SHOWN_CONTROL),
+        ("crates/kr-cli/src/error.rs", ERRORS_CONTROL),
+        ("crates/kr-cli/src/control.rs", text),
+        (
+            "crates/kr-other/Cargo.toml",
+            "[package]\nname = \"kr-other\"\n",
+        ),
+        ("crates/kr-other/src/lib.rs", other),
+    ];
+    files.extend_from_slice(more);
+    let scratch = Scratch::files(label, &files);
     let guarded = crate_sources(
         &scratch.workspace,
         &scratch.workspace.join("crates/kr-cli/src/lib.rs"),
@@ -4421,6 +4499,34 @@ fn each_name_is_placed_where_the_compiler_places_it() {
             "a derived Debug over text that arrived",
         ),
         (
+            "a variant a glob gives under some conditions only, past which the outer name is the Debug trait",
+            "",
+            "use std::fmt::Debug;\npub enum Names {\n    #[cfg(not(unix))]\n    Debug,\n}\npub struct Leak(pub String);\nconst _: () = {\n    use self::Names::*;\n    #[cfg(unix)]\n    impl Debug for Leak {\n        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n            formatter.debug_tuple(\"Leak\").field(&self.0).finish()\n        }\n    }\n};\n",
+            10,
+            "a trait this reading cannot place",
+        ),
+        (
+            "an alias a cfg under cfg_attr can leave out, past which a glob gives text",
+            "pub mod values {\n    pub type Handle = String;\n}\npub mod names {\n    pub use super::values::*;\n    #[cfg_attr(unix, cfg(not(unix)))]\n    pub type Handle = u64;\n}\n",
+            "#[derive(Debug)]\npub struct Leak(pub kr_other::names::Handle);\n",
+            1,
+            "a derived Debug over text that arrived",
+        ),
+        (
+            "a binding in a Debug written by hand a cfg can leave out",
+            "",
+            "pub struct Leak(pub String);\nimpl std::fmt::Debug for Leak {\n    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n        let value = &self.0;\n        #[cfg(not(unix))]\n        let value: u64 = 0;\n        formatter.debug_tuple(\"Leak\").field(&value).finish()\n    }\n}\n",
+            7,
+            "a value this reading cannot place",
+        ),
+        (
+            "a binding a macro in another crate's Debug written by hand gives the name again",
+            "macro_rules! shadow {\n    ($name:ident, $value:expr) => {\n        let $name = $value;\n    };\n}\npub struct Secret(pub u64, pub String);\nimpl std::fmt::Debug for Secret {\n    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n        let value = &self.0;\n        shadow!(value, &self.1);\n        formatter.debug_tuple(\"Secret\").field(value).finish()\n    }\n}\n",
+            "#[derive(Debug)]\npub struct Leak(pub kr_other::Secret);\n",
+            1,
+            "a derived Debug over text that arrived",
+        ),
+        (
             "an extern crate",
             "",
             "extern crate kr_other;\n",
@@ -4496,4 +4602,26 @@ fn names_the_compiler_places_elsewhere_are_not_named() {
         })
         .collect();
     assert!(named.is_empty(), "{}", named.join("\n"));
+}
+
+/// A module whose file a `#[path]` names is not read at its default place, where another file can
+/// stand: what the module holds is unknown to this reading, so a type it gives carries.
+#[test]
+fn a_module_a_path_moves_is_not_read_at_its_default_place() {
+    let findings = debug_findings_among(
+        "debug-path",
+        "#[derive(Debug)]\npub struct Leak(pub kr_other::net::Handle);\n",
+        "#[path = \"real.rs\"]\npub mod net;\n",
+        &[
+            ("crates/kr-other/src/real.rs", "pub type Handle = String;\n"),
+            ("crates/kr-other/src/net.rs", "pub type Handle = u64;\n"),
+        ],
+    );
+    assert!(
+        findings.iter().any(|finding| finding.line == 1
+            && finding
+                .what
+                .contains("a derived Debug over text that arrived")),
+        "{findings:?}"
+    );
 }
