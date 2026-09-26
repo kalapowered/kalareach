@@ -14,7 +14,7 @@
 use kr_protocol::gateway::PendingState;
 use kr_protocol::grant::{EnvironmentSelector, Grant, GrantExpiry, HistoryScope, SessionSelector};
 use kr_protocol::ids::{
-    ApprovalRequestId, AuthorityRevision, DeviceId, GrantId, QuestionId, SessionId,
+    AuthorityRevision, DeviceId, GrantId, PendingResourceId, QuestionId, SessionId,
 };
 use kr_protocol::projection::{ProjectedBuffer, ProjectionEvent, ProjectionResetReason};
 use kr_protocol::rights::ActionRight;
@@ -34,8 +34,9 @@ fn question_id(byte: u8) -> QuestionId {
     QuestionId::new(Uuid::from_bytes([byte; 16]))
 }
 
-fn approval_id(text: &str) -> ApprovalRequestId {
-    ApprovalRequestId::new(text).expect("an approval request identifier")
+/// The resource the broker arbitrates for one approval, which is how a grant names it.
+fn approval_resource(byte: u8) -> PendingResourceId {
+    PendingResourceId::new(Uuid::from_bytes([byte; 16]))
 }
 
 fn dimensions(columns: u64, rows: u64) -> kr_protocol::session::Dimensions {
@@ -70,13 +71,13 @@ fn scope(
     lower_bound_ms: Option<u64>,
     include_live_screen: bool,
     named_questions: &[QuestionId],
-    named_approvals: &[ApprovalRequestId],
+    named_approvals: &[PendingResourceId],
 ) -> HistoryScope {
     HistoryScope {
         lower_bound_ms: Nullable(lower_bound_ms.map(TimestampMs::new)),
         include_live_screen,
         named_questions: named_questions.iter().copied().collect(),
-        named_approvals: named_approvals.iter().cloned().collect(),
+        named_approvals: named_approvals.iter().copied().collect(),
     }
 }
 
@@ -406,8 +407,8 @@ fn voice_context_intersects_the_requesting_device_scope() {
 fn a_named_question_is_permitted_and_previewed_although_it_predates_the_cutoff() {
     let named = question_id(7);
     let unnamed = question_id(8);
-    let approval = approval_id("upstream-opaque-request-id");
-    let other_approval = approval_id("another-request");
+    let approval = approval_resource(0x71);
+    let other_approval = approval_resource(0x72);
 
     let filter = HistoryFilter::new(ViewerScope::from_grant(&grant(
         scope(
@@ -461,7 +462,7 @@ fn a_named_question_is_permitted_and_previewed_although_it_predates_the_cutoff()
 /// grant without `session.view` reaches none, named or not.
 #[test]
 fn a_named_approval_is_excepted_only_while_it_is_current() {
-    let named = approval_id("a-named-approval");
+    let named = approval_resource(0x73);
     let before = CUTOFF_MS - 5_000;
     let filter = HistoryFilter::new(ViewerScope::from_grant(&grant(
         scope(Some(CUTOFF_MS), false, &[], std::slice::from_ref(&named)),

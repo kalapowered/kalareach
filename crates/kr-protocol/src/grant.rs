@@ -12,7 +12,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::ids::{
-    ApprovalRequestId, AuthorityRevision, DeviceId, EnvironmentId, GrantId, OrganisationId,
+    AuthorityRevision, DeviceId, EnvironmentId, GrantId, OrganisationId, PendingResourceId,
     QuestionId, SessionId,
 };
 use crate::rights::ActionRight;
@@ -118,8 +118,12 @@ pub struct HistoryScope {
     pub include_live_screen: bool,
     /// Current questions named explicitly, even when they were created before the lower bound.
     pub named_questions: CanonicalSet<QuestionId>,
-    /// Current approval requests named explicitly, on the same terms.
-    pub named_approvals: CanonicalSet<ApprovalRequestId>,
+    /// Current approvals named explicitly, on the same terms, each by the identity of the one
+    /// resource the broker arbitrates for it.
+    ///
+    /// An upstream's own request identifier does not pick out one request: two connections both
+    /// call their first request `1`. A resource identity names exactly one.
+    pub named_approvals: CanonicalSet<PendingResourceId>,
 }
 
 impl HistoryScope {

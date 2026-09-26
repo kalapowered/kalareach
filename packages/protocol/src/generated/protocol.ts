@@ -495,10 +495,6 @@ export type ActionRight =
   | 'host.manage'
   | 'voice.use'
 /**
- * An upstream approval request identifier. Opaque to KalaReach.
- */
-export type ApprovalRequestId = string
-/**
  * One agent-to-user question.
  */
 export type QuestionId = string
@@ -777,6 +773,10 @@ export type ActionTokenId = string
  * A host-issued action window identifier, bound to one authenticated connection and host boot.
  */
 export type ActionWindowId = string
+/**
+ * An upstream approval request identifier. Opaque to KalaReach.
+ */
+export type ApprovalRequestId = string
 /**
  * One backup archive. The service sees only this opaque identifier.
  */
@@ -7057,9 +7057,13 @@ export interface HistoryScope {
    */
   lower_bound_ms: TimestampMs | null
   /**
-   * Current approval requests named explicitly, on the same terms.
+   * Current approvals named explicitly, on the same terms, each by the identity of the one
+   * resource the broker arbitrates for it.
+   *
+   * An upstream's own request identifier does not pick out one request: two connections both
+   * call their first request `1`. A resource identity names exactly one.
    */
-  named_approvals: ApprovalRequestId[]
+  named_approvals: PendingResourceId[]
   /**
    * Current questions named explicitly, even when they were created before the lower bound.
    */
@@ -12619,9 +12623,13 @@ export interface HistoryScope1 {
    */
   lower_bound_ms: TimestampMs | null
   /**
-   * Current approval requests named explicitly, on the same terms.
+   * Current approvals named explicitly, on the same terms, each by the identity of the one
+   * resource the broker arbitrates for it.
+   *
+   * An upstream's own request identifier does not pick out one request: two connections both
+   * call their first request `1`. A resource identity names exactly one.
    */
-  named_approvals: ApprovalRequestId[]
+  named_approvals: PendingResourceId[]
   /**
    * Current questions named explicitly, even when they were created before the lower bound.
    */
@@ -12729,9 +12737,9 @@ export interface RoleSelection {
    */
   include_question_respond: boolean
   /**
-   * Current approval requests this invitation names explicitly.
+   * Current approvals this invitation names explicitly, by the broker's resource identity.
    */
-  named_approvals: ApprovalRequestId[]
+  named_approvals: PendingResourceId[]
   /**
    * Current questions this invitation names explicitly.
    */
@@ -12899,9 +12907,13 @@ export interface HistoryScope2 {
    */
   lower_bound_ms: TimestampMs | null
   /**
-   * Current approval requests named explicitly, on the same terms.
+   * Current approvals named explicitly, on the same terms, each by the identity of the one
+   * resource the broker arbitrates for it.
+   *
+   * An upstream's own request identifier does not pick out one request: two connections both
+   * call their first request `1`. A resource identity names exactly one.
    */
-  named_approvals: ApprovalRequestId[]
+  named_approvals: PendingResourceId[]
   /**
    * Current questions named explicitly, even when they were created before the lower bound.
    */
@@ -12924,17 +12936,17 @@ export interface LiveScreenPreview {
   truncated: boolean
 }
 /**
- * One current approval request an invitation names explicitly.
+ * One current approval an invitation names explicitly.
  */
 export interface NamedApprovalPreview {
-  /**
-   * An upstream approval request identifier. Opaque to KalaReach.
-   */
-  approval_request_id: string
   /**
    * A UTC timestamp in milliseconds, as a decimal string in JSON.
    */
   created_at_ms: string
+  /**
+   * One pending resource the broker arbitrates and resolves exactly once.
+   */
+  resource_id: string
   /**
    * What the upstream is asking to do.
    */
@@ -14865,9 +14877,13 @@ export interface HistoryScope3 {
    */
   lower_bound_ms: TimestampMs | null
   /**
-   * Current approval requests named explicitly, on the same terms.
+   * Current approvals named explicitly, on the same terms, each by the identity of the one
+   * resource the broker arbitrates for it.
+   *
+   * An upstream's own request identifier does not pick out one request: two connections both
+   * call their first request `1`. A resource identity names exactly one.
    */
-  named_approvals: ApprovalRequestId[]
+  named_approvals: PendingResourceId[]
   /**
    * Current questions named explicitly, even when they were created before the lower bound.
    */
@@ -21463,9 +21479,9 @@ export interface RoleSelection1 {
    */
   include_question_respond: boolean
   /**
-   * Current approval requests this invitation names explicitly.
+   * Current approvals this invitation names explicitly, by the broker's resource identity.
    */
-  named_approvals: ApprovalRequestId[]
+  named_approvals: PendingResourceId[]
   /**
    * Current questions this invitation names explicitly.
    */
@@ -25002,7 +25018,7 @@ export interface VoiceDelegateParams {
  */
 export interface VerifiedApprovalAnswer {
   /**
-   * An upstream approval request identifier. Opaque to KalaReach.
+   * The approval being answered.
    */
   approval_request_id: string
   /**
