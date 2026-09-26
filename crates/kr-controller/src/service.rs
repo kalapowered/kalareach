@@ -68,6 +68,10 @@ use crate::supervision::{JobRetirement, LaunchOutcome, WorkerLaunch, WorkerSuper
 #[path = "net/mod.rs"]
 pub mod net;
 
+/// The rounds of plugin admissions this daemon sends its workers.
+#[path = "catalogue/rounds.rs"]
+mod admission_rounds;
+
 /// How long a closing worker is watched before the controller stops waiting for it to end.
 pub const CLOSURE_WATCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
@@ -739,6 +743,13 @@ pub struct Controller {
     project: Arc<crate::project::ProjectModule>,
     /// The environment's plugin catalogues, whose two method groups this daemon dispatches.
     catalogue: Arc<crate::catalogue::CatalogueModule>,
+    /// What the workers hold live and which of them have reported it, which the catalogue asks
+    /// before a reclaim that needs room.
+    plugin_bridge: Arc<crate::catalogue::bridge::WorkerBridge>,
+    /// What asks the admissions cadence for a pass before its next tick.
+    admissions_due: Arc<tokio::sync::Notify>,
+    /// Why admissions could not be handed over lately, for the doctor's catalogue check.
+    admission_notes: std::sync::Mutex<Vec<String>>,
     /// The environment's grants and invitations, which the sharing and device method groups act on.
     sharing: Arc<crate::sharing::SharingService>,
     /// The environment's voice service: the coordinator and the seams it reads and proposes
@@ -1045,10 +1056,13 @@ impl Controller {
         let authority_revision = registry.authority_revision()?;
         let transfer = Arc::new(crate::transfer::TransferModule::open(&setup.paths).await?);
         let project = Arc::new(crate::project::ProjectModule::open(&setup.paths).await?);
-        // The catalogue fetches through the proxy this daemon started with, the endpoint's own.
+        // The catalogue fetches through the proxy this daemon started with, the endpoint's own,
+        // and asks this generation's member set what the workers hold before it makes room.
+        let plugin_bridge = Arc::new(crate::catalogue::bridge::WorkerBridge::new(generation));
         let catalogue = Arc::new(crate::catalogue::CatalogueModule::open(
             &setup.paths,
             Self::proxy_of(&started)?.as_ref(),
+            Arc::clone(&plugin_bridge) as Arc<dyn kr_plugin_catalogue::BrokerBridge>,
         )?);
         // The change-set service reads every repository through the project service's own opened
         // handles and restricted execution profile, so it takes that service rather than opening
@@ -1259,6 +1273,9 @@ impl Controller {
             secret_store: setup.secret_store,
             generation,
             paths: setup.paths,
+            plugin_bridge,
+            admissions_due: Arc::new(tokio::sync::Notify::new()),
+            admission_notes: std::sync::Mutex::new(Vec::new()),
             catalogue_evidence: None,
             accepted_configuration: Mutex::new(accepted_configuration),
             in_force: std::sync::Mutex::new(in_force),
@@ -1331,6 +1348,9 @@ impl Controller {
             Directory::rebuild(&controller.paths, &registry, &controller.reconnect()).await?
         };
         *controller.directory.lock().await = directory;
+        // Every reservation whose claim was consumed and every recorded worker is a member of the
+        // plugin admissions' set before anything is served, each pending until it reports.
+        controller.seed_admission_members().await?;
         // A reboot ends every live execution, of either profile. Sessions published in an earlier
         // boot are closed with that as their reason before anything tries to recover them, so the
         // record says the host restarted rather than that a worker died for reasons unknown.
@@ -1341,6 +1361,9 @@ impl Controller {
         controller.sweep_worker_dirs().await?;
         // Before this daemon serves anything, so no job a create of its own defines is looked at.
         controller.retire_ended_jobs().await;
+        // The workers recovery reached are sent their admissions from here on, and every member
+        // that is pending or not confirmed ended is asked about on a cadence.
+        controller.start_admissions_cadence();
         // A fence this environment recorded and never saw answered is announced again, to the
         // workers this daemon has just reconnected to. The debt is durable, so a daemon that
         // stopped between raising a fence and hearing every answer comes back still owing it; the
@@ -3881,11 +3904,18 @@ impl Controller {
     /// Adds a verified worker to the directory, with its own description of its session where
     /// this daemon has one (`Directory::insert`), and starts reading its attention sources.
     async fn add_worker(&self, worker: KnownWorker, described: Option<SessionSummary>) {
+        // A recorded or adopted worker answers rounds of plugin admissions on its own endpoint from
+        // here on, and is sent one at once.
+        self.plugin_bridge.recorded(
+            worker.descriptor.session_id,
+            worker.descriptor.process_start_identity.clone(),
+        );
         self.directory
             .lock()
             .await
             .insert(worker.clone(), described);
         self.attention.watch(self.attention_reach(), worker);
+        self.admissions_due();
     }
 
     /// Starts the attention store's reading of every session it has to read.
@@ -4036,6 +4066,7 @@ impl Controller {
                 // somebody's question, and the directory stays until it is answered.
                 if resolved {
                     self.discard_worker_dir(claim.session_id);
+                    self.plugin_bridge.ended(claim.session_id);
                 }
                 self.resolve(reservation_id, Err(error)).await;
                 Ok(())
@@ -4080,6 +4111,7 @@ impl Controller {
             .ok_or_else(|| ControllerError::rendezvous("the platform did not report the peer"))?;
         if u64::from(peer_pid) != launcher.pid.get() {
             self.registry.lock().await.fence(claim.reservation_id)?;
+            self.plugin_bridge.fenced(claim.session_id);
             return Err(ControllerError::rendezvous(
                 "the connecting process is not the one the launcher started",
             ));
@@ -4094,12 +4126,14 @@ impl Controller {
         })?;
         if connected != launcher {
             self.registry.lock().await.fence(claim.reservation_id)?;
+            self.plugin_bridge.fenced(claim.session_id);
             return Err(ControllerError::rendezvous(
                 "the connecting process did not start when the launcher's did",
             ));
         }
         if claim.process_start_identity != connected {
             self.registry.lock().await.fence(claim.reservation_id)?;
+            self.plugin_bridge.fenced(claim.session_id);
             return Err(ControllerError::rendezvous(
                 "the claim's process identity is not the connecting process's",
             ));
@@ -4109,7 +4143,16 @@ impl Controller {
         // this worker from now on. Everything above is a check; this is the commitment.
         let reservation = {
             let mut registry = self.registry.lock().await;
-            registry.claim_rendezvous(claim.reservation_id, claim.worker_public_key)?
+            match registry.claim_rendezvous(claim.reservation_id, claim.worker_public_key) {
+                Ok(reservation) => reservation,
+                Err(error) => {
+                    // A claim on a reservation already claimed fences it, and the worker that
+                    // made the first claim may hold admissions by now: it stays a member, never
+                    // sent another round, until its process is known to have ended.
+                    self.plugin_bridge.fenced(claim.session_id);
+                    return Err(error);
+                }
+            }
         };
         let recorded = reservation.create_intent.as_deref().ok_or_else(|| {
             ControllerError::rendezvous(
@@ -4141,7 +4184,9 @@ impl Controller {
         } else {
             Nullable::null()
         };
-        let admissions = self.first_admissions();
+        let admissions = self
+            .first_admissions(reservation.session_id, launcher.clone())
+            .await;
         let plugins = kr_protocol::admission::AdmissionsHeader {
             frame: admissions[0].frame,
             parts: admissions[0].parts,
@@ -4161,24 +4206,6 @@ impl Controller {
             },
             admissions,
         ))
-    }
-
-    /// The first snapshot of plugin admissions a worker is handed with its specification: one
-    /// part, admitting nothing.
-    fn first_admissions(&self) -> Vec<kr_protocol::admission::PluginAdmissions> {
-        vec![kr_protocol::admission::PluginAdmissions {
-            environment_id: self.paths.environment_id(),
-            frame: kr_protocol::admission::FrameId {
-                generation: self.generation,
-                revision: kr_protocol::scalars::U64::new(0),
-                round: kr_protocol::scalars::U64::new(1),
-            },
-            part: 1,
-            parts: 1,
-            policy: kr_protocol::admission::RevocationPolicy::WarnOnly,
-            packages: Vec::new(),
-            releases: Vec::new(),
-        }]
     }
 
     /// Waits for the launcher's reported identity to reach the registry.
@@ -5530,8 +5557,7 @@ impl Controller {
         }
         if crate::catalogue::CatalogueModule::serves(method) {
             return self
-                .catalogue
-                .read_frame(kr_protocol::actor::ActorIngress::LocalIpc, request)
+                .catalogue_read_frame(kr_protocol::actor::ActorIngress::LocalIpc, request)
                 .await;
         }
         if crate::changeset::ChangeSetModule::serves(method) {
@@ -5777,10 +5803,11 @@ impl Controller {
             let confirmations = pairing
                 .as_deref()
                 .map(|host| host as &dyn crate::sharing::OwnerConfirmations);
-            return self
-                .catalogue
-                .write_frame(actor_id, mutation, method, confirmations, admission)
-                .await;
+            return crate::catalogue::frame(
+                mutation.request_id,
+                self.catalogue_write(actor_id, mutation, method, confirmations, admission)
+                    .await,
+            );
         }
         if crate::project::ProjectModule::serves(method) {
             let Some(admitted_revision) = admitted else {
@@ -9653,6 +9680,13 @@ impl Controller {
         // retired worker would stay pending for every later revocation, because nothing would be
         // left to say that it ended.
         self.leases.worker_ended(record.session_id);
+        // The worker leaves the plugin admissions' set with its session: at once where the
+        // closure confirms its end, and otherwise once the kernel says its process ended.
+        let unaccounted = record
+            .surviving
+            .iter()
+            .any(|resource| resource.kind == UNACCOUNTED_WORKER);
+        self.plugin_bridge.closed(record.session_id, !unaccounted);
         // The session has stopped being work this host counts, and this is the line where that
         // became true of everything the counting reads: the record is written and the session has
         // left the directory a demand scan takes its list from. Every path that records a closure

@@ -1280,8 +1280,7 @@ impl RemoteConnection {
             }
             DeviceRead::Catalogue => {
                 self.controller
-                    .catalogue
-                    .read_frame(kr_protocol::actor::ActorIngress::PairedDevice, request)
+                    .catalogue_read_frame(kr_protocol::actor::ActorIngress::PairedDevice, request)
                     .await
             }
             DeviceRead::Attention => {
@@ -1744,8 +1743,7 @@ impl RemoteConnection {
                     let admission: Arc<dyn crate::catalogue::Admission> =
                         Arc::new(crate::catalogue::DaemonAdmission::new(admitting, carried));
                     controller
-                        .catalogue
-                        .write(&actor_id, &mutation, method, confirmations, admission)
+                        .catalogue_write(&actor_id, &mutation, method, confirmations, admission)
                         .await
                 });
                 match tokio::time::timeout(EFFECT_WAIT, effect).await {

@@ -460,6 +460,71 @@ impl LocalClient {
         }
     }
 
+    /// Hands a worker one snapshot of plugin admissions, every part in order, and returns its
+    /// report, every part of it, once it has applied the snapshot.
+    ///
+    /// The worker answers only a complete snapshot, on this connection. What this returns is the
+    /// report's parts as the worker sent them; judging them is the caller's.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IpcError::IdentityUnavailable`] when the worker refused the snapshot,
+    /// [`IpcError::UnexpectedMessage`] when it answered something other than a report, or the
+    /// report's parts do not agree with each other, and whatever writing or reading failed with.
+    pub async fn exchange_admissions(
+        &mut self,
+        parts: Vec<kr_protocol::admission::PluginAdmissions>,
+    ) -> Result<Vec<kr_protocol::admission::PluginAdmissionsAck>> {
+        for part in parts {
+            self.writer
+                .write_message(&ControlFrame::PluginAdmissions(Box::new(part)))
+                .await?;
+        }
+        let mut report: Vec<kr_protocol::admission::PluginAdmissionsAck> = Vec::new();
+        loop {
+            match self.read_socket_frame().await? {
+                ControlFrame::PluginAdmissionsAck(part) => {
+                    let expected = u32::try_from(report.len() + 1).unwrap_or(u32::MAX);
+                    let agrees = part.part == expected
+                        && report.first().is_none_or(|first| {
+                            first.parts == part.parts
+                                && first.frame == part.frame
+                                && first.report_seq == part.report_seq
+                        });
+                    if !agrees || part.parts == 0 {
+                        return Err(IpcError::UnexpectedMessage(
+                            "the worker's report on its admissions came in parts that do not agree",
+                        ));
+                    }
+                    let done = part.part == part.parts;
+                    report.push(*part);
+                    if done {
+                        return Ok(report);
+                    }
+                }
+                // This connection's subscription, not an answer to the snapshot. It is kept in
+                // arrival order and handed back afterwards.
+                ControlFrame::Notification(notification) => {
+                    self.hold(ControlFrame::Notification(notification))?;
+                }
+                ControlFrame::Response(Response {
+                    outcome: Outcome::Error(error),
+                    ..
+                }) => {
+                    return Err(IpcError::IdentityUnavailable {
+                        what: "the worker refused the plugin admissions",
+                        detail: error.to_string(),
+                    });
+                }
+                _ => {
+                    return Err(IpcError::UnexpectedMessage(
+                        "the worker answered its admissions with something other than a report",
+                    ));
+                }
+            }
+        }
+    }
+
     /// Passes a mutation the host admitted to the component that owns its subject.
     ///
     /// The mutation travels unchanged, because it is what the payload digest covers and what the

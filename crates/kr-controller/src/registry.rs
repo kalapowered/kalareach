@@ -1669,6 +1669,41 @@ impl Registry {
     }
 }
 
+impl Registry {
+    /// Reads every closure record, with the session it closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the read fails or a record cannot be
+    /// read back.
+    pub fn closures(&self) -> Result<Vec<(SessionId, ClosureRecord)>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT session_id, record FROM tombstones ORDER BY session_id")
+            .map_err(ControllerError::registry)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })
+            .map_err(ControllerError::registry)?;
+        let mut closures = Vec::new();
+        for row in rows {
+            let (session, record) = row.map_err(ControllerError::registry)?;
+            let session: [u8; 16] = session.as_slice().try_into().map_err(|_| {
+                ControllerError::registry("a closure names a session this build cannot read")
+            })?;
+            let record: ClosureRecord =
+                kr_cbor::from_canonical_slice(&record, &kr_cbor::Limits::DEFAULT)
+                    .map_err(ControllerError::registry)?;
+            closures.push((
+                SessionId::new(kr_protocol::scalars::Uuid::from_bytes(session)),
+                record,
+            ));
+        }
+        Ok(closures)
+    }
+}
+
 struct RawReservation {
     reservation: Vec<u8>,
     actor: String,

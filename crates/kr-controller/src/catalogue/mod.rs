@@ -28,6 +28,8 @@
 //!   repository's ceiling permits by itself, and every release that installs a native bridge, is
 //!   refused unless it carries the owner's confirmation of that exact installation.
 
+pub mod admissions;
+pub mod bridge;
 pub(crate) mod files;
 pub mod native_bridge;
 
@@ -222,15 +224,18 @@ impl CatalogueModule {
     pub fn open(
         paths: &kr_ipc::paths::EnvironmentPaths,
         proxy: Option<&kr_transport::config::ProxyUrl>,
+        broker: Arc<dyn kr_plugin_catalogue::BrokerBridge>,
     ) -> crate::Result<Self> {
         Self::open_with(
             paths,
             proxy,
             native_bridge::BridgeHost::discover(paths.state_dir()),
+            broker,
         )
     }
 
-    /// Opens the environment's catalogue, applying native bridges where `bridges` says.
+    /// Opens the environment's catalogue, applying native bridges where `bridges` says, and asking
+    /// `broker` what the workers hold live whenever a reclaim needs room.
     ///
     /// Before this daemon serves anything, every package's bridge is brought to what its
     /// installation wants: a recipe an earlier daemon left part way is finished or undone, and one
@@ -243,13 +248,15 @@ impl CatalogueModule {
         paths: &kr_ipc::paths::EnvironmentPaths,
         proxy: Option<&kr_transport::config::ProxyUrl>,
         bridges: native_bridge::BridgeHost,
+        broker: Arc<dyn kr_plugin_catalogue::BrokerBridge>,
     ) -> crate::Result<Self> {
         let root = paths.state_dir().join("catalogue");
         let unavailable = |error: CatalogueError| crate::ControllerError::RegistryUnavailable {
             detail: error.to_string(),
         };
         let mut catalogue =
-            Catalogue::open(&root, Arc::new(repository_transport(proxy))).map_err(unavailable)?;
+            Catalogue::with_broker(&root, broker, Arc::new(repository_transport(proxy)))
+                .map_err(unavailable)?;
         catalogue
             .recover_interrupted(kr_ipc::now_ms().get())
             .map_err(unavailable)?;
@@ -270,6 +277,53 @@ impl CatalogueModule {
     #[must_use]
     pub fn native_bridges(&self) -> &native_bridge::NativeBridges {
         &self.bridges
+    }
+
+    /// Returns the admissions in force now, as records on the wire, for this host: what new
+    /// bindings may use and the state of every admitted release and of every release in `live`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal the catalogue decided when its records cannot be read.
+    pub async fn snapshot(
+        &self,
+        live: &[kr_protocol::admission::LiveRelease],
+    ) -> Answer<admissions::Snapshot> {
+        let catalogue = self.catalogue.lock().await;
+        admissions::snapshot(
+            &catalogue,
+            &self.bridges,
+            self.environment_id,
+            live,
+            &kr_plugin_catalogue::this_host(),
+        )
+        .map_err(ProtocolError::from)
+    }
+
+    /// Returns the admission revision now.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal the catalogue decided when the record cannot be read.
+    pub async fn admission_revision(&self) -> Answer<u64> {
+        self.catalogue
+            .lock()
+            .await
+            .admission_revision()
+            .map_err(ProtocolError::from)
+    }
+
+    /// Returns the release every installation in this environment holds, by the key a live
+    /// release is found by.
+    pub async fn installed_releases(&self) -> std::collections::BTreeSet<bridge::ReleaseKey> {
+        let catalogue = self.catalogue.lock().await;
+        catalogue
+            .installations()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|installation| installation.environment_id == self.environment_id)
+            .map(|installation| installed_key(&installation))
+            .collect()
     }
 
     /// Returns true when this daemon serves the method.
@@ -333,9 +387,17 @@ impl CatalogueModule {
     }
 
     /// Serves one catalogue or plugin read and returns the frame it answers with.
+    ///
+    /// `view` is what the workers reported, which `plugin.list` counts from; every other read
+    /// takes none.
     #[must_use]
-    pub async fn read_frame(&self, ingress: ActorIngress, request: &Request) -> ControlFrame {
-        frame(request.request_id, self.read(ingress, request).await)
+    pub async fn read_frame(
+        &self,
+        ingress: ActorIngress,
+        request: &Request,
+        view: Option<&bridge::LiveView>,
+    ) -> ControlFrame {
+        frame(request.request_id, self.read(ingress, request, view).await)
     }
 
     /// Serves one catalogue or plugin read.
@@ -347,7 +409,12 @@ impl CatalogueModule {
     /// # Errors
     ///
     /// Returns the refusal the catalogue decided, under the catalogue's own code.
-    pub async fn read(&self, ingress: ActorIngress, request: &Request) -> Answer<ParamsValue> {
+    pub async fn read(
+        &self,
+        ingress: ActorIngress,
+        request: &Request,
+        view: Option<&bridge::LiveView>,
+    ) -> Answer<ParamsValue> {
         let Some(method) = request.method.method() else {
             return Err(ProtocolError::new(
                 ErrorCode::PermissionDenied,
@@ -393,12 +460,70 @@ impl CatalogueModule {
                 let views = catalogue
                     .installation_views(params.environment_id)
                     .map_err(ProtocolError::from)?;
+                let empty = bridge::LiveView::default();
+                let view = view.unwrap_or(&empty);
+                let mut plugins = Vec::with_capacity(views.len());
+                for installation in &views {
+                    let mut summary = plugin_summary(installation)?;
+                    let key = installed_key(&installation.installation);
+                    summary.live_bindings = Nullable::from(view.counts.as_ref().map(|counts| {
+                        U64::new(counts.get(&key).map_or(0, |(_, count, _)| *count))
+                    }));
+                    plugins.push(summary);
+                }
+                let installed: std::collections::BTreeSet<bridge::ReleaseKey> = views
+                    .iter()
+                    .map(|installation| installed_key(&installation.installation))
+                    .collect();
+                // Every release a worker reports that no installation describes stays listed,
+                // ending where it ends, until its bindings close; its revocation is its own
+                // origin's.
+                let left: Vec<kr_protocol::admission::LiveRelease> = view
+                    .live
+                    .iter()
+                    .filter(|(key, _)| !installed.contains(*key))
+                    .map(|(_, (release, _))| release.clone())
+                    .collect();
+                let states = admissions::snapshot(
+                    &catalogue,
+                    &self.bridges,
+                    self.environment_id,
+                    &left,
+                    &kr_plugin_catalogue::this_host(),
+                )
+                .map_err(ProtocolError::from)?
+                .releases;
+                let live_releases = left
+                    .iter()
+                    .map(|release| {
+                        let key = bridge::key_of(release);
+                        let state = states.iter().find(|state| {
+                            (
+                                state.plugin_id.clone(),
+                                state.package_digest,
+                                state.origin.clone(),
+                            ) == key
+                        });
+                        kr_protocol::admission::LiveReleaseSummary {
+                            plugin_id: release.plugin_id.clone(),
+                            version: release.version.clone(),
+                            package_digest: kr_plugin_sdk::digest::PayloadDigest::from_bytes(
+                                *release.package_digest.as_bytes(),
+                            )
+                            .to_string(),
+                            catalogue_id: release.origin.repository_id.clone(),
+                            live_bindings: Nullable::from(view.counts.as_ref().map(|counts| {
+                                U64::new(counts.get(&key).map_or(0, |(_, count, _)| *count))
+                            })),
+                            ending: view.live.get(&key).is_some_and(|(_, ending)| *ending)
+                                || state.is_some_and(|state| state.ends_at_next_boundary),
+                            revoked: state.is_some_and(|state| state.revocation.is_present()),
+                        }
+                    })
+                    .collect();
                 encode(&wire::PluginListResult {
-                    plugins: views
-                        .iter()
-                        .map(plugin_summary)
-                        .collect::<Answer<Vec<_>>>()?,
-                    live_releases: Vec::new(),
+                    plugins,
+                    live_releases,
                 })
             }
             Method::PluginCapabilities => {
@@ -500,11 +625,19 @@ impl CatalogueModule {
         method: Method,
         confirmations: Option<&dyn OwnerConfirmations>,
         admission: Arc<dyn Admission>,
+        removal: Option<(u64, u64)>,
     ) -> ControlFrame {
         frame(
             mutation.request_id,
-            self.write(actor_id, mutation, method, confirmations, admission)
-                .await,
+            self.write(
+                actor_id,
+                mutation,
+                method,
+                confirmations,
+                admission,
+                removal,
+            )
+            .await,
         )
     }
 
@@ -524,6 +657,7 @@ impl CatalogueModule {
             method,
             confirmations,
             Arc::new(Owner::acting()),
+            None,
         )
         .await
     }
@@ -535,6 +669,10 @@ impl CatalogueModule {
     /// `None` is a host with no enrolled owner signer, which refuses them rather than performing
     /// them under the identity of whoever called.
     ///
+    /// `removal` is, for `plugin.remove`, how many live bindings the workers reported holding the
+    /// package and the admission revision their reports were at; the removal answers with that
+    /// count only when it commits right after that revision.
+    ///
     /// # Errors
     ///
     /// Returns the refusal the catalogue decided, under the catalogue's own code.
@@ -545,6 +683,7 @@ impl CatalogueModule {
         method: Method,
         confirmations: Option<&dyn OwnerConfirmations>,
         admission: Arc<dyn Admission>,
+        removal: Option<(u64, u64)>,
     ) -> Answer<ParamsValue> {
         let mut catalogue = self.catalogue.lock().await;
         admission.check().map_err(ProtocolError::from)?;
@@ -578,6 +717,7 @@ impl CatalogueModule {
                 confirmations,
                 &recording,
                 key.clone(),
+                removal,
             )
             .await;
         let answer = match outcome {
@@ -625,6 +765,9 @@ impl CatalogueModule {
         answer
     }
 
+    // Each argument is one part of the change: what was asked, by whom, under which admission,
+    // and what the workers reported about the package a removal ends.
+    #[allow(clippy::too_many_arguments)]
     async fn perform_write(
         &self,
         catalogue: &mut Catalogue,
@@ -633,6 +776,7 @@ impl CatalogueModule {
         confirmations: Option<&dyn OwnerConfirmations>,
         admission: &dyn Authority,
         key: ReceiptKey,
+        removal: Option<(u64, u64)>,
     ) -> Answer<ParamsValue> {
         let now = kr_ipc::now_ms().get();
         let mut answer: Option<ParamsValue> = None;
@@ -860,7 +1004,7 @@ impl CatalogueModule {
                     .uninstall_with(
                         params.environment_id,
                         &params.plugin_id,
-                        None,
+                        removal,
                         &mut Change::settling(admission, key, now, &mut render),
                     )
                     .map_err(ProtocolError::from)?;
@@ -1002,8 +1146,20 @@ impl CatalogueModule {
     }
 }
 
+/// The key an installation's release is found by among the releases the workers report.
+fn installed_key(installation: &Installation) -> bridge::ReleaseKey {
+    (
+        installation.plugin_id.clone(),
+        Digest256::from_bytes(*installation.package_digest.as_bytes()),
+        kr_protocol::admission::ReleaseOrigin {
+            repository_id: installation.repository.to_string(),
+            enrolment_key: installation.enrolment.as_str().to_owned(),
+        },
+    )
+}
+
 /// The package a plugin mutation names, where it names one.
-fn plugin_named(method: Method, params: &ParamsValue) -> Option<PluginId> {
+pub(crate) fn plugin_named(method: Method, params: &ParamsValue) -> Option<PluginId> {
     match method {
         Method::PluginInstall => typed::<wire::PluginInstallParams>(params)
             .ok()

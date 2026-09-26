@@ -183,7 +183,12 @@ fn host() -> Host {
     let temp = kr_ipc::testing::TempHost::create();
     let environment = temp.environment();
     let environment_id = temp.environment_id();
-    let module = CatalogueModule::open(&environment, None).expect("an openable catalogue");
+    let module = CatalogueModule::open(
+        &environment,
+        None,
+        Arc::new(kr_plugin_catalogue::UnboundBroker),
+    )
+    .expect("an openable catalogue");
     let working_temp = tempfile::tempdir().expect("a temporary directory");
     let working = working_temp.path().join("development");
     copy_tree(&fixture(), &working);
@@ -438,6 +443,7 @@ async fn kr_req_23_28_the_catalogue_group_adds_syncs_pins_lists_and_removes() {
                     environment_id: host.environment_id,
                 },
             ),
+            None,
         )
         .await);
     assert_eq!(listed.catalogues.len(), 1);
@@ -565,6 +571,7 @@ async fn a_request_for_another_environment_is_refused_before_anything_is_read() 
                         environment_id: other,
                     },
                 ),
+                None,
             )
             .await,
     );
@@ -791,6 +798,7 @@ async fn kr_req_23_29_the_plugin_group_installs_enables_pins_reads_and_removes()
                     environment_id: host.environment_id,
                 },
             ),
+            None,
         )
         .await);
     assert_eq!(listed.plugins.len(), 1);
@@ -808,6 +816,7 @@ async fn kr_req_23_29_the_plugin_group_installs_enables_pins_reads_and_removes()
                     plugin_id: plugin(),
                 },
             ),
+            None,
         )
         .await);
     assert_eq!(capabilities.plugin.package_digest, digest);
@@ -983,6 +992,7 @@ async fn kr_req_23_29_removing_a_catalogue_does_not_uninstall_what_came_from_it(
                     environment_id: host.environment_id,
                 },
             ),
+            None,
         )
         .await);
     assert_eq!(
@@ -1185,7 +1195,12 @@ async fn both_groups_reach_the_catalogue_through_the_daemon() {
 
     // What a restarted daemon opens reads the same receipt: the deadline is recorded with the
     // claim, not derived again from whatever admits the next request.
-    let reopened = CatalogueModule::open(&environment, None).expect("the catalogue reopens");
+    let reopened = CatalogueModule::open(
+        &environment,
+        None,
+        Arc::new(kr_plugin_catalogue::UnboundBroker),
+    )
+    .expect("the catalogue reopens");
     let restarted = reopened
         .action_read(&first.receipt.actor_id, sync.action_id)
         .await
@@ -1260,6 +1275,7 @@ async fn an_admission_refusal_keeps_the_class_the_daemon_decided() {
                     Method::CatalogueSync,
                     Some(host.confirmations()),
                     admission.clone(),
+                    None,
                 )
                 .await,
         );
@@ -1483,6 +1499,7 @@ async fn catalogue_mutations_are_retained_and_prevent_duplicate_execution() {
             Method::CatalogueAdd,
             Some(host.confirmations()),
             Arc::new(Owner::acting()),
+            None,
         )
         .await;
     let added1: wire::CatalogueAddResult = ok(outcome1);
@@ -1497,6 +1514,7 @@ async fn catalogue_mutations_are_retained_and_prevent_duplicate_execution() {
             Method::CatalogueAdd,
             Some(host.confirmations()),
             Arc::new(Owner::acting()),
+            None,
         )
         .await;
     let added2: wire::CatalogueAddResult = ok(outcome2);
@@ -1548,6 +1566,7 @@ async fn catalogue_mutations_are_retained_and_prevent_duplicate_execution() {
                 Method::CatalogueAdd,
                 Some(host.confirmations()),
                 Arc::new(Owner::acting()),
+                None,
             )
             .await,
     );
@@ -1574,6 +1593,7 @@ async fn catalogue_mutations_are_retained_and_prevent_duplicate_execution() {
                 Method::CataloguePin,
                 None,
                 Arc::new(Lapsed),
+                None,
             )
             .await,
     );
@@ -1667,6 +1687,7 @@ async fn listed_ceiling(host: &Host, catalogue_id: &str) -> Vec<String> {
                     environment_id: host.environment_id,
                 },
             ),
+            None,
         )
         .await);
     listed
@@ -2004,6 +2025,7 @@ async fn a_record_this_host_cannot_read_is_a_storage_failure_in_every_answer() {
                         plugin_id: plugin(),
                     },
                 ),
+                None,
             )
             .await,
     );
@@ -2023,6 +2045,7 @@ async fn a_record_this_host_cannot_read_is_a_storage_failure_in_every_answer() {
                         environment_id: host.environment_id,
                     },
                 ),
+                None,
             )
             .await,
     );
@@ -2052,6 +2075,7 @@ async fn a_record_this_host_cannot_read_is_a_storage_failure_in_every_answer() {
                         environment_id: host.environment_id,
                     },
                 ),
+                None,
             )
             .await,
     );
@@ -2138,6 +2162,7 @@ async fn an_installation_withdrawn_after_its_package_was_placed_is_unknown_and_n
                 Method::PluginInstall,
                 Some(host.confirmations()),
                 admission.clone(),
+                None,
             )
             .await,
     );
@@ -2176,6 +2201,7 @@ async fn an_installation_withdrawn_after_its_package_was_placed_is_unknown_and_n
                 Method::PluginInstall,
                 Some(host.confirmations()),
                 admission.clone(),
+                None,
             )
             .await,
     );
@@ -2347,7 +2373,14 @@ async fn a_deadline_that_passes_while_the_change_waits_for_the_database_changes_
 
     let refused = refusal(
         host.module
-            .write_frame(&actor, &pin, Method::CataloguePin, None, admission.clone())
+            .write_frame(
+                &actor,
+                &pin,
+                Method::CataloguePin,
+                None,
+                admission.clone(),
+                None,
+            )
             .await,
     );
     let committed_at = admission.finish();
@@ -2417,6 +2450,7 @@ async fn a_confirmation_that_expires_while_the_change_waits_for_the_database_cha
                 Method::CatalogueAdd,
                 Some(host.confirmations()),
                 admission.clone(),
+                None,
             )
             .await,
     );
@@ -2570,8 +2604,13 @@ mod native_bridges {
         let temp = kr_ipc::testing::TempHost::create();
         let environment = temp.environment();
         let environment_id = temp.environment_id();
-        let module = CatalogueModule::open_with(&environment, None, site.bridges(&environment))
-            .expect("an openable catalogue");
+        let module = CatalogueModule::open_with(
+            &environment,
+            None,
+            site.bridges(&environment),
+            Arc::new(kr_plugin_catalogue::UnboundBroker),
+        )
+        .expect("an openable catalogue");
         let working_temp = tempfile::tempdir().expect("a temporary directory");
         let working = working_temp.path().join("development");
         copy_tree(&generation(), &working);
@@ -2588,8 +2627,13 @@ mod native_bridges {
     /// The daemon started again over the same environment and site.
     fn restarted(host: &mut Host, site: &Site) {
         let environment = host._temp.environment();
-        host.module = CatalogueModule::open_with(&environment, None, site.bridges(&environment))
-            .expect("an openable catalogue");
+        host.module = CatalogueModule::open_with(
+            &environment,
+            None,
+            site.bridges(&environment),
+            Arc::new(kr_plugin_catalogue::UnboundBroker),
+        )
+        .expect("an openable catalogue");
     }
 
     /// Enrols and synchronises the bridge generation, and returns release 0.3.0's hash.

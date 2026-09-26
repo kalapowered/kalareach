@@ -1,0 +1,383 @@
+//! The rounds of plugin admissions this daemon sends its workers, and the answers it uses.
+//!
+//! A worker is handed its first snapshot with its launch specification, and every later one on
+//! this daemon's authority connection to it: after it is recorded or adopted, after every change
+//! that raises the admission revision, and on a cadence while it is pending or reports a release
+//! no installation describes. Each round is bounded: a worker that does not answer in time stays
+//! pending, and the next round follows on the cadence. Nothing is evicted on a guess.
+
+use std::sync::Arc;
+
+use kr_protocol::admission::{LiveRelease, PluginAdmissions};
+use kr_protocol::identity::ProcessStartIdentity;
+use kr_protocol::ids::SessionId;
+
+use crate::catalogue::admissions::Snapshot;
+use crate::catalogue::bridge::{Acceptance, LiveView, Report};
+
+use super::{Controller, LaunchPhase, UNACCOUNTED_WORKER, WORKER_EXCHANGE};
+
+/// How often the cadence asks again: every pending member a round, and the kernel about every
+/// member whose end is not confirmed.
+pub(crate) const ADMISSIONS_CADENCE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How many rounds one member is sent in a row while each answer discovers a release the round
+/// before did not cover.
+const DISCOVERY_ROUNDS: usize = 4;
+
+impl Controller {
+    /// Returns every release a worker reported live.
+    fn reported_live(&self) -> Vec<LiveRelease> {
+        self.plugin_bridge
+            .live()
+            .into_values()
+            .map(|(release, _)| release)
+            .collect()
+    }
+
+    /// Computes the admissions in force now, or `None` with the refusal recorded for the doctor.
+    async fn current_snapshot(&self) -> Option<Snapshot> {
+        let live = self.reported_live();
+        match self.catalogue.snapshot(&live).await {
+            Ok(snapshot) => Some(snapshot),
+            Err(error) => {
+                self.note_admissions(format!(
+                    "the admissions could not be computed: {}",
+                    error.message
+                ));
+                None
+            }
+        }
+    }
+
+    /// Records why admissions could not be handed over, for the doctor's catalogue check.
+    fn note_admissions(&self, why: String) {
+        let mut notes = self
+            .admission_notes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        notes.push(why);
+        let excess = notes.len().saturating_sub(16);
+        notes.drain(..excess);
+    }
+
+    /// The first snapshot a worker is handed, with its launch specification, once its
+    /// reservation's claim is consumed: it becomes a member first, so a reclaim that needs room
+    /// waits for it from here on.
+    pub(super) async fn first_admissions(
+        &self,
+        session_id: SessionId,
+        launcher: ProcessStartIdentity,
+    ) -> Vec<PluginAdmissions> {
+        self.plugin_bridge.claimed(session_id, Some(launcher));
+        let snapshot = match self.current_snapshot().await {
+            Some(snapshot) => snapshot,
+            None => Snapshot::nothing(self.catalogue.admission_revision().await.unwrap_or(0)),
+        };
+        let frame =
+            self.plugin_bridge
+                .first_frame(session_id, snapshot.revision, snapshot.covered());
+        let environment_id = self.paths.environment_id();
+        match snapshot.parts(environment_id, frame) {
+            Ok(parts) => parts,
+            Err(why) => {
+                self.note_admissions(format!("session {session_id}: {why}"));
+                Snapshot::nothing(snapshot.revision)
+                    .parts(environment_id, frame)
+                    .unwrap_or_default()
+            }
+        }
+    }
+
+    /// Sends one recorded member a round at the current revision and uses its answer, and sends it
+    /// the next round at once while its answers discover releases the round did not cover.
+    pub(crate) async fn admissions_round(&self, session_id: SessionId) {
+        for _ in 0..DISCOVERY_ROUNDS {
+            if self.one_round(session_id).await != Some(Acceptance::Discovered) {
+                return;
+            }
+        }
+    }
+
+    async fn one_round(&self, session_id: SessionId) -> Option<Acceptance> {
+        let snapshot = self.current_snapshot().await?;
+        let frame =
+            self.plugin_bridge
+                .next_frame(session_id, snapshot.revision, snapshot.covered())?;
+        let parts = match snapshot.parts(self.paths.environment_id(), frame) {
+            Ok(parts) => parts,
+            Err(why) => {
+                self.note_admissions(format!("session {session_id}: {why}"));
+                self.plugin_bridge.unanswered(session_id);
+                return None;
+            }
+        };
+        let bound = WORKER_EXCHANGE.saturating_mul(u32::try_from(parts.len()).unwrap_or(1).max(1));
+        let answered =
+            match tokio::time::timeout(WORKER_EXCHANGE, self.worker_client_of(session_id)).await {
+                Ok(Ok(mut held)) => {
+                    let exchanged = match held.as_mut() {
+                        Some(client) => {
+                            tokio::time::timeout(bound, client.exchange_admissions(parts)).await
+                        }
+                        None => return self.unanswered(session_id),
+                    };
+                    match exchanged {
+                        Ok(Ok(report)) => Some(report),
+                        Ok(Err(_)) | Err(_) => {
+                            // A client whose stream position nothing knows is retired, as an
+                            // announcement retires one.
+                            *held = None;
+                            None
+                        }
+                    }
+                }
+                Ok(Err(_)) | Err(_) => None,
+            };
+        let Some(parts) = answered else {
+            return self.unanswered(session_id);
+        };
+        let first = parts.first()?;
+        if first.session_id != session_id {
+            return self.unanswered(session_id);
+        }
+        let report = Report {
+            frame: first.frame,
+            report_seq: first.report_seq.get(),
+            bindings: parts
+                .iter()
+                .flat_map(|part| part.bindings.iter().cloned())
+                .collect(),
+            refusals: parts
+                .iter()
+                .flat_map(|part| part.refusals.iter().cloned())
+                .collect(),
+        };
+        Some(self.plugin_bridge.accept(session_id, report))
+    }
+
+    fn unanswered(&self, session_id: SessionId) -> Option<Acceptance> {
+        self.plugin_bridge.unanswered(session_id);
+        None
+    }
+
+    /// Sends each of `members` a round, each on a task of its own, and waits for them all, or
+    /// until `deadline` where there is one.
+    ///
+    /// A round still running at the deadline is left to finish rather than cut part way: each
+    /// exchange is bounded by itself, and one cut between two frames would leave the connection
+    /// at a position nothing knows.
+    async fn rounds_to(&self, members: Vec<SessionId>, deadline: Option<tokio::time::Instant>) {
+        let Some(controller) = self.me.upgrade() else {
+            return;
+        };
+        let mut rounds = tokio::task::JoinSet::new();
+        for session_id in members {
+            let controller = Arc::clone(&controller);
+            rounds.spawn(async move { controller.admissions_round(session_id).await });
+        }
+        drop(controller);
+        let all = async { while rounds.join_next().await.is_some() {} };
+        match deadline {
+            None => all.await,
+            Some(deadline) => {
+                let _ = tokio::time::timeout_at(deadline, all).await;
+                rounds.detach_all();
+            }
+        }
+    }
+
+    /// Asks every recorded member for a report now, and counts what the reports used after the
+    /// read began say: every member answers within one bounded exchange, or the counts are
+    /// unknown. A member with a round already out is not sent a second one; its answer counts.
+    pub(crate) async fn refreshed_view(&self) -> LiveView {
+        let mark = self.plugin_bridge.mark();
+        let revision = self.catalogue.admission_revision().await.unwrap_or(0);
+        let asked: Vec<SessionId> = self
+            .plugin_bridge
+            .recorded_members()
+            .into_iter()
+            .filter(|session_id| !self.plugin_bridge.in_flight(*session_id))
+            .collect();
+        let deadline = tokio::time::Instant::now() + WORKER_EXCHANGE;
+        self.rounds_to(asked, Some(deadline)).await;
+        while !self.plugin_bridge.answered_since(mark) && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        LiveView {
+            live: self.plugin_bridge.live(),
+            counts: self.plugin_bridge.counts_since(mark, revision),
+        }
+    }
+
+    /// One pass of the cadence: a round to every recorded member that is pending or reports a
+    /// release no installation describes, and a question to the kernel about every member whose
+    /// end is not confirmed.
+    pub(crate) async fn admissions_pass(&self) {
+        let revision = self.catalogue.admission_revision().await.unwrap_or(0);
+        let installed = self.catalogue.installed_releases().await;
+        let due: Vec<SessionId> = self
+            .plugin_bridge
+            .recorded_members()
+            .into_iter()
+            .filter(|session_id| {
+                self.plugin_bridge
+                    .needs_round(*session_id, revision, &|release| {
+                        installed.contains(release)
+                    })
+            })
+            .collect();
+        self.rounds_to(due, None).await;
+        self.check_unconfirmed_members();
+    }
+
+    /// Asks the kernel about every member whose end is not confirmed, and lets go of each whose
+    /// process has ended.
+    fn check_unconfirmed_members(&self) {
+        for (session_id, process) in self.plugin_bridge.to_check() {
+            let ended = process.as_ref().is_none_or(|process| {
+                kr_ipc::identity::process_state(process) == kr_ipc::identity::ProcessState::Ended
+            });
+            if ended {
+                self.plugin_bridge.ended(session_id);
+            }
+        }
+    }
+
+    /// Seeds the member set at start, before anything is served: every reservation whose claim was
+    /// consumed, every registered worker, and every session a closure left with a worker nothing
+    /// confirmed ended. Each starts pending; a fenced or closed one whose process has already ended
+    /// is let go at once.
+    pub(super) async fn seed_admission_members(&self) -> crate::Result<()> {
+        let registry = self.registry.lock().await;
+        for reservation in registry.reservations_in(LaunchPhase::Claimed)? {
+            self.plugin_bridge.claimed(
+                reservation.session_id,
+                reservation.launcher_identity.clone(),
+            );
+        }
+        for reservation in registry.reservations_in(LaunchPhase::Fenced)? {
+            if reservation.claimed_key.is_some() {
+                self.plugin_bridge.claimed(
+                    reservation.session_id,
+                    reservation.launcher_identity.clone(),
+                );
+                self.plugin_bridge.fenced(reservation.session_id);
+            }
+        }
+        for worker in registry.workers()? {
+            self.plugin_bridge
+                .claimed(worker.session_id, Some(worker.process_identity.clone()));
+            self.plugin_bridge
+                .recorded(worker.session_id, worker.process_identity);
+        }
+        for (session_id, record) in registry.closures()? {
+            let unaccounted = record
+                .surviving
+                .iter()
+                .any(|resource| resource.kind == UNACCOUNTED_WORKER);
+            if !unaccounted {
+                continue;
+            }
+            let launcher = registry
+                .reservation_for_session(session_id)?
+                .and_then(|reservation| reservation.launcher_identity);
+            self.plugin_bridge.claimed(session_id, launcher);
+            self.plugin_bridge.closed(session_id, false);
+        }
+        drop(registry);
+        self.check_unconfirmed_members();
+        Ok(())
+    }
+
+    /// Starts the cadence, which runs a pass every [`ADMISSIONS_CADENCE`] and at once whenever a
+    /// change or a new member asks for one. It holds this daemon weakly between passes, so a daemon
+    /// dropped everywhere else is dropped.
+    pub(super) fn start_admissions_cadence(self: &Arc<Self>) {
+        let controller = Arc::downgrade(self);
+        let due = Arc::clone(&self.admissions_due);
+        tokio::spawn(async move {
+            let mut cadence = tokio::time::interval(ADMISSIONS_CADENCE);
+            loop {
+                tokio::select! {
+                    _ = cadence.tick() => {}
+                    () = due.notified() => {}
+                }
+                let Some(controller) = controller.upgrade() else {
+                    return;
+                };
+                controller.admissions_pass().await;
+            }
+        });
+    }
+
+    /// Asks the cadence for a pass now.
+    pub(crate) fn admissions_due(&self) {
+        self.admissions_due.notify_one();
+    }
+
+    /// Serves one catalogue or plugin read: `plugin.list` counts from a fresh round of every
+    /// worker's report, and every other read asks none.
+    pub(crate) async fn catalogue_read_frame(
+        &self,
+        ingress: kr_protocol::actor::ActorIngress,
+        request: &kr_protocol::envelope::Request,
+    ) -> kr_protocol::envelope::ControlFrame {
+        if request.method.method() == Some(kr_protocol::method::Method::PluginList) {
+            let view = self.refreshed_view().await;
+            return self
+                .catalogue
+                .read_frame(ingress, request, Some(&view))
+                .await;
+        }
+        self.catalogue.read_frame(ingress, request, None).await
+    }
+
+    /// Serves one catalogue or plugin mutation, and announces the admissions it changed.
+    ///
+    /// A removal first asks every worker for a fresh report and counts the package's live
+    /// bindings in them, at the admission revision it read before asking; the catalogue answers
+    /// with that count only when it commits right after that revision.
+    pub(crate) async fn catalogue_write(
+        &self,
+        actor_id: &kr_protocol::ids::ActorId,
+        mutation: &kr_protocol::envelope::MutationRequest,
+        method: kr_protocol::method::Method,
+        confirmations: Option<&dyn crate::sharing::OwnerConfirmations>,
+        admission: Arc<dyn crate::catalogue::Admission>,
+    ) -> crate::catalogue::Answer<kr_protocol::envelope::ParamsValue> {
+        let before = self.catalogue.admission_revision().await.ok();
+        let removal = if method == kr_protocol::method::Method::PluginRemove {
+            let plugin = crate::catalogue::plugin_named(method, &mutation.params);
+            let view = self.refreshed_view().await;
+            match (plugin, before, view.counts) {
+                (Some(plugin), Some(revision), Some(counts)) => Some((
+                    revision,
+                    counts
+                        .iter()
+                        .filter(|(key, _)| key.0 == plugin)
+                        .map(|(_, (_, count, _))| *count)
+                        .sum(),
+                )),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let answer = self
+            .catalogue
+            .write(
+                actor_id,
+                mutation,
+                method,
+                confirmations,
+                admission,
+                removal,
+            )
+            .await;
+        if self.catalogue.admission_revision().await.ok() != before {
+            self.admissions_due();
+        }
+        answer
+    }
+}
