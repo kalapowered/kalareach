@@ -420,6 +420,25 @@ struct Written {
 struct Member {
     name: String,
     written: Written,
+    /// Whether a `cfg` this reading cannot decide can leave it out.
+    conditional: bool,
+}
+
+impl Shape {
+    /// The members whose name or position no `cfg` can change: every named field, and the tuple's
+    /// fields before the first one a `cfg` can leave out, which moves every position after it.
+    fn stable(&self) -> impl Iterator<Item = &Member> {
+        let moving = self
+            .members
+            .iter()
+            .position(|member| member.conditional && member.name.parse::<usize>().is_ok())
+            .unwrap_or(usize::MAX);
+        self.members
+            .iter()
+            .enumerate()
+            .filter(move |(at, member)| member.name.parse::<usize>().is_err() || *at < moving)
+            .map(|(_, member)| member)
+    }
 }
 
 /// A struct's one shape, or one variant of an enum.
@@ -1178,6 +1197,7 @@ impl Debugs {
                             .map(|field| Member {
                                 name: field.name,
                                 written: written(field.type_tokens),
+                                conditional: field.conditional,
                             })
                             .collect();
                         variant = closing(tokens, variant).map_or(close, |end| end + 1);
@@ -1197,6 +1217,7 @@ impl Debugs {
                     .map(|field| Member {
                         name: field.name,
                         written: written(field.type_tokens),
+                        conditional: field.conditional,
                     })
                     .collect();
                 shapes.push(Shape {
@@ -1648,6 +1669,9 @@ fn reach(visibility: Visibility, module: &str) -> Reach {
 struct Named {
     path: String,
     reach: Reach,
+    /// Whether it is there under every set of conditions: a `cfg` this reading cannot decide can
+    /// leave an item out, and then the name leads further.
+    present: bool,
 }
 
 /// The one item `given` leads to, or why `name`, which leads to none or to more than one, cannot
@@ -1774,21 +1798,24 @@ impl Debugs {
             return self.beyond(index, name, single, kind);
         };
         let given = self.explicit(index, scope, name, visiting)?;
-        if !given.is_empty() {
+        if given.iter().any(|named| named.present) {
             return one_of(&given, name).map(Some);
         }
+        // An item or an import a `cfg` can leave out is one candidate; past it, the name is placed
+        // as if it were left out, and every candidate has to agree.
+        let mut candidates: Vec<(String, bool)> =
+            given.into_iter().map(|named| (named.path, false)).collect();
         let source = &self.sources[index];
         let module = source.module_of(scope).join("::");
-        let mut candidates: Vec<(String, bool)> = Vec::new();
         for (position, glob) in source.globs.iter().enumerate() {
             if glob.scope != scope {
                 continue;
             }
             for named in self.through_glob(index, position, name, visiting)? {
                 match named.reach.seen_from(&module) {
-                    Some(true) => candidates.push((named.path, true)),
+                    Some(true) if !glob.conditional => candidates.push((named.path, true)),
                     Some(false) => {}
-                    None => candidates.push((named.path, false)),
+                    _ => candidates.push((named.path, false)),
                 }
             }
         }
@@ -1884,7 +1911,12 @@ impl Debugs {
             visiting.pop();
             given.push(Named {
                 path: target?,
-                reach: reach(import.visibility, &module),
+                reach: if import.conditional {
+                    Reach::Unsure
+                } else {
+                    reach(import.visibility, &module)
+                },
+                present: !import.conditional,
             });
         }
         let key = (scope, name.to_owned());
@@ -1894,16 +1926,25 @@ impl Debugs {
             .copied()
             .unwrap_or(Visibility::Private);
         let defined = source.defined_path(scope, name);
+        let always = source.always.contains(&key);
+        let item_reach = if always {
+            reach(visibility, &module)
+        } else {
+            Reach::Unsure
+        };
         if source.definitions.contains(&key) {
             given.push(Named {
                 path: defined,
-                reach: reach(visibility, &module),
+                reach: item_reach.clone(),
+                present: always,
             });
         } else if self.declared.contains_key(&defined) || self.type_aliases.contains_key(&defined) {
-            // A type a macro declares here, whose visibility this reading does not read.
+            // A type a macro declares here, whose visibility and conditions this reading does not
+            // read.
             given.push(Named {
                 path: defined,
                 reach: Reach::Unsure,
+                present: false,
             });
         }
         let declares_module = (scope == 0
@@ -1917,9 +1958,18 @@ impl Debugs {
                     && other.module.last().is_some_and(|last| last == name)
             });
         if declares_module {
+            let path = format!("{module}::{name}");
+            // A module file whose own `cfg` this reading cannot decide can be left out as well.
+            let file_conditional = self.modules.get(&path).is_some_and(|scopes| {
+                scopes.iter().any(|&(child, child_scope)| {
+                    child_scope == 0 && self.sources[child].conditional
+                })
+            });
+            let present = always && !file_conditional;
             given.push(Named {
-                path: format!("{module}::{name}"),
-                reach: reach(visibility, &module),
+                path,
+                reach: if present { item_reach } else { Reach::Unsure },
+                present,
             });
         }
         let exported = format!("{module}::{name}");
@@ -1927,6 +1977,7 @@ impl Debugs {
             given.push(Named {
                 path: exported,
                 reach: Reach::Everywhere,
+                present: true,
             });
         }
         Ok(given)
@@ -1971,6 +2022,7 @@ impl Debugs {
             return Ok(vec![Named {
                 path: full,
                 reach: Reach::Unsure,
+                present: true,
             }]);
         }
         let Some(scopes) = self.modules.get(module) else {
@@ -1981,7 +2033,11 @@ impl Debugs {
                 } else {
                     Reach::Unsure
                 };
-                return Ok(vec![Named { path: full, reach }]);
+                return Ok(vec![Named {
+                    path: full,
+                    reach,
+                    present: true,
+                }]);
             }
             // A type of the workspace, whose variants an import can name.
             return match self.declared.get(module) {
@@ -1996,6 +2052,7 @@ impl Debugs {
                     .then(|| Named {
                         path: full.clone(),
                         reach: Reach::Everywhere,
+                        present: true,
                     })
                     .into_iter()
                     .collect()),
@@ -2008,11 +2065,13 @@ impl Debugs {
             return Ok(Vec::new());
         }
         visiting.push(key);
-        // A module declared once for each set of `cfg` conditions gives what any of them gives.
-        let mut given = Vec::new();
+        // A module declared once for each set of `cfg` conditions gives what any of them gives;
+        // where the declarations give the name differently, or one does not give it, what it
+        // leads to is there only under some conditions.
+        let mut each = Vec::new();
         for &(index, scope) in scopes {
             match self.module_member(index, scope, module, name, visiting) {
-                Ok(named) => given.extend(named),
+                Ok(named) => each.push(named),
                 Err(why) => {
                     visiting.pop();
                     return Err(why);
@@ -2020,7 +2079,32 @@ impl Debugs {
             }
         }
         visiting.pop();
-        Ok(given)
+        let signature = |named: &[Named]| {
+            let mut signature: Vec<String> = named
+                .iter()
+                .map(|named| format!("{} {:?} {}", named.path, named.reach, named.present))
+                .collect();
+            signature.sort();
+            signature
+        };
+        let alike = each
+            .windows(2)
+            .all(|pair| signature(&pair[0]) == signature(&pair[1]));
+        Ok(each
+            .into_iter()
+            .flatten()
+            .map(|named| {
+                if alike {
+                    named
+                } else {
+                    Named {
+                        reach: Reach::Unsure,
+                        present: false,
+                        ..named
+                    }
+                }
+            })
+            .collect())
     }
 
     /// [`Debugs::member`] for one declaration of a module of the workspace, whose names `scope` of
@@ -2034,20 +2118,27 @@ impl Debugs {
         visiting: &mut Vec<String>,
     ) -> Result<Vec<Named>, Why> {
         let given = self.explicit(index, scope, name, visiting)?;
-        if !given.is_empty() {
+        if given.iter().any(|named| named.present) {
             return Ok(given);
         }
-        let mut found = Vec::new();
+        // An item or an import a `cfg` can leave out gives the name under some conditions only;
+        // past it, the module's globs can give it.
+        let mut found = given;
         for (position, glob) in self.sources[index].globs.iter().enumerate() {
             if glob.scope != scope {
                 continue;
             }
-            let passed_on = reach(glob.visibility, module);
+            let passed_on = if glob.conditional {
+                Reach::Unsure
+            } else {
+                reach(glob.visibility, module)
+            };
             for named in self.through_glob(index, position, name, visiting)? {
                 // A glob takes what its module sees, and gives it on no further than itself.
                 if named.reach.seen_from(module) != Some(false) {
                     found.push(Named {
                         reach: named.reach.and(&passed_on),
+                        present: named.present && !glob.conditional,
                         path: named.path,
                     });
                 }
@@ -2919,8 +3010,7 @@ impl Reading<'_> {
         };
         Some(
             shape
-                .members
-                .iter()
+                .stable()
                 .map(|member| (member.name.clone(), member.written.clone()))
                 .collect(),
         )
@@ -3026,15 +3116,27 @@ impl Reading<'_> {
         let declared = self
             .declaration(of)
             .ok_or_else(|| "a field of a type this reading cannot place".to_owned())?;
-        let members: Vec<&Member> = declared
+        let shapes: Vec<&Shape> = declared
             .shapes
             .iter()
             .filter(|shape| shape.name == declared.name)
+            .collect();
+        let members: Vec<&Member> = shapes
+            .iter()
             .flat_map(|shape| &shape.members)
             .filter(|member| member.name == name)
             .collect();
+        let stable = shapes
+            .iter()
+            .flat_map(|shape| shape.stable())
+            .any(|member| member.name == name);
         let member = match members.as_slice() {
-            [member] => *member,
+            [member] if stable => *member,
+            [_] => {
+                return Err(format!(
+                    "the field `{name}`, a position cfg can move by leaving a field out"
+                ));
+            }
             [] => {
                 return Err(format!(
                     "the field `{name}`, which this reading cannot find"
@@ -4274,6 +4376,48 @@ fn each_name_is_placed_where_the_compiler_places_it() {
             "#[cfg_attr(not(unix), derive(Debug))]\npub struct Code(pub u64);\n#[cfg(unix)]\nimpl std::fmt::Debug for Code {\n    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n        formatter.write_str(&::std::format!(\"{}\", \"SECRET\"))\n    }\n}\n",
             "#[derive(Debug)]\npub struct Leak(pub kr_other::Code);\n",
             1,
+            "a derived Debug over text that arrived",
+        ),
+        (
+            "a trait one module path makes private on one platform and public on another",
+            "#[cfg(unix)]\npub mod names {\n    #[allow(dead_code)]\n    trait Debug {}\n    pub fn open() {}\n}\n#[cfg(not(unix))]\npub mod names {\n    pub trait Debug {\n        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result;\n    }\n    pub fn open() {}\n}\n",
+            "use std::fmt::Debug;\npub struct Leak(pub String);\nconst _: () = {\n    use kr_other::names::*;\n    impl Debug for Leak {\n        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n            formatter.debug_tuple(\"Leak\").field(&self.0).finish()\n        }\n    }\n};\n",
+            5,
+            "a trait this reading cannot place",
+        ),
+        (
+            "a tuple position a field under cfg moves",
+            "",
+            "pub struct Leak(#[cfg(not(unix))] pub u64, #[cfg(unix)] pub String);\nimpl std::fmt::Debug for Leak {\n    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n        formatter.debug_tuple(\"Leak\").field(&self.0).finish()\n    }\n}\n",
+            4,
+            "a position cfg can move",
+        ),
+        (
+            "a variant's position a field under cfg moves",
+            "",
+            "pub enum Leak {\n    Said(#[cfg(not(unix))] u64, #[cfg(unix)] String),\n}\nimpl std::fmt::Debug for Leak {\n    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n        match self {\n            Self::Said(said) => formatter.debug_tuple(\"Said\").field(said).finish(),\n        }\n    }\n}\n",
+            7,
+            "a value this reading cannot place",
+        ),
+        (
+            "a trait a glob gives only under some conditions, past which the outer name is the Debug trait",
+            "pub mod names {\n    #[cfg(not(unix))]\n    pub trait Debug {\n        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result;\n    }\n    pub fn open() {}\n}\n",
+            "use std::fmt::Debug;\npub struct Leak(pub String);\nconst _: () = {\n    use kr_other::names::*;\n    impl Debug for Leak {\n        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n            formatter.debug_tuple(\"Leak\").field(&self.0).finish()\n        }\n    }\n};\n",
+            5,
+            "a trait this reading cannot place",
+        ),
+        (
+            "an import in force only under some conditions, past which the outer name is the Debug trait",
+            "pub mod names {\n    pub trait Debug {\n        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result;\n    }\n}\n",
+            "use std::fmt::Debug;\npub struct Leak(pub String);\nconst _: () = {\n    #[cfg(not(unix))]\n    use kr_other::names::Debug;\n    impl Debug for Leak {\n        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n            formatter.debug_tuple(\"Leak\").field(&self.0).finish()\n        }\n    }\n};\n",
+            6,
+            "a trait this reading cannot place",
+        ),
+        (
+            "a type defined only under some conditions over one a glob gives",
+            "pub type Handle = String;\n",
+            "use kr_other::*;\n#[cfg(not(unix))]\n#[derive(Debug)]\npub struct Handle(pub u64);\n#[derive(Debug)]\npub struct Leak(pub Handle);\n",
+            5,
             "a derived Debug over text that arrived",
         ),
         (
