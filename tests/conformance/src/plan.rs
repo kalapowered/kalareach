@@ -750,6 +750,42 @@ fn windows() -> Vec<Step> {
         ),
         Step::cargo(
             Group::Rust,
+            "the shared directory flush",
+            &["test", "--locked", "-p", "kr-flush"],
+        ),
+        qualified_only(
+            "the contact skill's installer",
+            &[
+                "test",
+                "--locked",
+                "-p",
+                "kr-controller",
+                "--lib",
+                "agent_tools",
+            ],
+            "agent_tools",
+        ),
+        Step::cargo(
+            Group::Rust,
+            "the contact skill installed and removed through the daemon",
+            &[
+                "test",
+                "--locked",
+                "-p",
+                "kr-controller",
+                "--test",
+                "agent_tools",
+                "--test",
+                "contact_skill",
+            ],
+        ),
+        Step::cargo(
+            Group::Rust,
+            "the directory secret store",
+            &["test", "--locked", "-p", "kr-crypto", "--lib"],
+        ),
+        Step::cargo(
+            Group::Rust,
             "the PowerShell bridge client over a named pipe",
             &[
                 "test",
