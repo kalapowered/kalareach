@@ -144,6 +144,22 @@ that cannot take it ends, and the command that started it goes on with the one t
 is for this installation's own environment only, and a command that names another environment is
 told to start that environment's daemon.
 
+On Windows the standalone start is this user's scheduled task for the environment, which
+`kr host startup --set standalone` registers: `KalaReach-` and the first eight digits of the
+environment's identifier, logging on where you are signed in and running the `kr-controller`
+installed beside `kr` as the environment's starter. With nothing listening, `kr new` checks the task,
+leaves a request for its starter and asks the Task Scheduler to run it; the starter starts the
+daemon, with its output in `controller.log` in the environment's state directory. The Task
+Scheduler creates the daemon, so it is in none of the command's jobs. It runs in the session where
+you are signed in, at the console or over remote desktop, connected or
+not, with the environment the Task Scheduler gives you rather than the command's own, and it ends
+when you sign out of that session, with every session it holds. A task that is not registered, that
+is not this environment's own, that is not the one this installation registers, or whose daemon is
+no longer beside `kr` ends the command with `HOST_NOT_CONFIGURED` and
+`kr host startup --set standalone`, and the task is not run. The Task Scheduler starts the task only
+where you are signed in; if it does not start it within the wait, the command ends with
+`ENVIRONMENT_UNAVAILABLE`, says where you have to sign in, and gives the task's last result.
+
 The command waits up to 30 seconds for an answer, then creates the session exactly as it would with
 a daemon that was already running. In text form it first says, on standard error, which daemon it
 started. A daemon that has not answered in 30 seconds ends the command with
@@ -1136,10 +1152,21 @@ what kr wrote.
 
 `standalone` is for a host with no service manager set up to start the daemon: `kr new` runs the
 `kr-controller` installed beside it, detached from the command, as
-[When no control daemon is running](#when-no-control-daemon-is-running) describes. On Windows both
-are refused, and the daemon is started by hand: the standalone start runs the daemon in a session of
-its own, which Windows does not have, and this build writes service definitions for launchd and
-systemd only.
+[When no control daemon is running](#when-no-control-daemon-is-running) describes.
+
+On Windows `service` is refused, since this build writes service definitions for launchd and systemd
+only, and `standalone` registers this user's scheduled task for the environment. A task under its
+name that belongs to another account or another environment is refused, and nothing is changed; the
+environment's own task that an earlier installation left, or that was changed, is registered again
+as this installation registers it; and a missing one is registered, to log on where you are signed
+in, with no password and no elevation. The choice is written after the task, and no other kr command
+changes the task in between; a choice that cannot be written leaves the task and the choice as they
+were. `--clear` removes only the environment's own task, reports a task under the name that it left
+in place, and clears the choice; a daemon or a worker the task started keeps running. `kr host startup` reports
+the task apart from the choice: whose it is, whether it is the one this installation registers,
+where a start can use it (the login session the command runs in), its last result, which is one for
+all of its runs, and that the daemon it starts ends when you sign out. `kr doctor` reports the same
+as its `startup-task` check.
 
 ## `kr host power`
 
@@ -1341,6 +1368,13 @@ document's condition as `kr doctor` names it, and `revision` is the document's r
   }
 }
 ```
+
+On Windows `startup` carries a `task` object: `name`, `ownership` (`own`, `absent`, `foreign` or
+`unknown`), `valid`, `differences` in kr's own words, `program_present`, `session` and whether it is
+`interactive`, `last_result` (`not_run`, `running` or the code in hexadecimal) and
+`ends_at_sign_out`. A command that changed the choice adds `task_change`, whose `change` is
+`registered`, `repaired`, `removed` or `unchanged`, and whose `left` says whether `--clear` left a task
+under the name.
 
 `kr pair invite --json` returns the invitation:
 
