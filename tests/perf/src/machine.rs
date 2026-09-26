@@ -25,9 +25,10 @@
 //!    stops the tick while a thread runs (`nohz_full`). On macOS it trails by at most one
 //!    ten-millisecond scheduling quantum. Allowance, where Linux keeps each thread's time: for each
 //!    of the run's threads, one tick if its state is running, and otherwise the lesser of one tick
-//!    and how far its time moved in the two ticks after it was read. Where it does not (no
-//!    `schedstat`, or zeros in it): for each process, its running threads times one tick and a
-//!    further two hundredths of a second for rounding. On macOS: for each process, its running
+//!    and how far its time moved in the two ticks after it was read; a process whose whole time
+//!    counts more than its threads' carries the whole reading's allowance instead. Where it does
+//!    not (no `schedstat`, or zeros in it): for each process, its running threads times one tick and
+//!    a further two hundredths of a second for rounding. On macOS: for each process, its running
 //!    threads times one quantum.
 //! 3. An idle count, read from more than one field without a lock, is right at least once in three.
 //!    A count taken just as a processor goes idle or wakes can drop that processor's current idle

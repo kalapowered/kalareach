@@ -34,13 +34,15 @@ nanoseconds), the reader takes the run's processes' time thread by thread rather
 process's clock ticks, which are the same counts rounded down. It reads each thread's time twice,
 at least two clock ticks apart, and then its state and start. A thread counts over a stretch when it
 was read at both ends of it, known by its identifier and start: one that ends inside the stretch
-loses its time since the first reading, and one first read inside it counts nothing, so the least
-can fall short of what the run used but never exceed it. A thread of a process that execs takes the
-process's first thread's identifier and start with its own earlier time, so the first thread counts
-only where its process had one thread at the stretch's first reading, or where another thread that
-started before that reading lives through the stretch, which an exec would have ended. A kernel
-without the file, or one that prints zeros in it, is read process by process, with that reading's
-allowance, and the record says which reading a figure used.
+loses its time since the first reading, and one first read inside it counts nothing, so the sum can
+fall short of what the run used but never exceed it. Each process counts the larger of that sum and
+the least its whole time gives, so threads that start and end between readings, as a thread pool
+made for each piece of work does, never leave the least below the process reading's. A thread of a
+process that execs takes the process's first thread's identifier and start with its own earlier
+time, so the first thread counts only where its process had one thread at the stretch's first
+reading, or where another thread that started before that reading lives through the stretch, which
+an exec would have ended. A kernel without the file, or one that prints zeros in it, is read process
+by process, with that reading's allowance, and the record says which reading a figure used.
 
 Over each measurement the script also reads the share of the machine's time a hypervisor took,
 where the platform keeps that count (the `steal` counter in Linux's `/proc/stat`), and a measurement
@@ -71,7 +73,7 @@ in any five seconds.
 | Assumption | Its bound | Why it holds on a reference host | What the reader checks | Allowance in each stretch between two readings |
 | --- | --- | --- | --- | --- |
 | Idle time is counted as it passes | Linux counts it exactly on a kernel that stops the clock tick on an idle processor; macOS brings an idle processor's count up to date when it is read | Distribution kernels for x86-64 and ARM64 are built for it, and those machines have the one-shot timers it needs | On Linux, `CONFIG_NO_HZ_COMMON` in the kernel's configuration and no `nohz=` that turns it off; a kernel that fails either is not read | Rounding to a hundredth of a second: 0.02 s on Linux (idle and waiting counts), a hundredth of a second and one 10 ms quantum per processor on macOS (0.24 s on twelve processors) |
-| A running thread's charged time trails by little | At most one clock tick on Linux (1 ms at 1000 Hz), one 10 ms scheduling quantum on macOS | The clock tick, or the quantum's timer, brings the running thread's time up to date, and a quiet host holds interrupts off for microseconds | On Linux, the clock rate from the kernel's configuration, no processor that stops the tick while a thread runs (`nohz_full`), and whether the kernel keeps each thread's time: the reader's own thread's time in `/proc/thread-self/schedstat` is more than nothing | On Linux with each thread's time: for each of the run's threads, one tick where its state is running, and otherwise the lesser of one tick and how far its time moved between its two reads, which catches a thread still running as it goes to sleep. On Linux without it: for each of the run's processes, its threads times one tick and a further 0.02 s for rounding. On macOS: for each process, its running threads times one quantum |
+| A running thread's charged time trails by little | At most one clock tick on Linux (1 ms at 1000 Hz), one 10 ms scheduling quantum on macOS | The clock tick, or the quantum's timer, brings the running thread's time up to date, and a quiet host holds interrupts off for microseconds | On Linux, the clock rate from the kernel's configuration, no processor that stops the tick while a thread runs (`nohz_full`), and whether the kernel keeps each thread's time: the reader's own thread's time in `/proc/thread-self/schedstat` is more than nothing | On Linux with each thread's time: for each of the run's threads, one tick where its state is running, and otherwise the lesser of one tick and how far its time moved between its two reads, which catches a thread still running as it goes to sleep; a process whose whole time counts more carries the whole reading's allowance instead. On Linux without it: for each of the run's processes, its threads times one tick and a further 0.02 s for rounding. On macOS: for each process, its running threads times one quantum |
 | An idle count read without a lock is right at least once in three | A count taken just as a processor goes idle or wakes can drop that processor's current idle stretch (Linux) or count it twice (macOS) | It needs a wake-up to land within the few hundred nanoseconds between two reads of one processor's fields, three times over, on a quiet host | Nothing checks it: every count is taken three times, and the largest is kept where it starts a stretch and the smallest where it ends one | None |
 | A process identifier and start name one process, and on Linux a thread identifier and start one thread | No identifier is given to a new process or thread within a hundredth of a second on Linux, which gives the start to that; macOS gives it to the microsecond | Both hand identifiers out in turn, Linux up to its `pid_max`, macOS up to 99,999, so one returns only after every other has been used, far longer than a hundredth of a second | That a process's identifier still names the same start after its threads are read, or its threads are not used; that a thread is not ending (`Z` or `X`) when its time is read, since an exec hands the ending first thread another thread's identifier | None |
 
