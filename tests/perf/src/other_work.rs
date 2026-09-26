@@ -102,9 +102,10 @@ pub struct Process {
 pub struct Summary {
     /// The most processors' worth of other work any window of the step can have held.
     pub bound: f64,
-    /// Of `bound`, the processors' worth that the counts' allowances add to it: their rounding, and
-    /// how far a running thread's time can trail. Other work in that window was at least `bound`
-    /// less this, and a quiet machine reads busier by at most this.
+    /// Of `bound`, the processors' worth that the counts' allowances make up: their rounding, and
+    /// how far a running thread's time can trail. It is only these allowances, and not the rest of
+    /// what makes a bound larger than the work it bounds, such as a run of readings that reaches
+    /// past the five seconds it covers.
     pub allowance: f64,
     /// The most processors' worth of other work over the whole run of readings.
     pub average: f64,

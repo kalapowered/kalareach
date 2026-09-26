@@ -6,10 +6,11 @@
 //!
 //! It reads the whole machine, creates the `--ready` file, and reads the machine again every
 //! `--every` seconds, two by default, until `--for` seconds have passed or the `--until` file
-//! exists, and then once more. It then prints `<bound> <average> <allowance>`: the most
-//! processors' worth of processor time the machine can have spent on anything but the run in any
-//! five seconds from the first reading to the last, the same over all of that time, and how much of
-//! the bound the counts' allowances for rounding and trailing make up. Where the readings cannot
+//! exists, and then once more. It then prints `<bound> <average> <allowance>`, each rounded up to
+//! two decimal places: the most processors' worth of processor time the machine can have spent on
+//! anything but the run in any five seconds from the first reading to the last, the same over all
+//! of that time, and how much of the bound the counts' allowances for rounding and trailing make
+//! up. Where the readings cannot
 //! show that, it prints `unread: <why>` instead. The run is process `--run` and every process
 //! descended from it; a run whose process has gone is unread, so a watcher whose run was stopped
 //! stops too.
@@ -49,12 +50,19 @@ fn main() -> ExitCode {
     };
     match watch(&options) {
         Ok(summary) => println!(
-            "{:.2} {:.2} {:.2}",
-            summary.bound, summary.average, summary.allowance
+            "{} {} {}",
+            upward(summary.bound),
+            upward(summary.average),
+            upward(summary.allowance)
         ),
         Err(why) => println!("unread: {why}"),
     }
     ExitCode::SUCCESS
+}
+
+/// A figure that bounds from above, to two decimal places and never shown as less than it is.
+fn upward(value: f64) -> String {
+    format!("{:.2}", (value * 100.0).ceil() / 100.0)
 }
 
 fn options(mut arguments: impl Iterator<Item = String>) -> Option<Options> {
