@@ -175,10 +175,12 @@ enum Ended {
 /// socket ends while the invitation is still on offer: the room keeps candidates that arrive
 /// meanwhile and tells the host about them when it is back. Every wait on the room, the pause
 /// before attaching again included, goes through one [`Watch`], which watches the owner ending the
-/// invitation through `stop` and asks the host every [`EXPIRY_RECHECK`] whether the invitation is
-/// still on offer, so no room outlives its invitation by more than one recheck. An invitation that
-/// ended by itself, or that the pairing service let go without ending, has its locator released
-/// here; one the owner ended is released by the owner's own call.
+/// invitation through `stop` and asks the host whether the invitation is still on offer: the relay
+/// asks before it first attaches, and the watch asks again no later than one [`EXPIRY_RECHECK`]
+/// after that question and every [`EXPIRY_RECHECK`] from then on, so no room outlives its
+/// invitation by more than one recheck. An invitation that ended by itself, or that the pairing
+/// service let go without ending, has its locator released here; one the owner ended is released
+/// by the owner's own call.
 pub async fn serve_room<H: RoomHost>(
     host: Weak<H>,
     service: Arc<dyn Rendezvous>,
@@ -233,7 +235,11 @@ struct Watch<H> {
 
 impl<H: RoomHost> Watch<H> {
     fn new(host: Weak<H>, invitation_id: InvitationId, stop: watch::Receiver<bool>) -> Self {
-        let mut recheck = tokio::time::interval(EXPIRY_RECHECK);
+        // The relay asks the host itself before it first attaches, after the watch begins, so the
+        // first recheck falls due one period after the watch begins: a recheck at once would only
+        // ask again what was just answered.
+        let mut recheck =
+            tokio::time::interval_at(tokio::time::Instant::now() + EXPIRY_RECHECK, EXPIRY_RECHECK);
         recheck.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         Self {
             host,
