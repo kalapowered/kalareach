@@ -78,15 +78,11 @@ fn installed(placed: &Placed, surfaces: &[BridgeSurface]) -> kr_worker::broker::
     launched::installed(&placed.forwarder, surfaces)
 }
 
-fn exit_code(launch: &mut Launch) -> Option<i32> {
-    let deadline = std::time::Instant::now() + LIVENESS;
-    loop {
-        if let Some(status) = launch.application.try_wait().expect("waitable") {
-            return status.code();
-        }
-        assert!(std::time::Instant::now() < deadline, "the channel ended");
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
+/// The code the channel ended with, which the application ends with too.
+fn exit_code(launch: &Launch) -> Option<i32> {
+    let code = launch.application.exit_code();
+    assert!(code.is_some(), "the channel ended");
+    code
 }
 
 fn permission_request(request_id: &str, input_preview: &str) -> serde_json::Value {
@@ -243,7 +239,7 @@ async fn kr_req_12_18_the_channel_negotiates_and_carries_frames_both_ways_and_no
 
     // Claude Code closes its end.
     drop(launch.requests.take());
-    assert_eq!(exit_code(&mut launch), Some(0));
+    assert_eq!(exit_code(&launch), Some(0));
     assert_eq!(
         to_worker(&mut admitted).await,
         None,
@@ -275,9 +271,23 @@ async fn kr_req_12_18_a_channel_the_worker_ends_ends_its_session() {
     );
     drop(admitted);
     assert_eq!(
-        exit_code(&mut launch),
+        exit_code(&launch),
         Some(i32::from(kr_hook::cli::EXIT_FAILURE))
     );
+}
+
+/// Waits, within the liveness bound, until the process `identity` names has ended.
+async fn gone(identity: &kr_protocol::identity::ProcessStartIdentity, what: &str) {
+    use kr_ipc::identity::{ProcessState, process_state};
+
+    let deadline = std::time::Instant::now() + LIVENESS;
+    while process_state(identity) != ProcessState::Ended {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{what} is still running: {identity:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
 }
 
 /// A launch ends every process it started when it goes, the channel the application started
@@ -286,7 +296,7 @@ async fn kr_req_12_18_a_channel_the_worker_ends_ends_its_session() {
 /// its own.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_launch_that_goes_ends_the_channel_it_started() {
-    use kr_ipc::identity::{ProcessState, process_start_identity, process_state};
+    use kr_ipc::identity::process_start_identity;
 
     let placed = Placed::new();
     let mut launch = Launch::channel(&placed, installed(&placed, &[BridgeSurface::Channel]));
@@ -297,20 +307,94 @@ async fn a_launch_that_goes_ends_the_channel_it_started() {
     let input = launch.requests.take();
 
     drop(launch);
-    assert_eq!(
-        process_state(&application),
-        ProcessState::Ended,
-        "the application ended with its launch"
-    );
+    gone(&application, "the application").await;
+    gone(&channel, "the channel the application started").await;
+    drop((input, admitted));
+}
+
+/// A launch whose application was ended from outside before the launch went, leaving the channel
+/// it started to another parent, still ends that channel when it goes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_launch_ends_its_channel_after_its_application_was_ended_from_outside() {
+    use kr_ipc::identity::{ProcessState, process_start_identity, process_state};
+
+    let placed = Placed::new();
+    let mut launch = Launch::channel(&placed, installed(&placed, &[BridgeSurface::Channel]));
+    let admitted = launch.accept().await.expect("the channel is admitted");
+    let channel = admitted.process.identity.clone();
+    let application =
+        process_start_identity(launch.application.id()).expect("the application is running");
+    let input = launch.requests.take();
+
+    let pid = launch.application.id().to_string();
+    let ended = std::process::Command::new("kill")
+        .args(["-KILL", &pid])
+        .status()
+        .expect("kill runs");
+    assert!(ended.success(), "the application is ended from outside");
+    // It has ended once it is waiting to be collected, which only its launch does.
     let deadline = std::time::Instant::now() + LIVENESS;
-    while process_state(&channel) != ProcessState::Ended {
+    loop {
+        let listed = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid])
+            .output()
+            .expect("ps runs");
+        if String::from_utf8_lossy(&listed.stdout)
+            .trim_start()
+            .starts_with('Z')
+        {
+            break;
+        }
         assert!(
             std::time::Instant::now() < deadline,
-            "the channel the application started is still running: {channel:?}"
+            "the application ended from outside"
         );
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
+    assert_eq!(
+        process_state(&channel),
+        ProcessState::Running,
+        "the channel outlives the application it was started by"
+    );
+
+    drop(launch);
+    gone(&application, "the application").await;
+    gone(&channel, "the channel the ended application started").await;
     drop((input, admitted));
+}
+
+/// A launch that goes as soon as it has started, before or after its application has started the
+/// channel, leaves nothing it started: no process is left in the application's group, and none
+/// runs the forwarder this case placed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_launch_that_goes_at_once_leaves_nothing_it_started() {
+    let placed = Placed::new();
+    let launch = Launch::channel(&placed, installed(&placed, &[BridgeSurface::Channel]));
+    let group = launch.application.id().to_string();
+    let forwarder = placed.forwarder.to_string_lossy().into_owned();
+
+    drop(launch);
+    let listed = |arguments: [&str; 2]| {
+        let listed = std::process::Command::new("pgrep")
+            .args(arguments)
+            .output()
+            .expect("pgrep runs");
+        String::from_utf8_lossy(&listed.stdout).trim().to_owned()
+    };
+    let deadline = std::time::Instant::now() + LIVENESS;
+    loop {
+        let in_group = listed(["-g", &group]);
+        let forwarding = listed(["-f", &forwarder]);
+        if in_group.is_empty() && forwarding.is_empty() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "left in the application's group {group}: [{in_group}]; running the forwarder: \
+             [{forwarding}]"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
 }
 
 /// KR-REQ-05.09, KR-REQ-11.43: a channel the installation did not register is refused before
@@ -319,7 +403,7 @@ async fn a_launch_that_goes_ends_the_channel_it_started() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn kr_req_05_09_a_channel_the_installation_does_not_have_is_refused() {
     let placed = Placed::new();
-    let mut launch = Launch::channel(&placed, installed(&placed, &[BridgeSurface::Hook]));
+    let launch = Launch::channel(&placed, installed(&placed, &[BridgeSurface::Hook]));
     let refused = launch
         .accept()
         .await
@@ -333,7 +417,7 @@ async fn kr_req_05_09_a_channel_the_installation_does_not_have_is_refused() {
         "{refused}"
     );
     assert_eq!(
-        exit_code(&mut launch),
+        exit_code(&launch),
         Some(i32::from(kr_hook::cli::EXIT_FAILURE))
     );
 }
@@ -466,7 +550,7 @@ async fn kr_req_12_18_a_standard_error_nobody_reads_cannot_stop_the_channel() {
     const REFUSALS: usize = 1_000;
 
     let Diagnosed {
-        mut launch,
+        launch,
         lines,
         mut admitted,
         diagnostics,
@@ -490,7 +574,7 @@ async fn kr_req_12_18_a_standard_error_nobody_reads_cannot_stop_the_channel() {
     let admitted = sending.await.expect("the worker's frames were all read");
     drop(admitted);
     assert_eq!(
-        exit_code(&mut launch),
+        exit_code(&launch),
         Some(i32::from(kr_hook::cli::EXIT_FAILURE)),
         "the channel ends when the worker closes it"
     );
@@ -507,7 +591,7 @@ async fn kr_req_12_18_every_refusal_is_reported_in_order_while_standard_error_is
     const REFUSALS: usize = 16;
 
     let Diagnosed {
-        mut launch,
+        launch,
         lines,
         mut admitted,
         diagnostics,
@@ -528,7 +612,7 @@ async fn kr_req_12_18_every_refusal_is_reported_in_order_while_standard_error_is
     assert_eq!(next(&lines), message("after the refusals"));
     drop(admitted);
     assert_eq!(
-        exit_code(&mut launch),
+        exit_code(&launch),
         Some(i32::from(kr_hook::cli::EXIT_FAILURE))
     );
     // The channel has ended, so once this test's own writing end goes, the pipe ends.

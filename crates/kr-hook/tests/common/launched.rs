@@ -69,23 +69,88 @@ done
 "#;
 
 /// The stand-in application for a channel: the channel server runs as its child, on its standard
-/// streams, and the application ends with the server's exit code.
+/// streams, and the application ends with the server's exit code, which it writes to `$3` first.
 const CHANNEL_APPLICATION: &str = r#"
 "$1" claude-code channel
 code=$?
+echo "$code" > "$3.tmp"
+mv "$3.tmp" "$3"
 exit "$code"
 "#;
+
+/// What the application runs first: it makes itself the leader of a process group of its own and
+/// then runs the stand-in `$4`, with the program, the application's name and the file its exit
+/// code goes to as `$1` to `$3`.
+///
+/// Everything it starts is then in that group, wherever the kernel puts the process afterwards: a
+/// process that outlives the application is adopted by another parent and stays in the group. A
+/// shell has no way to lead a group of its own without job control, which takes the terminal from
+/// whatever holds it, so the one step is Perl's `setpgrp`.
+const LEADER: &str = r#"exec /usr/bin/perl -e 'setpgrp(0, 0) or die "setpgrp: $!\n"; exec @ARGV or die "exec: $!\n"' /bin/sh -c "$4" application "$1" "$2" "$3""#;
 
 /// One launch this host made of the stand-in application, with its bridge installed.
 pub struct Launch {
     pub broker: Arc<Broker>,
     pub gateway: NativeGateway,
-    pub application: std::process::Child,
+    pub application: Application,
     /// The application's input, until a test closes it.
     pub requests: Option<std::process::ChildStdin>,
     pub runtime: PathBuf,
     pub inbox: PathBuf,
     next: u32,
+}
+
+/// The stand-in application one launch started, which that launch alone ends and collects.
+///
+/// It leads a process group of its own, and it is collected only once the group has been ended:
+/// until then its identifier, and with it the group's, can name no other process. So ending the
+/// group reaches exactly what the application started, however long ago the application itself
+/// ended and whoever ended it.
+pub struct Application {
+    child: std::process::Child,
+    /// The application's output, until a test takes it.
+    pub stdout: Option<std::process::ChildStdout>,
+    /// The file the channel's stand-in writes the code it ends with to.
+    code: PathBuf,
+}
+
+impl Application {
+    /// The application's process identifier.
+    pub fn id(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// The code the channel's stand-in ended with, read from what it wrote rather than by
+    /// collecting it, once it has ended within the liveness bound.
+    pub fn exit_code(&self) -> Option<i32> {
+        let deadline = std::time::Instant::now() + LIVENESS;
+        loop {
+            if let Ok(code) = std::fs::read_to_string(&self.code) {
+                return code.trim().parse().ok();
+            }
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Ends the application and everything it started, and collects it.
+    ///
+    /// The application is ended by its identifier, which is still its own because nothing else
+    /// collects it. Once it has ended, and before it is collected, its group is ended: nothing in
+    /// the group can start anything more, and the group's identifier can name no other group. Then
+    /// the application is collected.
+    fn end(&mut self) {
+        let _ = self.child.kill();
+        if !collected_elsewhere(self.child.id()) {
+            let _ = std::process::Command::new("kill")
+                .args(["-KILL", "--", &format!("-{}", self.child.id())])
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+        let _ = self.child.wait();
+    }
 }
 
 impl Launch {
@@ -134,6 +199,7 @@ impl Launch {
             std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
                 .expect("made private");
         }
+        let code = inbox.join("application.code");
         let broker = Arc::new(
             Broker::open(
                 None,
@@ -171,10 +237,12 @@ impl Launch {
             },
             arguments: vec![
                 "-c".to_owned(),
-                script.to_owned(),
+                LEADER.to_owned(),
                 "application".to_owned(),
                 program.to_string_lossy().into_owned(),
                 invoked.to_owned(),
+                code.to_string_lossy().into_owned(),
+                script.to_owned(),
             ],
             authentication: AuthenticationState::Authenticated,
             mode: IntegrationMode::NativeBridge,
@@ -196,10 +264,15 @@ impl Launch {
             .stdin
             .take()
             .expect("the application reads requests");
+        let stdout = launched.child.stdout.take();
         Self {
             broker,
             gateway,
-            application: launched.child,
+            application: Application {
+                child: launched.child,
+                stdout,
+                code,
+            },
             requests: Some(requests),
             runtime,
             inbox,
@@ -237,74 +310,40 @@ impl Launch {
 }
 
 impl Drop for Launch {
-    /// Ends the application and every process it started that is still its own: the channel
-    /// server it runs, or a hook it is running.
-    ///
-    /// The application is stopped first, so it can start nothing more and collect nothing it
-    /// started, and while it is stopped each identifier it started still names the process it
-    /// started: even one that has exited stays its uncollected child. Those are ended by their
-    /// identifiers, and then the application. A process the application started and collected
-    /// before it was stopped has already gone.
+    /// Ends the application and everything it started, the channel server it runs or a hook it is
+    /// running, before anything else of the launch goes.
     fn drop(&mut self) {
-        if matches!(self.application.try_wait(), Ok(None)) {
-            let application = self.application.id().to_string();
-            if signal("-STOP", &application) && stopped(&application) {
-                for child in children(&application) {
-                    let _ = signal("-KILL", &child);
-                }
-            }
-        }
-        let _ = self.application.kill();
-        let _ = self.application.wait();
+        self.application.end();
     }
 }
 
-/// Sends `signal` to the process `pid` names, and says whether it was sent.
-fn signal(signal: &str, pid: &str) -> bool {
-    std::process::Command::new("kill")
-        .args([signal, pid])
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
-}
-
-/// Waits, within the liveness bound, until the process `pid` names is stopped, and says whether it
-/// is. A process that has exited meanwhile is not, and whatever it had started is no longer its
-/// own to find.
-fn stopped(pid: &str) -> bool {
+/// Waits, within the liveness bound, until the process `pid` names has ended, and says whether
+/// something other than its parent has collected it since.
+///
+/// One that has ended and waits to be collected has not, and neither, as far as anything here can
+/// tell, has one `ps` cannot read. Only a host that collects every child for its parent could have,
+/// and there the group is left alone: the group's identifier could by then name another group.
+fn collected_elsewhere(pid: u32) -> bool {
+    let pid = pid.to_string();
     let deadline = std::time::Instant::now() + LIVENESS;
     while std::time::Instant::now() < deadline {
-        let Ok(state) = std::process::Command::new("ps")
-            .args(["-o", "state=", "-p", pid])
+        let Ok(listed) = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid])
             .output()
         else {
             return false;
         };
-        match String::from_utf8_lossy(&state.stdout)
+        match String::from_utf8_lossy(&listed.stdout)
             .trim_start()
             .chars()
             .next()
         {
-            Some('T') => return true,
-            None | Some('Z') => return false,
+            Some('Z') => return false,
+            None => return true,
             Some(_) => std::thread::sleep(Duration::from_millis(5)),
         }
     }
     false
-}
-
-/// The identifiers of the processes whose parent is the process `pid` names.
-fn children(pid: &str) -> Vec<String> {
-    std::process::Command::new("pgrep")
-        .args(["-P", pid])
-        .output()
-        .map(|listed| {
-            String::from_utf8_lossy(&listed.stdout)
-                .split_whitespace()
-                .map(str::to_owned)
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 /// What one hook the application ran produced, once it has ended.
