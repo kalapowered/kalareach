@@ -304,3 +304,213 @@ async fn kr_req_05_09_a_channel_the_installation_does_not_have_is_refused() {
         Some(i32::from(kr_hook::cli::EXIT_FAILURE))
     );
 }
+
+/// A channel whose standard error is a named pipe this test holds, launched and admitted, with
+/// Claude Code's handshake done.
+///
+/// The launch runs the channel through a script of this test's own, which points standard error at
+/// the pipe and then becomes the installed forwarder, so the process the worker admits is the
+/// forwarder, started by the application, as it is in every other case here.
+struct Diagnosed {
+    launch: Launch,
+    lines: Receiver<serde_json::Value>,
+    admitted: AdmittedBridge,
+    /// The pipe's reading end, which a test reads or leaves unread.
+    diagnostics: std::fs::File,
+    /// A writing end of this test's own, which keeps the pipe from ending before the test is done.
+    held: std::fs::File,
+    _script: Placed,
+    _placed: Placed,
+}
+
+impl Diagnosed {
+    /// Starts a channel whose standard error is a pipe, full before the channel starts when `full`
+    /// says so, and empty otherwise.
+    async fn start(full: bool) -> Self {
+        use rustix::fs::{Mode, OFlags};
+
+        let placed = Placed::new();
+        let pipe = placed.host.root().join("diagnostics");
+        let made = std::process::Command::new("/usr/bin/mkfifo")
+            .arg(&pipe)
+            .status()
+            .expect("mkfifo runs");
+        assert!(made.success(), "the named pipe is made: {made}");
+        // The reading end first, without waiting for a writer; then the test's own writing end,
+        // which a reader being there lets open at once.
+        let diagnostics = std::fs::File::from(
+            rustix::fs::open(
+                &pipe,
+                OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .expect("the pipe's reading end"),
+        );
+        rustix::io::ioctl_fionbio(&diagnostics, false).expect("a reading end that waits");
+        let held = std::fs::File::from(
+            rustix::fs::open(&pipe, OFlags::WRONLY | OFlags::CLOEXEC, Mode::empty())
+                .expect("a writing end of the test's own"),
+        );
+        if full {
+            fill(&held);
+        }
+
+        // Written aside and placed by a process of its own, as a program this process starts is.
+        let text = placed.host.root().join("channel.text");
+        std::fs::write(
+            &text,
+            format!(
+                "#!/bin/sh\nexec 2>'{}'\nexec '{}' \"$@\"\n",
+                pipe.display(),
+                placed.forwarder.display()
+            ),
+        )
+        .expect("the script");
+        let script = Placed {
+            host: kr_ipc::testing::TempHost::create(),
+            forwarder: placed.host.root().join("bin").join("channel"),
+        };
+        kr_ipc::testing::place_program(&text, &script.forwarder);
+
+        let mut launch = Launch::channel(&script, installed(&placed, &[BridgeSurface::Channel]));
+        let lines = read_lines(&mut launch);
+        let admitted = launch.accept().await.expect("the channel is admitted");
+        to_channel(
+            &mut launch,
+            &serde_json::json!({
+                "jsonrpc": "2.0", "id": 0, "method": "initialize",
+                "params": {"protocolVersion": "2025-11-25", "capabilities": {},
+                    "clientInfo": {"name": "claude-code", "version": "2.1.278"}},
+            }),
+        );
+        assert_eq!(next(&lines)["id"], 0);
+        to_channel(
+            &mut launch,
+            &serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+        );
+        Self {
+            launch,
+            lines,
+            admitted,
+            diagnostics,
+            held,
+            _script: script,
+            _placed: placed,
+        }
+    }
+}
+
+/// A frame the channel refuses, which names `index`, so the report of it can be told apart.
+fn refused(index: usize) -> serde_json::Value {
+    serde_json::json!({"method": format!("notifications/unknown/{index}"), "params": {}})
+}
+
+/// Fills a pipe until it takes nothing more, and leaves its writing end waiting again.
+fn fill(pipe: &std::fs::File) {
+    rustix::io::ioctl_fionbio(pipe, true).expect("a pipe that says when it is full");
+    let mut writer = pipe;
+    // Whole pages first, then single bytes, so no room is left that one short line could take.
+    for size in [4096_usize, 1] {
+        let bytes = vec![b'.'; size];
+        loop {
+            match writer.write(&bytes) {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("the pipe could not be filled: {error}"),
+            }
+        }
+    }
+    rustix::io::ioctl_fionbio(pipe, false).expect("the pipe waits again");
+}
+
+/// KR-REQ-12.18: a standard error nobody reads cannot stop the channel. With standard error a pipe
+/// that is full before the channel starts and is never read, the worker sends more refused frames
+/// than any queue of reports could hold, and then a message: the message reaches Claude Code, and
+/// the channel still ends, with its failure, when the worker closes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kr_req_12_18_a_standard_error_nobody_reads_cannot_stop_the_channel() {
+    /// More refusals than any bounded queue of reports this channel keeps.
+    const REFUSALS: usize = 1_000;
+
+    let Diagnosed {
+        mut launch,
+        lines,
+        mut admitted,
+        diagnostics,
+        held,
+        _script,
+        _placed,
+    } = Diagnosed::start(true).await;
+    let sending = tokio::spawn(async move {
+        for index in 0..REFUSALS {
+            from_worker(&mut admitted, &refused(index)).await;
+        }
+        from_worker(&mut admitted, &message("after the refusals")).await;
+        admitted
+    });
+    let arrived = lines.recv_timeout(LIVENESS);
+    assert_eq!(
+        arrived.ok(),
+        Some(message("after the refusals")),
+        "the message reaches Claude Code while nobody reads standard error"
+    );
+    let admitted = sending.await.expect("the worker's frames were all read");
+    drop(admitted);
+    assert_eq!(
+        exit_code(&mut launch),
+        Some(i32::from(kr_hook::cli::EXIT_FAILURE)),
+        "the channel ends when the worker closes it"
+    );
+    drop(held);
+    drop(diagnostics);
+}
+
+/// KR-REQ-12.18, the control: while standard error is read, every refusal is reported, one line
+/// each, in the order the frames came, and the message after them still reaches Claude Code.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kr_req_12_18_every_refusal_is_reported_in_order_while_standard_error_is_read() {
+    /// Fewer refusals than a queue of reports holds, so none can be dropped however slowly the
+    /// reports are written.
+    const REFUSALS: usize = 16;
+
+    let Diagnosed {
+        mut launch,
+        lines,
+        mut admitted,
+        diagnostics,
+        held,
+        _script,
+        _placed,
+    } = Diagnosed::start(false).await;
+    let reading = std::thread::spawn(move || {
+        let mut said = String::new();
+        let mut diagnostics = diagnostics;
+        let _ = std::io::Read::read_to_string(&mut diagnostics, &mut said);
+        said
+    });
+    for index in 0..REFUSALS {
+        from_worker(&mut admitted, &refused(index)).await;
+    }
+    from_worker(&mut admitted, &message("after the refusals")).await;
+    assert_eq!(next(&lines), message("after the refusals"));
+    drop(admitted);
+    assert_eq!(
+        exit_code(&mut launch),
+        Some(i32::from(kr_hook::cli::EXIT_FAILURE))
+    );
+    // The channel has ended, so once this test's own writing end goes, the pipe ends.
+    drop(held);
+    let said = reading.join().expect("the diagnostics are read");
+    let reported: Vec<&str> = said
+        .lines()
+        .filter(|line| line.contains("not forwarded"))
+        .collect();
+    assert_eq!(reported.len(), REFUSALS, "{said}");
+    for (index, line) in reported.iter().enumerate() {
+        assert!(
+            line.starts_with("kr-hook: ")
+                && line.contains(&format!("\"notifications/unknown/{index}\"")),
+            "refusal {index} in its place: {said}"
+        );
+    }
+}
