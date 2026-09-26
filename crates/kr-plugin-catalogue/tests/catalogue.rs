@@ -21,8 +21,8 @@ use kr_plugin_catalogue::{
     Authority, BrokerBridge, BudgetLedger, CapabilityCeiling, Catalogue, CatalogueError,
     CatalogueResult, Change, Claimed, Committed, DisablePolicy, Effect, Enrolment, FetchReason,
     HostPlatform, Installation, InstallationGrant, LivePackages, LiveRelease, MatchIndex,
-    NotAdmittedReason, Observation, Owner, ReceiptClaim, ReceiptKey, Recording, ReleaseOrigin,
-    RepositoryId, RepositoryKind, Transition, capability_from_str, this_host,
+    NotAdmittedReason, Observation, Owner, PackageLimits, ReceiptClaim, ReceiptKey, Recording,
+    ReleaseOrigin, RepositoryId, RepositoryKind, Transition, capability_from_str, this_host,
 };
 use kr_plugin_sdk::capability::{CapabilityState, EvidenceSource, PluginCapability};
 use kr_plugin_sdk::catalogue::{QualificationResult, RevocationReason, RevocationRecord};
@@ -6005,6 +6005,73 @@ async fn a_package_that_lost_or_changed_a_file_is_repaired_before_it_is_enabled(
             .expect("still installed")
             .enabled
     );
+}
+
+/// A package whose repository was removed is held to the package limits in force when it is
+/// enabled, as a package enabled through its repository is: past `package_bytes`, `object_count`
+/// or `expanded_pack_bytes` it is refused by that name and stays disabled, and within the limits
+/// it is enabled.
+#[tokio::test]
+async fn a_package_whose_repository_was_removed_is_held_to_the_limits_in_force_when_enabled() {
+    let format = PackageLimits::format();
+    for (resource, limits) in [
+        (
+            Resource::PackageBytes,
+            PackageLimits {
+                package_bytes: 1,
+                ..format
+            },
+        ),
+        (
+            Resource::PackageFiles,
+            PackageLimits {
+                object_count: 1,
+                ..format
+            },
+        ),
+        (
+            Resource::ExpandedPackBytes,
+            PackageLimits {
+                expanded_pack_bytes: 1,
+                ..format
+            },
+        ),
+    ] {
+        let home = tempfile::tempdir().expect("a temporary directory");
+        let generation = Generation::build(home.path(), GenerationSpec::default()).await;
+        let mut catalogue = installed_catalogue(home.path(), &generation).await;
+        catalogue
+            .remove_repository(&repository())
+            .expect("the owner stopped trusting this root");
+        catalogue.set_package_limits(limits);
+        let refusal = catalogue
+            .set_enabled(environment(), &plugin(), true)
+            .await
+            .expect_err("a package past a limit in force");
+        assert!(
+            matches!(&refusal, CatalogueError::ResourceLimit(limit) if limit.resource == resource),
+            "{resource}: {refusal}"
+        );
+        assert!(
+            refusal.to_string().contains(resource.as_str()),
+            "{resource}: {refusal}"
+        );
+        assert!(
+            !catalogue
+                .installation(environment(), &plugin())
+                .expect("readable")
+                .expect("still installed")
+                .enabled,
+            "{resource}: still disabled"
+        );
+
+        catalogue.set_package_limits(format);
+        let enabled = catalogue
+            .set_enabled(environment(), &plugin(), true)
+            .await
+            .expect("within the limits it is enabled");
+        assert!(enabled.enabled, "{resource}");
+    }
 }
 
 // ---------------------------------------------------------------------------------------------

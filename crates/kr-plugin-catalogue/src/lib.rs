@@ -1653,11 +1653,15 @@ impl Catalogue {
         // again and replaced, and one this host cannot read is its disk's failure.
         // The limits in force hold it as they hold a fetched one: a limit lowered since it was
         // extracted refuses it here rather than letting a kept copy through.
-        let limits = ledger_of(store, enrolled, self.package_limits)?;
         if let Some(hash) = package_hash
             && let PackageCheck::Complete(package) = store.check_package(hash)?
         {
-            within_limits(store, &package, &limits, &format!("{plugin_id} {version}"))?;
+            within_limits(
+                store,
+                &package,
+                self.package_limits,
+                &format!("{plugin_id} {version}"),
+            )?;
             return Ok(*package);
         }
         let active = enrolled.active.ok_or_else(|| CatalogueError::NotFound {
@@ -1685,10 +1689,11 @@ impl Catalogue {
         let subject = format!("{} {}", entry.plugin_id, entry.version);
         // The same package reached through the entry: the entry is a signed statement about this
         // hash, and it has to agree with the manifest the hash names before anything relies on it.
+        let limits = ledger_of(store, enrolled, self.package_limits)?;
         extract::check_declared(&entry, &limits)?;
         if let PackageCheck::Complete(package) = store.check_package(entry.manifest_digest)? {
             extract::reconcile(&entry, package.manifest(), &subject)?;
-            within_limits(store, &package, &limits, &subject)?;
+            within_limits(store, &package, self.package_limits, &subject)?;
             return Ok(*package);
         }
 
@@ -2199,10 +2204,18 @@ impl Catalogue {
                     // every file the package declares is checked where it lies: one that is gone
                     // or altered is section 11's own answer, because nothing can fetch it again,
                     // and one this host cannot read is its disk's failure.
+                    // A complete one is held to the package limits in force, as one enabled
+                    // through its repository is: a limit lowered since it was extracted refuses
+                    // it here.
                     let store = self.store_of(&installation);
                     let _lock = store.lock()?;
                     match store.check_package(installation.package_digest)? {
-                        PackageCheck::Complete(_) => {}
+                        PackageCheck::Complete(package) => within_limits(
+                            &store,
+                            &package,
+                            self.package_limits,
+                            &format!("{plugin_id} {}", installation.version),
+                        )?,
                         PackageCheck::Missing { detail } | PackageCheck::Corrupt { detail } => {
                             return Err(CatalogueError::UnavailableOffline {
                                 detail: format!(
@@ -2706,7 +2719,7 @@ fn check_decided_under(
 fn within_limits(
     store: &Store,
     package: &ReadyPackage,
-    ledger: &BudgetLedger,
+    limits: PackageLimits,
     subject: &str,
 ) -> CatalogueResult<()> {
     let payloads = &package.manifest().payloads;
@@ -2721,7 +2734,7 @@ fn within_limits(
     let files = u64::try_from(payloads.len())
         .unwrap_or(u64::MAX)
         .saturating_add(1);
-    ledger.check_package(extracted.max(declared), files, Stage::Declared, subject)?;
+    limits.check(extracted.max(declared), files, Stage::Declared, subject)?;
     Ok(())
 }
 

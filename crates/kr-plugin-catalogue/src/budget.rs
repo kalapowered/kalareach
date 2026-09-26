@@ -110,6 +110,53 @@ impl PackageLimits {
             expanded_pack_bytes: expanded_pack_bytes.min(format.expanded_pack_bytes),
         }
     }
+
+    /// Checks one package against these limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ResourceLimit`] when the package declares or takes more bytes, or holds more
+    /// files, than one package may.
+    pub fn check(
+        &self,
+        bytes: u64,
+        files: u64,
+        stage: Stage,
+        subject: &str,
+    ) -> Result<(), ResourceLimit> {
+        // What a package declares is held to `package_bytes`, and what it takes once extracted to
+        // `expanded_pack_bytes`; its files to `object_count` at both. This format stores every file
+        // as it is, so the declared total is also the extracted size, and a declaration is held to
+        // both byte limits before anything is fetched.
+        let limits: &[(Resource, u64)] = match stage {
+            Stage::Declared => &[
+                (Resource::PackageBytes, self.package_bytes),
+                (Resource::ExpandedPackBytes, self.expanded_pack_bytes),
+            ],
+            Stage::Actual => &[(Resource::ExpandedPackBytes, self.expanded_pack_bytes)],
+        };
+        for &(resource, limit) in limits {
+            if bytes > limit {
+                return Err(ResourceLimit {
+                    resource,
+                    limit,
+                    requested: bytes,
+                    stage,
+                    subject: subject.to_owned(),
+                });
+            }
+        }
+        if files > self.object_count {
+            return Err(ResourceLimit {
+                resource: Resource::PackageFiles,
+                limit: self.object_count,
+                requested: files,
+                stage,
+                subject: subject.to_owned(),
+            });
+        }
+        Ok(())
+    }
 }
 
 /// When the allowance was found to be exhausted.
@@ -382,12 +429,11 @@ impl BudgetLedger {
         self.payload_bytes = self.payload_bytes.saturating_sub(bytes);
     }
 
-    /// Checks one package against the per-package limits the SDK states.
+    /// Checks one package against the package limits this ledger holds.
     ///
     /// # Errors
     ///
-    /// Returns [`ResourceLimit`] when the package declares more bytes or more files than one
-    /// package may carry.
+    /// Returns what [`PackageLimits::check`] returns.
     pub fn check_package(
         &self,
         bytes: u64,
@@ -395,45 +441,7 @@ impl BudgetLedger {
         stage: Stage,
         subject: &str,
     ) -> Result<(), ResourceLimit> {
-        // What a package declares is held to `package_bytes`, and what it takes once extracted to
-        // `expanded_pack_bytes`; its files to `object_count` at both. This format stores every file
-        // as it is, so the declared total is also the extracted size, and a declaration is held to
-        // both byte limits before anything is fetched.
-        let limits: &[(Resource, u64)] = match stage {
-            Stage::Declared => &[
-                (Resource::PackageBytes, self.package.package_bytes),
-                (
-                    Resource::ExpandedPackBytes,
-                    self.package.expanded_pack_bytes,
-                ),
-            ],
-            Stage::Actual => &[(
-                Resource::ExpandedPackBytes,
-                self.package.expanded_pack_bytes,
-            )],
-        };
-        for &(resource, limit) in limits {
-            if bytes > limit {
-                return Err(ResourceLimit {
-                    resource,
-                    limit,
-                    requested: bytes,
-                    stage,
-                    subject: subject.to_owned(),
-                });
-            }
-        }
-        let file_limit = self.package.object_count;
-        if files > file_limit {
-            return Err(ResourceLimit {
-                resource: Resource::PackageFiles,
-                limit: file_limit,
-                requested: files,
-                stage,
-                subject: subject.to_owned(),
-            });
-        }
-        Ok(())
+        self.package.check(bytes, files, stage, subject)
     }
 }
 
