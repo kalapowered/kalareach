@@ -37,7 +37,7 @@
 
 use std::collections::BTreeSet;
 
-use kr_protocol::gateway::PendingState;
+use kr_protocol::gateway::{PendingKind, PendingState};
 use kr_protocol::grant::{Grant, HistoryScope};
 use kr_protocol::ids::{PendingResourceId, QuestionId};
 use kr_protocol::rights::ActionRight;
@@ -404,6 +404,25 @@ impl ViewerScope {
         }
     }
 
+    /// The scope of a live view that began at `from_ms`.
+    ///
+    /// A view that goes on receiving what happens after it began reaches, under section 10's
+    /// live-screen exception, the screen that is showing and what follows it. So a scope that keeps
+    /// no retained history and includes the live screen reaches what is recorded from `from_ms` on,
+    /// and nothing older. A scope with a bound keeps its bound, and one without the live screen
+    /// keeps reaching no retained content at all.
+    #[must_use]
+    pub fn live_from(self, from_ms: u64) -> Self {
+        if self.lower_bound_ms.is_none() && self.include_live_screen {
+            Self {
+                lower_bound_ms: Some(from_ms),
+                ..self
+            }
+        } else {
+            self
+        }
+    }
+
     /// Returns true when this is the host owner's own unrestricted authority.
     #[must_use]
     pub const fn is_unrestricted(&self) -> bool {
@@ -636,6 +655,35 @@ impl HistoryFilter {
                 | WithheldReason::OutsideTheVisibleScreen => WithheldReason::NotNamedByTheGrant,
                 other => other,
             })
+    }
+
+    /// Decides about one resource the broker arbitrates: an approval, a reverse call or an action
+    /// this host prepared against the upstream.
+    ///
+    /// The pending-resource snapshot and every transition that follows it are decided here, so
+    /// neither carries what the approval record read would withhold. An approval is decided as
+    /// [`Self::admit_approval`] decides it: named and current, else by the bound. A name is for an
+    /// approval, so a reverse call and an upstream action are decided by that same bound, whatever
+    /// the grant names. `kind` is what the resource is now, since a request becomes an approval
+    /// when a decoder interprets it, and `recorded_at_ms` is when the broker recorded it, which
+    /// never changes.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason the resource is outside this viewer's scope.
+    pub fn admit_resource(
+        &self,
+        kind: PendingKind,
+        resource_id: PendingResourceId,
+        recorded_at_ms: u64,
+        state: PendingState,
+    ) -> std::result::Result<(), WithheldReason> {
+        match kind {
+            PendingKind::Approval => self.admit_approval(resource_id, recorded_at_ms, state),
+            PendingKind::ReverseRpc | PendingKind::UpstreamAction => {
+                self.admit_at(Surface::LoadedConversation, recorded_at_ms)
+            }
+        }
     }
 
     /// Decides about one attachment's bytes.

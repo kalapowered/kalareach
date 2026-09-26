@@ -2656,9 +2656,9 @@ impl WorkerService {
         }
         let outcome = match method {
             Method::SessionRead => self.session_read(&request.params, caller),
-            Method::EventsSnapshot => self.events_snapshot(state, &request.params),
+            Method::EventsSnapshot => self.events_snapshot(state, &request.params, caller),
             Method::HistoryPage => self.history_page(state, &request.params, caller),
-            Method::EventsSubscribe => self.events_subscribe(state, &request.params),
+            Method::EventsSubscribe => self.events_subscribe(state, &request.params, caller),
             Method::ActionRead => self.action_read(&caller.actor_id, &request.params),
             Method::InputWrite => self.input_write(state, &request.params, caller),
             Method::QuestionReadOwn => self.question_read_own(state, &request.params),
@@ -4459,13 +4459,20 @@ impl WorkerService {
     /// different states. A continuation names the copy it belongs to, and a copy that has ended -
     /// read to its end, outlived its deadline, or given up so another connection could recover -
     /// is refused, because the client can always start a new one.
+    ///
+    /// A read that came with a history scope is given only the resources that scope reaches, as
+    /// [`Self::resource_filter`] says. A fresh snapshot on a connection whose subscription is held
+    /// to a scope keeps that subscription's live moment, and what it carries replaces what the
+    /// subscription's later transitions are decided by; one on a connection delivering no such
+    /// subscription reaches from now, and keeps nothing.
     fn events_snapshot(
         &self,
         state: &ConnectionState,
         params: &ParamsValue,
+        caller: &Caller,
     ) -> Result<ParamsValue> {
         let params: EventsSnapshotParams = parse(params)?;
-        let session = self.runtime.session();
+        let mut session = self.runtime.session();
         Self::check_session(&session, params.session_id)?;
         // What the answer costs before a single resource is in it, which is what the page has to
         // fit beside. The session and its attachments decide that, so it is measured and not
@@ -4476,7 +4483,23 @@ impl WorkerService {
             Self::answer_bytes(&session.snapshot(Self::no_resources())),
         )?;
         let page = match params.agent_resources_from.as_ref() {
-            None => self.begin_recovery(state, bounds),
+            None => {
+                let subscribed = session.scoped_subscription(state.connection_id);
+                let filter = Self::resource_filter(caller, Method::EventsSnapshot, || {
+                    subscribed.map_or_else(|| kr_ipc::now_ms().get(), |(_, began)| began)
+                });
+                let recovered = self.begin_recovery(state, bounds, filter.as_ref());
+                if let (Some(filter), Some((attachment_id, _))) = (filter, subscribed) {
+                    session.hold_resources(
+                        attachment_id,
+                        state.connection_id,
+                        filter,
+                        recovered.page.cursor,
+                        recovered.shown,
+                    );
+                }
+                recovered.page
+            }
             Some(from) => self
                 .recoveries
                 .resume(
@@ -4582,21 +4605,70 @@ impl WorkerService {
     /// Copies what the broker holds for this connection and returns the first page of it.
     ///
     /// The copy and the cursor are taken in the same call, under the broker's own lock, which is
-    /// what makes the pages that follow one state taken at one position.
+    /// what makes the pages that follow one state taken at one position. A copy for a read held to
+    /// a filter is filtered before it is kept and paged, so every page of it, the ones read later
+    /// included, carries only what that filter admits, and the pages stay as full as the frame
+    /// allows. What comes back beside the page is every resource the whole copy carries that has
+    /// not ended, which is what the view was shown.
     fn begin_recovery(
         &self,
         state: &ConnectionState,
         bounds: crate::recovery::PageBounds,
-    ) -> crate::recovery::RecoveryPage {
-        let snapshot = self.broker.resource_snapshot();
-        self.recoveries.begin(
+        filter: Option<&crate::history_filter::HistoryFilter>,
+    ) -> Recovered {
+        let mut snapshot = self.broker.resource_snapshot();
+        let mut shown = std::collections::BTreeSet::new();
+        if let Some(filter) = filter {
+            snapshot.resources.retain(|resource| {
+                filter
+                    .admit_resource(
+                        resource.kind,
+                        resource.resource_id,
+                        resource.recorded_at.get(),
+                        resource.state,
+                    )
+                    .is_ok()
+            });
+            shown.extend(
+                snapshot
+                    .resources
+                    .iter()
+                    .filter(|resource| !resource.state.is_terminal())
+                    .map(|resource| resource.resource_id),
+            );
+        }
+        let page = self.recoveries.begin(
             state.connection_id,
             snapshot.cursor,
             snapshot.resources,
             self.clock.now(),
             bounds,
             &|| !state.withdrawn.is_set(),
-        )
+        );
+        Recovered { page, shown }
+    }
+
+    /// The filter a read of the broker's pending resources is held to, or `None` for a read that
+    /// is shown them all.
+    ///
+    /// Section 10: without a named scope, a pending-resource snapshot cannot bypass the history
+    /// filter. A read that came with a history scope, a paired device's through the daemon, is
+    /// held to that scope by [`crate::history_filter::HistoryFilter::admit_resource`], as a live
+    /// view that began at the moment `live_from_ms` gives: see
+    /// [`crate::history_filter::ViewerScope::live_from`]. The local owner, and a read that came
+    /// with no scope, are shown every resource and every transition, as they always were. That is
+    /// these two reads' own rule and not [`Self::history_of`]'s, which refuses a caller under a
+    /// grant whose scope did not come with its read.
+    fn resource_filter(
+        caller: &Caller,
+        method: Method,
+        live_from_ms: impl FnOnce() -> u64,
+    ) -> Option<crate::history_filter::HistoryFilter> {
+        caller.history.as_ref()?;
+        let scoped = caller.history_filter(method.entry())?;
+        Some(crate::history_filter::HistoryFilter::new(
+            scoped.scope().clone().live_from(live_from_ms()),
+        ))
     }
 
     /// Measures an answer that carries no resource, which is what a page has to fit beside.
@@ -4684,10 +4756,20 @@ impl WorkerService {
         encode(&page)
     }
 
+    /// Serves `events.subscribe`: the screen, the resources the broker arbitrates, and everything
+    /// that follows them.
+    ///
+    /// A read that came with a history scope is held to it, as [`Self::resource_filter`] says: its
+    /// first page and every later page carry only what the scope reaches, and every transition
+    /// after the snapshot is decided the same way before it is queued for this view. A live view's
+    /// moment is the one the attachment's first such subscription began at, kept for the
+    /// attachment. A subscription with no scope is told everything, as before, whatever an earlier
+    /// subscription of the attachment was held to.
     fn events_subscribe(
         &self,
         state: &mut ConnectionState,
         params: &ParamsValue,
+        caller: &Caller,
     ) -> Result<ParamsValue> {
         let params: EventsSubscribeParams = parse(params)?;
         Self::check_attachment(state, params.attachment_id)?;
@@ -4728,7 +4810,23 @@ impl WorkerService {
         // The page is cut to what is left of the frame once the rest of this answer is in it. The
         // screen this subscription is drawn is not in the same frame; the cursors and the stream
         // identifier are.
-        let agent_resources = self.begin_recovery(state, bounds);
+        let filter = Self::resource_filter(caller, Method::EventsSubscribe, || {
+            session.live_view_began(params.attachment_id, kr_ipc::now_ms().get())
+        });
+        let recovered = self.begin_recovery(state, bounds, filter.as_ref());
+        // What this view is shown after the snapshot is decided against the snapshot, and it is
+        // installed under the same lock, so no transition falls between the two.
+        match filter {
+            Some(filter) => session.hold_resources(
+                params.attachment_id,
+                state.connection_id,
+                filter,
+                recovered.page.cursor,
+                recovered.shown,
+            ),
+            None => session.release_resources(params.attachment_id, state.connection_id),
+        }
+        let agent_resources = recovered.page;
         let oldest = session.oldest_retained_cursor();
         // A client whose position has fallen out of the retained window is told so. The screen it
         // is about to be drawn is current either way; the gap says that what happened in between is
@@ -5503,6 +5601,14 @@ pub struct JoinedScreen {
     pub bytes: Vec<u8>,
     /// The part of the stream that is no longer readable, when the client had fallen behind it.
     pub gap: Option<kr_protocol::recovery::HistoryGap>,
+}
+
+/// The first page of a recovery, and what the view that asked for it was shown.
+struct Recovered {
+    /// The page.
+    page: crate::recovery::RecoveryPage,
+    /// Every resource of the whole copy that has not ended, when the copy was held to a filter.
+    shown: std::collections::BTreeSet<kr_protocol::ids::PendingResourceId>,
 }
 
 /// Who one request is served as.
