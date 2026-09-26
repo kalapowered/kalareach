@@ -4191,16 +4191,16 @@ wants to replay what it missed reads the outbox rather than the live stream.
 A view whose subscription came with a grant's history scope, a paired device's, is told only what
 that scope reaches, by the rule its snapshot was cut by, and each transition is decided before
 anything is queued for the view, so the notifications it is sent are numbered without gaps. A
-transition at or below the snapshot's position is already in the snapshot and is dropped, whatever
-it says. After that, a transition reaches the view when its resource is one the view was shown, so
-the end of an approval it was shown reaches it, or when the rule admits the resource as the broker
-holds it when the transition arrives, which adds the resource to what the view was shown: a request
-is decided as an approval once a decoder has interpreted it. A transition whose resource the broker
-cannot read reaches only a view that was shown it, and one of another run of the stream is decided
-by the rule alone. A resource the scope does not reach is absent from the pages and the stream
-alike, as a resource the host does not hold, and nothing counts what was withheld. A fresh snapshot
-on the same connection replaces the position and what the view was shown, and keeps the moment the
-attachment's first such subscription began.
+transition of the snapshot's own run at or below its position is already in the snapshot and is
+dropped, whatever it says. After that, a transition reaches the view when its resource is one the
+view was shown, so the end of an approval it was shown reaches it, or when the rule admits the
+resource as the broker holds it when the transition arrives, which adds the resource to what the
+view was shown: a request is decided as an approval once a decoder has interpreted it. A transition
+whose resource the broker cannot read reaches only a view that was shown it, and one of another run
+of the stream is decided by the rule alone. A resource the scope does not reach is absent from the
+pages and the stream alike, as a resource the host does not hold, and nothing counts what was
+withheld. A fresh snapshot on the same connection replaces the position and what the view was shown,
+and keeps the moment the attachment's first such subscription began.
 
 ## Reverse operations
 
