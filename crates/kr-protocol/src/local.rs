@@ -125,6 +125,23 @@ pub struct LocalHelloAck {
 /// in the worker's answer to its hello before it sends such a frame.
 pub const FORWARDED_UTC_DEADLINE: &str = "forwarded.utc-deadline/1";
 
+/// The capability a worker states when it reads the history scope a forwarded read carries
+/// ([`ForwardedRequest::history`]), and a control daemon reads before it sends one.
+///
+/// A worker survives an upgrade of the daemon, the forwarded frames are closed schemas, and a
+/// worker ends the connection a frame it cannot read arrived on, so a worker of an earlier build is
+/// sent no scope at all. It refuses the reads a scope narrows by itself, as it always did.
+pub const FORWARDED_HISTORY_SCOPE: &str = "forwarded.history-scope/1";
+
+/// Returns true when a worker's statement says it reads a forwarded read's history scope
+/// ([`FORWARDED_HISTORY_SCOPE`]).
+#[must_use]
+pub fn reads_history_scopes(capabilities: &CanonicalSet<CapabilityId>) -> bool {
+    capabilities
+        .iter()
+        .any(|capability| capability.as_str() == FORWARDED_HISTORY_SCOPE)
+}
+
 /// What a worker's statement of the clock floor it maps starts with. The rest is the floor's
 /// identity, as 32 lowercase hexadecimal digits.
 pub const UTC_FLOOR_PREFIX: &str = "utc-floor/";
@@ -353,6 +370,20 @@ pub struct ForwardedRequest {
     /// when the caller's authority is not something that expires, which is what a locally
     /// authenticated caller's operating-system identity is.
     pub authority_deadline_boot_ms: crate::scalars::Nullable<crate::scalars::U64>,
+    /// The history scope of the grant the host decided this read under.
+    ///
+    /// Section 10 narrows a grant's history in one place, the shared host-side filter, and the
+    /// worker applies that filter to what it retains: an agent's semantic history and an
+    /// approval's record. The worker holds no grants, so the scope travels with the read. It is
+    /// absent for a caller acting under no grant. Absence never widens what a caller reads: a
+    /// worker serves retained history without a scope only to a caller it can see is the local
+    /// owner, and refuses anybody else.
+    ///
+    /// It is absent from the wire when it is absent, so a read without one is byte for byte what a
+    /// worker built before scopes travelled reads. A daemon sends one only to a worker that states
+    /// [`FORWARDED_HISTORY_SCOPE`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history: Option<crate::grant::HistoryScope>,
 }
 
 #[cfg(test)]
@@ -475,6 +506,96 @@ mod tests {
             undecoded.to_string().contains("never travels to a worker"),
             "{undecoded}"
         );
+    }
+
+    /// A forwarded read without a history scope is the frame a worker of an earlier build reads,
+    /// member for member, and a frame such a daemon wrote reads as one without a scope. A scope
+    /// round-trips, and an earlier worker could not read it, which is why a daemon asks first.
+    #[test]
+    fn a_forwarded_read_without_a_scope_is_the_frame_an_earlier_worker_reads() {
+        use crate::actor::{ActorEnvelope, ActorIngress};
+        use crate::grant::HistoryScope;
+        use crate::ids::{ActorId, ControllerGeneration};
+        use crate::scalars::{CanonicalSet, Nullable, TimestampMs, U64, Uuid};
+
+        /// The frame as a worker built before scopes travelled declares it.
+        #[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Earlier {
+            request: Request,
+            actor: ActorEnvelope,
+            authority_deadline_boot_ms: Nullable<U64>,
+        }
+
+        let read = |history: Option<HistoryScope>| super::ForwardedRequest {
+            request: Request {
+                request_id: RequestId::new(3),
+                method: Method::AgentSnapshot.into(),
+                method_version: MethodVersion::V1,
+                params: ParamsValue::empty(),
+            },
+            actor: ActorEnvelope {
+                actor_id: ActorId::new("device:test").expect("a principal"),
+                ingress: ActorIngress::PairedDevice,
+                device_id: Nullable::null(),
+                grant_id: Nullable::null(),
+                grant_revision: Nullable::null(),
+                controller_generation: ControllerGeneration::new(1),
+                connection_id: crate::ids::ConnectionId::new(Uuid::from_bytes([3; 16])),
+            },
+            authority_deadline_boot_ms: Nullable::some(U64::new(9)),
+            history,
+        };
+        let limits = kr_cbor::Limits::DEFAULT;
+
+        let unscoped = read(None);
+        let bytes = kr_cbor::to_canonical_vec(&unscoped).expect("encodes");
+        let earlier: Earlier =
+            kr_cbor::from_canonical_slice(&bytes, &limits).expect("an earlier worker reads it");
+        assert_eq!(
+            kr_cbor::to_canonical_vec(&earlier).expect("encodes"),
+            bytes,
+            "no scope, no member"
+        );
+        let decoded: super::ForwardedRequest =
+            kr_cbor::from_canonical_slice(&bytes, &limits).expect("decodes");
+        assert_eq!(
+            decoded, unscoped,
+            "an earlier daemon's frame reads as unscoped"
+        );
+
+        let scoped = read(Some(HistoryScope {
+            lower_bound_ms: Nullable::some(TimestampMs::new(2_000)),
+            include_live_screen: false,
+            named_questions: CanonicalSet::new(),
+            named_approvals: CanonicalSet::new(),
+        }));
+        let bytes = kr_cbor::to_canonical_vec(&scoped).expect("encodes");
+        let decoded: super::ForwardedRequest =
+            kr_cbor::from_canonical_slice(&bytes, &limits).expect("decodes");
+        assert_eq!(decoded, scoped);
+        assert!(
+            kr_cbor::from_canonical_slice::<Earlier>(&bytes, &limits).is_err(),
+            "an earlier worker cannot read a scope"
+        );
+    }
+
+    #[test]
+    fn a_worker_states_that_it_reads_a_forwarded_scope() {
+        use crate::ids::CapabilityId;
+        use crate::scalars::CanonicalSet;
+
+        let stated: CanonicalSet<CapabilityId> =
+            [CapabilityId::new(super::FORWARDED_HISTORY_SCOPE).expect("a capability identifier")]
+                .into_iter()
+                .collect();
+        assert!(super::reads_history_scopes(&stated));
+        assert!(!super::reads_history_scopes(&CanonicalSet::new()));
+        let other: CanonicalSet<CapabilityId> =
+            [CapabilityId::new(super::FORWARDED_UTC_DEADLINE).expect("a capability identifier")]
+                .into_iter()
+                .collect();
+        assert!(!super::reads_history_scopes(&other));
     }
 
     #[test]
