@@ -341,8 +341,9 @@ and each time the daemon starts.
 Before anything is written, everything the recipe needs is checked, and a failed check is a refusal
 that writes nothing:
 
-- the host changes an application's directory on macOS and Linux only, because only there can it
-  tell whether a replacement keeps who may read what it replaces;
+- the host changes an application's directory on macOS and Linux only, because only there does it
+  walk the directory from one handle without following a link and check what a replacement keeps,
+  as the steps below describe;
 - the application is one whose directory this host knows: Claude Code's is `.claude` in the
   account's home, the directory it reads when `CLAUDE_CONFIG_DIR` is not set;
 - the forwarder the registration is expected to start is the `kr-hook` beside the daemon;

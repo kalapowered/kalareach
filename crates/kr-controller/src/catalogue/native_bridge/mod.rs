@@ -18,7 +18,8 @@
 //!
 //! # What is checked before anything is written
 //!
-//! - The platform: where this host cannot read access-control lists, it changes nothing.
+//! - The platform: this host changes an application's directory on macOS and Linux only, where
+//!   it walks the directory as below and checks what a replacement keeps.
 //! - The application's directory: one this host knows, which exists.
 //! - The forwarder the registration is expected to start: the `kr-hook` beside the daemon.
 //! - The recipe: every step it installs has the removal that undoes it, and every file it names is
@@ -705,8 +706,7 @@ impl NativeBridges {
         journal: &Journal,
         target: &BridgeTarget,
     ) -> std::result::Result<Plan, String> {
-        files::supported_platform("apply or remove a native bridge", INSTEAD)
-            .map_err(|error| error.to_string())?;
+        supported_platform()?;
         let recipe = &target.recipe;
         let application = recipe.application.as_str();
         let directory = self
@@ -2089,6 +2089,25 @@ impl NativeBridges {
     }
 }
 
+/// Refuses on the platform where this host does not change an application's directory.
+///
+/// Every name a recipe writes, reads or removes is reached from one handle on the application's
+/// directory without following a link, a file is known by the device and inode a rename keeps (see
+/// [`tree`]), and a copy about to replace a document must keep its permission bits, its owners and
+/// its protection. That walk and those checks exist on macOS and Linux only.
+fn supported_platform() -> std::result::Result<(), String> {
+    // A compile-time value rather than a conditional body, so both answers are checked on every
+    // platform this crate builds for.
+    if cfg!(windows) {
+        return Err(format!(
+            "this host does not apply or remove a native bridge on Windows, because it reaches an \
+             application's files from one handle on its directory without following a link, and \
+             checks what a replacement keeps, on macOS and Linux only; {INSTEAD}"
+        ));
+    }
+    Ok(())
+}
+
 /// The removal operations of a recipe, once every step it installs is shown to have the removal
 /// that undoes it and every removal to undo a step it installs.
 fn removal_of(recipe: &NativeBridge) -> std::result::Result<Vec<Removal>, String> {
@@ -2873,4 +2892,27 @@ fn refused(root: &Dir, path: &str, error: &std::io::Error) -> Fault {
 
 fn halted(error: std::io::Error) -> Fault {
     Fault::Halted(files::storage(error))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The refusal names what is refused, why, and what happens instead, and only where it
+    /// applies.
+    #[test]
+    fn the_platform_guard_refuses_on_windows_alone() {
+        let answer = supported_platform();
+        if cfg!(windows) {
+            let refused = answer.expect_err("refuses");
+            assert!(
+                refused.contains("does not apply or remove a native bridge on Windows")
+                    && refused.contains("without following a link")
+                    && refused.ends_with(INSTEAD),
+                "{refused}"
+            );
+        } else {
+            answer.expect("changes are made here");
+        }
+    }
 }
