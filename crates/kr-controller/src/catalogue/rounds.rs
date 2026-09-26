@@ -2,9 +2,10 @@
 //!
 //! A worker is handed its first snapshot with its launch specification, and every later one on
 //! this daemon's authority connection to it: after it is recorded or adopted, after every change
-//! that raises the admission revision, and on a cadence while it is pending or reports a release
-//! no installation describes. Each round is bounded: a worker that does not answer in time stays
-//! pending, and the next round follows on the cadence. Nothing is evicted on a guess.
+//! that raises the admission revision, and on a cadence while it is pending, reports a release no
+//! installation describes, or reports a binding due to end, which closes only at a snapshot. Each
+//! round is bounded: a worker that does not answer in time stays pending, and the next round
+//! follows on the cadence. Nothing is evicted on a guess.
 
 use std::sync::Arc;
 
@@ -16,8 +17,8 @@ use crate::catalogue::bridge::{Acceptance, LiveView, Report};
 
 use super::{Controller, LaunchPhase, UNACCOUNTED_WORKER, WORKER_EXCHANGE};
 
-/// How often the cadence asks again: every pending member a round, and the kernel about every
-/// member whose end is not confirmed.
+/// How often the cadence asks again: every member that needs one a round, and the kernel about
+/// every member whose end is not confirmed.
 pub(crate) const ADMISSIONS_CADENCE: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// How many rounds one member is sent in a row while each answer discovers a release the round
@@ -288,9 +289,9 @@ impl Controller {
         }
     }
 
-    /// One pass of the cadence: a round to every recorded member that is pending or reports a
-    /// release no installation describes, and a question to the kernel about every member whose
-    /// end is not confirmed.
+    /// One pass of the cadence: a round to every recorded member that is pending, reports a
+    /// release no installation describes or reports a binding due to end, and a question to the
+    /// kernel about every member whose end is not confirmed.
     pub(crate) async fn admissions_pass(&self) {
         // The kernel first: letting go of an ended member waits for nothing else.
         self.check_unconfirmed_members();
@@ -433,6 +434,39 @@ impl Controller {
     #[must_use]
     pub fn admission_round_out(&self, session_id: SessionId) -> bool {
         self.plugin_bridge.in_flight(session_id)
+    }
+
+    /// Makes the accepted report of the member for `session_id` list a binding of `release` due
+    /// to end, as the answer of a worker does while a request that binding admitted is open, and
+    /// says whether the member had an accepted report. For this host's own tests.
+    #[cfg(feature = "testing")]
+    pub fn report_ending_binding(&self, session_id: SessionId, release: LiveRelease) -> bool {
+        self.plugin_bridge.list_in_accepted_report(
+            session_id,
+            kr_protocol::admission::LiveBinding {
+                binding_id: kr_protocol::ids::BrokerBindingId::new(kr_ipc::new_uuid()),
+                application_instance_id: kr_protocol::ids::ApplicationInstanceId::new(
+                    kr_ipc::new_uuid(),
+                ),
+                release,
+                ending: true,
+                component: kr_protocol::scalars::Nullable::null(),
+            },
+        )
+    }
+
+    /// Returns every release the accepted reports list live, with whether it is ending there, read
+    /// with no round. For this host's own tests.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn reported_releases(&self) -> Vec<(LiveRelease, bool)> {
+        self.plugin_bridge.live().into_values().collect()
+    }
+
+    /// Asks the cadence for a pass now, as a change does. For this host's own tests.
+    #[cfg(feature = "testing")]
+    pub fn ask_for_admissions_pass(&self) {
+        self.admissions_due();
     }
 
     /// Serves one catalogue or plugin read: `plugin.list` counts from a fresh round of every

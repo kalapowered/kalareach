@@ -319,7 +319,9 @@ binding of the package, on every release it holds, and the next action that need
 grant the owner confirms reaches only bindings on the installed release: a release the installation
 left is held to what it could do when it was left, and never gains. A package disabled or removed
 ends its bindings at the next snapshot, each once no request it admitted is still open, and a
-binding is reported as ending until it has closed.
+binding is reported as ending until it has closed. A binding closes only at a snapshot, so while a
+worker reports one as ending, the host sends that worker a snapshot every 30 seconds: the binding
+closes within about 30 seconds of its last request finishing, with no other change.
 
 `plugin.list` counts each installation's live bindings, and every release a worker still holds that
 no installation describes, from reports every worker makes after the read began. While a worker

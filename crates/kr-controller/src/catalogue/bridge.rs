@@ -377,7 +377,8 @@ impl WorkerBridge {
     }
 
     /// Returns true when a recorded member needs a round at `revision`: it is not reconciled there,
-    /// or its accepted report lists a release `described` does not describe.
+    /// or its accepted report lists a release `described` does not describe, or a binding due to
+    /// end, which closes only at a snapshot that follows the settlement of its requests.
     #[must_use]
     pub fn needs_round(
         &self,
@@ -398,9 +399,9 @@ impl WorkerBridge {
         member.accepted.as_ref().is_some_and(|accepted| {
             accepted
                 .report
-                .releases()
+                .bindings
                 .iter()
-                .any(|release| !described(release))
+                .any(|binding| binding.ending || !described(&key_of(&binding.release)))
         })
     }
 
@@ -471,6 +472,23 @@ impl WorkerBridge {
             }
         }
         live
+    }
+
+    /// Makes the accepted report of the member for `session_id` list `binding` too, and says
+    /// whether the member had one. For this host's own tests, which stand in for a worker whose
+    /// answer listed a binding due to end.
+    #[cfg(feature = "testing")]
+    pub fn list_in_accepted_report(&self, session_id: SessionId, binding: LiveBinding) -> bool {
+        let mut members = self.members();
+        let Some(accepted) = members
+            .members
+            .get_mut(&session_id)
+            .and_then(|member| member.accepted.as_mut())
+        else {
+            return false;
+        };
+        accepted.report.bindings.push(binding);
+        true
     }
 
     /// Returns every package a member's accepted report says it would not read or bind.
@@ -796,5 +814,45 @@ mod tests {
         // A member that has not reported makes every count unknown.
         let _other = recorded(&bridge, 2);
         assert!(bridge.counts_since(mark, 5).is_none());
+    }
+
+    /// A binding due to end closes at the first snapshot after its requests settle, so a member
+    /// whose report lists one needs a round even where it is reconciled and every installation
+    /// still describes the release, as a disabled one and a revoked one do; once a report omits
+    /// the binding, it needs none.
+    #[test]
+    fn a_member_reporting_a_binding_due_to_end_needs_a_round_until_its_report_omits_it() {
+        let bridge = WorkerBridge::new(ControllerGeneration::new(3));
+        let member = recorded(&bridge, 1);
+        let covered: BTreeSet<ReleaseKey> = std::iter::once(key_of(&release(1))).collect();
+        let installed = |key: &ReleaseKey| *key == key_of(&release(1));
+
+        let frame = bridge
+            .next_frame(member, 5, covered.clone())
+            .expect("a frame");
+        bridge.accept(member, report(frame, 1, vec![binding(release(1), false)]));
+        assert!(
+            !bridge.needs_round(member, 5, &installed),
+            "a binding that is not ending, on an installed release, needs nothing"
+        );
+
+        let frame = bridge
+            .next_frame(member, 5, covered.clone())
+            .expect("a frame");
+        assert_eq!(
+            bridge.accept(member, report(frame, 2, vec![binding(release(1), true)])),
+            Acceptance::Reconciled
+        );
+        assert!(
+            bridge.needs_round(member, 5, &installed),
+            "a reconciled member whose report lists a binding due to end is asked again"
+        );
+
+        let frame = bridge.next_frame(member, 5, covered).expect("a frame");
+        bridge.accept(member, report(frame, 3, Vec::new()));
+        assert!(
+            !bridge.needs_round(member, 5, &installed),
+            "and once a report omits it, the member needs no round"
+        );
     }
 }

@@ -31,12 +31,15 @@ use kr_plugin_catalogue::transport::RepositoryTransport;
 use kr_plugin_catalogue::{
     CapabilityCeiling, Catalogue, Enrolment, InstallationGrant, RepositoryId, RepositoryKind,
 };
+use kr_protocol::admission::{LiveRelease, ReleaseOrigin};
 use kr_protocol::catalogue as wire;
 use kr_protocol::envelope::{ActionTarget, ControlFrame};
 use kr_protocol::frame::StreamKind;
 use kr_protocol::hello::PROTOCOL_VERSION;
 use kr_protocol::identity::ProcessStartIdentity;
-use kr_protocol::ids::{ActionId, BuildId, EnvironmentId, PluginId, SessionEpoch, SessionId};
+use kr_protocol::ids::{
+    ActionId, BuildId, EnvironmentId, PluginId, PublisherId, SessionEpoch, SessionId,
+};
 use kr_protocol::local::{LocalClientKind, LocalHello};
 use kr_protocol::method::Method;
 use kr_protocol::scalars::{Nullable, U64};
@@ -167,6 +170,8 @@ struct Hosted {
     environment_id: EnvironmentId,
     worker: PathBuf,
     launched: Arc<Mutex<Vec<Launched>>>,
+    /// The example package's installed release.
+    example: LiveRelease,
     _repository: tempfile::TempDir,
     /// Last, so it goes last: it ends every worker the daemon started.
     tree: teardown::Tree,
@@ -182,7 +187,7 @@ impl Hosted {
         let repository = tempfile::tempdir().expect("a directory on the internal disk");
         let published = repository.path().join("development");
         copy_tree(&fixture(), &published);
-        install_the_example(&tree, &published).await;
+        let example = install_the_example(&tree, &published).await;
         let environment = tree.environment();
         let mut hosted = Self {
             controller: None,
@@ -191,6 +196,7 @@ impl Hosted {
             environment_id: tree.environment_id(),
             worker,
             launched: Arc::default(),
+            example,
             _repository: repository,
             tree,
         };
@@ -593,8 +599,9 @@ impl Hosted {
 }
 
 /// Enrols the published development catalogue, synchronises it, and installs and enables its
-/// example package, as the owner acting directly, before any daemon opens the catalogue.
-async fn install_the_example(tree: &teardown::Tree, published: &Path) {
+/// example package, as the owner acting directly, before any daemon opens the catalogue, and
+/// returns the release installed, as a worker reports a binding of it.
+async fn install_the_example(tree: &teardown::Tree, published: &Path) -> LiveRelease {
     let environment = tree.environment();
     let mut catalogue = Catalogue::open(
         &environment.state_dir().join("catalogue"),
@@ -642,6 +649,24 @@ async fn install_the_example(tree: &teardown::Tree, published: &Path) {
         .set_enabled(tree.environment_id(), &plugin(), true)
         .await
         .expect("enabled");
+    let installation = catalogue
+        .installations()
+        .expect("readable")
+        .into_iter()
+        .find(|installation| installation.plugin_id == plugin())
+        .expect("the example package is installed");
+    LiveRelease {
+        plugin_id: installation.plugin_id,
+        publisher_id: PublisherId::new(installation.publisher_id.as_str()).expect("a publisher"),
+        version: installation.version.to_string(),
+        package_digest: kr_protocol::scalars::Digest256::from_bytes(
+            *installation.package_digest.as_bytes(),
+        ),
+        origin: ReleaseOrigin {
+            repository_id: installation.repository.to_string(),
+            enrolment_key: installation.enrolment.as_str().to_owned(),
+        },
+    }
 }
 
 /// Sends `signal` to a worker the daemon started, after checking that the process is still that
@@ -1209,4 +1234,58 @@ async fn a_program_adopted_with_no_catalogue_change_is_counted_while_it_runs() {
         Nullable::some(U64::new(0)),
         "and once it has exited, none is"
     );
+}
+
+/// A binding due to end closes at the first snapshot after every request it admitted settles, and
+/// only a round brings a snapshot. A worker answers the round of a disabling with its binding
+/// ending while such a request is open; the release is still installed, and the worker is
+/// reconciled, so the cadence asks it again, with no `plugin.list` and no other change, until an
+/// answer omits the binding.
+///
+/// The worker here holds no request: the test makes its accepted report list a binding of the
+/// example release due to end, as the answer given while a request was open does, and the
+/// worker's own next answer is the one given after that request settled. That the worker closes
+/// the binding at that snapshot is the worker's own tests' to show.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn the_cadence_asks_a_worker_reporting_a_binding_due_to_end_again_until_it_closes() {
+    let hosted = Hosted::start().await;
+    let created = hosted.session().await;
+    let session_id = created.session.session_id;
+    assert!(hosted.counted_once_known().await.is_present());
+    hosted.change(Method::PluginDisable).await;
+    let deadline = tokio::time::Instant::now() + PATIENCE;
+    while !hosted.pending().await.is_empty() || hosted.controller().admission_round_out(session_id)
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the worker answers at the disabling's revision"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    assert!(
+        hosted
+            .controller()
+            .report_ending_binding(session_id, hosted.example.clone()),
+        "the worker has an accepted report"
+    );
+    assert_eq!(
+        hosted.controller().reported_releases(),
+        vec![(hosted.example.clone(), true)]
+    );
+    assert!(
+        hosted.pending().await.is_empty(),
+        "a report listing an installed release leaves the worker reconciled"
+    );
+
+    hosted.controller().ask_for_admissions_pass();
+    let deadline = tokio::time::Instant::now() + PATIENCE;
+    while !hosted.controller().reported_releases().is_empty() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the cadence asks the worker again, and its answer omits the binding"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(hosted.pending().await.is_empty());
 }
