@@ -542,11 +542,16 @@ struct WorkerTerminal {
 }
 
 impl WorkerTerminal {
-    /// Attaches to the session's worker through its own descriptor and endpoint, takes the keys and
-    /// subscribes to what the session writes.
+    /// Attaches to the session's worker through its own descriptor and endpoint, at the session's
+    /// own size, takes the keys and subscribes to what the session writes.
+    ///
+    /// At the session's size the worker streams the session's output as it is written. A terminal
+    /// of another size that holds no geometry of its own is drawn a projection of the screen
+    /// instead, which carries none of the session's output events.
     async fn attach(
         environment: &kr_ipc::paths::EnvironmentPaths,
         session_id: kr_protocol::ids::SessionId,
+        dimensions: kr_protocol::session::Dimensions,
     ) -> Self {
         use kr_protocol::attachment::{AttachMode, AttachmentCapability, SessionAttachParams};
         use kr_protocol::envelope::ActionTarget;
@@ -587,8 +592,8 @@ impl WorkerTerminal {
                 &SessionAttachParams {
                     session_id,
                     mode: AttachMode::Terminal,
-                    claim_geometry: true,
-                    dimensions: Nullable::some(kr_protocol::session::Dimensions::new(300, 40)),
+                    claim_geometry: false,
+                    dimensions: Nullable::some(dimensions),
                     terminal_profile_id: Nullable::some("xterm-256color".to_owned()),
                     requested,
                 },
@@ -617,16 +622,16 @@ impl WorkerTerminal {
             .expect("decodes");
         let mut streams = CanonicalSet::new();
         streams.insert(kr_protocol::recovery::EventStream::Output);
+        // The subscription is the last call: a client drops what arrives while it waits for an
+        // answer of its own, and the screen it is drawn is queued the moment it subscribes.
         client
             .request(
                 Method::EventsSubscribe,
-                // From the start of what the session retains, so what the shell wrote before this
-                // terminal attached, its prompt among it, arrives too.
                 &kr_protocol::recovery::EventsSubscribeParams {
                     session_id,
                     attachment_id,
                     streams,
-                    from_cursor: Nullable::some(kr_protocol::scalars::U64::new(0)),
+                    from_cursor: Nullable::null(),
                 },
             )
             .await
@@ -824,8 +829,13 @@ impl WorkerHost {
     }
 
     /// Creates a session whose root shell is the POSIX shell Git for Windows installs, as the host
-    /// tests' sessions have, through this host's daemon.
-    async fn session(&self) -> kr_protocol::ids::SessionId {
+    /// tests' sessions have, through this host's daemon, and returns it with its size.
+    async fn session(
+        &self,
+    ) -> (
+        kr_protocol::ids::SessionId,
+        kr_protocol::session::Dimensions,
+    ) {
         let runtime_root = self.tree.paths().runtime_root().to_path_buf();
         let state_root = self.tree.paths().state_root().to_path_buf();
         let cwd = self.tree.root().display().to_string();
@@ -852,11 +862,19 @@ impl WorkerHost {
         let created: serde_json::Value =
             serde_json::from_slice(&output.stdout).expect("kr new's document");
         assert!(output.status.success(), "kr new: {created}");
-        created["session_id"]
-            .as_str()
-            .expect("a session identifier")
-            .parse()
-            .expect("parses")
+        let size = |axis: &str| {
+            created["dimensions"][axis]
+                .as_u64()
+                .unwrap_or_else(|| panic!("the session's {axis}: {created}"))
+        };
+        (
+            created["session_id"]
+                .as_str()
+                .expect("a session identifier")
+                .parse()
+                .expect("parses"),
+            kr_protocol::session::Dimensions::new(size("columns"), size("rows")),
+        )
     }
 }
 
@@ -879,9 +897,9 @@ impl Drop for WorkerHost {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_first_owner_is_not_confirmed_in_a_real_workers_session_without_its_variables() {
     let host = WorkerHost::start().await;
-    let session_id = host.session().await;
+    let (session_id, dimensions) = host.session().await;
     let environment = host.tree.environment();
-    let mut terminal = WorkerTerminal::attach(&environment, session_id).await;
+    let mut terminal = WorkerTerminal::attach(&environment, session_id, dimensions).await;
     let kr_path = kr();
     let roots = format!(
         "export KR_RUNTIME_DIR='{}' KR_STATE_DIR='{}'",
