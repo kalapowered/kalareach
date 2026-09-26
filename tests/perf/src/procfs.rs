@@ -678,6 +678,38 @@ mod tests {
     }
 
     #[test]
+    fn a_thread_whose_identifier_passes_to_the_ending_first_thread_between_its_reads_counts_nothing()
+     {
+        // The first thread (3.0 s) and a worker (1.0 s) started in the same hundredth. During the end
+        // reading, after the worker's first read, the worker execs: it takes the first thread's
+        // identifier with its own time, and its old identifier passes to the ending first thread,
+        // whose 3.1 s show there with the worker's start. The worker's second read then moves up to
+        // the first thread's time, and only its status, read last, shows the identifier is ending.
+        // The run used 0.35 s in the stretch, and none of it may be credited from those readings.
+        let stand_in = StandIn::new(2);
+        stand_in.thread(RUN, 'S', OLD, 3.0);
+        stand_in.thread(501, 'S', OLD, 1.0);
+        let mut tally = Tally::new(RUN);
+        let first = stand_in.reading(&tally, 0.0, 0.0, || {});
+        tally.add(&first).expect("take the first reading");
+        stand_in.time(RUN, 3.1);
+        stand_in.time(501, 1.2);
+        let end = stand_in.reading(&tally, 2.0, 0.35, || {
+            stand_in.thread(RUN, 'S', OLD, 1.25);
+            stand_in.thread(501, 'Z', OLD, 3.1);
+        });
+        assert_eq!(
+            run_threads(&end).map(Vec::len),
+            Some(0),
+            "{:?}",
+            run_threads(&end)
+        );
+        tally.add(&end).expect("take the end reading");
+        let summary = tally.summary(5.0).expect("bound the other work");
+        assert!(close(summary.bound, 0.35 / 2.0), "{summary:?}");
+    }
+
+    #[test]
     fn an_older_thread_that_lives_through_the_stretch_lets_the_first_count() {
         let stand_in = StandIn::new(2);
         stand_in.thread(RUN, 'S', OLD, 1.0);
