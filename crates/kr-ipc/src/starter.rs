@@ -338,7 +338,7 @@ pub fn clear_recorded_session(environment: &EnvironmentPaths) -> Result<()> {
 pub use self::windows::{
     ChildCommand, ChildRefusal, LaunchListener, LaunchStream, MAX_LAUNCH_FRAME, NamedLock,
     PeerProcess, Reached, StartedChild, account_sid, connect, current_session, current_user_sid,
-    in_any_job, process_facts, start_child,
+    in_any_job, pipe_client_is_this_user, process_facts, start_child,
 };
 
 #[cfg(all(windows, any(test, feature = "testing")))]
@@ -378,8 +378,8 @@ mod windows {
         ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
     };
     use windows_sys::Win32::Security::{
-        EqualSid, GetTokenInformation, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_QUERY,
-        TOKEN_USER, TokenSessionId, TokenUser,
+        EqualSid, GetTokenInformation, PSECURITY_DESCRIPTOR, PSID, RevertToSelf,
+        SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenSessionId, TokenUser,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, FILE_FLAG_OVERLAPPED, OPEN_EXISTING, PIPE_ACCESS_DUPLEX, ReadFile,
@@ -389,15 +389,17 @@ mod windows {
     use windows_sys::Win32::System::JobObjects::IsProcessInJob;
     use windows_sys::Win32::System::Pipes::{
         ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeClientProcessId,
-        GetNamedPipeServerProcessId, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
-        PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT, WaitNamedPipeW,
+        GetNamedPipeServerProcessId, ImpersonateNamedPipeClient, PIPE_READMODE_BYTE,
+        PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
+        WaitNamedPipeW,
     };
     use windows_sys::Win32::System::Threading::{
         CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED,
         CREATE_UNICODE_ENVIRONMENT, CreateEventW, CreateProcessW, DETACHED_PROCESS,
-        GetCurrentProcess, GetProcessTimes, OpenProcess, OpenProcessToken, PROCESS_INFORMATION,
-        PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
-        ResumeThread, STARTUPINFOW, TerminateProcess, WaitForSingleObject,
+        GetCurrentProcess, GetCurrentThread, GetProcessTimes, OpenProcess, OpenProcessToken,
+        OpenThreadToken, PROCESS_INFORMATION, PROCESS_NAME_WIN32,
+        PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW, ResumeThread, STARTUPINFOW,
+        TerminateProcess, WaitForSingleObject,
     };
 
     use super::{JobPlan, job_plan};
@@ -1465,10 +1467,91 @@ mod windows {
                 let theirs = std::ptr::read(theirs.as_ptr().cast::<TOKEN_USER>())
                     .User
                     .Sid;
-                !mine.is_null() && !theirs.is_null() && EqualSid(mine, theirs) != 0
+                same_sid(mine, theirs)
             };
             Ok(equal)
         }
+
+        /// Opens the calling thread's token, which is the impersonated client's while a thread
+        /// impersonates one.
+        ///
+        /// `OpenAsSelf` is set, so the access check for opening the token runs under this process's
+        /// own context rather than the impersonated one; a client whose context could not open its
+        /// own token still cannot stop this read.
+        fn of_current_thread() -> io::Result<Self> {
+            let mut token: HANDLE = std::ptr::null_mut();
+            // SAFETY: a pseudo-handle for this thread, a query-only access mask, `OpenAsSelf` true,
+            // and a live out parameter.
+            let opened =
+                unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &raw mut token) };
+            if opened == 0 || token.is_null() {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: the call above returned a new handle that nothing else owns.
+            Ok(Self(unsafe { OwnedHandle::from_raw_handle(token) }))
+        }
+    }
+
+    /// Whether two security identifiers name the same account.
+    ///
+    /// The decision the account checks turn on, factored out so it can be tested with identifiers
+    /// built from their text form rather than from live tokens.
+    fn same_sid(left: PSID, right: PSID) -> bool {
+        // SAFETY: each pointer names a valid identifier for the duration of the call, or is null.
+        unsafe { !left.is_null() && !right.is_null() && EqualSid(left, right) != 0 }
+    }
+
+    /// Impersonates the client at the other end of a named pipe for as long as it lives, and
+    /// restores this thread's own token when it is dropped.
+    ///
+    /// A thread that returned to the runtime still carrying another account's token would run later
+    /// work as that account, so a `RevertToSelf` that fails ends the process on a non-unwinding
+    /// path rather than let that happen: there is no safe way to continue from it.
+    struct ImpersonatedClient;
+
+    impl ImpersonatedClient {
+        fn of(pipe: BorrowedHandle<'_>) -> io::Result<Self> {
+            // SAFETY: `pipe` is a borrowed handle to a connected named pipe; the call impersonates
+            // that pipe's client on this thread and returns a boolean.
+            if unsafe { ImpersonateNamedPipeClient(pipe.as_raw_handle()) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(Self)
+        }
+    }
+
+    impl Drop for ImpersonatedClient {
+        fn drop(&mut self) {
+            // SAFETY: restores this thread to its own token; the call has no preconditions.
+            if unsafe { RevertToSelf() } == 0 {
+                // The thread must never re-enter the runtime still impersonating another account.
+                std::process::abort();
+            }
+        }
+    }
+
+    /// Whether the client connected to `pipe` runs as the account this process runs as.
+    ///
+    /// The client's token is read from the connection itself, by impersonating it only long enough
+    /// to open the thread token; the impersonation is always undone before this returns. Because the
+    /// token comes from the connection and not from a process looked up by identifier, a client whose
+    /// process has exited and whose identifier was reused cannot be taken for this account. An
+    /// anonymous or otherwise unreadable client context is an error, which the caller refuses.
+    ///
+    /// # Errors
+    ///
+    /// Returns the operating system's error when the client cannot be impersonated or its token
+    /// read, or when this process's own token cannot be read.
+    pub fn pipe_client_is_this_user(pipe: BorrowedHandle<'_>) -> io::Result<bool> {
+        // This process's own token is opened before impersonating, so the comparison is against this
+        // process and not the client this thread is about to take on.
+        let own = Token::of(current_process())?;
+        let client = {
+            let _guard = ImpersonatedClient::of(pipe)?;
+            Token::of_current_thread()
+            // `_guard` drops here, restoring this thread, before the result is unwrapped below.
+        }?;
+        client.same_user_as(&own)
     }
 
     /// A security descriptor parsed from its text form, freed when it goes.
@@ -1609,6 +1692,62 @@ mod windows {
     /// Encodes a path or name for a wide call, with its terminator.
     fn wide(text: &std::ffi::OsStr) -> Vec<u16> {
         text.encode_wide().chain(std::iter::once(0)).collect()
+    }
+
+    #[cfg(test)]
+    mod decision {
+        use windows_sys::Win32::Foundation::LocalFree;
+        use windows_sys::Win32::Security::Authorization::ConvertStringSidToSidW;
+
+        use super::{PSID, same_sid};
+
+        /// One identifier parsed from its text form, freed when it is dropped.
+        struct Sid(PSID);
+
+        impl Sid {
+            fn parse(text: &str) -> Self {
+                let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+                let mut sid: PSID = std::ptr::null_mut();
+                // SAFETY: `wide` is a terminated wide string held for the call, and `sid` is a live
+                // out parameter the call fills with a freshly allocated identifier.
+                let parsed = unsafe { ConvertStringSidToSidW(wide.as_ptr(), &raw mut sid) };
+                assert!(
+                    parsed != 0 && !sid.is_null(),
+                    "the identifier {text} parses"
+                );
+                Self(sid)
+            }
+        }
+
+        impl Drop for Sid {
+            fn drop(&mut self) {
+                // SAFETY: the identifier came from the parse above and is freed exactly once.
+                unsafe {
+                    LocalFree(self.0.cast());
+                }
+            }
+        }
+
+        /// The decision the account checks turn on: identifiers are the same account or they are
+        /// not, and a missing identifier is never a match.
+        #[test]
+        fn the_same_identifier_matches_and_a_different_one_does_not() {
+            let system = Sid::parse("S-1-5-18");
+            let system_again = Sid::parse("S-1-5-18");
+            let local_service = Sid::parse("S-1-5-19");
+            assert!(
+                same_sid(system.0, system_again.0),
+                "one account matches itself"
+            );
+            assert!(
+                !same_sid(system.0, local_service.0),
+                "two accounts do not match"
+            );
+            assert!(
+                !same_sid(std::ptr::null_mut(), system.0),
+                "a missing identifier never matches"
+            );
+        }
     }
 }
 

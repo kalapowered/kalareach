@@ -108,10 +108,16 @@ impl Listener {
                 Ok(accepted) => accepted,
                 // A caller whose credentials the kernel will not report cannot be authenticated,
                 // whatever is still sitting in its receive buffer. Some platforms report that as
-                // "not connected" the moment the caller closes its end. Dropping the connection
-                // and waiting for the next caller is the safe answer; it is not a reason for the
-                // listener to stop serving the owner, which is why neither failure escapes here.
-                Err(IpcError::PeerClosed | IpcError::PeerUnknown { .. }) => continue,
+                // "not connected" the moment the caller closes its end. A caller the platform
+                // accept proved to be another account (the Windows named-pipe check) is refused the
+                // same way. Dropping the connection and waiting for the next caller is the safe
+                // answer; it is not a reason for the listener to stop serving the owner, which is
+                // why none of these failures escapes here.
+                Err(
+                    IpcError::PeerClosed
+                    | IpcError::PeerUnknown { .. }
+                    | IpcError::PeerAccountRejected { .. },
+                ) => continue,
                 Err(error) => return Err(error),
             };
             match peer.authorise(self.owner_uid) {
@@ -502,17 +508,22 @@ mod platform {
 
 #[cfg(windows)]
 mod platform {
+    use std::os::windows::io::AsHandle as _;
     use std::pin::Pin;
     use std::task::{Context, Poll};
+    use std::time::Duration;
 
+    use interprocess::local_socket::tokio::Stream as PipeServer;
     use interprocess::local_socket::tokio::prelude::*;
     use interprocess::local_socket::{GenericNamespaced, ListenerOptions, ToNsName};
     use interprocess::os::windows::local_socket::ListenerOptionsExt as _;
     use interprocess::os::windows::security_descriptor::SecurityDescriptor;
     use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+    use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient};
+    use windows_sys::Win32::Foundation::ERROR_PIPE_BUSY;
 
     use crate::error::{IpcError, Result};
-    use crate::paths::Endpoint;
+    use crate::paths::{AccessListRefusal, Endpoint, check_access_list};
     use crate::peer::PeerIdentity;
 
     /// The object's owner only, with inheritance blocked.
@@ -522,6 +533,17 @@ mod platform {
     /// which is this user. The CREATOR OWNER identifier would be wrong here, because it is a
     /// placeholder that only means anything in an inheritable entry.
     const OWNER_ONLY_DESCRIPTOR: &str = "D:P(A;;GA;;;OW)";
+
+    /// How long a connect waits for a busy pipe before it gives up.
+    ///
+    /// A pipe that exists but reports every instance busy has a live listener that is between
+    /// handing one instance out and creating the next, so waiting is the right answer; a pipe that
+    /// is not there at all fails at once with a different error and never reaches this wait. The
+    /// bound keeps a listener that never frees an instance from hanging the caller for ever.
+    const CONNECT_BUSY_WAIT: Duration = Duration::from_secs(30);
+
+    /// How long a busy connect pauses between attempts.
+    const BUSY_RETRY_PAUSE: Duration = Duration::from_millis(20);
 
     #[derive(Debug)]
     pub(super) struct Listener {
@@ -566,7 +588,23 @@ mod platform {
                 .accept()
                 .await
                 .map_err(|error| IpcError::socket("accept", error))?;
-            let connection = Connection(stream);
+            // Prove the connected client runs as this account before it is handed to a reader, and
+            // before any frame is parsed. The client's token is read from the connection itself, so
+            // a client that has exited and whose identifier was reused cannot be taken for this
+            // account. A caller of another account is a `PeerRejected`-like refusal the accept loop
+            // drops without ceasing to serve the owner.
+            let this_account = match &stream {
+                PipeServer::NamedPipe(pipe) => {
+                    crate::starter::pipe_client_is_this_user(pipe.as_handle())
+                }
+            }
+            .map_err(|source| IpcError::PeerUnknown { source })?;
+            if !this_account {
+                return Err(IpcError::PeerAccountRejected {
+                    detail: "the caller runs as another account".to_owned(),
+                });
+            }
+            let connection = Connection::Server(stream);
             let peer = connection.peer()?;
             Ok((super::Connection(connection), peer))
         }
@@ -575,74 +613,121 @@ mod platform {
     /// A note on what is *not* here, because it looks as though it should be.
     ///
     /// The Unix side hands the frame writer a duplicate of the connection's descriptor, so that the
-    /// attempt and the wait borrow nothing the writer holds. There is no equivalent here. A
-    /// duplicate of this pipe's handle can be made, but the runtime adopting it would be a second
-    /// pipe object over one pipe, and registering one starts a read of its own: the bytes it took
-    /// would be bytes the frame reader never sees. So one object reads, writes and reports
-    /// readiness, and the writer's attempt goes through the connection's own write half.
-
+    /// attempt and the wait borrow nothing the writer holds. There is no equivalent here. One object
+    /// reads, writes and reports readiness, and the writer's attempt goes through the connection's
+    /// own write half.
+    ///
+    /// The two halves are different types. The connecting side opens the pipe itself, for
+    /// identification only, so a server another account created first cannot act as this client; the
+    /// accepting side takes what its listener produced. Each is a named-pipe stream underneath.
     #[derive(Debug)]
-    pub(super) struct Connection(interprocess::local_socket::tokio::Stream);
+    pub(super) enum Connection {
+        /// The connecting side: a client opened for identification only.
+        Client(NamedPipeClient),
+        /// The accepting side, produced by the listener.
+        Server(PipeServer),
+    }
 
     impl Connection {
         pub(super) async fn connect(endpoint: &Endpoint) -> Result<Self> {
-            let name = endpoint
-                .as_text()
-                .to_ns_name::<GenericNamespaced>()
-                .map_err(|error| IpcError::socket("connect", error))?;
-            interprocess::local_socket::tokio::Stream::connect(name)
-                .await
-                .map(Self)
-                .map_err(|error| IpcError::socket("connect", error))
+            let path = format!(r"\\.\pipe\{}", endpoint.as_text());
+            // `ClientOptions` opens for identification only (`SECURITY_IDENTIFICATION`), so a server
+            // another account created first cannot impersonate this client in the moment before the
+            // account check below refuses it.
+            let deadline = tokio::time::Instant::now() + CONNECT_BUSY_WAIT;
+            let client = loop {
+                match ClientOptions::new().open(&path) {
+                    Ok(client) => break client,
+                    Err(error)
+                        if error.raw_os_error() == Some(ERROR_PIPE_BUSY.cast_signed())
+                            && tokio::time::Instant::now() < deadline =>
+                    {
+                        tokio::time::sleep(BUSY_RETRY_PAUSE).await;
+                    }
+                    Err(error) => return Err(IpcError::socket("connect", error)),
+                }
+            };
+            // The endpoint namespace is shared by every account, so a server another account created
+            // first is refused before a frame is written to it. The pipe's own list has to name this
+            // user as its owner and no account the machine does not already hold.
+            match check_access_list(client.as_handle(), "the endpoint", true) {
+                Ok(()) => Ok(Self::Client(client)),
+                Err(AccessListRefusal::Policy(detail) | AccessListRefusal::Unreadable(detail)) => {
+                    Err(IpcError::PeerAccountRejected { detail })
+                }
+            }
         }
 
         pub(super) fn peer(&self) -> Result<PeerIdentity> {
-            let credentials = self
-                .0
-                .peer_creds()
-                .map_err(|source| IpcError::PeerUnknown { source })?;
-            // Windows reports the peer's process, not a numeric user. The access-control list on
-            // the pipe is what keeps another user out, so the identity carried here is the process
-            // and the owning user this endpoint belongs to.
-            Ok(PeerIdentity {
-                uid: crate::paths::current_uid(),
-                gid: 0,
-                pid: credentials.pid(),
-            })
+            match self {
+                // Windows reports the peer's process, not a numeric user. The listener has already
+                // proved the caller is this account, so the identity carried here is that process
+                // and the owning user this endpoint belongs to.
+                Self::Server(stream) => {
+                    let credentials = stream
+                        .peer_creds()
+                        .map_err(|source| IpcError::PeerUnknown { source })?;
+                    Ok(PeerIdentity {
+                        uid: crate::paths::current_uid(),
+                        gid: 0,
+                        pid: credentials.pid(),
+                    })
+                }
+                // The connecting side. The server it reached was proved to be this account before
+                // this connection was returned; Windows carries no numeric account and there is no
+                // peer process to report from here.
+                Self::Client(_) => Ok(PeerIdentity {
+                    uid: crate::paths::current_uid(),
+                    gid: 0,
+                    pid: None,
+                }),
+            }
         }
     }
 
     impl AsyncRead for Connection {
         fn poll_read(
-            mut self: Pin<&mut Self>,
+            self: Pin<&mut Self>,
             context: &mut Context<'_>,
             buffer: &mut ReadBuf<'_>,
         ) -> Poll<std::io::Result<()>> {
-            Pin::new(&mut self.0).poll_read(context, buffer)
+            match self.get_mut() {
+                Self::Client(client) => Pin::new(client).poll_read(context, buffer),
+                Self::Server(stream) => Pin::new(stream).poll_read(context, buffer),
+            }
         }
     }
 
     impl AsyncWrite for Connection {
         fn poll_write(
-            mut self: Pin<&mut Self>,
+            self: Pin<&mut Self>,
             context: &mut Context<'_>,
             bytes: &[u8],
         ) -> Poll<std::io::Result<usize>> {
-            Pin::new(&mut self.0).poll_write(context, bytes)
+            match self.get_mut() {
+                Self::Client(client) => Pin::new(client).poll_write(context, bytes),
+                Self::Server(stream) => Pin::new(stream).poll_write(context, bytes),
+            }
         }
 
         fn poll_flush(
-            mut self: Pin<&mut Self>,
+            self: Pin<&mut Self>,
             context: &mut Context<'_>,
         ) -> Poll<std::io::Result<()>> {
-            Pin::new(&mut self.0).poll_flush(context)
+            match self.get_mut() {
+                Self::Client(client) => Pin::new(client).poll_flush(context),
+                Self::Server(stream) => Pin::new(stream).poll_flush(context),
+            }
         }
 
         fn poll_shutdown(
-            mut self: Pin<&mut Self>,
+            self: Pin<&mut Self>,
             context: &mut Context<'_>,
         ) -> Poll<std::io::Result<()>> {
-            Pin::new(&mut self.0).poll_shutdown(context)
+            match self.get_mut() {
+                Self::Client(client) => Pin::new(client).poll_shutdown(context),
+                Self::Server(stream) => Pin::new(stream).poll_shutdown(context),
+            }
         }
     }
 }
