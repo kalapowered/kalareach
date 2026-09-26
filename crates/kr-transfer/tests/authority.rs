@@ -2416,44 +2416,102 @@ fn serving(image: &std::path::Path) -> String {
     // The listing names an image by its resolved path: the temporary directory is reached
     // through a link.
     let resolved = std::fs::canonicalize(image).unwrap_or_else(|_| image.to_path_buf());
-    let listed = match std::process::Command::new("/usr/bin/hdiutil")
+    match std::process::Command::new("/usr/bin/hdiutil")
         .arg("info")
         .output()
     {
-        Ok(output) if output.status.success() => {
-            String::from_utf8_lossy(&output.stdout).into_owned()
-        }
-        Ok(output) => return format!("hdiutil info ended with {}", output.status),
-        Err(error) => return format!("hdiutil info could not be run: {error}"),
-    };
+        Ok(output) if output.status.success() => described(&serving_in(
+            &String::from_utf8_lossy(&output.stdout),
+            &resolved,
+        )),
+        Ok(output) => format!("hdiutil info ended with {}", output.status),
+        Err(error) => format!("hdiutil info could not be run: {error}"),
+    }
+}
+
+/// The process of each attachment of `image` an `hdiutil info` listing shows, by number, in the
+/// order the listing gives them.
+#[cfg(target_os = "macos")]
+fn serving_in(listing: &str, image: &std::path::Path) -> Vec<String> {
     let mut current = None;
     let mut processes = Vec::new();
-    for line in listed.lines() {
+    for line in listing.lines() {
         let Some((key, value)) = line.split_once(':') else {
             continue;
         };
         match key.trim() {
             "image-path" => current = Some(std::path::PathBuf::from(value.trim())),
-            "process ID" if current.as_deref() == Some(resolved.as_path()) => {
-                let pid = value.trim();
-                let name = std::process::Command::new("/bin/ps")
-                    .args(["-o", "comm=", "-p", pid])
-                    .output()
-                    .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
-                    .unwrap_or_default();
-                processes.push(format!("{pid} ({name})"));
+            "process ID" if current.as_deref() == Some(image) => {
+                processes.push(value.trim().to_owned());
             }
             _ => {}
         }
     }
+    processes
+}
+
+/// Says which processes serve an image, each by number and by the name `ps` gives it.
+#[cfg(target_os = "macos")]
+fn described(processes: &[String]) -> String {
     if processes.is_empty() {
-        "hdiutil info shows no process serving it".to_owned()
-    } else {
-        format!(
-            "hdiutil info shows it still served by process {}",
-            processes.join(", ")
-        )
+        return "hdiutil info shows no process serving it".to_owned();
     }
+    let named: Vec<String> = processes
+        .iter()
+        .map(|pid| {
+            let name = std::process::Command::new("/bin/ps")
+                .args(["-o", "comm=", "-p", pid])
+                .output()
+                .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+                .unwrap_or_default();
+            format!("{pid} ({name})")
+        })
+        .collect();
+    format!(
+        "hdiutil info shows it still served by process {}",
+        named.join(", ")
+    )
+}
+
+/// A report names the processes `hdiutil info` shows serving the image it is about, every
+/// attachment of it and nothing another image has, each by number and by the name `ps` gives it.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_processes_serving_an_image_are_named_from_hdiutil_info() {
+    let own = std::process::id().to_string();
+    let listing = format!(
+        "framework       : 683.160.3\n\
+         ================================================\n\
+         image-path      : /private/tmp/another.dmg\n\
+         process ID      : 101\n\
+         /dev/disk4s1\tGUID\t/private/tmp/another\n\
+         ================================================\n\
+         image-path      : /private/tmp/served.dmg\n\
+         process ID      : {own}\n\
+         /dev/disk5s1\tGUID\t/private/tmp/first\n\
+         ================================================\n\
+         image-path      : /private/tmp/served.dmg\n\
+         process ID      : 303\n\
+         /dev/disk6s1\tGUID\t/private/tmp/second\n"
+    );
+    assert_eq!(
+        serving_in(&listing, std::path::Path::new("/private/tmp/served.dmg")),
+        [own.clone(), "303".to_owned()],
+        "both attachments of the image, and not the other image's"
+    );
+    assert!(serving_in(&listing, std::path::Path::new("/private/tmp/absent.dmg")).is_empty());
+    let this_test = std::env::current_exe().expect("this test's own executable");
+    let name = this_test
+        .file_name()
+        .expect("a name")
+        .to_string_lossy()
+        .into_owned();
+    let said = described(std::slice::from_ref(&own));
+    assert!(
+        said.contains(&format!("{own} (")) && said.contains(&name),
+        "the process is named by number and by name: {said}"
+    );
+    assert_eq!(described(&[]), "hdiutil info shows no process serving it");
 }
 
 /// A detach that fails is reported, naming the image and the mount point, rather than passed over
