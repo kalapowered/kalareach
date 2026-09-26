@@ -646,8 +646,17 @@ fn confirm_directories(chain: &[PathBuf]) -> Result<()> {
     Ok(())
 }
 
+/// How many times a call tries to leave a marker that another writer's confirmation keeps taking
+/// away ([`mark_unconfirmed`]).
+const MARKER_ATTEMPTS: u32 = 8;
+
 /// Leaves the marker at `marker`, an empty owner-only directory, whether or not another writer left
 /// it there already. Anything else at that name, a link among them, stops the call.
+///
+/// Another writer's marker is taken away once that writer has confirmed the directory, which can
+/// happen between the attempt to make this one and the look at what is there; the marker is then
+/// made again. The attempts are bounded, so a name that keeps coming and going cannot hold the
+/// call.
 fn mark_unconfirmed(marker: &Path) -> Result<()> {
     #[cfg(unix)]
     let builder = {
@@ -658,24 +667,31 @@ fn mark_unconfirmed(marker: &Path) -> Result<()> {
     };
     #[cfg(not(unix))]
     let builder = std::fs::DirBuilder::new();
-    match builder.create(marker) {
-        Ok(()) => Ok(()),
-        // Another writer's marker, or one a call that stopped left there.
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            #[cfg(test)]
-            marker_race::run(marker);
-            if std::fs::symlink_metadata(marker).is_ok_and(|found| found.is_dir()) {
-                Ok(())
-            } else {
-                Err(CryptoError::SecretStore {
-                    message: format!("create {}: {error}", marker.display()),
-                })
-            }
+    let refused = |error: &std::io::Error| CryptoError::SecretStore {
+        message: format!("create {}: {error}", marker.display()),
+    };
+    for _ in 0..MARKER_ATTEMPTS {
+        let error = match builder.create(marker) {
+            Ok(()) => return Ok(()),
+            // Another writer's marker, or one a call that stopped left there.
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => error,
+            Err(error) => return Err(refused(&error)),
+        };
+        #[cfg(test)]
+        marker_race::run(marker);
+        match std::fs::symlink_metadata(marker) {
+            Ok(found) if found.is_dir() => return Ok(()),
+            // Taken away since the attempt: the marker is made again.
+            Err(looked) if looked.kind() == std::io::ErrorKind::NotFound => {}
+            _ => return Err(refused(&error)),
         }
-        Err(error) => Err(CryptoError::SecretStore {
-            message: format!("create {}: {error}", marker.display()),
-        }),
     }
+    Err(CryptoError::SecretStore {
+        message: format!(
+            "{}: the marker came and went {MARKER_ATTEMPTS} times while it was being left",
+            marker.display()
+        ),
+    })
 }
 
 /// What the unit tests run when the marker a call is about to leave is there already, before the
