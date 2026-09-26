@@ -1,85 +1,87 @@
 /**
  * The raw terminal view.
  *
- * It draws the host's projection through xterm.js. The projection is already a grid of resolved
- * cells, so this does not run a terminal state machine of its own: it writes the rows it was given
- * at the positions they name, substituting any cluster this renderer cannot draw for exactly as
- * many columns as that cluster declared.
+ * It draws the session's screen as native code holds it for this view: the part of the live screen
+ * the host drew for the view's grid, as cells. It writes the renderer only this page's own fixed
+ * sequences and each piece's text, so it runs no terminal state machine over the session's output
+ * and nothing the session printed can make the renderer answer.
  *
  * Two modes, and the wheel belongs to whichever one is active. In control mode the application
- * inside the terminal gets the wheel, unchanged. In view mode the person is looking around the
- * projection and the view pans and zooms. Switching to the rich view releases this view's own
- * geometry claim and nothing else.
+ * inside the terminal gets the wheel, unchanged. In view mode the person is reading the screen: the
+ * view takes the wheel and zooms with it, and the program gets nothing. The window stays on the
+ * live screen, so nothing pans.
+ *
+ * The view holds no geometry claim. Leaving it for the conversation closes it, which releases what
+ * it held and nothing of anyone else's.
  */
 
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import { Terminal } from '@xterm/xterm'
+import { FitAddon } from '@xterm/addon-fit'
 import '@xterm/xterm/css/xterm.css'
 
 import { Badge, Button, Segmented } from '../components/ui'
 import { useApp } from '../app/state'
+import type { TerminalGrid } from '../host/port'
+import { backgroundOf, paint, themeOf } from './frame'
 import {
-  failureMessage,
-  watch,
-  type ProjectedScreen,
-  type SessionSubject,
-  type Watch
-} from '../host/port'
-import { ask } from '../mobile/model/call'
-import { drawRow, measuredReproducible } from './clusters'
-import {
+  ATTACHING,
+  clipping,
   describeProvenance,
   presentationOf,
   routeWheel,
-  unreadPresentation,
+  WAITING,
   zoomBy,
   ZOOM_DEFAULT_INDEX,
   ZOOM_STEPS,
-  type Presentation,
   type ViewMode
 } from './modes'
+import { FALLBACK_GRID, useTerminalView } from './view'
 
 /** The base cell size before zoom. */
 const BASE_FONT_SIZE = 12
 
+/**
+ * The surface's padding. The renderer sits inside it, on an element of its own, so the grid is
+ * measured from the space the renderer actually has.
+ */
+const SURFACE_INSET = 12
+
 /** The raw view of one session. */
 export function RawTerminal({
   sessionId,
-  subject,
-  attachmentId,
-  onReleaseGeometry
+  onLeave
 }: {
   readonly sessionId: string
-  readonly subject: SessionSubject
-  readonly attachmentId: string
-  readonly onReleaseGeometry: () => void
+  readonly onLeave: () => void
 }): ReactNode {
-  const { port, say } = useApp()
+  const { port } = useApp()
   const host = useRef<HTMLDivElement | null>(null)
-  const terminal = useRef<Terminal | null>(null)
+  const surface = useRef<HTMLDivElement | null>(null)
+  const renderer = useRef<{ readonly terminal: Terminal; readonly fit: FitAddon } | null>(null)
   const [mode, setMode] = useState<ViewMode>('control')
   const [zoom, setZoom] = useState(ZOOM_DEFAULT_INDEX)
-  // The screen and the failure the newest read answered, each with the session it was read for.
-  const [shown, setShown] = useState<{ readonly sessionId: string; readonly screen: ProjectedScreen } | null>(
-    null
-  )
-  const [failed, setFailed] = useState<{ readonly sessionId: string; readonly message: string } | null>(
-    null
-  )
-  // How the host presents this view, as the newest snapshot said, with the session it was read for.
-  const [presented, setPresented] = useState<{
-    readonly sessionId: string
-    readonly presentation: Presentation
-  } | null>(null)
+  // Which renderer the screen was last drawn into: a new one draws the last frame again at once.
+  const [generation, setGeneration] = useState(0)
   const [wheelToApplication, setWheelToApplication] = useState(0)
-  // Every read of the screen and of the session's snapshot, on opening and after the window moves,
-  // is made under one watch with no listeners, which starts again for each session: only the newest
-  // read's answers are shown, and nothing read for a session the view has left.
-  const reads = useRef<Watch | null>(null)
-  const screen = shown?.sessionId === sessionId ? shown.screen : null
-  const failure = failed?.sessionId === sessionId ? failed.message : null
-  const presentation = presented?.sessionId === sessionId ? presented.presentation : null
 
+  /** The grid the surface holds at the current cell size, as the renderer measures its cells. */
+  const measure = useCallback((): TerminalGrid => {
+    const proposed = renderer.current?.fit.proposeDimensions()
+    if (
+      proposed !== undefined &&
+      Number.isFinite(proposed.cols) &&
+      Number.isFinite(proposed.rows) &&
+      proposed.cols > 0 &&
+      proposed.rows > 0
+    ) {
+      return { columns: proposed.cols, rows: proposed.rows }
+    }
+    return FALLBACK_GRID
+  }, [])
+
+  // The renderer is created again for each session, so nothing written for one session can reach
+  // another's screen, and for each cell size, because it measures its cell once.
   useEffect(() => {
     const element = host.current
     if (!element) return
@@ -87,79 +89,46 @@ export function RawTerminal({
       fontFamily: 'ui-monospace, SFMono-Regular, Consolas, monospace',
       fontSize: BASE_FONT_SIZE * (ZOOM_STEPS[zoom] ?? 1),
       convertEol: false,
+      cursorBlink: false,
       // The host owns scrollback. A buffer here would be a second, disagreeing copy of it.
       scrollback: 0,
       allowProposedApi: true
     })
+    const fit = new FitAddon()
+    created.loadAddon(fit)
     created.open(element)
-    terminal.current = created
+    renderer.current = { terminal: created, fit }
+    setGeneration((count) => count + 1)
     return () => {
       created.dispose()
-      terminal.current = null
+      if (renderer.current?.terminal === created) renderer.current = null
     }
-    // The terminal is recreated when the cell size changes, because xterm measures its cell once,
-    // and for each session, so nothing written for one session can reach another's screen.
   }, [zoom, sessionId])
 
-  /**
-   * Reads this session's screen and its snapshot under `reading`, and shows each answer or failure
-   * only while that read is the newest the watch has started and the watch is running. The
-   * snapshot says how the host presents this view, from this view's own attachment.
-   */
-  const readUnder = useCallback(
-    (reading: Watch | null) => {
-      const current = reading?.read() ?? null
-      if (current === null) return
-      ask(() => port.terminalProjection({ session_id: sessionId }))
-        .then((projection) => {
-          if (!current()) return
-          setShown({ sessionId, screen: projection })
-          setFailed(null)
-        })
-        .catch((error: unknown) => {
-          if (!current()) return
-          setFailed({ sessionId, message: failureMessage(error) })
-        })
-      ask(() => port.eventsSnapshot({ session_id: sessionId, agent_resources_from: null }))
-        .then((snapshot) => {
-          if (!current()) return
-          setPresented({ sessionId, presentation: presentationOf(snapshot.attachments, attachmentId) })
-        })
-        .catch((error: unknown) => {
-          if (!current()) return
-          setPresented({ sessionId, presentation: unreadPresentation(failureMessage(error)) })
-        })
-    },
-    [port, sessionId, attachmentId]
-  )
+  const { state, frame, slow, resize, again } = useTerminalView(port, sessionId, measure)
 
+  // The last complete screen, drawn in one write, in the palette the session has.
   useEffect(() => {
-    const reading: Watch = watch([], () => {
-      readUnder(reading)
+    const current = renderer.current
+    if (!current) return
+    if (frame !== null) current.terminal.options.theme = themeOf(frame.palette)
+    paint(current.terminal, frame)
+  }, [frame, generation])
+
+  // The grid goes to the host whenever the surface or the cell size changes: at once, and then as
+  // the surface is resized.
+  useEffect(() => {
+    resize(measure())
+    const element = surface.current
+    if (!element || typeof ResizeObserver === 'undefined') return
+    const observer = new ResizeObserver(() => {
+      resize(measure())
     })
-    reads.current = reading
+    observer.observe(element)
     return () => {
-      reading.stop()
-      if (reads.current === reading) reads.current = null
-      // What this watch read ends with it: a return to the session shows nothing from before until
-      // its screen has been read again.
-      setShown(null)
-      setFailed(null)
-      setPresented(null)
+      observer.disconnect()
     }
-  }, [readUnder])
-
-  // This session's screen as this renderer draws it at this cell size, or nothing before it has
-  // been read.
-  const drawing = useMemo(() => (screen ? drawScreen(screen, zoom) : null), [screen, zoom])
-  const substituted = drawing?.substituted ?? 0
-
-  useEffect(() => {
-    const created = terminal.current
-    if (!created) return
-    // Nothing is drawn but this session's screen: until it has been read, the terminal is empty.
-    paint(created, drawing?.lines ?? [])
-  }, [drawing])
+  }, [generation, resize, measure])
 
   // The wheel is read here rather than through a React handler, because the renderer inside this
   // element listens for it too. In control mode it must reach the program unchanged, so this
@@ -185,44 +154,22 @@ export function RawTerminal({
       event.preventDefault()
       if (outcome.kind === 'zoom') {
         setZoom((current) => zoomBy(current, outcome.steps))
-        return
       }
-      // The move, and the read after it, belong to the watch this session's screen is read under:
-      // a move that answers after the view has changed session reads nothing.
-      const moving = reads.current
-      void ask(() =>
-        port.attachmentViewport(
-          {
-            attachment_id: attachmentId,
-            session_id: sessionId,
-            viewport: { rows_above: outcome.rows, columns: outcome.columns }
-          },
-          subject
-        )
-      )
-        .then(() => {
-          readUnder(moving)
-        })
-        .catch(() => {
-          // Nothing to say: the projection stays where it was.
-        })
     }
     element.addEventListener('wheel', onWheel, { capture: true, passive: false })
     return () => {
       element.removeEventListener('wheel', onWheel, { capture: true })
     }
-  }, [mode, port, sessionId, attachmentId, subject, readUnder])
+  }, [mode, port, sessionId])
 
-  const columns = Number(screen?.dimensions.columns ?? '0')
-  const rows = Number(screen?.dimensions.rows ?? '0')
-  // What the screen says about itself is shown once a screen has been read, and not before: a size,
-  // a palette or a window claimed ahead of the answer would be the view's guess.
+  const attachment = state !== null && state.state !== 'ended' ? state.attachment : null
+  const presentation = attachment === null ? null : presentationOf(attachment)
+  const waiting = state?.state === 'waiting'
+  // What the position slot says: that the view is waiting, once it has waited, or that the window
+  // shows only part of the session.
   const position =
-    screen === null
-      ? null
-      : screen.viewport_top_row === null
-        ? 'At the live end.'
-        : `Showing history from row ${screen.viewport_top_row}. Oldest retained row is ${screen.oldest_retained_row}.`
+    waiting && (frame === null || slow) ? WAITING : frame === null ? null : clipping(frame)
+  const truncated = frame?.lines.some((line) => line.truncated) ?? false
 
   return (
     <section className="raw-terminal" data-testid="raw-terminal" data-mode={mode}>
@@ -242,42 +189,67 @@ export function RawTerminal({
           <span className="small faint">
             {mode === 'control'
               ? 'The program in this terminal gets the wheel and the keys.'
-              : 'Pan and zoom the projection. The program gets nothing.'}
+              : 'Make the text larger or smaller. The program gets nothing.'}
           </span>
         </span>
-        {screen ? (
+        {frame ? (
           <span className="row">
             <Badge tone="neutral" data-testid="palette-provenance">
-              Palette: {describeProvenance(screen.palette_provenance)}
+              Palette: {describeProvenance(frame.palette.source)}
             </Badge>
             <Badge tone="neutral" data-testid="terminal-size">
-              {`${columns}×${rows}`}
+              {`${frame.dimensions.columns}×${frame.dimensions.rows}`}
             </Badge>
-            {substituted > 0 ? (
+            {frame.replaced > 0 ? (
               <Badge tone="warning" data-testid="substituted-count">
-                {substituted} {substituted === 1 ? 'cell' : 'cells'} replaced
+                {frame.replaced} left blank
+              </Badge>
+            ) : null}
+            {truncated ? (
+              <Badge tone="warning" data-testid="rows-truncated">
+                Rows cut short
+              </Badge>
+            ) : null}
+            {frame.degraded ? (
+              <Badge tone="warning" data-testid="screen-degraded">
+                Shortened by the session
               </Badge>
             ) : null}
           </span>
         ) : null}
       </header>
 
-      {failure !== null ? (
-        <p className="banner warning" role="status">
-          {failure}
-        </p>
+      {state?.state === 'ended' ? (
+        <div className="banner warning row between" role="status" data-testid="terminal-ended">
+          <span>{state.reason}</span>
+          <Button data-testid="attach-again" onClick={again}>
+            Attach again
+          </Button>
+        </div>
       ) : null}
 
       <div
         className="terminal-surface"
-        ref={host}
+        ref={surface}
         data-testid="terminal-surface"
         data-wheel-to-application={wheelToApplication}
-      />
+        aria-busy={state === null || waiting}
+        style={{
+          position: 'relative',
+          overflow: 'hidden',
+          ...(frame ? { background: backgroundOf(frame.palette) } : {})
+        }}
+      >
+        <div ref={host} style={{ position: 'absolute', inset: SURFACE_INSET }} />
+      </div>
 
       <footer className="terminal-footer between">
         <span className="row wrap small faint">
-          {presentation ? (
+          {state === null ? (
+            <span data-testid="terminal-presentation" data-presentation="attaching">
+              {ATTACHING}
+            </span>
+          ) : presentation ? (
             <span data-testid="terminal-presentation" data-presentation={presentation.state}>
               {presentation.sentence}
             </span>
@@ -303,57 +275,11 @@ export function RawTerminal({
           >
             Larger
           </Button>
-          <Button
-            data-testid="release-geometry"
-            onClick={() => {
-              onReleaseGeometry()
-              say('This view released its size claim.')
-            }}
-          >
+          <Button data-testid="release-geometry" onClick={onLeave}>
             Back to the conversation
           </Button>
         </span>
       </footer>
     </section>
   )
-}
-
-/**
- * One screen as this renderer draws it: each row as text, and how many cells it had to replace.
- *
- * What the renderer can draw is measured at the cell size in use rather than assumed, so a cluster
- * it cannot reproduce is replaced by exactly as many columns as the cluster declared.
- */
-function drawScreen(
-  screen: ProjectedScreen,
-  zoom: number
-): { readonly lines: readonly string[]; readonly substituted: number } {
-  const canvas = document.createElement('canvas')
-  const context = canvas.getContext('2d')
-  const font = `${BASE_FONT_SIZE * (ZOOM_STEPS[zoom] ?? 1)}px ui-monospace, monospace`
-  if (context) context.font = font
-  const cellWidth = context?.measureText('M').width ?? BASE_FONT_SIZE * 0.6
-  const reproducible = measuredReproducible(
-    (text) => context?.measureText(text).width ?? 0,
-    cellWidth
-  )
-  let substituted = 0
-  const lines = screen.rows.map((row) => {
-    const drawn = drawRow(row.cells, reproducible)
-    substituted += drawn.substituted
-    return drawn.text
-  })
-  return { lines, substituted }
-}
-
-/**
- * Replaces what `terminal` shows with `lines`.
- *
- * A renderer processes what it is written later than it is written, so a screen is replaced by one
- * write that begins with a full reset (ESC c), not by a reset that takes effect at once: the reset
- * then clears whatever an earlier write left, in the order the writes were made, and an earlier
- * screen still waiting in the renderer can never be drawn over this one.
- */
-export function paint(terminal: Terminal, lines: readonly string[]): void {
-  terminal.write(`\u001bc${lines.map((line) => `${line}\r\n`).join('')}`)
 }

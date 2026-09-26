@@ -1,9 +1,11 @@
 /**
  * How the host presents each raw terminal view, and why, on the desktop and on the phone.
  *
- * Each view reads the session's snapshot and takes the summary of its own attachment and no other:
- * a viewport is shown with the host's reason in the host's words, a viewport whose worker gave no
- * reason says so and is never taken for a direct presentation, and a direct one shows no reason.
+ * Each view says what its own attachment's summary says, which native code sends with the view's
+ * states from the moment it attaches: a viewport is shown with the host's reason in the host's
+ * words, a viewport whose worker gave no reason says so and is never taken for a direct
+ * presentation, and a direct one shows no reason. A view declares no terminal profile, so the host
+ * presents it as a viewport for that reason unless it says otherwise.
  */
 
 import { describe, expect, it } from 'vitest'
@@ -14,13 +16,12 @@ import type { PresentationReason } from '@kalareach/protocol'
 
 import { App } from '../src/App'
 import { AppProvider } from '../src/app/state'
-import { fakeHost, type HeldReads } from '../src/host/fake'
+import { fakeHost } from '../src/host/fake'
 import type { HostPort } from '../src/host/port'
 import { MobileApp } from '../src/mobile/MobileApp'
-import { terminalAttachment } from '../src/terminal/modes'
+import { ATTACHING } from '../src/terminal/modes'
 
 const SESSION_MAIN = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
-const VIEW = terminalAttachment(SESSION_MAIN)
 
 /** Each reason, with the sentence the host gives it. */
 const HOST_WORDS: readonly (readonly [PresentationReason, string])[] = [
@@ -64,22 +65,6 @@ function anyReasonShown(): boolean {
   return HOST_WORDS.some(([, words]) => text.includes(words))
 }
 
-/** Answers the held read at `index`, and lets everything that answer sets off run. */
-async function answer(held: HeldReads, index: number): Promise<void> {
-  await act(async () => {
-    held.answer(index)
-    await new Promise((resolve) => {
-      setTimeout(resolve, 0)
-    })
-  })
-}
-
-async function made(held: HeldReads, count: number): Promise<void> {
-  await waitFor(() => {
-    expect(held.count).toBe(count)
-  })
-}
-
 describe('the desktop raw view says how the host presents it, and why (KR-REQ-08.02)', () => {
   function openTerminal(port: HostPort): void {
     render(
@@ -95,64 +80,61 @@ describe('the desktop raw view says how the host presents it, and why (KR-REQ-08
   for (const [reason, words] of HOST_WORDS) {
     it(`gives a viewport's reason in the host's words: ${reason}`, async () => {
       const { port, controls } = fakeHost()
-      controls.presentAttachment(VIEW, 'viewport', reason)
+      controls.presentTerminal('viewport', reason)
       openTerminal(port)
+      await screen.findByTestId('palette-provenance')
       expect(await presented()).toBe(viewport(words))
     })
   }
 
-  it('shows a direct presentation with no reason', async () => {
+  it('says, as the host does for a view with no terminal profile, why it is a viewport', async () => {
     const { port } = fakeHost()
     openTerminal(port)
+    await screen.findByTestId('palette-provenance')
+    expect(await presented()).toBe(viewport(HOST_WORDS[0]?.[1] ?? ''))
+  })
+
+  it('shows a direct presentation with no reason', async () => {
+    const { port, controls } = fakeHost()
+    controls.presentTerminal('direct')
+    openTerminal(port)
+    await screen.findByTestId('palette-provenance')
     expect(await presented()).toBe(DIRECT)
     expect(anyReasonShown()).toBe(false)
   })
 
   it('never shows a viewport whose worker gave no reason as direct', async () => {
     const { port, controls } = fakeHost()
-    controls.presentAttachment(VIEW, 'viewport')
+    controls.presentTerminal('viewport')
     openTerminal(port)
+    await screen.findByTestId('palette-provenance')
     expect(await presented()).toBe(NO_REASON)
     expect(document.body.textContent).not.toContain('directly')
   })
 
-  it("never takes another attachment's summary for its own", async () => {
+  it('says the host reported nothing when its own summary has no presentation', async () => {
     const { port, controls } = fakeHost()
-    // What is left is another client's viewport, for a reason of its own, and a semantic view.
-    controls.detachAttachment(VIEW)
+    controls.presentTerminal(null)
     openTerminal(port)
+    await screen.findByTestId('palette-provenance')
     expect(await presented()).toBe(NOT_REPORTED)
     expect(anyReasonShown()).toBe(false)
   })
 
-  it('reads the snapshot again when its window moves, and shows the reason then in force', async () => {
-    const person = userEvent.setup()
-    const { port } = fakeHost()
-    openTerminal(port)
-    expect(await presented()).toBe(DIRECT)
-
-    await person.click(screen.getByRole('tab', { name: 'View' }))
-    act(() => {
-      screen
-        .getByTestId('terminal-surface')
-        .dispatchEvent(new WheelEvent('wheel', { deltaY: 120, bubbles: true, cancelable: true }))
-    })
-    await waitFor(() => {
-      expect(screen.getByTestId('terminal-presentation').textContent).toBe(
-        viewport('its window is above the live screen')
-      )
-    })
-  })
-
-  it('says nothing of its presentation before the snapshot answers', async () => {
+  it('says it is attaching, and nothing of a presentation, before the view has attached', async () => {
     const { port, controls } = fakeHost()
-    const held = controls.hold('eventsSnapshot')
+    controls.holdTerminalViews()
     openTerminal(port)
-    await made(held, 1)
-    expect(screen.queryByTestId('terminal-presentation')).toBeNull()
+    await waitFor(() => {
+      expect(controls.terminalViews).toHaveLength(1)
+    })
+    expect(await presented()).toBe(ATTACHING)
+    expect(anyReasonShown()).toBe(false)
 
-    await answer(held, 0)
-    expect(await presented()).toBe(DIRECT)
+    act(() => {
+      controls.terminalViews[0]?.attach()
+    })
+    expect(await presented()).toBe(viewport(HOST_WORDS[0]?.[1] ?? ''))
   })
 })
 
@@ -177,14 +159,15 @@ describe("the phone's raw view says the same (KR-REQ-08.02)", () => {
   for (const [reason, words] of HOST_WORDS) {
     it(`gives a viewport's reason in the host's words: ${reason}`, async () => {
       const { port, controls } = fakeHost()
-      controls.presentAttachment(VIEW, 'viewport', reason)
+      controls.presentTerminal('viewport', reason)
       await openTerminal(port)
       expect(await presented()).toBe(viewport(words))
     })
   }
 
   it('shows a direct presentation with no reason', async () => {
-    const { port } = fakeHost()
+    const { port, controls } = fakeHost()
+    controls.presentTerminal('direct')
     await openTerminal(port)
     expect(await presented()).toBe(DIRECT)
     expect(anyReasonShown()).toBe(false)
@@ -192,35 +175,39 @@ describe("the phone's raw view says the same (KR-REQ-08.02)", () => {
 
   it('never shows a viewport whose worker gave no reason as direct', async () => {
     const { port, controls } = fakeHost()
-    controls.presentAttachment(VIEW, 'viewport')
+    controls.presentTerminal('viewport')
     await openTerminal(port)
     expect(await presented()).toBe(NO_REASON)
   })
 
-  it("never takes another attachment's summary for its own", async () => {
+  it('says the host reported nothing when its own summary has no presentation', async () => {
     const { port, controls } = fakeHost()
-    controls.detachAttachment(VIEW)
+    controls.presentTerminal(null)
     await openTerminal(port)
     expect(await presented()).toBe(NOT_REPORTED)
     expect(anyReasonShown()).toBe(false)
   })
 
-  it('shows only its newest read when it is left and opened again', async () => {
+  it('shows what its newest view attached with when it is left and opened again', async () => {
     const { port, controls } = fakeHost()
-    const held = controls.hold('eventsSnapshot')
     const person = await openTerminal(port)
-    await made(held, 1)
+    expect(await presented()).toBe(viewport(HOST_WORDS[0]?.[1] ?? ''))
 
-    // The presentation changes, and the person leaves the terminal and comes back to it.
-    controls.presentAttachment(VIEW, 'viewport', 'size_mismatch')
+    // The presentation changes, and the person leaves the terminal and comes back to it: a new
+    // view attaches, and says what it attached with.
+    controls.presentTerminal('viewport', 'size_mismatch')
     await person.click(screen.getByRole('tab', { name: 'Conversation' }))
+    await waitFor(() => {
+      expect(controls.terminalViews[0]?.closed).toBe(true)
+    })
     await person.click(screen.getByRole('tab', { name: 'Terminal' }))
-    await made(held, 2)
-
-    await answer(held, 1)
-    expect(await presented()).toBe(viewport("its size is not the session's"))
-    // The first read, made before the change, answers last.
-    await answer(held, 0)
-    expect(await presented()).toBe(viewport("its size is not the session's"))
+    await waitFor(() => {
+      expect(controls.terminalViews).toHaveLength(2)
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId('terminal-presentation').textContent).toBe(
+        viewport("its size is not the session's")
+      )
+    })
   })
 })

@@ -7,9 +7,9 @@
  * reached the host is not a prompt the agent took.
  *
  * The terminal view is the one with a rule in it. In control mode the program inside the terminal
- * owns the touch, exactly as it owns the wheel on a desktop, and the view's own pan does not
- * exist. Only a pinch zooms, because nothing on the wire carries a pinch, so zooming takes nothing
- * from anyone.
+ * owns the touch, exactly as it owns the wheel on a desktop. Only a pinch zooms, because nothing on
+ * the wire carries a pinch, so zooming takes nothing from anyone. The window stays on the live
+ * screen, so nothing pans in either mode.
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
@@ -36,16 +36,19 @@ import {
   failed
 } from '../../model/receipts'
 import { renderMarkdown } from '../../markdown/render'
+import type { TerminalGrid, TerminalScreen } from '../../host/port'
+import { stretchesOf, styleOf } from '../../terminal/cells'
 import {
+  ATTACHING,
+  clipping,
   presentationOf,
-  terminalAttachment,
-  unreadPresentation,
+  WAITING,
   ZOOM_DEFAULT_INDEX,
   ZOOM_STEPS,
   zoomBy,
-  type Presentation,
   type ViewMode
 } from '../../terminal/modes'
+import { FALLBACK_GRID, useTerminalView } from '../../terminal/view'
 import { AccessoryRow } from '../components/keys'
 import { AttachmentPicker } from '../components/picker'
 import { sequenceForKeyPress, afterKey, pressModifier, sequenceFor, NO_LATCH, type Latch } from '../model/accessory'
@@ -109,23 +112,10 @@ export function MobileSession({
     readonly nodes: readonly ReadNode[]
     readonly refusal: string | null
   } | null>(null)
-  const [screenRead, setScreenRead] = useState<{
-    readonly sessionId: string
-    readonly rows: readonly string[]
-  } | null>(null)
-  // How the host presents this view's terminal, as the newest snapshot said.
-  const [presentationRead, setPresentationRead] = useState<{
-    readonly sessionId: string
-    readonly presentation: Presentation
-  } | null>(null)
   const read = conversation?.sessionId === sessionId ? conversation : null
   const nodes = read?.nodes ?? []
-  const screen = screenRead?.sessionId === sessionId ? screenRead.rows : []
-  const presented =
-    presentationRead?.sessionId === sessionId ? presentationRead.presentation : null
   const [mode, setMode] = useState<ViewMode>('control')
   const [zoom, setZoom] = useState(ZOOM_DEFAULT_INDEX)
-  const [pan, setPan] = useState({ x: 0, y: 0 })
   const [latch, setLatch] = useState<Latch>(NO_LATCH)
   const [busy, setBusy] = useState(false)
   // What the person picked, held here until there is a command that carries bytes to a host. It
@@ -187,45 +177,59 @@ export function MobileSession({
     }
   }, [port, sessionId])
 
-  // The terminal's screen and the session's snapshot are read each time the terminal is shown,
-  // under one watch with no listeners that ends when the view leaves the terminal or the session:
-  // only the newest read's answers are shown, and what an ended watch read goes with it.
+  // The terminal's grid: as many cells as the pane holds at the current zoom, measured from a probe
+  // of the grid's own font.
+  const terminalSurface = useRef<HTMLDivElement | null>(null)
+  const cellProbe = useRef<HTMLSpanElement | null>(null)
+  const measure = useCallback((): TerminalGrid => {
+    const surfaceElement = terminalSurface.current
+    const probe = cellProbe.current
+    const pane = paneRef.current
+    const grid = probe?.parentElement
+    if (!surfaceElement || !probe || !pane || !grid) return FALLBACK_GRID
+    const cell = probe.getBoundingClientRect()
+    const style = getComputedStyle(grid)
+    const across =
+      surfaceElement.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight)
+    const down = pane.clientHeight - parseFloat(style.paddingTop) - parseFloat(style.paddingBottom)
+    const columns = Math.floor(across / (cell.width / PROBE_CELLS))
+    const rows = Math.floor(down / cell.height)
+    return Number.isFinite(columns) && Number.isFinite(rows) && columns > 0 && rows > 0
+      ? { columns, rows }
+      : FALLBACK_GRID
+  }, [])
+
+  // The terminal's view is open while the terminal is shown, and closed when the person goes back
+  // to the conversation or the session changes.
+  const { state: terminal, frame, slow, resize, again } = useTerminalView(
+    port,
+    sessionId,
+    measure,
+    pane === 'terminal'
+  )
+  const terminalAttachmentSummary =
+    terminal !== null && terminal.state !== 'ended' ? terminal.attachment : null
+  const presented =
+    terminalAttachmentSummary === null ? null : presentationOf(terminalAttachmentSummary)
+  const terminalWaiting = terminal?.state === 'waiting'
+  const terminalPosition =
+    terminalWaiting && (frame === null || slow) ? WAITING : frame === null ? null : clipping(frame)
+
+  // The grid goes to the host when the terminal is shown, when the zoom changes, and as the pane
+  // is resized.
   useEffect(() => {
     if (pane !== 'terminal') return
-    const reading: Watch = watch([], () => {
-      const current = reading.read()
-      if (current === null) return
-      ask(() => port.terminalProjection({ session_id: sessionId }))
-        .then((projection) => {
-          if (!current()) return
-          setScreenRead({
-            sessionId,
-            rows: projection.rows.map((row) => row.cells.map((cell) => cell.text || ' ').join(''))
-          })
-        })
-        .catch(() => {
-          if (!current()) return
-          setScreenRead({ sessionId, rows: [] })
-        })
-      ask(() => port.eventsSnapshot({ session_id: sessionId, agent_resources_from: null }))
-        .then((snapshot) => {
-          if (!current()) return
-          setPresentationRead({
-            sessionId,
-            presentation: presentationOf(snapshot.attachments, terminalAttachment(sessionId))
-          })
-        })
-        .catch((failure: unknown) => {
-          if (!current()) return
-          setPresentationRead({ sessionId, presentation: unreadPresentation(failureMessage(failure)) })
-        })
+    resize(measure())
+    const element = paneRef.current
+    if (!element || typeof ResizeObserver === 'undefined') return
+    const observer = new ResizeObserver(() => {
+      resize(measure())
     })
+    observer.observe(element)
     return () => {
-      reading.stop()
-      setScreenRead(null)
-      setPresentationRead(null)
+      observer.disconnect()
     }
-  }, [port, sessionId, pane])
+  }, [pane, zoom, resize, measure])
 
   // Restoring the position happens after the view has drawn, which is the only moment the element
   // is tall enough to be scrolled to where it was.
@@ -396,19 +400,34 @@ export function MobileSession({
             )}
           </div>
         ) : (
-          <RawTerminal
-            rows={screen}
-            mode={mode}
-            zoom={zoom}
-            pan={pan}
-            onPan={setPan}
-            onZoom={(steps) => {
-              setZoom((index) => zoomBy(index, steps))
-            }}
-            onApplicationScroll={(lines) => {
-              sendKeys(lines > 0 ? '\u001b[A'.repeat(Math.min(10, lines)) : '\u001b[B'.repeat(Math.min(10, -lines)))
-            }}
-          />
+          <>
+            {terminal?.state === 'ended' ? (
+              <Banner
+                tone="warning"
+                title="This terminal has ended"
+                detail={terminal.reason}
+                action={
+                  <Button data-testid="attach-again" onClick={again}>
+                    Attach again
+                  </Button>
+                }
+              />
+            ) : null}
+            <RawTerminal
+              screen={frame}
+              busy={terminal === null || terminalWaiting}
+              surfaceRef={terminalSurface}
+              probeRef={cellProbe}
+              mode={mode}
+              zoom={zoom}
+              onZoom={(steps) => {
+                setZoom((index) => zoomBy(index, steps))
+              }}
+              onApplicationScroll={(lines) => {
+                sendKeys(lines > 0 ? '\u001b[A'.repeat(Math.min(10, lines)) : '\u001b[B'.repeat(Math.min(10, -lines)))
+              }}
+            />
+          </>
         )}
       </div>
 
@@ -426,11 +445,18 @@ export function MobileSession({
                 {mode === 'control' ? 'Look around' : 'Take control'}
               </Button>
               <span>{`Zoom ${Math.round((ZOOM_STEPS[zoom] ?? 1) * 100)}%`}</span>
-              {presented ? (
+              {terminal === null ? (
+                <span data-testid="terminal-presentation" data-presentation="attaching">
+                  {ATTACHING}
+                </span>
+              ) : presented ? (
                 <span data-testid="terminal-presentation" data-presentation={presented.state}>
                   {presented.sentence}
                 </span>
               ) : null}
+              {terminalPosition === null ? null : (
+                <span data-testid="terminal-position">{terminalPosition}</span>
+              )}
             </div>
             <AccessoryRow
               surface={surface}
@@ -550,35 +576,36 @@ export function MobileSession({
   )
 }
 
-/** The projection, with the view's own pan and zoom over it. */
+/** How many cells the probe that measures the grid's cell holds. */
+const PROBE_CELLS = 10
+
+/** The session's screen, as cells drawn as text, zoomed by the pinch. */
 function RawTerminal({
-  rows,
+  screen,
+  busy,
+  surfaceRef,
+  probeRef,
   mode,
   zoom,
-  pan,
-  onPan,
   onZoom,
   onApplicationScroll
 }: {
-  readonly rows: readonly string[]
+  readonly screen: TerminalScreen | null
+  readonly busy: boolean
+  readonly surfaceRef: React.RefObject<HTMLDivElement | null>
+  readonly probeRef: React.RefObject<HTMLSpanElement | null>
   readonly mode: ViewMode
   readonly zoom: number
-  readonly pan: { readonly x: number; readonly y: number }
-  readonly onPan: (pan: { x: number; y: number }) => void
   readonly onZoom: (steps: number) => void
   readonly onApplicationScroll: (lines: number) => void
 }): ReactNode {
   const pointers = useRef(new Map<number, { x: number; y: number }>())
-  // Where the gesture began, and where the pan was when it began. A drag is the displacement from
-  // that origin, not a sum of each move's step: adding steps makes the view keep going when the
-  // finger reverses, and makes the distance depend on how many events the device sent.
-  const start = useRef<{ x: number; y: number; spread: number; pan: { x: number; y: number } } | null>(
-    null
-  )
+  // Where the gesture began. A drag is the displacement from that origin, not a sum of each move's
+  // step: adding steps makes the distance depend on how many events the device sent.
+  const start = useRef<{ x: number; y: number; spread: number } | null>(null)
 
   /** Takes the gesture's origin again from the fingers that are still down. */
-  const rebase = (element: HTMLElement) => {
-    void element
+  const rebase = () => {
     const points = [...pointers.current.values()]
     const first = points[0]
     if (!first) {
@@ -591,8 +618,7 @@ function RawTerminal({
       spread:
         points.length >= 2 && points[1]
           ? Math.hypot(first.x - points[1].x, first.y - points[1].y)
-          : 0,
-      pan
+          : 0
     }
   }
 
@@ -611,63 +637,77 @@ function RawTerminal({
     }
   }
 
+  const palette = screen?.palette
   return (
     <div
       className="m-terminal"
+      ref={surfaceRef}
       data-mode={mode}
       data-testid="mobile-terminal"
+      aria-busy={busy}
       style={
         {
           '--zoom': ZOOM_STEPS[zoom] ?? 1,
-          '--pan-x': pan.x,
-          '--pan-y': pan.y
+          ...(palette
+            ? {
+                background: `rgb(${palette.background.red}, ${palette.background.green}, ${palette.background.blue})`
+              }
+            : {})
         } as React.CSSProperties
       }
       onPointerDown={(event) => {
         event.currentTarget.setPointerCapture(event.pointerId)
         pointers.current.set(event.pointerId, { x: event.clientX, y: event.clientY })
-        const points = [...pointers.current.values()]
-        start.current = {
-          x: event.clientX,
-          y: event.clientY,
-          spread:
-            points.length >= 2 && points[0] && points[1]
-              ? Math.hypot(points[0].x - points[1].x, points[0].y - points[1].y)
-              : 0,
-          pan
-        }
+        rebase()
       }}
       onPointerMove={(event) => {
         if (!pointers.current.has(event.pointerId)) return
         pointers.current.set(event.pointerId, { x: event.clientX, y: event.clientY })
-        const origin = start.current
-        const outcome = routeGesture(mode, gestureFrom(event))
-        if (outcome.kind === 'pan' && origin) {
-          onPan({ x: origin.pan.x - outcome.columns, y: origin.pan.y - outcome.rows })
-        }
       }}
       onPointerUp={(event) => {
-        const gesture = gestureFrom(event)
-        const outcome = routeGesture(mode, gesture)
+        const outcome = routeGesture(mode, gestureFrom(event))
         pointers.current.delete(event.pointerId)
         // A finger leaving changes what the gesture is measured from, so the origin is taken
-        // again from the fingers still down. Keeping the old one makes the view jump by whatever
-        // the lifted finger had travelled.
-        rebase(event.currentTarget)
+        // again from the fingers still down. Keeping the old one makes the next gesture jump by
+        // whatever the lifted finger had travelled.
+        rebase()
         if (outcome.kind === 'zoom') onZoom(outcome.steps)
         // In control mode the movement was the program's, so it is handed over rather than used.
         if (outcome.kind === 'application' && outcome.lines !== 0) onApplicationScroll(outcome.lines)
       }}
       onPointerCancel={(event) => {
         pointers.current.delete(event.pointerId)
-        rebase(event.currentTarget)
+        rebase()
       }}
       onLostPointerCapture={(event) => {
         pointers.current.delete(event.pointerId)
-        rebase(event.currentTarget)
+        rebase()
       }}
     >
-      <pre className="m-terminal-grid">{rows.join('\n')}</pre>
+      <pre className="m-terminal-grid">
+        <span
+          ref={probeRef}
+          aria-hidden="true"
+          style={{ position: 'absolute', visibility: 'hidden', pointerEvents: 'none' }}
+        >
+          {'M'.repeat(PROBE_CELLS)}
+        </span>
+        {screen && palette
+          ? screen.lines.map((line, index) => (
+              <span key={`${index}-${line.row}`} data-testid="mobile-terminal-line">
+                {stretchesOf(line).map((stretch) => (
+                  <span
+                    key={stretch.column}
+                    style={stretch.piece === null ? undefined : styleOf(stretch.piece.rendition, palette)}
+                  >
+                    {stretch.text}
+                  </span>
+                ))}
+                {'\n'}
+              </span>
+            ))
+          : null}
+      </pre>
     </div>
   )
 }

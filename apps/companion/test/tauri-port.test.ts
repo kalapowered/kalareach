@@ -1,11 +1,11 @@
 /**
- * What the desktop port sends for a session's snapshot, the read it refuses, and how it takes in the
- * connection state native code reports.
+ * What the desktop port sends for a raw terminal view, and how it takes in the connection state
+ * native code reports.
  *
- * The snapshot command answers a session's state and carries no screen, so the port types it as
- * that and sends it there, and it refuses the projected screen, which no command answers, rather
- * than reading a screen out of an answer that has none. A connection state's reason that is blank
- * is no reason, so the port hands it on as none, from a read and from a change alike.
+ * A view is opened with the session and the grid the command takes, and a channel of its own that
+ * native code publishes that view's states on; its size and its close go to their own commands with
+ * the handle the open answered. A connection state's reason that is blank is no reason, so the port
+ * hands it on as none, from a read and from a change alike.
  */
 
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -24,7 +24,11 @@ const shell = vi.hoisted(() => ({
 vi.mock('@tauri-apps/api/core', () => ({
   invoke: (command: string, args: unknown) => {
     shell.invoked.push({ command, args })
-    return Promise.resolve(shell.answers.has(command) ? shell.answers.get(command) : { attachments: [] })
+    return Promise.resolve(shell.answers.has(command) ? shell.answers.get(command) : null)
+  },
+  // The page's end of a channel: native code calls `onmessage` with each message.
+  Channel: class {
+    onmessage: (message: unknown) => void = () => undefined
   }
 }))
 
@@ -41,18 +45,44 @@ afterEach(() => {
   shell.handlers.clear()
 })
 
-describe('the desktop port and a session snapshot', () => {
-  it('sends the snapshot read to the snapshot command, with the parameters the host decodes', async () => {
-    const params = { session_id: '8a7b6c50-22bb-4c3d-8e4f-000000000101', agent_resources_from: null }
-    await tauriPort().eventsSnapshot(params)
-    expect(shell.invoked).toEqual([{ command: 'events_snapshot', args: { params } }])
+describe('the desktop port and a raw terminal view', () => {
+  const SESSION = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
+
+  it('opens a view with the session, the grid and a channel of its own', async () => {
+    shell.answers.set('terminal_view_open', '7')
+    const heard: unknown[] = []
+    await tauriPort().openTerminalView(SESSION, { columns: 80, rows: 24 }, (state) => {
+      heard.push(state)
+    })
+    expect(shell.invoked).toHaveLength(1)
+    const [opened] = shell.invoked
+    expect(opened?.command).toBe('terminal_view_open')
+    const args = opened?.args as {
+      sessionId: string
+      columns: number
+      rows: number
+      onState: { onmessage: (message: unknown) => void }
+    }
+    expect({ sessionId: args.sessionId, columns: args.columns, rows: args.rows }).toEqual({
+      sessionId: SESSION,
+      columns: 80,
+      rows: 24
+    })
+    // What native code publishes on the view's channel reaches the view's listener, and only it.
+    const ended = { state: 'ended', reason: 'This session has closed.' }
+    args.onState.onmessage(ended)
+    expect(heard).toEqual([ended])
   })
 
-  it('refuses the projected screen, which no command answers, and sends nothing', async () => {
-    await expect(
-      tauriPort().terminalProjection({ session_id: '8a7b6c50-22bb-4c3d-8e4f-000000000101' })
-    ).rejects.toMatchObject({ code: 'UNSUPPORTED_SCHEMA' })
-    expect(shell.invoked).toEqual([])
+  it('sends the size and the close to their own commands, with the handle the open answered', async () => {
+    shell.answers.set('terminal_view_open', '7')
+    const view = await tauriPort().openTerminalView(SESSION, { columns: 80, rows: 24 }, () => undefined)
+    await view.resize({ columns: 100, rows: 30 })
+    await view.close()
+    expect(shell.invoked.slice(1)).toEqual([
+      { command: 'terminal_view_resize', args: { view: '7', columns: 100, rows: 30 } },
+      { command: 'terminal_view_close', args: { view: '7' } }
+    ])
   })
 })
 

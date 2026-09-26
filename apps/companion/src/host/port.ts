@@ -11,13 +11,14 @@
  */
 
 import type {
+  AttachmentSummary,
+  CellRendition,
   ClosureRecord,
-  Dimensions4,
+  Dimensions,
   EnvironmentCapabilitiesResult,
   EnvironmentListResult,
-  EventsSnapshotParams,
-  EventsSnapshotResult,
   HostInfoResult,
+  PaletteState,
   Receipt,
   SessionListResult,
   SessionReadResult,
@@ -557,14 +558,16 @@ export interface HostPort {
   storageObjectDelete(params: unknown, subject: SessionSubject): Promise<Settled>
 
   /**
-   * One session as the host installs it: every attachment with how it is presented and why, who
-   * owns the size and who holds input. It carries no screen.
+   * Opens a raw terminal view of one session, `grid` in size. Native code attaches it to the
+   * session and holds its screen; every state it is in reaches `listener`, and nothing else does.
+   * Resolves with the view as soon as native code holds it, before the host has answered anything.
    */
-  eventsSnapshot(params: EventsSnapshotParams): Promise<EventsSnapshotResult>
-  /** The projected screen a raw terminal view draws: rows of resolved cells, the cursor, the window. */
-  terminalProjection(params: unknown): Promise<ProjectedScreen>
+  openTerminalView(
+    sessionId: string,
+    grid: TerminalGrid,
+    listener: (state: TerminalViewState) => void
+  ): Promise<TerminalView>
   terminalInput(params: unknown): Promise<unknown>
-  attachmentViewport(params: unknown, subject: SessionSubject): Promise<Settled>
 
   /**
    * What a voice session started now would be, before one exists.
@@ -832,58 +835,85 @@ export function follow<T>(
   }
 }
 
-/** One row of the projected screen, as the raw view draws it. */
-export interface ProjectedRow {
-  /** The row's stable identity above the live screen. */
-  readonly row: number
-  /** The cells, already resolved to text and attributes. */
-  readonly cells: readonly ProjectedCell[]
+/** A raw terminal view's grid: the cells its surface holds at its cell size. */
+export interface TerminalGrid {
+  readonly columns: number
+  readonly rows: number
 }
 
-/** One cell of the projected screen. */
-export interface ProjectedCell {
-  /** The cluster this cell holds. Empty for a continuation cell of a wide cluster. */
+/**
+ * What a raw terminal view is, as native code publishes it on the view's own channel.
+ *
+ * Waiting: attached, with no complete screen to draw, before the first or between the host's reset
+ * or resynchronisation and the next. Showing: attached, with a complete screen. Ended: the view is
+ * over, for a reason in the host's words or the link's. The attachment's summary, which says how
+ * the host presents the view and why, rides on the first two.
+ */
+export type TerminalViewState =
+  | { readonly state: 'waiting'; readonly attachment: AttachmentSummary }
+  | {
+      readonly state: 'showing'
+      readonly attachment: AttachmentSummary
+      readonly screen: TerminalScreen
+    }
+  | { readonly state: 'ended'; readonly reason: string }
+
+/** The part of a session's screen one view shows, as cells, never bytes. */
+export interface TerminalScreen {
+  /** The session's own size. */
+  readonly dimensions: Dimensions
+  /** The size of the window the host drew for this view, from the live screen's top left. */
+  readonly window: { readonly rows: number; readonly columns: number }
+  /** Exactly the window's rows, top to bottom. */
+  readonly lines: readonly TerminalLine[]
+  /** The cursor, or null when it is outside the window. */
+  readonly cursor: TerminalCursor | null
+  /** The session's palette, with where it came from. */
+  readonly palette: PaletteState
+  /** Whether the session had to shorten content to stay inside a bound. */
+  readonly degraded: boolean
+  /** How many runs and clusters could not be placed, and are blank or left out. */
+  readonly replaced: number
+}
+
+/** One line of a view's window. */
+export interface TerminalLine {
+  /** The row's stable identifier in the session. */
+  readonly row: string
+  readonly soft_wrapped: boolean
+  /** Whether the session left runs out of the row to keep it inside a page's bound. */
+  readonly truncated: boolean
+  /** What is drawn on the line, left to right. A cell no piece covers is blank. */
+  readonly pieces: readonly TerminalPiece[]
+}
+
+/** Text drawn at one column of a line, never past its cells. */
+export interface TerminalPiece {
+  /** The column, in the window, of its first cell. */
+  readonly column: number
+  readonly cells: number
   readonly text: string
-  /** How many columns the cluster occupies. */
-  readonly width: number
-  /** The foreground colour, as a palette index or a hex string. */
-  readonly fg?: string
-  /** The background colour. */
-  readonly bg?: string
-  /** True when the cell is bold. */
-  readonly bold?: boolean
-  /** True when the cell is underlined. */
-  readonly underline?: boolean
-  /** True when the cell is inverted. */
-  readonly inverse?: boolean
-  /** The hyperlink this cell carries, where the host reported one. */
-  readonly link?: string
+  /** How it is drawn, with the screen's reverse video already applied. */
+  readonly rendition: CellRendition
+  /** The link it is inside, as inert metadata: nothing draws or opens it. */
+  readonly hyperlink: string | null
 }
 
-/** Where the palette a projection is drawn with came from. */
-export type PaletteProvenance =
-  | 'host_default'
-  | 'client_probe'
-  | 'client_preset'
-  | 'session_create'
-  | 'unknown'
+/** The cursor, in the window's coordinates. */
+export interface TerminalCursor {
+  readonly column: number
+  readonly line: number
+  readonly visible: boolean
+  /** The cursor-style number the session set. */
+  readonly style: number
+}
 
-/** The projected screen a raw terminal view draws. */
-export interface ProjectedScreen {
-  /** Columns and rows. */
-  readonly dimensions: Dimensions4
-  /** The rows the host published. */
-  readonly rows: readonly ProjectedRow[]
-  /** The cursor's column and row. */
-  readonly cursor: { readonly column: number; readonly row: number; readonly visible: boolean }
-  /** The first row above the live screen this view is showing, or null while it is at the end. */
-  readonly viewport_top_row: number | null
-  /** The oldest row the host still retains. */
-  readonly oldest_retained_row: number
-  /** Where the palette came from. */
-  readonly palette_provenance: PaletteProvenance
-  /** The sixteen palette entries, as hex strings. */
-  readonly palette: readonly string[]
+/** One open raw terminal view. */
+export interface TerminalView {
+  /** Tells the view the page's grid is now `grid`. */
+  resize(grid: TerminalGrid): Promise<void>
+  /** Closes the view. Resolves once it has ended: nothing it publishes arrives after. */
+  close(): Promise<void>
 }
 
 /** Whether a value is a host failure rather than an unexpected one. */

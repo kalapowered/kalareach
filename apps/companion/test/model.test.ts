@@ -44,15 +44,18 @@ import {
   unresolved
 } from '../src/model/receipts'
 import { emptyControlState, evaluate, isRendered, visibilityOf } from '../src/model/controls'
-import { drawCell, drawRow, REPLACEMENT } from '../src/terminal/clusters'
+import { stretchesOf, styleOf } from '../src/terminal/cells'
+import { drawableText, frameOf, REPLACEMENT, sgr } from '../src/terminal/frame'
 import {
+  clipping,
+  describeProvenance,
   PRESENTATION_REASONS,
   presentationOf,
   routeWheel,
-  terminalAttachment,
   zoomBy,
   ZOOM_STEPS
 } from '../src/terminal/modes'
+import { terminalScreen } from '../src/host/fake'
 import { projectEndpoint, rubberband, shouldDismiss, stepSpring } from '../src/motion'
 import { failureMessage } from '../src/host/port'
 // The protocol crate's source, as text: the sentences the host gives each presentation reason.
@@ -404,41 +407,77 @@ describe('declarative controls', () => {
 })
 
 describe('the raw terminal', () => {
-  const drawsEverything = () => true
-  const drawsNothingWide = (cluster: string) => [...cluster].length === 1
+  const PLAIN = terminalScreen('8a7b6c50-22bb-4c3d-8e4f-000000000101', { columns: 80, rows: 8 }).lines[0]
+    ?.pieces[0]?.rendition
+  if (PLAIN === undefined) throw new Error('the scripted screen has a piece')
 
-  it('draws a cluster it can reproduce, unchanged', () => {
-    const drawn = drawCell({ text: 'a', width: 1 }, drawsEverything)
-    expect(drawn).toEqual({ text: 'a', columns: 1, substituted: false, original: null })
+  it('replaces every control character a piece carries, by scalar, and keeps every other', () => {
+    expect(drawableText('a\u{1b}[6n\u{7}\u{9b}\u{7f}\u{e9}\u{4e2d}')).toBe(
+      `a${REPLACEMENT}[6n${REPLACEMENT}${REPLACEMENT}${REPLACEMENT}\u{e9}\u{4e2d}`
+    )
   })
 
-  it('replaces an unreproducible cluster with exactly its own column count', () => {
-    const drawn = drawCell({ text: '\u{1F468}‍\u{1F469}‍\u{1F467}', width: 2 }, drawsNothingWide)
-    expect(drawn.columns).toBe(2)
-    expect(drawn.text).toBe(REPLACEMENT.repeat(2))
-    expect(drawn.substituted).toBe(true)
+  it('writes a rendition as numbers from the plain pen, and never a blink', () => {
+    expect(sgr(PLAIN)).toBe('\u{1b}[0m')
+    expect(
+      sgr({
+        ...PLAIN,
+        bold: true,
+        italic: true,
+        reverse: true,
+        blink: 'rapid',
+        underline: 'curly',
+        underline_colour: { indexed: 9 },
+        foreground: { indexed: 1 },
+        background: { direct: { red: 1, green: 2, blue: 300 } }
+      })
+    ).toBe('\u{1b}[0;1;3;4:3;7;31;48;2;1;2;255;58;5;9m')
+    expect(sgr({ ...PLAIN, foreground: { indexed: 12 }, background: { indexed: 200 } })).toBe(
+      '\u{1b}[0;94;48;5;200m'
+    )
   })
 
-  it('clips to the base character when the marks are what cannot be composed', () => {
-    const drawn = drawCell({ text: 'é̂̃', width: 1 }, (cluster) => cluster === 'e')
-    expect(drawn.text).toBe('e')
-    expect(drawn.columns).toBe(1)
-    expect(drawn.substituted).toBe(true)
+  it('draws a screen in one write: reset, autowrap off, each piece placed, the cursor last', () => {
+    const screen = terminalScreen('8a7b6c50-22bb-4c3d-8e4f-000000000102', { columns: 20, rows: 3 })
+    const written = frameOf(screen)
+    expect(written.startsWith('\u{1b}c\u{1b}[?7l\u{1b}[?25l')).toBe(true)
+    expect(written).toContain('\u{1b}[1;1H\u{1b}[0m$ pnpm -r build')
+    // A cursor style that would blink is drawn steady.
+    expect(written.endsWith('\u{1b}[3;3H\u{1b}[2 q\u{1b}[?25h')).toBe(true)
   })
 
-  it('never moves a following cell, whatever it had to substitute', () => {
-    const cells = [
-      { text: 'o', width: 1 },
-      { text: 'k', width: 1 },
-      { text: '\u{1F468}‍\u{1F469}‍\u{1F467}', width: 2 },
-      { text: '', width: 0 },
-      { text: '!', width: 1 }
-    ]
-    const reproduced = drawRow(cells, drawsEverything)
-    const substituted = drawRow(cells, drawsNothingWide)
-    expect(substituted.columns).toBe(reproduced.columns)
-    expect(substituted.text.endsWith('!')).toBe(true)
-    expect(substituted.substituted).toBe(1)
+  it('says where the palette came from for each of the protocol sources', () => {
+    expect(describeProvenance('profile_default')).toBe("the profile's default")
+    expect(describeProvenance('client_preference')).toBe("the creating terminal's colours")
+    expect(describeProvenance('light_preset')).toBe('the light preset')
+    expect(describeProvenance('dark_preset')).toBe('the dark preset')
+    expect(describeProvenance('explicit_change')).toBe('changed after the session began')
+  })
+
+  it('says a window smaller than the session shows its top left, and says nothing otherwise', () => {
+    const main = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
+    expect(clipping(terminalScreen(main, { columns: 120, rows: 40 }))).toBeNull()
+    expect(clipping(terminalScreen(main, { columns: 30, rows: 8 }))).toBe(
+      "Showing the top-left 30×8 of the session's 80×8."
+    )
+  })
+
+  it('draws a line on a phone as its pieces at their columns and spaces between them', () => {
+    const line = terminalScreen('8a7b6c50-22bb-4c3d-8e4f-000000000101', { columns: 80, rows: 8 }).lines[3]
+    if (line === undefined) throw new Error('the scripted screen has four lines')
+    expect(stretchesOf(line).map((stretch) => stretch.text).join('')).toBe('ok    done')
+    expect(stretchesOf(line).map((stretch) => stretch.column)).toEqual([0, 2, 3, 5, 6])
+  })
+
+  it('swaps the colours of a reversed piece on a phone', () => {
+    const palette = terminalScreen('8a7b6c50-22bb-4c3d-8e4f-000000000101', { columns: 80, rows: 8 })
+      .palette
+    expect(styleOf({ ...PLAIN, reverse: true }, palette)).toMatchObject({
+      color: '#071217',
+      backgroundColor: '#dcdcda'
+    })
+    expect(styleOf({ ...PLAIN, foreground: { indexed: 1 } }, palette).color).toBe('#a2352e')
+    expect(styleOf({ ...PLAIN, foreground: { indexed: 196 } }, palette).color).toBe('#ff0000')
   })
 
   it('gives the wheel to the application in control mode, whatever is held', () => {
@@ -452,11 +491,9 @@ describe('the raw terminal', () => {
     })
   })
 
-  it('pans and zooms only in view mode', () => {
+  it('zooms in view mode, and pans nothing: the window stays on the live screen', () => {
     expect(routeWheel('view', { deltaX: 16, deltaY: 32, zoomGesture: false })).toEqual({
-      kind: 'pan',
-      rows: 2,
-      columns: 1
+      kind: 'none'
     })
     expect(routeWheel('view', { deltaX: 0, deltaY: -16, zoomGesture: true })).toEqual({
       kind: 'zoom',
@@ -543,9 +580,9 @@ describe('the words for a failure', () => {
 })
 
 describe("a raw view's presentation", () => {
-  const view = terminalAttachment('8a7b6c50-22bb-4c3d-8e4f-000000000101')
+  const view = 'a77ac4ed-0000-4000-8000-000000000001'
 
-  /** One attachment's summary, as a session snapshot carries it. */
+  /** A view's own summary, as its attach answers it. */
   function summary(
     attachmentId: string,
     presentation: AttachmentSummary['presentation'],
@@ -567,7 +604,7 @@ describe("a raw view's presentation", () => {
 
   it('gives a viewport the reason in the host words for each of the seven reasons', () => {
     for (const [reason, words] of Object.entries(PRESENTATION_REASONS) as [PresentationReason, string][]) {
-      const read = presentationOf([summary(view, 'viewport', reason)], view)
+      const read = presentationOf(summary(view, 'viewport', reason))
       expect(read).toEqual({
         state: 'viewport',
         reason,
@@ -576,14 +613,17 @@ describe("a raw view's presentation", () => {
     }
   })
 
-  it('reads its own attachment and never another one', () => {
-    const others = [summary('another', 'viewport', 'size_mismatch'), summary('semantic', null)]
-    expect(presentationOf(others, view).state).toBe('unreported')
-    expect(presentationOf([...others, summary(view, 'direct')], view).state).toBe('direct')
+  it('says the host reported nothing for a summary with no presentation, and a direct one plainly', () => {
+    expect(presentationOf(summary(view, null)).state).toBe('unreported')
+    expect(presentationOf(summary(view, 'direct'))).toEqual({
+      state: 'direct',
+      reason: null,
+      sentence: "This view is shown the session's output directly."
+    })
   })
 
   it('never takes a viewport with no reason for a direct presentation', () => {
-    const read = presentationOf([summary(view, 'viewport')], view)
+    const read = presentationOf(summary(view, 'viewport'))
     expect(read.state).toBe('viewport')
     expect(read.reason).toBeNull()
     expect(read.sentence).not.toContain('directly')

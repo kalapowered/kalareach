@@ -10,10 +10,8 @@
  * with the protocol's own word for it, rather than sending a request whose shape nobody agrees on.
  */
 
-import { invoke } from '@tauri-apps/api/core'
+import { Channel, invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
-
-import type { EventsSnapshotResult } from '@kalareach/protocol'
 
 import type { AccountView, UsageView } from '../model/account'
 
@@ -34,6 +32,8 @@ import type {
   Settled,
   SettingsPane,
   SetupIdentity,
+  TerminalView,
+  TerminalViewState,
   VoiceCallState,
   VoiceClosure,
   Written
@@ -171,13 +171,24 @@ export function tauriPort(): HostPort {
     storageStatus: () => noAgreedShape('what this host retains'),
     storageObjectDelete: () => noAgreedShape('deleting a retained artefact'),
 
-    eventsSnapshot: (params) => read<EventsSnapshotResult>('events_snapshot', params),
-    // No command answers a projected screen: `events_snapshot` answers the session's state, which
-    // has no rows, so the screen is refused rather than read from a shape it is not.
-    terminalProjection: () => noAgreedShape('the projected screen'),
+    // Each view has a channel of its own, which native code publishes that view's states on and
+    // nothing else: no protocol event and no other view's state ever reaches its listener.
+    openTerminalView: async (sessionId, grid, listener): Promise<TerminalView> => {
+      const states = new Channel<TerminalViewState>()
+      states.onmessage = listener
+      const view = await call<string>('terminal_view_open', {
+        sessionId,
+        columns: grid.columns,
+        rows: grid.rows,
+        onState: states
+      })
+      return {
+        resize: (next) =>
+          call<undefined>('terminal_view_resize', { view, columns: next.columns, rows: next.rows }),
+        close: () => call<undefined>('terminal_view_close', { view })
+      }
+    },
     terminalInput: (params) => read('input_write', params),
-    attachmentViewport: (params, subject) =>
-      mutate<Settled>('attachment_viewport', params, subject),
 
     // Voice. The first three each reach one method; the last two reach the call this device is
     // holding and no service at all, which is what keeps mute and closure working when the broker

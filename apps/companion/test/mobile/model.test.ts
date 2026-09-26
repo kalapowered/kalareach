@@ -34,7 +34,7 @@ import {
   attributesFor,
   describeBytes
 } from '../../src/mobile/model/media'
-import { routeGesture, consumesGesture } from '../../src/mobile/model/gestures'
+import { routeGesture, consumesGesture, describeMode } from '../../src/mobile/model/gestures'
 import {
   EMPTY_DURABLE_STATE,
   onResume,
@@ -230,12 +230,16 @@ describe('the raw terminal on a touch screen (KR-REQ-13.18, 13.17)', () => {
     }
   })
 
-  it('pans and zooms in view mode', () => {
-    expect(routeGesture('view', { pointers: 1, deltaX: 0, deltaY: -32, scale: 1 }).kind).toBe('pan')
+  it('zooms in view mode, and moves nothing with a drag: the window stays on the live screen', () => {
+    expect(routeGesture('view', { pointers: 1, deltaX: 12, deltaY: -32, scale: 1 })).toEqual({
+      kind: 'none'
+    })
     expect(routeGesture('view', { pointers: 2, deltaX: 0, deltaY: 0, scale: 1.4 })).toEqual({
       kind: 'zoom',
       steps: 1
     })
+    expect(describeMode('view')).toBe('View: pinch to make the text larger or smaller.')
+    expect(describeMode('control')).toBe('Control: your touches go to the program in this terminal.')
   })
 
   it('zooms in either mode, because nothing on the wire carries a pinch', () => {

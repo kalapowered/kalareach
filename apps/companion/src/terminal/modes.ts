@@ -2,22 +2,27 @@
  * Control mode and view mode, and which of them owns the wheel.
  *
  * A raw terminal view has one input and two possible owners. In control mode the application inside
- * the terminal owns the pointer: a wheel event is the application's scroll, and a pan control that
- * consumed it would make `less` and `vim` unusable. In view mode the person is looking around the
- * projection rather than driving the program, so the view owns pan and zoom.
+ * the terminal owns the pointer: a wheel event is the application's scroll, and a control of the
+ * view's that consumed it would make `less` and `vim` unusable. In view mode the person is reading
+ * the screen rather than driving the program, so the view owns the wheel, and zooms with it. The
+ * window stays on the live screen, so nothing pans.
  *
  * The switch is explicit in both directions. Nothing here infers a mode from how fast a wheel
  * turned or whether a modifier was held.
  *
- * The raw views on the desktop and the phone also share what the host says about each of them:
- * the attachment a view is, and how the host presents it, directly or as a viewport, and why.
+ * The raw views on the desktop and the phone also share what they say: how the host presents a
+ * view, directly or as a viewport, and why, from the view's own attachment; where its palette came
+ * from; and the words for attaching, waiting and a window smaller than the session.
  */
 
 import type {
   AttachmentSummary,
+  PaletteState,
   PresentationReason,
   TerminalPresentationMode
 } from '@kalareach/protocol'
+
+import type { TerminalScreen } from '../host/port'
 
 /** Who owns the pointer. */
 export type ViewMode = 'control' | 'view'
@@ -26,10 +31,10 @@ export type ViewMode = 'control' | 'view'
 export type WheelOutcome =
   /** Forwarded to the application as its own scroll. */
   | { readonly kind: 'application'; readonly lines: number }
-  /** Used by the view to pan the projection. */
-  | { readonly kind: 'pan'; readonly rows: number; readonly columns: number }
   /** Used by the view to zoom. */
   | { readonly kind: 'zoom'; readonly steps: number }
+  /** Taken by the view and used for nothing: the window stays on the live screen. */
+  | { readonly kind: 'none' }
 
 /** One wheel event, in the terms both modes understand. */
 export interface Wheel {
@@ -56,11 +61,7 @@ export function routeWheel(mode: ViewMode, wheel: Wheel): WheelOutcome {
   if (wheel.zoomGesture) {
     return { kind: 'zoom', steps: -Math.sign(wheel.deltaY) }
   }
-  return {
-    kind: 'pan',
-    rows: Math.trunc(wheel.deltaY / WHEEL_ROW_PIXELS),
-    columns: Math.trunc(wheel.deltaX / WHEEL_ROW_PIXELS)
-  }
+  return { kind: 'none' }
 }
 
 /** The zoom steps this view offers, as multiples of the base cell size. */
@@ -74,51 +75,42 @@ export function zoomBy(index: number, steps: number): number {
   return Math.max(0, Math.min(ZOOM_STEPS.length - 1, index + steps))
 }
 
-/**
- * What a view releases when it stops being the raw view.
- *
- * Switching to the rich view gives up this view's own geometry claim and nothing else: another
- * view's claim, and the session's own dimensions, are not this view's to release.
- */
-export interface GeometryClaim {
-  readonly attachmentId: string
-  readonly columns: number
-  readonly rows: number
-}
-
-/**
- * The attachment a raw terminal view is, named from its session.
- *
- * The desktop's raw view and the phone's name their own attachment the same way, and each reads
- * the summary with this name from the session's snapshot, never another attachment's. A host that
- * reports no attachment of this name reports no presentation for the view.
- */
-export function terminalAttachment(sessionId: string): string {
-  return `att-${sessionId}`
-}
-
-/** The request that releases one view's geometry claim. */
-export function releaseGeometry(claim: GeometryClaim): {
-  readonly attachment_id: string
-  readonly geometry: null
-} {
-  return { attachment_id: claim.attachmentId, geometry: null }
-}
-
-/** What the palette's provenance is called, in words. */
-export function describeProvenance(provenance: string): string {
-  switch (provenance) {
-    case 'client_probe':
-      return 'Probed from the terminal that created this session'
-    case 'client_preset':
-      return 'A light or dark preset this client sent'
-    case 'session_create':
-      return 'Chosen when the session was created'
-    case 'host_default':
-      return "The host's own default palette"
+/** What the palette's source is called, in words. */
+export function describeProvenance(source: PaletteState['source']): string {
+  switch (source) {
+    case 'profile_default':
+      return "the profile's default"
+    case 'client_preference':
+      return "the creating terminal's colours"
+    case 'light_preset':
+      return 'the light preset'
+    case 'dark_preset':
+      return 'the dark preset'
+    case 'explicit_change':
+      return 'changed after the session began'
     default:
-      return 'Not recorded'
+      return 'not recorded'
   }
+}
+
+/** What a view says while it attaches to its session, before the host has answered. */
+export const ATTACHING = 'Attaching to this session…'
+
+/** What a view says when it has no complete screen to draw and has waited for one. */
+export const WAITING = "Waiting for the session's screen…"
+
+/** How long a view with a frame to keep waits before it says it is waiting. */
+export const SLOW_MS = 250
+
+/**
+ * What a view says when the host drew it a window smaller than the session, or null when the
+ * window holds the whole of it. The window starts at the live screen's top left.
+ */
+export function clipping(screen: TerminalScreen): string | null {
+  const columns = Number(screen.dimensions.columns)
+  const rows = Number(screen.dimensions.rows)
+  if (screen.window.columns >= columns && screen.window.rows >= rows) return null
+  return `Showing the top-left ${screen.window.columns}×${screen.window.rows} of the session's ${columns}×${rows}.`
 }
 
 /**
@@ -142,30 +134,22 @@ export const PRESENTATION_REASONS: Readonly<Record<PresentationReason, string>> 
 
 /** How the host presents one view, and the sentence the view says it with. */
 export interface Presentation {
-  /**
-   * What the host said: the live output directly, a viewport, nothing for this view, or no answer
-   * that could be read.
-   */
-  readonly state: TerminalPresentationMode | 'unreported' | 'unread'
+  /** What the host said: the live output directly, a viewport, or nothing for this view. */
+  readonly state: TerminalPresentationMode | 'unreported'
   /** The host's reason for a viewport, or null when it gave none. */
   readonly reason: PresentationReason | null
   readonly sentence: string
 }
 
 /**
- * How the host presents one view, from the attachments of the session's snapshot.
+ * How the host presents one view, from its own attachment's summary.
  *
- * Only the summary with the view's own attachment identity is read, never another attachment's. A
- * viewport is given with the host's reason in the host's words. A viewport with no reason, which
+ * A viewport is given with the host's reason in the host's words. A viewport with no reason, which
  * is how a worker built before reasons reports every viewport, says that no reason was reported
  * and is never taken for a direct presentation. A direct presentation has no reason.
  */
-export function presentationOf(
-  attachments: readonly AttachmentSummary[],
-  attachmentId: string
-): Presentation {
-  const own = attachments.find((summary) => summary.attachment_id === attachmentId)
-  if (!own || own.presentation === null) {
+export function presentationOf(own: AttachmentSummary): Presentation {
+  if (own.presentation === null) {
     return {
       state: 'unreported',
       reason: null,
@@ -188,13 +172,3 @@ export function presentationOf(
         sentence: `This view is shown a viewport because ${PRESENTATION_REASONS[reason]}.`
       }
 }
-
-/** What a view says when the snapshot that would say how it is presented could not be read. */
-export function unreadPresentation(failure: string): Presentation {
-  return {
-    state: 'unread',
-    reason: null,
-    sentence: `How the host presents this view could not be read: ${failure}`
-  }
-}
-

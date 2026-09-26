@@ -11,7 +11,6 @@
 
 import { expect, test, type Locator, type Page } from '@playwright/test'
 
-import { terminalAttachment } from '../src/terminal/modes'
 
 import { PRESENTATION_DEADLINE } from './bounds'
 
@@ -415,7 +414,7 @@ test.describe('the raw terminal', () => {
     await page.getByRole('tab', { name: 'Terminal' }).click()
     const terminal = page.getByTestId('raw-terminal')
     await expect(terminal).toBeVisible()
-    await expect(page.getByTestId('palette-provenance')).toContainText('Probed')
+    await expect(page.getByTestId('palette-provenance')).toContainText("the creating terminal's colours")
     await expect(page.getByTestId('terminal-surface').locator('.xterm')).toBeVisible()
     await expect(page.getByTestId('terminal-surface')).toContainText('cargo test -p kr-client')
     await page.screenshot({ path: shot('terminal-04.04'), fullPage: true })
@@ -442,12 +441,12 @@ test.describe('the raw terminal', () => {
     // This watches the wheel itself instead. The view owns the wheel here and cancels it, and the
     // path that would have given it to the application returns before anything is cancelled, so a
     // wheel that was cancelled is a wheel that was not forwarded. This listener sits on the same
-    // element and in the same phase as the terminal's own, and was added after it, so it is called
-    // second and reads a decision that has already been made.
+    // element and in the same phase as the view's own, the element that holds the renderer, and was
+    // added after it, so it is called second and reads a decision that has already been made.
     await surface.evaluate((element) => {
       const held = window as unknown as { krWheelCancelled?: boolean }
       held.krWheelCancelled = undefined
-      element.addEventListener(
+      element.firstElementChild?.addEventListener(
         'wheel',
         (event) => {
           held.krWheelCancelled = event.defaultPrevented
@@ -477,7 +476,6 @@ test.describe('the raw terminal', () => {
 
 test.describe('how the host presents a raw view', () => {
   const SESSION_MAIN = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
-  const VIEW = terminalAttachment(SESSION_MAIN)
 
   /** Where a screenshot for this browser goes, so each engine keeps its own. */
   const shotFor = (name: string): string => shot(`${name}-${test.info().project.name}`)
@@ -496,9 +494,9 @@ test.describe('how the host presents a raw view', () => {
     }) => {
       await inTheme(page, theme)
       await openSession(page)
-      await page.evaluate((view) => {
-        window.krTestHost?.presentAttachment(view, 'viewport', 'size_mismatch')
-      }, VIEW)
+      await page.evaluate(() => {
+        window.krTestHost?.presentTerminal('viewport', 'size_mismatch')
+      })
       await page.getByRole('tab', { name: 'Terminal' }).click()
       await page.setViewportSize({ width: 320, height: 720 })
 
@@ -512,6 +510,25 @@ test.describe('how the host presents a raw view', () => {
       })
     })
 
+    // KR-REQ-08.02: the desktop raw view in a wide window: the screen drawn in the session's own
+    // palette, the badges, and the host's words for the viewport.
+    test(`the desktop raw view draws its screen and says how it is presented, ${theme}, wide`, async ({
+      page
+    }) => {
+      await inTheme(page, theme)
+      await openSession(page)
+      await page.getByRole('tab', { name: 'Terminal' }).click()
+      await expect(page.getByTestId('terminal-surface')).toContainText('$ cargo test -p kr-client')
+      await expect(page.getByTestId('terminal-presentation')).toContainText(
+        'its client declared no terminal profile'
+      )
+      await expect(page.locator('html')).toHaveAttribute('data-theme', theme)
+      await page.screenshot({
+        path: shotFor(`terminal-08.02-desktop-wide-${theme}`),
+        fullPage: true
+      })
+    })
+
     // KR-REQ-08.02: the phone's raw view says the same, in the same words.
     test(`the phone's raw view says how it is presented and why, ${theme}, at 320 px`, async ({
       page
@@ -519,9 +536,9 @@ test.describe('how the host presents a raw view', () => {
       await inTheme(page, theme)
       await page.setViewportSize({ width: 320, height: 720 })
       await page.goto(`/harness.html?surface=ios&session=${SESSION_MAIN}`)
-      await page.evaluate((view) => {
-        window.krTestHost?.presentAttachment(view, 'viewport', 'no_terminal_profile')
-      }, VIEW)
+      await page.evaluate(() => {
+        window.krTestHost?.presentTerminal('viewport', 'no_terminal_profile')
+      })
       await page.getByRole('tab', { name: 'Terminal' }).click()
 
       await expect(page.getByTestId('terminal-presentation')).toHaveText(
@@ -535,21 +552,33 @@ test.describe('how the host presents a raw view', () => {
     })
   }
 
-  // KR-REQ-08.02: a direct view shows no reason, and once its window moves above the live screen
-  // it reads the snapshot again and gives the reason then in force.
-  test('a direct view gives the reason for a viewport once its window moves', async ({ page }) => {
+  // KR-REQ-13.18: a zoom step answers at once. The last frame is drawn again at the new cell size
+  // from its top-left corner, where the host anchors the smaller window, and the view reports the
+  // grid its surface now holds; the host's next screen says how much of the session it shows.
+  test('a zoom step redraws the last frame at once and reports the new grid', async ({ page }) => {
     await openSession(page)
     await page.getByRole('tab', { name: 'Terminal' }).click()
-    const presentation = page.getByTestId('terminal-presentation')
-    await expect(presentation).toHaveText("This view is shown the session's output directly.")
+    const surface = page.getByTestId('terminal-surface')
+    await expect(surface).toContainText('$ cargo test -p kr-client')
+    const before = await page.evaluate(() => window.krTestHost?.terminalViews[0]?.grids.at(-1))
+    expect(before?.columns ?? 0).toBeGreaterThan(20)
 
     await page.getByRole('tab', { name: 'View' }).click()
-    await page.getByTestId('terminal-surface').hover()
-    await page.mouse.wheel(0, 120)
-    await expect(presentation).toHaveText(
-      'This view is shown a viewport because its window is above the live screen.'
-    )
-    await page.screenshot({ path: shotFor('terminal-presentation-08.02-moved'), fullPage: true })
+    for (let step = 0; step < 5; step += 1) await page.getByTestId('zoom-in').click()
+    await expect(surface).toContainText('$ cargo test')
+    await expect
+      .poll(async () => page.evaluate(() => window.krTestHost?.terminalViews[0]?.grids.at(-1)?.columns))
+      .toBeLessThan(before?.columns ?? 0)
+    // The top-left cell is still the first cell of the session's first line.
+    const firstLine = await surface.locator('.xterm-rows > div').first().textContent()
+    expect(firstLine?.startsWith('$ cargo')).toBe(true)
+
+    // The host's next screen for the smaller grid says how much of the session it shows.
+    await page.evaluate(() => {
+      window.krTestHost?.terminalViews[0]?.show()
+    })
+    await expect(page.getByTestId('terminal-position')).toContainText('Showing the top-left')
+    await page.screenshot({ path: shotFor('terminal-zoom-13.18'), fullPage: true })
   })
 })
 

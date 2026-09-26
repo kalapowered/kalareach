@@ -18,7 +18,6 @@ import { AppProvider } from '../../src/app/state'
 import { fakeHost, type HeldReads } from '../../src/host/fake'
 import { MobileSession } from '../../src/mobile/views/MobileSession'
 import { useLifecycle } from '../../src/mobile/useLifecycle'
-import { terminalAttachment } from '../../src/terminal/modes'
 
 const SESSION_MAIN = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
 const SESSION_BUILD = '8a7b6c50-22bb-4c3d-8e4f-000000000102'
@@ -53,7 +52,7 @@ describe("the phone's session view keeps each read to its own session", () => {
   it('shows nothing of the session it has left, from the first render after the change', async () => {
     const person = userEvent.setup()
     const { port, controls } = fakeHost()
-    controls.presentAttachment(terminalAttachment(SESSION_MAIN), 'viewport', 'size_mismatch')
+    controls.presentTerminal('viewport', 'size_mismatch')
     // What the page shows at each commit, read as each commit is made.
     const commits: string[] = []
     const onSession = (sessionId: string) => (
@@ -77,9 +76,8 @@ describe("the phone's session view keeps each read to its own session", () => {
       expect(screen.getByTestId('mobile-terminal').textContent).toContain('cargo test')
     })
 
-    // Session 2's reads are held, so nothing of it is shown either.
-    controls.hold('terminalProjection')
-    controls.hold('eventsSnapshot')
+    // Session 2's view publishes nothing, so nothing of it is shown either.
+    controls.holdTerminalViews()
     commits.length = 0
     rerender(onSession(SESSION_BUILD))
 
@@ -172,5 +170,80 @@ describe("the phone's session view keeps each read to its own session", () => {
       </AppProvider>
     )
     expect(await screen.findByText('Find why the reconnect test is flaky.')).toBeInTheDocument()
+  })
+})
+
+describe("the phone's raw terminal view (KR-REQ-08.02, 13.18)", () => {
+  async function onTerminal(port: Parameters<typeof AppProvider>[0]['port']) {
+    const person = userEvent.setup()
+    render(
+      <AppProvider port={port}>
+        <OnSession sessionId={SESSION_MAIN} />
+      </AppProvider>
+    )
+    await person.click(screen.getByRole('tab', { name: 'Terminal' }))
+    return person
+  }
+
+  it('draws the screen as text, each piece at its column, in the same words as the desktop', async () => {
+    const { port } = fakeHost()
+    await onTerminal(port)
+    await waitFor(() => {
+      expect(screen.getAllByTestId('mobile-terminal-line')).toHaveLength(8)
+    })
+    const lines = screen.getAllByTestId('mobile-terminal-line').map((line) => line.textContent)
+    expect(lines[0]).toBe('$ cargo test -p kr-client\n')
+    expect(lines[3]).toBe('ok    done\n')
+    expect(screen.getByTestId('terminal-presentation').textContent).toContain(
+      'its client declared no terminal profile'
+    )
+    expect(screen.getByTestId('mobile-terminal')).toHaveAttribute('aria-busy', 'false')
+  })
+
+  it('says it is attaching before its view has attached, and draws nothing', async () => {
+    const { port, controls } = fakeHost()
+    controls.holdTerminalViews()
+    await onTerminal(port)
+    await waitFor(() => {
+      expect(controls.terminalViews).toHaveLength(1)
+    })
+    expect(screen.getByTestId('terminal-presentation').textContent).toBe(
+      'Attaching to this session…'
+    )
+    expect(screen.queryAllByTestId('mobile-terminal-line')).toEqual([])
+    expect(screen.getByTestId('mobile-terminal')).toHaveAttribute('aria-busy', 'true')
+  })
+
+  it('closes its view when the person goes back to the conversation', async () => {
+    const { port, controls } = fakeHost()
+    const person = await onTerminal(port)
+    await waitFor(() => {
+      expect(controls.terminalViews).toHaveLength(1)
+    })
+    await person.click(screen.getByRole('tab', { name: 'Conversation' }))
+    await waitFor(() => {
+      expect(controls.terminalViews[0]?.closed).toBe(true)
+    })
+  })
+
+  it('ends with the host words and attaches again when asked', async () => {
+    const { port, controls } = fakeHost()
+    const person = await onTerminal(port)
+    await waitFor(() => {
+      expect(screen.getAllByTestId('mobile-terminal-line')).toHaveLength(8)
+    })
+    act(() => {
+      controls.terminalViews[0]?.end('This view was detached from the session.')
+    })
+    expect(screen.getByText('This view was detached from the session.')).toBeInTheDocument()
+    // The last frame stays beneath the words.
+    expect(screen.getAllByTestId('mobile-terminal-line')).toHaveLength(8)
+    await person.click(screen.getByTestId('attach-again'))
+    await waitFor(() => {
+      expect(controls.terminalViews).toHaveLength(2)
+    })
+    await waitFor(() => {
+      expect(screen.queryByText('This view was detached from the session.')).toBeNull()
+    })
   })
 })

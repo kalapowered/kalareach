@@ -5,11 +5,11 @@
  * terminal, and a pan control that took it would make a pager or an editor unusable. A finger is
  * the same question in a different shape, and it gets the same answer.
  *
- * In control mode a one-finger drag is the program's scroll, exactly as the wheel is, and the
- * view's own pan does not exist. Zoom is the one thing a finger can do that no program has a
- * meaning for: nothing on the wire carries a pinch, so a pinch cannot be taken from anyone. In
- * view mode the person is reading the projection rather than driving the program, so the view owns
- * every gesture.
+ * In control mode a one-finger drag is the program's scroll, exactly as the wheel is. Zoom is the
+ * one thing a finger can do that no program has a meaning for: nothing on the wire carries a pinch,
+ * so a pinch cannot be taken from anyone. In view mode the person is reading the screen rather than
+ * driving the program, so the view owns every gesture, and a pinch is the only one it uses: the
+ * window stays on the live screen, so a drag moves nothing.
  */
 
 import { WHEEL_ROW_PIXELS, type ViewMode, type WheelOutcome } from '../../terminal/modes'
@@ -44,19 +44,16 @@ export function routeGesture(mode: ViewMode, gesture: TouchGesture): WheelOutcom
     // the same sign the wheel produces for the same movement.
     return { kind: 'application', lines: Math.trunc(-gesture.deltaY / WHEEL_ROW_PIXELS) }
   }
-  return {
-    kind: 'pan',
-    rows: Math.trunc(-gesture.deltaY / WHEEL_ROW_PIXELS),
-    columns: Math.trunc(-gesture.deltaX / WHEEL_ROW_PIXELS)
-  }
+  return { kind: 'none' }
 }
 
 /**
  * Whether the view should stop the browser handling this gesture itself.
  *
- * The answer is yes for every gesture the view or the program uses, because the alternative is the
- * page scrolling under the person's finger while the program also scrolls. It is no for a gesture
- * neither of them uses, so a person can still scroll the screen the terminal sits on.
+ * The answer is yes for every gesture the program owns, which is every gesture in control mode, and
+ * for every gesture the view owns: a pinch in either mode, and any movement in view mode, which the
+ * view takes and uses for nothing, so the page never scrolls under a finger that is reading the
+ * screen. It is no for a touch in view mode that has not moved, which neither of them uses.
  */
 export function consumesGesture(mode: ViewMode, gesture: TouchGesture): boolean {
   if (gesture.pointers >= 2) return true
@@ -67,5 +64,5 @@ export function consumesGesture(mode: ViewMode, gesture: TouchGesture): boolean 
 export function describeMode(mode: ViewMode): string {
   return mode === 'control'
     ? 'Control: your touches go to the program in this terminal.'
-    : 'View: your touches pan and zoom this projection.'
+    : 'View: pinch to make the text larger or smaller.'
 }

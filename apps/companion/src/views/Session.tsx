@@ -17,7 +17,6 @@ import { failureMessage, watch, type HostPort, type SessionSubject, type Watch }
 import type { LaunchSurface } from '../model/pending'
 import { Conversation, outcomeMessage, receiptTone } from './Conversation'
 import { RawTerminal } from '../terminal/RawTerminal'
-import { terminalAttachment } from '../terminal/modes'
 import { ask } from '../mobile/model/call'
 import { describeApplicationState, sessionDescription } from './Sessions'
 
@@ -287,9 +286,7 @@ export function Session({
       ) : (
         <RawTerminal
           sessionId={sessionId}
-          subject={subject}
-          attachmentId={terminalAttachment(sessionId)}
-          onReleaseGeometry={() => {
+          onLeave={() => {
             go({ view: 'session', sessionId, pane: 'semantic' })
           }}
         />

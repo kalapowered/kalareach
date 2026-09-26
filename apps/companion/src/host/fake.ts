@@ -20,7 +20,6 @@ import type {
   ClosureRecord,
   EnvironmentCapabilitiesResult,
   EnvironmentListResult,
-  EventsSnapshotResult,
   HostInfoResult,
   PresentationReason,
   Receipt,
@@ -54,17 +53,20 @@ import type {
   OwnerView,
   PairingView,
   PasteView,
-  ProjectedScreen,
   ReviewOutcome,
   SettingsPane,
   SetupIdentity,
+  TerminalGrid,
+  TerminalLine,
+  TerminalScreen,
+  TerminalView,
+  TerminalViewState,
   VoiceCallState,
   VoiceStartRequest,
   Written
 } from './port'
 import { receivedConnection } from './port'
 import { codeComplete } from '../pairing/words'
-import { terminalAttachment } from '../terminal/modes'
 
 const ENVIRONMENT = '3f1a2c40-11aa-4b2c-9d3e-000000000001'
 const VOICE_SESSION = '6c5d4e30-33cc-4d4e-9f5a-000000000201'
@@ -294,23 +296,48 @@ export interface FakeHostControls {
    */
   holdRegistrations(): () => void
   /**
-   * Sets how the host presents one attachment while its window is on the live screen: directly, as
-   * a viewport for `reason`, as a viewport with no reason (which is how a worker built before
-   * reasons reports every viewport), or with null, not as a terminal at all.
+   * Sets how the host presents raw terminal views opened from now on: directly, as a viewport for
+   * `reason`, as a viewport with no reason (which is how a worker built before reasons reports every
+   * viewport), or with null, not as a terminal at all. A view declares no terminal profile, so a
+   * host presents it as a viewport for that reason unless a test says otherwise.
    */
-  presentAttachment(
-    attachmentId: string,
-    presentation: TerminalPresentationMode | null,
-    reason?: PresentationReason
-  ): void
-  /** Takes one attachment out of what the host reports, as a detach does. */
-  detachAttachment(attachmentId: string): void
+  presentTerminal(presentation: TerminalPresentationMode | null, reason?: PresentationReason): void
+  /** Holds every raw terminal view opened from now on: nothing is published until the test says. */
+  holdTerminalViews(): void
+  /** The raw terminal views the page has opened, oldest first. */
+  readonly terminalViews: readonly FakeTerminalView[]
 }
 
 /**
- * A call the fake host can hold, named as the port names it: a read, or a window move, after whose
- * answer a view reads its screen again.
+ * One raw terminal view the page opened, as native code holds it: the test publishes its states.
+ * Nothing is published once the page has closed it, as native code publishes nothing after a close.
  */
+export interface FakeTerminalView {
+  readonly sessionId: string
+  /** The grid it opened at, then each one the page reported. */
+  readonly grids: readonly TerminalGrid[]
+  /** Whether the page has closed it. */
+  readonly closed: boolean
+  /** The summary it attached with. */
+  readonly attachment: AttachmentSummary
+  /** Publishes that it attached, with no screen yet. */
+  attach(): void
+  /** Publishes the session's screen at the view's newest grid, or `screen`. */
+  show(screen?: TerminalScreen): void
+  /** Publishes that it waits for a screen, as after the host's reset. */
+  wait(): void
+  /** Publishes that it ended, for `reason`. */
+  end(reason: string): void
+  /** Publishes `state` as it is, a malformed one included. */
+  publish(state: TerminalViewState): void
+  /**
+   * Delivers `state` although the page has closed the view: a state native code published before
+   * the close reached it, still on its way to the page.
+   */
+  deliverInFlight(state: TerminalViewState): void
+}
+
+/** A read the fake host can hold, named as the port names it. */
 export type HeldRead =
   | 'connectionState'
   | 'accountStatus'
@@ -324,9 +351,6 @@ export type HeldRead =
   | 'changesetRead'
   | 'storageStatus'
   | 'pluginList'
-  | 'terminalProjection'
-  | 'attachmentViewport'
-  | 'eventsSnapshot'
 
 /** The reads of one kind a test is holding. */
 export interface HeldReads {
@@ -394,17 +418,13 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
   const importedImages: string[] = []
   const uploaded: string[] = []
   const nodes: DocumentNode[] = startingConversation()
-  /** How far above its live screen each session's view is looking, in rows. */
-  const rowsAbove = new Map<string, number>()
-  /** Each session's attachments, in join order. */
-  const attached = new Map<string, FakeAttachment[]>(
-    [SESSION_MAIN, SESSION_BUILD, SESSION_OFFLINE].map((sessionId) => [
-      sessionId,
-      startingAttachments(sessionId)
-    ])
-  )
-  const attachmentNamed = (attachmentId: string): FakeAttachment | undefined =>
-    [...attached.values()].flat().find((each) => each.attachmentId === attachmentId)
+  /** The raw terminal views the page has opened, oldest first. */
+  const terminalViews: FakeTerminalView[] = []
+  let holdingTerminalViews = false
+  let terminalPresentation: {
+    readonly presentation: TerminalPresentationMode | null
+    readonly reason: PresentationReason | undefined
+  } = { presentation: 'viewport', reason: 'no_terminal_profile' }
   const acknowledged = new Set<string>()
   const deletedArtefacts = new Set<string>()
   const openedPanes: string[] = []
@@ -774,40 +794,28 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
       return Promise.resolve(settledAs('storage.object.delete', 'applied'))
     },
 
-    eventsSnapshot: (params) =>
-      reading('eventsSnapshot', () => {
-        requireConnection()
-        const found = sessions().sessions.find((each) => each.session_id === params.session_id)
-        if (!found) refuse('UNKNOWN_SESSION', 'That session is not on this host.')
-        const view = terminalAttachment(found.session_id)
-        const above = (rowsAbove.get(found.session_id) ?? 0) > 0
-        return sessionSnapshot(
-          found,
-          (attached.get(found.session_id) ?? []).map((each) =>
-            summaryOf(each, above && each.attachmentId === view)
-          )
-        )
-      }),
-    terminalProjection: (params) =>
-      reading('terminalProjection', () => {
-        requireConnection()
-        const sessionId = (params as { session_id?: string } | null)?.session_id ?? SESSION_MAIN
-        return projection(sessionId, rowsAbove.get(sessionId) ?? 0)
-      }),
+    openTerminalView: (sessionId, grid, listener) => {
+      const view = fakeTerminalView(sessionId, grid, listener, terminalPresentation)
+      terminalViews.push(view)
+      if (!connected) {
+        // Native code publishes the failure on the view's channel; the open itself answers.
+        setTimeout(() => {
+          view.end(`This session could not be reached: ${lostBecause}`)
+        }, 0)
+      } else if (!holdingTerminalViews) {
+        setTimeout(() => {
+          view.attach()
+          setTimeout(() => {
+            view.show()
+          }, 0)
+        }, 0)
+      }
+      return Promise.resolve(view.handle)
+    },
     terminalInput: (params) => {
       requireConnection()
       return Promise.resolve({ accepted: true, sequence: '1', echo: params })
     },
-    // The window a view asks for is where its screen starts from then on: a number of rows above
-    // the live screen, or the live screen itself.
-    attachmentViewport: (params) =>
-      reading('attachmentViewport', () => {
-        const asked = params as { session_id?: string; viewport?: { rows_above?: number } } | null
-        const sessionId = asked?.session_id ?? SESSION_MAIN
-        rowsAbove.set(sessionId, Math.max(0, asked?.viewport?.rows_above ?? 0))
-        return settledAs('attachment.viewport', 'applied')
-      }),
-
     pairingView: () => Promise.resolve(pairing),
     pairingSetOrigin: (origin) => {
       const trimmed = origin.trim().replace(/\/$/, '')
@@ -1269,20 +1277,16 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
         registering = Promise.resolve()
       }
     },
-    presentAttachment(attachmentId, presentation, reason) {
-      const found = attachmentNamed(attachmentId)
-      if (!found) return
-      found.presentation = presentation
-      found.reason = presentation === 'viewport' ? reason : undefined
-    },
-    detachAttachment(attachmentId) {
-      for (const [sessionId, held] of attached) {
-        attached.set(
-          sessionId,
-          held.filter((each) => each.attachmentId !== attachmentId)
-        )
+    presentTerminal(presentation, reason) {
+      terminalPresentation = {
+        presentation,
+        reason: presentation === 'viewport' ? reason : undefined
       }
-    }
+    },
+    holdTerminalViews() {
+      holdingTerminalViews = true
+    },
+    terminalViews
   }
 
   return { port: answeringAsNativeCodeDoes(port), controls }
@@ -1891,184 +1895,174 @@ function grants(): IssuedGrants {
   }
 }
 
+/** A fake view, and the handle the page holds for it. */
+type HeldTerminalView = FakeTerminalView & { readonly handle: TerminalView }
+
+let terminalViewCount = 0
+
+/** One raw terminal view, publishing to `listener` what the test tells it to. */
+function fakeTerminalView(
+  sessionId: string,
+  grid: TerminalGrid,
+  listener: (state: TerminalViewState) => void,
+  presented: {
+    readonly presentation: TerminalPresentationMode | null
+    readonly reason: PresentationReason | undefined
+  }
+): HeldTerminalView {
+  terminalViewCount += 1
+  const grids: TerminalGrid[] = [grid]
+  let closed = false
+  const attachment: AttachmentSummary = {
+    attached_at_ms: String(FAKE_NOW_MS),
+    attachment_id: `a77ac4ed-0000-4000-8000-${String(terminalViewCount).padStart(12, '0')}`,
+    claim_geometry: false,
+    dimensions: { columns: String(grid.columns), rows: String(grid.rows) },
+    granted: ['observe_terminal'],
+    mode: 'terminal',
+    ordinal: String(3 + terminalViewCount),
+    presentation: presented.presentation,
+    // Left out when there is none, as the host writes it.
+    ...(presented.reason === undefined ? {} : { presentation_reason: presented.reason }),
+    terminal_profile_id: null
+  }
+  const publish = (state: TerminalViewState) => {
+    if (!closed) listener(state)
+  }
+  return {
+    sessionId,
+    get grids() {
+      return grids
+    },
+    get closed() {
+      return closed
+    },
+    attachment,
+    attach() {
+      publish({ state: 'waiting', attachment })
+    },
+    show(screen) {
+      publish({
+        state: 'showing',
+        attachment,
+        screen: screen ?? terminalScreen(sessionId, grids.at(-1) ?? grid)
+      })
+    },
+    wait() {
+      publish({ state: 'waiting', attachment })
+    },
+    end(reason) {
+      publish({ state: 'ended', reason })
+    },
+    publish,
+    deliverInFlight: listener,
+    handle: {
+      resize: (next) => {
+        grids.push(next)
+        return Promise.resolve()
+      },
+      close: () => {
+        closed = true
+        return Promise.resolve()
+      }
+    }
+  }
+}
+
 /**
- * A projected screen with the two things the raw view has to get right: a cluster the renderer
- * cannot reproduce, and a viewport above the live end.
+ * A session's screen as native code publishes it for a view of `grid`: the part of the live screen
+ * the grid holds, from its top left, as lines of pieces.
  *
  * Each session has a screen of its own, so a view that shows one session's screen under another's
- * name is caught by what it draws. A window `rowsAbove` rows above the live screen starts where
- * that many rows up would, and never above the oldest row the host retains.
+ * name is caught by what it draws. The main session's has a run native code could not place: a
+ * joined emoji the host measures at two cells, which the pinned width model does not, left blank
+ * and counted.
  */
-function projection(sessionId: string, rowsAbove: number): ProjectedScreen {
-  const line = (row: number, text: string) => ({
-    row,
-    cells: [...text].map((character) => ({ text: character, width: 1 }))
-  })
-  const screen =
-    sessionId === SESSION_MAIN
-      ? {
-          dimensions: { columns: '80', rows: '8' },
-          rows: [
-            line(101, '$ cargo test -p kr-client'),
-            line(102, '   Compiling kr-client v0.1.0'),
-            line(103, '    Finished test profile in 12.4s'),
-            {
-              row: 104,
-              cells: [
-                { text: 'o', width: 1 },
-                { text: 'k', width: 1 },
-                { text: ' ', width: 1 },
-                // A family emoji: one cluster, two columns, and no font here can draw it.
-                { text: '\u{1F468}‍\u{1F469}‍\u{1F467}', width: 2 },
-                { text: '', width: 0 },
-                { text: ' ', width: 1 },
-                { text: 'd', width: 1 },
-                { text: 'o', width: 1 },
-                { text: 'n', width: 1 },
-                { text: 'e', width: 1 }
-              ]
-            },
-            line(105, 'test result: ok. 143 passed'),
-            line(106, '$ '),
-            line(107, ''),
-            line(108, '')
-          ],
-          cursor: { column: 2, row: 106, visible: true }
-        }
-      : {
-          dimensions: { columns: '100', rows: '4' },
-          rows: [
-            line(201, '$ pnpm -r build'),
-            line(202, 'apps/companion build: done'),
-            line(203, '$ '),
-            line(204, '')
-          ],
-          cursor: { column: 2, row: 203, visible: true }
-        }
-  const oldest = 1
-  const liveTop = screen.rows[0]?.row ?? oldest
-  return {
-    ...screen,
-    viewport_top_row: rowsAbove > 0 ? Math.max(oldest, liveTop - rowsAbove) : null,
-    oldest_retained_row: oldest,
-    palette_provenance: 'client_probe',
-    palette: [
-      '#071217', '#a2352e', '#315e4a', '#7b500d', '#1a57b5', '#6b4d8a', '#2f6f74', '#dcdcda',
-      '#585c60', '#faa49c', '#aad2bb', '#e7bf7a', '#8fb8f5', '#c0a6dc', '#8fb4a8', '#ffffff'
-    ]
-  }
-}
-
-/** One attachment of a session, as this host holds it. */
-interface FakeAttachment {
-  readonly attachmentId: string
-  readonly ordinal: number
-  readonly mode: 'semantic' | 'terminal'
-  /** How it is presented while its window is on the live screen; null when it is no terminal. */
-  presentation: TerminalPresentationMode | null
-  /** The reason a viewport is given, or none, as a worker built before reasons reports it. */
-  reason: PresentationReason | undefined
-}
-
-/**
- * A session's attachments when this host starts: `kr` attached from a terminal of another size,
- * a semantic view, and the raw view this application names as its own, shown directly.
- */
-function startingAttachments(sessionId: string): FakeAttachment[] {
-  const tail = sessionId.slice(-12)
-  return [
-    {
-      attachmentId: `c1a0c1a0-0000-4000-8000-${tail}`,
-      ordinal: 1,
-      mode: 'terminal',
-      presentation: 'viewport',
-      reason: 'size_mismatch'
-    },
-    {
-      attachmentId: `5e5a5e5a-0000-4000-8000-${tail}`,
-      ordinal: 2,
-      mode: 'semantic',
-      presentation: null,
-      reason: undefined
-    },
-    {
-      attachmentId: terminalAttachment(sessionId),
-      ordinal: 3,
-      mode: 'terminal',
-      presentation: 'direct',
-      reason: undefined
+export function terminalScreen(sessionId: string, grid: TerminalGrid): TerminalScreen {
+  const main = sessionId === SESSION_MAIN
+  const columns = main ? 80 : 100
+  const rows = main ? 8 : 4
+  const texts = main
+    ? [
+        '$ cargo test -p kr-client',
+        '   Compiling kr-client v0.1.0',
+        '    Finished test profile in 12.4s',
+        'ok    done',
+        'test result: ok. 143 passed',
+        '$ ',
+        '',
+        ''
+      ]
+    : ['$ pnpm -r build', 'apps/companion build: done', '$ ', '']
+  const window = { columns: Math.min(grid.columns, columns), rows: Math.min(grid.rows, rows) }
+  const lines: TerminalLine[] = texts.slice(0, window.rows).map((text, index) => {
+    const shown = text.slice(0, window.columns)
+    const pieces =
+      shown.length === 0 ? [] : [{ column: 0, cells: shown.length, text: shown, rendition: PLAIN, hyperlink: null }]
+    // Where the emoji was: blank cells of its run, at the column it started at.
+    if (main && index === 3 && window.columns > 4) {
+      pieces.splice(0, pieces.length, {
+        column: 0,
+        cells: 2,
+        text: 'ok',
+        rendition: PLAIN,
+        hyperlink: null
+      }, {
+        column: 3,
+        cells: 2,
+        text: '  ',
+        rendition: PLAIN,
+        hyperlink: null
+      }, {
+        column: 6,
+        cells: 4,
+        text: 'done'.slice(0, Math.max(0, window.columns - 6)),
+        rendition: PLAIN,
+        hyperlink: null
+      })
     }
-  ]
-}
-
-/** Every presentation reason, in the order the first that holds is the one reported. */
-const PRESENTATION_ORDER: readonly PresentationReason[] = [
-  'no_terminal_profile',
-  'unqualified_terminal_profile',
-  'size_mismatch',
-  'history_window',
-  'stream_not_carryable',
-  'restoration_incomplete',
-  'awaiting_parser_boundary'
-]
-
-/**
- * What the host reports for one attachment, given how it stands and whether its window is above
- * the live screen: the first reason in the order that holds, a viewport with no reason from a
- * worker that gives none, or direct when nothing holds.
- */
-function summaryOf(attachment: FakeAttachment, windowAbove: boolean): AttachmentSummary {
-  const terminal = attachment.mode === 'terminal'
-  let presentation: TerminalPresentationMode | null = attachment.presentation
-  let reason: PresentationReason | undefined
-  if (presentation === 'viewport' && attachment.reason === undefined) {
-    reason = undefined
-  } else if (presentation !== null) {
-    const holding = [
-      ...(attachment.reason === undefined ? [] : [attachment.reason]),
-      ...(windowAbove ? (['history_window'] as const) : [])
-    ]
-    reason = PRESENTATION_ORDER.find((each) => holding.includes(each))
-    presentation = reason === undefined ? 'direct' : 'viewport'
-  }
+    return { row: String((main ? 101 : 201) + index), soft_wrapped: false, truncated: false, pieces }
+  })
+  const cursorLine = main ? 5 : 2
   return {
-    attached_at_ms: String(FAKE_NOW_MS - 60_000 * attachment.ordinal),
-    attachment_id: attachment.attachmentId,
-    claim_geometry: false,
-    dimensions: terminal ? { columns: '120', rows: '40' } : null,
-    granted: terminal ? ['observe_terminal', 'input'] : ['observe_semantic'],
-    mode: attachment.mode,
-    ordinal: String(attachment.ordinal),
-    presentation,
-    // Left out when there is none, as the host writes it.
-    ...(reason === undefined ? {} : { presentation_reason: reason }),
-    terminal_profile_id: terminal ? 'xterm-256color' : null
-  }
-}
-
-/** One session's snapshot: its state now, with every attachment's summary. */
-function sessionSnapshot(
-  session: SessionListResult['sessions'][number],
-  attachments: readonly AttachmentSummary[]
-): EventsSnapshotResult {
-  return {
-    agent_instances: { instances: [], sequence: '1' },
-    agent_resources: {
-      continue_after: null,
-      cursor: '40',
-      resources: [],
-      snapshot_id: '1',
-      stream_generation: '1'
+    dimensions: { columns: String(columns), rows: String(rows) },
+    window,
+    lines,
+    cursor: cursorLine < window.rows && 2 < window.columns
+      ? { column: 2, line: cursorLine, visible: true, style: 1 }
+      : null,
+    palette: {
+      source: 'client_preference',
+      foreground: { red: 0xdc, green: 0xdc, blue: 0xda },
+      background: { red: 0x07, green: 0x12, blue: 0x17 },
+      cursor: { red: 0xdc, green: 0xdc, blue: 0xda },
+      pointer_foreground: { red: 0xdc, green: 0xdc, blue: 0xda },
+      pointer_background: { red: 0x07, green: 0x12, blue: 0x17 },
+      selection_background: { red: 0x31, green: 0x5e, blue: 0x4a },
+      selection_foreground: { red: 0xff, green: 0xff, blue: 0xff },
+      overrides: [{ index: 1, colour: { red: 0xa2, green: 0x35, blue: 0x2e } }]
     },
-    attachments: [...attachments],
-    cursor: '40',
-    geometry: { dimensions: { columns: '120', rows: '40' }, epoch: '1', owner: null },
-    lease: { connection_id: null, epoch: '1', holder: null, next_sequence: '1' },
-    oldest_retained_cursor: '1',
-    session,
-    taken_at_ms: String(FAKE_NOW_MS)
+    degraded: false,
+    replaced: main && window.rows > 3 ? 1 : 0
   }
 }
+
+/** A cell with no attributes, in the session's default colours. */
+const PLAIN = {
+  background: 'default',
+  blink: 'none',
+  bold: false,
+  faint: false,
+  foreground: 'default',
+  invisible: false,
+  italic: false,
+  overline: false,
+  reverse: false,
+  strikethrough: false,
+  underline: 'none',
+  underline_colour: 'default',
+  vertical_align: 'baseline'
+} as const
 
 /* ---- First-start setup --------------------------------------------------------------------- */
 
