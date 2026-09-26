@@ -40,6 +40,7 @@ import {
   foregroundOf,
   placedCursor,
   placedPieces,
+  selectionOf,
   type PlacedCursor
 } from './frame'
 import {
@@ -128,8 +129,10 @@ function Grid({ screen, cell }: { readonly screen: TerminalScreen; readonly cell
   const columns = count(screen.window.columns)
   const rows = count(screen.window.rows)
   const pieces = placedPieces(screen)
+  const selection = selectionOf(palette)
   return (
     <div
+      className="kr-terminal-grid"
       data-testid="terminal-grid"
       data-columns={columns}
       data-rows={rows}
@@ -172,6 +175,10 @@ function Grid({ screen, cell }: { readonly screen: TerminalScreen; readonly cell
           {piece.text}
         </span>
       ))}
+      {/* Selected text takes the session's selection colours, as the terminal it came from shows it. */}
+      <style data-terminal-selection="">
+        {`.kr-terminal-grid ::selection { background-color: ${selection.background}; color: ${selection.foreground}; }`}
+      </style>
       {cursor === null ? null : (
         <span
           data-testid="terminal-cursor"

@@ -153,3 +153,8 @@ export function foregroundOf(palette: PaletteState): string {
 export function cursorColourOf(palette: PaletteState): string {
   return hex(palette.cursor)
 }
+
+/** The palette's colours for selected text. */
+export function selectionOf(palette: PaletteState): { readonly background: string; readonly foreground: string } {
+  return { background: hex(palette.selection_background), foreground: hex(palette.selection_foreground) }
+}

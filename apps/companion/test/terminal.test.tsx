@@ -219,6 +219,18 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
     expect(placed[10]?.style.color).toBe('transparent')
   })
 
+  it("colours a selection of the screen in the session's selection colours", async () => {
+    const { port } = fakeHost()
+    open(port)
+    await screen.findByTestId('palette-provenance')
+    const grid = screen.getByTestId('terminal-grid')
+    const rule = document.querySelector('style[data-terminal-selection]')?.textContent ?? ''
+    expect(grid.classList.contains('kr-terminal-grid')).toBe(true)
+    expect(rule).toContain('.kr-terminal-grid ::selection')
+    expect(rule).toContain('background-color: #315e4a')
+    expect(rule).toContain('color: #ffffff')
+  })
+
   it("draws the session's cursor in its steady shape at its cell", async () => {
     const { port, controls } = fakeHost()
     open(port)
