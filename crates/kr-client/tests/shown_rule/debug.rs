@@ -91,8 +91,15 @@ const OUTSIDE: &[(&str, Outside)] = &[
     ("std::sync::atomic::AtomicI32", Outside::Nothing),
     ("std::sync::atomic::AtomicI64", Outside::Nothing),
     ("tokio::time::Instant", Outside::Nothing),
-    // A child process prints its three pipes, each by its handle alone.
+    // A child process prints its three pipes, and a pipe its handle, each by the handle alone.
     ("std::process::Child", Outside::Nothing),
+    ("std::io::PipeWriter", Outside::Nothing),
+    ("std::io::PipeReader", Outside::Nothing),
+    // An address is numbers: a host's address and a port.
+    ("std::net::SocketAddr", Outside::Nothing),
+    ("std::net::IpAddr", Outside::Nothing),
+    ("std::net::Ipv4Addr", Outside::Nothing),
+    ("std::net::Ipv6Addr", Outside::Nothing),
     ("std::option::Option", Outside::Holds),
     ("std::result::Result", Outside::Holds),
     ("std::vec::Vec", Outside::Holds),
@@ -469,6 +476,74 @@ impl Debugs {
                     self.declare_by_hand(index, &tokens, at, scope, None);
                 }
                 _ => {}
+            }
+        }
+        // The two macros of the files that define what may be shown that write a `Debug`, read as
+        // the `Debug` each writes: the type's name alone, or the type's name and the fields named.
+        if index < self.guarded {
+            for at in 0..tokens.len() {
+                let which = ident(tokens.get(at));
+                if !matches!(which, Some("debug_as_name" | "debug_fields"))
+                    || !punct(tokens.get(at + 1), '!')
+                {
+                    continue;
+                }
+                let scope = self.sources[index].scope_at(at);
+                let line = tokens[at].line;
+                let parts = arguments(&tokens, at + 2).unwrap_or_default();
+                let written: Vec<(String, String)> = if which == Some("debug_as_name") {
+                    parts
+                        .iter()
+                        .filter_map(|part| {
+                            ident(part.first()).map(|name| (name.to_owned(), String::new()))
+                        })
+                        .collect()
+                } else {
+                    let Some(name) = ident(tokens.get(at + 3)).map(ToOwned::to_owned) else {
+                        continue;
+                    };
+                    let fields = arguments(&tokens, at + 4)
+                        .unwrap_or_default()
+                        .iter()
+                        .filter_map(|field| match field.first().map(|located| &located.token) {
+                            Some(Token::Ident(word) | Token::Number(word)) => {
+                                Some(format!(".field(\"{word}\", &self.{word})"))
+                            }
+                            _ => None,
+                        })
+                        .collect::<String>();
+                    vec![(name, fields)]
+                };
+                for (name, fields) in written {
+                    let text = format!(
+                        "{{ fn fmt(&self, formatter: &mut Formatter<'_>) -> Result {{ \
+                         formatter.debug_struct(\"{name}\"){fields}.finish_non_exhaustive() }} }}"
+                    );
+                    let Ok(mut body) = lex(&text) else {
+                        continue;
+                    };
+                    for located in &mut body {
+                        located.line = line;
+                    }
+                    let target = Written {
+                        source: index,
+                        scope,
+                        generics: Vec::new(),
+                        tokens: vec![Located {
+                            token: Token::Ident(name.clone()),
+                            line,
+                        }],
+                    };
+                    let path = self
+                        .resolve(&target, std::slice::from_ref(&name))
+                        .unwrap_or_else(|| format!("?{name}"));
+                    self.by_hand.push(ByHand {
+                        target: path,
+                        written: target,
+                        line,
+                        tokens: body,
+                    });
+                }
             }
         }
         // A macro that declares a type or writes a `Debug`, read at each place it is invoked in
@@ -1087,7 +1162,7 @@ enum Trait {
     Display,
     /// `LowerHex` and the other number formats.
     Number,
-    /// `write_str`, which writes text as it is.
+    /// `write_str`, which writes text as it is: held as a `Display` is.
     Text,
 }
 
@@ -1715,9 +1790,6 @@ impl Reading<'_> {
             }
             return Err(self.refuse(at, "a value this reading does not read"));
         }
-        if used == Trait::Text {
-            return Err(self.refuse(at, "text that is neither this program's words nor a Shown"));
-        }
         // A place, measured or mapped by what this reading knows.
         let place_end = place_end(tokens);
         let place = self
@@ -1871,7 +1943,7 @@ impl Reading<'_> {
                 None => Ok(()),
                 Some(why) => Err(why),
             },
-            Trait::Display => {
+            Trait::Display | Trait::Text => {
                 if matches!(written.tokens.as_slice(), [and, lifetime, word] if punct(Some(and), '&') && matches!(&lifetime.token, Token::Lifetime(name) if name == "'static") && ident(Some(word)) == Some("str"))
                 {
                     return Ok(());
@@ -1898,7 +1970,7 @@ impl Reading<'_> {
                     ))
                 }
             }
-            Trait::Number | Trait::Text => {
+            Trait::Number => {
                 let head = self.head(written).unwrap_or_default();
                 if head
                     .strip_prefix("prim::")
@@ -2206,7 +2278,7 @@ fn each_debug_that_can_print_text_is_named_with_its_place() {
             "a method this reading does not read",
             "pub struct Planted {\n    pub text: String,\n}\nimpl std::fmt::Debug for Planted {\n    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n        formatter.write_str(&self.text.clone())\n    }\n}\n",
             6,
-            "neither this program's words nor a Shown",
+            "the method `clone`",
         ),
         (
             "a fallback over text",
@@ -2239,6 +2311,12 @@ fn each_debug_that_can_print_text_is_named_with_its_place() {
             "the Display of std::string::String",
         ),
         (
+            "a field named to the Debug that says only the fields named",
+            "pub struct Planted {\n    pub id: u64,\n    pub text: String,\n}\nkr_client::debug_fields!(Planted { id, text });\n",
+            5,
+            "formats std::string::String",
+        ),
+        (
             "a name that is not the program's words",
             "pub struct Planted {\n    pub name: &'static str,\n}\nimpl std::fmt::Debug for Planted {\n    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n        formatter.debug_struct(self.name).finish()\n    }\n}\n",
             6,
@@ -2265,6 +2343,11 @@ fn what_the_debug_rule_allows_is_not_named() {
                 pub enum Said {\n    Text(String),\n    Count(u64),\n}\n\
                 pub struct Held {\n    pub text: String,\n    pub maybe: Option<String>,\n    pub count: Option<u64>,\n    pub counts: Counts,\n    pub said: Said,\n}\n\
                 impl std::fmt::Debug for Held {\n    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n        formatter\n            .debug_struct(\"Held\")\n            .field(\"text_bytes\", &self.text.len())\n            .field(\"maybe_bytes\", &self.maybe.as_ref().map(String::len))\n            .field(\"present\", &self.maybe.as_ref().map(|_| \"<present>\"))\n            .field(\"count\", &self.count.unwrap_or(0))\n            .field(\"counts\", &self.counts)\n            .field(\"said\", &self.said)\n            .field(\"words\", &Shown::said(\"words\"))\n            .field(\"composed\", &kr_client::shown!(\"{}\", 3_u64))\n            .finish_non_exhaustive()\n    }\n}\n\
+                pub struct Store {\n    pub file: std::fs::File,\n    pub name: String,\n}\n\
+                kr_client::debug_as_name!(Store);\n\
+                pub struct Named {\n    pub id: u64,\n    pub text: String,\n}\n\
+                kr_client::debug_fields!(Named { id });\n\
+                #[derive(Debug)]\npub struct Holding {\n    pub store: Store,\n    pub named: Named,\n}\n\
                 impl std::fmt::Debug for Said {\n    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n        match self {\n            Self::Text(text) => write!(formatter, \"Text({} bytes)\", text.len()),\n            Self::Count(count) => write!(formatter, \"Count({count})\"),\n        }\n    }\n}\n";
     let findings = debug_findings_in("debug-allowed", text, OTHER_CONTROL);
     assert!(findings.is_empty(), "{findings:?}");

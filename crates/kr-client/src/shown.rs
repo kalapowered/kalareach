@@ -25,11 +25,12 @@
 //!
 //! # What `Plain` claims
 //!
-//! A type is [`Plain`] when its `Display` cannot carry text from input: a number, a switch, this
-//! program's words, an identifier that is a UUID or a counter, a code or a state from a fixed
-//! vocabulary, an origin that is a scheme, a host and a port by construction. Every such claim is in
-//! this file or in the command line's own `shown.rs`, and nowhere else, so the set of claims is one
-//! place to read. A path is not `Plain`: a name found in a directory is whatever somebody put there.
+//! A type is [`Plain`] when neither its `Display` nor its `Debug` can carry text from input: a
+//! number, a switch, this program's words, an identifier that is a UUID or a counter, a code or a
+//! state from a fixed vocabulary, an origin that is a scheme, a host and a port by construction.
+//! Every such claim is in this file or in the command line's own `shown.rs`, and nowhere else, so
+//! the set of claims is one place to read. A path is not `Plain`: a name found in a directory is
+//! whatever somebody put there. Neither is an identifier whose text is whatever arrived.
 //!
 //! # How a failure type is held to this
 //!
@@ -39,6 +40,17 @@
 //! error's `Debug` is its `Display`, through [`debug_as_display!`](crate::debug_as_display!). A test
 //! reads both crates' sources and holds every failure type and every `Display` to that, so a new one
 //! is held from the day it is written rather than by somebody remembering to add it to a list.
+//!
+//! # How every other `Debug` is held
+//!
+//! A `Debug` reaches a rendering as surely as a failure does, so every other type of this crate and
+//! the command line that has one says only what may be shown: a `Debug` derived over fields that
+//! carry no text that arrived, one that names the type and nothing it holds
+//! ([`debug_as_name!`](crate::debug_as_name!)), one that says only the fields it names
+//! ([`debug_fields!`](crate::debug_fields!)), or one written by hand that formats only a `Shown`, a
+//! `Plain` value, this program's words, a number, or a value whose own `Debug` is held the same way.
+//! The source test reads every crate in the workspace for what each field's type prints, and holds
+//! each of these.
 
 use std::borrow::Cow;
 use std::ffi::OsStr;
@@ -1195,7 +1207,7 @@ impl fmt::Debug for IoFault {
 /* Plain                                                                      */
 /* -------------------------------------------------------------------------- */
 
-/// A value whose `Display` cannot carry text from input.
+/// A value whose `Display` and `Debug` cannot carry text from input.
 ///
 /// Implemented only here and in the command line's own `shown.rs`: see the [module](self).
 pub trait Plain: fmt::Display {}
@@ -1294,6 +1306,41 @@ macro_rules! debug_as_display {
             }
         }
     )+};
+}
+
+/// Gives each type a `Debug` that names it and says nothing it holds: `Name { .. }`.
+///
+/// For a value whose parts are text that arrived, a key, a file, a connection or a service, where
+/// what helps somebody reading a diagnostic is which kind of value it was, not what was in it.
+#[macro_export]
+macro_rules! debug_as_name {
+    ($($name:ident),+ $(,)?) => {$(
+        impl ::core::fmt::Debug for $name {
+            fn fmt(&self, formatter: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+                formatter
+                    .debug_struct(::core::stringify!($name))
+                    .finish_non_exhaustive()
+            }
+        }
+    )+};
+}
+
+/// Gives a struct a `Debug` that says the fields named, each through its own `Debug`, and leaves
+/// every other field out: `Name { first: .., second: .., .. }`.
+///
+/// The source test holds each field named to what may be shown, as it holds any `Debug`.
+#[macro_export]
+macro_rules! debug_fields {
+    ($name:ident { $($field:tt),* $(,)? }) => {
+        impl ::core::fmt::Debug for $name {
+            fn fmt(&self, formatter: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+                formatter
+                    .debug_struct(::core::stringify!($name))
+                    $(.field(::core::stringify!($field), &self.$field))*
+                    .finish_non_exhaustive()
+            }
+        }
+    };
 }
 
 macro_rules! plain {
