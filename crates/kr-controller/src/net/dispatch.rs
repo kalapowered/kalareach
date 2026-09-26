@@ -5469,7 +5469,6 @@ mod write_boundary {
 
         drop(output);
         drop(controller);
-        tokio::time::sleep(Duration::from_millis(50)).await;
         let controller = super::super::tests::daemon(&temp).await;
         controller
             .decide_for_device(&expiring, &expiring_record, wound_back)
