@@ -145,6 +145,13 @@ const PRELUDE: &[(&str, &str)] = &[
     ("Box", "std::boxed::Box"),
 ];
 
+/// The `Debug` trait and the two macros that write a `Debug`, by full path.
+const KNOWN_NAMES: [&str; 3] = [
+    "std::fmt::Debug",
+    "kr_client::debug_as_name",
+    "kr_client::debug_fields",
+];
+
 /// What an alias's expansion writes for a parameter of the type the alias was used in, which no
 /// path can spell.
 const PARAMETER: &str = "{a parameter}";
@@ -983,7 +990,10 @@ impl Debugs {
                     at += 1;
                 }
                 let rest = &tokens[at..];
-                if lifetime == "'static" && matches!(rest, [one] if ident(Some(one)) == Some("str"))
+                let (text, after) = written_path(rest);
+                if lifetime == "'static"
+                    && after == rest.len()
+                    && self.resolve(written, &text).as_deref() == Some("prim::str")
                 {
                     return None;
                 }
@@ -998,7 +1008,7 @@ impl Debugs {
                     .position(|located| located.token == Token::Punct(';'))
                     .unwrap_or(inner.len());
                 let element = &inner[..element_end];
-                if matches!(element, [one] if ident(Some(one)) == Some("u8")) {
+                if self.is_byte(written, element) {
                     return Some("bytes".to_owned());
                 }
                 self.carries_in(written, element, carrying)
@@ -1169,32 +1179,48 @@ impl Debugs {
             generics: Vec::new(),
             tokens: Vec::new(),
         };
-        if let Some(path) = self.resolve(&written, segments) {
-            return Some(path);
-        }
+        // Every path the name can reach: the one it resolves to where it is written, or through
+        // each glob in force there, and from each of those on through the globs of the module it
+        // lands in.
         let source = &self.sources[index];
-        let known = [
-            "std::fmt::Debug",
-            "kr_client::debug_as_name",
-            "kr_client::debug_fields",
-        ];
+        let mut reached: Vec<String> = self.resolve(&written, segments).into_iter().collect();
         if let [name] = segments {
             for visible in source.visible(scope) {
                 for (glob_scope, glob) in &source.glob_paths {
-                    let candidate = self.normal(&format!("{}::{name}", glob.join("::")));
-                    if *glob_scope == visible && known.contains(&candidate.as_str()) {
-                        return Some(candidate);
+                    if *glob_scope == visible {
+                        reached.push(self.normal(&format!("{}::{name}", glob.join("::"))));
                     }
                 }
             }
         }
-        // A name this reading cannot place is read as what it says it is: a trait named `Debug`
-        // is that trait, and a macro named as one of the two is that one.
-        let last = segments.last()?.as_str();
-        known
-            .iter()
-            .find(|path| path.rsplit("::").next() == Some(last))
-            .map(|path| (*path).to_owned())
+        let mut seen = BTreeSet::new();
+        while let Some(path) = reached.pop() {
+            if KNOWN_NAMES.contains(&path.as_str()) {
+                return Some(path);
+            }
+            if seen.len() > 64 || !seen.insert(path.clone()) {
+                continue;
+            }
+            if let Some((module, name)) = path.rsplit_once("::") {
+                for glob in self.globs.get(module).into_iter().flatten() {
+                    reached.push(self.normal(&format!("{glob}::{name}")));
+                }
+            }
+        }
+        // Past that, a name is read as what it says it is, written or resolved: a trait named
+        // `Debug` is that trait, and a macro named as one of the two is that one. A trait of
+        // another name reached through a path this reading cannot follow is one the rendering
+        // rule already names: a renamed import.
+        let said = |path: &str| {
+            KNOWN_NAMES
+                .iter()
+                .find(|known| known.rsplit("::").next() == path.rsplit("::").next())
+                .map(|known| (*known).to_owned())
+        };
+        said(&segments.join("::")).or_else(|| {
+            self.resolve(&written, segments)
+                .and_then(|path| said(&path))
+        })
     }
 
     /// A type alias as its use at `use_site` spells it: its parameters replaced by the arguments
@@ -2696,6 +2722,30 @@ fn each_debug_that_can_print_text_is_named_with_its_place() {
             "which with its arguments carries bytes",
         ),
         (
+            "a byte array given to a generic type",
+            "#[derive(Debug)]\npub struct Wrapper<T>(pub T);\n#[derive(Debug)]\npub struct Planted(pub Wrapper<[u8; 32]>);\n",
+            3,
+            "bytes",
+        ),
+        (
+            "an array of bytes under an alias",
+            "type Byte = u8;\n#[derive(Debug)]\npub struct Planted(pub [Byte; 4]);\n",
+            2,
+            "bytes",
+        ),
+        (
+            "the Debug trait through a glob a module re-exports",
+            "mod names {\n    pub use std::fmt::*;\n}\nuse names::Debug;\npub struct Planted(String);\nimpl Debug for Planted {\n    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n        formatter.debug_tuple(\"Planted\").field(&self.0).finish()\n    }\n}\n",
+            8,
+            "a Debug written by hand that formats",
+        ),
+        (
+            "the Debug trait renamed behind a chain of globs",
+            "mod first {\n    pub use std::fmt::Debug as Shows;\n}\nmod second {\n    pub use super::first::*;\n}\nuse second::*;\npub struct Planted(pub u64, pub std::string::String);\nimpl Shows for Planted {\n    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n        formatter.debug_tuple(\"Planted\").field(&self.1).finish()\n    }\n}\n",
+            11,
+            "a Debug written by hand that formats",
+        ),
+        (
             "a name that is not the program's words",
             "pub struct Planted {\n    pub name: &'static str,\n}\nimpl std::fmt::Debug for Planted {\n    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n        formatter.debug_struct(self.name).finish()\n    }\n}\n",
             6,
@@ -2726,7 +2776,7 @@ fn what_the_debug_rule_allows_is_not_named() {
                 kr_client::debug_as_name!(Store);\n\
                 pub struct Named {\n    pub id: u64,\n    pub text: String,\n}\n\
                 kr_client::debug_fields!(Named { id });\n\
-                #[derive(Debug)]\npub struct Holding {\n    pub store: Store,\n    pub named: Named,\n    pub mode: Option<u8>,\n    pub pairs: Pairs,\n}\ntype Pair<const N: usize, T> = ([u16; N], T);\ntype Pairs = Pair<1, u64>;\n\
+                #[derive(Debug)]\npub struct Holding {\n    pub store: Store,\n    pub named: Named,\n    pub mode: Option<u8>,\n    pub pairs: Pairs,\n    pub words: Wrapped<&'static str>,\n}\n#[derive(Debug)]\npub struct Wrapped<T>(pub T);\ntype Pair<const N: usize, T> = ([u16; N], T);\ntype Pairs = Pair<1, u64>;\n\
                 impl std::fmt::Debug for Said {\n    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n        match self {\n            Self::Text(text) => write!(formatter, \"Text({} bytes)\", text.len()),\n            Self::Count(count) => write!(formatter, \"Count({count})\"),\n        }\n    }\n}\n";
     let findings = debug_findings_in("debug-allowed", text, OTHER_CONTROL);
     assert!(findings.is_empty(), "{findings:?}");
