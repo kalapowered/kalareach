@@ -694,6 +694,7 @@ fn a_package_file_that_is_not_what_the_recipe_names_is_refused() {
 #[cfg(windows)]
 #[test]
 fn on_windows_a_recipe_is_refused_and_recorded_at_every_reconciliation() {
+    let why = "does not apply or remove a native bridge on Windows";
     let site = Site::new();
     let before = site.tree();
     let bridges = site.bridges();
@@ -702,15 +703,17 @@ fn on_windows_a_recipe_is_refused_and_recorded_at_every_reconciliation() {
         let settled = bridges
             .reconcile(&plugin(), Some(&site.release()))
             .expect("the refusal is recorded");
-        assert!(
-            refused(&settled).contains("does not apply or remove a native bridge on Windows"),
-            "{settled:?}"
-        );
+        assert!(refused(&settled).contains(why), "{settled:?}");
         assert_eq!(site.tree(), before, "nothing was written");
+        // The journal read back says the same: the refusal, and why.
+        let reports = bridges.reports().expect("reads");
+        assert_eq!(reports.len(), 1, "{reports:?}");
+        assert_eq!(reports[0].state, "refused", "{reports:?}");
+        assert!(
+            reports[0].notes.iter().any(|note| note.contains(why)),
+            "{reports:?}"
+        );
     }
-    let reports = bridges.reports().expect("reads");
-    assert_eq!(reports.len(), 1, "{reports:?}");
-    assert_eq!(reports[0].state, "refused", "{reports:?}");
     let journals: Vec<_> = std::fs::read_dir(site.root.join("state/native-bridges"))
         .expect("the journals")
         .map(|entry| entry.expect("an entry").file_name())
