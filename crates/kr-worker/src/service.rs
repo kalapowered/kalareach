@@ -526,12 +526,34 @@ impl WorkerService {
             return None;
         }
         let parts = std::mem::take(&mut state.admissions_parts);
-        self.plugin_admissions
-            .apply(&parts, &self.connector_sources);
+        {
+            // Applied inside the authority's own boundary, and checked again there: a
+            // replacement that fences this connection takes the same lock, so it lands wholly
+            // before this (which then applies nothing) or wholly after.
+            let authority = self
+                .authority
+                .lock()
+                .expect("the authority lock is not poisoned");
+            if let Err(error) = Self::check_bound(state, &authority) {
+                return Some(failure(RequestId::new(0), &error.to_protocol_error()));
+            }
+            self.plugin_admissions
+                .apply(&parts, &self.connector_sources);
+        }
         let session_id = self.runtime.session().id();
-        let mut report = self
+        let report = match self
             .plugin_admissions
             .report(session_id, self.broker.live_bindings())
+        {
+            Ok(report) => report,
+            Err(why) => {
+                return Some(failure(
+                    RequestId::new(0),
+                    &ProtocolError::new(ErrorCode::ResourceUnavailable, why),
+                ));
+            }
+        };
+        let mut report = report
             .into_iter()
             .map(|part| ControlFrame::PluginAdmissionsAck(Box::new(part)));
         let first = report.next();

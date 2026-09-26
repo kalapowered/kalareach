@@ -480,6 +480,7 @@ async fn read_first_admissions(
     specification: &WorkerLaunchSpec,
 ) -> Result<Vec<kr_protocol::admission::PluginAdmissions>, Box<dyn std::error::Error>> {
     let header = specification.plugins;
+    kr_worker::broker::catalogue::check_header(&header, specification.controller_generation)?;
     let mut parts = Vec::new();
     for expected in 1..=header.parts {
         let frame: ControlFrame = reader.read_message().await?;

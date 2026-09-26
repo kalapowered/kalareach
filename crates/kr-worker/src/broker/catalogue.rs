@@ -8,10 +8,16 @@
 //! comparing the daemon generation, then the admission revision, then the round; an older one
 //! changes nothing and is answered with the frame held.
 //!
+//! What a package's hash names (its verified files) is read once and kept. What its installation
+//! grants (the capabilities, the native bridge, the signed builds) is taken from each snapshot and
+//! never kept from an earlier one, so a withdrawal reaches the connector with the next snapshot,
+//! and a refusal that belongs to one snapshot (two connectors claiming one command) goes with it.
+//!
 //! Each report is numbered, and the number rises with every report this process makes, so two
 //! reports that name one applied frame are ordered too. Free text in a report (why a package was
 //! refused) is cut at a character boundary to [`MAX_REPORT_DETAIL_BYTES`] and marked as cut, so a
-//! report's records are bounded like the snapshot's.
+//! report's records are bounded like the snapshot's, and a report is at most
+//! [`MAX_ADMISSION_PARTS`] parts.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -20,12 +26,12 @@ use std::sync::{Arc, Mutex};
 use kr_plugin_sdk::capability::PluginCapability;
 use kr_plugin_sdk::plugin::{PayloadRole, PluginManifest};
 use kr_protocol::admission::{
-    AdmittedPackage, FrameId, LiveBinding, PackageRefusal, PluginAdmissions, PluginAdmissionsAck,
-    ReleaseState, RevocationPolicy,
+    AdmissionsHeader, AdmittedPackage, FrameId, LiveBinding, PackageRefusal, PluginAdmissions,
+    PluginAdmissionsAck, ReleaseState, RevocationPolicy,
 };
 use kr_protocol::envelope::ControlFrame;
-use kr_protocol::ids::SessionId;
-use kr_protocol::limits::{MAX_CONTROL_FRAME_LEN, MAX_REPORT_DETAIL_BYTES};
+use kr_protocol::ids::{ControllerGeneration, SessionId};
+use kr_protocol::limits::{MAX_ADMISSION_PARTS, MAX_CONTROL_FRAME_LEN, MAX_REPORT_DETAIL_BYTES};
 use kr_protocol::scalars::{Digest256, U64};
 
 use crate::broker::bridge::BridgeSurface;
@@ -71,6 +77,10 @@ struct Held {
     policy: Option<RevocationPolicy>,
     packages: Vec<AdmittedPackage>,
     releases: Vec<ReleaseState>,
+    /// What each admitted hash names, checked once: its verified files, or why they failed.
+    verified: BTreeMap<Digest256, Result<Arc<kr_plugin_sdk::package::Package>, String>>,
+    /// What this snapshot makes of each admitted package, with its grants: a connector, a
+    /// declarative package, or why it was refused.
     read: BTreeMap<Digest256, Result<ReadPackage, String>>,
     report_seq: u64,
 }
@@ -140,8 +150,9 @@ impl Admissions {
     }
 
     /// Applies a complete snapshot, where its frame is above the one held: every package hash
-    /// not read before is read and checked, and `sources` is replaced with the admitted
-    /// connectors.
+    /// not checked before is checked, what each installation grants is taken from this snapshot,
+    /// and `sources` is replaced with the admitted connectors, all under one lock, so two
+    /// snapshots applied at once never leave one's packages beside the other's connectors.
     ///
     /// `parts` are the snapshot's parts, in order; the caller has checked that they are all of
     /// one frame and complete.
@@ -162,42 +173,54 @@ impl Admissions {
             .iter()
             .flat_map(|part| part.releases.iter().cloned())
             .collect();
+        let mut verified = BTreeMap::new();
         let mut read = BTreeMap::new();
         for package in &packages {
-            let known = held.read.remove(&package.package_digest);
-            let outcome = known.unwrap_or_else(|| read_package(package));
-            read.insert(package.package_digest, outcome);
+            let checked = held
+                .verified
+                .remove(&package.package_digest)
+                .unwrap_or_else(|| verify(package));
+            read.insert(
+                package.package_digest,
+                checked
+                    .as_ref()
+                    .map_err(Clone::clone)
+                    .and_then(|checked| derive(package, checked)),
+            );
+            verified.insert(package.package_digest, checked);
+        }
+        let connectors: Vec<Arc<InstalledConnector>> = read
+            .values()
+            .filter_map(|outcome| match outcome {
+                Ok(ReadPackage::Connector(connector)) => Some(Arc::clone(connector)),
+                _ => None,
+            })
+            .collect();
+        // A refusal of this kind belongs to this snapshot alone: the next one reads again.
+        for (connector, refusal) in sources.replace_read(connectors) {
+            read.insert(connector.package_digest(), Err(refusal.detail));
         }
         held.frame = Some(frame);
         held.policy = Some(first.policy);
         held.packages = packages;
         held.releases = releases;
+        held.verified = verified;
         held.read = read;
-        let connectors: Vec<Arc<InstalledConnector>> = held
-            .packages
-            .iter()
-            .filter_map(|package| match held.read.get(&package.package_digest) {
-                Some(Ok(ReadPackage::Connector(connector))) => Some(Arc::clone(connector)),
-                _ => None,
-            })
-            .collect();
-        drop(held);
-        for (connector, refusal) in sources.replace_read(connectors) {
-            let mut held = self.held();
-            held.read
-                .insert(connector.package_digest(), Err(refusal.detail));
-        }
         Applied::Newer
     }
 
     /// Makes a report on `bindings` for the frame held, numbered above every earlier report of
     /// this process, cut into parts that each fit a control frame.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// Returns why, by name, when the report would need more than [`MAX_ADMISSION_PARTS`] parts:
+    /// a report is never cut short, since a shorter one would say fewer bindings are live.
     pub fn report(
         &self,
         session_id: SessionId,
         bindings: Vec<LiveBinding>,
-    ) -> Vec<PluginAdmissionsAck> {
+    ) -> Result<Vec<PluginAdmissionsAck>, String> {
         let mut held = self.held();
         held.report_seq = held.report_seq.saturating_add(1);
         let report_seq = U64::new(held.report_seq);
@@ -221,8 +244,43 @@ impl Admissions {
             })
             .collect();
         drop(held);
-        page(session_id, frame, report_seq, bindings, refusals)
+        let parts = page(session_id, frame, report_seq, bindings, refusals);
+        if parts.len() > MAX_ADMISSION_PARTS as usize {
+            return Err(format!(
+                "the report on this worker's bindings needs {} parts, and a report is at most \
+                 {MAX_ADMISSION_PARTS}",
+                parts.len()
+            ));
+        }
+        Ok(parts)
     }
+}
+
+/// Checks the header of a first snapshot before any part of it is read: at least one part and no
+/// more than a snapshot may have, of the generation that spawned this worker.
+///
+/// # Errors
+///
+/// Returns why, by name, when the header breaks either.
+pub fn check_header(
+    header: &AdmissionsHeader,
+    generation: ControllerGeneration,
+) -> Result<(), String> {
+    if header.parts == 0 || header.parts > MAX_ADMISSION_PARTS {
+        return Err(format!(
+            "the first snapshot of plugin admissions announces {} parts, and a snapshot has one \
+             to {MAX_ADMISSION_PARTS}",
+            header.parts
+        ));
+    }
+    if header.frame.generation != generation {
+        return Err(
+            "the first snapshot of plugin admissions names another controller generation than the \
+             one that spawned this worker"
+                .to_owned(),
+        );
+    }
+    Ok(())
 }
 
 /// Cuts `text` at a character boundary to at most `max` bytes, and says whether it was cut.
@@ -348,39 +406,12 @@ pub fn source_of(package: &AdmittedPackage) -> ConnectorSource {
     }
 }
 
-/// Reads one admitted package from its checked copy: a connector where it has a connector table,
-/// and otherwise its manifest, checked against the admitted hash with the SDK's package check.
-fn read_package(package: &AdmittedPackage) -> Result<ReadPackage, String> {
+/// Checks what one admitted package's hash names: its copy passes the SDK's package check, its
+/// manifest hashes to the admitted hash, and it is the admitted package.
+fn verify(package: &AdmittedPackage) -> Result<Arc<kr_plugin_sdk::package::Package>, String> {
     let directory = PathBuf::from(&package.package_dir);
-    let validated = kr_plugin_sdk::validate::validate_package_directory(&directory);
-    if !validated.report.is_valid() {
-        let findings: Vec<String> = validated
-            .report
-            .findings
-            .iter()
-            .map(ToString::to_string)
-            .collect();
-        return Err(format!(
-            "the package in {} does not pass the package check: {}",
-            directory.display(),
-            findings.join("; ")
-        ));
-    }
-    let checked = validated
-        .package
-        .ok_or_else(|| format!("the package in {} could not be read", directory.display()))?;
-    let manifest_file = checked
-        .files
-        .iter()
-        .find(|file| file.path.as_str() == kr_plugin_sdk::package::MANIFEST_FILE)
-        .ok_or_else(|| format!("the package in {} has no manifest", directory.display()))?;
-    if manifest_file.digest.as_bytes() != package.package_digest.as_bytes() {
-        return Err(format!(
-            "the package in {} is not the admitted one: its manifest does not hash to the \
-             admitted hash",
-            directory.display()
-        ));
-    }
+    let checked = InstalledConnector::check(&directory, package.package_digest)
+        .map_err(|refusal| refusal.detail)?;
     if checked.manifest.plugin_id() != package.plugin_id {
         return Err(format!(
             "the package in {} is {}, not the admitted {}",
@@ -389,12 +420,21 @@ fn read_package(package: &AdmittedPackage) -> Result<ReadPackage, String> {
             package.plugin_id
         ));
     }
+    Ok(Arc::new(checked))
+}
+
+/// What one checked package is under this snapshot's grants: a connector where it carries a
+/// connector table, and otherwise its manifest.
+fn derive(
+    package: &AdmittedPackage,
+    checked: &kr_plugin_sdk::package::Package,
+) -> Result<ReadPackage, String> {
     if checked.manifest.payload(PayloadRole::Connector).is_some() {
-        return InstalledConnector::read(source_of(package))
+        return InstalledConnector::assemble(source_of(package), checked.clone())
             .map(|connector| ReadPackage::Connector(Arc::new(connector)))
             .map_err(|refusal| refusal.detail);
     }
-    Ok(ReadPackage::Declarative(Arc::new(checked.manifest)))
+    Ok(ReadPackage::Declarative(Arc::new(checked.manifest.clone())))
 }
 
 #[cfg(test)]
@@ -410,6 +450,322 @@ mod tests {
         assert!(text.starts_with(&cut_text));
         let (whole, was_cut) = cut("short", MAX_REPORT_DETAIL_BYTES);
         assert_eq!((whole.as_str(), was_cut), ("short", false));
+    }
+
+    fn header(parts: u32, generation: u64) -> AdmissionsHeader {
+        AdmissionsHeader {
+            frame: FrameId {
+                generation: ControllerGeneration::new(generation),
+                revision: U64::new(1),
+                round: U64::new(1),
+            },
+            parts,
+        }
+    }
+
+    /// A first snapshot is one to the bound's parts, of the generation that spawned the worker.
+    #[test]
+    fn a_first_header_outside_its_bounds_or_of_another_generation_is_refused() {
+        let spawned = ControllerGeneration::new(3);
+        assert_eq!(check_header(&header(1, 3), spawned), Ok(()));
+        assert_eq!(
+            check_header(&header(MAX_ADMISSION_PARTS, 3), spawned),
+            Ok(())
+        );
+        for (bad, why) in [
+            (header(0, 3), "parts"),
+            (header(MAX_ADMISSION_PARTS + 1, 3), "parts"),
+            (header(1, 4), "generation"),
+        ] {
+            let refusal = check_header(&bad, spawned).expect_err("refused");
+            assert!(refusal.contains(why), "{refusal}");
+        }
+    }
+
+    /// A report of the bound's parts is made; one that would need more is refused whole, never
+    /// cut short.
+    #[test]
+    fn a_report_past_the_part_bound_is_refused_whole() {
+        let admissions = Admissions::new();
+        let refusal = |n: u32| PackageRefusal {
+            package_digest: Digest256::from_bytes([u8::try_from(n % 256).unwrap_or(0); 32]),
+            detail: "d".repeat(MAX_REPORT_DETAIL_BYTES),
+            detail_cut: true,
+        };
+        let one = measure(&refusal(0));
+        let per_part = MAX_CONTROL_FRAME_LEN / one;
+        let binding = |n: u32| LiveBinding {
+            binding_id: kr_protocol::ids::BrokerBindingId::new(kr_protocol::scalars::Uuid::NIL),
+            application_instance_id: kr_protocol::ids::ApplicationInstanceId::new(
+                kr_protocol::scalars::Uuid::NIL,
+            ),
+            release: kr_protocol::admission::LiveRelease {
+                plugin_id: kr_protocol::ids::PluginId::new(format!("kalareach/p{n}"))
+                    .expect("an identifier"),
+                publisher_id: kr_protocol::ids::PublisherId::new("kalareach").expect("an id"),
+                version: "d".repeat(900),
+                package_digest: Digest256::from_bytes([1; 32]),
+                origin: kr_protocol::admission::ReleaseOrigin {
+                    repository_id: "official".to_owned(),
+                    enrolment_key: "k".to_owned(),
+                },
+            },
+            ending: false,
+            component: kr_protocol::scalars::Nullable::null(),
+        };
+        let bindings = |count: usize| -> Vec<LiveBinding> {
+            (0..u32::try_from(count).unwrap_or(u32::MAX))
+                .map(binding)
+                .collect()
+        };
+        let session = SessionId::new(kr_protocol::scalars::Uuid::NIL);
+        let _ = per_part;
+        let many = admissions
+            .report(session, bindings(70 * 1024))
+            .map(|parts| parts.len());
+        assert!(
+            matches!(&many, Err(why) if why.contains("parts")),
+            "{many:?}"
+        );
+        let fits = admissions
+            .report(session, bindings(1024))
+            .expect("within the bound");
+        assert!(fits.len() <= MAX_ADMISSION_PARTS as usize);
+        assert!(
+            fits.windows(2)
+                .all(|pair| pair[0].report_seq == pair[1].report_seq),
+            "one report, one number"
+        );
+    }
+
+    /// What an installation hands over, as an admitted package.
+    fn admitted(source: &ConnectorSource, plugin_id: &str) -> AdmittedPackage {
+        AdmittedPackage {
+            plugin_id: kr_protocol::ids::PluginId::new(plugin_id).expect("an identifier"),
+            publisher_id: kr_protocol::ids::PublisherId::new("kalareach").expect("an identifier"),
+            version: "1.0.0".to_owned(),
+            package_digest: source.package_digest,
+            origin: kr_protocol::admission::ReleaseOrigin {
+                repository_id: "official".to_owned(),
+                enrolment_key: "key".to_owned(),
+            },
+            package_dir: source.package_dir.display().to_string(),
+            grants: source
+                .granted
+                .iter()
+                .map(|capability| capability.as_str().to_owned())
+                .collect(),
+            bridge: source.bridge.as_ref().map_or_else(
+                kr_protocol::scalars::Nullable::null,
+                |bridge| {
+                    kr_protocol::scalars::Nullable::some(kr_protocol::admission::AdmittedBridge {
+                        application: bridge.application.clone(),
+                        surfaces: bridge
+                            .surfaces
+                            .iter()
+                            .map(|surface| surface.as_str().to_owned())
+                            .collect(),
+                        forwarder: bridge.forwarder.display().to_string(),
+                    })
+                },
+            ),
+            builds: Vec::new(),
+            component: kr_protocol::scalars::Nullable::null(),
+        }
+    }
+
+    /// A one-part snapshot at revision and round `step`.
+    fn snapshot(step: u64, packages: Vec<AdmittedPackage>) -> Vec<PluginAdmissions> {
+        vec![PluginAdmissions {
+            environment_id: kr_protocol::ids::EnvironmentId::new(kr_protocol::scalars::Uuid::NIL),
+            frame: FrameId {
+                generation: ControllerGeneration::new(1),
+                revision: U64::new(step),
+                round: U64::new(step),
+            },
+            part: 1,
+            parts: 1,
+            policy: RevocationPolicy::WarnOnly,
+            packages,
+            releases: Vec::new(),
+        }]
+    }
+
+    /// What an installation grants is taken from each snapshot, while the package its hash names
+    /// is read once: a withdrawn launch grant, a removed bridge and a changed build list each
+    /// reach the connector with the next snapshot, and a restored grant comes back with it.
+    #[test]
+    fn grants_bridges_and_builds_follow_each_snapshot_under_one_hash() {
+        use crate::broker::connectors::fixture;
+        let root = tempfile::tempdir().expect("a directory");
+        let source = fixture::claude_code_package(
+            root.path(),
+            std::path::Path::new("/opt/kalareach/bin/kr-hook"),
+        )
+        .expect("the package is written");
+        let digest = source.package_digest;
+        let full = admitted(&source, "kalareach/claude-code");
+        let admissions = Admissions::new();
+        let sources = ConnectorSources::new();
+        let launch = kr_plugin_sdk::capability::PluginCapability::CommandIntegrationLaunch;
+        let command = |sources: &ConnectorSources| sources.for_command(fixture::COMMAND);
+
+        assert_eq!(
+            admissions.apply(&snapshot(1, vec![full.clone()]), &sources),
+            Applied::Newer
+        );
+        let connector = command(&sources).expect("the launch grant integrates the command");
+        assert!(connector.installed_bridge().is_some());
+
+        let mut withdrawn = full.clone();
+        withdrawn.grants.retain(|grant| grant != launch.as_str());
+        admissions.apply(&snapshot(2, vec![withdrawn]), &sources);
+        assert!(
+            command(&sources).is_none(),
+            "a withdrawn grant ends the integration"
+        );
+        let (_, read) = admissions.admitted(digest).expect("still admitted");
+        assert!(matches!(read, ReadPackage::Connector(connector) if !connector.granted(launch)));
+
+        admissions.apply(&snapshot(3, vec![full.clone()]), &sources);
+        assert!(command(&sources).is_some(), "a restored grant restores it");
+
+        let mut unbridged = full.clone();
+        unbridged.bridge = kr_protocol::scalars::Nullable::null();
+        admissions.apply(&snapshot(4, vec![unbridged]), &sources);
+        assert!(
+            command(&sources)
+                .expect("still integrated")
+                .installed_bridge()
+                .is_none(),
+            "a removed bridge is gone from the connector"
+        );
+
+        let build = Digest256::from_bytes(fixture::QUALIFIED_DIGEST);
+        let mut built = full.clone();
+        built.builds = vec![kr_protocol::admission::AdmittedBuild {
+            executable_digest: build,
+            version: fixture::QUALIFIED_VERSION.to_owned(),
+        }];
+        admissions.apply(&snapshot(5, vec![built]), &sources);
+        assert_eq!(
+            command(&sources)
+                .expect("integrated")
+                .qualified_version(&build),
+            Some(fixture::QUALIFIED_VERSION)
+        );
+        admissions.apply(&snapshot(6, vec![full]), &sources);
+        assert_eq!(
+            command(&sources)
+                .expect("integrated")
+                .qualified_version(&build),
+            None,
+            "a build the snapshot no longer names qualifies nothing"
+        );
+    }
+
+    /// Two packages that integrate one command are both refused in the snapshot that admits them
+    /// both, and the one left resolves the command once the other is no longer admitted.
+    #[test]
+    fn a_command_conflict_ends_with_the_snapshot_that_holds_it() {
+        use crate::broker::connectors::fixture;
+        let root = tempfile::tempdir().expect("a directory");
+        let forwarder = std::path::Path::new("/opt/kalareach/bin/kr-hook");
+        let gemini = fixture::package(root.path(), forwarder, &fixture::Shape::gemini_cli(&[]))
+            .expect("the package is written");
+        let other = fixture::package(
+            root.path(),
+            forwarder,
+            &fixture::Shape {
+                plugin_name: "gemini-other",
+                display_name: "Gemini Other",
+                ..fixture::Shape::gemini_cli(&[])
+            },
+        )
+        .expect("the package is written");
+        let admissions = Admissions::new();
+        let sources = ConnectorSources::new();
+        let both = vec![
+            admitted(&gemini, "kalareach/gemini-cli"),
+            admitted(&other, "kalareach/gemini-other"),
+        ];
+        admissions.apply(&snapshot(1, both), &sources);
+        assert!(sources.for_command("gemini").is_none());
+        assert!(admissions.admitted(gemini.package_digest).is_none());
+        let refusals = admissions
+            .report(SessionId::new(kr_protocol::scalars::Uuid::NIL), Vec::new())
+            .expect("a report")
+            .into_iter()
+            .flat_map(|part| part.refusals)
+            .count();
+        assert_eq!(refusals, 2);
+
+        admissions.apply(
+            &snapshot(2, vec![admitted(&gemini, "kalareach/gemini-cli")]),
+            &sources,
+        );
+        assert_eq!(
+            sources
+                .for_command("gemini")
+                .map(|connector| connector.plugin_id().to_string()),
+            Some("kalareach/gemini-cli".to_owned())
+        );
+        assert!(admissions.admitted(gemini.package_digest).is_some());
+    }
+
+    /// A report of exactly the bound's parts is made; one binding more is refused whole.
+    #[test]
+    fn a_report_of_the_bound_is_made_and_one_record_more_is_refused() {
+        let binding = |n: usize| LiveBinding {
+            binding_id: kr_protocol::ids::BrokerBindingId::new(kr_protocol::scalars::Uuid::NIL),
+            application_instance_id: kr_protocol::ids::ApplicationInstanceId::new(
+                kr_protocol::scalars::Uuid::NIL,
+            ),
+            release: kr_protocol::admission::LiveRelease {
+                plugin_id: kr_protocol::ids::PluginId::new(format!("kalareach/p{n:08}"))
+                    .expect("an identifier"),
+                publisher_id: kr_protocol::ids::PublisherId::new("kalareach").expect("an id"),
+                version: "v".repeat(900),
+                package_digest: Digest256::from_bytes([1; 32]),
+                origin: kr_protocol::admission::ReleaseOrigin {
+                    repository_id: "official".to_owned(),
+                    enrolment_key: "k".to_owned(),
+                },
+            },
+            ending: false,
+            component: kr_protocol::scalars::Nullable::null(),
+        };
+        let session = SessionId::new(kr_protocol::scalars::Uuid::NIL);
+        let frame = FrameId {
+            generation: ControllerGeneration::new(0),
+            revision: U64::new(0),
+            round: U64::new(0),
+        };
+        // Every record costs the same, so every full part holds the same count of them.
+        let paged = page(
+            session,
+            frame,
+            U64::new(1),
+            (0..4096).map(binding).collect(),
+            Vec::new(),
+        );
+        assert!(paged.len() > 2);
+        let per_part = paged[0].bindings.len();
+        assert_eq!(paged[1].bindings.len(), per_part);
+        let bound = per_part * MAX_ADMISSION_PARTS as usize;
+        let admissions = Admissions::new();
+        let made = admissions
+            .report(session, (0..bound).map(binding).collect())
+            .expect("a report of the bound is made");
+        assert_eq!(made.len(), MAX_ADMISSION_PARTS as usize);
+        assert!(made.iter().all(|part| part.parts == MAX_ADMISSION_PARTS));
+        let refused = admissions
+            .report(session, (0..=bound).map(binding).collect())
+            .map(|parts| parts.len());
+        assert!(
+            matches!(&refused, Err(why) if why.contains("parts")),
+            "{refused:?}"
+        );
     }
 
     #[test]

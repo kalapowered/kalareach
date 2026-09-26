@@ -138,7 +138,22 @@ impl InstalledConnector {
     /// describes a native bridge the package does not declare, was not granted or that is another
     /// application's, or its publisher is not one this host can record.
     pub fn read(source: ConnectorSource) -> Result<Self, ConnectorRefusal> {
-        let validated = kr_plugin_sdk::validate::validate_package_directory(&source.package_dir);
+        let package = Self::check(&source.package_dir, source.package_digest)?;
+        Self::assemble(source, package)
+    }
+
+    /// Checks one installed package's copy with the SDK's package check, and that its manifest
+    /// hashes to the installed hash: what the hash names, and nothing an installation grants.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConnectorRefusal`] when the package fails the check, has no manifest, or its
+    /// manifest does not hash to `package_digest`.
+    pub fn check(
+        package_dir: &std::path::Path,
+        package_digest: Digest256,
+    ) -> Result<kr_plugin_sdk::package::Package, ConnectorRefusal> {
+        let validated = kr_plugin_sdk::validate::validate_package_directory(package_dir);
         if !validated.report.is_valid() {
             let findings: Vec<String> = validated
                 .report
@@ -148,14 +163,14 @@ impl InstalledConnector {
                 .collect();
             return Err(ConnectorRefusal::new(format!(
                 "the package in {} does not pass the package check: {}",
-                source.package_dir.display(),
+                package_dir.display(),
                 findings.join("; ")
             )));
         }
         let package = validated.package.ok_or_else(|| {
             ConnectorRefusal::new(format!(
                 "the package in {} could not be read",
-                source.package_dir.display()
+                package_dir.display()
             ))
         })?;
         let manifest_file = package
@@ -165,16 +180,34 @@ impl InstalledConnector {
             .ok_or_else(|| {
                 ConnectorRefusal::new(format!(
                     "the package in {} has no manifest",
-                    source.package_dir.display()
+                    package_dir.display()
                 ))
             })?;
-        if manifest_file.digest.as_bytes() != source.package_digest.as_bytes() {
+        if manifest_file.digest.as_bytes() != package_digest.as_bytes() {
             return Err(ConnectorRefusal::new(format!(
                 "the package in {} is not the installed one: its manifest does not hash to {}",
-                source.package_dir.display(),
-                kr_plugin_sdk::digest::PayloadDigest::from_bytes(*source.package_digest.as_bytes())
+                package_dir.display(),
+                kr_plugin_sdk::digest::PayloadDigest::from_bytes(*package_digest.as_bytes())
             )));
         }
+        Ok(package)
+    }
+
+    /// Builds one connector from a package [`Self::check`] checked and what its installation
+    /// hands over now: its grants, its native bridge and its signed builds.
+    ///
+    /// What an installation grants is read here each time, never kept from an earlier hand-over,
+    /// so a withdrawn capability or a removed bridge reaches the connector with the next one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConnectorRefusal`] naming the first thing that does not hold: the package carries
+    /// no table, the installation describes a native bridge the package does not declare, was not
+    /// granted or that is another application's, or its publisher is not one this host can record.
+    pub fn assemble(
+        source: ConnectorSource,
+        package: kr_plugin_sdk::package::Package,
+    ) -> Result<Self, ConnectorRefusal> {
         // The package check has already refused a table that names another package.
         let plugin_id = package.manifest.plugin_id();
         let table = package.connector.ok_or_else(|| {
