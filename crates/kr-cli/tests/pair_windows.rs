@@ -26,6 +26,8 @@ use kr_protocol::scalars::Nullable;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
 mod support;
+#[path = "../../kr-controller/tests/teardown/mod.rs"]
+mod teardown;
 
 use support::kr;
 
@@ -525,5 +527,413 @@ async fn the_first_owner_is_not_confirmed_where_membership_is_unknown() {
     assert!(
         !printed.contains("Type pair"),
         "nothing was asked: {printed}"
+    );
+}
+
+/// A terminal attached to a real worker's session, holding its keys: what it types reaches the
+/// session's root shell, and what the session writes reaches it.
+struct WorkerTerminal {
+    client: LocalClient,
+    session_id: kr_protocol::ids::SessionId,
+    attachment_id: kr_protocol::ids::AttachmentId,
+    epoch: kr_protocol::ids::InputLeaseEpoch,
+    sequence: u64,
+    seen: String,
+}
+
+impl WorkerTerminal {
+    /// Attaches to the session's worker through its own descriptor and endpoint, takes the keys and
+    /// subscribes to what the session writes.
+    async fn attach(
+        environment: &kr_ipc::paths::EnvironmentPaths,
+        session_id: kr_protocol::ids::SessionId,
+    ) -> Self {
+        use kr_protocol::attachment::{AttachMode, AttachmentCapability, SessionAttachParams};
+        use kr_protocol::envelope::ActionTarget;
+        use kr_protocol::ids::ActionId;
+        use kr_protocol::method::Method;
+        use kr_protocol::scalars::CanonicalSet;
+
+        let descriptor = kr_ipc::descriptor::read_all(environment)
+            .expect("reads the runtime directory")
+            .into_iter()
+            .filter_map(|entry| entry.descriptor.ok())
+            .find(|descriptor| descriptor.session_id == session_id)
+            .expect("the session's descriptor is published");
+        let endpoint =
+            kr_ipc::paths::Endpoint::from_path(&descriptor.endpoint).expect("an endpoint");
+        let mut client = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
+            .await
+            .expect("reaches the worker");
+        client
+            .verify_worker(&descriptor)
+            .await
+            .expect("the worker answers the descriptor's challenge");
+        let target = ActionTarget {
+            environment_id: descriptor.environment_id,
+            session_id: Nullable::some(session_id),
+            session_epoch: Nullable::some(kr_protocol::ids::SessionEpoch::V1),
+            application_instance_id: Nullable::null(),
+            agent_binding_revision: Nullable::null(),
+        };
+        let mut requested = CanonicalSet::new();
+        requested.insert(AttachmentCapability::ObserveTerminal);
+        requested.insert(AttachmentCapability::Input);
+        let attached: kr_protocol::attachment::SessionAttachResult = client
+            .mutate(
+                Method::SessionAttach,
+                ActionId::new(kr_ipc::new_uuid()),
+                target.clone(),
+                &SessionAttachParams {
+                    session_id,
+                    mode: AttachMode::Terminal,
+                    claim_geometry: true,
+                    dimensions: Nullable::some(kr_protocol::session::Dimensions::new(300, 40)),
+                    terminal_profile_id: Nullable::some("xterm-256color".to_owned()),
+                    requested,
+                },
+            )
+            .await
+            .expect("the call reaches the worker")
+            .expect("the worker attaches the terminal")
+            .to_typed()
+            .expect("decodes");
+        let attachment_id = attached.attachment.attachment_id;
+        let lease: kr_protocol::input::InputAcquireResult = client
+            .mutate(
+                Method::InputAcquire,
+                ActionId::new(kr_ipc::new_uuid()),
+                target,
+                &kr_protocol::input::InputAcquireParams {
+                    session_id,
+                    attachment_id,
+                    expected_epoch: Nullable::null(),
+                },
+            )
+            .await
+            .expect("the call reaches the worker")
+            .expect("the worker hands this terminal the keys")
+            .to_typed()
+            .expect("decodes");
+        let mut streams = CanonicalSet::new();
+        streams.insert(kr_protocol::recovery::EventStream::Output);
+        client
+            .request(
+                Method::EventsSubscribe,
+                &kr_protocol::recovery::EventsSubscribeParams {
+                    session_id,
+                    attachment_id,
+                    streams,
+                    from_cursor: Nullable::null(),
+                },
+            )
+            .await
+            .expect("the call reaches the worker")
+            .expect("the worker subscribes the terminal");
+        Self {
+            client,
+            session_id,
+            attachment_id,
+            epoch: lease.lease.epoch,
+            sequence: 0,
+            seen: String::new(),
+        }
+    }
+
+    /// Types one line into the session's root shell.
+    async fn type_line(&mut self, line: &str) {
+        let _: kr_protocol::input::InputWriteResult = self
+            .client
+            .request(
+                kr_protocol::method::Method::InputWrite,
+                &kr_protocol::input::InputWriteParams {
+                    session_id: self.session_id,
+                    attachment_id: self.attachment_id,
+                    epoch: self.epoch,
+                    sequence: kr_protocol::ids::InputSequence::new(self.sequence),
+                    bytes: kr_protocol::scalars::Bytes::new(format!("{line}\r").into_bytes()),
+                },
+            )
+            .await
+            .expect("the call reaches the worker")
+            .expect("the worker takes the line")
+            .to_typed()
+            .expect("decodes");
+        self.sequence += 1;
+    }
+
+    /// What the session has written so far, with its control sequences and line breaks taken out,
+    /// so text the console wrapped or redrew reads as one run.
+    fn text(&self) -> String {
+        let mut plain = String::new();
+        let mut characters = self.seen.chars().peekable();
+        while let Some(character) = characters.next() {
+            match character {
+                '\u{1b}' => {
+                    // A control sequence: ESC, then `[` and parameters up to a final letter, or `]`
+                    // up to BEL or ST, or one character.
+                    match characters.next() {
+                        Some('[') => {
+                            for next in characters.by_ref() {
+                                if next.is_ascii_alphabetic() || next == '~' {
+                                    break;
+                                }
+                            }
+                        }
+                        Some(']') => {
+                            while let Some(next) = characters.next() {
+                                if next == '\u{7}' {
+                                    break;
+                                }
+                                if next == '\u{1b}' && characters.peek() == Some(&'\\') {
+                                    characters.next();
+                                    break;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                '\r' | '\n' => {}
+                other if other.is_control() => {}
+                other => plain.push(other),
+            }
+        }
+        plain
+    }
+
+    /// Waits until the session has written `pattern`, as [`Self::text`] reads it, and returns it all.
+    async fn shown(&mut self, pattern: &str, what: &str) -> String {
+        let started = tokio::time::Instant::now();
+        let deadline = started + LIVENESS_DEADLINE;
+        while !self.text().contains(pattern) {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match tokio::time::timeout(remaining, self.client.recv()).await {
+                Ok(Ok(kr_protocol::envelope::ControlFrame::Notification(notification)))
+                    if notification.event_type.as_str() == "session.output" =>
+                {
+                    if let Ok(event) = notification
+                        .payload
+                        .to_typed::<kr_protocol::recovery::OutputEvent>()
+                    {
+                        self.seen
+                            .push_str(&String::from_utf8_lossy(event.bytes.as_slice()));
+                    }
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => panic!(
+                    "{what}: waited {:?} for {pattern:?} and the connection ended ({error}): {}",
+                    started.elapsed(),
+                    self.text()
+                ),
+                Err(_) => panic!(
+                    "{what}: waited {:?} for {pattern:?}: {}",
+                    started.elapsed(),
+                    self.text()
+                ),
+            }
+        }
+        self.text()
+    }
+}
+
+/// A daemon this test hosts for its own tree, on loopback as [`Host`]'s is, starting each worker
+/// through the environment's scheduled task: the task's starter creates the worker, so a session's
+/// worker is a process of its own outside this test's job.
+struct WorkerHost {
+    tree: teardown::Tree,
+    _task: kr_controller::supervision::windows::testing::TestTask,
+    controller: Option<std::sync::Arc<kr_controller::service::Controller>>,
+    serving: Vec<tokio::task::JoinHandle<kr_controller::Result<()>>>,
+}
+
+impl WorkerHost {
+    async fn start() -> Self {
+        use kr_controller::service::{Controller, ControllerSetup};
+        use kr_controller::supervision::windows::testing::{TestTask, built_binary};
+
+        let tree = teardown::Tree::create();
+        let environment = tree.environment();
+        let mut document = ConfigurationDocument::empty();
+        document.revision = 1;
+        document.network.enabled = Nullable::some(true);
+        document.network.bind_address = Nullable::some("127.0.0.1:0".to_owned());
+        let path = kr_worker::config::document_path(&environment);
+        std::fs::create_dir_all(path.parent().expect("the document has a directory"))
+            .expect("the state directory");
+        kr_ipc::paths::write_owner_only_file(
+            &path,
+            kr_protocol::hostinfo::configuration::contents(&document).as_bytes(),
+        )
+        .expect("the configuration document");
+        let starter = built_binary("kr-controller").unwrap_or_else(|missing| panic!("{missing}"));
+        let task = TestTask::register(&environment, &starter)
+            .unwrap_or_else(|failure| panic!("the environment's task: {failure}"));
+        let worker = tree.root().join("kr-worker.exe");
+        kr_ipc::testing::place_and_start_once(
+            &built_binary("kr-worker").unwrap_or_else(|missing| panic!("{missing}")),
+            &worker,
+            &["--version"],
+        );
+        let environment_id = environment.environment_id();
+        let secrets = environment.secrets_dir();
+        let controller = Controller::start(ControllerSetup {
+            paths: environment.clone(),
+            environment_id,
+            identity: Box::new(move || {
+                let store = kr_crypto::store::open_store_in(&secrets).expect("a secret store");
+                Ok(kr_ipc::verify::ControllerIdentity::open(
+                    store.store.as_ref(),
+                    environment_id,
+                    false,
+                )
+                .expect("an identity"))
+            }),
+            secret_store: kr_crypto::store::StoreSelection::File,
+            boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
+            supervisor: tree.supervisor(Box::new(task.supervisor(&environment))),
+            worker_program: worker,
+            build_id: build(),
+            release: "0".to_owned(),
+            shell_packages: None,
+            terminal: Box::new(kr_controller::supervision::NoTerminal),
+        })
+        .await
+        .expect("the daemon starts");
+        let rendezvous = kr_ipc::endpoint::Listener::bind(
+            &environment.rendezvous_endpoint().expect("an endpoint"),
+        )
+        .expect("binds the rendezvous");
+        let clients = kr_ipc::endpoint::Listener::bind(
+            &environment.controller_endpoint().expect("an endpoint"),
+        )
+        .expect("binds the client endpoint");
+        let serving = vec![
+            tokio::spawn(std::sync::Arc::clone(&controller).serve_rendezvous(rendezvous)),
+            tokio::spawn(std::sync::Arc::clone(&controller).serve_clients(clients)),
+        ];
+        Self {
+            tree,
+            _task: task,
+            controller: Some(controller),
+            serving,
+        }
+    }
+
+    /// Creates a session whose root shell is PowerShell 7, through this host's daemon.
+    async fn session(&self) -> kr_protocol::ids::SessionId {
+        let runtime_root = self.tree.paths().runtime_root().to_path_buf();
+        let state_root = self.tree.paths().state_root().to_path_buf();
+        let cwd = self.tree.root().display().to_string();
+        let output = tokio::task::spawn_blocking(move || {
+            std::process::Command::new(kr())
+                .args([
+                    "--json",
+                    "new",
+                    "--invisible",
+                    "--headless",
+                    "--cwd",
+                    &cwd,
+                    "--shell",
+                    &kr_worker::testing::powershell(),
+                ])
+                .env("KR_RUNTIME_DIR", runtime_root)
+                .env("KR_STATE_DIR", state_root)
+                .stdin(std::process::Stdio::null())
+                .output()
+                .expect("kr new runs")
+        })
+        .await
+        .expect("kr new is waited for");
+        let created: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("kr new's document");
+        assert!(output.status.success(), "kr new: {created}");
+        created["session_id"]
+            .as_str()
+            .expect("a session identifier")
+            .parse()
+            .expect("parses")
+    }
+}
+
+impl Drop for WorkerHost {
+    fn drop(&mut self) {
+        for task in &self.serving {
+            task.abort();
+        }
+        drop(self.controller.take());
+    }
+}
+
+/// KR-REQ-10.53: a console inside a real worker's session is not where the first owner is
+/// confirmed, even with `KR_SESSION` and `KR_ATTACHMENT` removed from it. `kr` asks every live
+/// session's worker whether it is one of its own, and the worker, which put the session's shell in
+/// its job before the shell ran, answers that it is. The worker is a process of its own, which the
+/// environment's scheduled task started outside this test's job; the session's root shell is
+/// PowerShell on the worker's pseudo-console, which `kr` runs on. With the variables left in place
+/// the refusal is theirs, which shows they were there to remove.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_first_owner_is_not_confirmed_in_a_real_workers_session_without_its_variables() {
+    let host = WorkerHost::start().await;
+    let session_id = host.session().await;
+    let environment = host.tree.environment();
+    let mut terminal = WorkerTerminal::attach(&environment, session_id).await;
+    terminal.shown("PS ", "the session's shell prompts").await;
+    let kr_path = kr();
+    let roots = format!(
+        "$env:KR_RUNTIME_DIR = '{}'; $env:KR_STATE_DIR = '{}'",
+        host.tree.paths().runtime_root().display(),
+        host.tree.paths().state_root().display()
+    );
+    terminal
+        .type_line(&format!(
+            "{roots}; Remove-Item Env:KR_SESSION, Env:KR_ATTACHMENT -ErrorAction SilentlyContinue; \
+             & '{}' pair invite --owner --direct; 'kr-exit-' + $LASTEXITCODE + '-end'",
+            kr_path.display()
+        ))
+        .await;
+    let seen = terminal
+        .shown("-end", "kr runs in the session with its variables removed")
+        .await;
+    assert!(
+        seen.contains(&format!("this process is inside session {session_id}")),
+        "the session's worker recognised kr as its own: {seen}"
+    );
+    assert!(!seen.contains("Type pair"), "nothing was asked: {seen}");
+    assert!(!seen.contains("kr-exit-0-end"), "and kr refused: {seen}");
+
+    terminal
+        .type_line(&format!(
+            "$env:KR_SESSION = '{session_id}'; & '{}' pair invite --owner --direct; \
+             'kr-control-' + $LASTEXITCODE + '-done'",
+            kr_path.display()
+        ))
+        .await;
+    let seen = terminal
+        .shown("-done", "the control, with the variable in place")
+        .await;
+    assert!(
+        seen.contains("KR_SESSION is set"),
+        "with the variable in place the refusal is its: {seen}"
+    );
+    drop(terminal);
+    let closed = tokio::task::spawn_blocking({
+        let runtime_root = host.tree.paths().runtime_root().to_path_buf();
+        let state_root = host.tree.paths().state_root().to_path_buf();
+        move || {
+            std::process::Command::new(kr())
+                .args(["--json", "close", &session_id.to_string()])
+                .env("KR_RUNTIME_DIR", runtime_root)
+                .env("KR_STATE_DIR", state_root)
+                .output()
+                .expect("kr close runs")
+        }
+    })
+    .await
+    .expect("kr close is waited for");
+    assert!(
+        closed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&closed.stdout)
     );
 }

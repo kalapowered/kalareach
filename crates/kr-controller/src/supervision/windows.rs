@@ -68,6 +68,10 @@ pub fn task_name(environment_id: EnvironmentId) -> String {
 /// What a task's description says before the environment's identity.
 const DESCRIPTION_PREFIX: &str = "KalaReach environment ";
 
+/// The file in an environment's state directory that the daemon a starter starts writes to: the
+/// log every start of the daemon writes to.
+pub const DAEMON_LOG: &str = "controller.log";
+
 /// The task this build registers for one environment.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TaskDefinition {
@@ -1767,6 +1771,7 @@ mod launching {
             directory: Path::new(&launch.working_directory),
             environment: &variables,
             session: launch.session,
+            output: None,
         });
         let (report, exit) = match started {
             Ok(child) => (
@@ -1830,6 +1835,7 @@ mod launching {
             directory: environment.state_dir(),
             environment: &[],
             session,
+            output: None,
         }) {
             Ok(_) => StarterExit::Done,
             Err(_) => StarterExit::Refused,

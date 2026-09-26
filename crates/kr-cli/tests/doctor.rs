@@ -299,7 +299,8 @@ fn an_attach_create_with_no_terminal_to_register_asks_for_no_session() {
 /// where a service definition or a lingering setting would be written: no path is added or removed
 /// and no file's content changes. It runs none of the service-manager, lingering or privilege
 /// tools found through its `PATH` either; each of those is replaced there by one that records
-/// being run.
+/// being run. On Windows, where the Task Scheduler's command is run from the system directory and
+/// never from `PATH`, the system directory it is given holds one that records being run.
 #[test]
 fn creating_with_no_host_says_what_to_set_up_and_installs_nothing() {
     let installation = Installation::create();
@@ -324,6 +325,8 @@ fn creating_with_no_host_says_what_to_set_up_and_installs_nothing() {
         );
     }
     let path = format!("{}:/usr/bin:/bin", tools.display());
+    #[cfg(windows)]
+    let system_root = recording_task_scheduler(installation.tree.root(), &calls);
     // The recording tools record: one run through the same `PATH` is found, and then forgotten.
     #[cfg(unix)]
     {
@@ -340,7 +343,8 @@ fn creating_with_no_host_says_what_to_set_up_and_installs_nothing() {
     }
     let before = every_path_under(installation.tree.root());
 
-    let output = Command::new(kr())
+    let mut command = Command::new(kr());
+    command
         .args(["--json", "new", "--invisible"])
         .env_clear()
         .env("PATH", &path)
@@ -354,9 +358,10 @@ fn creating_with_no_host_says_what_to_set_up_and_installs_nothing() {
             kr_ipc::paths::STATE_DIR_VARIABLE,
             installation.tree.paths().state_root(),
         )
-        .current_dir(support::command_binaries())
-        .output()
-        .expect("the command runs");
+        .current_dir(support::command_binaries());
+    #[cfg(windows)]
+    command.env("SystemRoot", &system_root);
+    let output = command.output().expect("the command runs");
 
     assert_ne!(output.status.code(), Some(0), "nothing was created");
     let report: serde_json::Value =
@@ -378,4 +383,55 @@ fn creating_with_no_host_says_what_to_set_up_and_installs_nothing() {
         "no service definition, no lingering setting and no runtime file was written, removed or \
          changed in the home and host trees this command was given"
     );
+}
+
+/// A system directory of this test's own under `root`, whose Task Scheduler command records each
+/// run in `calls` and does nothing else, and the root it is under: what `SystemRoot` names for a
+/// command that must not touch the Task Scheduler. The recorder is compiled here with the .NET
+/// Framework's own C# compiler, which every supported Windows has, and it is shown to record once
+/// before the check, which then forgets that run.
+#[cfg(windows)]
+fn recording_task_scheduler(root: &std::path::Path, calls: &std::path::Path) -> std::path::PathBuf {
+    let system_root = root.join("system-root");
+    let system32 = system_root.join("System32");
+    std::fs::create_dir_all(&system32).expect("a system directory of this test's own");
+    let source = root.join("recorder.cs");
+    std::fs::write(
+        &source,
+        format!(
+            "class Recorder {{ static int Main(string[] words) {{ \
+             System.IO.File.AppendAllText(@\"{}\", \"schtasks \" + string.Join(\" \", words) + \"\\n\"); \
+             return 1; }} }}",
+            calls.display()
+        ),
+    )
+    .expect("the recorder's source");
+    let compiler =
+        std::path::PathBuf::from(std::env::var_os("WINDIR").expect("the Windows directory"))
+            .join("Microsoft.NET")
+            .join("Framework64")
+            .join("v4.0.30319")
+            .join("csc.exe");
+    let recorder = system32.join("schtasks.exe");
+    let compiled = Command::new(&compiler)
+        .arg("/nologo")
+        .arg(format!("/out:{}", recorder.display()))
+        .arg(&source)
+        .output()
+        .unwrap_or_else(|error| panic!("the C# compiler at {} runs: {error}", compiler.display()));
+    assert!(
+        compiled.status.success(),
+        "the recorder is compiled: {}",
+        String::from_utf8_lossy(&compiled.stdout)
+    );
+    let _ = Command::new(&recorder)
+        .args(["/Query", "/FO", "CSV"])
+        .status();
+    assert_eq!(
+        std::fs::read_to_string(calls).unwrap_or_default(),
+        "schtasks /Query /FO CSV\n",
+        "the recorder records"
+    );
+    std::fs::remove_file(calls).expect("forgets the check");
+    system_root
 }
