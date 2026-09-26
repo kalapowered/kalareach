@@ -1643,14 +1643,15 @@ mod windows_boot {
     /// hibernation, or a hypervisor setting the clock after pausing the machine, leaves both as
     /// they were.
     ///
-    /// A restart gives another value. The new kernel creates a new System process and records its
-    /// creation as the clock it starts from plus the time it took to start, to the hundred
-    /// nanoseconds, so unless the clock went back across the restart by at least the earlier
-    /// boot's uptime, that time alone is later. It normally advances the counter as well. The pair
-    /// repeats only if both parts do: a real-time clock that reads the same instant at both starts,
-    /// as one a dead battery resets can; the same startup time to the hundred nanoseconds; and a
-    /// counter that did not advance because a start went unrecorded. A repeat would take the new
-    /// boot for the old one, and apply the old boot's continuous deadlines to the new boot's clock.
+    /// A restart normally gives another value; the pair repeats exactly when both of its records
+    /// repeat. The new kernel records its System process's creation as the clock it starts from
+    /// plus the time it took to start, to the hundred nanoseconds. Unless the clock went back
+    /// between the two starts, that time is later than the earlier boot's. It repeats only if the
+    /// later start's clock read earlier by exactly as much as that start took longer, as it can
+    /// when a dead battery resets the real-time clock to one instant and two starts take one time.
+    /// The counter usually advances at a restart, but nothing guarantees that it does. A repeat
+    /// would take the new boot for the old one, and apply the old boot's continuous deadlines to
+    /// the new boot's clock.
     pub(super) fn value(boot_count: u32, system_created: u64) -> [u8; 12] {
         let mut value = [0_u8; 12];
         value[..4].copy_from_slice(&boot_count.to_be_bytes());

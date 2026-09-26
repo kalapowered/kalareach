@@ -579,12 +579,14 @@ with every process (`KUSER_SHARED_DATA.BootId`), and the time it recorded when i
 System process, process 4, which it keeps for as long as it runs. Neither record changes while the
 kernel runs. A clock set, a sleep, a hibernation, or a hypervisor setting the clock after pausing
 the machine leaves both as they were, so every read in one boot gives the same value. A restart
-creates a new System process, recorded at the clock the kernel starts from plus the time the kernel
-took to start, to the hundred nanoseconds, and it usually advances the counter too. The pair repeats
-only when both records repeat, which takes a real-time clock that reads the same instant at two
-starts (a dead battery can reset one), the same startup time to the hundred nanoseconds, and a
-counter that did not advance because a start went unrecorded. A repeat would take the new boot for
-the old one and measure the old boot's continuous deadlines on the new boot's clock.
+normally gives the pair another value, and the pair repeats exactly when both records repeat. The
+new kernel records its System process's creation as the clock it starts from plus the time it took
+to start, to the hundred nanoseconds. Unless the clock went back between two starts, the later one
+records a later time. The time repeats only if the later start's clock read earlier by exactly as
+much as that start took longer, as it can when a dead battery resets the real-time clock to one
+instant and two starts take the same time. The counter usually advances at a restart, but nothing
+guarantees that it does. A repeat would take the new boot for the old one and measure the old
+boot's continuous deadlines on the new boot's clock.
 
 A build before this one identified a Windows boot by its boot time in whole seconds. Its boot
 record, its workers' descriptors, and the deadlines and checkpoints it bound to the current boot
