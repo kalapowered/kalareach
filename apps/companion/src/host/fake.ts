@@ -58,6 +58,8 @@ import type {
   SetupIdentity,
   TerminalGrid,
   TerminalLine,
+  TerminalMove,
+  TerminalRoom,
   TerminalScreen,
   TerminalView,
   TerminalViewState,
@@ -305,6 +307,11 @@ export interface FakeHostControls {
   /** Holds every raw terminal view opened from now on: nothing is published until the test says. */
   holdTerminalViews(): void
   /**
+   * Holds the moves of every raw terminal view opened from now on: each is recorded and nothing is
+   * published for it until the test says, as native code waits for the screen the host names.
+   */
+  holdTerminalMoves(): void
+  /**
    * Holds the answer to every raw terminal view opened from now on until the returned function is
    * called, so the page holds no handle for a view that is still opening.
    */
@@ -325,15 +332,18 @@ export interface FakeTerminalView {
   readonly closed: boolean
   /** The summary it attached with. */
   readonly attachment: AttachmentSummary
+  /** Every move the page made, in the order it made them. */
+  readonly moves: readonly TerminalMove[]
   /** Publishes that it attached, with no screen yet. */
   attach(): void
   /**
-   * Publishes the session's screen at the view's newest grid, with any of its fields replaced by
-   * those `screen` gives.
+   * Publishes the session's screen at the view's newest grid and where its window now is, with any
+   * of its fields replaced by those `screen` gives, as settling the page's moves up to `settled`
+   * (the newest move the view has applied, unless the test says otherwise).
    */
-  show(screen?: Partial<TerminalScreen>): void
+  show(screen?: Partial<TerminalScreen>, settled?: number): void
   /** Publishes that it waits for a screen, as after the host's reset. */
-  wait(): void
+  wait(settled?: number): void
   /** Publishes that it ended, for `reason`. */
   end(reason: string): void
   /** Publishes `state` as it is, a malformed one included. */
@@ -429,6 +439,7 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
   /** The raw terminal views the page has opened, oldest first. */
   const terminalViews: FakeTerminalView[] = []
   let holdingTerminalViews = false
+  let holdingTerminalMoves = false
   let terminalOpensAnswer: Promise<void> = Promise.resolve()
   let terminalPresentation: {
     readonly presentation: TerminalPresentationMode | null
@@ -804,7 +815,7 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
     },
 
     openTerminalView: (sessionId, grid, listener) => {
-      const view = fakeTerminalView(sessionId, grid, listener, terminalPresentation)
+      const view = fakeTerminalView(sessionId, grid, listener, terminalPresentation, holdingTerminalMoves)
       terminalViews.push(view)
       if (!connected) {
         // Native code publishes the failure on the view's channel; the open itself answers.
@@ -1294,6 +1305,9 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
     },
     holdTerminalViews() {
       holdingTerminalViews = true
+    },
+    holdTerminalMoves() {
+      holdingTerminalMoves = true
     },
     holdTerminalOpens() {
       let answer = () => {}
@@ -1927,11 +1941,16 @@ function fakeTerminalView(
   presented: {
     readonly presentation: TerminalPresentationMode | null
     readonly reason: PresentationReason | undefined
-  }
+  },
+  holdingMoves = false
 ): HeldTerminalView {
   terminalViewCount += 1
   const grids: TerminalGrid[] = [grid]
+  const moves: TerminalMove[] = []
   let closed = false
+  // Where the window is, and the newest move that put it there.
+  let place: TerminalPlace = HOME
+  let applied = 0
   const attachment: AttachmentSummary = {
     attached_at_ms: String(FAKE_NOW_MS),
     attachment_id: `a77ac4ed-0000-4000-8000-${String(terminalViewCount).padStart(12, '0')}`,
@@ -1957,18 +1976,22 @@ function fakeTerminalView(
       return closed
     },
     attachment,
-    attach() {
-      publish({ state: 'waiting', attachment })
+    get moves() {
+      return moves
     },
-    show(screen) {
+    attach() {
+      publish({ state: 'waiting', attachment, settled: applied })
+    },
+    show(screen, settled) {
       publish({
         state: 'showing',
         attachment,
-        screen: { ...terminalScreen(sessionId, grids.at(-1) ?? grid), ...screen }
+        screen: { ...terminalScreen(sessionId, grids.at(-1) ?? grid, place), ...screen },
+        settled: settled ?? applied
       })
     },
-    wait() {
-      publish({ state: 'waiting', attachment })
+    wait(settled) {
+      publish({ state: 'waiting', attachment, settled: settled ?? applied })
     },
     end(reason) {
       publish({ state: 'ended', reason })
@@ -1980,6 +2003,24 @@ function fakeTerminalView(
         grids.push(next)
         return Promise.resolve()
       },
+      // Native code applies a move, has the host draw the window there, and says the move is
+      // settled with that screen. A view whose moves are held records them and waits for the test.
+      move: (next) => {
+        moves.push(next)
+        if (!holdingMoves && !closed) {
+          place = moved(sessionId, grids.at(-1) ?? grid, place, next)
+          applied = next.number
+          setTimeout(() => {
+            publish({
+              state: 'showing',
+              attachment,
+              screen: terminalScreen(sessionId, grids.at(-1) ?? grid, place),
+              settled: applied
+            })
+          }, 0)
+        }
+        return Promise.resolve()
+      },
       close: () => {
         closed = true
         return Promise.resolve()
@@ -1988,21 +2029,32 @@ function fakeTerminalView(
   }
 }
 
-/**
- * A session's screen as native code publishes it for a view of `grid`: the part of the live screen
- * the grid holds, from its top left, as lines of pieces.
- *
- * Each session has a screen of its own, so a view that shows one session's screen under another's
- * name is caught by what it draws. The main session's has a run native code could not place: a
- * joined emoji the host measures at two cells, which the pinned width model does not, left blank
- * and counted.
- */
-export function terminalScreen(sessionId: string, grid: TerminalGrid): TerminalScreen {
-  const main = sessionId === SESSION_MAIN
-  const columns = main ? 80 : 100
-  const rows = main ? 8 : 4
-  const texts = main
-    ? [
+/** Where a view's window starts: its first column, and its line of the live screen or its rows above. */
+export interface TerminalPlace {
+  readonly column: number
+  readonly line: number
+  readonly above: number
+}
+
+/** The live screen's first line and column, where a window starts until it is moved. */
+const HOME: TerminalPlace = { column: 0, line: 0, above: 0 }
+
+/** One session's screen: its size, the history it keeps above the live screen, and the live screen. */
+interface FakeScreen {
+  readonly columns: number
+  readonly rows: number
+  /** Oldest first. */
+  readonly history: readonly string[]
+  readonly live: readonly string[]
+}
+
+function fakeScreenOf(sessionId: string): FakeScreen {
+  if (sessionId === SESSION_MAIN) {
+    return {
+      columns: 80,
+      rows: 8,
+      history: Array.from({ length: 12 }, (_, index) => `$ echo earlier ${index + 1}`),
+      live: [
         '$ cargo test -p kr-client',
         '   Compiling kr-client v0.1.0',
         '    Finished test profile in 12.4s',
@@ -2012,14 +2064,81 @@ export function terminalScreen(sessionId: string, grid: TerminalGrid): TerminalS
         '',
         ''
       ]
-    : ['$ pnpm -r build', 'apps/companion build: done', '$ ', '']
-  const window = { columns: Math.min(grid.columns, columns), rows: Math.min(grid.rows, rows) }
-  const lines: TerminalLine[] = texts.slice(0, window.rows).map((text, index) => {
-    const shown = text.slice(0, window.columns)
+    }
+  }
+  return {
+    columns: 100,
+    rows: 4,
+    history: [],
+    live: ['$ pnpm -r build', 'apps/companion build: done', '$ ', '']
+  }
+}
+
+/** The room a window of `grid` at `place` has on `session`'s screen. */
+function roomOf(session: FakeScreen, grid: TerminalGrid, place: TerminalPlace): TerminalRoom {
+  const rows = Math.min(grid.rows, session.rows)
+  const columns = Math.min(grid.columns, session.columns)
+  const top = place.above > 0 ? -place.above : place.line
+  return {
+    up: session.history.length + top,
+    down: session.rows - rows - top,
+    left: place.column,
+    right: session.columns - columns - place.column
+  }
+}
+
+/** Where `move` takes a window of `grid` at `place`, held to its room, as native code moves it. */
+function moved(sessionId: string, grid: TerminalGrid, place: TerminalPlace, move: TerminalMove): TerminalPlace {
+  const top = place.above > 0 ? -place.above : place.line
+  if ('live' in move) return top < 0 ? { column: place.column, line: 0, above: 0 } : place
+  const room = roomOf(fakeScreenOf(sessionId), grid, place)
+  const down = Math.min(room.down, Math.max(-room.up, move.down))
+  const across = Math.min(room.right, Math.max(-room.left, move.across))
+  const next = top + down
+  return {
+    column: place.column + across,
+    line: next < 0 ? 0 : next,
+    above: next < 0 ? -next : 0
+  }
+}
+
+/**
+ * A session's screen as native code publishes it for a view of `grid` whose window is at `place`:
+ * the part of the session the window holds, as lines of pieces, with where the window starts and
+ * how far it can still move.
+ *
+ * Each session has a screen of its own, so a view that shows one session's screen under another's
+ * name is caught by what it draws. The main session keeps some history above its live screen, and
+ * its live screen has a run native code could not place: a joined emoji the host measures at two
+ * cells, which the pinned width model does not, left blank and counted.
+ */
+export function terminalScreen(
+  sessionId: string,
+  grid: TerminalGrid,
+  place: TerminalPlace = HOME
+): TerminalScreen {
+  const main = sessionId === SESSION_MAIN
+  const session = fakeScreenOf(sessionId)
+  const { columns, rows } = session
+  const top = place.above > 0 ? -place.above : place.line
+  const window = {
+    columns: Math.min(grid.columns, columns),
+    rows: Math.min(grid.rows, rows),
+    column: place.column,
+    line: place.line,
+    above: place.above
+  }
+  const texts = Array.from({ length: window.rows }, (_, offset) => {
+    const index = top + offset
+    return index < 0 ? (session.history[session.history.length + index] ?? '') : (session.live[index] ?? '')
+  })
+  const lines: TerminalLine[] = texts.map((text, offset) => {
+    const index = top + offset
+    const shown = text.slice(place.column, place.column + window.columns)
     const pieces =
       shown.length === 0 ? [] : [{ column: 0, cells: shown.length, text: shown, rendition: PLAIN, hyperlink: null }]
     // Where the emoji was: blank cells of its run, at the column it started at.
-    if (main && index === 3 && window.columns > 4) {
+    if (main && index === 3 && place.column === 0 && window.columns > 4) {
       pieces.splice(0, pieces.length, {
         column: 0,
         cells: 2,
@@ -2042,14 +2161,17 @@ export function terminalScreen(sessionId: string, grid: TerminalGrid): TerminalS
     }
     return { row: String((main ? 101 : 201) + index), soft_wrapped: false, truncated: false, pieces }
   })
-  const cursorLine = main ? 5 : 2
+  const cursorLine = (main ? 5 : 2) - top
+  const cursorColumn = 2 - place.column
   return {
     dimensions: { columns: String(columns), rows: String(rows) },
     window,
+    room: roomOf(session, grid, place),
     lines,
-    cursor: cursorLine < window.rows && 2 < window.columns
-      ? { column: 2, line: cursorLine, visible: true, style: 1 }
-      : null,
+    cursor:
+      cursorLine >= 0 && cursorLine < window.rows && cursorColumn >= 0 && cursorColumn < window.columns
+        ? { column: cursorColumn, line: cursorLine, visible: true, style: 1 }
+        : null,
     palette: {
       source: 'client_preference',
       foreground: { red: 0xdc, green: 0xdc, blue: 0xda },
@@ -2062,7 +2184,7 @@ export function terminalScreen(sessionId: string, grid: TerminalGrid): TerminalS
       overrides: [{ index: 1, colour: { red: 0xa2, green: 0x35, blue: 0x2e } }]
     },
     degraded: false,
-    replaced: main && window.rows > 3 ? 1 : 0
+    replaced: main && place.column === 0 && top <= 3 && top + window.rows > 3 ? 1 : 0
   }
 }
 

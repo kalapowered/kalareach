@@ -9,8 +9,13 @@
  *
  * Two modes, and the wheel belongs to whichever one is active. In control mode the application
  * inside the terminal gets the wheel, unchanged. In view mode the person is reading the screen: the
- * view takes the wheel and zooms with it, and the program gets nothing. The window stays on the
- * live screen, so nothing pans.
+ * wheel and a drag move the window across the session, up into its history and down its live
+ * screen, a zoom gesture makes the text larger or smaller, and the program gets nothing. A drag in
+ * view mode moves the window, so text is selected in control mode. Switching to control mode brings
+ * a window in the history back to the live screen.
+ *
+ * The frame is drawn where the moves the page made and native code has not yet settled will put
+ * the window (`pan.ts`), and a drag follows the pointer to the pixel; nothing animates.
  *
  * The view holds no geometry claim. Leaving it for the conversation closes it, which releases what
  * it held and nothing of anyone else's.
@@ -45,8 +50,8 @@ import {
 } from './frame'
 import {
   ATTACHING,
-  clipping,
   describeProvenance,
+  placeOf,
   presentationOf,
   routeWheel,
   WAITING,
@@ -56,6 +61,17 @@ import {
   ZOOM_STEPS,
   type ViewMode
 } from './modes'
+import {
+  beginDrag,
+  dragTo,
+  releaseDrag,
+  WHEEL_AT_REST,
+  wheelTurn,
+  type Cells,
+  type Drag,
+  type Point,
+  type WheelRest
+} from './pan'
 import { FALLBACK_GRID, useTerminalView } from './view'
 
 const FONT_FAMILY = 'ui-monospace, SFMono-Regular, Consolas, monospace'
@@ -88,6 +104,22 @@ function cellOf(probe: HTMLSpanElement | null): Cell | null {
 
 /** The cell a grid is laid out with before its first measure, which a page with no layout keeps. */
 const UNMEASURED_CELL: Cell = { width: 8, height: 16 }
+
+/** The frame where it rests. */
+const AT_REST: Point = { x: 0, y: 0 }
+
+/** Whether a movement moves anything. */
+function moves(cells: Cells): boolean {
+  return cells.across !== 0 || cells.down !== 0
+}
+
+/** One drag of the window in progress: its session, its pointer, the drag, and its cell. */
+interface Dragging {
+  readonly sessionId: string
+  readonly pointer: number
+  readonly drag: Drag
+  readonly cell: Cell
+}
 
 /** How every piece's box is drawn: at its cells, its text laid out on its own and cut at its edges. */
 const PIECE: CSSProperties = {
@@ -123,7 +155,16 @@ function cursorStyle(cursor: PlacedCursor, cell: Cell, palette: PaletteState): C
  * The screen as the view draws it: each piece a box of its own at its cells, and the cursor. A copy
  * of a selection gives the pieces it touches as lines of text laid out by their cells.
  */
-function Grid({ screen, cell }: { readonly screen: TerminalScreen; readonly cell: Cell }): ReactNode {
+function Grid({
+  screen,
+  cell,
+  shift
+}: {
+  readonly screen: TerminalScreen
+  readonly cell: Cell
+  /** How far the frame is drawn from its place, in pixels. */
+  readonly shift: Point
+}): ReactNode {
   const palette = screen.palette
   const cursor = placedCursor(screen)
   const columns = count(screen.window.columns)
@@ -153,7 +194,8 @@ function Grid({ screen, cell }: { readonly screen: TerminalScreen; readonly cell
         width: columns * cell.width,
         height: rows * cell.height,
         lineHeight: `${cell.height}px`,
-        color: foregroundOf(palette)
+        color: foregroundOf(palette),
+        transform: `translate(${shift.x}px, ${shift.y}px)`
       }}
     >
       {pieces.map((piece) => (
@@ -233,7 +275,48 @@ export function RawTerminal({
     return columns > 0 && rows > 0 ? { columns, rows } : FALLBACK_GRID
   }, [cell])
 
-  const { state, frame, slow, resize, again } = useTerminalView(port, sessionId, measure)
+  const { state, frame, slow, resize, again, shift, moving, movingSlow, roomNow, pan, live } =
+    useTerminalView(port, sessionId, measure)
+  const drawnCell = cell ?? UNMEASURED_CELL
+
+  // The drag in progress, and the part of it not sent, as drawn. A wheel's part short of a cell is
+  // carried to its next turn.
+  const dragging = useRef<Dragging | null>(null)
+  const [dragged, setDragged] = useState<{ readonly sessionId: string; readonly at: Point } | null>(null)
+  const wheelRest = useRef<WheelRest>(WHEEL_AT_REST)
+  // The newest way to move the window, for the wheel's own listener and the end of a drag.
+  const panning = useRef({ pan, roomNow, cell: drawnCell })
+  useEffect(() => {
+    panning.current = { pan, roomNow, cell: drawnCell }
+  })
+
+  /**
+   * Ends the drag in progress. A release sends only the cells rounding adds; any other end drops
+   * the part not sent at once. The moves already sent wait for their screen either way.
+   */
+  const endDrag = useCallback((released: Point | null) => {
+    const current = dragging.current
+    dragging.current = null
+    setDragged(null)
+    if (current === null || released === null) return
+    const room = panning.current.roomNow()
+    if (room === null) return
+    const rounding = releaseDrag(current.drag, released, current.cell, room)
+    if (moves(rounding)) panning.current.pan(rounding)
+  }, [])
+
+  // A drag belongs to its session and its mode: an ended view, another session or control mode draws
+  // none, and the next pointer event of the old one is ignored.
+  const ended = state?.state === 'ended'
+  const draggable = mode === 'view' && !ended
+  const drawnDrag = draggable && dragged?.sessionId === sessionId ? dragged.at : AT_REST
+  useEffect(
+    () => () => {
+      dragging.current = null
+      wheelRest.current = WHEEL_AT_REST
+    },
+    [sessionId]
+  )
 
   // The grid goes to the host whenever the surface or the cell size changes: at once, and then as
   // the surface is resized.
@@ -260,7 +343,8 @@ export function RawTerminal({
       const outcome = routeWheel(mode, {
         deltaX: event.deltaX,
         deltaY: event.deltaY,
-        zoomGesture: event.ctrlKey
+        zoomGesture: event.ctrlKey,
+        sideways: event.shiftKey
       })
       if (outcome.kind === 'application') {
         setWheelToApplication((count) => count + 1)
@@ -274,7 +358,27 @@ export function RawTerminal({
       event.preventDefault()
       if (outcome.kind === 'zoom') {
         setZoom((current) => zoomBy(current, outcome.steps))
+        return
       }
+      const { pan: send, roomNow: roomOf, cell: at } = panning.current
+      const room = roomOf()
+      if (room === null) return
+      // A wheel that counts in lines or pages is measured in rows and columns of this grid.
+      const line = event.deltaMode === 1
+      const page = event.deltaMode === 2
+      const rows = Math.max(1, Math.floor(element.clientHeight / at.height))
+      const columns = Math.max(1, Math.floor(element.clientWidth / at.width))
+      const turned = wheelTurn(
+        wheelRest.current,
+        {
+          across: outcome.across * (line ? at.width : page ? at.width * columns : 1),
+          down: outcome.down * (line ? at.height : page ? at.height * rows : 1)
+        },
+        at,
+        room
+      )
+      wheelRest.current = turned.rest
+      if (moves(turned.send)) send(turned.send)
     }
     element.addEventListener('wheel', onWheel, { capture: true, passive: false })
     return () => {
@@ -285,10 +389,18 @@ export function RawTerminal({
   const attachment = state !== null && state.state !== 'ended' ? state.attachment : null
   const presentation = attachment === null ? null : presentationOf(attachment)
   const waiting = state?.state === 'waiting'
-  // What the position slot says: that the view is waiting, once it has waited, or that the window
-  // shows only part of the session.
+  // What the position slot says: that the view is waiting, once it or its moves have waited, or
+  // where the window is.
   const position =
-    waiting && (frame === null || slow) ? WAITING : frame === null ? null : clipping(frame)
+    (waiting && (frame === null || slow)) || movingSlow
+      ? WAITING
+      : frame === null
+        ? null
+        : placeOf(frame)
+  const drawnShift: Point = {
+    x: drawnDrag.x - shift.across * drawnCell.width,
+    y: drawnDrag.y - shift.down * drawnCell.height
+  }
 
   return (
     <section className="raw-terminal" data-testid="raw-terminal" data-mode={mode}>
@@ -302,13 +414,16 @@ export function RawTerminal({
               { value: 'view', label: 'View' }
             ]}
             onChange={(next) => {
+              endDrag(null)
+              // Control mode shows the program's live screen: a window in the history comes back.
+              if (next === 'control') live()
               setMode(next)
             }}
           />
           <span className="small faint">
             {mode === 'control'
               ? 'The program in this terminal gets the wheel and the keys.'
-              : 'Make the text larger or smaller. The program gets nothing.'}
+              : 'Scroll or drag to move around the session. The program gets nothing.'}
           </span>
         </span>
         {frame ? (
@@ -343,7 +458,7 @@ export function RawTerminal({
         ref={surface}
         data-testid="terminal-surface"
         data-wheel-to-application={wheelToApplication}
-        aria-busy={state === null || waiting}
+        aria-busy={state === null || waiting || moving}
         style={{
           position: 'relative',
           overflow: 'hidden',
@@ -352,6 +467,53 @@ export function RawTerminal({
       >
         <div
           ref={host}
+          onPointerDown={(event) => {
+            if (!draggable || event.button !== 0 || event.isPrimary === false) return
+            if (dragging.current?.sessionId === sessionId) return
+            event.preventDefault()
+            event.currentTarget.setPointerCapture(event.pointerId)
+            dragging.current = {
+              sessionId,
+              pointer: event.pointerId,
+              drag: beginDrag({ x: event.clientX, y: event.clientY }),
+              cell: drawnCell
+            }
+          }}
+          onPointerMove={(event) => {
+            const current = dragging.current
+            if (current === null || event.pointerId !== current.pointer) return
+            if (!draggable || current.sessionId !== sessionId) {
+              dragging.current = null
+              return
+            }
+            const at = { x: event.clientX, y: event.clientY }
+            // A zoom step changes the cell: the drag goes on from here, keeping what it sent.
+            if (current.cell.width !== drawnCell.width || current.cell.height !== drawnCell.height) {
+              dragging.current = { ...current, drag: beginDrag(at), cell: drawnCell }
+              setDragged(null)
+              return
+            }
+            const room = roomNow()
+            if (room === null) return
+            const element = event.currentTarget
+            const step = dragTo(current.drag, at, current.cell, room, {
+              width: element.clientWidth || (frame?.window.columns ?? 0) * current.cell.width,
+              height: element.clientHeight || (frame?.window.rows ?? 0) * current.cell.height
+            })
+            if (moves(step.send)) pan(step.send)
+            dragging.current = { ...current, drag: step.drag }
+            setDragged({ sessionId, at: step.offset })
+          }}
+          onPointerUp={(event) => {
+            if (event.pointerId !== dragging.current?.pointer) return
+            endDrag({ x: event.clientX, y: event.clientY })
+          }}
+          onPointerCancel={(event) => {
+            if (event.pointerId === dragging.current?.pointer) endDrag(null)
+          }}
+          onLostPointerCapture={(event) => {
+            if (event.pointerId === dragging.current?.pointer) endDrag(null)
+          }}
           style={{
             position: 'absolute',
             inset: SURFACE_INSET,
@@ -359,7 +521,9 @@ export function RawTerminal({
             fontFamily: FONT_FAMILY,
             fontSize,
             fontKerning: 'none',
-            fontVariantLigatures: 'none'
+            fontVariantLigatures: 'none',
+            // In view mode a drag moves the window: the browser neither selects nor scrolls with it.
+            ...(draggable ? { userSelect: 'none', touchAction: 'none' } : {})
           }}
         >
           <span
@@ -369,7 +533,7 @@ export function RawTerminal({
           >
             {'M'.repeat(PROBE_CELLS)}
           </span>
-          {frame === null ? null : <Grid screen={frame} cell={cell ?? UNMEASURED_CELL} />}
+          {frame === null ? null : <Grid screen={frame} cell={drawnCell} shift={drawnShift} />}
         </div>
       </div>
 

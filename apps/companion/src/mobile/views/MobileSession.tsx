@@ -8,11 +8,13 @@
  *
  * The terminal view is the one with a rule in it. In control mode the program inside the terminal
  * owns the touch, exactly as it owns the wheel on a desktop. Only a pinch zooms, because nothing on
- * the wire carries a pinch, so zooming takes nothing from anyone. The window stays on the live
- * screen, so nothing pans in either mode.
+ * the wire carries a pinch, so zooming takes nothing from anyone. In view mode a one-finger drag
+ * moves the window across the session, up into its history and down its live screen: the screen
+ * follows the finger, and comes to rest on the screen the host draws for the window's new place.
+ * Taking control brings a window in the history back to the live screen.
  */
 
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 
 import { useApp } from '../../app/state'
 import { Badge, Banner, Button, Segmented } from '../../components/ui'
@@ -36,11 +38,11 @@ import {
   failed
 } from '../../model/receipts'
 import { renderMarkdown } from '../../markdown/render'
-import type { TerminalGrid, TerminalScreen } from '../../host/port'
+import type { TerminalGrid, TerminalRoom, TerminalScreen } from '../../host/port'
 import { leftBlankOnPhone, stretchesOf, styleOf } from '../../terminal/cells'
 import {
   ATTACHING,
-  clipping,
+  placeOf,
   presentationOf,
   WAITING,
   warningsOf,
@@ -49,6 +51,14 @@ import {
   zoomBy,
   type ViewMode
 } from '../../terminal/modes'
+import {
+  beginDrag,
+  dragTo,
+  releaseDrag,
+  type Cells,
+  type Drag,
+  type Point
+} from '../../terminal/pan'
 import { FALLBACK_GRID, useTerminalView } from '../../terminal/view'
 import { AccessoryRow } from '../components/keys'
 import { AttachmentPicker } from '../components/picker'
@@ -202,19 +212,30 @@ export function MobileSession({
 
   // The terminal's view is open while the terminal is shown, and closed when the person goes back
   // to the conversation or the session changes.
-  const { state: terminal, frame, slow, resize, again } = useTerminalView(
-    port,
-    sessionId,
-    measure,
-    pane === 'terminal'
-  )
+  const {
+    state: terminal,
+    frame,
+    slow,
+    resize,
+    again,
+    shift,
+    moving,
+    movingSlow,
+    roomNow,
+    pan,
+    live
+  } = useTerminalView(port, sessionId, measure, pane === 'terminal')
   const terminalAttachmentSummary =
     terminal !== null && terminal.state !== 'ended' ? terminal.attachment : null
   const presented =
     terminalAttachmentSummary === null ? null : presentationOf(terminalAttachmentSummary)
   const terminalWaiting = terminal?.state === 'waiting'
   const terminalPosition =
-    terminalWaiting && (frame === null || slow) ? WAITING : frame === null ? null : clipping(frame)
+    (terminalWaiting && (frame === null || slow)) || movingSlow
+      ? WAITING
+      : frame === null
+        ? null
+        : placeOf(frame)
 
   // The grid goes to the host when the terminal is shown, when the zoom changes, and as the pane
   // is resized.
@@ -416,7 +437,11 @@ export function MobileSession({
             ) : null}
             <RawTerminal
               screen={frame}
-              busy={terminal === null || terminalWaiting}
+              busy={terminal === null || terminalWaiting || moving}
+              ended={terminal?.state === 'ended'}
+              shift={shift}
+              roomNow={roomNow}
+              onPan={pan}
               surfaceRef={terminalSurface}
               probeRef={cellProbe}
               mode={mode}
@@ -440,7 +465,9 @@ export function MobileSession({
               <span>{describeMode(mode)}</span>
               <Button
                 onClick={() => {
-                  setMode((current) => (current === 'control' ? 'view' : 'control'))
+                  // Taking control shows the program's live screen: a window in the history comes back.
+                  if (mode === 'view') live()
+                  setMode(mode === 'control' ? 'view' : 'control')
                 }}
               >
                 {mode === 'control' ? 'Look around' : 'Take control'}
@@ -587,10 +614,34 @@ export function MobileSession({
 /** How many cells the probe that measures the grid's cell holds. */
 const PROBE_CELLS = 10
 
-/** The session's screen, as cells drawn as text, zoomed by the pinch. */
+/** One cell of the phone's grid in pixels: a column of the probe, and a line of the grid. */
+function cellOf(probe: HTMLSpanElement | null): { width: number; height: number } | null {
+  const box = probe?.getBoundingClientRect()
+  if (!probe || !box || box.width <= 0) return null
+  const grid = probe.parentElement
+  const style = grid ? getComputedStyle(grid) : null
+  const line = style?.lineHeight ?? ''
+  const size = parseFloat(style?.fontSize ?? '')
+  // A line is as tall as the grid's own line height, which a unitless one gives as a multiple.
+  const pitch = line.endsWith('px')
+    ? parseFloat(line)
+    : Number.isFinite(parseFloat(line)) && Number.isFinite(size)
+      ? parseFloat(line) * size
+      : box.height
+  return { width: box.width / PROBE_CELLS, height: pitch > 0 ? pitch : box.height }
+}
+
+/** The screen where it rests. */
+const AT_REST: Point = { x: 0, y: 0 }
+
+/** The session's screen, as cells drawn as text, zoomed by the pinch and moved by a drag in view mode. */
 function RawTerminal({
   screen,
   busy,
+  ended,
+  shift,
+  roomNow,
+  onPan,
   surfaceRef,
   probeRef,
   mode,
@@ -600,6 +651,11 @@ function RawTerminal({
 }: {
   readonly screen: TerminalScreen | null
   readonly busy: boolean
+  readonly ended: boolean
+  /** Where the screen is drawn from its own place: moved by the moves not yet settled. */
+  readonly shift: Cells
+  readonly roomNow: () => TerminalRoom | null
+  readonly onPan: (cells: Cells) => Cells
   readonly surfaceRef: React.RefObject<HTMLDivElement | null>
   readonly probeRef: React.RefObject<HTMLSpanElement | null>
   readonly mode: ViewMode
@@ -608,6 +664,40 @@ function RawTerminal({
   readonly onApplicationScroll: (lines: number) => void
 }): ReactNode {
   const pointers = useRef(new Map<number, { x: number; y: number }>())
+  // The one-finger drag in progress in view mode, and the part of it not sent, as drawn.
+  const dragging = useRef<{
+    readonly pointer: number
+    readonly drag: Drag
+    readonly cell: { width: number; height: number }
+  } | null>(null)
+  const [dragged, setDragged] = useState<Point | null>(null)
+  // One cell in pixels, measured once laid out at each zoom and screen, for drawing the shift.
+  const [cell, setCell] = useState<{ width: number; height: number } | null>(null)
+  useLayoutEffect(() => {
+    const measured = cellOf(probeRef.current)
+    setCell((current) =>
+      current?.width === measured?.width && current?.height === measured?.height ? current : measured
+    )
+  }, [probeRef, zoom, screen])
+  // Only view mode drags, and only while the view lasts: otherwise no drag is drawn, and the next
+  // event of one in progress ends it.
+  const draggable = mode === 'view' && !ended
+  const drawnDrag = draggable && dragged !== null ? dragged : AT_REST
+
+  /**
+   * Ends the drag in progress. A finger lifted sends only the cells rounding adds; any other end
+   * drops the part not sent at once. The moves already sent wait for their screen either way.
+   */
+  const endDrag = (released: Point | null) => {
+    const current = dragging.current
+    dragging.current = null
+    setDragged(null)
+    if (current === null || released === null) return
+    const room = roomNow()
+    if (room === null) return
+    const rounding = releaseDrag(current.drag, released, current.cell, room)
+    if (rounding.across !== 0 || rounding.down !== 0) onPan(rounding)
+  }
   // Where the gesture began. A drag is the displacement from that origin, not a sum of each move's
   // step: adding steps makes the distance depend on how many events the device sent.
   const start = useRef<{ x: number; y: number; spread: number } | null>(null)
@@ -667,10 +757,47 @@ function RawTerminal({
         event.currentTarget.setPointerCapture(event.pointerId)
         pointers.current.set(event.pointerId, { x: event.clientX, y: event.clientY })
         rebase()
+        // One finger in view mode drags the window; a second one ends the drag and pinches.
+        if (pointers.current.size === 1 && draggable) {
+          const cell = cellOf(probeRef.current)
+          if (cell !== null) {
+            dragging.current = {
+              pointer: event.pointerId,
+              drag: beginDrag({ x: event.clientX, y: event.clientY }),
+              cell
+            }
+          }
+        } else if (dragging.current !== null) {
+          endDrag(null)
+        }
       }}
       onPointerMove={(event) => {
         if (!pointers.current.has(event.pointerId)) return
         pointers.current.set(event.pointerId, { x: event.clientX, y: event.clientY })
+        const current = dragging.current
+        if (current === null || current.pointer !== event.pointerId) return
+        if (!draggable) {
+          dragging.current = null
+          return
+        }
+        const at = { x: event.clientX, y: event.clientY }
+        // A pinch's zoom changes the cell: the drag goes on from here, keeping what it sent.
+        const now = cellOf(probeRef.current)
+        if (now !== null && (now.width !== current.cell.width || now.height !== current.cell.height)) {
+          dragging.current = { pointer: current.pointer, drag: beginDrag(at), cell: now }
+          setDragged(null)
+          return
+        }
+        const room = roomNow()
+        if (room === null) return
+        const element = event.currentTarget
+        const step = dragTo(current.drag, at, current.cell, room, {
+          width: element.clientWidth,
+          height: element.clientHeight
+        })
+        if (step.send.across !== 0 || step.send.down !== 0) onPan(step.send)
+        dragging.current = { ...current, drag: step.drag }
+        setDragged(step.offset)
       }}
       onPointerUp={(event) => {
         const outcome = routeGesture(mode, gestureFrom(event))
@@ -679,6 +806,10 @@ function RawTerminal({
         // again from the fingers still down. Keeping the old one makes the next gesture jump by
         // whatever the lifted finger had travelled.
         rebase()
+        if (dragging.current?.pointer === event.pointerId) {
+          endDrag({ x: event.clientX, y: event.clientY })
+          return
+        }
         if (outcome.kind === 'zoom') onZoom(outcome.steps)
         // In control mode the movement was the program's, so it is handed over rather than used.
         if (outcome.kind === 'application' && outcome.lines !== 0) onApplicationScroll(outcome.lines)
@@ -686,13 +817,22 @@ function RawTerminal({
       onPointerCancel={(event) => {
         pointers.current.delete(event.pointerId)
         rebase()
+        if (dragging.current?.pointer === event.pointerId) endDrag(null)
       }}
       onLostPointerCapture={(event) => {
         pointers.current.delete(event.pointerId)
         rebase()
+        if (dragging.current?.pointer === event.pointerId) endDrag(null)
       }}
     >
-      <pre className="m-terminal-grid">
+      <pre
+        className="m-terminal-grid"
+        style={{
+          transform: `translate(${drawnDrag.x - shift.across * (cell?.width ?? 0)}px, ${
+            drawnDrag.y - shift.down * (cell?.height ?? 0)
+          }px)`
+        }}
+      >
         <span
           ref={probeRef}
           aria-hidden="true"

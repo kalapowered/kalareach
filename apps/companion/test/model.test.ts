@@ -47,7 +47,7 @@ import { emptyControlState, evaluate, isRendered, visibilityOf } from '../src/mo
 import { leftBlankOnPhone, stretchesOf, styleOf } from '../src/terminal/cells'
 import { copiedText, drawableText, placedCursor, placedPieces, REPLACEMENT } from '../src/terminal/frame'
 import {
-  clipping,
+  placeOf,
   describeProvenance,
   PRESENTATION_REASONS,
   presentationOf,
@@ -429,7 +429,7 @@ describe('the raw terminal', () => {
     })
     const screen = {
       ...whole,
-      window: { columns: 8, rows: 2 },
+      window: { ...whole.window, columns: 8, rows: 2 },
       lines: [
         {
           row: '1',
@@ -492,11 +492,27 @@ describe('the raw terminal', () => {
     expect(describeProvenance('explicit_change')).toBe('changed after the session began')
   })
 
-  it('says a window smaller than the session shows its top left, and says nothing otherwise', () => {
+  it('says where a window smaller than the session is, and says nothing of one that holds it', () => {
     const main = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
-    expect(clipping(terminalScreen(main, { columns: 120, rows: 40 }))).toBeNull()
-    expect(clipping(terminalScreen(main, { columns: 30, rows: 8 }))).toBe(
-      "Showing the top-left 30×8 of the session's 80×8."
+    expect(placeOf(terminalScreen(main, { columns: 120, rows: 40 }))).toBeNull()
+    expect(placeOf(terminalScreen(main, { columns: 30, rows: 8 }))).toBe(
+      "Showing columns 1–30 and lines 1–8 of the session's 80×8."
+    )
+    expect(placeOf(terminalScreen(main, { columns: 30, rows: 4 }, { column: 20, line: 3, above: 0 }))).toBe(
+      "Showing columns 21–50 and lines 4–7 of the session's 80×8."
+    )
+  })
+
+  it('says how far above the live screen a window in the history is, and when it is the oldest kept', () => {
+    const main = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
+    expect(placeOf(terminalScreen(main, { columns: 80, rows: 4 }, { column: 0, line: 0, above: 5 }))).toBe(
+      'Showing the history, 5 rows above the live screen.'
+    )
+    expect(placeOf(terminalScreen(main, { columns: 80, rows: 4 }, { column: 0, line: 0, above: 1 }))).toBe(
+      'Showing the history, 1 row above the live screen.'
+    )
+    expect(placeOf(terminalScreen(main, { columns: 80, rows: 4 }, { column: 0, line: 0, above: 12 }))).toBe(
+      'Showing the history, 12 rows above the live screen, the oldest the session keeps.'
     )
   })
 
@@ -608,21 +624,28 @@ describe('the raw terminal', () => {
   })
 
   it('gives the wheel to the application in control mode, whatever is held', () => {
-    expect(routeWheel('control', { deltaX: 0, deltaY: 48, zoomGesture: false })).toEqual({
+    expect(routeWheel('control', { deltaX: 0, deltaY: 48, zoomGesture: false, sideways: false })).toEqual({
       kind: 'application',
       lines: 3
     })
-    expect(routeWheel('control', { deltaX: 0, deltaY: 48, zoomGesture: true })).toEqual({
+    expect(routeWheel('control', { deltaX: 0, deltaY: 48, zoomGesture: true, sideways: true })).toEqual({
       kind: 'application',
       lines: 3
     })
   })
 
-  it('zooms in view mode, and pans nothing: the window stays on the live screen', () => {
-    expect(routeWheel('view', { deltaX: 16, deltaY: 32, zoomGesture: false })).toEqual({
-      kind: 'none'
+  it('moves the window with the wheel in view mode, sideways with Shift, and zooms with a zoom gesture', () => {
+    expect(routeWheel('view', { deltaX: 16, deltaY: 32, zoomGesture: false, sideways: false })).toEqual({
+      kind: 'pan',
+      across: 16,
+      down: 32
     })
-    expect(routeWheel('view', { deltaX: 0, deltaY: -16, zoomGesture: true })).toEqual({
+    expect(routeWheel('view', { deltaX: 0, deltaY: 40, zoomGesture: false, sideways: true })).toEqual({
+      kind: 'pan',
+      across: 40,
+      down: 0
+    })
+    expect(routeWheel('view', { deltaX: 0, deltaY: -16, zoomGesture: true, sideways: false })).toEqual({
       kind: 'zoom',
       steps: 1
     })

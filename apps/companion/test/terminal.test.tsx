@@ -128,7 +128,7 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
     })
     const full: TerminalScreen = {
       ...terminalScreen(SESSION_MAIN, { columns: 4, rows: 2 }),
-      window: { columns: 4, rows: 2 },
+      window: { columns: 4, rows: 2, column: 0, line: 0, above: 0 },
       lines: [
         { row: '1', soft_wrapped: false, truncated: false, pieces: [piece(0, 'abcd')] },
         { row: '2', soft_wrapped: false, truncated: false, pieces: [piece(0, 'efgh')] }
@@ -152,7 +152,7 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
     const invisible = { ...piece(0, '').rendition, invisible: true }
     const mixed: TerminalScreen = {
       ...terminalScreen(SESSION_MAIN, { columns: 16, rows: 2 }),
-      window: { columns: 16, rows: 2 },
+      window: { columns: 16, rows: 2, column: 0, line: 0, above: 0 },
       lines: [
         {
           row: '1',
@@ -260,7 +260,7 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
     })
     const overlapping: TerminalScreen = {
       ...terminalScreen(SESSION_MAIN, { columns: 8, rows: 1 }),
-      window: { columns: 8, rows: 1 },
+      window: { columns: 8, rows: 1, column: 0, line: 0, above: 0 },
       lines: [
         {
           row: '1',
@@ -327,7 +327,7 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
     expect(screen.getByTestId('terminal-surface')).toHaveAttribute('aria-busy', 'false')
   })
 
-  it('says when the window shows only the top left of the session', async () => {
+  it('says which part of the session the window shows when it holds only part of it', async () => {
     const { port, controls } = fakeHost()
     open(port)
     await screen.findByTestId('palette-provenance')
@@ -335,7 +335,7 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
     act(() => {
       controls.terminalViews[0]?.show(terminalScreen(SESSION_MAIN, { columns: 60, rows: 5 }))
     })
-    expect(position()).toBe("Showing the top-left 60×5 of the session's 80×8.")
+    expect(position()).toBe("Showing columns 1–60 and lines 1–5 of the session's 80×8.")
   })
 
   it('ends with the host words, keeps the last frame, and attaches again when asked', async () => {
@@ -471,6 +471,7 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
       first?.deliverInFlight({
         state: 'showing',
         attachment: first.attachment,
+        settled: 0,
         screen: terminalScreen(SESSION_MAIN, { columns: 80, rows: 24 })
       })
     })
@@ -491,7 +492,7 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
     })
     const hostile: TerminalScreen = {
       ...terminalScreen(SESSION_MAIN, { columns: 40, rows: 1 }),
-      window: { columns: 40, rows: 1 },
+      window: { columns: 40, rows: 1, column: 0, line: 0, above: 0 },
       lines: [
         {
           row: '1',
@@ -509,33 +510,219 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
     expect(drawn()[0]).toBe('a\u{fffd}[6n\u{fffd}]11;?\u{fffd}b')
   })
 
-  it('gives the wheel to the program in control mode, and moves nothing with it in view mode', async () => {
+  it('gives the wheel to the program in control mode, and moves the window with it in view mode', async () => {
     const person = userEvent.setup()
     const { port, controls } = fakeHost()
     const forwarded = vi.spyOn(port, 'terminalInput')
     open(port)
     await screen.findByTestId('palette-provenance')
-    const wheel = (deltaY: number, ctrlKey = false) => {
-      const event = new WheelEvent('wheel', { deltaY, ctrlKey, bubbles: true, cancelable: true })
-      act(() => {
-        screen.getByTestId('terminal-surface').firstElementChild?.dispatchEvent(event)
-      })
-      return event
-    }
 
-    // Control mode: the same call the page has always made for the program's wheel.
-    const given = wheel(48)
+    // Control mode: the same call the page has always made for the program's wheel, and no move.
+    const given = wheel({ deltaY: 48 })
     expect(given.defaultPrevented).toBe(false)
     expect(forwarded).toHaveBeenCalledWith({ session_id: SESSION_MAIN, wheel: { lines: 3 } })
+    expect(controls.terminalViews[0]?.moves).toEqual([])
 
     await person.click(screen.getByRole('tab', { name: 'View' }))
     forwarded.mockClear()
-    const taken = wheel(120)
+    // Three rows of wheel up take the window three rows into the history.
+    const taken = wheel({ deltaY: -48 })
     expect(taken.defaultPrevented).toBe(true)
     expect(forwarded).not.toHaveBeenCalled()
+    expect(controls.terminalViews[0]?.moves).toEqual([{ number: 1, across: 0, down: -3 }])
+    await waitFor(() => {
+      expect(position()).toBe('Showing the history, 3 rows above the live screen.')
+    })
+    expect(drawn()[0]).toBe('$ echo earlier 10')
     expect(controls.terminalViews[0]?.grids).toHaveLength(1)
   })
+
+  it('moves the window only as far as it can go, and a wheel at a limit moves nothing', async () => {
+    const person = userEvent.setup()
+    const { port, controls } = fakeHost()
+    open(port)
+    await screen.findByTestId('palette-provenance')
+    await person.click(screen.getByRole('tab', { name: 'View' }))
+    // The window holds the live screen's last line already, and the session is narrower than it.
+    wheel({ deltaY: 160 })
+    wheel({ deltaX: 80 })
+    await settle()
+    expect(controls.terminalViews[0]?.moves).toEqual([])
+    // Twelve rows of history are kept: twenty asked for, twelve go.
+    wheel({ deltaY: -320 })
+    expect(controls.terminalViews[0]?.moves).toEqual([{ number: 1, across: 0, down: -12 }])
+    await waitFor(() => {
+      expect(position()).toBe(
+        'Showing the history, 12 rows above the live screen, the oldest the session keeps.'
+      )
+    })
+    wheel({ deltaY: -48 })
+    await settle()
+    expect(controls.terminalViews[0]?.moves).toHaveLength(1)
+  })
+
+  it('draws the frame where its unsettled moves put it, busy at once and saying so after a moment', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    try {
+      const person = userEvent.setup({ advanceTimers: vi.advanceTimersByTime })
+      const { port, controls } = fakeHost()
+      controls.holdTerminalMoves()
+      open(port)
+      await screen.findByTestId('palette-provenance')
+      await person.click(screen.getByRole('tab', { name: 'View' }))
+      wheel({ deltaY: -32 })
+      expect(controls.terminalViews[0]?.moves).toEqual([{ number: 1, across: 0, down: -2 }])
+      // The frame moves down two rows at once, over the cells it does not cover.
+      expect(gridShift()).toEqual({ x: 0, y: 32 })
+      expect(screen.getByTestId('terminal-surface')).toHaveAttribute('aria-busy', 'true')
+      expect(position()).not.toBe(WAITING)
+      act(() => {
+        vi.advanceTimersByTime(SLOW_MS)
+      })
+      expect(position()).toBe(WAITING)
+      // A screen that settles nothing, such as a repaint of the old place, leaves the move waiting.
+      act(() => {
+        controls.terminalViews[0]?.show(undefined, 0)
+      })
+      expect(gridShift()).toEqual({ x: 0, y: 32 })
+      expect(screen.getByTestId('terminal-surface')).toHaveAttribute('aria-busy', 'true')
+      // Native code says the move is settled with the screen that holds it: the frame is replaced
+      // in one write and nothing is shifted any more.
+      act(() => {
+        controls.terminalViews[0]?.show(
+          terminalScreen(SESSION_MAIN, { columns: 80, rows: 24 }, { column: 0, line: 0, above: 2 }),
+          1
+        )
+      })
+      expect(gridShift()).toEqual({ x: 0, y: 0 })
+      expect(drawn()[0]).toBe('$ echo earlier 11')
+      expect(screen.getByTestId('terminal-surface')).toHaveAttribute('aria-busy', 'false')
+      expect(position()).toBe('Showing the history, 2 rows above the live screen.')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('follows a drag in view mode to the pixel, and sends a move for each whole row it crosses', async () => {
+    const person = userEvent.setup()
+    const { port, controls } = fakeHost()
+    controls.holdTerminalMoves()
+    open(port)
+    await screen.findByTestId('palette-provenance')
+    await person.click(screen.getByRole('tab', { name: 'View' }))
+    // Down a row and a half: the window goes up one row, and the frame follows the pointer.
+    pointer('pointerdown', 100, 100)
+    pointer('pointermove', 100, 124)
+    expect(controls.terminalViews[0]?.moves).toEqual([{ number: 1, across: 0, down: -1 }])
+    expect(gridShift()).toEqual({ x: 0, y: 24 })
+    // Released there: the half rounds to one more row, and the frame rests on whole rows.
+    pointer('pointerup', 100, 124)
+    expect(controls.terminalViews[0]?.moves).toEqual([
+      { number: 1, across: 0, down: -1 },
+      { number: 2, across: 0, down: -1 }
+    ])
+    expect(gridShift()).toEqual({ x: 0, y: 32 })
+  })
+
+  it('ends a drag any other way by dropping what it had not sent, and a switch to control returns', async () => {
+    const person = userEvent.setup()
+    const { port, controls } = fakeHost()
+    controls.holdTerminalMoves()
+    open(port)
+    await screen.findByTestId('palette-provenance')
+    await person.click(screen.getByRole('tab', { name: 'View' }))
+    for (const end of ['pointercancel', 'lostpointercapture']) {
+      pointer('pointerdown', 100, 100)
+      pointer('pointermove', 100, 108)
+      expect(gridShift()).toEqual({ x: 0, y: 8 })
+      pointer(end, 100, 108)
+      expect(gridShift()).toEqual({ x: 0, y: 0 })
+    }
+    expect(controls.terminalViews[0]?.moves).toEqual([])
+
+    pointer('pointerdown', 100, 100)
+    pointer('pointermove', 100, 124)
+    await person.click(screen.getByRole('tab', { name: 'Control' }))
+    expect(controls.terminalViews[0]?.moves).toEqual([
+      { number: 1, across: 0, down: -1 },
+      { number: 2, live: true }
+    ])
+    // The part of the drag not sent is gone; the row it sent waits for its screen, behind which the
+    // return takes the window back to the live screen.
+    expect(gridShift()).toEqual({ x: 0, y: 0 })
+  })
+
+  it('resists a drag past a limit and sends nothing past it', async () => {
+    const person = userEvent.setup()
+    const { port, controls } = fakeHost()
+    controls.holdTerminalMoves()
+    open(port)
+    await screen.findByTestId('palette-provenance')
+    await person.click(screen.getByRole('tab', { name: 'View' }))
+    // Fifteen rows down with twelve kept: twelve go, and the other three are drawn resisting.
+    pointer('pointerdown', 100, 100)
+    pointer('pointermove', 100, 100 + 15 * 16)
+    expect(controls.terminalViews[0]?.moves).toEqual([{ number: 1, across: 0, down: -12 }])
+    const shifted = gridShift().y
+    expect(shifted).toBeGreaterThan(12 * 16)
+    expect(shifted).toBeLessThan(15 * 16)
+    pointer('pointerup', 100, 100 + 15 * 16)
+    expect(controls.terminalViews[0]?.moves).toHaveLength(1)
+    expect(gridShift()).toEqual({ x: 0, y: 12 * 16 })
+  })
+
+  it('moves nothing with a drag in control mode', async () => {
+    const { port, controls } = fakeHost()
+    open(port)
+    await screen.findByTestId('palette-provenance')
+    pointer('pointerdown', 100, 100)
+    pointer('pointermove', 100, 180)
+    pointer('pointerup', 100, 180)
+    await settle()
+    expect(controls.terminalViews[0]?.moves).toEqual([])
+    expect(gridShift()).toEqual({ x: 0, y: 0 })
+  })
 })
+
+/** Turns the wheel over the terminal. */
+function wheel(init: WheelEventInit): WheelEvent {
+  const event = new WheelEvent('wheel', { bubbles: true, cancelable: true, ...init })
+  act(() => {
+    screen.getByTestId('terminal-surface').firstElementChild?.dispatchEvent(event)
+  })
+  return event
+}
+
+/** Sends the primary pointer's `type` over the terminal at `x`, `y`. */
+function pointer(type: string, x: number, y: number): void {
+  act(() => {
+    screen
+      .getByTestId('terminal-surface')
+      .firstElementChild?.dispatchEvent(
+        new PointerEvent(type, {
+          bubbles: true,
+          cancelable: true,
+          pointerId: 1,
+          pointerType: 'mouse',
+          isPrimary: true,
+          button: 0,
+          buttons: type === 'pointerup' ? 0 : 1,
+          clientX: x,
+          clientY: y
+        })
+      )
+  })
+}
+
+/** How far the grid is drawn from its place, in pixels. */
+function gridShift(): { x: number; y: number } {
+  const transform = screen.getByTestId('terminal-grid').style.transform
+  const found = /translate\((-?[\d.]+)px, (-?[\d.]+)px\)/.exec(transform)
+  if (found === null) return { x: 0, y: 0 }
+  const x = Number(found[1])
+  const y = Number(found[2])
+  return { x: x === 0 ? 0 : x, y: y === 0 ? 0 : y }
+}
 
 function piece(column: number, text: string): TerminalScreen['lines'][number]['pieces'][number] {
   return {

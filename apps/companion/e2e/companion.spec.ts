@@ -477,7 +477,7 @@ test.describe('the raw terminal', () => {
       })
       window.krTestHost?.terminalViews[0]?.show({
         dimensions: { columns: '20', rows: '2' },
-        window: { columns: 20, rows: 2 },
+        window: { columns: 20, rows: 2, column: 0, line: 0, above: 0 },
         lines: [
           {
             row: '1',
@@ -783,9 +783,151 @@ test.describe('how the host presents a raw view', () => {
     await page.evaluate(() => {
       window.krTestHost?.terminalViews[0]?.show()
     })
-    await expect(page.getByTestId('terminal-position')).toContainText('Showing the top-left')
+    await expect(page.getByTestId('terminal-position')).toContainText('Showing columns 1–')
     await page.screenshot({ path: shotFor('terminal-zoom-13.18'), fullPage: true })
   })
+})
+
+// KR-REQ-08.75, KR-REQ-13.18: in view mode the wheel and a drag move the window across the session
+// and into its history, the phone's one-finger drag the same; control mode's wheel and drag are the
+// program's and move nothing, and taking control brings a window in the history back.
+test.describe("moving a raw view's window", () => {
+  const SESSION_MAIN = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
+
+  /** Where a screenshot for this browser goes, so each engine keeps its own. */
+  const shotFor = (name: string): string => shot(`${name}-${test.info().project.name}`)
+
+  /** Opens the harness in one colour mode, whatever the system's. */
+  async function inTheme(page: Page, theme: 'light' | 'dark'): Promise<void> {
+    await page.addInitScript((mode) => {
+      localStorage.setItem('kalareach-theme', mode)
+    }, theme)
+  }
+
+  /** How many moves the page has made with its view. */
+  const moves = (page: Page): Promise<number> =>
+    page.evaluate(() => window.krTestHost?.terminalViews[0]?.moves.length ?? -1)
+
+  /** Drags the pointer from the middle of `locator` by `down` pixels. */
+  async function drag(page: Page, locator: Locator, down: number): Promise<void> {
+    const box = await locator.boundingBox()
+    if (box === null) throw new Error('nothing to drag on')
+    const x = box.x + box.width / 2
+    const y = box.y + Math.min(box.height / 2, 40)
+    await page.mouse.move(x, y)
+    await page.mouse.down()
+    await page.mouse.move(x, y + down, { steps: 8 })
+    await page.mouse.up()
+  }
+
+  test("view mode's wheel and drag move the window, and control mode's do not", async ({ page }) => {
+    await openSession(page)
+    await page.getByRole('tab', { name: 'Terminal' }).click()
+    const surface = page.getByTestId('terminal-surface')
+    const position = page.getByTestId('terminal-position')
+    await expect(surface).toContainText('$ cargo test -p kr-client')
+
+    // Control mode: the program's wheel and nothing else, and a drag moves nothing.
+    await surface.hover()
+    await page.mouse.wheel(0, -120)
+    await expect(surface).toHaveAttribute('data-wheel-to-application', '1')
+    await drag(page, surface, 90)
+    expect(await moves(page)).toBe(0)
+    await expect(position).toHaveText('')
+
+    // View mode: the wheel turned up takes the window into the history, and down brings it back.
+    await page.getByRole('tab', { name: 'View' }).click()
+    await surface.hover()
+    await page.mouse.wheel(0, -120)
+    await expect(position).toContainText('Showing the history')
+    await expect(surface).toContainText('$ echo earlier')
+    await expect(surface).toHaveAttribute('data-wheel-to-application', '1')
+    await page.mouse.wheel(0, 600)
+    await expect(position).toHaveText('')
+    await expect(surface).toContainText('$ cargo test -p kr-client')
+
+    // A drag down moves the window up, as the pointer carries the screen.
+    const before = await moves(page)
+    await drag(page, surface, 90)
+    await expect.poll(async () => moves(page)).toBeGreaterThan(before)
+    await expect(position).toContainText('Showing the history')
+
+    // Taking control brings it back to the live screen.
+    await page.getByRole('tab', { name: 'Control' }).click()
+    await expect(position).toHaveText('')
+    await expect(surface).toContainText('$ cargo test -p kr-client')
+  })
+
+  for (const theme of ['light', 'dark'] as const) {
+    test(`the desktop view moves across the session and into its history, ${theme}, at 320 px`, async ({
+      page
+    }) => {
+      await inTheme(page, theme)
+      await openSession(page)
+      await page.getByRole('tab', { name: 'Terminal' }).click()
+      // Narrowed once open, as a person narrows a window: the sessions list is behind a button there.
+      await page.setViewportSize({ width: 320, height: 720 })
+      const surface = page.getByTestId('terminal-surface')
+      const position = page.getByTestId('terminal-position')
+      await expect(surface).toContainText('$ cargo')
+      // The view reports its narrower grid, and the host's next screen is drawn for it.
+      await expect
+        .poll(async () => page.evaluate(() => window.krTestHost?.terminalViews[0]?.grids.at(-1)?.columns))
+        .toBeLessThan(80)
+      await page.evaluate(() => {
+        window.krTestHost?.terminalViews[0]?.show()
+      })
+      await expect(position).toContainText('Showing columns 1–')
+
+      await page.getByRole('tab', { name: 'View' }).click()
+      await surface.hover()
+      // Sideways across a session wider than the view, then up into its history.
+      await page.mouse.wheel(120, 0)
+      await expect(position).not.toContainText('Showing columns 1–')
+      await expect(position).toContainText('Showing columns ')
+      await page.mouse.wheel(0, -64)
+      await expect(position).toContainText('Showing the history')
+      await expect(page.locator('html')).toHaveAttribute('data-theme', theme)
+      await page.screenshot({ path: shotFor(`terminal-pan-08.75-desktop-320-${theme}`), fullPage: true })
+    })
+
+    test(`the desktop view moves into the history, ${theme}, in a wide window`, async ({ page }) => {
+      await inTheme(page, theme)
+      await openSession(page)
+      await page.getByRole('tab', { name: 'Terminal' }).click()
+      const surface = page.getByTestId('terminal-surface')
+      await expect(surface).toContainText('$ cargo')
+      await page.getByRole('tab', { name: 'View' }).click()
+      await drag(page, surface, 60)
+      await expect(page.getByTestId('terminal-position')).toContainText('Showing the history')
+      await expect(page.locator('html')).toHaveAttribute('data-theme', theme)
+      await page.screenshot({ path: shotFor(`terminal-pan-08.75-desktop-wide-${theme}`), fullPage: true })
+    })
+
+    test(`the phone's view moves with a one-finger drag, ${theme}, at 320 px`, async ({ page }) => {
+      await inTheme(page, theme)
+      await page.setViewportSize({ width: 320, height: 1000 })
+      await page.goto(`/harness.html?surface=ios&session=${SESSION_MAIN}`)
+      await page.getByRole('tab', { name: 'Terminal' }).click()
+      const terminal = page.getByTestId('mobile-terminal')
+      await expect(page.getByTestId('mobile-terminal-line').first()).toContainText('$ cargo')
+      // Control mode: the drag is the program's.
+      await drag(page, terminal, 60)
+      expect(await moves(page)).toBe(0)
+      await page.getByRole('button', { name: 'Look around' }).click()
+      await expect(
+        page.getByText('View: drag to move around the session, pinch to make the text larger or smaller.')
+      ).toBeVisible()
+      await drag(page, terminal, 60)
+      await expect(page.getByTestId('terminal-position')).toContainText('Showing the history')
+      await expect(terminal).toContainText('$ echo earlier')
+      await expect(page.locator('html')).toHaveAttribute('data-theme', theme)
+      await page.screenshot({ path: shotFor(`terminal-pan-08.75-phone-320-${theme}`), fullPage: true })
+      // Taking control brings the window back to the live screen.
+      await page.getByRole('button', { name: 'Take control' }).click()
+      await expect(page.getByTestId('mobile-terminal-line').first()).toContainText('$ cargo')
+    })
+  }
 })
 
 // KR-REQ-13.19: a window as narrow as a phone. Nothing runs past the window's edge or the

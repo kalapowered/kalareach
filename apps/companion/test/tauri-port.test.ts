@@ -74,13 +74,20 @@ describe('the desktop port and a raw terminal view', () => {
     expect(heard).toEqual([ended])
   })
 
-  it('sends the size and the close to their own commands, with the handle the open answered', async () => {
+  it('sends the size, the moves and the close to their own commands, with the handle the open answered', async () => {
     shell.answers.set('terminal_view_open', '7')
     const view = await tauriPort().openTerminalView(SESSION, { columns: 80, rows: 24 }, () => undefined)
     await view.resize({ columns: 100, rows: 30 })
+    await view.move({ number: 1, across: -2, down: 3 })
+    await view.move({ number: 2, live: true })
     await view.close()
     expect(shell.invoked.slice(1)).toEqual([
       { command: 'terminal_view_resize', args: { view: '7', columns: 100, rows: 30 } },
+      {
+        command: 'terminal_view_move',
+        args: { view: '7', number: 1, across: -2, down: 3, live: false }
+      },
+      { command: 'terminal_view_move', args: { view: '7', number: 2, across: 0, down: 0, live: true } },
       { command: 'terminal_view_close', args: { view: '7' } }
     ])
   })

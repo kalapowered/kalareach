@@ -185,6 +185,13 @@ export function tauriPort(): HostPort {
       return {
         resize: (next) =>
           call<undefined>('terminal_view_resize', { view, columns: next.columns, rows: next.rows }),
+        move: (next) =>
+          call<undefined>(
+            'terminal_view_move',
+            'live' in next
+              ? { view, number: next.number, across: 0, down: 0, live: true }
+              : { view, number: next.number, across: next.across, down: next.down, live: false }
+          ),
         close: () => call<undefined>('terminal_view_close', { view })
       }
     },

@@ -846,24 +846,60 @@ export interface TerminalGrid {
  *
  * Waiting: attached, with no complete screen to draw, before the first or between the host's reset
  * or resynchronisation and the next. Showing: attached, with a complete screen. Ended: the view is
- * over, for a reason in the host's words or the link's. The attachment's summary, which says how
- * the host presents the view and why, rides on the first two.
+ * over, for a reason in the host's words or the link's, and every move the page made with it is
+ * settled. The attachment's summary, which says how the host presents the view and why, rides on
+ * the first two, and so does `settled`: the newest of the page's moves it may take as settled,
+ * which native code says only with a screen that holds it.
  */
 export type TerminalViewState =
-  | { readonly state: 'waiting'; readonly attachment: AttachmentSummary }
+  | { readonly state: 'waiting'; readonly attachment: AttachmentSummary; readonly settled: number }
   | {
       readonly state: 'showing'
       readonly attachment: AttachmentSummary
       readonly screen: TerminalScreen
+      readonly settled: number
     }
   | { readonly state: 'ended'; readonly reason: string }
+
+/** The window the host drew for a view: its size in cells, and where it starts. */
+export interface TerminalWindow {
+  readonly rows: number
+  readonly columns: number
+  /** The first of the session's columns it shows. */
+  readonly column: number
+  /** The line of the live screen it starts at; 0 in the history. */
+  readonly line: number
+  /** How many rows above the live screen's first line it starts; 0 on the live screen. */
+  readonly above: number
+}
+
+/** How many cells a window can still move each way before it reaches a limit. */
+export interface TerminalRoom {
+  /** Rows up, back into the session's history. */
+  readonly up: number
+  /** Rows down, as far as the live screen's last line that still fills the window. */
+  readonly down: number
+  readonly left: number
+  /** Columns to the right, as far as the last that still fills the window. */
+  readonly right: number
+}
+
+/**
+ * One move of a view's window, numbered by the page in the order it makes them: by `across` columns
+ * and `down` rows (to the right and down when positive), or back to the live screen.
+ */
+export type TerminalMove =
+  | { readonly number: number; readonly across: number; readonly down: number }
+  | { readonly number: number; readonly live: true }
 
 /** The part of a session's screen one view shows, as cells, never bytes. */
 export interface TerminalScreen {
   /** The session's own size. */
   readonly dimensions: Dimensions
-  /** The size of the window the host drew for this view, from the live screen's top left. */
-  readonly window: { readonly rows: number; readonly columns: number }
+  /** The window the host drew for this view: its size, and where it starts. */
+  readonly window: TerminalWindow
+  /** How far the window can still move each way. */
+  readonly room: TerminalRoom
   /** Exactly the window's rows, top to bottom. */
   readonly lines: readonly TerminalLine[]
   /** The cursor, or null when it is outside the window. */
@@ -912,6 +948,8 @@ export interface TerminalCursor {
 export interface TerminalView {
   /** Tells the view the page's grid is now `grid`. */
   resize(grid: TerminalGrid): Promise<void>
+  /** Moves the view's window. */
+  move(move: TerminalMove): Promise<void>
   /** Closes the view. Resolves once it has ended: nothing it publishes arrives after. */
   close(): Promise<void>
 }

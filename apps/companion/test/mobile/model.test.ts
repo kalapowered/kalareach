@@ -230,15 +230,21 @@ describe('the raw terminal on a touch screen (KR-REQ-13.18, 13.17)', () => {
     }
   })
 
-  it('zooms in view mode, and moves nothing with a drag: the window stays on the live screen', () => {
-    expect(routeGesture('view', { pointers: 1, deltaX: 12, deltaY: -32, scale: 1 })).toEqual({
-      kind: 'none'
+  it('moves the window with a one-finger drag in view mode, and zooms with a pinch', () => {
+    // The frame follows the finger, so a finger dragged up and to the left moves the window down
+    // and to the right.
+    expect(routeGesture('view', { pointers: 1, deltaX: -12, deltaY: -32, scale: 1 })).toEqual({
+      kind: 'pan',
+      across: 12,
+      down: 32
     })
     expect(routeGesture('view', { pointers: 2, deltaX: 0, deltaY: 0, scale: 1.4 })).toEqual({
       kind: 'zoom',
       steps: 1
     })
-    expect(describeMode('view')).toBe('View: pinch to make the text larger or smaller.')
+    expect(describeMode('view')).toBe(
+      'View: drag to move around the session, pinch to make the text larger or smaller.'
+    )
     expect(describeMode('control')).toBe('Control: your touches go to the program in this terminal.')
   })
 

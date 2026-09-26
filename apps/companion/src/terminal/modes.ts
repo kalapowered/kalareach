@@ -4,16 +4,16 @@
  * A raw terminal view has one input and two possible owners. In control mode the application inside
  * the terminal owns the pointer: a wheel event is the application's scroll, and a control of the
  * view's that consumed it would make `less` and `vim` unusable. In view mode the person is reading
- * the screen rather than driving the program, so the view owns the wheel, and zooms with it. The
- * window stays on the live screen, so nothing pans.
+ * the screen rather than driving the program, so the view owns the wheel: it moves the window across
+ * the session, up into its history and down its live screen, and a zoom gesture makes the text
+ * larger or smaller.
  *
  * The switch is explicit in both directions. Nothing here infers a mode from how fast a wheel
  * turned or whether a modifier was held.
  *
  * The raw views on the desktop and the phone also share what they say: how the host presents a
  * view, directly or as a viewport, and why, from the view's own attachment; where its palette came
- * from; the words for attaching, waiting and a window smaller than the session; and what a screen
- * warns of.
+ * from; the words for attaching, waiting and where the window is; and what a screen warns of.
  */
 
 import type {
@@ -34,8 +34,11 @@ export type WheelOutcome =
   | { readonly kind: 'application'; readonly lines: number }
   /** Used by the view to zoom. */
   | { readonly kind: 'zoom'; readonly steps: number }
-  /** Taken by the view and used for nothing: the window stays on the live screen. */
-  | { readonly kind: 'none' }
+  /**
+   * Used by the view to move its window, by this many pixels: to the right and down when positive,
+   * as a wheel turned down moves a page down.
+   */
+  | { readonly kind: 'pan'; readonly across: number; readonly down: number }
 
 /** One wheel event, in the terms both modes understand. */
 export interface Wheel {
@@ -43,6 +46,8 @@ export interface Wheel {
   readonly deltaY: number
   /** True when the platform reports this as a zoom gesture rather than a scroll. */
   readonly zoomGesture: boolean
+  /** True when Shift is held, which turns a vertical wheel sideways. */
+  readonly sideways: boolean
 }
 
 /** How many pixels of wheel make one row. */
@@ -62,7 +67,11 @@ export function routeWheel(mode: ViewMode, wheel: Wheel): WheelOutcome {
   if (wheel.zoomGesture) {
     return { kind: 'zoom', steps: -Math.sign(wheel.deltaY) }
   }
-  return { kind: 'none' }
+  // A wheel with no sideways axis turns sideways with Shift, as it scrolls a page sideways.
+  if (wheel.sideways && wheel.deltaX === 0) {
+    return { kind: 'pan', across: wheel.deltaY, down: 0 }
+  }
+  return { kind: 'pan', across: wheel.deltaX, down: wheel.deltaY }
 }
 
 /** The zoom steps this view offers, as multiples of the base cell size. */
@@ -103,15 +112,28 @@ export const WAITING = "Waiting for the session's screen…"
 /** How long a view with a frame to keep waits before it says it is waiting. */
 export const SLOW_MS = 250
 
+/** A count of rows in words. */
+function rowsOf(count: number): string {
+  return count === 1 ? '1 row' : `${count} rows`
+}
+
 /**
- * What a view says when the host drew it a window smaller than the session, or null when the
- * window holds the whole of it. The window starts at the live screen's top left.
+ * Where a view's window is, in words, or null when it holds the whole of the live screen: which of
+ * the session's columns and lines it shows, or how far above the live screen a window in the
+ * history starts, and when that is the oldest the session keeps.
  */
-export function clipping(screen: TerminalScreen): string | null {
+export function placeOf(screen: TerminalScreen): string | null {
+  const window = screen.window
+  if (window.above > 0) {
+    const oldest = screen.room.up === 0 ? ', the oldest the session keeps' : ''
+    return `Showing the history, ${rowsOf(window.above)} above the live screen${oldest}.`
+  }
   const columns = Number(screen.dimensions.columns)
   const rows = Number(screen.dimensions.rows)
-  if (screen.window.columns >= columns && screen.window.rows >= rows) return null
-  return `Showing the top-left ${screen.window.columns}×${screen.window.rows} of the session's ${columns}×${rows}.`
+  if (window.columns >= columns && window.rows >= rows) return null
+  const across = `columns ${window.column + 1}–${window.column + window.columns}`
+  const down = `lines ${window.line + 1}–${window.line + window.rows}`
+  return `Showing ${across} and ${down} of the session's ${columns}×${rows}.`
 }
 
 /** Something a screen is missing, with the words a view shows for it. */

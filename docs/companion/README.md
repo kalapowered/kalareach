@@ -50,6 +50,16 @@ the host presents it: the session's output directly, or a viewport with the host
 host's own words. It reads the summary of its own attachment and no other, and a viewport whose
 worker reported no reason says so, and is never shown as direct.
 
+In view mode a raw view moves its window over the session: up into the history, down the live
+screen, and across a session wider than the view. On the desktop the wheel does it (Shift turns a
+vertical wheel sideways) and so does a drag; on the phone, a one-finger drag. In control mode the
+wheel and a drag are the program's and move nothing, and switching to control mode brings a window
+in the history back to the live screen. The page never decides where the window is. Native code
+sends one viewport report at a time, settles each move on the screen the host names for it, and
+tells the page a move is settled only with a screen that holds it. Until then the page draws its
+last screen shifted to where the waiting moves will put the window, so a move shows at once, and a
+drag follows the pointer to the pixel. The footer says where the window is.
+
 A session fits a window as narrow as 320 px. Its actions move below its title, in the same order
 and at the same size, a long name or directory wraps whole, and the terminal's badges and footer
 controls wrap inside the terminal.
