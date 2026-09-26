@@ -102,6 +102,15 @@ struct Held {
 #[derive(Debug, Default)]
 pub struct Admissions {
     held: Mutex<Held>,
+    /// A pause at the start of a snapshot's package reads, which this host's own tests arm to
+    /// stand inside a read that has stalled. It is compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    read_pause: Mutex<
+        Option<(
+            std::sync::mpsc::SyncSender<()>,
+            std::sync::mpsc::Receiver<()>,
+        )>,
+    >,
 }
 
 impl Admissions {
@@ -116,6 +125,49 @@ impl Admissions {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
+
+    /// Stops the next snapshot that has a package to read at the start of its reads, for this
+    /// host's own tests: no lock is held there, which is what a read that stalls must not hold.
+    ///
+    /// Returns the end that says the reads have begun, and the end that lets them go on. The
+    /// pause fires once.
+    #[cfg(feature = "testing")]
+    pub fn pause_reads(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        let (arrived, watch) = std::sync::mpsc::sync_channel(1);
+        let (release, go) = std::sync::mpsc::sync_channel(1);
+        *self
+            .read_pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((arrived, go));
+        (watch, release)
+    }
+
+    /// Waits at the pause above, where one is armed. Compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    fn wait_before_reads(&self) {
+        let armed = self
+            .read_pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some((arrived, go)) = armed {
+            let _ = arrived.send(());
+            let _ = go.recv();
+        }
+    }
+
+    /// The same, without the feature: there is no pause.
+    #[cfg(not(feature = "testing"))]
+    #[expect(
+        clippy::unused_self,
+        reason = "it is the shipped form of a method that reads this worker's own pause"
+    )]
+    const fn wait_before_reads(&self) {}
 
     /// Returns the frame held, where one is.
     #[must_use]
@@ -194,6 +246,12 @@ impl Admissions {
                 })
                 .collect()
         };
+        if packages
+            .iter()
+            .any(|package| !known.contains_key(&package.package_digest))
+        {
+            self.wait_before_reads();
+        }
         let verified = packages
             .iter()
             .map(|package| {
