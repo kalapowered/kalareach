@@ -725,6 +725,8 @@ struct Import {
     visibility: Visibility,
     /// Whether a `cfg` this reading cannot decide can leave the import out.
     conditional: bool,
+    /// The line its `use` is on.
+    line: usize,
 }
 
 /// One module a file imports everything from.
@@ -740,6 +742,8 @@ struct Glob {
     visibility: Visibility,
     /// Whether a `cfg` this reading cannot decide can leave the import out.
     conditional: bool,
+    /// The line its `use` is on.
+    line: usize,
 }
 
 /// One source file, as the rule reads it.
@@ -1261,14 +1265,22 @@ fn read_source(
                     &mut in_scope,
                 );
                 found.extend(in_scope.into_iter().map(|(segments, renamed)| {
-                    (scope, segments, renamed, global, visibility, conditional)
+                    (
+                        scope,
+                        segments,
+                        renamed,
+                        global,
+                        visibility,
+                        conditional,
+                        located.line,
+                    )
                 }));
             }
             _ => {}
         }
     }
     source.tokens = tokens;
-    for (scope, segments, renamed, global, visibility, conditional) in found {
+    for (scope, segments, renamed, global, visibility, conditional, line) in found {
         if renamed.as_deref() == Some("*") {
             source.globs.push(Glob {
                 scope,
@@ -1276,6 +1288,7 @@ fn read_source(
                 global,
                 visibility,
                 conditional,
+                line,
             });
             continue;
         }
@@ -1310,6 +1323,7 @@ fn read_source(
                 global,
                 visibility,
                 conditional,
+                line,
             });
         }
     }
