@@ -2510,7 +2510,8 @@ impl Debugs {
                     .filter(|hand| hand.target == *path)
                     .collect();
                 // A type defined once for each set of `cfg` conditions carries when any definition
-                // does.
+                // does, and each `Debug` written by hand for it is read beside a derived one, since
+                // `cfg` can put either in force.
                 let why = definitions
                     .iter()
                     .find_map(|declared| match declared.derived {
@@ -2520,10 +2521,13 @@ impl Debugs {
                         None if hands.is_empty() => {
                             Some("a type whose Debug this reading cannot find".to_owned())
                         }
-                        None => hands
+                        None => None,
+                    })
+                    .or_else(|| {
+                        hands
                             .iter()
                             .find_map(|hand| self.read_by_hand(hand, &carrying).err())
-                            .map(|(_, why)| why),
+                            .map(|(_, why)| why)
                     });
                 if let Some(why) = why {
                     carrying.insert(path.clone(), why);
@@ -4264,6 +4268,13 @@ fn each_name_is_placed_where_the_compiler_places_it() {
             "use std::fmt::Debug;\npub struct Leak(pub String);\nconst _: () = {\n    use kr_other::names::*;\n    impl Debug for Leak {\n        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n            formatter.debug_tuple(\"Leak\").field(&self.0).finish()\n        }\n    }\n};\n",
             5,
             "a trait this reading cannot place",
+        ),
+        (
+            "a type another crate derives Debug for on one platform and writes it by hand for on another",
+            "#[cfg_attr(not(unix), derive(Debug))]\npub struct Code(pub u64);\n#[cfg(unix)]\nimpl std::fmt::Debug for Code {\n    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n        formatter.write_str(&::std::format!(\"{}\", \"SECRET\"))\n    }\n}\n",
+            "#[derive(Debug)]\npub struct Leak(pub kr_other::Code);\n",
+            1,
+            "a derived Debug over text that arrived",
         ),
         (
             "an extern crate",
