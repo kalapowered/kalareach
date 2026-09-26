@@ -2293,13 +2293,20 @@ fn the_intersection_finds_the_lease_through_the_bindings_key() {
         grant_id: Some(held.grant_id),
     };
     assert!(
+        policy.utc_floor().written() < AT_MS,
+        "nothing has written the floor down yet"
+    );
+    assert!(
         recipients.scope_for(&rule).is_none(),
         "nor for a push rule naming its grant"
     );
-    // The lease the push rule found run out left the floor owed its record; a daemon writes it
-    // with its next decision, as this does.
-    assert!(policy.utc_floor().is_owed(), "the lapse is owed its record");
-    policy.utc_floor().wrote(policy.utc_floor().get());
+    // The lease the push rule found run out wrote down the floor it was found at, as a device's
+    // refusal does, so nothing is left owed.
+    assert!(
+        policy.utc_floor().written() >= AT_MS,
+        "the lapse is written down"
+    );
+    assert!(!policy.utc_floor().is_owed(), "and nothing is left owed");
 
     // The control: this device's own renewal answers both, once the policy holding it is
     // published as a daemon publishes it.

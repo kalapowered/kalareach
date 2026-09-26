@@ -1695,7 +1695,7 @@ impl Controller {
             // decide the other way, so the answer states no lapse. An expiry found here still
             // stops the connection's frames, which records nothing ([`Refusal::ExpiryUnrecorded`]).
             let floor = policy.utc_floor_ms();
-            self.owe_floor(&policy);
+            self.sharing.grants().record_floor(&policy);
             if self.utc_floor.written() < floor {
                 return Err(crate::config::ceilings::CeilingRefusal::Refused(
                     match decided {

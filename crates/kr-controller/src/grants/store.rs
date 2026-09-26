@@ -1623,6 +1623,33 @@ impl GrantDirectory {
         self.store("policy", policy)
     }
 
+    /// Writes down the clock floor a decision was taken on, the floor of `policy`, and owes it its
+    /// record when the write fails.
+    ///
+    /// The guard is the policy's own, so the write happens while the lock is held, like every
+    /// other write of the policy: two callers cannot reach the store out of order and leave the
+    /// older floor on disk. The write comes before the debt, so a floor that lands is never seen
+    /// as owed: a store effect deciding a time bound on another thread meanwhile would otherwise
+    /// refuse for a record that was a moment from landing. A floor already on disk with nothing
+    /// owed costs no write.
+    pub fn record_floor(&self, policy: &std::sync::MutexGuard<'_, super::HostPolicy>) {
+        let floor = policy.utc_floor();
+        if floor.get() <= floor.written() && !floor.is_owed() {
+            return;
+        }
+        let snapshot = policy.snapshot();
+        match self.store_policy(&snapshot) {
+            Ok(()) => floor.wrote(snapshot.utc_floor_ms.get()),
+            Err(error) => {
+                floor.owe(snapshot.utc_floor_ms.get());
+                eprintln!(
+                    "kr-controller: could not record the clock floor this host decided from: \
+                     {error}"
+                );
+            }
+        }
+    }
+
     /// Writes this host's policy together with the retained event of the binding it made, in one
     /// transaction, so neither is on disk without the other.
     ///

@@ -2788,7 +2788,7 @@ impl Controller {
                 // disk: a clock wound back before the next start would otherwise decide the other
                 // way.
                 let floor = held.utc_floor_ms();
-                self.owe_floor(&held);
+                self.sharing.grants().record_floor(&held);
                 return Ok(Err(if self.utc_floor.written() < floor {
                     LeaseRefused::FloorUnrecorded
                 } else {
@@ -2981,34 +2981,8 @@ impl Controller {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         policy.observe_utc(now_ms);
         let settled = policy.settled_now(now_ms);
-        self.owe_floor(&policy);
+        self.sharing.grants().record_floor(&policy);
         settled
-    }
-
-    /// Writes down the clock floor a decision was taken on, and owes it its record when the write
-    /// fails.
-    ///
-    /// The guard is the policy's own, so the write happens while the lock is held, like every
-    /// other write of the policy: two callers cannot reach the store out of order and leave the
-    /// older floor on disk. The write comes before the debt, so a floor that lands is never seen
-    /// as owed: a store effect deciding a time bound on another thread meanwhile would otherwise
-    /// refuse for a record that was a moment from landing. A floor already on disk with nothing
-    /// owed costs no write.
-    pub(crate) fn owe_floor(&self, policy: &std::sync::MutexGuard<'_, crate::grants::HostPolicy>) {
-        if self.utc_floor.get() <= self.utc_floor.written() && !self.utc_floor.is_owed() {
-            return;
-        }
-        let snapshot = policy.snapshot();
-        match self.sharing.grants().store_policy(&snapshot) {
-            Ok(()) => self.utc_floor.wrote(snapshot.utc_floor_ms.get()),
-            Err(error) => {
-                self.utc_floor.owe(snapshot.utc_floor_ms.get());
-                eprintln!(
-                    "kr-controller: could not record the clock floor this host decided from: \
-                     {error}"
-                );
-            }
-        }
     }
 
     /// Writes the clock floor down when a decision taken on it is still owed that record.
@@ -3234,7 +3208,7 @@ impl Controller {
                 // A refusal the clock decided is one a clock wound back before the next start
                 // would otherwise revive, so it is answered only once its floor is on disk.
                 let floor = policy.utc_floor_ms();
-                self.owe_floor(&policy);
+                self.sharing.grants().record_floor(&policy);
                 if self.utc_floor.written() < floor {
                     return unwritten();
                 }

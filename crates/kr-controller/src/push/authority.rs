@@ -195,12 +195,10 @@ impl RecipientAuthority for GrantedRecipients {
         ) {
             Ok(effective) => effective,
             Err(refusal) => {
-                // A lapse the clock decided, a lease or the offline bound run out in UTC, is owed
-                // the record of the floor it was found at, as every such lapse is: the host's next
-                // decision or its record task writes it, and until then no clock wound back before
-                // a restart can revive the bound.
+                // A lapse the clock decided, a lease or the offline bound run out, is written down
+                // as the floor it was found at, as every such lapse is.
                 if refusal.is_clock_decided() {
-                    policy.utc_floor().owe(now_ms);
+                    self.sharing.grants().record_floor(&policy);
                 }
                 return None;
             }
@@ -382,11 +380,11 @@ mod tests {
     }
 
     /// A message under a personal grant whose offline bound has run out admits nothing: in UTC, and
-    /// then the floor it was found at is owed its record, so a clock wound back before a restart
+    /// then the floor it was found at is written down, so a clock wound back before a restart
     /// cannot revive the bound; and on the continuous clock, whatever UTC says. The control: inside
-    /// the bound it admits, and nothing is owed.
+    /// the bound it admits, and no floor is written.
     #[test]
-    fn a_lapsed_offline_bound_admits_nothing_and_its_utc_lapse_is_owed_its_record() {
+    fn a_lapsed_offline_bound_admits_nothing_and_its_utc_lapse_writes_the_floor_down() {
         use std::sync::atomic::{AtomicU64, Ordering};
 
         for lapsed in [None, Some("in UTC"), Some("on the continuous clock")] {
@@ -437,12 +435,13 @@ mod tests {
             }
             let scope = recipients.scope_for(&rule(Some(14)));
             assert_eq!(scope.is_some(), lapsed.is_none(), "lapsed {lapsed:?}");
-            let owed = policy.lock().expect("not poisoned").utc_floor().is_owed();
+            let floor = Arc::clone(policy.lock().expect("not poisoned").utc_floor());
             assert_eq!(
-                owed,
+                floor.written() >= NOW + 60_001,
                 lapsed == Some("in UTC"),
-                "only a lapse found in UTC is owed the floor's record"
+                "only a lapse found in UTC writes the floor down, at the reading it was found at"
             );
+            assert!(!floor.is_owed(), "and nothing is left owed");
         }
     }
 
