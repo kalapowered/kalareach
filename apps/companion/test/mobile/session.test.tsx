@@ -845,7 +845,7 @@ describe("the phone's raw terminal view (KR-REQ-08.02, 13.18)", () => {
     expect(screen.getByRole('button', { name: 'More' })).toHaveAttribute('aria-expanded', 'false')
   })
 
-  it('reaches its controls from the keyboard in order: the mode, the moves, the status, the keys, the field and Send', async () => {
+  it('keeps its controls in keyboard order: the mode, the moves, the status, the keys and the field, with Send after it', async () => {
     const { port } = fakeHost()
     const person = await onTerminal(port)
     await waitFor(() => {

@@ -78,8 +78,9 @@ terminal keeps at least four rows at its default size in any case: when the comp
 room than is left, it scrolls from the bottom, so the field stays in view. The host is told the
 grid the terminal's surface shows.
 
-A selection in either raw view takes the session's own selection colours. On the desktop a copy
-gives the selected pieces as lines laid out by their cells.
+A selection in either raw view takes the session's own selection colours, except on iOS, which
+draws its own highlight over a page's selection. On the desktop a copy gives the selected pieces as
+lines laid out by their cells.
 
 ## The boundary
 
