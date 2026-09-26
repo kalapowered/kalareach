@@ -143,17 +143,28 @@ impl Application {
     /// collected its group's identifier can name no other group. Then the application is
     /// collected.
     ///
-    /// # Panics
+    /// Every answer the kernel gives is looked at, and the only refusals taken as done are the
+    /// ones this ownership makes certain: a process that had already ended, and a group that does
+    /// not exist because the application ended before it made one, so it started nothing. What
+    /// macOS answers for a group holding only processes that have ended is taken as done once a
+    /// query shows no process of the group still running.
     ///
-    /// When its end cannot be waited for or its group cannot be signalled, unless a panic is
-    /// already unwinding: a cleanup that did not happen fails the test rather than leaving a
-    /// process behind unsaid.
-    fn end(&mut self) {
+    /// # Errors
+    ///
+    /// Returns what went wrong when the application could not be ended, its end could not be
+    /// waited for, its group could not be ended or it could not be collected.
+    fn end(&mut self) -> Result<(), String> {
         use rustix::io::Errno;
         use rustix::process::{Pid, Signal, WaitId, WaitIdOptions, kill_process_group, waitid};
 
         let pid = Pid::from_child(&self.child);
-        let _ = self.child.kill();
+        match self.child.kill() {
+            Ok(()) => {}
+            // It had ended already and waits to be collected, which the wait below establishes.
+            Err(error) if error.raw_os_error() == Some(Errno::SRCH.raw_os_error()) => {}
+            // It may still be running, so nothing below would return: say so and leave it.
+            Err(error) => return Err(format!("the application could not be ended: {error}")),
+        }
         let ended = loop {
             match waitid(
                 WaitId::Pid(pid),
@@ -163,19 +174,63 @@ impl Application {
                 ended => break ended,
             }
         };
-        let ended = ended.and_then(|_| match kill_process_group(pid, Signal::KILL) {
-            // No group: the application ended before it made one, so it had started nothing. And
-            // a group left holding only processes that have ended, which macOS refuses to signal.
-            Err(Errno::SRCH | Errno::PERM) => Ok(()),
-            signalled => signalled,
-        });
-        let _ = self.child.wait();
-        if let Err(error) = ended
-            && !std::thread::panicking()
-        {
-            panic!("the launch could not end what its application started: {error}");
+        let group = match ended {
+            Ok(_) => match kill_process_group(pid, Signal::KILL) {
+                Ok(()) | Err(Errno::SRCH) => Ok(()),
+                #[cfg(target_os = "macos")]
+                Err(Errno::PERM) => nothing_running_in_group(pid.as_raw_pid()),
+                Err(error) => Err(format!(
+                    "the application's group could not be ended: {error}"
+                )),
+            },
+            Err(error) => Err(format!(
+                "the application's end could not be waited for: {error}"
+            )),
+        };
+        let collected = self
+            .child
+            .wait()
+            .map(|_| ())
+            .map_err(|error| format!("the application could not be collected: {error}"));
+        group.and(collected)
+    }
+}
+
+/// Says whether `ps` shows no process of the group `group` still running, as a check of what a
+/// refused group signal means on macOS: there, a group whose processes have all ended refuses the
+/// signal. A query that fails is a failure, never an empty group.
+#[cfg(target_os = "macos")]
+fn nothing_running_in_group(group: i32) -> Result<(), String> {
+    let listed = std::process::Command::new("ps")
+        .args(["-A", "-o", "pgid=,stat="])
+        .output()
+        .map_err(|error| format!("ps could not be run: {error}"))?;
+    if !listed.status.success() {
+        return Err(format!(
+            "ps failed ({}): {}",
+            listed.status,
+            String::from_utf8_lossy(&listed.stderr)
+        ));
+    }
+    let text = String::from_utf8(listed.stdout).map_err(|error| format!("ps printed: {error}"))?;
+    for line in text.lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(member), Some(state)) = (fields.next(), fields.next()) else {
+            return Err(format!(
+                "ps printed a line with no group and state: {line:?}"
+            ));
+        };
+        let member: i32 = member.parse().map_err(|error| {
+            format!("ps printed a group that is not a number, {line:?}: {error}")
+        })?;
+        if member == group && !state.starts_with('Z') {
+            return Err(format!(
+                "the signal to group {group} was refused and one of its processes still runs: \
+                 {line:?}"
+            ));
         }
     }
+    Ok(())
 }
 
 impl Launch {
@@ -337,8 +392,20 @@ impl Launch {
 impl Drop for Launch {
     /// Ends the application and everything it started, the channel server it runs or a hook it is
     /// running, before anything else of the launch goes.
+    ///
+    /// # Panics
+    ///
+    /// When that cannot be done, unless a panic is already unwinding, which is told what went
+    /// wrong instead: a cleanup that did not happen fails the test rather than leaving a process
+    /// behind unsaid.
     fn drop(&mut self) {
-        self.application.end();
+        if let Err(failure) = self.application.end() {
+            if std::thread::panicking() {
+                eprintln!("the launch could not end what its application started: {failure}");
+            } else {
+                panic!("the launch could not end what its application started: {failure}");
+            }
+        }
     }
 }
 
