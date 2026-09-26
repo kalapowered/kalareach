@@ -1385,6 +1385,184 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// Refuses every flush of one directory until it is dropped, while names can still be created
+    /// and removed in it.
+    ///
+    /// A flush opens the directory itself. On Windows a handle that shares no writing holds it, and
+    /// the flush's open, which holds a right to add to the directory, has to be shared that. On
+    /// macOS and Linux the directory's read permission is taken away and its write and search
+    /// permissions stay: the flush's open reads the directory, and a creation or a removal of a name
+    /// in it only writes and searches it.
+    struct FlushRefused {
+        #[cfg(windows)]
+        _holding: std::fs::File,
+        #[cfg(unix)]
+        directory: PathBuf,
+        #[cfg(unix)]
+        mode: u32,
+    }
+
+    impl FlushRefused {
+        #[cfg(windows)]
+        fn on(directory: &Path) -> Self {
+            use std::os::windows::fs::OpenOptionsExt as _;
+
+            /// The right to list a directory, which is all the handle holds.
+            const FILE_LIST_DIRECTORY: u32 = 0x0001;
+            /// Reading is shared with other handles.
+            const FILE_SHARE_READ: u32 = 0x0001;
+            /// Deleting is shared; writing is not.
+            const FILE_SHARE_DELETE: u32 = 0x0004;
+            /// What lets a program open a directory at all.
+            const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+
+            let holding = std::fs::OpenOptions::new()
+                .access_mode(FILE_LIST_DIRECTORY)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                .open(directory)
+                .expect("the directory is held");
+            Self { _holding: holding }
+        }
+
+        #[cfg(unix)]
+        fn on(directory: &Path) -> Self {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            let mode = std::fs::metadata(directory)
+                .expect("the directory's mode")
+                .permissions()
+                .mode()
+                & 0o7777;
+            std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o300))
+                .expect("write and search only");
+            let refused = Self {
+                directory: directory.to_path_buf(),
+                mode,
+            };
+            // An account whose privilege overrides the mode would be let through, and for it this
+            // arrangement cannot be made.
+            assert_eq!(
+                std::fs::File::open(directory)
+                    .expect_err("a directory without read permission does not open")
+                    .kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+            refused
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for FlushRefused {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            let _ = std::fs::set_permissions(
+                &self.directory,
+                std::fs::Permissions::from_mode(self.mode),
+            );
+        }
+    }
+
+    /// Whether `error` is a flush the store reports as refused.
+    fn is_refused_flush(error: &CryptoError) -> bool {
+        matches!(error, CryptoError::SecretStore { message } if message.starts_with("sync "))
+    }
+
+    /// KR-REQ-10.47: a secret set in a scope that has no directory yet makes that directory, and
+    /// each directory made for it is flushed into the one above it before the secret is written. A
+    /// flush that is refused is reported, where a store that never flushed a directory it made would
+    /// report the secret stored while a crash could take the directory, and the secret in it, away.
+    /// With nothing held, the same writes succeed and read back.
+    #[test]
+    fn each_directory_made_for_a_secret_is_flushed_into_the_one_above_it() {
+        let base = scratch_directory("made");
+        let opened = open_store_in(&base).expect("a store in the named directory");
+
+        // A scope of one directory, made in the store's own.
+        let first = SecretName::new("host/x").expect("a name");
+        let refused = {
+            let _refused = FlushRefused::on(&base);
+            opened
+                .store
+                .set(&first, b"seed")
+                .expect_err("the directory made in the store's own is not flushed into it")
+        };
+        assert!(is_refused_flush(&refused), "{refused}");
+        assert!(
+            opened.store.get(&first).expect("a read").is_none(),
+            "nothing is stored in a directory that is not flushed"
+        );
+        opened
+            .store
+            .set(&first, b"seed")
+            .expect("with nothing held, the same secret is stored");
+
+        // A scope two deep whose first directory is there already: the second is made in it.
+        let nested = SecretName::new("host/device-key/transport").expect("a name");
+        let refused = {
+            let _refused = FlushRefused::on(&base.join("host"));
+            opened
+                .store
+                .set(&nested, b"key")
+                .expect_err("the directory made in the scope's is not flushed into it")
+        };
+        assert!(is_refused_flush(&refused), "{refused}");
+        assert!(
+            opened.store.get(&nested).expect("a read").is_none(),
+            "nothing is stored in a directory that is not flushed"
+        );
+        opened
+            .store
+            .set(&nested, b"key")
+            .expect("with nothing held, the nested secret is stored");
+        for (name, secret) in [(&first, &b"seed"[..]), (&nested, &b"key"[..])] {
+            assert_eq!(
+                opened
+                    .store
+                    .get(name)
+                    .expect("a read")
+                    .expect("a value")
+                    .expose(),
+                secret
+            );
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// KR-REQ-10.47: a deleted secret's name is flushed out of its directory before the deletion is
+    /// reported. A flush that is refused is reported, where a store that never flushed the removal
+    /// would report the secret gone while a crash could bring its name back. With nothing held, a
+    /// deletion succeeds and the secret stays gone.
+    #[test]
+    fn a_deleted_secret_is_flushed_out_of_its_directory() {
+        let base = scratch_directory("deleted");
+        let opened = open_store_in(&base).expect("a store in the named directory");
+        let name = SecretName::new("host/x").expect("a name");
+        opened.store.set(&name, b"seed").expect("a write");
+
+        let refused = {
+            let _refused = FlushRefused::on(&base.join("host"));
+            opened
+                .store
+                .delete(&name)
+                .expect_err("the removal is not flushed out of the directory")
+        };
+        assert!(is_refused_flush(&refused), "{refused}");
+        assert!(
+            opened.store.get(&name).expect("a read").is_none(),
+            "the name is gone, and only its flush was refused"
+        );
+
+        opened.store.set(&name, b"again").expect("a write");
+        opened
+            .store
+            .delete(&name)
+            .expect("with nothing held, the deletion is flushed");
+        assert!(opened.store.get(&name).expect("a read").is_none());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// A name that reaches the store through a link is refused however it is spelled.
     ///
     /// A trailing separator or a `.` component makes the kernel resolve the link before it reports
