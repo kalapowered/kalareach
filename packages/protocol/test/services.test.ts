@@ -202,22 +202,22 @@ describe('the settings-sync requests a client sends', () => {
 
   it('publishes one request for each member, and the recovery bundle\'s four beside them', () => {
     expect(requests.method).toBe('sync.compare_exchange')
-    expect(
-      Object.fromEntries(requests.cases.map((entry) => [entry.id, Object.keys(entry.json)]))
-    ).toEqual({
-      exchange: ['exchange'],
-      compare: ['compare'],
-      resolve: ['resolve'],
-      status: ['status'],
-      fence: ['fence'],
-      keys: ['keys'],
-      rekey: ['rekey'],
-      memberships: ['memberships'],
-      bundle_exchange: ['exchange'],
-      bundle_compare: ['compare'],
-      bundle_status: ['status'],
-      bundle_fence: ['fence']
-    })
+    // The list as published, in order: a case that repeated an identifier is one more entry here
+    // rather than one that takes another's place.
+    expect(requests.cases.map((entry) => [entry.id, Object.keys(entry.json)])).toEqual([
+      ['exchange', ['exchange']],
+      ['compare', ['compare']],
+      ['resolve', ['resolve']],
+      ['status', ['status']],
+      ['fence', ['fence']],
+      ['keys', ['keys']],
+      ['rekey', ['rekey']],
+      ['memberships', ['memberships']],
+      ['bundle_exchange', ['exchange']],
+      ['bundle_compare', ['compare']],
+      ['bundle_status', ['status']],
+      ['bundle_fence', ['fence']]
+    ])
   })
 
   it('encodes each request to the bytes the host produces and digests it as its signature does', async () => {
