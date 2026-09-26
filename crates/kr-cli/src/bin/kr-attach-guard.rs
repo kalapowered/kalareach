@@ -28,7 +28,7 @@ use kr_cli::attach::{GUARD_BEGIN, GUARD_KEYBOARD, GUARD_MODES, GUARD_READY, GUAR
 use kr_cli::terminal::RESET_SEQUENCES;
 use kr_cli::terminal::{KeyboardState, SavedModes, ScreenModes};
 
-#[derive(Debug, Parser)]
+#[derive(Parser)]
 #[command(
     name = "kr-attach-guard",
     version,

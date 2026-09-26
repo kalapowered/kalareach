@@ -269,7 +269,7 @@ impl ProjectedDisplay {
 /// projection addresses every cluster absolutely - but each is a smaller promise than the one a
 /// qualified terminal gets, and a person is told which promise was made rather than left to assume
 /// the larger one.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct Qualification {
     /// The modes nothing could be read for, which are the ones a detach puts back to their default.
     pub defaulted_modes: Vec<kr_term::probe::SavedMode>,

@@ -56,7 +56,6 @@ const fn produces_text(record: &KeyRecord) -> bool {
 const BATCH: usize = 256;
 
 /// The console input this attachment reads, and the encoding it sends.
-#[derive(Debug)]
 pub struct RecordReader {
     handle: std::fs::File,
     fidelity: Fidelity,

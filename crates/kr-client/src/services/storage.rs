@@ -169,7 +169,7 @@ pub struct RetentionChange {
 }
 
 /// One object's upload, as its caller declares it before any content is accepted.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct NewUpload {
     /// The archive the object belongs to.
     pub archive_id: ArchiveId,
@@ -189,9 +189,11 @@ pub struct NewUpload {
 /// The identity the service gave one upload, in the answer that created it and nowhere else.
 ///
 /// Opaque: this client carries it back and never reads anything out of it.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
+#[derive(Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
 pub struct UploadId(String);
+
+crate::debug_as_name!(UploadId);
 
 impl UploadId {
     /// Wraps an identity the service named.
@@ -394,12 +396,26 @@ pub fn collection_deleted() -> ClientError {
 }
 
 /// Who the bytes are charged to, as the service named it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum StoragePrincipal {
     /// An account, under the identifier the service gives it.
     Account(String),
     /// An installation, which holds no backup storage of its own.
     Installation(InstallationId),
+}
+
+impl fmt::Debug for StoragePrincipal {
+    /// Which kind of principal it is, and an installation by its identifier. Never an account's
+    /// identifier, which is the service's text.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Account(_) => formatter.write_str("Account(..)"),
+            Self::Installation(installation) => formatter
+                .debug_tuple("Installation")
+                .field(installation)
+                .finish(),
+        }
+    }
 }
 
 impl<'de> Deserialize<'de> for StoragePrincipal {
@@ -442,7 +458,7 @@ pub struct StorageUsage {
 }
 
 /// What managed storage a principal holds, as a status read answers it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct StorageStatus {
     /// Who the storage is charged to.
     pub principal: StoragePrincipal,
@@ -467,6 +483,19 @@ pub struct StorageStatus {
     /// The figures the deployment pins.
     pub limits: StorageLimits,
 }
+
+crate::debug_fields!(StorageStatus {
+    principal,
+    backup,
+    retention_revision,
+    retention,
+    stored,
+    tombstoned,
+    uploading,
+    reserved_bytes,
+    allowance_bytes,
+    limits
+});
 
 /// The figures a deployment pins, as a status read reports them.
 ///
@@ -533,7 +562,7 @@ pub enum RetentionAnswer {
 }
 
 /// What creating an upload answered.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct UploadCreated {
     /// The upload, as the service named it.
     pub upload_id: UploadId,
@@ -546,6 +575,13 @@ pub struct UploadCreated {
     /// Who it is charged to.
     pub principal: StoragePrincipal,
 }
+
+crate::debug_fields!(UploadCreated {
+    upload_id,
+    table,
+    reserved_bytes,
+    principal
+});
 
 impl UploadCreated {
     /// The progress of an upload that has just been created: nothing acknowledged yet.
@@ -571,7 +607,7 @@ pub struct PartStored {
 }
 
 /// One stored object, as the archive's manifest names it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct StoredObject {
     /// The object.
     pub object_id: BackupObjectId,
@@ -581,8 +617,13 @@ pub struct StoredObject {
     pub encrypted_len: u64,
 }
 
+crate::debug_fields!(StoredObject {
+    object_id,
+    encrypted_len
+});
+
 /// What completing an upload answered.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct UploadCompleted {
     /// Whether this completion stored the object now, or had already been answered.
     pub duplicate: bool,
@@ -597,6 +638,14 @@ pub struct UploadCompleted {
     /// When the service stored it, as it wrote it.
     pub stored_at: String,
 }
+
+crate::debug_fields!(UploadCompleted {
+    duplicate,
+    archive_id,
+    backup_generation,
+    object,
+    committed_bytes
+});
 
 /// What abandoning an upload answered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -629,7 +678,7 @@ impl fmt::Debug for ObjectRange {
 }
 
 /// What deleting an object answered.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ObjectDeleted {
     /// Whether this deletion made the tombstone, or found the one it had made.
     pub already: bool,
@@ -642,6 +691,12 @@ pub struct ObjectDeleted {
     /// The retention the service applies.
     pub retention: RetentionPolicy,
 }
+
+crate::debug_fields!(ObjectDeleted {
+    already,
+    retained_bytes,
+    retention
+});
 
 /* -------------------------------------------------------------------------- */
 /* On the wire                                                                 */
@@ -1052,7 +1107,7 @@ impl ManagedStorageService {
             .await?
         {
             Answer::Data(data) => data,
-            Answer::Refused(refusal) if refusal.code() == "CONFLICT" => {
+            Answer::Refused(refusal) if refusal.code() == Some("CONFLICT") => {
                 return stale_retention(refusal);
             }
             Answer::Refused(refusal) => return Err(refusal.into_error()),
@@ -1101,7 +1156,7 @@ impl ManagedStorageService {
             .await?
         {
             Answer::Data(data) => data,
-            Answer::Refused(refusal) if refusal.code() == "COLLECTION_DELETED" => {
+            Answer::Refused(refusal) if refusal.code() == Some("COLLECTION_DELETED") => {
                 return Ok(ArchiveAnswer::CollectionDeleted);
             }
             Answer::Refused(refusal) => return Err(refusal.into_error()),
@@ -1287,7 +1342,7 @@ impl ManagedStorageService {
             }
             Content::Bytes(bytes) => Ok(ObjectRange { offset, bytes }),
             // A tombstoned object reads the same as one that never existed.
-            Content::Refused(refusal) if refusal.code() == "NOT_FOUND" => Err(not_held()),
+            Content::Refused(refusal) if refusal.code() == Some("NOT_FOUND") => Err(not_held()),
             Content::Refused(refusal) => Err(refusal.into_error()),
         }
     }
@@ -1307,7 +1362,9 @@ impl ManagedStorageService {
             .await?
         {
             Answer::Data(data) => data,
-            Answer::Refused(refusal) if refusal.code() == "NOT_FOUND" => return Err(not_held()),
+            Answer::Refused(refusal) if refusal.code() == Some("NOT_FOUND") => {
+                return Err(not_held());
+            }
             Answer::Refused(refusal) => return Err(refusal.into_error()),
         };
         let answer: DeleteAnswer = read(data, "what an object deletion answered")?;
@@ -1453,8 +1510,8 @@ fn upload_answer(answer: Answer) -> Result<ArchiveAnswer<serde_json::Value>> {
     match answer {
         Answer::Data(data) => Ok(ArchiveAnswer::Done(data)),
         Answer::Refused(refusal) => match refusal.code() {
-            "COLLECTION_DELETED" => Ok(ArchiveAnswer::CollectionDeleted),
-            "NOT_FOUND" => Ok(ArchiveAnswer::UploadGone),
+            Some("COLLECTION_DELETED") => Ok(ArchiveAnswer::CollectionDeleted),
+            Some("NOT_FOUND") => Ok(ArchiveAnswer::UploadGone),
             _ => Err(refusal.into_error()),
         },
     }

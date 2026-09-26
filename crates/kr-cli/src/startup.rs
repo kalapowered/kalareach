@@ -69,7 +69,7 @@ const LOG_LIMIT: u64 = 1024 * 1024;
 const LOG_TAIL: u64 = 4096;
 
 /// What this environment's configuration document chooses about starting its control daemon.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Chosen {
     /// The way of starting it, when the document chooses one.
     pub controller: Option<ControllerStartup>,

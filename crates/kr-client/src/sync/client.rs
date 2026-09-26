@@ -262,7 +262,7 @@ pub struct KeptExplicitly {
 /// Something that had already left this device before privacy mode was enabled.
 ///
 /// It is not erased and this client does not claim it could be.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Exported {
     /// What kind of copy it is.
     pub kind: String,
@@ -278,6 +278,11 @@ pub struct Exported {
     /// action it cannot perform.
     pub deletable: bool,
 }
+
+crate::debug_fields!(Exported {
+    left_at_ms,
+    deletable
+});
 
 /// What asking the service to drop the copies a person chose about established.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -316,7 +321,6 @@ pub struct Resumed {
 /// privacy state lives in the store rather than in this value: admitting work, taking it back and
 /// settling it each decide against the generation and write under one hold, so a fence cannot land
 /// between a decision and what follows from it.
-#[derive(Debug)]
 pub struct SyncClient {
     service: Arc<dyn SyncBackupService>,
     sealer: Arc<dyn DraftSealer>,

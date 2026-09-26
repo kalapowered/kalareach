@@ -174,7 +174,7 @@ pub trait HostLink: Send + Sync {
 /// It is read from the connection iroh authenticated, never from what an invitation or a bundle
 /// said. A connection this device dialled completed its handshake before the dial returned, and
 /// its endpoint keeps no TLS tickets, so nothing on it ever travelled as early data.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct ConnectionPeer(EndpointKey);
 
 impl ConnectionPeer {
@@ -206,7 +206,7 @@ impl kr_pairing::platform::LivePeer for ConnectionPeer {
 /// Direct-address hints describe where a *peer* is, not what the endpoint is, so two hosts whose
 /// services agree share an endpoint whatever their hints. The services are compared as the
 /// transport parses them, so two spellings of one relay are one relay.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 struct Services {
     relays: Vec<iroh::RelayUrl>,
     resolver: Option<url::Url>,
@@ -327,7 +327,6 @@ impl std::fmt::Debug for EndpointPool {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("EndpointPool")
-            .field("endpoint_id", self.transport.public())
             .field("bind", &self.bind)
             .finish_non_exhaustive()
     }

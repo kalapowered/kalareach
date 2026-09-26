@@ -328,7 +328,7 @@ const CALLS_FINISH_WITHIN: std::time::Duration = std::time::Duration::from_secs(
 /// A call is here from the moment its handler starts until it returns, so a notice that names it
 /// is kept for as long as the call can look for it, however slowly either side runs, and a notice
 /// that names no running call is not kept at all.
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct Calls {
     /// Each running call, and whether a notice from the client has named it.
     running: std::sync::Mutex<std::collections::HashMap<RequestId, bool>>,
@@ -464,10 +464,7 @@ pub struct Contact {
 
 impl std::fmt::Debug for Contact {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("Contact")
-            .field("build_id", &self.build_id)
-            .finish_non_exhaustive()
+        formatter.debug_struct("Contact").finish_non_exhaustive()
     }
 }
 

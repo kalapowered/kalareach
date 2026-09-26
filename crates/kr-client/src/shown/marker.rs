@@ -56,6 +56,23 @@ fn spellings() -> Vec<String> {
     spellings
 }
 
+/// The marker as each kind of input could carry it: as text, and its bytes as decimal numbers, as
+/// hexadecimal digits, as base64 and as base64url.
+pub(crate) fn planted_spellings() -> [String; 5] {
+    let bytes = MARKER.as_bytes();
+    [
+        MARKER.to_owned(),
+        bytes
+            .iter()
+            .map(u8::to_string)
+            .collect::<Vec<_>>()
+            .join(", "),
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect(),
+        base64::engine::general_purpose::STANDARD.encode(bytes),
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes),
+    ]
+}
+
 /// Holds every rendering to carrying no spelling of the marker.
 ///
 /// Each rendering is looked at as it is and with its whitespace taken out, because the indented

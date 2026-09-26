@@ -31,7 +31,7 @@ impl std::fmt::Debug for Invitation {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Code(code) => formatter.debug_tuple("Code").field(code).finish(),
-            Self::Direct(payload) => formatter.debug_tuple("Direct").field(payload).finish(),
+            Self::Direct(_) => formatter.write_str("Direct(..)"),
         }
     }
 }
@@ -39,7 +39,6 @@ impl std::fmt::Debug for Invitation {
 /// A code payload, read.
 ///
 /// `Debug` shows the locator and never the six secret characters.
-#[derive(Debug)]
 pub struct CodeInvitation {
     /// The origin the payload names.
     pub origin: RendezvousOrigin,
@@ -50,8 +49,12 @@ pub struct CodeInvitation {
     pub names_another_origin: bool,
 }
 
+crate::debug_fields!(CodeInvitation {
+    names_another_origin
+});
+
 /// What a person is shown about an invitation before they pair with it. Nothing in it is secret.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 pub struct InvitationSummary {
     /// `code` or `direct`.
     pub mode: &'static str,
@@ -69,6 +72,14 @@ pub struct InvitationSummary {
     /// When a direct invitation expires.
     pub expires_at_ms: Option<u64>,
 }
+
+crate::debug_fields!(InvitationSummary {
+    mode,
+    names_another_origin,
+    rights,
+    grant_expires_at_ms,
+    expires_at_ms
+});
 
 impl Invitation {
     /// What a person is shown about this invitation.

@@ -194,10 +194,11 @@ pub struct SignedService {
 impl fmt::Debug for SignedService {
     /// The gateway and which kind of key signs for it. Never the key and never a request.
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let signer: ServiceRequestSigner = self.signer.signer();
         formatter
             .debug_struct("SignedService")
-            .field("gateway_origin", &self.origin.as_str())
-            .field("signer", &self.signer.signer())
+            .field("gateway_origin", &self.origin)
+            .field("signer", &signer)
             .finish_non_exhaustive()
     }
 }
@@ -615,7 +616,9 @@ pub(crate) struct Refusal {
     /// The method of the request it answered.
     method: Method,
     status: u16,
-    code: String,
+    /// The code the service named, when it is one of [`SERVICE_CODES`]: this client's own
+    /// constant, never the text that arrived.
+    code: Option<&'static str>,
     message: ServiceMessage,
     retry_after_seconds: Option<u64>,
     /// The whole answer the refusal arrived in, which [`Self::members`] reads again.
@@ -623,20 +626,24 @@ pub(crate) struct Refusal {
 }
 
 impl fmt::Debug for Refusal {
-    /// The code and the status. Never the message or the answer, which are the service's.
+    /// The code when the contract names it, and the status. Never a code it does not name, the
+    /// message or the answer, which are the service's.
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("Refusal")
-            .field("code", &self.code)
+            .field(
+                "code",
+                &self.code.unwrap_or("[a code this client does not know]"),
+            )
             .field("status", &self.status)
             .finish_non_exhaustive()
     }
 }
 
 impl Refusal {
-    /// The service's own code for the refusal.
-    pub(crate) fn code(&self) -> &str {
-        &self.code
+    /// The service's code for the refusal, when this client's contract names it.
+    pub(crate) fn code(&self) -> Option<&'static str> {
+        self.code
     }
 
     /// The members the refusal carried beside its code, read as the shape `T` gives them.
@@ -656,8 +663,8 @@ impl Refusal {
 
     /// The error the service named, with the delay it asked for when it named one.
     pub(crate) fn into_error(self) -> ClientError {
-        let message = plain_message(&self.code, &self.message);
-        let (code, action, message) = if leaves_outcome_unknown(self.method, &self.code) {
+        let message = plain_message(self.code, &self.message);
+        let (code, action, message) = if leaves_outcome_unknown(self.method, self.code) {
             (
                 ErrorCode::OutcomeUnknown,
                 UserAction::CheckTheOutcome,
@@ -668,7 +675,7 @@ impl Refusal {
                 ),
             )
         } else {
-            let (code, action) = classify(&self.code, self.status);
+            let (code, action) = classify(self.code, self.status);
             (code, action, message)
         };
         ClientError::Refused {
@@ -687,9 +694,9 @@ impl Refusal {
 /// request reaches it as an error, and for those what matters is what the refusal means: nothing
 /// ran, nothing was recorded, and asking again can succeed only once the service's cutoff falls
 /// behind the clocks.
-fn plain_message(code: &str, message: &ServiceMessage) -> Shown {
+fn plain_message(code: Option<&str>, message: &ServiceMessage) -> Shown {
     match code {
-        "SIGNED_BEFORE_CUTOFF" => Shown::said(
+        Some("SIGNED_BEFORE_CUTOFF") => Shown::said(
             "nothing ran and nothing was recorded: the service holds this request as signed \
              before its collection's cutoff, which runs ahead of the clocks, and asking again can \
              succeed only once the cutoff falls behind them",
@@ -775,7 +782,10 @@ fn answer_of(answer: &ServiceHttpAnswer, method: Method) -> Result<Answer> {
     Ok(Answer::Refused(Refusal {
         method,
         status: answer.status,
-        code: named.code,
+        code: SERVICE_CODES
+            .iter()
+            .copied()
+            .find(|known| *known == named.code),
         message: ServiceMessage::from_refusal(named.message),
         retry_after_seconds: named.retry_after_seconds,
         answer: answer.body.clone(),
@@ -801,6 +811,30 @@ fn content_of(answer: ServiceHttpAnswer, method: Method) -> Result<Content> {
         )),
     }
 }
+
+/// Every refusal code this client's service contract names: the codes [`classify`] maps, which
+/// are also every code an adapter reads a refusal by. A refusal keeps the one it named, or none.
+const SERVICE_CODES: [&str; 19] = [
+    "UNAUTHENTICATED",
+    "REAUTHENTICATION_REQUIRED",
+    "FORBIDDEN",
+    "RATE_LIMITED",
+    "QUOTA_EXHAUSTED",
+    "NOT_CONFIGURED",
+    "INTERNAL",
+    "INVALID_REQUEST",
+    "INVALID_ARGUMENT",
+    "NOT_FOUND",
+    "METHOD_NOT_ALLOWED",
+    "ID_CONFLICT",
+    "CONFLICT",
+    "REQUEST_FENCED",
+    "COLLECTION_ABSENT",
+    "KEY_EPOCH_RETIRED",
+    "SIGNED_BEFORE_CUTOFF",
+    "COLLECTION_DELETED",
+    "SERVICE_UNAVAILABLE",
+];
 
 /// The protocol code one service error code means, and what a person does about it.
 ///
@@ -859,26 +893,26 @@ fn content_of(answer: ServiceHttpAnswer, method: Method) -> Result<Content> {
 /// the request, and refreshing the view is what a person does. A storage retention change reads
 /// its conflict as an answer carrying the retention as it stands; one whose members that adapter
 /// cannot read, and a conflict from any other method, reach a caller as this.
-fn classify(code: &str, status: u16) -> (ErrorCode, UserAction) {
+fn classify(code: Option<&str>, status: u16) -> (ErrorCode, UserAction) {
     match code {
-        "UNAUTHENTICATED" => (ErrorCode::PermissionDenied, UserAction::FixConfiguration),
-        "REAUTHENTICATION_REQUIRED" => (ErrorCode::PermissionDenied, UserAction::SignIn),
-        "FORBIDDEN" => (ErrorCode::PermissionDenied, UserAction::FixConfiguration),
-        "RATE_LIMITED" => (ErrorCode::RateLimited, UserAction::Wait),
-        "QUOTA_EXHAUSTED" => (ErrorCode::QuotaExceeded, UserAction::Wait),
-        "NOT_CONFIGURED" => (ErrorCode::HostNotConfigured, UserAction::FixConfiguration),
-        "INTERNAL" => (ErrorCode::UpstreamUnavailable, UserAction::Wait),
-        "INVALID_REQUEST" | "INVALID_ARGUMENT" | "NOT_FOUND" | "METHOD_NOT_ALLOWED" => {
+        Some("UNAUTHENTICATED") => (ErrorCode::PermissionDenied, UserAction::FixConfiguration),
+        Some("REAUTHENTICATION_REQUIRED") => (ErrorCode::PermissionDenied, UserAction::SignIn),
+        Some("FORBIDDEN") => (ErrorCode::PermissionDenied, UserAction::FixConfiguration),
+        Some("RATE_LIMITED") => (ErrorCode::RateLimited, UserAction::Wait),
+        Some("QUOTA_EXHAUSTED") => (ErrorCode::QuotaExceeded, UserAction::Wait),
+        Some("NOT_CONFIGURED") => (ErrorCode::HostNotConfigured, UserAction::FixConfiguration),
+        Some("INTERNAL") => (ErrorCode::UpstreamUnavailable, UserAction::Wait),
+        Some("INVALID_REQUEST" | "INVALID_ARGUMENT" | "NOT_FOUND" | "METHOD_NOT_ALLOWED") => {
             (ErrorCode::InvalidArgument, UserAction::Update)
         }
-        "ID_CONFLICT" => (ErrorCode::IdConflict, UserAction::Update),
-        "CONFLICT" => (ErrorCode::DraftConflict, UserAction::Resync),
-        "REQUEST_FENCED" => (ErrorCode::PermissionDenied, UserAction::Nothing),
-        "COLLECTION_ABSENT" => (ErrorCode::UnknownSession, UserAction::Nothing),
-        "KEY_EPOCH_RETIRED" => (ErrorCode::ResyncRequired, UserAction::Resync),
-        "SIGNED_BEFORE_CUTOFF" => (ErrorCode::ClockUntrusted, UserAction::Wait),
-        "COLLECTION_DELETED" => (ErrorCode::PermissionDenied, UserAction::FixConfiguration),
-        "SERVICE_UNAVAILABLE" => (ErrorCode::ServiceCapacity, UserAction::Wait),
+        Some("ID_CONFLICT") => (ErrorCode::IdConflict, UserAction::Update),
+        Some("CONFLICT") => (ErrorCode::DraftConflict, UserAction::Resync),
+        Some("REQUEST_FENCED") => (ErrorCode::PermissionDenied, UserAction::Nothing),
+        Some("COLLECTION_ABSENT") => (ErrorCode::UnknownSession, UserAction::Nothing),
+        Some("KEY_EPOCH_RETIRED") => (ErrorCode::ResyncRequired, UserAction::Resync),
+        Some("SIGNED_BEFORE_CUTOFF") => (ErrorCode::ClockUntrusted, UserAction::Wait),
+        Some("COLLECTION_DELETED") => (ErrorCode::PermissionDenied, UserAction::FixConfiguration),
+        Some("SERVICE_UNAVAILABLE") => (ErrorCode::ServiceCapacity, UserAction::Wait),
         _ if status >= 500 => (ErrorCode::UpstreamUnavailable, UserAction::Wait),
         _ => (ErrorCode::InvalidArgument, UserAction::Update),
     }
@@ -935,8 +969,8 @@ fn unanswered(method: Method, status: u16, error: ClientError) -> Unanswered {
 /// about whether the request ran, as a gateway's lost answer does not ([`unanswered`]), and it is
 /// an unknown outcome, never sent again. For any other request it is the transient failure
 /// [`classify`] names.
-fn leaves_outcome_unknown(method: Method, code: &str) -> bool {
-    code == "INTERNAL" && !repeat_is_safe(method)
+fn leaves_outcome_unknown(method: Method, code: Option<&str>) -> bool {
+    code == Some("INTERNAL") && !repeat_is_safe(method)
 }
 
 /// Whether a request of `method` may be sent again, signed afresh, after its answer was lost.
@@ -1154,7 +1188,7 @@ mod tests {
         let Answer::Refused(refusal) = answer else {
             panic!("a refusal: {answer:?}");
         };
-        assert_eq!(refusal.code(), "KEY_EPOCH_RETIRED");
+        assert_eq!(refusal.code(), Some("KEY_EPOCH_RETIRED"));
         assert_eq!(
             refusal
                 .members::<Epoch>("an epoch")
@@ -1271,7 +1305,7 @@ mod tests {
         let Answer::Refused(refusal) = answer else {
             panic!("a refusal: {answer:?}");
         };
-        assert_eq!(refusal.code(), "KEY_EPOCH_RETIRED");
+        assert_eq!(refusal.code(), Some("KEY_EPOCH_RETIRED"));
     }
 
     #[test]
@@ -1691,7 +1725,7 @@ mod tests {
                 body: br#"{"ok":false,"error":{"code":"INTERNAL","message":"Not now."}}"#.to_vec(),
             }));
             match dispatched(&service(&wire), method).await {
-                Ok(Answer::Refused(refusal)) => assert_eq!(refusal.code(), "INTERNAL"),
+                Ok(Answer::Refused(refusal)) => assert_eq!(refusal.code(), Some("INTERNAL")),
                 other => panic!("{method:?}: the service's refusal is an answer: {other:?}"),
             }
         }
@@ -1737,7 +1771,7 @@ mod tests {
                     Ok(Answer::Refused(refusal)) => refusal,
                     other => panic!("{method:?} {status}: the service's refusal: {other:?}"),
                 };
-                assert_eq!(refusal.code(), "INTERNAL");
+                assert_eq!(refusal.code(), Some("INTERNAL"));
                 let error = refusal.into_error();
                 assert_eq!(
                     error.code(),
@@ -1822,7 +1856,7 @@ mod tests {
                 .to_vec(),
         }));
         match send(&service(&wire), Some(&account)).await {
-            Ok(Answer::Refused(refusal)) => assert_eq!(refusal.code(), "COLLECTION_ABSENT"),
+            Ok(Answer::Refused(refusal)) => assert_eq!(refusal.code(), Some("COLLECTION_ABSENT")),
             other => panic!("a refusal is an answer: {other:?}"),
         }
     }
@@ -2237,7 +2271,7 @@ mod tests {
                     .to_vec(),
         }));
         match read(&wire).await {
-            Ok(Content::Refused(refusal)) => assert_eq!(refusal.code(), "NOT_FOUND"),
+            Ok(Content::Refused(refusal)) => assert_eq!(refusal.code(), Some("NOT_FOUND")),
             other => panic!("a refusal: {other:?}"),
         }
 
@@ -2316,5 +2350,76 @@ mod tests {
             };
             assert_eq!(retry_after_seconds, Some(2));
         }
+    }
+
+    /// A refusal as its service sent it, with `code` as the code it names.
+    fn refused_with(code: &str, status: u16) -> ServiceHttpAnswer {
+        let body =
+            serde_json::json!({ "ok": false, "error": { "code": code, "message": "refused" } });
+        ServiceHttpAnswer {
+            status,
+            body: serde_json::to_vec(&body).expect("a body"),
+        }
+    }
+
+    /// A refusal's code is said when the service's contract names it and is replaced otherwise,
+    /// so a code the service or something in front of it wrote is never rendered. Planted as the
+    /// code in each spelling a code could carry it, the marker is in neither `Debug` form of the
+    /// refusal, of the answer it arrived in or of the content it refused, and the refusal keeps no
+    /// code at all; the error it becomes is classified by its status alone.
+    #[test]
+    fn a_refusal_code_the_contract_does_not_name_is_never_rendered() {
+        use crate::shown::marker::{assert_unmarked, debug_renderings, planted_spellings};
+
+        for planted in planted_spellings() {
+            let answer = refused_with(&planted, 418);
+            let Ok(Answer::Refused(refusal)) = answer_of(&answer, Method::MailboxRead) else {
+                panic!("a refusal");
+            };
+            assert_eq!(refusal.code(), None);
+            renders_only(
+                &refusal,
+                r#"Refusal{code:"[acodethisclientdoesnotknow]",status:418,..}"#,
+            );
+            let mut renderings = debug_renderings(&refusal);
+            let Ok(content) = content_of(refused_with(&planted, 418), Method::MailboxRead) else {
+                panic!("a refusal of content");
+            };
+            renderings.extend(debug_renderings(&content));
+            let answered = answer_of(&answer, Method::MailboxRead).expect("a refusal");
+            renderings.extend(debug_renderings(&answered));
+            assert_unmarked(&planted, &renderings);
+            assert_eq!(refusal.into_error().code(), ErrorCode::InvalidArgument);
+        }
+    }
+
+    /// The neutral control: a code the contract names is said as itself, in every rendering the
+    /// refusal has.
+    #[test]
+    fn a_refusal_code_the_contract_names_is_said_as_itself() {
+        let answer = refused_with("FORBIDDEN", 403);
+        let Ok(Answer::Refused(refusal)) = answer_of(&answer, Method::MailboxRead) else {
+            panic!("a refusal");
+        };
+        assert_eq!(refusal.code(), Some("FORBIDDEN"));
+        renders_only(&refusal, r#"Refusal{code:"FORBIDDEN",status:403,..}"#);
+        renders_only(
+            &answer_of(&answer, Method::MailboxRead).expect("a refusal"),
+            r#"Refused(Refusal{code:"FORBIDDEN",status:403,..})"#,
+        );
+        renders_only(
+            &content_of(refused_with("FORBIDDEN", 403), Method::MailboxRead).expect("a refusal"),
+            r#"Refused(Refusal{code:"FORBIDDEN",status:403,..})"#,
+        );
+    }
+
+    /// The exchange names its gateway and the kind of key that signs, and nothing else.
+    #[test]
+    fn a_signed_service_renders_its_gateway_and_its_signer() {
+        let wire = Wire::answering(Err(ErrorCode::UpstreamUnavailable));
+        renders_only(
+            &service(&wire),
+            r#"SignedService{gateway_origin:GatewayOrigin("https://reach.kala.to"),signer:Installation,..}"#,
+        );
     }
 }

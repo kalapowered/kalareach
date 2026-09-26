@@ -73,7 +73,6 @@ pub trait ControlTransport: Send + Sync + std::fmt::Debug {
 }
 
 /// A connection to a paired host over iroh.
-#[derive(Debug)]
 pub struct NetworkTransport {
     connection: Connection,
     connection_id: ConnectionId,
@@ -85,6 +84,8 @@ pub struct NetworkTransport {
     claimed: std::sync::atomic::AtomicBool,
     streams: Arc<StreamRegistry>,
 }
+
+crate::debug_fields!(NetworkTransport { connection_id });
 
 impl NetworkTransport {
     /// Dials a paired host and completes the handshake.
@@ -219,7 +220,7 @@ impl ControlTransport for NetworkTransport {
 /// cancellation safe, so a caller that drops a send part way through would otherwise leave a prefix
 /// of one frame on the stream and the next frame would be read as its continuation; the writer
 /// refuses to continue a stream an interrupted write left in pieces.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ControlSender {
     writer: Arc<Mutex<FrameWriter>>,
 }

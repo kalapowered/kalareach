@@ -307,7 +307,7 @@ impl ScreenModes {
 }
 
 /// What a bounded probe of the outer terminal established.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct Probe {
     /// The keyboard protocols the terminal reported.
     pub keyboard: KeyboardState,
@@ -609,7 +609,6 @@ mod unix {
     use crate::error::{CliError, Result};
 
     /// A handle on this process's controlling terminal.
-    #[derive(Debug)]
     pub struct ControllingTerminal {
         handle: File,
     }

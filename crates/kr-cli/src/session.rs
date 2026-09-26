@@ -26,7 +26,7 @@ use crate::error::{CliError, Result};
 use crate::terminal::ControllingTerminal;
 
 /// Why an attachment ended.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum AttachOutcome {
     /// The terminal's own input ended, or the user detached.
     Detached,
@@ -54,6 +54,34 @@ pub enum AttachOutcome {
     Disconnected,
     /// Input could not be delivered, and whether it arrived is not known.
     DeliveryUncertain(Shown),
+}
+
+impl std::fmt::Debug for AttachOutcome {
+    /// How the attachment ended, and whether typing was left undelivered. Never the closure record,
+    /// which names what the session ran.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Detached => formatter.write_str("Detached"),
+            Self::Closed { undelivered, .. } => formatter
+                .debug_struct("Closed")
+                .field("undelivered", undelivered)
+                .finish_non_exhaustive(),
+            Self::ClosureUnreadable {
+                detail,
+                undelivered,
+            } => formatter
+                .debug_struct("ClosureUnreadable")
+                .field("detail", detail)
+                .field("undelivered", undelivered)
+                .finish(),
+            Self::LeaseLost => formatter.write_str("LeaseLost"),
+            Self::Disconnected => formatter.write_str("Disconnected"),
+            Self::DeliveryUncertain(detail) => formatter
+                .debug_tuple("DeliveryUncertain")
+                .field(detail)
+                .finish(),
+        }
+    }
 }
 
 /// What the line about a closure adds when the session refused something typed here.

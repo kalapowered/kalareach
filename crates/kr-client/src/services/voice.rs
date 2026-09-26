@@ -160,9 +160,11 @@ impl fmt::Debug for VoiceSessionRequest {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("VoiceSessionRequest")
-            .field("host_id", &self.host_id)
             .field("duration_seconds", &self.duration_seconds)
-            .field("expected_rate_version", &self.expected_rate_version)
+            .field(
+                "expected_rate_version",
+                &self.expected_rate_version.as_ref().map(|_| "<present>"),
+            )
             .field("offer_sdp_bytes", &self.offer_sdp.len())
             .finish_non_exhaustive()
     }
@@ -239,7 +241,7 @@ impl VoiceSessionRequest {
 /* -------------------------------------------------------------------------- */
 
 /// A reservation as the caller needs to see it: what is held and until when.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VoiceHold {
     /// The reservation.
@@ -253,7 +255,7 @@ pub struct VoiceHold {
 }
 
 /// The rate a call was authorised under. A later price change cannot enlarge it.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VoiceRateQuote {
     /// Operator-configured version of the rate table this call accepted.
@@ -265,6 +267,8 @@ pub struct VoiceRateQuote {
     /// ISO 4217 code the amounts are in.
     pub currency: String,
 }
+
+crate::debug_fields!(VoiceRateQuote { minimum_seconds });
 
 impl VoiceRateQuote {
     /// Minor units per second as a number, when the service wrote one this client can read.
@@ -293,7 +297,7 @@ impl VoiceRateQuote {
 /// Every value is the deployment's own configuration or a constant of its contract, and nothing in
 /// it is about the caller. The wordings are the deployment's own, and a host carries them to a
 /// person unchanged rather than keeping a second copy that could drift from them.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VoiceMetadata {
     /// Whether an operator has managed voice open. False is the circuit breaker: a call started
@@ -381,10 +385,6 @@ impl fmt::Debug for VoiceSession {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("VoiceSession")
-            .field("call_id", &self.call_id)
-            .field("attempt_id", &self.attempt_id)
-            .field("model", &self.model)
-            .field("closes_at", &self.closes_at)
             .field("answer_sdp_bytes", &self.answer_sdp.len())
             .field("replayed", &self.replayed)
             .finish_non_exhaustive()
@@ -458,7 +458,7 @@ impl crate::shown::Said for VoiceRefusalReason {
 crate::display_as_said!(VoiceRefusalReason);
 
 /// A refusal, as this client reports it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct VoiceRefusal {
     /// The service's own reason.
     pub reason: VoiceRefusalReason,
@@ -472,8 +472,10 @@ pub struct VoiceRefusal {
     pub call_id: Option<String>,
 }
 
+crate::debug_fields!(VoiceRefusal { reason });
+
 /// What a creation request was answered with.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum VoiceStart {
     /// A call is running.
     Started(Box<VoiceSession>),
@@ -504,6 +506,24 @@ pub enum VoiceStart {
     },
     /// The service refused, and what still works.
     Refused(Box<VoiceRefusal>),
+}
+
+impl fmt::Debug for VoiceStart {
+    /// Which answer it is, and the session or the refusal as their own renderings give them. Never
+    /// an identifier or a message, which are the service's text.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Started(session) => formatter.debug_tuple("Started").field(session).finish(),
+            Self::CreationUnknown { .. } => formatter
+                .debug_struct("CreationUnknown")
+                .finish_non_exhaustive(),
+            Self::RateChanged { rate, .. } => formatter
+                .debug_struct("RateChanged")
+                .field("rate", rate)
+                .finish_non_exhaustive(),
+            Self::Refused(refusal) => formatter.debug_tuple("Refused").field(refusal).finish(),
+        }
+    }
 }
 
 impl VoiceStart {
@@ -537,7 +557,7 @@ impl VoiceStart {
 }
 
 /// What ending a call did.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VoiceClosure {
     /// The call that ended.
@@ -654,9 +674,11 @@ impl fmt::Debug for VoiceContextFrame {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("VoiceContextFrame")
-            .field("id", &self.id)
             .field("command", &self.command)
-            .field("delegation_id", &self.delegation_id)
+            .field(
+                "delegation",
+                &self.delegation_id.as_ref().map(|_| "<present>"),
+            )
             .field(
                 "content_bytes",
                 &self.content.as_ref().map_or(0, String::len),
@@ -712,7 +734,7 @@ impl VoiceContextFrame {
 /// The variants are the frames this build knows. Anything else is [`Self::Unknown`], which records
 /// the type and carries nothing: section 15 ¶6 says an unknown event is never reflected into a
 /// host action, and a variant with no payload is the shortest way to mean it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum VoiceControlEvent {
     /// The call is attached and ready to carry context requests.
     Ready {
@@ -786,6 +808,55 @@ pub enum VoiceControlEvent {
         /// The type the service named.
         frame_type: String,
     },
+}
+
+impl fmt::Debug for VoiceControlEvent {
+    /// Which event it is and its numbers. Never an identifier, a reason, a note or a message,
+    /// which are the service's or the provider's text.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Ready { delegations, .. } => formatter
+                .debug_struct("Ready")
+                .field("delegations", &delegations.len())
+                .finish_non_exhaustive(),
+            Self::HeartbeatAcknowledged { remaining_seconds } => formatter
+                .debug_struct("HeartbeatAcknowledged")
+                .field("remaining_seconds", remaining_seconds)
+                .finish(),
+            Self::ContextAccepted { .. } => formatter
+                .debug_struct("ContextAccepted")
+                .finish_non_exhaustive(),
+            Self::ContextAdmitted { .. } => formatter
+                .debug_struct("ContextAdmitted")
+                .finish_non_exhaustive(),
+            Self::ContextRefused { .. } => formatter
+                .debug_struct("ContextRefused")
+                .finish_non_exhaustive(),
+            Self::Usage {
+                seconds,
+                provisional,
+            } => formatter
+                .debug_struct("Usage")
+                .field("seconds", seconds)
+                .field("provisional", provisional)
+                .finish(),
+            Self::Closed {
+                seconds,
+                provisional,
+                ..
+            } => formatter
+                .debug_struct("Closed")
+                .field("seconds", seconds)
+                .field("provisional", provisional)
+                .finish_non_exhaustive(),
+            Self::Notice { .. } => formatter.debug_struct("Notice").finish_non_exhaustive(),
+            Self::Delegation { offset_ms, .. } => formatter
+                .debug_struct("Delegation")
+                .field("offset_ms", offset_ms)
+                .finish_non_exhaustive(),
+            Self::Unknown { .. } => formatter.debug_struct("Unknown").finish_non_exhaustive(),
+        }
+    }
 }
 
 /// Reads one control-socket frame.
@@ -1492,10 +1563,11 @@ pub struct StoredAccountToken {
 impl fmt::Debug for StoredAccountToken {
     /// The origin without anything in front of the host, the scopes and the expiry.
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let scopes: Shown = scope_summary(&self.scopes);
         formatter
             .debug_struct("StoredAccountToken")
             .field("origin", &Shown::address(&self.origin))
-            .field("scopes", &scope_summary(&self.scopes))
+            .field("scopes", &scopes)
             .field("expires_at_ms", &self.expires_at_ms)
             .finish_non_exhaustive()
     }
@@ -1620,7 +1692,7 @@ impl fmt::Debug for AccountTokenFile {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("AccountTokenFile")
-            .field("path", &self.path)
+            .field("path", &Shown::host_path(&self.path))
             .field("origin", &self.origin.as_deref().map(Shown::address))
             .finish()
     }
@@ -1746,7 +1818,7 @@ mod tests {
         renders_only(
             &request,
             &format!(
-                r#"VoiceSessionRequest{{host_id:"33333333-3333-3333-3333-333333333333",duration_seconds:300,expected_rate_version:Some("2026-09-a"),offer_sdp_bytes:{},..}}"#,
+                r#"VoiceSessionRequest{{duration_seconds:300,expected_rate_version:Some("<present>"),offer_sdp_bytes:{},..}}"#,
                 offer.len()
             ),
         );
@@ -1779,7 +1851,7 @@ mod tests {
         renders_only(
             &session,
             &format!(
-                r#"VoiceSession{{call_id:"call-1",attempt_id:"attempt-1",model:"a-model",closes_at:"2026-09-21T10:00:00Z",answer_sdp_bytes:{},replayed:false,..}}"#,
+                r#"VoiceSession{{answer_sdp_bytes:{},replayed:false,..}}"#,
                 answer_sdp.len()
             ),
         );
@@ -1799,7 +1871,7 @@ mod tests {
         renders_only(
             &frame,
             &format!(
-                r#"VoiceContextFrame{{id:"request-1",command:Instructions,delegation_id:None,content_bytes:{},..}}"#,
+                r#"VoiceContextFrame{{command:Instructions,delegation:None,content_bytes:{},..}}"#,
                 NEVER_RENDERED.len()
             ),
         );
