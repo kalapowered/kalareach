@@ -45,7 +45,7 @@
 //! placed stays recorded until the directory is back.
 
 mod journal;
-mod json;
+pub(crate) mod json;
 mod tree;
 
 use std::collections::BTreeSet;
