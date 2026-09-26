@@ -1099,7 +1099,9 @@ Its description carries the
 environment's full identifier, and the principal and the description together say whose it is: a
 task under the name that is not this environment's own is never replaced or removed. `kr new` runs
 it when no daemon answers, having left a request its starter takes once, and the starter starts the
-daemon, so the daemon and every process it starts are outside the command's jobs. A task that logs
+daemon, so the daemon and every process it starts are outside the command's jobs. The starter gives
+the daemon a console of its own that shows no window, and the console programs the daemon runs share
+it rather than each opening a window on the signed-in desktop. A task that logs
 on as the signed-in user runs its starter in a job of the Task Scheduler's own that neither kills its
 members on close nor lets them leave, so the daemon stays in that job. That holds up only while the
 Task Scheduler does not end the job before the user's session ends, and the job's own limits cannot
