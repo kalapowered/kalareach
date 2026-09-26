@@ -573,8 +573,8 @@ in four kinds of event and always in this order:
 
 | Event | What it carries |
 | --- | --- |
-| `session.projection.reset` | Discard what is on the screen; a snapshot follows. It names the generation and why |
-| `session.projection.snapshot` | Everything a screen is apart from its rows, at one output cursor |
+| `session.projection.reset` | Discard what is on the screen; a snapshot follows. It names the generation, why, and the revision of the attachment's window the next screen is drawn for |
+| `session.projection.snapshot` | Everything a screen is apart from its rows, at one output cursor, with the revision of the window it is drawn for |
 | `session.projection.rows` | One page of rows, for a named buffer, with *that buffer's own* oldest retained row and eviction marker. The last page clears `more` |
 | `session.projection.delta` | The rows that changed since a named base, and the state that changed with them |
 
@@ -657,7 +657,50 @@ the live screen, at a parser-ground boundary like every other transition into fo
 An attachment that is shown the live screen and no retained content beyond it cannot place its
 window in the history at all. That is section 10's live-screen exception: the rows above the screen
 are content the exception never reached, so the report is refused rather than quietly answered with
-the live screen, which would leave the client drawing as though it had moved.
+the live screen, which would leave the client drawing as though it had moved. It can still move its
+window down or across the live screen, which is its own.
+
+### Further down the live screen, and across it
+
+A window shorter than the grid can start below the live screen's first line, and one narrower than
+the grid can start at a later column. `attachment.viewport` names the line as `{"line": …}`, and
+the column in `column`, which every report carries, so a report of a new size keeps the column the
+window had. The host holds each to the last line and column the whole window still fits from and
+answers with where the window landed: a line below the first as a line, the first line as no
+position at all. It keeps the line rather than a row. The live screen moves whenever the
+application writes, and a window on it goes on showing the same lines of it. A buffer switch keeps
+the line and the column, because both buffers have the same ones, and so does a canonical resize,
+whose screen draws the window from the last line and column it fits from in the new grid.
+
+A row, or a distance above, that lands at or below the live screen's first row is still the live
+screen from its first line. So a window leaves the live screen's first line and column only when a
+report names a line or a column, and a client that forwards pointer reports as its terminal wrote
+them, as the command-line tool does, is never shown a window whose cells are not the canonical
+cells. A client that does move its window maps a pointer event at display cell (x, y) to canonical
+cell (column + x, line + y) of the live screen before it encodes one, and sends nothing for a cell
+off the grid or in the history.
+
+### Which screen answers a report
+
+A report's answer and the screens it causes reach a client from two writers, the connection's and
+the subscription's, so either can arrive first. The session's generation and cursor cannot say which
+screen answers which report: a window moved on a session that is not writing is drawn again at the
+same ones. So the host keeps a revision of each attachment's window. It starts at zero and moves on
+by one whenever that window changes: a report of another size, place or column, the owner's own
+resize, or a buffer switch or full reset that brings a window above the live page back to the live
+screen. The answer to `attachment.viewport` names the revision the report left, and the reset and
+the snapshot of every screen name the revision of the window they are drawn for.
+
+A report that moved the window has its screen queued before its answer is written. One that changed
+the size or the presentation is drawn on the client's next subscription, whose first screen names
+the report's revision or a later one. One that changed nothing names the revision the client already
+holds, and nothing is sent; a refused one changes nothing, the revision included. A screen drawn
+again for the same window, for new output, an eviction or a canonical resize, names the same
+revision as before. A client waiting on a report therefore takes the first complete screen naming
+the answer's revision or a later one, and never takes where its window is from an older screen: a
+repaint queued before the report names an earlier revision. The host serves the raw stream only to a
+window at the live screen's first line and column, so a client whose next subscription begins with
+the stream knows where its window is without a screen.
 
 Moving the window is not input: section 8 puts passive scrollback with focus events and terminal
 replies among the things that never seize the input lease, and nothing on this path touches it.

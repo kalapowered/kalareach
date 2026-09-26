@@ -33,8 +33,10 @@
 //! handed complete spans the engine has cleared, each one beginning where a sequence begins, so
 //! there is no moment at which it could be handed the middle of an escape sequence.
 
+use kr_protocol::attachment::ViewportPosition;
 use kr_protocol::ids::{AttachmentId, InputLeaseEpoch};
 use kr_protocol::projection::ProjectionResetReason;
+use kr_protocol::scalars::U64;
 use kr_protocol::session::Dimensions;
 use kr_term::budget::GridSize;
 use kr_term::engine::{Engine, EngineConfig, FeedOutcome};
@@ -118,55 +120,87 @@ impl Filtered {
 
 /// Where one client's window sits in the session's rows.
 ///
-/// The live screen is where every attachment starts and where it returns to. A window above it is
-/// named by a stable row identifier, because the live screen moves whenever the application writes
-/// and a window measured from it would slide away from what the person is reading.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// The live screen from its first line is where every attachment starts and where it returns to.
+/// A window above it is named by a stable row identifier, because the live screen moves whenever
+/// the application writes and a window measured from it would slide away from what the person is
+/// reading. A window further down the live screen is named by its line, for the opposite reason: it
+/// is on the live screen, and it goes on showing the same lines of it as the application writes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ViewportAnchor {
-    /// The live screen.
-    #[default]
-    LiveScreen,
+    /// The live screen, from this line of it.
+    Live(u32),
     /// The retained row the window starts at.
     History(i64),
 }
 
-impl ViewportAnchor {
-    /// The anchor for a recorded top row, where `None` is the live screen.
-    #[must_use]
-    pub const fn of(top_row: Option<i64>) -> Self {
-        match top_row {
-            None => Self::LiveScreen,
-            Some(row) => Self::History(row),
-        }
+impl Default for ViewportAnchor {
+    /// The live screen from its first line.
+    fn default() -> Self {
+        Self::Live(0)
     }
+}
 
+impl ViewportAnchor {
     /// Whether this window is above the live screen.
     #[must_use]
     pub const fn is_history(self) -> bool {
         matches!(self, Self::History(_))
     }
+
+    /// The stable row a window above the live screen starts at, or `None` for one on it.
+    #[must_use]
+    pub const fn history_row(self) -> Option<i64> {
+        match self {
+            Self::History(row) => Some(row),
+            Self::Live(_) => None,
+        }
+    }
+
+    /// Where this window is, as a viewport report's answer says it.
+    ///
+    /// A row for a window above the live screen, a line for one further down it, and nothing for
+    /// the live screen from its first line, which is what no position at all means.
+    #[must_use]
+    pub fn position(self) -> Option<ViewportPosition> {
+        match self {
+            Self::History(row) => Some(ViewportPosition::Row(U64::new(
+                u64::try_from(row).unwrap_or_default(),
+            ))),
+            Self::Live(0) => None,
+            Self::Live(line) => Some(ViewportPosition::Line(U64::new(u64::from(line)))),
+        }
+    }
 }
 
-/// What one client is looking through: a size, and a place in the session's rows.
+/// What one client is looking through: a size, a place in the session's rows, a first column, and
+/// the revision of that window.
 ///
-/// The two travel together because neither answers the question on its own. A size says how much
-/// of the grid the window holds; the anchor says which part of it. A caller that carried only the
-/// size would draw the right number of rows from the wrong place.
+/// They travel together because none of them answers the question on its own. A size says how much
+/// of the grid the window holds; the anchor and the column say which part of it. A caller that
+/// carried only the size would draw the right number of cells from the wrong place. The revision
+/// is what every screen drawn for the window names, so a client can tell which window a screen is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Window {
     /// The attachment's own physical dimensions.
     pub dimensions: Dimensions,
-    /// Where the window sits.
+    /// Where the window sits in the rows.
     pub anchor: ViewportAnchor,
+    /// The first canonical column the window shows, as the attachment asked for it. The window is
+    /// drawn from it held to the grid, which a canonical resize can make narrower than it was.
+    pub column: u32,
+    /// The revision of the window, which the host advances whenever it changes.
+    pub revision: u64,
 }
 
 impl Window {
-    /// A window of these dimensions on the live screen.
+    /// A window of these dimensions on the live screen, from its first line and column.
     #[must_use]
     pub const fn live(dimensions: Dimensions) -> Self {
         Self {
             dimensions,
-            anchor: ViewportAnchor::LiveScreen,
+            anchor: ViewportAnchor::Live(0),
+            column: 0,
+            revision: 0,
         }
     }
 }
@@ -391,22 +425,24 @@ impl TerminalEngine {
         self.collect(&outcome, gate, now_ms)
     }
 
-    /// Returns the window a terminal of these dimensions looks at.
+    /// Returns the part of the grid a window of these dimensions and this column looks at.
     ///
-    /// The window is anchored at the left of the grid and at the top of the visible page: nothing
-    /// is reflowed, so a terminal narrower than the session sees the left of each line rather than
-    /// a rewrapped approximation of all of it. The top row is filled in when the snapshot is taken,
-    /// because it is the snapshot that says which canonical rows the page currently holds.
+    /// Nothing is reflowed, so a terminal narrower than the session sees a span of each line rather
+    /// than a rewrapped approximation of all of it: the span that starts at the window's column,
+    /// held to the last column the whole window still fits from. The top row is filled in when the
+    /// snapshot is taken, because it is the snapshot that says which canonical rows the page
+    /// currently holds.
     #[must_use]
-    pub fn viewport_for(&self, dimensions: Dimensions) -> Viewport {
-        let rows = u32::try_from(dimensions.rows.get()).unwrap_or(u32::MAX);
-        let cols = u32::try_from(dimensions.columns.get()).unwrap_or(u32::MAX);
+    pub fn viewport_for(&self, window: Window) -> Viewport {
+        let rows = u32::try_from(window.dimensions.rows.get()).unwrap_or(u32::MAX);
+        let cols = u32::try_from(window.dimensions.columns.get()).unwrap_or(u32::MAX);
         let canonical = grid_size(self.canonical).unwrap_or(GridSize::new(1, 1));
+        let cols = cols.min(canonical.cols);
         Viewport {
             top_row: 0,
             rows: rows.min(canonical.rows),
-            left_col: 0,
-            cols: cols.min(canonical.cols),
+            left_col: window.column.min(canonical.cols - cols),
+            cols,
         }
     }
 
@@ -428,7 +464,7 @@ impl TerminalEngine {
         keyboard: crate::render::Keyboard,
         scope: crate::render::Scope,
     ) -> (u64, Restoration, Filtered) {
-        let mut viewport = self.viewport_for(dimensions);
+        let mut viewport = self.viewport_for(Window::live(dimensions));
         let (mut snapshot, settled) = self.engine.snapshot(viewport, now_ms);
         let settled = self.collect(&settled, gate, now_ms);
         // The page's own first row is what the window is anchored to. It is read from the snapshot
@@ -495,12 +531,12 @@ impl TerminalEngine {
     /// both move it and a client holding rows by their identifiers has to be told which of them
     /// the page now holds. A window anchored above the live page is resolved the same way: it is
     /// held between the oldest row the session still retains and the live page's own first row, so
-    /// a client that names an evicted row is shown the oldest page there is and one that names a
-    /// row inside the live page is shown the live page.
+    /// a client that names an evicted row is shown the oldest page there is. A window on the live
+    /// page starts at its line of it, held to the last line the whole window still fits from.
     #[must_use]
     pub fn anchored_viewport(&self, window: Window) -> Viewport {
-        let mut viewport = self.viewport_for(window.dimensions);
-        viewport.top_row = self.resolve(window.anchor);
+        let mut viewport = self.viewport_for(window);
+        viewport.top_row = self.resolve(window.anchor, viewport.rows);
         viewport
     }
 
@@ -510,11 +546,13 @@ impl TerminalEngine {
         self.engine.grid().visible_top_row()
     }
 
-    /// The stable row an anchor names right now.
-    fn resolve(&self, anchor: ViewportAnchor) -> i64 {
+    /// The stable row an anchor names right now, for a window showing `rows` rows.
+    fn resolve(&self, anchor: ViewportAnchor, rows: u32) -> i64 {
         let live = self.engine.grid().visible_top_row();
         match anchor {
-            ViewportAnchor::LiveScreen => live,
+            ViewportAnchor::Live(line) => {
+                live.saturating_add(i64::from(line.min(self.last_line(rows))))
+            }
             ViewportAnchor::History(row) => {
                 let (oldest, _) = self.engine.grid().stable_range();
                 row.clamp(oldest, live)
@@ -522,32 +560,73 @@ impl TerminalEngine {
         }
     }
 
-    /// Where a reported position lands, as a retained row, or `None` for the live screen.
+    /// The last line of the live screen a window showing `rows` rows still fits from.
+    fn last_line(&self, rows: u32) -> u32 {
+        let canonical = grid_size(self.canonical).unwrap_or(GridSize::new(1, 1));
+        canonical.rows.saturating_sub(rows)
+    }
+
+    /// The rows a window of these dimensions is shown, which is never more than the grid has.
+    fn rows_shown(&self, dimensions: Dimensions) -> u32 {
+        let canonical = grid_size(self.canonical).unwrap_or(GridSize::new(1, 1));
+        u32::try_from(dimensions.rows.get())
+            .unwrap_or(u32::MAX)
+            .min(canonical.rows)
+    }
+
+    /// Where a reported column lands for a window of these dimensions.
+    ///
+    /// The last column the whole window still fits from, at most. A window as wide as the grid, or
+    /// wider, has only the first.
+    #[must_use]
+    pub fn resolve_column(&self, column: u64, dimensions: Dimensions) -> u32 {
+        let canonical = grid_size(self.canonical).unwrap_or(GridSize::new(1, 1));
+        let cols = u32::try_from(dimensions.columns.get())
+            .unwrap_or(u32::MAX)
+            .min(canonical.cols);
+        u32::try_from(column)
+            .unwrap_or(u32::MAX)
+            .min(canonical.cols - cols)
+    }
+
+    /// Where a reported position lands for a window of these dimensions.
     ///
     /// `above` is resolved here, once, against the live screen as it stands at the moment of the
     /// report: it is the spelling for a client that has not been given a row identifier to name
-    /// yet, and what it means is a place rather than a distance kept.
+    /// yet, and what it means is a place rather than a distance kept. A line is kept as a line, held
+    /// to the last one the whole window still fits from, because a window on the live screen moves
+    /// with it.
     #[must_use]
     pub fn resolve_position(
         &self,
-        position: Option<kr_protocol::attachment::ViewportPosition>,
-    ) -> Option<i64> {
-        use kr_protocol::attachment::ViewportPosition;
-
+        position: Option<ViewportPosition>,
+        dimensions: Dimensions,
+    ) -> ViewportAnchor {
         let live = self.engine.grid().visible_top_row();
-        let asked = match position? {
-            ViewportPosition::Row(row) => i64::try_from(row.get()).unwrap_or(i64::MAX),
-            ViewportPosition::Above(rows) => {
+        let asked = match position {
+            None => return ViewportAnchor::default(),
+            Some(ViewportPosition::Line(line)) => {
+                let last = self.last_line(self.rows_shown(dimensions));
+                return ViewportAnchor::Live(
+                    u32::try_from(line.get()).unwrap_or(u32::MAX).min(last),
+                );
+            }
+            Some(ViewportPosition::Row(row)) => i64::try_from(row.get()).unwrap_or(i64::MAX),
+            Some(ViewportPosition::Above(rows)) => {
                 live.saturating_sub(i64::try_from(rows.get()).unwrap_or(i64::MAX))
             }
-            ViewportPosition::Line(_) => live,
         };
         let (oldest, _) = self.engine.grid().stable_range();
         let landed = asked.clamp(oldest, live);
         // A window at the live page's first row is the live screen, and saying so is what lets a
         // client that has scrolled back down stop naming a row and start following the session
-        // again.
-        (landed < live).then_some(landed)
+        // again. A row names a place in the history: a window moves down the live screen only
+        // when a report names a line of it.
+        if landed < live {
+            ViewportAnchor::History(landed)
+        } else {
+            ViewportAnchor::default()
+        }
     }
 
     /// Builds the events that install the canonical screen on a projected client.
@@ -568,14 +647,14 @@ impl TerminalEngine {
         budget: usize,
         scope: crate::render::Scope,
     ) -> Result<(crate::snapshot::Update, Filtered)> {
-        let viewport = self.viewport_for(window.dimensions);
+        let viewport = self.viewport_for(window);
         // The state without its rows, and then the rows a bounded run at a time as the pages are
         // built. Taking the whole screen first and paging it afterwards would hold the session
         // twice over: once as the engine's copy of it and once as the wire's.
         let (mut snapshot, settled) = self.engine.snapshot_without_rows(viewport, now_ms);
         let settled = self.collect(&settled, gate, now_ms);
         let mut viewport = viewport;
-        viewport.top_row = self.resolve(window.anchor);
+        viewport.top_row = self.resolve(window.anchor, viewport.rows);
         snapshot.viewport = viewport;
         let degraded = self.resident_state_truncated();
         let live = self.engine.grid().visible_top_row();
@@ -590,7 +669,15 @@ impl TerminalEngine {
                 live,
             );
             crate::snapshot::install(
-                &snapshot, viewport, live, reason, degraded, budget, scope, &rows,
+                &snapshot,
+                viewport,
+                live,
+                reason,
+                window.revision,
+                degraded,
+                budget,
+                scope,
+                &rows,
             )?
         } else {
             crate::snapshot::install(
@@ -598,6 +685,7 @@ impl TerminalEngine {
                 viewport,
                 live,
                 reason,
+                window.revision,
                 degraded,
                 budget,
                 scope,
@@ -920,7 +1008,7 @@ mod tests {
     #[test]
     fn a_smaller_terminal_is_shown_the_part_of_the_grid_it_has_room_for() {
         let engine = engine();
-        let viewport = engine.viewport_for(dimensions(40, 10));
+        let viewport = engine.viewport_for(Window::live(dimensions(40, 10)));
         assert_eq!(viewport.cols, 40);
         assert_eq!(viewport.rows, 10);
     }
@@ -928,7 +1016,7 @@ mod tests {
     #[test]
     fn a_larger_terminal_is_never_shown_more_grid_than_there_is() {
         let engine = engine();
-        let viewport = engine.viewport_for(dimensions(200, 60));
+        let viewport = engine.viewport_for(Window::live(dimensions(200, 60)));
         assert_eq!(viewport.cols, 80);
         assert_eq!(viewport.rows, 24);
     }

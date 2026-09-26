@@ -871,6 +871,42 @@ mod tests {
         );
     }
 
+    /// A screen names the window it was drawn for, and an update to it leaves that as it was: only
+    /// a fresh screen is drawn for another window.
+    #[test]
+    fn a_screen_keeps_the_window_revision_it_was_drawn_for() {
+        let mut projection = Projection::new();
+        let mut drawn_for = header(3, 40);
+        drawn_for.window_revision = U64::new(5);
+        projection.apply(ProjectionEvent::Snapshot(drawn_for));
+        projection.apply(ProjectionEvent::Rows(page(
+            3,
+            40,
+            vec![row(0, "ab", None), row(1, "cd", None)],
+            false,
+        )));
+        assert_eq!(
+            projection.screen().expect("a screen").window_revision,
+            5,
+            "the screen names the window its header named"
+        );
+        assert!(matches!(
+            projection.apply(ProjectionEvent::Delta(delta(
+                40,
+                44,
+                3,
+                vec![row(1, "ef", None)]
+            ))),
+            Applied::Updated(_)
+        ));
+        let screen = projection.screen().expect("still a screen");
+        assert_eq!(screen.cursor_at, 44);
+        assert_eq!(
+            screen.window_revision, 5,
+            "an update continues the screen, window and all"
+        );
+    }
+
     /// KR-REQ-08.83: a delta that names another base is refused, and what was held is discarded.
     #[test]
     fn a_delta_against_another_base_is_refused_and_discards_the_screen() {

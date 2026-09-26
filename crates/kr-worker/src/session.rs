@@ -1521,18 +1521,16 @@ impl Session {
         self.attachments.history_top_row(attachment_id)
     }
 
-    /// What one attachment is looking through: its own size, and where its window sits.
+    /// What one attachment is looking through: its own size, where its window sits, its first
+    /// column and the revision of that window.
     fn window_of(
         &self,
         attachment_id: AttachmentId,
         dimensions: Dimensions,
     ) -> crate::projection::Window {
-        crate::projection::Window {
-            dimensions,
-            anchor: crate::projection::ViewportAnchor::of(
-                self.attachments.history_top_row(attachment_id),
-            ),
-        }
+        self.attachments
+            .window(attachment_id, dimensions)
+            .unwrap_or(crate::projection::Window::live(dimensions))
     }
 
     /// Returns one attachment's own dimensions, falling back to the session's canonical geometry.
@@ -1850,7 +1848,14 @@ impl Session {
         })
     }
 
-    /// Records an attachment's own dimensions.
+    /// Records an attachment's own dimensions, where its window sits and its first column.
+    ///
+    /// The answer names the revision the report left the window at. A report that moved the
+    /// window has its screen queued on the attachment's own subscription here, under this lock and
+    /// so before the answer exists; one that changed the size or the presentation tells the
+    /// subscription to resynchronise, and the next subscription's first screen is drawn for the
+    /// window as it stands then; one that changed nothing is answered with the revision the window
+    /// already had, and nothing is sent.
     ///
     /// # Errors
     ///
@@ -1860,21 +1865,26 @@ impl Session {
         attachment_id: AttachmentId,
         dimensions: Dimensions,
         position: Option<kr_protocol::attachment::ViewportPosition>,
-        _column: u64,
+        column: u64,
     ) -> Result<crate::projection::Landed> {
         let before = self.presentation_of_attachment(attachment_id);
         let before_dimensions = self.attachments.own_dimensions(attachment_id).flatten();
-        let before_top_row = self.attachments.history_top_row(attachment_id);
+        let before_window = self.attachments.window(attachment_id, dimensions);
         // The same two answers the dispatch asked for before it marked the effect. Asked again
         // because this is callable on its own, and because asking twice costs a measurement while
         // not asking costs a refusal nobody can read.
         self.window_refusal(attachment_id, dimensions, position)?;
         // Resolved against the session as it stands now: an offset above the live screen is a
         // place, and the row it names is what the attachment holds from here.
-        let top_row = self.engine.resolve_position(position);
+        let anchor = self.engine.resolve_position(position, dimensions);
+        let column = self.engine.resolve_column(column, dimensions);
         let presentation = self
             .attachments
-            .viewport(attachment_id, dimensions, top_row)?;
+            .viewport(attachment_id, dimensions, anchor, column)?;
+        let window_revision = self
+            .attachments
+            .window(attachment_id, dimensions)
+            .map_or(0, |window| window.revision);
         // A window that changed size is looking at a different part of the grid, and one that
         // changed presentation is being served a different thing altogether. Either way what it
         // holds is no longer continuous with what it is about to be sent, so it is told now rather
@@ -1887,12 +1897,14 @@ impl Session {
         let no_longer_continuous = before != Some(presentation)
             || (presentation == TerminalPresentationMode::Viewport
                 && before_dimensions != Some(dimensions));
+        let moved =
+            before_window.is_none_or(|window| window.anchor != anchor || window.column != column);
         if no_longer_continuous {
             let next = self.history.next_cursor();
             let oldest = self.history.oldest_retained_cursor();
             self.hub
                 .require_resync(attachment_id, ResyncReason::ProjectionReset, next, oldest);
-        } else if before_top_row != top_row {
+        } else if moved {
             // The window moved without the terminal changing. Nothing about the session changed
             // either, so there is nothing for the client to ask again for: the pages that cover
             // where it is now looking are queued through its own subscription, charged to its own
@@ -1901,13 +1913,9 @@ impl Session {
         }
         Ok(crate::projection::Landed {
             presentation,
-            position: top_row.map(|row| {
-                kr_protocol::attachment::ViewportPosition::Row(U64::new(
-                    u64::try_from(row).unwrap_or_default(),
-                ))
-            }),
-            column: 0,
-            window_revision: 0,
+            position: anchor.position(),
+            column: u64::from(column),
+            window_revision,
         })
     }
 
@@ -3412,9 +3420,15 @@ impl Session {
         // page at all. A caller narrowed to the live screen is served the screen that is showing
         // and no retained content beyond it, and a window in the session's history is exactly that
         // content: it is refused rather than quietly answered with the live screen, because a
-        // client told its window moved would draw as though it had.
-        if position.is_some()
-            && self.content_scope(attachment_id) == crate::render::Scope::LiveScreen
+        // client told its window moved would draw as though it had. A line of the live screen is
+        // the live screen's own, so it may name one.
+        if matches!(
+            position,
+            Some(
+                kr_protocol::attachment::ViewportPosition::Row(_)
+                    | kr_protocol::attachment::ViewportPosition::Above(_)
+            )
+        ) && self.content_scope(attachment_id) == crate::render::Scope::LiveScreen
         {
             return Err(WorkerError::PresentationUnsupported {
                 detail: "this attachment is shown the live screen and no retained rows above it, \
@@ -3433,16 +3447,17 @@ impl Session {
         // it can be a larger screen than the one this subscriber was admitted for; being told the
         // window moved and then that the queue is full is two answers where there should be one.
         // The size is part of the question: the same row in a taller window is a larger screen.
-        let top_row = self.engine.resolve_position(position);
+        let anchor = self.engine.resolve_position(position, dimensions);
         let before_top_row = self.attachments.history_top_row(attachment_id);
         let before_dimensions = self.attachments.own_dimensions(attachment_id).flatten();
-        if top_row.is_some() && (top_row != before_top_row || before_dimensions != Some(dimensions))
+        if anchor.is_history()
+            && (anchor.history_row() != before_top_row || before_dimensions != Some(dimensions))
         {
             let limit = self.hub.limit_of(attachment_id);
             let minimum = self.engine.minimum_projection_install(
                 crate::projection::Window {
-                    dimensions,
-                    anchor: crate::projection::ViewportAnchor::of(top_row),
+                    anchor,
+                    ..crate::projection::Window::live(dimensions)
                 },
                 self.content_scope(attachment_id),
             )?;

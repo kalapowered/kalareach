@@ -56,12 +56,23 @@ pub struct Attachment {
     /// only *begin* at a boundary, so this is about the moment the transition would happen rather
     /// than about the attachment, and it is cleared the moment a boundary arrives.
     pub forwarding_held: bool,
-    /// The stable row this attachment's window starts at, when it is looking above the live page.
+    /// Where this attachment's window starts in the session's rows.
     ///
-    /// `None` is the live screen, which is where every attachment starts. It is a row identifier
-    /// rather than a distance, because the live screen moves whenever the application writes and a
-    /// window measured from it would slide away from what the person is reading.
-    pub history_top_row: Option<i64>,
+    /// The live screen from its first line is where every attachment starts. A window above the
+    /// live page is kept as a row identifier rather than a distance, because the live screen moves
+    /// whenever the application writes and a window measured from it would slide away from what the
+    /// person is reading; a window further down the live screen is kept as its line, because it
+    /// moves with the live screen.
+    pub anchor: crate::projection::ViewportAnchor,
+    /// The first canonical column this attachment's window shows, where its last report landed.
+    pub column: u32,
+    /// The revision of this attachment's window.
+    ///
+    /// It starts at zero and is advanced whenever the window kept here changes, whoever changes
+    /// it: a report of another size, place or column, the owner's own resize, and a projection
+    /// reset that brings a window above the live page back to the live screen. Every screen
+    /// installed on the attachment names the revision of the window it is drawn for.
+    pub window_revision: u64,
 }
 
 impl Attachment {
@@ -155,7 +166,7 @@ impl Attachment {
         }
         if own != geometry {
             Some(PresentationReason::SizeMismatch)
-        } else if self.history_top_row.is_some() {
+        } else if self.anchor.is_history() {
             Some(PresentationReason::HistoryWindow)
         } else if !carryable {
             Some(PresentationReason::StreamNotCarryable)
@@ -427,7 +438,9 @@ impl AttachmentTable {
             attached_at_ms: now,
             restoration_continues: true,
             forwarding_held: false,
-            history_top_row: None,
+            anchor: crate::projection::ViewportAnchor::default(),
+            column: 0,
+            window_revision: 0,
         };
         let eligible = attachment.is_eligible();
         self.attachments.insert(ordinal, attachment);
@@ -496,10 +509,12 @@ impl AttachmentTable {
         })
     }
 
-    /// Records an attachment's own physical dimensions.
+    /// Records an attachment's own physical dimensions and where its window sits.
     ///
     /// Every terminal attachment reports these, owner or not. A report never changes the canonical
-    /// geometry; it only decides whether that attachment can take the live byte stream directly.
+    /// geometry; it only decides whether that attachment can take the live byte stream directly,
+    /// and which part of the grid it is shown. A report that changes any of them advances the
+    /// window's revision; one that repeats them leaves it where it was.
     ///
     /// # Errors
     ///
@@ -509,7 +524,8 @@ impl AttachmentTable {
         &mut self,
         id: AttachmentId,
         dimensions: Dimensions,
-        history_top_row: Option<i64>,
+        anchor: crate::projection::ViewportAnchor,
+        column: u32,
     ) -> Result<TerminalPresentationMode> {
         self.check_viewport(id, dimensions)?;
         let ordinal = *self.by_id.get(&id).ok_or_else(|| unknown(id))?;
@@ -519,8 +535,15 @@ impl AttachmentTable {
                 .attachments
                 .get_mut(&ordinal)
                 .ok_or_else(|| unknown(id))?;
+            if attachment.dimensions != Some(dimensions)
+                || attachment.anchor != anchor
+                || attachment.column != column
+            {
+                attachment.window_revision = attachment.window_revision.saturating_add(1);
+            }
             attachment.dimensions = Some(dimensions);
-            attachment.history_top_row = history_top_row;
+            attachment.anchor = anchor;
+            attachment.column = column;
         }
         let carryable = self.carryable;
         let attachment = self
@@ -537,15 +560,21 @@ impl AttachmentTable {
             })
     }
 
-    /// Brings every window back to the live screen.
+    /// Brings every window above the live page back to the live screen.
     ///
     /// A buffer switch is what this is for. The buffer a full-screen application takes keeps no
     /// history and numbers its rows from its own beginning, so a window above the shell's live
     /// page has nothing to be above any more; it comes back to the live screen with the screen
-    /// that program took, rather than waiting to be restored to rows the person has left.
+    /// that program took, rather than waiting to be restored to rows the person has left. The
+    /// host changed that window, so its revision moves on, and the next screen the attachment is
+    /// given says so whether or not anything is published to it now. A window on the live screen
+    /// keeps its line and its column: both buffers have the same ones.
     pub fn clear_history_windows(&mut self) {
         for attachment in self.attachments.values_mut() {
-            attachment.history_top_row = None;
+            if attachment.anchor.is_history() {
+                attachment.anchor = crate::projection::ViewportAnchor::default();
+                attachment.window_revision = attachment.window_revision.saturating_add(1);
+            }
         }
     }
 
@@ -553,7 +582,25 @@ impl AttachmentTable {
     #[must_use]
     pub fn history_top_row(&self, id: AttachmentId) -> Option<i64> {
         let ordinal = self.by_id.get(&id)?;
-        self.attachments.get(ordinal)?.history_top_row
+        self.attachments.get(ordinal)?.anchor.history_row()
+    }
+
+    /// Where one attachment's window is kept: its place in the rows, its first column and the
+    /// revision of the window, for a window of the given dimensions.
+    #[must_use]
+    pub fn window(
+        &self,
+        id: AttachmentId,
+        dimensions: Dimensions,
+    ) -> Option<crate::projection::Window> {
+        let ordinal = self.by_id.get(&id)?;
+        let attachment = self.attachments.get(ordinal)?;
+        Some(crate::projection::Window {
+            dimensions,
+            anchor: attachment.anchor,
+            column: attachment.column,
+            revision: attachment.window_revision,
+        })
     }
 
     /// Returns every terminal attachment being shown a rendering rather than the raw stream.
@@ -774,6 +821,11 @@ impl AttachmentTable {
         }
         let ordinal = *self.by_id.get(&id).ok_or_else(|| unknown(id))?;
         if let Some(attachment) = self.attachments.get_mut(&ordinal) {
+            // The owner's own window takes the size it gave the session, which is a change of that
+            // window like any other.
+            if attachment.dimensions != Some(dimensions) {
+                attachment.window_revision = attachment.window_revision.saturating_add(1);
+            }
             attachment.dimensions = Some(dimensions);
         }
         self.dimensions = dimensions;
@@ -932,7 +984,12 @@ mod tests {
         assert_eq!(change.state.dimensions, Dimensions::new(100, 30));
         assert_eq!(
             table
-                .viewport(identifier(2), Dimensions::new(40, 20), None)
+                .viewport(
+                    identifier(2),
+                    Dimensions::new(40, 20),
+                    crate::projection::ViewportAnchor::default(),
+                    0,
+                )
                 .expect("reports"),
             TerminalPresentationMode::Viewport
         );
@@ -1104,7 +1161,12 @@ mod tests {
         attach(&mut table, 1, &terminal(120, 40, true));
         assert_eq!(
             table
-                .viewport(identifier(1), Dimensions::new(120, 40), None)
+                .viewport(
+                    identifier(1),
+                    Dimensions::new(120, 40),
+                    crate::projection::ViewportAnchor::default(),
+                    0,
+                )
                 .expect("reports"),
             TerminalPresentationMode::Direct
         );
@@ -1122,7 +1184,12 @@ mod tests {
         attach(&mut table, 1, &unqualified);
         assert_eq!(
             table
-                .viewport(identifier(1), Dimensions::new(120, 40), None)
+                .viewport(
+                    identifier(1),
+                    Dimensions::new(120, 40),
+                    crate::projection::ViewportAnchor::default(),
+                    0,
+                )
                 .expect("reports"),
             TerminalPresentationMode::Viewport
         );
@@ -1140,7 +1207,12 @@ mod tests {
         attach(&mut table, 1, &unprobed);
         assert_eq!(
             table
-                .viewport(identifier(1), Dimensions::new(120, 40), None)
+                .viewport(
+                    identifier(1),
+                    Dimensions::new(120, 40),
+                    crate::projection::ViewportAnchor::default(),
+                    0,
+                )
                 .expect("reports"),
             TerminalPresentationMode::Viewport
         );
@@ -1153,7 +1225,12 @@ mod tests {
         assert!(table.set_carryable(false), "the answer changed");
         assert_eq!(
             table
-                .viewport(identifier(1), Dimensions::new(120, 40), None)
+                .viewport(
+                    identifier(1),
+                    Dimensions::new(120, 40),
+                    crate::projection::ViewportAnchor::default(),
+                    0,
+                )
                 .expect("reports"),
             TerminalPresentationMode::Viewport
         );
@@ -1201,7 +1278,12 @@ mod tests {
         attach(&mut table, 4, &terminal(100, 30, false));
         attach(&mut table, 5, &terminal(120, 40, false));
         table
-            .viewport(identifier(5), Dimensions::new(120, 40), Some(17))
+            .viewport(
+                identifier(5),
+                Dimensions::new(120, 40),
+                crate::projection::ViewportAnchor::History(17),
+                0,
+            )
             .expect("reports a window above the live page");
         attach(&mut table, 6, &terminal(120, 40, false));
         table.note_restoration(identifier(6), false);
@@ -1281,7 +1363,12 @@ mod tests {
                 .flatten()
                 .expect("its own size");
             table
-                .viewport(identifier(id), own, Some(3))
+                .viewport(
+                    identifier(id),
+                    own,
+                    crate::projection::ViewportAnchor::History(3),
+                    0,
+                )
                 .expect("reports a window above the live page");
         }
         for id in 1..=4 {
@@ -1335,5 +1422,93 @@ mod tests {
             Err(WorkerError::Dimensions(_))
         ));
         assert_eq!(table.geometry().dimensions, Dimensions::new(120, 40));
+    }
+
+    /// A window's revision moves on exactly when the window kept for it changes, whoever changes
+    /// it, and stands still when a report repeats it.
+    #[test]
+    fn a_windows_revision_moves_on_only_when_the_window_does() {
+        use crate::projection::ViewportAnchor;
+
+        let revision = |table: &AttachmentTable, id: u8| {
+            table
+                .window(identifier(id), Dimensions::new(40, 10))
+                .expect("the attachment has a window")
+                .revision
+        };
+        let mut table = AttachmentTable::new(Dimensions::new(80, 24));
+        attach(&mut table, 1, &terminal(80, 24, true));
+        attach(&mut table, 2, &terminal(40, 10, false));
+        attach(&mut table, 3, &terminal(40, 10, false));
+        assert_eq!(revision(&table, 2), 0, "a window starts at revision zero");
+
+        let report = |table: &mut AttachmentTable, anchor, column| {
+            table
+                .viewport(identifier(2), Dimensions::new(40, 10), anchor, column)
+                .expect("reports");
+        };
+        report(&mut table, ViewportAnchor::default(), 0);
+        assert_eq!(
+            revision(&table, 2),
+            0,
+            "a report that repeats the window changes nothing"
+        );
+        report(&mut table, ViewportAnchor::default(), 12);
+        assert_eq!(revision(&table, 2), 1, "a new column is a new window");
+        report(&mut table, ViewportAnchor::Live(3), 12);
+        assert_eq!(revision(&table, 2), 2, "and so is a new line");
+        report(&mut table, ViewportAnchor::History(100), 12);
+        assert_eq!(revision(&table, 2), 3, "and a place above the live page");
+        table
+            .viewport(
+                identifier(2),
+                Dimensions::new(40, 12),
+                ViewportAnchor::History(100),
+                12,
+            )
+            .expect("reports");
+        assert_eq!(revision(&table, 2), 4, "and a new size");
+
+        // The host's own change: a projection reset brings the window above the live page back,
+        // and leaves the one on the live screen alone.
+        table
+            .viewport(
+                identifier(3),
+                Dimensions::new(40, 10),
+                ViewportAnchor::Live(5),
+                0,
+            )
+            .expect("reports");
+        let on_the_live_screen = revision(&table, 3);
+        table.clear_history_windows();
+        assert_eq!(revision(&table, 2), 5, "the host moved this window");
+        assert_eq!(table.history_top_row(identifier(2)), None);
+        assert_eq!(
+            revision(&table, 3),
+            on_the_live_screen,
+            "and not the one on the live screen"
+        );
+
+        // The owner's own resize is a new size of its window; a refused one changes nothing.
+        let owner = revision(&table, 1);
+        let epoch = table.geometry().epoch.get();
+        assert!(
+            table
+                .resize(identifier(1), Dimensions::new(90, 30), epoch + 5)
+                .is_err()
+        );
+        assert_eq!(
+            revision(&table, 1),
+            owner,
+            "a refused resize changes nothing"
+        );
+        table
+            .resize(identifier(1), Dimensions::new(90, 30), epoch)
+            .expect("the owner resizes");
+        assert_eq!(
+            revision(&table, 1),
+            owner + 1,
+            "the owner's window has a new size"
+        );
     }
 }

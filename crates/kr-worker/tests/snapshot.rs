@@ -3184,3 +3184,1133 @@ async fn a_buffer_switch_reaches_a_window_whose_client_is_behind() {
     );
 }
 
+/// A session that prints `lines` numbered lines and then one more line each time it is typed to.
+///
+/// The typed line is not echoed, so each keystroke scrolls the live screen by exactly the line the
+/// application writes and nothing else.
+fn more_on_each_line(lines: u32) -> String {
+    format!(
+        "stty -echo -echonl || exit 1; \
+         i=0; while [ $i -lt {lines} ]; do printf 'line %d\\r\\n' $i; i=$((i+1)); done; \
+         while read -r _; do printf 'more\\r\\n'; done"
+    )
+}
+
+/// Reports a window's size, place and column, and returns where the host put it.
+async fn report_window(
+    host: &Host,
+    attached: &mut Attached,
+    dimensions: Dimensions,
+    position: Option<kr_protocol::attachment::ViewportPosition>,
+    column: u64,
+) -> kr_protocol::attachment::AttachmentViewportResult {
+    attached
+        .client
+        .mutate(
+            Method::AttachmentViewport,
+            ActionId::new(kr_ipc::new_uuid()),
+            target(host),
+            &kr_protocol::attachment::AttachmentViewportParams {
+                attachment_id: attached.attachment_id,
+                dimensions,
+                position: Nullable(position),
+                column: kr_protocol::scalars::U64::new(column),
+            },
+        )
+        .await
+        .expect("the call reaches the worker")
+        .expect("a viewport report is not refused")
+        .to_typed()
+        .expect("decodes")
+}
+
+/// The row an answer says a window above the live screen landed on.
+fn landed_row(answer: &kr_protocol::attachment::AttachmentViewportResult) -> u64 {
+    match answer.position.0 {
+        Some(kr_protocol::attachment::ViewportPosition::Row(row)) => row.get(),
+        other => panic!("a window above the live screen lands on a row: {other:?}"),
+    }
+}
+
+/// Every complete screen in a run of events: the reset and the header of each installation whose
+/// last page arrived, in the order they completed.
+fn complete_screens(events: &[Event]) -> Vec<(ProjectionReset, ProjectionSnapshot)> {
+    let mut screens = Vec::new();
+    let mut reset: Option<ProjectionReset> = None;
+    let mut header: Option<ProjectionSnapshot> = None;
+    for event in events {
+        match event {
+            Event::Reset(next) => {
+                reset = Some(*next);
+                header = None;
+            }
+            Event::Snapshot(next) => header = Some(next.as_ref().clone()),
+            Event::Rows(page) if !page.more => {
+                if let (Some(reset), Some(header)) = (reset, header.take()) {
+                    screens.push((reset, header));
+                }
+            }
+            _ => {}
+        }
+    }
+    screens
+}
+
+/// The last complete screen in a run of events.
+fn installed_screen(events: &[Event]) -> (ProjectionReset, ProjectionSnapshot) {
+    complete_screens(events)
+        .pop()
+        .unwrap_or_else(|| panic!("a complete screen: {events:?}"))
+}
+
+/// Collects until a complete screen naming `revision` or a later one has arrived.
+async fn collect_until_screen_of(client: &mut LocalClient, revision: u64) -> Vec<Event> {
+    collect_until(
+        client,
+        &format!("a complete screen naming window revision {revision} or later"),
+        |seen| {
+            complete_screens(seen)
+                .iter()
+                .any(|(_, header)| header.window_revision.get() >= revision)
+        },
+    )
+    .await
+}
+
+/// Everything already queued on a subscription, taken without waiting.
+fn drain(stream: &mut kr_worker::output::OutputStream) -> Vec<kr_worker::output::OutputDelivery> {
+    let mut taken = Vec::new();
+    while let Some(delivery) = stream.try_recv() {
+        stream.written(delivery.len());
+        taken.push(delivery);
+    }
+    taken
+}
+
+/// The projection events and markers among what a subscription was queued, as a client decodes them.
+fn events_of(deliveries: &[kr_worker::output::OutputDelivery]) -> Vec<Event> {
+    deliveries
+        .iter()
+        .filter_map(|delivery| match delivery {
+            kr_worker::output::OutputDelivery::Projection { event, .. } => {
+                Some(match event.as_ref() {
+                    kr_protocol::projection::ProjectionEvent::Reset(reset) => Event::Reset(*reset),
+                    kr_protocol::projection::ProjectionEvent::Snapshot(header) => {
+                        Event::Snapshot(header.clone())
+                    }
+                    kr_protocol::projection::ProjectionEvent::Rows(page) => {
+                        Event::Rows(page.clone())
+                    }
+                    kr_protocol::projection::ProjectionEvent::Delta(delta) => {
+                        Event::Delta(delta.clone())
+                    }
+                })
+            }
+            kr_worker::output::OutputDelivery::Resync(marker) => Some(Event::Resync(*marker)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Two moves to the same place with a move elsewhere between them, on a session that is not
+/// writing: each answer names its own screen, and each screen names the report it answers.
+///
+/// Nothing was written between the first and the third, so the session draws them as the same
+/// screen: the same generation, cursor, reason and window. Only the window's revision tells a
+/// client which of its reports each one answers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn each_move_is_answered_with_the_revision_its_own_screen_names() {
+    let host = host_with(
+        &numbered(400),
+        Dimensions::new(CANONICAL.0, CANONICAL.1),
+        None,
+        1024 * 1024,
+    )
+    .await;
+    produced(&host.runtime, b"line 399\r\r\n").await;
+    let window = Dimensions::new(SMALLER.0, SMALLER.1);
+    let mut watcher = attach(&host, window, Some("xterm-256color")).await;
+    let (_, joined) = installed_screen(&collect_until_installed(&mut watcher.client).await);
+
+    let first = report_viewport(
+        &host,
+        &mut watcher,
+        window,
+        Some(kr_protocol::attachment::ViewportPosition::Above(
+            kr_protocol::scalars::U64::new(100),
+        )),
+    )
+    .await;
+    let place = landed_row(&first);
+    let mut answers = vec![first];
+    let mut screens = vec![installed_screen(
+        &collect_until_installed(&mut watcher.client).await,
+    )];
+    for row in [place - 50, place] {
+        answers.push(
+            report_viewport(
+                &host,
+                &mut watcher,
+                window,
+                Some(kr_protocol::attachment::ViewportPosition::Row(
+                    kr_protocol::scalars::U64::new(row),
+                )),
+            )
+            .await,
+        );
+        screens.push(installed_screen(
+            &collect_until_installed(&mut watcher.client).await,
+        ));
+    }
+
+    let revisions: Vec<u64> = answers
+        .iter()
+        .map(|answer| answer.window_revision.get())
+        .collect();
+    assert!(
+        revisions[0] > joined.window_revision.get(),
+        "a move is a new window, past the one the attachment joined with ({}): {revisions:?}",
+        joined.window_revision.get()
+    );
+    assert!(
+        revisions.windows(2).all(|pair| pair[1] > pair[0]),
+        "each move is answered with a revision of its own: {revisions:?}"
+    );
+    for (answer, (reset, header)) in answers.iter().zip(&screens) {
+        assert_eq!(
+            (reset.window_revision, header.window_revision),
+            (answer.window_revision, answer.window_revision),
+            "the screen drawn for a report names the revision its answer names"
+        );
+        assert_eq!(
+            header.viewport.top_row.get(),
+            landed_row(answer),
+            "and it is drawn where the answer says the window landed"
+        );
+    }
+    let (first_reset, first_header) = &screens[0];
+    let (third_reset, third_header) = &screens[2];
+    assert_eq!(
+        (
+            first_header.projection_generation,
+            first_header.output_cursor,
+            first_reset.reason,
+            first_header.viewport,
+        ),
+        (
+            third_header.projection_generation,
+            third_header.output_cursor,
+            third_reset.reason,
+            third_header.viewport,
+        ),
+        "the first and third screens are the same screen of the same place"
+    );
+    assert_ne!(
+        first_header.window_revision, third_header.window_revision,
+        "and only the window's revision tells them apart"
+    );
+}
+
+/// A repaint queued for a client before it moves its window is told apart from the move's screen.
+///
+/// The window reaches into the live page, so a line the application writes scrolls rows out from
+/// under it and the session draws it again. That repaint is queued, unread, when the client moves
+/// the window elsewhere; both are complete screens, and the answer to the move names only one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_repaint_queued_before_a_move_is_told_apart_from_the_moves_screen() {
+    let host = host_with(
+        &more_on_each_line(300),
+        Dimensions::new(CANONICAL.0, CANONICAL.1),
+        None,
+        1024 * 1024,
+    )
+    .await;
+    produced(&host.runtime, b"line 299\r\r\n").await;
+    let mut typist = typist(&host).await;
+    let window = Dimensions::new(SMALLER.0, SMALLER.1);
+    let mut watcher = attach(&host, window, Some("xterm-256color")).await;
+    let _ = collect_until_installed(&mut watcher.client).await;
+
+    let parked = report_viewport(
+        &host,
+        &mut watcher,
+        window,
+        Some(kr_protocol::attachment::ViewportPosition::Above(
+            kr_protocol::scalars::U64::new(5),
+        )),
+    )
+    .await;
+    let (_, held) = installed_screen(&collect_until_installed(&mut watcher.client).await);
+    assert_eq!(held.window_revision, parked.window_revision);
+
+    // The application writes a line while this client is not reading. The repaint it causes is
+    // queued for this client before the move below is even asked for.
+    typist.release(&host).await;
+    produced(&host.runtime, b"more\r\r\n").await;
+    let moved = report_viewport(
+        &host,
+        &mut watcher,
+        window,
+        Some(kr_protocol::attachment::ViewportPosition::Above(
+            kr_protocol::scalars::U64::new(60),
+        )),
+    )
+    .await;
+    assert!(
+        moved.window_revision > parked.window_revision,
+        "the move is a new window: {:?} after {:?}",
+        moved.window_revision,
+        parked.window_revision
+    );
+
+    let arrived = collect_until_screen_of(&mut watcher.client, moved.window_revision.get()).await;
+    let screens = complete_screens(&arrived);
+    let (repaint_reset, repaint) = screens
+        .first()
+        .unwrap_or_else(|| panic!("the repaint arrives first: {arrived:?}"));
+    assert_eq!(
+        repaint_reset.reason,
+        ProjectionResetReason::Repaint,
+        "the first screen is the repaint the application's line caused: {screens:?}"
+    );
+    assert_eq!(
+        repaint.window_revision, parked.window_revision,
+        "and it names the window it was drawn for, which is the one before the move"
+    );
+    let (_, moved_screen) = screens.last().expect("the move's screen");
+    assert_eq!(moved_screen.window_revision, moved.window_revision);
+    assert_eq!(moved_screen.viewport.top_row.get(), landed_row(&moved));
+}
+
+/// A new size is drawn on the next subscription, and that subscription's first screen names the
+/// revision the report was answered with.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_size_change_is_answered_with_the_revision_the_next_subscriptions_screen_names() {
+    let host = host_with(
+        &numbered(100),
+        Dimensions::new(CANONICAL.0, CANONICAL.1),
+        None,
+        1024 * 1024,
+    )
+    .await;
+    produced(&host.runtime, b"line 99\r\r\n").await;
+    let window = Dimensions::new(SMALLER.0, SMALLER.1);
+    let mut watcher = attach(&host, window, Some("xterm-256color")).await;
+    let (_, joined) = installed_screen(&collect_until_installed(&mut watcher.client).await);
+
+    let taller = Dimensions::new(SMALLER.0, SMALLER.1 + 2);
+    let answer = report_viewport(&host, &mut watcher, taller, None).await;
+    assert!(
+        answer.window_revision > joined.window_revision,
+        "a new size is a new window: {:?} after {:?}",
+        answer.window_revision,
+        joined.window_revision
+    );
+
+    let told = collect_until_resync(&mut watcher.client, "the marker for the new size").await;
+    assert!(
+        complete_screens(&told)
+            .iter()
+            .all(|(_, header)| header.window_revision < answer.window_revision),
+        "nothing on the subscription that was told to resynchronise is drawn for the new size"
+    );
+    let marker = resync_of(&told);
+    let _ = resubscribe(&host, &mut watcher, marker.cursor.get()).await;
+    let (reset, header) = installed_screen(&collect_until_installed(&mut watcher.client).await);
+    assert_eq!(
+        (reset.window_revision, header.window_revision),
+        (answer.window_revision, answer.window_revision),
+        "the next subscription's first screen names the revision the report was answered with"
+    );
+    assert_eq!(
+        header.viewport.rows.get(),
+        SMALLER.1 + 2,
+        "drawn at the new size"
+    );
+}
+
+/// A buffer switch while a view resynchronises is named by the view's next screen.
+///
+/// The session brings the view's history window back to the live screen while it is publishing
+/// nothing to that view. The next subscription's first screen opens with the reason every first
+/// screen has, so the reason cannot say it; the revision says the host changed the window after the
+/// last report this client made.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_buffer_switch_while_a_view_resynchronises_is_named_by_its_next_screen() {
+    let host = host_with(
+        &alternate_after(300),
+        Dimensions::new(CANONICAL.0, CANONICAL.1),
+        None,
+        1024 * 1024,
+    )
+    .await;
+    produced(&host.runtime, b"line 299\r\r\n").await;
+    let mut typist = typist(&host).await;
+    let window = Dimensions::new(SMALLER.0, SMALLER.1);
+    let mut watcher = attach(&host, window, Some("xterm-256color")).await;
+    let _ = collect_until_installed(&mut watcher.client).await;
+    let parked = report_viewport(
+        &host,
+        &mut watcher,
+        window,
+        Some(kr_protocol::attachment::ViewportPosition::Above(
+            kr_protocol::scalars::U64::new(80),
+        )),
+    )
+    .await;
+    let _ = collect_until_installed(&mut watcher.client).await;
+
+    {
+        let mut session = host.runtime.session();
+        session.require_resync(
+            watcher.attachment_id,
+            kr_protocol::recovery::ResyncReason::SendQueueFull,
+        );
+        assert!(session.is_resynchronising(watcher.attachment_id));
+    }
+    typist.release(&host).await;
+    let deadline = tokio::time::Instant::now() + LIVENESS_DEADLINE;
+    while host
+        .runtime
+        .session()
+        .history_window(watcher.attachment_id)
+        .is_some()
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the buffer switch brings the window back"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let told = collect_until_resync(&mut watcher.client, "the marker this view was sent").await;
+    let marker = resync_of(&told);
+    let _ = resubscribe(&host, &mut watcher, marker.cursor.get()).await;
+    let (reset, header) = installed_screen(&collect_until_installed(&mut watcher.client).await);
+    assert_eq!(
+        reset.reason,
+        ProjectionResetReason::Attached,
+        "a first screen opens with the reason every first screen has"
+    );
+    assert!(
+        header.window_revision > parked.window_revision,
+        "and names a change of the window this client's last report did not make: {:?} after {:?}",
+        header.window_revision,
+        parked.window_revision
+    );
+    assert_eq!(reset.window_revision, header.window_revision);
+    assert_eq!(
+        header.viewport.top_row, header.viewport.screen_top_row,
+        "the window is back on the live screen"
+    );
+    assert_eq!(header.active_buffer, ProjectedBuffer::Alternate);
+}
+
+/// A window narrower than the grid is drawn from the column it names, held to the grid at the right
+/// edge and answered where it landed; a canonical resize holds it to the new grid again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_narrow_window_is_drawn_from_its_column_and_held_to_the_grid() {
+    let host =
+        host("printf 'a line wider than the window, to be drawn from a column\\r\\n'; read -r _")
+            .await;
+    produced(&host.runtime, b"to be drawn from a column\r\r\n").await;
+    // The owner declares no profile, so it is projected and a resize draws it too; it is there to
+    // move the session's size.
+    let mut owner = attach_claiming(&host, Dimensions::new(CANONICAL.0, CANONICAL.1), None).await;
+    let _ = collect_until_installed(&mut owner.client).await;
+    let window = Dimensions::new(40, 10);
+    let mut watcher = attach(&host, window, Some("xterm-256color")).await;
+    let _ = collect_until_installed(&mut watcher.client).await;
+
+    let at_thirty = report_window(&host, &mut watcher, window, None, 30).await;
+    assert_eq!(
+        at_thirty.column.get(),
+        30,
+        "the whole window fits from column 30"
+    );
+    let (_, header) = installed_screen(&collect_until_installed(&mut watcher.client).await);
+    assert_eq!(
+        header.viewport.left_column.get(),
+        30,
+        "and it is drawn from there"
+    );
+    assert_eq!(header.window_revision, at_thirty.window_revision);
+
+    let past = report_window(&host, &mut watcher, window, None, 60).await;
+    assert_eq!(
+        past.column.get(),
+        CANONICAL.0 - 40,
+        "a column past the last the window fits from is answered with that last one"
+    );
+    let (_, header) = installed_screen(&collect_until_installed(&mut watcher.client).await);
+    assert_eq!(header.viewport.left_column.get(), CANONICAL.0 - 40);
+    assert_eq!(header.viewport.columns.get(), 40);
+
+    let epoch = host.runtime.session().geometry().epoch;
+    let narrower = Dimensions::new(60, CANONICAL.1);
+    let _: kr_protocol::attachment::GeometryResult = owner
+        .client
+        .mutate(
+            Method::TerminalResize,
+            ActionId::new(kr_ipc::new_uuid()),
+            target(&host),
+            &kr_protocol::attachment::TerminalResizeParams {
+                attachment_id: owner.attachment_id,
+                dimensions: narrower,
+                expected_geometry_epoch: epoch,
+            },
+        )
+        .await
+        .expect("the call reaches the worker")
+        .expect("the owner resizes")
+        .to_typed()
+        .expect("decodes");
+    let after = collect_until(
+        &mut watcher.client,
+        "the watcher's screen for the new geometry",
+        |seen| {
+            complete_screens(seen)
+                .iter()
+                .any(|(reset, _)| reset.reason == ProjectionResetReason::Geometry)
+        },
+    )
+    .await;
+    let (reset, header) = complete_screens(&after)
+        .into_iter()
+        .find(|(reset, _)| reset.reason == ProjectionResetReason::Geometry)
+        .expect("the reinstall for the new geometry");
+    assert_eq!(header.dimensions, narrower);
+    assert_eq!(
+        header.viewport.left_column.get(),
+        60 - 40,
+        "the window is drawn from the last column it fits from in the narrower grid"
+    );
+    assert_eq!(
+        (reset.window_revision, header.window_revision),
+        (past.window_revision, past.window_revision),
+        "the window it keeps did not change, only where it can be drawn"
+    );
+}
+
+/// The screen for a moved window is queued before the answer to the report exists.
+///
+/// This is why a client can hold the screen before it reads the answer: the host queues the one
+/// and then produces the other, under the same lock, and they reach the client from two writers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_moved_windows_screen_is_queued_before_its_answer_is_produced() {
+    let host = host_with(
+        &numbered(300),
+        Dimensions::new(CANONICAL.0, CANONICAL.1),
+        None,
+        1024 * 1024,
+    )
+    .await;
+    produced(&host.runtime, b"line 299\r\r\n").await;
+    let window = Dimensions::new(SMALLER.0, SMALLER.1);
+    let watcher = attach(&host, window, Some("xterm-256color")).await;
+
+    let mut session = host.runtime.session();
+    let mut stream = session
+        .subscribe(watcher.attachment_id)
+        .expect("a subscription");
+    session
+        .install_projection(watcher.attachment_id)
+        .expect("the live screen is queued");
+    let (_, joined) = installed_screen(&events_of(&drain(&mut stream)));
+
+    let landed = session
+        .viewport(
+            watcher.attachment_id,
+            window,
+            Some(kr_protocol::attachment::ViewportPosition::Above(
+                kr_protocol::scalars::U64::new(40),
+            )),
+            0,
+        )
+        .expect("the move is accepted");
+    assert!(
+        landed.window_revision > joined.window_revision.get(),
+        "the move is a new window: {} after {}",
+        landed.window_revision,
+        joined.window_revision.get()
+    );
+    let (reset, header) = installed_screen(&events_of(&drain(&mut stream)));
+    assert_eq!(
+        (reset.window_revision.get(), header.window_revision.get()),
+        (landed.window_revision, landed.window_revision),
+        "the whole screen for the move is already queued when the answer is produced"
+    );
+}
+
+/// A move whose screen fills a client's queue part way is drawn on the next subscription, whose
+/// first screen names the move's revision or a later one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_moves_screen_that_fills_the_queue_part_way_is_drawn_on_the_next_subscription() {
+    let host = host_with(
+        &numbered(300),
+        Dimensions::new(CANONICAL.0, CANONICAL.1),
+        None,
+        1024 * 1024,
+    )
+    .await;
+    produced(&host.runtime, b"line 299\r\r\n").await;
+    let window = Dimensions::new(SMALLER.0, SMALLER.1);
+    let watcher = attach(&host, window, Some("xterm-256color")).await;
+
+    let mut session = host.runtime.session();
+    // What the live screen costs this client's queue, measured.
+    let mut probe = session
+        .subscribe(watcher.attachment_id)
+        .expect("a subscription");
+    session
+        .install_projection(watcher.attachment_id)
+        .expect("the live screen is queued");
+    let live_bytes = probe.queued_bytes();
+    let (_, joined) = installed_screen(&events_of(&drain(&mut probe)));
+
+    // A queue that holds the live screen and half as much again, which this client does not read.
+    let mut stream = session
+        .subscribe_within(watcher.attachment_id, live_bytes + live_bytes / 2)
+        .expect("a smaller queue");
+    session
+        .install_projection(watcher.attachment_id)
+        .expect("the live screen is queued");
+    let landed = session
+        .viewport(
+            watcher.attachment_id,
+            window,
+            Some(kr_protocol::attachment::ViewportPosition::Above(
+                kr_protocol::scalars::U64::new(40),
+            )),
+            0,
+        )
+        .expect("the move is accepted: its smallest screen fits this queue");
+    let queued = events_of(&drain(&mut stream));
+    assert!(
+        queued.iter().any(|event| matches!(event, Event::Resync(_))),
+        "the move's screen filled the queue part way and the client is told: {queued:?}"
+    );
+    assert!(
+        complete_screens(&queued)
+            .iter()
+            .all(|(_, header)| header.window_revision.get() < landed.window_revision),
+        "and no complete screen for the move reached it"
+    );
+
+    let mut again = session
+        .subscribe(watcher.attachment_id)
+        .expect("the next subscription");
+    session
+        .install_projection(watcher.attachment_id)
+        .expect("its screen is queued");
+    let (_, header) = installed_screen(&events_of(&drain(&mut again)));
+    assert!(landed.window_revision > joined.window_revision.get());
+    assert!(
+        header.window_revision.get() >= landed.window_revision,
+        "the next subscription's first screen names the move's revision or a later one"
+    );
+}
+
+/// A move made while a client is resynchronising sends it nothing, and its next subscription's
+/// first screen names the move.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_move_while_resynchronising_is_named_by_the_next_subscriptions_screen() {
+    let host = host_with(
+        &numbered(300),
+        Dimensions::new(CANONICAL.0, CANONICAL.1),
+        None,
+        1024 * 1024,
+    )
+    .await;
+    produced(&host.runtime, b"line 299\r\r\n").await;
+    let window = Dimensions::new(SMALLER.0, SMALLER.1);
+    let watcher = attach(&host, window, Some("xterm-256color")).await;
+
+    let mut session = host.runtime.session();
+    let mut stream = session
+        .subscribe(watcher.attachment_id)
+        .expect("a subscription");
+    session
+        .install_projection(watcher.attachment_id)
+        .expect("the live screen is queued");
+    let (_, joined) = installed_screen(&events_of(&drain(&mut stream)));
+    session.require_resync(
+        watcher.attachment_id,
+        kr_protocol::recovery::ResyncReason::SendQueueFull,
+    );
+    let landed = session
+        .viewport(
+            watcher.attachment_id,
+            window,
+            Some(kr_protocol::attachment::ViewportPosition::Above(
+                kr_protocol::scalars::U64::new(40),
+            )),
+            0,
+        )
+        .expect("the move is accepted");
+    let after = events_of(&drain(&mut stream));
+    assert!(
+        matches!(after.as_slice(), [Event::Resync(_)]),
+        "the marker, and nothing after it: {after:?}"
+    );
+
+    let mut again = session
+        .subscribe(watcher.attachment_id)
+        .expect("the next subscription");
+    session
+        .install_projection(watcher.attachment_id)
+        .expect("its screen is queued");
+    let (_, header) = installed_screen(&events_of(&drain(&mut again)));
+    assert!(
+        landed.window_revision > joined.window_revision.get(),
+        "the move is a new window"
+    );
+    assert_eq!(header.window_revision.get(), landed.window_revision);
+    assert_eq!(
+        header.viewport.top_row.get(),
+        match landed.position {
+            Some(kr_protocol::attachment::ViewportPosition::Row(row)) => row.get(),
+            other => panic!("a window above the live screen lands on a row: {other:?}"),
+        }
+    );
+}
+
+/// A view of the session's own size moved into its history while it resynchronises, and brought
+/// back by a buffer switch, is served the stream on its next subscription, and the host's change
+/// is named.
+///
+/// Its report was answered while it was projected, and no projected screen will ever come for it:
+/// the next subscription begins with the stream's own restoration, at the live screen's origin,
+/// which is the only place the host serves the stream to.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_view_brought_back_while_resynchronising_is_served_the_stream_next() {
+    let host = host_with(
+        &alternate_after(300),
+        Dimensions::new(CANONICAL.0, CANONICAL.1),
+        None,
+        1024 * 1024,
+    )
+    .await;
+    produced(&host.runtime, b"line 299\r\r\n").await;
+    let mut typist = typist(&host).await;
+    let canonical = Dimensions::new(CANONICAL.0, CANONICAL.1);
+    let mut watcher = attach(&host, canonical, Some("xterm-256color")).await;
+    assert_eq!(watcher.presentation, Some(TerminalPresentationMode::Direct));
+
+    let parked = report_viewport(
+        &host,
+        &mut watcher,
+        canonical,
+        Some(kr_protocol::attachment::ViewportPosition::Above(
+            kr_protocol::scalars::U64::new(80),
+        )),
+    )
+    .await;
+    assert_eq!(
+        parked.presentation,
+        TerminalPresentationMode::Viewport,
+        "a window above the live page is projected"
+    );
+    assert!(
+        host.runtime
+            .session()
+            .is_resynchronising(watcher.attachment_id)
+    );
+
+    typist.release(&host).await;
+    let deadline = tokio::time::Instant::now() + LIVENESS_DEADLINE;
+    while host
+        .runtime
+        .session()
+        .history_window(watcher.attachment_id)
+        .is_some()
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the buffer switch brings the window back"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let told = collect_until_resync(&mut watcher.client, "the marker for the presentation").await;
+    let marker = resync_of(&told);
+    let _ = resubscribe(&host, &mut watcher, marker.cursor.get()).await;
+    let started = tokio::time::Instant::now();
+    let first = loop {
+        let remaining =
+            (started + LIVENESS_DEADLINE).saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(remaining, watcher.client.recv()).await {
+            Ok(Ok(ControlFrame::Notification(notification)))
+                if notification.event_type.as_str() != "session.gap" =>
+            {
+                break notification;
+            }
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => panic!("the connection ended: {error}"),
+            Err(_) => panic!("waited {LIVENESS_DEADLINE:?} for the next subscription"),
+        }
+    };
+    assert_eq!(
+        first.event_type.as_str(),
+        "session.output",
+        "the next subscription begins with the stream's restoration, not a projected screen"
+    );
+
+    // The restoration of a screen a full-screen application took cannot carry the other buffer's
+    // saved cursor, so the host may project this view again straight away; either way the window
+    // it keeps is the live screen, and the host's own change of it is named.
+    let again = report_viewport(&host, &mut watcher, canonical, None).await;
+    assert!(again.position.0.is_none(), "{:?}", again.position.0);
+    assert!(
+        again.window_revision > parked.window_revision,
+        "the host's own change of the window is named: {:?} after {:?}",
+        again.window_revision,
+        parked.window_revision
+    );
+}
+
+/// An owner's resize changes the size of the window it is served, and the screen that draws the
+/// new size names a new revision.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_owners_resize_is_named_by_the_screen_that_draws_it() {
+    let host = host("printf 'before the resize\\r\\n'; read -r _").await;
+    produced(&host.runtime, b"before the resize\r\r\n").await;
+    let mut owner = attach_claiming(&host, Dimensions::new(CANONICAL.0, CANONICAL.1), None).await;
+    let (_, joined) = installed_screen(&collect_until_installed(&mut owner.client).await);
+    let epoch = host.runtime.session().geometry().epoch;
+    let _: kr_protocol::attachment::GeometryResult = owner
+        .client
+        .mutate(
+            Method::TerminalResize,
+            ActionId::new(kr_ipc::new_uuid()),
+            target(&host),
+            &kr_protocol::attachment::TerminalResizeParams {
+                attachment_id: owner.attachment_id,
+                dimensions: Dimensions::new(CANONICAL.0 + 10, CANONICAL.1 + 4),
+                expected_geometry_epoch: epoch,
+            },
+        )
+        .await
+        .expect("the call reaches the worker")
+        .expect("the resize succeeds")
+        .to_typed()
+        .expect("decodes");
+    let (_, header) = installed_screen(&collect_until_installed(&mut owner.client).await);
+    assert_eq!(
+        header.dimensions,
+        Dimensions::new(CANONICAL.0 + 10, CANONICAL.1 + 4)
+    );
+    assert!(
+        header.window_revision > joined.window_revision,
+        "the owner's window has a new size, and its screen says so: {:?} after {:?}",
+        header.window_revision,
+        joined.window_revision
+    );
+}
+
+/// A window below the live screen's first line is held to the last line it fits from, and it goes
+/// on showing the same lines of the live screen as the session writes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_window_below_the_first_line_follows_the_live_screen() {
+    let host = host_with(
+        &more_on_each_line(100),
+        Dimensions::new(CANONICAL.0, CANONICAL.1),
+        None,
+        1024 * 1024,
+    )
+    .await;
+    produced(&host.runtime, b"line 99\r\r\n").await;
+    let mut typist = typist(&host).await;
+    let window = Dimensions::new(SMALLER.0, SMALLER.1);
+    let mut watcher = attach(&host, window, Some("xterm-256color")).await;
+    let _ = collect_until_installed(&mut watcher.client).await;
+
+    let last = CANONICAL.1 - SMALLER.1;
+    let past = report_viewport(
+        &host,
+        &mut watcher,
+        window,
+        Some(kr_protocol::attachment::ViewportPosition::Line(
+            kr_protocol::scalars::U64::new(last + 6),
+        )),
+    )
+    .await;
+    assert_eq!(
+        past.position.0,
+        Some(kr_protocol::attachment::ViewportPosition::Line(
+            kr_protocol::scalars::U64::new(last)
+        )),
+        "a line past the last the window fits from is answered with that last one"
+    );
+    let (_, header) = installed_screen(&collect_until_installed(&mut watcher.client).await);
+    assert_eq!(header.window_revision, past.window_revision);
+    assert_eq!(
+        header.viewport.top_row.get(),
+        header.viewport.screen_top_row.get() + last,
+        "the window is drawn from that line of the live screen"
+    );
+
+    // The application writes a line, which scrolls the live screen. The window is still on the
+    // same line of it.
+    typist.release(&host).await;
+    produced(&host.runtime, b"more\r\r\n").await;
+    let moved = collect_until(&mut watcher.client, "the update for the line", |seen| {
+        seen.iter().any(|event| match event {
+            Event::Delta(delta) => {
+                delta.viewport.screen_top_row.get() > header.viewport.screen_top_row.get()
+            }
+            _ => false,
+        })
+    })
+    .await;
+    let viewport = moved
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            Event::Delta(delta) => Some(delta.viewport),
+            _ => None,
+        })
+        .expect("an update");
+    assert_eq!(
+        viewport.top_row.get(),
+        viewport.screen_top_row.get() + last,
+        "the window follows the live screen, still from the same line of it"
+    );
+
+    // A line that is the first line is the live screen, which no position at all says.
+    let first = report_viewport(
+        &host,
+        &mut watcher,
+        window,
+        Some(kr_protocol::attachment::ViewportPosition::Line(
+            kr_protocol::scalars::U64::ZERO,
+        )),
+    )
+    .await;
+    assert!(first.position.0.is_none(), "{:?}", first.position.0);
+}
+
+/// A window below the first line keeps its line across a buffer switch, is drawn from the last
+/// line it fits from after the grid shrinks, and may be named by a caller shown the live screen
+/// alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_window_below_the_first_line_keeps_its_line_and_is_the_live_screens_own() {
+    let host = host_with(
+        &alternate_after(100),
+        Dimensions::new(CANONICAL.0, CANONICAL.1),
+        None,
+        1024 * 1024,
+    )
+    .await;
+    produced(&host.runtime, b"line 99\r\r\n").await;
+    let mut typist = typist(&host).await;
+    let mut owner = attach_claiming(&host, Dimensions::new(CANONICAL.0, CANONICAL.1), None).await;
+    let _ = collect_until_installed(&mut owner.client).await;
+    let window = Dimensions::new(SMALLER.0, SMALLER.1);
+    let mut watcher = attach(&host, window, Some("xterm-256color")).await;
+    let _ = collect_until_installed(&mut watcher.client).await;
+    host.runtime
+        .session()
+        .narrow_content(watcher.attachment_id, kr_worker::render::Scope::LiveScreen);
+
+    // A line of the live screen is the live screen's own, so a caller shown it alone may name one.
+    let placed = report_viewport(
+        &host,
+        &mut watcher,
+        window,
+        Some(kr_protocol::attachment::ViewportPosition::Line(
+            kr_protocol::scalars::U64::new(12),
+        )),
+    )
+    .await;
+    assert_eq!(
+        placed.position.0,
+        Some(kr_protocol::attachment::ViewportPosition::Line(
+            kr_protocol::scalars::U64::new(12)
+        ))
+    );
+    let _ = collect_until_installed(&mut watcher.client).await;
+    let refusal = try_viewport(
+        &host,
+        &mut watcher,
+        window,
+        Some(kr_protocol::attachment::ViewportPosition::Above(
+            kr_protocol::scalars::U64::new(3),
+        )),
+    )
+    .await
+    .expect_err("but not a place above it");
+    assert_eq!(
+        refusal.code,
+        kr_protocol::error::ErrorCode::UnsupportedCapability
+    );
+
+    // The application takes the alternate screen. The window keeps its line and its revision.
+    typist.release(&host).await;
+    let switched = collect_until(&mut watcher.client, "the screen after the switch", |seen| {
+        complete_screens(seen)
+            .iter()
+            .any(|(reset, _)| reset.reason == ProjectionResetReason::BufferSwitch)
+    })
+    .await;
+    let (_, header) = complete_screens(&switched)
+        .into_iter()
+        .find(|(reset, _)| reset.reason == ProjectionResetReason::BufferSwitch)
+        .expect("the screen after the switch");
+    assert_eq!(header.active_buffer, ProjectedBuffer::Alternate);
+    assert_eq!(
+        header.viewport.top_row.get(),
+        header.viewport.screen_top_row.get() + 12,
+        "the window is on the same line of the screen that program took"
+    );
+    assert_eq!(header.window_revision, placed.window_revision);
+
+    // The grid shrinks under it: the window keeps the line, and is drawn from the last one it fits
+    // from in the shorter grid.
+    let epoch = host.runtime.session().geometry().epoch;
+    let shorter = Dimensions::new(CANONICAL.0, 18);
+    let _: kr_protocol::attachment::GeometryResult = owner
+        .client
+        .mutate(
+            Method::TerminalResize,
+            ActionId::new(kr_ipc::new_uuid()),
+            target(&host),
+            &kr_protocol::attachment::TerminalResizeParams {
+                attachment_id: owner.attachment_id,
+                dimensions: shorter,
+                expected_geometry_epoch: epoch,
+            },
+        )
+        .await
+        .expect("the call reaches the worker")
+        .expect("the owner resizes")
+        .to_typed()
+        .expect("decodes");
+    let resized = collect_until(
+        &mut watcher.client,
+        "the screen for the new geometry",
+        |seen| {
+            complete_screens(seen)
+                .iter()
+                .any(|(reset, _)| reset.reason == ProjectionResetReason::Geometry)
+        },
+    )
+    .await;
+    let (_, header) = complete_screens(&resized)
+        .into_iter()
+        .find(|(reset, _)| reset.reason == ProjectionResetReason::Geometry)
+        .expect("the screen for the new geometry");
+    assert_eq!(
+        header.viewport.top_row.get(),
+        header.viewport.screen_top_row.get() + (18 - SMALLER.1),
+        "drawn from the last line a ten-row window fits from in eighteen rows"
+    );
+    assert_eq!(header.window_revision, placed.window_revision);
+}
+
+/// A report that changes nothing sends no screen, and its answer names the revision of the screen
+/// the client already holds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_report_that_changes_nothing_names_the_revision_already_held() {
+    let host = host_with(
+        &more_on_each_line(200),
+        Dimensions::new(CANONICAL.0, CANONICAL.1),
+        None,
+        1024 * 1024,
+    )
+    .await;
+    produced(&host.runtime, b"line 199\r\r\n").await;
+    let mut typist = typist(&host).await;
+    let window = Dimensions::new(SMALLER.0, SMALLER.1);
+    let mut watcher = attach(&host, window, Some("xterm-256color")).await;
+    let _ = collect_until_installed(&mut watcher.client).await;
+    let parked = report_viewport(
+        &host,
+        &mut watcher,
+        window,
+        Some(kr_protocol::attachment::ViewportPosition::Above(
+            kr_protocol::scalars::U64::new(40),
+        )),
+    )
+    .await;
+    let (_, held) = installed_screen(&collect_until_installed(&mut watcher.client).await);
+
+    let again = report_viewport(
+        &host,
+        &mut watcher,
+        window,
+        Some(kr_protocol::attachment::ViewportPosition::Row(
+            kr_protocol::scalars::U64::new(landed_row(&parked)),
+        )),
+    )
+    .await;
+    assert_eq!(again.window_revision, held.window_revision);
+    assert_eq!(again.position.0, parked.position.0);
+
+    // Nothing was queued for it: the next thing this client is sent is the update for a line.
+    typist.release(&host).await;
+    produced(&host.runtime, b"more\r\r\n").await;
+    let next = collect_until(&mut watcher.client, "the update for the line", |seen| {
+        !seen.is_empty()
+    })
+    .await;
+    assert!(
+        matches!(next.first(), Some(Event::Delta(_))),
+        "no screen was sent for a report that changed nothing: {next:?}"
+    );
+}
+
+/// A refused report changes neither the window nor its revision.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_report_changes_neither_the_window_nor_its_revision() {
+    let host = host_with(
+        &numbered(200),
+        Dimensions::new(CANONICAL.0, CANONICAL.1),
+        None,
+        1024 * 1024,
+    )
+    .await;
+    produced(&host.runtime, b"line 199\r\r\n").await;
+    let window = Dimensions::new(SMALLER.0, SMALLER.1);
+    let mut watcher = attach(&host, window, Some("xterm-256color")).await;
+    let _ = collect_until_installed(&mut watcher.client).await;
+    let parked = report_viewport(
+        &host,
+        &mut watcher,
+        window,
+        Some(kr_protocol::attachment::ViewportPosition::Above(
+            kr_protocol::scalars::U64::new(40),
+        )),
+    )
+    .await;
+    let _ = collect_until_installed(&mut watcher.client).await;
+
+    let refused = try_viewport(
+        &host,
+        &mut watcher,
+        Dimensions::new(0, 0),
+        Some(kr_protocol::attachment::ViewportPosition::Above(
+            kr_protocol::scalars::U64::new(80),
+        )),
+    )
+    .await;
+    assert!(
+        refused.is_err(),
+        "a window of no size is refused: {refused:?}"
+    );
+
+    let again = report_viewport(
+        &host,
+        &mut watcher,
+        window,
+        Some(kr_protocol::attachment::ViewportPosition::Row(
+            kr_protocol::scalars::U64::new(landed_row(&parked)),
+        )),
+    )
+    .await;
+    assert_eq!(
+        (again.window_revision, again.position.0),
+        (parked.window_revision, parked.position.0),
+        "the window and its revision are where the last accepted report left them"
+    );
+}

@@ -402,22 +402,28 @@ fn outgoing(event: ProjectionEvent) -> Outgoing {
 /// that authority is paged the active buffer alone: the other buffer's rows are not sent, in the
 /// same way a rendered restoration does not paint them.
 ///
+/// `window_revision` is the revision of the attachment's window the screen is drawn for. The reset
+/// and the header both name it, which is how a client tells which of its viewport reports the
+/// screen answers.
+///
 /// # Errors
 ///
 /// Returns an error when a row's stable identifier is not a forward count, which this engine
 /// cannot produce.
 #[expect(
     clippy::too_many_arguments,
-    reason = "an installation is the screen, the window it is drawn for, where the live screen \
-              begins, why it is being sent, whether the session has shortened anything, what the \
-              subscriber's queue holds, how much of the screen this client may see and where its \
-              rows come from; every one of those decides part of what arrives"
+    reason = "an installation is the screen, the window it is drawn for and that window's revision, \
+              where the live screen begins, why it is being sent, whether the session has \
+              shortened anything, what the subscriber's queue holds, how much of the screen this \
+              client may see and where its rows come from; every one of those decides part of \
+              what arrives"
 )]
 pub fn install(
     snapshot: &Snapshot,
     viewport: Viewport,
     screen_top_row: i64,
     reason: ProjectionResetReason,
+    window_revision: u64,
     degraded: bool,
     budget: usize,
     scope: crate::render::Scope,
@@ -432,12 +438,12 @@ pub fn install(
             projection_generation: U64::new(generation),
             cursor: U64::new(cursor),
             reason,
-            window_revision: U64::ZERO,
+            window_revision: U64::new(window_revision),
         })),
         outgoing(ProjectionEvent::Snapshot(Box::new(ProjectionSnapshot {
             projection_generation: U64::new(generation),
             output_cursor: U64::new(cursor),
-            window_revision: U64::ZERO,
+            window_revision: U64::new(window_revision),
             active_buffer: wire::buffer(snapshot.active_buffer),
             dimensions: kr_protocol::session::Dimensions::new(
                 u64::from(snapshot.dimensions.cols),
@@ -676,13 +682,15 @@ pub fn minimum_install(
     rows: &impl RowSource,
 ) -> Result<usize> {
     // A queue of nothing: every row is emptied as it is converted, which is what the smallest
-    // installation is. The reason is the one that spells longest on the wire, because this figure
-    // is a bound and a reset carrying a longer reason must still fit under it.
+    // installation is. The reason is the one that spells longest on the wire and the revision the
+    // widest there is, because this figure is a bound and a reset carrying a longer reason or a
+    // later revision must still fit under it.
     Ok(install(
         snapshot,
         viewport,
         screen_top_row,
         ProjectionResetReason::longest(),
+        u64::MAX,
         true,
         0,
         scope,
