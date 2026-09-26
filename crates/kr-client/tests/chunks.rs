@@ -81,6 +81,8 @@ struct Script {
     reservation: Reply,
     /// Once the attachment-chunk endpoint has renewed the window, the first window has expired.
     expire_first_window: bool,
+    /// How many keepalives the attachment-chunk endpoint sends before it renews the window.
+    keepalives_before_renewal: usize,
     /// The attachment-chunk endpoint ends the connection instead of acknowledging the hello.
     drop_hello: bool,
     /// What the host answers `download.chunk` with, by index: the descriptor and the bytes.
@@ -459,6 +461,15 @@ async fn converse(
     }
     let mut current = window("window-1");
     if let (Some(_), Some(renewal)) = (leg, host.script.renewal.clone()) {
+        for _ in 0..host.script.keepalives_before_renewal {
+            if writer
+                .write_message(&ControlFrame::Event(ControlEvent::Keepalive))
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
         let renewed = ControlFrame::Event(ControlEvent::ActionWindowRenewed(action_window(
             renewal.clone(),
         )));
@@ -1056,5 +1067,43 @@ async fn an_idle_lane_sends_under_the_window_the_host_renewed_while_it_waited() 
         .await
         .expect("the chunk goes under the renewed window");
     assert_eq!(accepted.index, U64::new(0));
+    assert_eq!(host.seen().windows, vec!["window-2"]);
+}
+
+/// A lane that sat idle under a backlog of keepalives still sends under the window the host
+/// renewed after them: the lane keeps up with its connection while nothing is being sent.
+#[tokio::test]
+async fn a_lane_behind_a_backlog_of_keepalives_sends_under_the_window_renewed_after_them() {
+    let host = Host::start(Script {
+        renewal: Some(window("window-2")),
+        expire_first_window: true,
+        keepalives_before_renewal: 300,
+        ..Script::default()
+    });
+    let session = host.session().await;
+    let bytes = pattern(4096);
+    let reserved = reserve(&host, &session, &bytes).await;
+    let mut lane = host
+        .route()
+        .open(reserved.transfer_id)
+        .await
+        .expect("a lane");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    while host.seen().renewals == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the host never renewed"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    lane.send_chunk(
+        &host.target(),
+        &chunk_of(reserved.transfer_id, &bytes, 0),
+        TTL,
+    )
+    .await
+    .expect("the chunk goes under the renewed window");
     assert_eq!(host.seen().windows, vec!["window-2"]);
 }

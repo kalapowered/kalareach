@@ -41,6 +41,8 @@ use kr_protocol::transfer::{
     ChunkDescriptor, DownloadChunkParams, DownloadChunkResult, UploadChunkParams, UploadChunkResult,
 };
 
+use tokio::sync::{mpsc, watch};
+
 use crate::error::{ClientError, Result};
 use crate::shown::Shown;
 
@@ -154,11 +156,9 @@ impl ChunkLane {
             ));
         }
         let Carrier::Local(carrier) = &mut self.carrier;
-        carrier.refresh()?;
+        let window = carrier.window();
         let entry = Method::UploadChunk.entry();
-        if entry.freshness == FreshnessRequirement::ActionWindow
-            && carrier.window.valid_for_ms.get() == 0
-        {
+        if entry.freshness == FreshnessRequirement::ActionWindow && window.valid_for_ms.get() == 0 {
             return Err(ClientError::NoActionWindow);
         }
         let request_id = carrier.next_request_id();
@@ -170,7 +170,7 @@ impl ChunkLane {
             grant_id: Nullable::null(),
             target: target.clone(),
             expected: ParamsValue::empty(),
-            action_window_id: carrier.window.action_window_id.clone(),
+            action_window_id: window.action_window_id,
             requested_ttl_ms: requested_ttl,
             params: ParamsValue::from_typed(params)?,
         };
@@ -200,7 +200,6 @@ impl ChunkLane {
     /// under its code, and `ATTACHMENT_INTEGRITY` when the answer is not the chunk described.
     pub async fn read_chunk(&mut self, expected: &ChunkDescriptor) -> Result<Bytes> {
         let Carrier::Local(carrier) = &mut self.carrier;
-        carrier.refresh()?;
         let request_id = carrier.next_request_id();
         let request = Request {
             request_id,
@@ -239,17 +238,39 @@ impl ChunkLane {
     }
 }
 
+/// How many answers the reader holds for a lane before it decides the host is answering calls the
+/// lane never made.
+///
+/// Calls on a lane go one at a time, so one answer is waiting at most, and another for each call a
+/// caller abandoned before its answer came.
+const ANSWER_DEPTH: usize = 8;
+
 /// A connection to an environment's attachment-chunk endpoint.
+///
+/// One task reads the connection for as long as the lane lives, as a session's reader reads its
+/// control connection: it applies each window the host renews as the renewal arrives and hands
+/// every answer to the call waiting for it. So a call is always built with the newest window the
+/// host has issued on this connection, however long the lane sat idle and however many keepalives
+/// came first, and no call has to read the host's backlog before it can start.
 #[derive(Debug)]
 struct LocalCarrier {
-    reader: FrameReader,
     writer: FrameWriter,
-    /// The window the host last issued on this connection.
-    window: ActionWindow,
+    /// The window the host last issued on this connection, as the reader last saw it.
+    window: watch::Receiver<ActionWindow>,
+    /// The answers the reader hands over, and the failure that ended it.
+    answers: mpsc::Receiver<Result<ControlFrame>>,
+    reader: tokio::task::JoinHandle<()>,
     next_request: u64,
     /// Set once the connection has failed. Nothing is sent on it again: a frame read or written in
     /// part leaves nothing a later call could trust.
     ended: bool,
+}
+
+impl Drop for LocalCarrier {
+    fn drop(&mut self) {
+        // The reader holds the read half, and the connection closes once both halves have gone.
+        self.reader.abort();
+    }
 }
 
 impl LocalCarrier {
@@ -307,13 +328,21 @@ impl LocalCarrier {
                  environment's controller",
             ));
         }
+        let (renewals, window) = watch::channel(acknowledgement.action_window);
+        let (answering, answers) = mpsc::channel(ANSWER_DEPTH);
         Ok(Self {
-            reader,
             writer,
-            window: acknowledgement.action_window,
+            window,
+            answers,
+            reader: tokio::spawn(read_lane(reader, renewals, answering)),
             next_request: 0,
             ended: false,
         })
+    }
+
+    /// The newest window the host has issued on this connection.
+    fn window(&self) -> ActionWindow {
+        self.window.borrow().clone()
     }
 
     fn next_request_id(&mut self) -> RequestId {
@@ -321,46 +350,7 @@ impl LocalCarrier {
         RequestId::new(self.next_request)
     }
 
-    /// Applies whatever the host has already sent on this connection, without waiting for more.
-    ///
-    /// The host renews the window on its own schedule, at half its validity, and says so on this
-    /// connection whether or not a call is in flight. A lane that sat idle past its window's
-    /// validity has the renewal waiting unread, so it is read here, before the next call is built,
-    /// rather than after that call has gone out under a window that expired while the lane waited.
-    /// The reader keeps a frame it has only partly read, so stopping at the first frame that is not
-    /// complete loses nothing.
-    fn refresh(&mut self) -> Result<()> {
-        use futures_util::FutureExt as _;
-
-        if self.ended {
-            return Err(ClientError::ConnectionEnded);
-        }
-        while let Some(read) = self.reader.read_message::<ControlFrame>().now_or_never() {
-            let frame = match read {
-                Ok(frame) => frame,
-                Err(error) => return Err(self.failed(error)),
-            };
-            match frame {
-                ControlFrame::Event(ControlEvent::ActionWindowRenewed(window)) => {
-                    self.window = window;
-                }
-                ControlFrame::Event(ControlEvent::Keepalive)
-                | ControlFrame::Notification(_)
-                | ControlFrame::Receipt(_) => {}
-                // Nothing is outstanding, so an answer here answers nothing this lane asked.
-                _ => {
-                    self.ended = true;
-                    return Err(refusal(
-                        ErrorCode::InvalidArgument,
-                        "the host sent a frame an attachment-chunk lane does not carry",
-                    ));
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Sends one frame and reads until its answer arrives, adopting a renewed window on the way.
+    /// Sends one frame and waits for the reader to hand over its answer.
     async fn exchange(
         &mut self,
         frame: &ControlFrame,
@@ -378,23 +368,24 @@ impl LocalCarrier {
             return Err(self.failed(error));
         }
         loop {
-            let frame = match self.reader.read_message::<ControlFrame>().await {
-                Ok(frame) => frame,
-                Err(error) => return Err(self.failed(error)),
+            let answer = match self.answers.recv().await {
+                Some(Ok(answer)) => answer,
+                Some(Err(error)) => {
+                    self.ended = true;
+                    return Err(error);
+                }
+                None => {
+                    self.ended = true;
+                    return Err(ClientError::ConnectionEnded);
+                }
             };
-            match frame {
+            match answer {
                 ControlFrame::Response(response) if response.request_id == request_id => {
                     return match response.outcome {
                         Outcome::Ok(value) => Ok(value),
                         Outcome::Error(error) => Err(ClientError::from(error)),
                     };
                 }
-                // A long run of chunks outlives the window it started under, and the host renews
-                // on this connection without being asked.
-                ControlFrame::Event(ControlEvent::ActionWindowRenewed(window)) => {
-                    self.window = window;
-                }
-                ControlFrame::Event(ControlEvent::Keepalive) | ControlFrame::Notification(_) => {}
                 // An answer that is a receipt rather than a result settles the call without the
                 // result a chunk needs.
                 ControlFrame::Receipt(receipt) if receipt.request_id == request_id => {
@@ -403,12 +394,17 @@ impl LocalCarrier {
                         "the host settled the call with a receipt and no result",
                     ));
                 }
-                ControlFrame::Receipt(_) => {}
+                // The answer to an earlier call, which its caller abandoned before it came.
+                ControlFrame::Response(kr_protocol::envelope::Response {
+                    request_id: earlier,
+                    ..
+                }) if earlier < request_id => {}
+                ControlFrame::Receipt(receipt) if receipt.request_id < request_id => {}
                 _ => {
                     self.ended = true;
                     return Err(refusal(
                         ErrorCode::InvalidArgument,
-                        "the host sent a frame an attachment-chunk lane does not carry",
+                        "the host answered a call this lane did not make",
                     ));
                 }
             }
@@ -423,6 +419,44 @@ impl LocalCarrier {
     fn failed(&mut self, error: kr_ipc::IpcError) -> ClientError {
         self.ended = true;
         failure_of(error)
+    }
+}
+
+/// Reads a lane's connection until it ends: each renewed window goes to the lane at once, and
+/// each answer to the call waiting for it.
+async fn read_lane(
+    mut reader: FrameReader,
+    renewals: watch::Sender<ActionWindow>,
+    answering: mpsc::Sender<Result<ControlFrame>>,
+) {
+    loop {
+        let frame = match reader.read_message::<ControlFrame>().await {
+            Ok(frame) => frame,
+            Err(error) => {
+                let _ = answering.try_send(Err(failure_of(error)));
+                return;
+            }
+        };
+        match frame {
+            ControlFrame::Event(ControlEvent::ActionWindowRenewed(window)) => {
+                renewals.send_replace(window);
+            }
+            ControlFrame::Event(ControlEvent::Keepalive) | ControlFrame::Notification(_) => {}
+            answer @ (ControlFrame::Response(_) | ControlFrame::Receipt(_)) => {
+                // A lane waits for one answer at a time. A host that fills this with answers
+                // nobody is waiting for is not answering this lane, and the lane ends.
+                if answering.try_send(Ok(answer)).is_err() {
+                    return;
+                }
+            }
+            _ => {
+                let _ = answering.try_send(Err(refusal(
+                    ErrorCode::InvalidArgument,
+                    "the host sent a frame an attachment-chunk lane does not carry",
+                )));
+                return;
+            }
+        }
     }
 }
 
