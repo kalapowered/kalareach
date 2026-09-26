@@ -71,6 +71,19 @@ pub enum Applied {
     Older,
 }
 
+/// What one admitted hash names, checked: its verified files, or why they failed.
+type Verified = Result<Arc<kr_plugin_sdk::package::Package>, String>;
+
+/// A snapshot whose packages are read and checked, waiting to be applied.
+#[derive(Debug)]
+pub struct Prepared {
+    frame: FrameId,
+    policy: RevocationPolicy,
+    packages: Vec<AdmittedPackage>,
+    releases: Vec<ReleaseState>,
+    verified: BTreeMap<Digest256, Verified>,
+}
+
 #[derive(Debug, Default)]
 struct Held {
     frame: Option<FrameId>,
@@ -78,7 +91,7 @@ struct Held {
     packages: Vec<AdmittedPackage>,
     releases: Vec<ReleaseState>,
     /// What each admitted hash names, checked once: its verified files, or why they failed.
-    verified: BTreeMap<Digest256, Result<Arc<kr_plugin_sdk::package::Package>, String>>,
+    verified: BTreeMap<Digest256, Verified>,
     /// What this snapshot makes of each admitted package, with its grants: a connector, a
     /// declarative package, or why it was refused.
     read: BTreeMap<Digest256, Result<ReadPackage, String>>,
@@ -149,22 +162,16 @@ impl Admissions {
         self.held().releases.clone()
     }
 
-    /// Applies a complete snapshot, where its frame is above the one held: every package hash
-    /// not checked before is checked, what each installation grants is taken from this snapshot,
-    /// and `sources` is replaced with the admitted connectors, all under one lock, so two
-    /// snapshots applied at once never leave one's packages beside the other's connectors.
+    /// Reads a complete snapshot's packages where its frame is above the one held: every package
+    /// hash not checked before is checked here, with no lock held, so a package slow to read holds
+    /// this snapshot and nothing a connection needs. `None` for a frame not above the one held.
     ///
     /// `parts` are the snapshot's parts, in order; the caller has checked that they are all of
     /// one frame and complete.
-    pub fn apply(&self, parts: &[PluginAdmissions], sources: &ConnectorSources) -> Applied {
-        let Some(first) = parts.first() else {
-            return Applied::Older;
-        };
+    #[must_use]
+    pub fn prepare(&self, parts: &[PluginAdmissions]) -> Option<Prepared> {
+        let first = parts.first()?;
         let frame = first.frame;
-        let mut held = self.held();
-        if held.frame.is_some_and(|held| frame <= held) {
-            return Applied::Older;
-        }
         let packages: Vec<AdmittedPackage> = parts
             .iter()
             .flat_map(|part| part.packages.iter().cloned())
@@ -173,21 +180,56 @@ impl Admissions {
             .iter()
             .flat_map(|part| part.releases.iter().cloned())
             .collect();
-        let mut verified = BTreeMap::new();
+        let known: BTreeMap<Digest256, Verified> = {
+            let held = self.held();
+            if held.frame.is_some_and(|held| frame <= held) {
+                return None;
+            }
+            packages
+                .iter()
+                .filter_map(|package| {
+                    held.verified
+                        .get(&package.package_digest)
+                        .map(|verified| (package.package_digest, verified.clone()))
+                })
+                .collect()
+        };
+        let verified = packages
+            .iter()
+            .map(|package| {
+                let checked = known
+                    .get(&package.package_digest)
+                    .cloned()
+                    .unwrap_or_else(|| verify(package));
+                (package.package_digest, checked)
+            })
+            .collect();
+        Some(Prepared {
+            frame,
+            policy: first.policy,
+            packages,
+            releases,
+            verified,
+        })
+    }
+
+    /// Applies a prepared snapshot where its frame is still above the one held: what each
+    /// installation grants is taken from this snapshot, and `sources` is replaced with the
+    /// admitted connectors, all under one lock, so two snapshots applied at once never leave one's
+    /// packages beside the other's connectors.
+    pub fn publish(&self, prepared: Prepared, sources: &ConnectorSources) -> Applied {
+        let mut held = self.held();
+        if held.frame.is_some_and(|held| prepared.frame <= held) {
+            return Applied::Older;
+        }
         let mut read = BTreeMap::new();
-        for package in &packages {
-            let checked = held
-                .verified
-                .remove(&package.package_digest)
-                .unwrap_or_else(|| verify(package));
-            read.insert(
-                package.package_digest,
-                checked
-                    .as_ref()
-                    .map_err(Clone::clone)
-                    .and_then(|checked| derive(package, checked)),
-            );
-            verified.insert(package.package_digest, checked);
+        for package in &prepared.packages {
+            let outcome = match prepared.verified.get(&package.package_digest) {
+                Some(Ok(checked)) => derive(package, checked),
+                Some(Err(why)) => Err(why.clone()),
+                None => Err("the package was not read".to_owned()),
+            };
+            read.insert(package.package_digest, outcome);
         }
         let connectors: Vec<Arc<InstalledConnector>> = read
             .values()
@@ -200,13 +242,22 @@ impl Admissions {
         for (connector, refusal) in sources.replace_read(connectors) {
             read.insert(connector.package_digest(), Err(refusal.detail));
         }
-        held.frame = Some(frame);
-        held.policy = Some(first.policy);
-        held.packages = packages;
-        held.releases = releases;
-        held.verified = verified;
+        held.frame = Some(prepared.frame);
+        held.policy = Some(prepared.policy);
+        held.packages = prepared.packages;
+        held.releases = prepared.releases;
+        held.verified = prepared.verified;
         held.read = read;
         Applied::Newer
+    }
+
+    /// Prepares and applies a snapshot at once, where nothing else can be waiting: the first
+    /// snapshot, read before this worker serves any connection.
+    pub fn apply(&self, parts: &[PluginAdmissions], sources: &ConnectorSources) -> Applied {
+        match self.prepare(parts) {
+            Some(prepared) => self.publish(prepared, sources),
+            None => Applied::Older,
+        }
     }
 
     /// Makes a report on `bindings` for the frame held, numbered above every earlier report of
@@ -711,6 +762,35 @@ mod tests {
             Some("kalareach/gemini-cli".to_owned())
         );
         assert!(admissions.admitted(gemini.package_digest).is_some());
+    }
+
+    /// A snapshot prepared while a newer one was applied applies nothing: the frame order is
+    /// checked again when a prepared snapshot is published.
+    #[test]
+    fn a_prepared_snapshot_overtaken_before_publication_applies_nothing() {
+        use crate::broker::connectors::fixture;
+        let root = tempfile::tempdir().expect("a directory");
+        let source = fixture::claude_code_package(
+            root.path(),
+            std::path::Path::new("/opt/kalareach/bin/kr-hook"),
+        )
+        .expect("the package is written");
+        let admissions = Admissions::new();
+        let sources = ConnectorSources::new();
+        let older = admissions
+            .prepare(&snapshot(
+                2,
+                vec![admitted(&source, "kalareach/claude-code")],
+            ))
+            .expect("above nothing");
+        assert_eq!(
+            admissions.apply(&snapshot(3, Vec::new()), &sources),
+            Applied::Newer
+        );
+        assert_eq!(admissions.publish(older, &sources), Applied::Older);
+        assert_eq!(admissions.frame().map(|frame| frame.round.get()), Some(3));
+        assert!(sources.for_command(fixture::COMMAND).is_none());
+        assert!(admissions.prepare(&snapshot(3, Vec::new())).is_none());
     }
 
     /// A report of exactly the bound's parts is made; one binding more is refused whole.

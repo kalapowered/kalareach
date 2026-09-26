@@ -526,10 +526,13 @@ impl WorkerService {
             return None;
         }
         let parts = std::mem::take(&mut state.admissions_parts);
+        // Read and checked before anything a connection needs is taken: a package slow to read
+        // holds this snapshot alone, never a replacement of the authority.
+        let prepared = self.plugin_admissions.prepare(&parts);
         {
-            // Applied inside the authority's own boundary, and checked again there: a
+            // Published inside the authority's own boundary, and checked again there: a
             // replacement that fences this connection takes the same lock, so it lands wholly
-            // before this (which then applies nothing) or wholly after.
+            // before this (which then publishes nothing) or wholly after.
             let authority = self
                 .authority
                 .lock()
@@ -537,8 +540,10 @@ impl WorkerService {
             if let Err(error) = Self::check_bound(state, &authority) {
                 return Some(failure(RequestId::new(0), &error.to_protocol_error()));
             }
-            self.plugin_admissions
-                .apply(&parts, &self.connector_sources);
+            if let Some(prepared) = prepared {
+                self.plugin_admissions
+                    .publish(prepared, &self.connector_sources);
+            }
         }
         let session_id = self.runtime.session().id();
         let report = match self
