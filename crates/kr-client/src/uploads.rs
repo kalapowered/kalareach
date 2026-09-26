@@ -36,10 +36,10 @@ use kr_protocol::transfer::{
     UploadFinishResult, UploadStatusParams, UploadStatusResult,
 };
 
-use crate::Session;
 use crate::chunks::{ChunkLane, ChunkRoute};
 use crate::error::{ClientError, Result};
 use crate::retry::{Attempts, Failure, Recovery, RequestClass};
+use crate::{Session, Settled};
 
 /// The bytes an upload carries, and how they are read.
 ///
@@ -205,8 +205,18 @@ pub struct Upload {
     transfer_id: Option<kr_protocol::ids::TransferId>,
     handle: Option<AttachmentHandle>,
     phase: Phase,
-    /// The reservation whose reply was lost, when one was.
-    unknown_reservation: Option<ActionId>,
+    /// Where the reservation stands while this plan holds no transfer.
+    reservation: Reservation,
+}
+
+/// Where a plan's reservation stands while the plan holds no transfer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reservation {
+    /// None has been asked for, or the host refused the last one asked for.
+    NotAsked,
+    /// One has been asked for and has had no definite answer, so whether the host holds it is
+    /// unknown. The action that asked, once the session has named it.
+    Unanswered(Option<ActionId>),
 }
 
 impl Upload {
@@ -225,19 +235,38 @@ impl Upload {
             transfer_id: None,
             handle: None,
             phase: Phase::Reserving,
-            unknown_reservation: None,
+            reservation: Reservation::NotAsked,
         }
     }
 
-    /// Records that the reservation this plan asked for has an outcome nobody knows.
+    /// Records that `upload.begin` is about to be sent for this plan.
     ///
-    /// An `upload.begin` whose reply was lost may have reserved a transfer this plan cannot name,
-    /// holding one of the device's transfer slots and part of the environment's budget. Asking
-    /// again would be a second reservation for one intent, so the plan refuses to: a new upload of
-    /// the same file is the person's new choice, made knowing the first one's outcome is unknown.
+    /// From here until a definite answer, whether the host holds a reservation for this upload is
+    /// unknown: the request may have reached it whatever becomes of the call, including a call
+    /// the caller abandons part way. A reservation of unknown outcome may hold one of the device's
+    /// transfer slots and part of the environment's budget under a transfer this plan cannot name,
+    /// and asking again would make a second one for one intent, so the plan refuses to ask again
+    /// until [`Upload::reservation_refused`] says the host refused this one. A new upload of the
+    /// same file is the person's new choice, made knowing the first one's outcome is unknown.
+    pub fn reserving(&mut self) {
+        if self.phase == Phase::Reserving {
+            self.reservation = Reservation::Unanswered(None);
+        }
+    }
+
+    /// Records the action that asked for a reservation whose outcome is unknown, so the refusal to
+    /// ask again can name it.
     pub fn reservation_unknown(&mut self, action_id: ActionId) {
         if self.phase == Phase::Reserving {
-            self.unknown_reservation = Some(action_id);
+            self.reservation = Reservation::Unanswered(Some(action_id));
+        }
+    }
+
+    /// Records that the host refused the reservation, or that the request never left this client,
+    /// so the plan may ask again.
+    pub fn reservation_refused(&mut self) {
+        if self.phase == Phase::Reserving {
+            self.reservation = Reservation::NotAsked;
         }
     }
 
@@ -305,19 +334,24 @@ impl Upload {
     /// Returns a failure when the content cannot produce the chunk the layout names.
     pub fn next(&self) -> Result<Step> {
         match self.phase {
-            Phase::Reserving => {
-                if let Some(action_id) = self.unknown_reservation {
-                    return Err(ClientError::refusal(
-                        kr_protocol::error::ErrorCode::OutcomeUnknown,
-                        crate::shown!(
-                            "this upload's reservation, action {}, has an unknown outcome; a new \
-                             upload is a new choice",
-                            action_id
-                        ),
-                    ));
-                }
-                self.reserve()
-            }
+            Phase::Reserving => match self.reservation {
+                Reservation::NotAsked => self.reserve(),
+                Reservation::Unanswered(Some(action_id)) => Err(ClientError::refusal(
+                    kr_protocol::error::ErrorCode::OutcomeUnknown,
+                    crate::shown!(
+                        "this upload's reservation, action {}, has an unknown outcome; a new upload \
+                         is a new choice",
+                        action_id
+                    ),
+                )),
+                Reservation::Unanswered(None) => Err(ClientError::refusal(
+                    kr_protocol::error::ErrorCode::OutcomeUnknown,
+                    crate::shown::Shown::said(
+                        "this upload's reservation has an unknown outcome; a new upload is a new \
+                         choice",
+                    ),
+                )),
+            },
             Phase::Sending => {
                 let transfer_id = self.transfer_id.ok_or_else(|| {
                     ClientError::refusal(
@@ -570,8 +604,10 @@ struct Unconditional {}
 ///   let go, the driver waits the backoff, reads `upload.status` and hands the plan the host's
 ///   bitmap before it sends again. Progress the host has confirmed, by acknowledging a chunk or in
 ///   its bitmap, restores the budget; failures in a row spend it.
-/// * A reservation whose reply was lost is recorded in the plan ([`Upload::reservation_unknown`]),
-///   which refuses to reserve again.
+/// * The plan records a reservation as asked for before `upload.begin` leaves
+///   ([`Upload::reserving`]), and only a definite answer clears that: the host's result, or its
+///   refusal. A reply that was lost, a refusal saying the outcome is unknown, a receipt with no
+///   result and a call abandoned part way all leave the plan refusing to reserve again.
 ///
 /// # Errors
 ///
@@ -596,7 +632,10 @@ pub async fn send(
     loop {
         match plan.next()? {
             Step::Begin(params) => {
-                let settled = match session
+                // Recorded before the request can leave: a caller that abandons this call part way
+                // leaves a plan that knows a reservation may exist.
+                plan.reserving();
+                let answered = session
                     .mutate(
                         Method::UploadBegin,
                         target.clone(),
@@ -605,16 +644,33 @@ pub async fn send(
                         &*params,
                         requested_ttl,
                     )
-                    .await
-                {
-                    Ok(settled) => settled,
+                    .await;
+                let begun = match answered {
+                    Ok(Settled::Result(value)) => value.to_typed()?,
+                    Ok(Settled::Receipt(receipt)) => {
+                        plan.reservation_unknown(receipt.action_id);
+                        return Err(ClientError::refusal(
+                            kr_protocol::error::ErrorCode::OutcomeUnknown,
+                            crate::shown::Shown::said(
+                                "the host answered the reservation with a receipt and no result",
+                            ),
+                        ));
+                    }
                     Err(ClientError::SubmissionUncertain { action_id }) => {
                         plan.reservation_unknown(action_id);
                         return Err(ClientError::SubmissionUncertain { action_id });
                     }
-                    Err(error) => return Err(error),
+                    // The host could not say what became of it, so the reservation may exist.
+                    Err(error) if error.code() == kr_protocol::error::ErrorCode::OutcomeUnknown => {
+                        return Err(error);
+                    }
+                    // A refusal the host decided, or a request that never left this client.
+                    Err(error) => {
+                        plan.reservation_refused();
+                        return Err(error);
+                    }
                 };
-                plan.accept(Answer::Begun(Box::new(settled.to_typed()?)))?;
+                plan.accept(Answer::Begun(Box::new(begun)))?;
             }
             Step::Chunk(params) => {
                 let confirmed = plan.acknowledged_chunks();
@@ -1043,5 +1099,26 @@ mod tests {
         reserved.accept(answer).expect("the reservation folds in");
         reserved.reservation_unknown(action);
         assert!(matches!(reserved.next().expect("a step"), Step::Chunk(_)));
+    }
+
+    #[test]
+    fn a_reservation_asked_for_stays_unknown_until_the_host_refuses_it() {
+        let mut upload = Upload::new(subject(), Box::new(Held::new(b"hello".to_vec())));
+        upload.reserving();
+        let refusal = upload.next().expect_err("the plan does not reserve again");
+        assert_eq!(
+            refusal.code(),
+            kr_protocol::error::ErrorCode::OutcomeUnknown
+        );
+
+        // A definite refusal means nothing was reserved, and the plan may ask again.
+        upload.reservation_refused();
+        assert!(matches!(upload.next().expect("a step"), Step::Begin(_)));
+
+        // The host's answer supersedes the record.
+        upload.reserving();
+        let answer = begun(&upload, 1, &ChunkBitmap::empty(1));
+        upload.accept(answer).expect("the reservation folds in");
+        assert!(matches!(upload.next().expect("a step"), Step::Chunk(_)));
     }
 }

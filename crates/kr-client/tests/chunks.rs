@@ -29,11 +29,12 @@ use kr_protocol::frame::StreamKind;
 use kr_protocol::hello::{ActionWindow, PROTOCOL_VERSION};
 use kr_protocol::identity::{BootIdentity, BootIdentitySource};
 use kr_protocol::ids::{
-    ActionWindowId, BootEpoch, BuildId, ConnectionId, EnvironmentId, RequestId, TransferId,
+    ActionWindowId, ActorId, BootEpoch, BuildId, ConnectionId, EnvironmentId, RequestId, TransferId,
 };
 use kr_protocol::limits::UPLOAD_CHUNK_LEN;
 use kr_protocol::local::{LocalHelloAck, LocalPeer, LocalRole};
 use kr_protocol::method::Method;
+use kr_protocol::receipt::{Receipt, ReceiptResponse, ReceiptState};
 use kr_protocol::scalars::{
     Bytes, CanonicalSet, Digest256, DurationMs, Nullable, TimestampMs, U64, Uuid,
 };
@@ -76,8 +77,8 @@ struct Script {
     /// On the first chunk connection, how many chunks the host stores before it ends the
     /// connection with the last of them unanswered.
     drop_after_chunks: Option<usize>,
-    /// The control endpoint ends the connection instead of answering a reservation.
-    drop_reservation: bool,
+    /// How the control endpoint answers a reservation.
+    reservation: Reply,
     /// Once the attachment-chunk endpoint has renewed the window, the first window has expired.
     expire_first_window: bool,
     /// The attachment-chunk endpoint ends the connection instead of acknowledging the hello.
@@ -98,6 +99,22 @@ struct Seen {
     statuses: usize,
     /// How many renewals the attachment-chunk endpoint has written.
     renewals: usize,
+}
+
+/// How the scripted host answers a reservation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Reply {
+    /// With the reservation.
+    #[default]
+    Answer,
+    /// Not at all: the connection ends.
+    Drop,
+    /// With `OUTCOME_UNKNOWN`, as a host that could not learn what its own work did.
+    Unknown,
+    /// With a receipt and no result.
+    ReceiptOnly,
+    /// Not yet: the host keeps the reservation and the connection, and never answers.
+    Hold,
 }
 
 /// One upload the host holds.
@@ -209,6 +226,12 @@ impl Host {
     }
 
     fn begin(&self, params: UploadBeginParams) -> Result<ParamsValue, ProtocolError> {
+        if params.environment_id != self.environment_id() {
+            return Err(ProtocolError::new(
+                ErrorCode::EnvironmentUnavailable,
+                "this host does not own that environment",
+            ));
+        }
         let transfer_id = TransferId::new(kr_ipc::new_uuid());
         let layout = ChunkLayout::for_length(params.declared_byte_len.get());
         let answer = UploadBeginResult {
@@ -455,6 +478,8 @@ async fn converse(
                 let MutationRequest {
                     request_id,
                     method,
+                    method_version,
+                    action_id,
                     params,
                     action_window_id,
                     ..
@@ -489,10 +514,40 @@ async fn converse(
                     }
                     (Some(Method::UploadBegin), None) => {
                         host.seen.lock().expect("what the host saw").reservations += 1;
-                        if host.script.drop_reservation {
-                            return;
+                        let reserved = parameters(&params).and_then(|p| host.begin(p));
+                        match host.script.reservation {
+                            Reply::Answer => answer(request_id, reserved),
+                            Reply::Drop => return,
+                            Reply::Unknown => answer(
+                                request_id,
+                                Err(ProtocolError::new(
+                                    ErrorCode::OutcomeUnknown,
+                                    "the host could not report what became of the reservation",
+                                )),
+                            ),
+                            Reply::ReceiptOnly => {
+                                ControlFrame::Receipt(Box::new(ReceiptResponse {
+                                    request_id,
+                                    receipt: Receipt {
+                                        action_id,
+                                        actor_id: ActorId::new("local:501").expect("a principal"),
+                                        method,
+                                        method_version,
+                                        revision: U64::new(1),
+                                        state: ReceiptState::Accepted,
+                                        reason: Nullable::null(),
+                                        payload_digest: Digest256::from_bytes([0; 32]),
+                                        accepted_deadline_ms: Nullable::null(),
+                                        error: Nullable::null(),
+                                        updated_at_ms: TimestampMs::new(0),
+                                    },
+                                }))
+                            }
+                            Reply::Hold => {
+                                std::future::pending::<()>().await;
+                                return;
+                            }
                         }
-                        answer(request_id, parameters(&params).and_then(|p| host.begin(p)))
                     }
                     (Some(Method::UploadFinish), None) => answer(
                         request_id,
@@ -839,7 +894,7 @@ async fn a_plan_that_holds_a_transfer_starts_from_status() {
 #[tokio::test]
 async fn an_uncertain_reservation_is_never_reserved_again() {
     let host = Host::start(Script {
-        drop_reservation: true,
+        reservation: Reply::Drop,
         ..Script::default()
     });
     let session = host.session().await;
@@ -861,6 +916,107 @@ async fn an_uncertain_reservation_is_never_reserved_again() {
         .expect_err("a new session does not reserve again either");
     assert_eq!(refused.code(), ErrorCode::OutcomeUnknown);
     assert_eq!(host.seen().reservations, 1);
+}
+
+/// Asks for a reservation the host answers as `reply`, and checks that the plan will not ask for
+/// another, on this session or a new one.
+async fn never_reserved_twice(reply: Reply) -> ClientError {
+    let host = Host::start(Script {
+        reservation: reply,
+        ..Script::default()
+    });
+    let session = host.session().await;
+    let mut plan = Upload::new(host.subject(), Box::new(Held::new(pattern(4096))));
+
+    let first = uploads::send(&session, &host.route(), &host.target(), &mut plan, TTL)
+        .await
+        .expect_err("the reservation has no definite answer");
+    let refused = plan.next().expect_err("the plan will not reserve again");
+    assert_eq!(refused.code(), ErrorCode::OutcomeUnknown);
+    let refused = uploads::send(&session, &host.route(), &host.target(), &mut plan, TTL)
+        .await
+        .expect_err("the same session does not reserve again");
+    assert_eq!(refused.code(), ErrorCode::OutcomeUnknown);
+    let reconnected = host.session().await;
+    let refused = uploads::send(&reconnected, &host.route(), &host.target(), &mut plan, TTL)
+        .await
+        .expect_err("a new session does not reserve again either");
+    assert_eq!(refused.code(), ErrorCode::OutcomeUnknown);
+    assert_eq!(host.seen().reservations, 1);
+    first
+}
+
+/// A host that says it cannot report what became of a reservation has not said it made none.
+#[tokio::test]
+async fn a_reservation_the_host_could_not_report_is_never_reserved_again() {
+    let first = never_reserved_twice(Reply::Unknown).await;
+    assert_eq!(first.code(), ErrorCode::OutcomeUnknown);
+}
+
+/// A receipt without the reservation's result names the action, and nothing more.
+#[tokio::test]
+async fn a_reservation_settled_by_a_receipt_alone_is_never_reserved_again() {
+    let first = never_reserved_twice(Reply::ReceiptOnly).await;
+    assert_eq!(first.code(), ErrorCode::OutcomeUnknown);
+}
+
+/// A caller that abandons the call after the host has taken the reservation leaves a plan that
+/// knows a reservation may exist.
+#[tokio::test]
+async fn a_reservation_abandoned_in_flight_is_never_reserved_again() {
+    let host = Host::start(Script {
+        reservation: Reply::Hold,
+        ..Script::default()
+    });
+    let session = host.session().await;
+    let mut plan = Upload::new(host.subject(), Box::new(Held::new(pattern(4096))));
+
+    let route = host.route();
+    let target = host.target();
+    {
+        let first = uploads::send(&session, &route, &target, &mut plan, TTL);
+        tokio::pin!(first);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            tokio::select! {
+                outcome = &mut first => panic!("the host never answers, and yet: {outcome:?}"),
+                () = tokio::time::sleep(std::time::Duration::from_millis(10)) => {
+                    if host.seen().reservations == 1 {
+                        break;
+                    }
+                    assert!(tokio::time::Instant::now() < deadline, "the host saw no reservation");
+                }
+            }
+        }
+        // The call is abandoned here, with the host holding the reservation it never answered.
+    }
+    let refused = plan.next().expect_err("the plan will not reserve again");
+    assert_eq!(refused.code(), ErrorCode::OutcomeUnknown);
+    let refused = uploads::send(&session, &host.route(), &host.target(), &mut plan, TTL)
+        .await
+        .expect_err("the plan does not reserve again");
+    assert_eq!(refused.code(), ErrorCode::OutcomeUnknown);
+    assert_eq!(host.seen().reservations, 1);
+}
+
+/// A refusal the host decided leaves nothing reserved, so the plan may ask again.
+#[tokio::test]
+async fn a_refused_reservation_may_be_asked_for_again() {
+    let host = Host::start(Script::default());
+    let session = host.session().await;
+    let mut plan = Upload::new(
+        Subject {
+            // An environment the host does not own, which it refuses.
+            environment_id: EnvironmentId::new(Uuid::from_bytes([8; 16])),
+            ..host.subject()
+        },
+        Box::new(Held::new(pattern(4096))),
+    );
+    let refused = uploads::send(&session, &host.route(), &host.target(), &mut plan, TTL)
+        .await
+        .expect_err("the host refuses a reservation for another environment");
+    assert_ne!(refused.code(), ErrorCode::OutcomeUnknown);
+    assert!(matches!(plan.next(), Ok(uploads::Step::Begin(_))));
 }
 
 /// A lane that sat idle while its window expired sends its next chunk under the window the host
