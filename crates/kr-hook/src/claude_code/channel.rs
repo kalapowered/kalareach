@@ -75,6 +75,11 @@ pub const MAX_RELAYED_REQUESTS: usize = 64;
 /// How long a closing channel gives the worker's direction to finish what was already relayed.
 const CLOSING: Duration = Duration::from_secs(1);
 
+/// How long an ending channel gives what it reported to reach standard error.
+///
+/// A standard error nobody reads never takes it, and the channel ends anyway.
+const REPORTS_CLOSING: Duration = Duration::from_secs(1);
+
 /// The length of a request identifier Claude Code issues.
 pub const REQUEST_ID_LENGTH: usize = 5;
 
@@ -91,30 +96,40 @@ const INSTRUCTIONS: &str = "Messages arrive as <channel source=\"kalareach\">. E
     normally would.";
 
 /// Runs the server until Claude Code closes its end, or the worker closes the channel.
+///
+/// What it reports goes to standard error through [`crate::Reports`], so a standard error nobody
+/// reads never stops it: the runtime has one thread, and a report that waited would stop both
+/// directions with it.
 #[must_use]
 pub fn run() -> std::process::ExitCode {
-    let runtime = match tokio::runtime::Builder::new_current_thread()
+    let (reports, writer) = crate::Reports::to_standard_error();
+    let code = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
     {
-        Ok(runtime) => runtime,
-        Err(error) => {
-            crate::report(&format!("the channel could not start: {error}"));
-            return std::process::ExitCode::from(crate::cli::EXIT_FAILURE);
+        Ok(runtime) => {
+            let outcome = runtime.block_on(serve(reports.clone()));
+            // A read of standard input that is still waiting runs on a blocking thread nothing can
+            // interrupt, and a runtime that is dropped waits for it. The process is ending, so the
+            // runtime is not waited for: when the worker ends the channel, Claude Code's end may
+            // still be open. The tasks it held go with it, and what they reported with them.
+            runtime.shutdown_background();
+            match outcome {
+                Ok(()) => std::process::ExitCode::SUCCESS,
+                Err(failure) => {
+                    reports.report(&failure);
+                    std::process::ExitCode::from(crate::cli::EXIT_FAILURE)
+                }
+            }
         }
-    };
-    let outcome = runtime.block_on(serve());
-    // A read of standard input that is still waiting runs on a blocking thread nothing can
-    // interrupt, and a runtime that is dropped waits for it. The process is ending, so the runtime
-    // is not waited for: when the worker ends the channel, Claude Code's end may still be open.
-    runtime.shutdown_background();
-    match outcome {
-        Ok(()) => std::process::ExitCode::SUCCESS,
-        Err(failure) => {
-            crate::report(&failure);
+        Err(error) => {
+            reports.report(&format!("the channel could not start: {error}"));
             std::process::ExitCode::from(crate::cli::EXIT_FAILURE)
         }
-    }
+    };
+    drop(reports);
+    writer.finish(std::time::Instant::now() + REPORTS_CLOSING);
+    code
 }
 
 /// Finds the worker, when this process is inside a launch, and is admitted by it.
@@ -137,13 +152,14 @@ async fn connect() -> Result<Option<Exchange>, String> {
     Ok(Some(exchange))
 }
 
-async fn serve() -> Result<(), String> {
+async fn serve(reports: crate::Reports) -> Result<(), String> {
     let exchange = connect().await?;
     let relayed = Arc::new(Mutex::new(Relayed::default()));
     let (to_worker, mut from_claude) = tokio::sync::mpsc::channel(MAX_RELAYED_REQUESTS);
     let channel = Channel {
         to_worker: exchange.is_some().then_some(to_worker),
         relayed: Arc::clone(&relayed),
+        reports: reports.clone(),
     };
     let transport = rmcp::transport::async_rw::AsyncRwTransport::new_server(
         tokio::io::stdin(),
@@ -184,7 +200,7 @@ async fn serve() -> Result<(), String> {
                             break None;
                         }
                     }
-                    Err(refusal) => crate::report(&format!("not forwarded: {refusal}")),
+                    Err(refusal) => reports.report(&format!("not forwarded: {refusal}")),
                 },
                 Ok(None) => break Some("the worker closed the channel".to_owned()),
                 Err(error) => break Some(error.to_string()),
@@ -229,6 +245,8 @@ struct Channel {
     to_worker: Option<tokio::sync::mpsc::Sender<serde_json::Value>>,
     /// The approvals relayed and not yet answered.
     relayed: Arc<Mutex<Relayed>>,
+    /// Where what this side refuses is reported.
+    reports: crate::Reports,
 }
 
 impl ServerHandler for Channel {
@@ -265,7 +283,7 @@ impl ServerHandler for Channel {
                     .record(request_id);
                 let _ = to_worker.send(frame).await;
             }
-            Err(refusal) => crate::report(&format!("not relayed: {refusal}")),
+            Err(refusal) => self.reports.report(&format!("not relayed: {refusal}")),
         }
     }
 }

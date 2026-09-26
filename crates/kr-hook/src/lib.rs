@@ -102,6 +102,121 @@ pub fn report_by(line: &str, by: std::time::Instant) {
     });
 }
 
+/// How many diagnostic lines [`Reports`] holds while its writer waits on standard error.
+pub const QUEUED_REPORTS: usize = 64;
+
+/// Diagnostic lines for a process that serves for as long as its session runs.
+///
+/// [`report`] waits for as long as standard error makes it wait, which a process that answers once
+/// and ends can afford. A server cannot: a standard error nobody reads fills up, and the first
+/// report after that would stop the thread that serves. So a line here is handed to a queue of
+/// [`QUEUED_REPORTS`] lines without waiting, and one writer thread of its own writes them, in
+/// order. A line that finds the queue full is dropped and counted, and the writer says how many
+/// were dropped once it can write again. Whatever reports never waits on standard error.
+#[derive(Clone)]
+pub struct Reports {
+    queue: std::sync::mpsc::SyncSender<Queued>,
+    /// How many lines were dropped since the last one the queue took.
+    dropped: std::sync::Arc<std::sync::Mutex<u64>>,
+}
+
+/// The writer of one [`Reports`], which its process waits for, for a bounded time, before it ends.
+pub struct ReportWriter {
+    done: std::sync::mpsc::Receiver<()>,
+}
+
+/// One line in the queue, with how many were dropped just before it.
+struct Queued {
+    dropped_before: u64,
+    line: String,
+}
+
+impl Reports {
+    /// Starts the writer, on standard error.
+    #[must_use]
+    pub fn to_standard_error() -> (Self, ReportWriter) {
+        Self::start(|bytes| {
+            use std::io::Write as _;
+            let _ = std::io::stderr().lock().write_all(bytes);
+        })
+    }
+
+    /// Starts the writer, with `write` in place of standard error.
+    ///
+    /// A thread that cannot be started writes nothing: a diagnostic never costs the caller its
+    /// work.
+    fn start(mut write: impl FnMut(&[u8]) + Send + 'static) -> (Self, ReportWriter) {
+        let (queue, queued) = std::sync::mpsc::sync_channel::<Queued>(QUEUED_REPORTS);
+        let dropped = std::sync::Arc::new(std::sync::Mutex::new(0_u64));
+        let (finished, done) = std::sync::mpsc::channel();
+        let counted = std::sync::Arc::clone(&dropped);
+        let _ = std::thread::Builder::new()
+            .name("kr-hook reports".to_owned())
+            .spawn(move || {
+                // Until every sender is gone and the queue is empty.
+                for Queued {
+                    dropped_before,
+                    line,
+                } in queued
+                {
+                    if dropped_before > 0 {
+                        write(dropped_notice(dropped_before).as_bytes());
+                    }
+                    write(line.as_bytes());
+                }
+                let after = std::mem::take(
+                    &mut *counted
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner),
+                );
+                if after > 0 {
+                    write(dropped_notice(after).as_bytes());
+                }
+                let _ = finished.send(());
+            });
+        (Self { queue, dropped }, ReportWriter { done })
+    }
+
+    /// Hands one line to the writer without waiting, or drops and counts it when the queue is full.
+    pub fn report(&self, line: &str) {
+        let mut dropped = self
+            .dropped
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let queued = Queued {
+            dropped_before: *dropped,
+            line: format!("kr-hook: {line}\n"),
+        };
+        match self.queue.try_send(queued) {
+            Ok(()) => *dropped = 0,
+            Err(std::sync::mpsc::TrySendError::Full(_)) => *dropped += 1,
+            // The writer is gone, so nothing is written any more, and nothing waits for it.
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {}
+        }
+    }
+}
+
+impl ReportWriter {
+    /// Waits, no later than `by`, for the writer to write what was reported and end.
+    ///
+    /// The writer ends once every [`Reports`] is gone and it has written what they queued. A write
+    /// still waiting on standard error at `by` ends with the process, and its lines are lost.
+    pub fn finish(self, by: std::time::Instant) {
+        let _ = self
+            .done
+            .recv_timeout(by.saturating_duration_since(std::time::Instant::now()));
+    }
+}
+
+/// What the writer says about lines it never saw.
+fn dropped_notice(count: u64) -> String {
+    if count == 1 {
+        "kr-hook: 1 report was dropped because standard error was not being read\n".to_owned()
+    } else {
+        format!("kr-hook: {count} reports were dropped because standard error was not being read\n")
+    }
+}
+
 /// Hands `bytes` to `write` on a thread of its own, and waits for it no later than `by`.
 ///
 /// A thread that cannot be started writes nothing: a diagnostic never costs the caller its
@@ -159,6 +274,119 @@ mod tests {
         assert_eq!(
             written.lock().expect("the buffer").as_slice(),
             b"kr-hook: a line\n"
+        );
+    }
+
+    /// A writer that stalls holds nobody who reports. The queue takes what it holds, the lines
+    /// after that are dropped and counted, and once the writer can write again it writes the
+    /// queued lines in order and says how many were dropped before the next line.
+    #[test]
+    fn a_writer_that_stalls_holds_no_report_and_says_what_it_dropped() {
+        const DROPPED: usize = 10;
+        let written = Arc::new(Mutex::new(Vec::<String>::new()));
+        let into = Arc::clone(&written);
+        let (stalling, stalled) = std::sync::mpsc::channel::<()>();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let mut first = true;
+        let (reports, writer) = Reports::start(move |bytes| {
+            if first {
+                first = false;
+                let _ = stalling.send(());
+                // Until the test lets it go, or for half a minute, so a report that waited for it
+                // fails rather than hangs.
+                let _ = released.recv_timeout(Duration::from_secs(30));
+            }
+            into.lock()
+                .expect("the lines")
+                .push(String::from_utf8_lossy(bytes).into_owned());
+        });
+        reports.report("line 0");
+        stalled
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the writer is writing the first line");
+        let begun = Instant::now();
+        for index in 1..=QUEUED_REPORTS + DROPPED {
+            reports.report(&format!("line {index}"));
+        }
+        let took = begun.elapsed();
+        drop(release);
+        assert!(took < Duration::from_secs(10), "a report waited: {took:?}");
+        // The writer catches up with the queue, and the next line carries the count.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while written.lock().expect("the lines").len() < 1 + QUEUED_REPORTS {
+            assert!(Instant::now() < deadline, "the queued lines were written");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        reports.report("after");
+        drop(reports);
+        writer.finish(Instant::now() + Duration::from_secs(60));
+
+        let mut expected: Vec<String> = (0..=QUEUED_REPORTS)
+            .map(|index| format!("kr-hook: line {index}\n"))
+            .collect();
+        expected.push(format!(
+            "kr-hook: {DROPPED} reports were dropped because standard error was not being read\n"
+        ));
+        expected.push("kr-hook: after\n".to_owned());
+        assert_eq!(*written.lock().expect("the lines"), expected);
+    }
+
+    /// Lines dropped after the last one queued are counted when the writer ends.
+    #[test]
+    fn lines_dropped_last_are_counted_when_the_writer_ends() {
+        let written = Arc::new(Mutex::new(Vec::<String>::new()));
+        let into = Arc::clone(&written);
+        let (stalling, stalled) = std::sync::mpsc::channel::<()>();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let mut first = true;
+        let (reports, writer) = Reports::start(move |bytes| {
+            if first {
+                first = false;
+                let _ = stalling.send(());
+                let _ = released.recv_timeout(Duration::from_secs(30));
+            }
+            into.lock()
+                .expect("the lines")
+                .push(String::from_utf8_lossy(bytes).into_owned());
+        });
+        reports.report("line 0");
+        stalled
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the writer is writing the first line");
+        for index in 1..=QUEUED_REPORTS + 1 {
+            reports.report(&format!("line {index}"));
+        }
+        drop(reports);
+        drop(release);
+        writer.finish(Instant::now() + Duration::from_secs(60));
+        let written = written.lock().expect("the lines");
+        assert_eq!(written.len(), QUEUED_REPORTS + 2, "{written:?}");
+        assert_eq!(
+            written.last().map(String::as_str),
+            Some("kr-hook: 1 report was dropped because standard error was not being read\n")
+        );
+    }
+
+    /// The control: a writer that keeps up gets every line, in order, and no notice.
+    #[test]
+    fn a_writer_that_keeps_up_gets_every_line_in_order() {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let into = Arc::clone(&written);
+        let (reports, writer) = Reports::start(move |bytes| {
+            into.lock().expect("the buffer").extend_from_slice(bytes);
+        });
+        // No more than the queue holds, so none is dropped however late the writer starts.
+        for index in 0..QUEUED_REPORTS {
+            reports.report(&format!("line {index}"));
+        }
+        drop(reports);
+        writer.finish(Instant::now() + Duration::from_secs(60));
+        let expected: String = (0..QUEUED_REPORTS)
+            .map(|index| format!("kr-hook: line {index}\n"))
+            .collect();
+        assert_eq!(
+            String::from_utf8_lossy(&written.lock().expect("the buffer")),
+            expected
         );
     }
 
