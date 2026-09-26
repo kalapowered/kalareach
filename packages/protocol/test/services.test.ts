@@ -114,6 +114,15 @@ interface Document {
     }>
     readonly refused: readonly string[]
   }
+  readonly sync_requests: {
+    readonly method: string
+    readonly cases: ReadonlyArray<{
+      readonly id: string
+      readonly json: Readonly<Record<string, Readonly<Record<string, unknown>>>>
+      readonly cbor_hex: string
+      readonly sha256: string
+    }>
+  }
   readonly mailbox_claim: {
     readonly domain: string
     readonly lifetime_ms: string
@@ -185,6 +194,51 @@ describe('the canonical body a signature covers', () => {
       const body = JSON.parse(text) as unknown
       expect(() => canonicalBody(body), text).toThrow(ServicesSchemaError)
     }
+  })
+})
+
+describe('the settings-sync requests a client sends', () => {
+  const requests = document.sync_requests
+
+  it('publishes one request for each member, and the recovery bundle\'s four beside them', () => {
+    expect(requests.method).toBe('sync.compare_exchange')
+    expect(
+      Object.fromEntries(requests.cases.map((entry) => [entry.id, Object.keys(entry.json)]))
+    ).toEqual({
+      exchange: ['exchange'],
+      compare: ['compare'],
+      resolve: ['resolve'],
+      status: ['status'],
+      fence: ['fence'],
+      keys: ['keys'],
+      rekey: ['rekey'],
+      memberships: ['memberships'],
+      bundle_exchange: ['exchange'],
+      bundle_compare: ['compare'],
+      bundle_status: ['status'],
+      bundle_fence: ['fence']
+    })
+  })
+
+  it('encodes each request to the bytes the host produces and digests it as its signature does', async () => {
+    for (const entry of requests.cases) {
+      expect(hex(canonicalBody(entry.json)), entry.id).toBe(entry.cbor_hex)
+      expect(hex(await canonicalBodyDigest(entry.json)), entry.id).toBe(entry.sha256)
+    }
+  })
+
+  it('carries in each write an object this package admits', () => {
+    const write = (id: string): Readonly<Record<string, unknown>> => {
+      const found = requests.cases.find((entry) => entry.id === id)?.json['exchange']
+      if (found === undefined) {
+        throw new Error(`no request ${id}`)
+      }
+      return found
+    }
+    expect(checkSealedSyncObject(readSealedSyncObject(write('exchange')['object']))).toBeNull()
+    expect(
+      checkSealedRecoveryBundle(readSealedRecoveryBundle(write('bundle_exchange')['object']))
+    ).toBeNull()
   })
 })
 

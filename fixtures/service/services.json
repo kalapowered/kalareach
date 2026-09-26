@@ -1023,5 +1023,888 @@
       "draft",
       "client_selection"
     ]
+  },
+  "sync_requests": {
+    "cases": [
+      {
+        "cbor_hex": "a16865786368616e6765a864686f6d65782430326434343961332d316662622d323637632d386633352d326539393638613739653365646b696e646873657474696e6773666f626a656374a3656e6f6e636578206c3565586c3565586c3565586c3565586c3565586c3565586c3565586c3565586a6369706865727465787479056b7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73374f7a73347173697a655f6275636b65745f62797465736431303234696b65795f65706f63686133696f626a6563745f6964782430623766333361322d356538312d346330362d623934642d3261373063353138653633666a726571756573745f6964782437313361306563342d393832352d346436622d383166372d3363353032643965343662336d636f6c6c656374696f6e5f6964782436633265393130642d336135372d346238382d396631342d3032643637626533343531397165787065637465645f7265766973696f6e782464343039366535322d313761622d346633302d383663312d356232663938306537346136",
+        "description": "A write into a shared collection: the collection and its home, the key epoch the object is sealed under, the object by its identity inside the collection, and the revision the write replaces.",
+        "id": "exchange",
+        "json": {
+          "exchange": {
+            "collection_id": "6c2e910d-3a57-4b88-9f14-02d67be34519",
+            "expected_revision": "d4096e52-17ab-4f30-86c1-5b2f980e74a6",
+            "home": "02d449a3-1fbb-267c-8f35-2e9968a79e3e",
+            "key_epoch": "3",
+            "kind": "settings",
+            "object": {
+              "ciphertext": "zs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs4",
+              "nonce": "l5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eX",
+              "size_bucket_bytes": "1024"
+            },
+            "object_id": "0b7f33a2-5e81-4c06-b94d-2a70c518e63f",
+            "request_id": "713a0ec4-9825-4d6b-81f7-3c502d9e46b3"
+          }
+        },
+        "sha256": "ddc71b72bd09b2613c7e46807b8fcb4d59cb42abd8a0615c8d5b823560fadea9",
+        "value": {
+          "map": [
+            [
+              "exchange",
+              {
+                "map": [
+                  [
+                    "home",
+                    {
+                      "text": "02d449a3-1fbb-267c-8f35-2e9968a79e3e"
+                    }
+                  ],
+                  [
+                    "kind",
+                    {
+                      "text": "settings"
+                    }
+                  ],
+                  [
+                    "object",
+                    {
+                      "map": [
+                        [
+                          "nonce",
+                          {
+                            "text": "l5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eX"
+                          }
+                        ],
+                        [
+                          "ciphertext",
+                          {
+                            "text": "zs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs4"
+                          }
+                        ],
+                        [
+                          "size_bucket_bytes",
+                          {
+                            "text": "1024"
+                          }
+                        ]
+                      ]
+                    }
+                  ],
+                  [
+                    "key_epoch",
+                    {
+                      "text": "3"
+                    }
+                  ],
+                  [
+                    "object_id",
+                    {
+                      "text": "0b7f33a2-5e81-4c06-b94d-2a70c518e63f"
+                    }
+                  ],
+                  [
+                    "request_id",
+                    {
+                      "text": "713a0ec4-9825-4d6b-81f7-3c502d9e46b3"
+                    }
+                  ],
+                  [
+                    "collection_id",
+                    {
+                      "text": "6c2e910d-3a57-4b88-9f14-02d67be34519"
+                    }
+                  ],
+                  [
+                    "expected_revision",
+                    {
+                      "text": "d4096e52-17ab-4f30-86c1-5b2f980e74a6"
+                    }
+                  ]
+                ]
+              }
+            ]
+          ]
+        }
+      },
+      {
+        "cbor_hex": "a167636f6d70617265a564686f6d65782430326434343961332d316662622d323637632d386633352d326539393638613739653365656b6e6f776e81a2687265766973696f6e782464343039366535322d313761622d346633302d383663312d356232663938306537346136696f626a6563745f6964782430623766333361322d356538312d346330362d623934642d3261373063353138653633666d636f6c6c656374696f6e5f6964782436633265393130642d336135372d346238382d396631342d3032643637626533343531396e776974685f636f6e666c69637473f57818636f6e666c696374735f61667465725f73657175656e63656137",
+        "description": "A read of a shared collection that names the one object the reader holds, at the revision it holds, and asks for the copies after the seventh.",
+        "id": "compare",
+        "json": {
+          "compare": {
+            "collection_id": "6c2e910d-3a57-4b88-9f14-02d67be34519",
+            "conflicts_after_sequence": "7",
+            "home": "02d449a3-1fbb-267c-8f35-2e9968a79e3e",
+            "known": [
+              {
+                "object_id": "0b7f33a2-5e81-4c06-b94d-2a70c518e63f",
+                "revision": "d4096e52-17ab-4f30-86c1-5b2f980e74a6"
+              }
+            ],
+            "with_conflicts": true
+          }
+        },
+        "sha256": "68442002c3af8be2df1c86345cf831d2c9f29267394642c0742861d638b4e274",
+        "value": {
+          "map": [
+            [
+              "compare",
+              {
+                "map": [
+                  [
+                    "home",
+                    {
+                      "text": "02d449a3-1fbb-267c-8f35-2e9968a79e3e"
+                    }
+                  ],
+                  [
+                    "known",
+                    {
+                      "array": [
+                        {
+                          "map": [
+                            [
+                              "revision",
+                              {
+                                "text": "d4096e52-17ab-4f30-86c1-5b2f980e74a6"
+                              }
+                            ],
+                            [
+                              "object_id",
+                              {
+                                "text": "0b7f33a2-5e81-4c06-b94d-2a70c518e63f"
+                              }
+                            ]
+                          ]
+                        }
+                      ]
+                    }
+                  ],
+                  [
+                    "collection_id",
+                    {
+                      "text": "6c2e910d-3a57-4b88-9f14-02d67be34519"
+                    }
+                  ],
+                  [
+                    "with_conflicts",
+                    {
+                      "bool": true
+                    }
+                  ],
+                  [
+                    "conflicts_after_sequence",
+                    {
+                      "text": "7"
+                    }
+                  ]
+                ]
+              }
+            ]
+          ]
+        }
+      },
+      {
+        "cbor_hex": "a1677265736f6c7665a364686f6d65782430326434343961332d316662622d323637632d386633352d3265393936386137396533656c636f6e666c6963745f69647381782432396630346238652d363133632d343764352d613337612d3066393432366264353830316d636f6c6c656374696f6e5f6964782436633265393130642d336135372d346238382d396631342d303264363762653334353139",
+        "description": "Drops the copy a refused write left, because the person has chosen.",
+        "id": "resolve",
+        "json": {
+          "resolve": {
+            "collection_id": "6c2e910d-3a57-4b88-9f14-02d67be34519",
+            "conflict_ids": [
+              "29f04b8e-613c-47d5-a37a-0f9426bd5801"
+            ],
+            "home": "02d449a3-1fbb-267c-8f35-2e9968a79e3e"
+          }
+        },
+        "sha256": "50d0e7b6ddb3ecc2f456dde43b1d1c74d51de7f2ce860534772f3e50e9846df4",
+        "value": {
+          "map": [
+            [
+              "resolve",
+              {
+                "map": [
+                  [
+                    "home",
+                    {
+                      "text": "02d449a3-1fbb-267c-8f35-2e9968a79e3e"
+                    }
+                  ],
+                  [
+                    "conflict_ids",
+                    {
+                      "array": [
+                        {
+                          "text": "29f04b8e-613c-47d5-a37a-0f9426bd5801"
+                        }
+                      ]
+                    }
+                  ],
+                  [
+                    "collection_id",
+                    {
+                      "text": "6c2e910d-3a57-4b88-9f14-02d67be34519"
+                    }
+                  ]
+                ]
+              }
+            ]
+          ]
+        }
+      },
+      {
+        "cbor_hex": "a166737461747573a364686f6d65782430326434343961332d316662622d323637632d386633352d3265393936386137396533656a726571756573745f6964782437313361306563342d393832352d346436622d383166372d3363353032643965343662336d636f6c6c656374696f6e5f6964782436633265393130642d336135372d346238382d396631342d303264363762653334353139",
+        "description": "Asks what the collection recorded about the write's request identity.",
+        "id": "status",
+        "json": {
+          "status": {
+            "collection_id": "6c2e910d-3a57-4b88-9f14-02d67be34519",
+            "home": "02d449a3-1fbb-267c-8f35-2e9968a79e3e",
+            "request_id": "713a0ec4-9825-4d6b-81f7-3c502d9e46b3"
+          }
+        },
+        "sha256": "86494170d1ed16a18004def4e900a1f789b7dd82e8f3810509001078e58efae1",
+        "value": {
+          "map": [
+            [
+              "status",
+              {
+                "map": [
+                  [
+                    "home",
+                    {
+                      "text": "02d449a3-1fbb-267c-8f35-2e9968a79e3e"
+                    }
+                  ],
+                  [
+                    "request_id",
+                    {
+                      "text": "713a0ec4-9825-4d6b-81f7-3c502d9e46b3"
+                    }
+                  ],
+                  [
+                    "collection_id",
+                    {
+                      "text": "6c2e910d-3a57-4b88-9f14-02d67be34519"
+                    }
+                  ]
+                ]
+              }
+            ]
+          ]
+        }
+      },
+      {
+        "cbor_hex": "a16566656e6365a564686f6d65782430326434343961332d316662622d323637632d386633352d3265393936386137396533656a726571756573745f6964782437313361306563342d393832352d346436622d383166372d3363353032643965343662336d636f6c6c656374696f6e5f6964782436633265393130642d336135372d346238382d396631342d303264363762653334353139716c6173745f7369676e65645f61745f6d736d313736373232353633303030307266697273745f7369676e65645f61745f6d736d31373637323235363030303030",
+        "description": "Ends the write's request identity, naming the earliest and the latest instant an attempt under it was signed at.",
+        "id": "fence",
+        "json": {
+          "fence": {
+            "collection_id": "6c2e910d-3a57-4b88-9f14-02d67be34519",
+            "first_signed_at_ms": "1767225600000",
+            "home": "02d449a3-1fbb-267c-8f35-2e9968a79e3e",
+            "last_signed_at_ms": "1767225630000",
+            "request_id": "713a0ec4-9825-4d6b-81f7-3c502d9e46b3"
+          }
+        },
+        "sha256": "779c991da6dbcb4aec4a344798749fa1d45082e47c204a7506112803b72c3fc8",
+        "value": {
+          "map": [
+            [
+              "fence",
+              {
+                "map": [
+                  [
+                    "home",
+                    {
+                      "text": "02d449a3-1fbb-267c-8f35-2e9968a79e3e"
+                    }
+                  ],
+                  [
+                    "request_id",
+                    {
+                      "text": "713a0ec4-9825-4d6b-81f7-3c502d9e46b3"
+                    }
+                  ],
+                  [
+                    "collection_id",
+                    {
+                      "text": "6c2e910d-3a57-4b88-9f14-02d67be34519"
+                    }
+                  ],
+                  [
+                    "last_signed_at_ms",
+                    {
+                      "text": "1767225630000"
+                    }
+                  ],
+                  [
+                    "first_signed_at_ms",
+                    {
+                      "text": "1767225600000"
+                    }
+                  ]
+                ]
+              }
+            ]
+          ]
+        }
+      },
+      {
+        "cbor_hex": "a1646b657973a364686f6d65782430326434343961332d316662622d323637632d386633352d3265393936386137396533656d636f6c6c656374696f6e5f6964782436633265393130642d336135372d346238382d396631342d3032643637626533343531396e61667465725f7265766973696f6e6132",
+        "description": "Reads the collection's key records after the second.",
+        "id": "keys",
+        "json": {
+          "keys": {
+            "after_revision": "2",
+            "collection_id": "6c2e910d-3a57-4b88-9f14-02d67be34519",
+            "home": "02d449a3-1fbb-267c-8f35-2e9968a79e3e"
+          }
+        },
+        "sha256": "28c8d000e806e5221beb827bc9d2befe2e920aedb7aa8eddab3921f7822b5c09",
+        "value": {
+          "map": [
+            [
+              "keys",
+              {
+                "map": [
+                  [
+                    "home",
+                    {
+                      "text": "02d449a3-1fbb-267c-8f35-2e9968a79e3e"
+                    }
+                  ],
+                  [
+                    "collection_id",
+                    {
+                      "text": "6c2e910d-3a57-4b88-9f14-02d67be34519"
+                    }
+                  ],
+                  [
+                    "after_revision",
+                    {
+                      "text": "2"
+                    }
+                  ]
+                ]
+              }
+            ]
+          ]
+        }
+      },
+      {
+        "cbor_hex": "a16572656b6579a464686f6d65782430326434343961332d316662622d323637632d386633352d326539393638613739653365667265636f7264a2677061796c6f6164a864686f6d65782430326434343961332d316662622d323637632d386633352d326539393638613739653365676d656d6265727382a36477726170a3656e6f6e636578206d7071616d7071616d7071616d7071616d7071616d7071616d7071616d70716167636f6e74657874a566666f726d617478186b722d636f6c6c656374696f6e2d6b65792d777261702f31696b65795f65706f636861336d636f6c6c656374696f6e5f6964782436633265393130642d336135372d346238382d396631342d3032643637626533343531396d73656e6465725f6b65795f6964782b35734d3474346c357047525437594b6b6c67643374524966307a75656b794f4c507a556a30496e7373385970726563697069656e745f6b65795f6964782b35734d3474346c357047525437594b6b6c67643374524966307a75656b794f4c507a556a30496e737338596a6369706865727465787479012e6d7071616d7071616d7071616d7071616d7071616d7071616d7071616d7071616d7071616d7071616d7071616d7071616d7071616d7071616d7071616d7071616d7071616d7071616d7071616d7071616d7071616d7071616d7071616d7071616d7071616d7071616d7071616d7071616d7071616d7071616d7071616d7071616d7071616d7071616d7071616d7071616d7071616d7071616d7071616d7071616d7071616d7071616d7071616d7071616d7071616d7071616d7071616d7071616d7071616d7071616d7071616d7071616d7071616d7071616d7071616d7071616d7071616d7071616d7071616d7071616d7071616d7071616d7071616d7071616d7071616d7071616d7071616d7071616d7071616d7071616d7071616d7071616d7071616d7071616d7071616d676d617574686f7269736174696f6e782b455245524552455245524552455245524552455245524552455245524552455245524552455245524552456f73746f7265645f656e76656c6f7065782b45684953456849534568495345684953456849534568495345684953456849534568495345684953456849a36477726170a3656e6f6e636578206d3575626d3575626d3575626d3575626d3575626d3575626d3575626d35756267636f6e74657874a566666f726d617478186b722d636f6c6c656374696f6e2d6b65792d777261702f31696b65795f65706f636861336d636f6c6c656374696f6e5f6964782436633265393130642d336135372d346238382d396631342d3032643637626533343531396d73656e6465725f6b65795f6964782b35734d3474346c357047525437594b6b6c67643374524966307a75656b794f4c507a556a30496e7373385970726563697069656e745f6b65795f6964782b48704f6473566c6c42784c5a36346331346d6a737272514d58524e76647947357439566a694156655478306a6369706865727465787479012e6d3575626d3575626d3575626d3575626d3575626d3575626d3575626d3575626d3575626d3575626d3575626d3575626d3575626d3575626d3575626d3575626d3575626d3575626d3575626d3575626d3575626d3575626d3575626d3575626d3575626d3575626d3575626d3575626d3575626d3575626d3575626d3575626d3575626d3575626d3575626d3575626d3575626d3575626d3575626d3575626d3575626d3575626d3575626d3575626d3575626d3575626d3575626d3575626d3575626d3575626d3575626d3575626d3575626d3575626d3575626d3575626d3575626d3575626d3575626d3575626d3575626d3575626d3575626d3575626d3575626d3575626d3575626d3575626d3575626d3575626d3575626d3575626d3575626d3575626d3575626d776d617574686f7269736174696f6e782b45784d5445784d5445784d5445784d5445784d5445784d5445784d5445784d5445784d5445784d5445784d6f73746f7265645f656e76656c6f7065782b464251554642515546425155464251554642515546425155464251554642515546425155464251554642516870726576696f7573782b586c3565586c3565586c3565586c3565586c3565586c3565586c3565586c3565586c3565586c3565586c34687265766973696f6e6135696b65795f65706f636861336c6973737565645f61745f6d736d313736373232353630303030306d636f6c6c656374696f6e5f6964782436633265393130642d336135372d346238382d396631342d3032643637626533343531396d6973737565725f6b65795f6964782b535f5871305f65494667644f574e797872766155392d6558536e6439557738657a334f7430493957653151697369676e61747572657856596d4a69596d4a69596d4a69596d4a69596d4a69596d4a69596d4a69596d4a69596d4a69596d4a69596d4a69596d4a69596d4a69596d4a69596d4a69596d4a69596d4a69596d4a69596d4a69596d4a69596d4a6959676a726571756573745f6964782434346238316636372d306164332d346532392d393536322d6366306237653331613835646d636f6c6c656374696f6e5f6964782436633265393130642d336135372d346238382d396631342d303264363762653334353139",
+        "description": "Offers the key record that follows the collection's newest, under a request identity of its own.",
+        "id": "rekey",
+        "json": {
+          "rekey": {
+            "collection_id": "6c2e910d-3a57-4b88-9f14-02d67be34519",
+            "home": "02d449a3-1fbb-267c-8f35-2e9968a79e3e",
+            "record": {
+              "payload": {
+                "collection_id": "6c2e910d-3a57-4b88-9f14-02d67be34519",
+                "home": "02d449a3-1fbb-267c-8f35-2e9968a79e3e",
+                "issued_at_ms": "1767225600000",
+                "issuer_key_id": "S_Xq0_eIFgdOWNyxrvaU9-eXSnd9Uw8ez3Ot0I9We1Q",
+                "key_epoch": "3",
+                "members": [
+                  {
+                    "authorisation": "ERERERERERERERERERERERERERERERERERERERERERE",
+                    "stored_envelope": "EhISEhISEhISEhISEhISEhISEhISEhISEhISEhISEhI",
+                    "wrap": {
+                      "ciphertext": "mpqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqamg",
+                      "context": {
+                        "collection_id": "6c2e910d-3a57-4b88-9f14-02d67be34519",
+                        "format": "kr-collection-key-wrap/1",
+                        "key_epoch": "3",
+                        "recipient_key_id": "5sM4t4l5pGRT7YKklgd3tRIf0zuekyOLPzUj0Inss8Y",
+                        "sender_key_id": "5sM4t4l5pGRT7YKklgd3tRIf0zuekyOLPzUj0Inss8Y"
+                      },
+                      "nonce": "mpqampqampqampqampqampqampqampqa"
+                    }
+                  },
+                  {
+                    "authorisation": "ExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExM",
+                    "stored_envelope": "FBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQ",
+                    "wrap": {
+                      "ciphertext": "m5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubmw",
+                      "context": {
+                        "collection_id": "6c2e910d-3a57-4b88-9f14-02d67be34519",
+                        "format": "kr-collection-key-wrap/1",
+                        "key_epoch": "3",
+                        "recipient_key_id": "HpOdsVllBxLZ64c14mjsrrQMXRNvdyG5t9VjiAVeTx0",
+                        "sender_key_id": "5sM4t4l5pGRT7YKklgd3tRIf0zuekyOLPzUj0Inss8Y"
+                      },
+                      "nonce": "m5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ub"
+                    }
+                  }
+                ],
+                "previous": "Xl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl4",
+                "revision": "5"
+              },
+              "signature": "YmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYg"
+            },
+            "request_id": "44b81f67-0ad3-4e29-9562-cf0b7e31a85d"
+          }
+        },
+        "sha256": "7e1748cc17093be2459e21eadf039b077c2fc8382394cbc73e0c20f916bb8e87",
+        "value": {
+          "map": [
+            [
+              "rekey",
+              {
+                "map": [
+                  [
+                    "home",
+                    {
+                      "text": "02d449a3-1fbb-267c-8f35-2e9968a79e3e"
+                    }
+                  ],
+                  [
+                    "record",
+                    {
+                      "map": [
+                        [
+                          "payload",
+                          {
+                            "map": [
+                              [
+                                "home",
+                                {
+                                  "text": "02d449a3-1fbb-267c-8f35-2e9968a79e3e"
+                                }
+                              ],
+                              [
+                                "members",
+                                {
+                                  "array": [
+                                    {
+                                      "map": [
+                                        [
+                                          "wrap",
+                                          {
+                                            "map": [
+                                              [
+                                                "nonce",
+                                                {
+                                                  "text": "mpqampqampqampqampqampqampqampqa"
+                                                }
+                                              ],
+                                              [
+                                                "context",
+                                                {
+                                                  "map": [
+                                                    [
+                                                      "format",
+                                                      {
+                                                        "text": "kr-collection-key-wrap/1"
+                                                      }
+                                                    ],
+                                                    [
+                                                      "key_epoch",
+                                                      {
+                                                        "text": "3"
+                                                      }
+                                                    ],
+                                                    [
+                                                      "collection_id",
+                                                      {
+                                                        "text": "6c2e910d-3a57-4b88-9f14-02d67be34519"
+                                                      }
+                                                    ],
+                                                    [
+                                                      "sender_key_id",
+                                                      {
+                                                        "text": "5sM4t4l5pGRT7YKklgd3tRIf0zuekyOLPzUj0Inss8Y"
+                                                      }
+                                                    ],
+                                                    [
+                                                      "recipient_key_id",
+                                                      {
+                                                        "text": "5sM4t4l5pGRT7YKklgd3tRIf0zuekyOLPzUj0Inss8Y"
+                                                      }
+                                                    ]
+                                                  ]
+                                                }
+                                              ],
+                                              [
+                                                "ciphertext",
+                                                {
+                                                  "text": "mpqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqamg"
+                                                }
+                                              ]
+                                            ]
+                                          }
+                                        ],
+                                        [
+                                          "authorisation",
+                                          {
+                                            "text": "ERERERERERERERERERERERERERERERERERERERERERE"
+                                          }
+                                        ],
+                                        [
+                                          "stored_envelope",
+                                          {
+                                            "text": "EhISEhISEhISEhISEhISEhISEhISEhISEhISEhISEhI"
+                                          }
+                                        ]
+                                      ]
+                                    },
+                                    {
+                                      "map": [
+                                        [
+                                          "wrap",
+                                          {
+                                            "map": [
+                                              [
+                                                "nonce",
+                                                {
+                                                  "text": "m5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ub"
+                                                }
+                                              ],
+                                              [
+                                                "context",
+                                                {
+                                                  "map": [
+                                                    [
+                                                      "format",
+                                                      {
+                                                        "text": "kr-collection-key-wrap/1"
+                                                      }
+                                                    ],
+                                                    [
+                                                      "key_epoch",
+                                                      {
+                                                        "text": "3"
+                                                      }
+                                                    ],
+                                                    [
+                                                      "collection_id",
+                                                      {
+                                                        "text": "6c2e910d-3a57-4b88-9f14-02d67be34519"
+                                                      }
+                                                    ],
+                                                    [
+                                                      "sender_key_id",
+                                                      {
+                                                        "text": "5sM4t4l5pGRT7YKklgd3tRIf0zuekyOLPzUj0Inss8Y"
+                                                      }
+                                                    ],
+                                                    [
+                                                      "recipient_key_id",
+                                                      {
+                                                        "text": "HpOdsVllBxLZ64c14mjsrrQMXRNvdyG5t9VjiAVeTx0"
+                                                      }
+                                                    ]
+                                                  ]
+                                                }
+                                              ],
+                                              [
+                                                "ciphertext",
+                                                {
+                                                  "text": "m5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubmw"
+                                                }
+                                              ]
+                                            ]
+                                          }
+                                        ],
+                                        [
+                                          "authorisation",
+                                          {
+                                            "text": "ExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExM"
+                                          }
+                                        ],
+                                        [
+                                          "stored_envelope",
+                                          {
+                                            "text": "FBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQ"
+                                          }
+                                        ]
+                                      ]
+                                    }
+                                  ]
+                                }
+                              ],
+                              [
+                                "previous",
+                                {
+                                  "text": "Xl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl4"
+                                }
+                              ],
+                              [
+                                "revision",
+                                {
+                                  "text": "5"
+                                }
+                              ],
+                              [
+                                "key_epoch",
+                                {
+                                  "text": "3"
+                                }
+                              ],
+                              [
+                                "issued_at_ms",
+                                {
+                                  "text": "1767225600000"
+                                }
+                              ],
+                              [
+                                "collection_id",
+                                {
+                                  "text": "6c2e910d-3a57-4b88-9f14-02d67be34519"
+                                }
+                              ],
+                              [
+                                "issuer_key_id",
+                                {
+                                  "text": "S_Xq0_eIFgdOWNyxrvaU9-eXSnd9Uw8ez3Ot0I9We1Q"
+                                }
+                              ]
+                            ]
+                          }
+                        ],
+                        [
+                          "signature",
+                          {
+                            "text": "YmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYg"
+                          }
+                        ]
+                      ]
+                    }
+                  ],
+                  [
+                    "request_id",
+                    {
+                      "text": "44b81f67-0ad3-4e29-9562-cf0b7e31a85d"
+                    }
+                  ],
+                  [
+                    "collection_id",
+                    {
+                      "text": "6c2e910d-3a57-4b88-9f14-02d67be34519"
+                    }
+                  ]
+                ]
+              }
+            ]
+          ]
+        }
+      },
+      {
+        "cbor_hex": "a16b6d656d6265727368697073a1656166746572784930326434343961332d316662622d323637632d386633352d3265393936386137396533652f36633265393130642d336135372d346238382d396631342d303264363762653334353139",
+        "description": "Lists the shared collections whose newest key record names the caller, after the cursor the previous page ended at, which names that page's last collection by its home.",
+        "id": "memberships",
+        "json": {
+          "memberships": {
+            "after": "02d449a3-1fbb-267c-8f35-2e9968a79e3e/6c2e910d-3a57-4b88-9f14-02d67be34519"
+          }
+        },
+        "sha256": "29afc76b92194460fc160205e06456c83b4526d99bb326fe8700b2aeed15d297",
+        "value": {
+          "map": [
+            [
+              "memberships",
+              {
+                "map": [
+                  [
+                    "after",
+                    {
+                      "text": "02d449a3-1fbb-267c-8f35-2e9968a79e3e/6c2e910d-3a57-4b88-9f14-02d67be34519"
+                    }
+                  ]
+                ]
+              }
+            ]
+          ]
+        }
+      },
+      {
+        "cbor_hex": "a16865786368616e6765a5646b696e646f7265636f766572795f62756e646c65666f626a656374a16a6369706865727465787478567672362d7672362d7672362d7672362d7672362d7672362d7672362d7672362d7672362d7672362d7672362d7672362d7672362d7672362d7672362d7672362d7672362d7672362d7672362d7672362d7672362d7667676c6f6361746f72782439633631643832622d343730352d346139332d616533652d3137356366303832366433346a726571756573745f6964782465323537303839622d333634632d343166612d626431332d3661383530636639323737307165787065637465645f7265766973696f6ef6",
+        "description": "The first write of the recovery bundle at its locator. It names no collection and no home, and it replaces no revision, so its expected revision is present and null.",
+        "id": "bundle_exchange",
+        "json": {
+          "exchange": {
+            "expected_revision": null,
+            "kind": "recovery_bundle",
+            "locator": "9c61d82b-4705-4a93-ae3e-175cf0826d34",
+            "object": {
+              "ciphertext": "vr6-vr6-vr6-vr6-vr6-vr6-vr6-vr6-vr6-vr6-vr6-vr6-vr6-vr6-vr6-vr6-vr6-vr6-vr6-vr6-vr6-vg"
+            },
+            "request_id": "e257089b-364c-41fa-bd13-6a850cf92770"
+          }
+        },
+        "sha256": "d73cc3324b76b4b1beaab0875b3e3d8ea82709546325df961d35c01dab1aab35",
+        "value": {
+          "map": [
+            [
+              "exchange",
+              {
+                "map": [
+                  [
+                    "kind",
+                    {
+                      "text": "recovery_bundle"
+                    }
+                  ],
+                  [
+                    "object",
+                    {
+                      "map": [
+                        [
+                          "ciphertext",
+                          {
+                            "text": "vr6-vr6-vr6-vr6-vr6-vr6-vr6-vr6-vr6-vr6-vr6-vr6-vr6-vr6-vr6-vr6-vr6-vr6-vr6-vr6-vr6-vg"
+                          }
+                        ]
+                      ]
+                    }
+                  ],
+                  [
+                    "locator",
+                    {
+                      "text": "9c61d82b-4705-4a93-ae3e-175cf0826d34"
+                    }
+                  ],
+                  [
+                    "request_id",
+                    {
+                      "text": "e257089b-364c-41fa-bd13-6a850cf92770"
+                    }
+                  ],
+                  [
+                    "expected_revision",
+                    {
+                      "null": null
+                    }
+                  ]
+                ]
+              }
+            ]
+          ]
+        }
+      },
+      {
+        "cbor_hex": "a167636f6d70617265a2646b696e646f7265636f766572795f62756e646c65676c6f6361746f72782439633631643832622d343730352d346139332d616533652d313735636630383236643334",
+        "description": "A read of the recovery bundle at its locator.",
+        "id": "bundle_compare",
+        "json": {
+          "compare": {
+            "kind": "recovery_bundle",
+            "locator": "9c61d82b-4705-4a93-ae3e-175cf0826d34"
+          }
+        },
+        "sha256": "c159a258d936dbccccfeeba86ab8991ce76390b2102ee0c859ab78a1c0929599",
+        "value": {
+          "map": [
+            [
+              "compare",
+              {
+                "map": [
+                  [
+                    "kind",
+                    {
+                      "text": "recovery_bundle"
+                    }
+                  ],
+                  [
+                    "locator",
+                    {
+                      "text": "9c61d82b-4705-4a93-ae3e-175cf0826d34"
+                    }
+                  ]
+                ]
+              }
+            ]
+          ]
+        }
+      },
+      {
+        "cbor_hex": "a166737461747573a2676c6f6361746f72782439633631643832622d343730352d346139332d616533652d3137356366303832366433346a726571756573745f6964782465323537303839622d333634632d343166612d626431332d366138353063663932373730",
+        "description": "Asks what was recorded about a write of the recovery bundle at its locator.",
+        "id": "bundle_status",
+        "json": {
+          "status": {
+            "locator": "9c61d82b-4705-4a93-ae3e-175cf0826d34",
+            "request_id": "e257089b-364c-41fa-bd13-6a850cf92770"
+          }
+        },
+        "sha256": "a05ff66c9df7a7dc00cd585b9f8fd50ce28d3c5dcdb061ffd89bccd76f8d113c",
+        "value": {
+          "map": [
+            [
+              "status",
+              {
+                "map": [
+                  [
+                    "locator",
+                    {
+                      "text": "9c61d82b-4705-4a93-ae3e-175cf0826d34"
+                    }
+                  ],
+                  [
+                    "request_id",
+                    {
+                      "text": "e257089b-364c-41fa-bd13-6a850cf92770"
+                    }
+                  ]
+                ]
+              }
+            ]
+          ]
+        }
+      },
+      {
+        "cbor_hex": "a16566656e6365a4676c6f6361746f72782439633631643832622d343730352d346139332d616533652d3137356366303832366433346a726571756573745f6964782465323537303839622d333634632d343166612d626431332d366138353063663932373730716c6173745f7369676e65645f61745f6d736d313736373232353633303030307266697273745f7369676e65645f61745f6d736d31373637323235363030303030",
+        "description": "Ends the request identity of a write of the recovery bundle at its locator, naming the instants its attempts were signed at.",
+        "id": "bundle_fence",
+        "json": {
+          "fence": {
+            "first_signed_at_ms": "1767225600000",
+            "last_signed_at_ms": "1767225630000",
+            "locator": "9c61d82b-4705-4a93-ae3e-175cf0826d34",
+            "request_id": "e257089b-364c-41fa-bd13-6a850cf92770"
+          }
+        },
+        "sha256": "453eb66894bacdfd77c49e539dd5fd6d8066212e01aaa0e0f05e040861724181",
+        "value": {
+          "map": [
+            [
+              "fence",
+              {
+                "map": [
+                  [
+                    "locator",
+                    {
+                      "text": "9c61d82b-4705-4a93-ae3e-175cf0826d34"
+                    }
+                  ],
+                  [
+                    "request_id",
+                    {
+                      "text": "e257089b-364c-41fa-bd13-6a850cf92770"
+                    }
+                  ],
+                  [
+                    "last_signed_at_ms",
+                    {
+                      "text": "1767225630000"
+                    }
+                  ],
+                  [
+                    "first_signed_at_ms",
+                    {
+                      "text": "1767225600000"
+                    }
+                  ]
+                ]
+              }
+            ]
+          ]
+        }
+      }
+    ],
+    "description": "The whole body a client sends for each settings-sync request, one case per member: the eight a collection takes, which name it by collection_id with its home where it is shared (a listing of memberships carries only its cursor), and the recovery bundle's exchange, compare, status and fence, which name the locator the recovery kit prints and neither a collection nor a home. cbor_hex is the canonical KR-CBOR-1 encoding of the document and sha256 its digest, which is the body digest the request's signature carries.",
+    "method": "sync.compare_exchange"
   }
 }
