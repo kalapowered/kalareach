@@ -1091,7 +1091,8 @@ mod windows {
         /// The login session the child must run in: the daemon's.
         pub session: u32,
         /// Where the child's standard output and standard error go: a file the starter opened,
-        /// which the child is given and nothing else of the starter's is. `None` gives it neither.
+        /// which the child is given and nothing else of the starter's is. `None` hands it no file:
+        /// it writes to the console it is given, which shows no window.
         pub output: Option<BorrowedHandle<'a>>,
     }
 
