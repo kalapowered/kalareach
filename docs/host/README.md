@@ -250,6 +250,10 @@ other start; several commands starting it at once leave one daemon. The command 
 seconds for it to answer, and
 [docs/cli/README.md](../cli/README.md#when-no-control-daemon-is-running) says what a person sees.
 
+On Windows `standalone` is this user's scheduled task for the environment, which
+`kr host startup --set standalone` registers and `kr new` asks the Task Scheduler to run; the task's
+starter starts the daemon, as [Windows](#windows) describes, and `service` is not available.
+
 `kr host startup` writes the section as one validated edit with no daemon running, and `kr doctor`
 reports it with its source and as applying at the next start, and, for `service`, whether the
 definition matches what kr wrote. Like the network and the voice broker, no request, profile or
@@ -1084,6 +1088,31 @@ worker does not yet choose the encoding per client. A session therefore runs on 
 today. Nothing reports that at runtime: the engine tracks which fidelity the backend asked for and
 the reader knows which one it is reading, but no receipt, diagnostic or client message carries
 either answer yet, so this page is where the limit is stated.
+
+**The standalone start, and signing out.** The standalone start on Windows is one scheduled task
+per environment, `KalaReach-` and the first eight digits of the environment's identifier, in the
+Task Scheduler's root folder. `kr host startup --set standalone` registers it. Its principal is the
+user's own account, and it logs on as the user where the user is signed in, with the least
+privilege. It has no trigger, runs its instances in parallel, has no time limit and runs at normal
+priority, and its one action runs this installation's `kr-controller` as the environment's starter.
+Its description carries the
+environment's full identifier, and the principal and the description together say whose it is: a
+task under the name that is not this environment's own is never replaced or removed. `kr new` runs
+it when no daemon answers, having left a request its starter takes once, and the starter starts the
+daemon, so the daemon and every process it starts are outside the command's jobs. A task that logs
+on as the signed-in user runs its starter in a job of the Task Scheduler's own that neither kills its
+members on close nor lets them leave, so the daemon stays in that job. That holds up only while the
+Task Scheduler does not end the job before the user's session ends, and the job's own limits cannot
+show whether it will.
+
+The daemon runs in the session where the user is signed in, at the console or over remote desktop,
+connected or not, with the user's own credential store. Signing out of that session ends the daemon,
+every worker and everything they started, as Windows ends every process of a session at sign-out; a
+remote desktop that disconnects without signing out ends nothing. A reboot ends everything too, and
+the task stays registered with no trigger, so nothing starts until a `kr new` after the next sign-in.
+A `kr new` run over SSH on a machine where the user is signed in nowhere cannot use the task: the
+Task Scheduler does not start it, and `kr new` says so.
+Removing the task, as `kr host startup --clear` does, ends nothing it started.
 
 ### Running the Windows tests
 
