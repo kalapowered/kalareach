@@ -543,11 +543,14 @@
   outline-offset: 1px;
 }
 
+/*
+ * One line of the field's own text, never less than the platform's target: larger text grows it.
+ * It takes the width Send leaves, so the two share a line at any text size.
+ */
 .m-composer-line textarea {
-  flex: 1 1 10rem;
+  flex: 1 1 0;
   inline-size: auto;
   min-inline-size: 0;
-  block-size: var(--target);
   min-block-size: var(--target);
   padding-block: var(--gap-2);
 }

@@ -986,6 +986,26 @@ test.describe("the phone's room for its terminal", () => {
     })
   }
 
+  /**
+   * How far `locator`'s element runs outside what a person sees of it: outside the screen, or
+   * outside any box around it that clips what it holds. Zero when it is whole in view.
+   */
+  async function hiddenPart(locator: Locator): Promise<number> {
+    return locator.evaluate((element) => {
+      const box = element.getBoundingClientRect()
+      let top = 0
+      let bottom = window.innerHeight
+      for (let around = element.parentElement; around !== null; around = around.parentElement) {
+        const style = getComputedStyle(around)
+        if (style.overflowY === 'visible' && style.overflowX === 'visible') continue
+        const clip = around.getBoundingClientRect()
+        top = Math.max(top, clip.top)
+        bottom = Math.min(bottom, clip.bottom)
+      }
+      return Math.max(0, top - box.top) + Math.max(0, box.bottom - bottom)
+    })
+  }
+
   /** Waits for the page to tell the host the grid its surface shows, and checks the rows it holds. */
   async function expectRoom(page: Page, rows: number, what: string): Promise<void> {
     await expect
@@ -1058,7 +1078,49 @@ test.describe("the phone's room for its terminal", () => {
           await page.setViewportSize({ width: phone.width, height: phone.height - phone.keyboard })
           await expectRoom(page, FLOOR, 'on a page the keyboard made shorter')
           // Whole to the pixel: WebKit can leave a scrolled box's last fraction of a pixel out.
-          await expect(page.getByLabel('Message this session')).toBeInViewport({ ratio: 0.99 })
+          expect(await hiddenPart(page.getByLabel('Message this session'))).toBeLessThanOrEqual(1)
+        })
+      }
+    }
+  }
+
+  // A person's own larger text size: every size given in rem grows with it. The field still shows
+  // its whole line at no less than the platform's target, nothing runs past the screen's edge, and
+  // the terminal keeps its four rows of its own, larger, type.
+  for (const surface of ['ios', 'android'] as const) {
+    for (const phone of PHONES) {
+      for (const scale of ['150%', '200%']) {
+        test(`keeps the field whole and room for the terminal on ${surface} at ${phone.width}×${phone.height} with text at ${scale}`, async ({
+          page
+        }) => {
+          await page.setViewportSize({ width: phone.width, height: phone.height })
+          await page.goto(`/harness.html?surface=${surface}&session=${SESSION_MAIN}`)
+          await page.getByRole('tab', { name: 'Terminal' }).click()
+          await expect(page.getByTestId('mobile-terminal-line').first()).toContainText('$ cargo')
+          await page.evaluate((size) => {
+            document.documentElement.style.fontSize = size
+          }, scale)
+          const field = page.getByLabel('Message this session')
+          await field.fill('ls -la')
+          const fits = await field.evaluate((element) => ({
+            clipped: element.scrollHeight - element.clientHeight,
+            height: element.getBoundingClientRect().height
+          }))
+          expect(fits.clipped, 'the field shows its whole line').toBeLessThanOrEqual(1)
+          expect(fits.height).toBeGreaterThanOrEqual(surface === 'ios' ? 44 : 48)
+          // Whole to the pixel: WebKit can leave a scrolled box's last fraction of a pixel out.
+          expect(await hiddenPart(field), 'the field is whole in view').toBeLessThanOrEqual(1)
+          const past = await page.evaluate(() =>
+            Array.from(document.querySelectorAll<HTMLElement>('.m-composer button, .m-composer textarea'))
+              .filter(
+                (element) =>
+                  element.closest('.m-accessory') === null &&
+                  element.getBoundingClientRect().right > window.innerWidth + 0.5
+              )
+              .map((element) => element.textContent || element.tagName)
+          )
+          expect(past).toEqual([])
+          await expectRoom(page, FLOOR, `text at ${scale}`)
         })
       }
     }
