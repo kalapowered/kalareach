@@ -532,7 +532,10 @@ fn prepare_named_directory(directory: &Path) -> Result<PathBuf> {
 
 /// The end of the name of the marker that stands beside a directory this store made, in the
 /// directory above it, until the directory's name is confirmed there. The marker's name is the
-/// directory's behind a dot, which no secret's name can start with, and it holds nothing.
+/// directory's behind a dot, which no secret's name can start with. It is an empty directory, so
+/// making it asks of the directory above only the right to add a directory, which making the
+/// directory it marks asks anyway: on Windows a directory can let an account add directories to it
+/// and not files.
 const UNCONFIRMED: &str = ".unconfirmed";
 
 /// The directory `directory` is in.
@@ -552,7 +555,8 @@ fn marker_of(directory: &Path) -> PathBuf {
 }
 
 /// Whether the marker of a directory this store made and has not confirmed yet stands beside
-/// `directory`.
+/// `directory`. Anything standing at the marker's name counts, so a directory is never taken as
+/// confirmed while something is there.
 fn marked_unconfirmed(directory: &Path) -> bool {
     std::fs::symlink_metadata(marker_of(directory)).is_ok()
 }
@@ -637,26 +641,36 @@ fn confirm_directories(chain: &[PathBuf]) -> Result<()> {
         }
         flush(above(directory), kr_flush::NameKind::Directory)?;
         // Confirmed. A marker that stays only has the next call flush the directory above again.
-        let _ = std::fs::remove_file(&marker);
+        let _ = std::fs::remove_dir(&marker);
     }
     Ok(())
 }
 
-/// Leaves the marker at `marker`, owner-only, whether or not another writer left it there already.
+/// Leaves the marker at `marker`, an empty owner-only directory, whether or not another writer left
+/// it there already. Anything else at that name, a link among them, stops the call.
 fn mark_unconfirmed(marker: &Path) -> Result<()> {
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(false);
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600);
-    }
-    options
-        .open(marker)
-        .map(drop)
-        .map_err(|error| CryptoError::SecretStore {
+    let builder = {
+        use std::os::unix::fs::DirBuilderExt as _;
+        let mut builder = std::fs::DirBuilder::new();
+        builder.mode(0o700);
+        builder
+    };
+    #[cfg(not(unix))]
+    let builder = std::fs::DirBuilder::new();
+    match builder.create(marker) {
+        Ok(()) => Ok(()),
+        // Another writer's marker, or one a call that stopped left there.
+        Err(error)
+            if error.kind() == std::io::ErrorKind::AlreadyExists
+                && std::fs::symlink_metadata(marker).is_ok_and(|found| found.is_dir()) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(CryptoError::SecretStore {
             message: format!("create {}: {error}", marker.display()),
-        })
+        }),
+    }
 }
 
 /// What the unit tests run after this store left a directory's marker and before it makes the
@@ -1785,7 +1799,7 @@ mod tests {
         }
         #[cfg(windows)]
         {
-            let _refused = DirectoriesRefused::on(&base);
+            let _refused = AddingRefused::directories(&base);
             opened
                 .store
                 .set(&named("z"), b"more")
@@ -1803,23 +1817,46 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// Refuses this account the right to add a directory to `directory`, and nothing else, until
-    /// it is dropped.
+    /// Refuses this account one right on `directory` alone, the right to add a directory to it or
+    /// the right to add a file to it, and nothing else, until it is dropped.
     #[cfg(windows)]
-    struct DirectoriesRefused {
+    struct AddingRefused {
         directory: PathBuf,
         account: String,
     }
 
     #[cfg(windows)]
-    impl DirectoriesRefused {
-        fn on(directory: &Path) -> Self {
+    impl AddingRefused {
+        /// The right to add a directory to one.
+        const FILE_ADD_SUBDIRECTORY: u32 = 0x0004;
+        /// The right to add a file to one.
+        const FILE_ADD_FILE: u32 = 0x0002;
+
+        /// Refuses adding a directory to `directory`; adding a file to it stays allowed.
+        fn directories(directory: &Path) -> Self {
+            Self::on(
+                directory,
+                "AD",
+                Self::FILE_ADD_SUBDIRECTORY,
+                Self::FILE_ADD_FILE,
+            )
+        }
+
+        /// Refuses adding a file to `directory`; adding a directory to it stays allowed.
+        fn files(directory: &Path) -> Self {
+            Self::on(
+                directory,
+                "WD",
+                Self::FILE_ADD_FILE,
+                Self::FILE_ADD_SUBDIRECTORY,
+            )
+        }
+
+        /// Denies `right`, as icacls names it, which is `refused` as an access right, and checks
+        /// that `allowed` is still granted.
+        fn on(directory: &Path, right: &str, refused: u32, allowed: u32) -> Self {
             use std::os::windows::fs::OpenOptionsExt as _;
 
-            /// The right to add a directory to one.
-            const FILE_ADD_SUBDIRECTORY: u32 = 0x0004;
-            /// The right to add a file to one.
-            const FILE_ADD_FILE: u32 = 0x0002;
             /// What lets a program open a directory at all.
             const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
 
@@ -1840,11 +1877,11 @@ mod tests {
             let denied = std::process::Command::new("icacls.exe")
                 .arg(directory)
                 .arg("/deny")
-                .arg(format!("*{account}:(AD)"))
+                .arg(format!("*{account}:({right})"))
                 .output()
                 .expect("icacls runs");
             assert!(denied.status.success(), "icacls refused: {denied:?}");
-            let refused = Self {
+            let holding = Self {
                 directory: directory.to_path_buf(),
                 account,
             };
@@ -1857,18 +1894,16 @@ mod tests {
             // The list is what refuses it: an account holding a privilege that overrides lists
             // would be let through, and for it this arrangement cannot be made.
             assert_eq!(
-                open(FILE_ADD_SUBDIRECTORY)
-                    .expect_err("adding a directory is refused")
-                    .kind(),
+                open(refused).expect_err("the right is refused").kind(),
                 std::io::ErrorKind::PermissionDenied
             );
-            open(FILE_ADD_FILE).expect("and adding a file is not");
-            refused
+            open(allowed).expect("and the other one is not");
+            holding
         }
     }
 
     #[cfg(windows)]
-    impl Drop for DirectoriesRefused {
+    impl Drop for AddingRefused {
         fn drop(&mut self) {
             let _ = std::process::Command::new("icacls.exe")
                 .arg(&self.directory)
@@ -1934,7 +1969,7 @@ mod tests {
         let base = scratch_directory("stopped");
         let opened = open_store_in(&base).expect("a store in the named directory");
         let scope = base.join("host");
-        std::fs::write(marker_of(&scope), b"").expect("the marker a stopped writer left");
+        std::fs::create_dir(marker_of(&scope)).expect("the marker a stopped writer left");
         std::fs::create_dir(&scope).expect("and the directory it made");
         let name = SecretName::new("host/x").expect("a name");
         let refused = {
@@ -1961,14 +1996,14 @@ mod tests {
         let base = scratch_directory("unmarkable");
         let opened = open_store_in(&base).expect("a store in the named directory");
         let scope = base.join("host");
-        std::fs::create_dir(marker_of(&scope)).expect("a directory where the marker would go");
+        std::fs::write(marker_of(&scope), b"").expect("a file where the marker would go");
         let name = SecretName::new("host/x").expect("a name");
         opened
             .store
             .set(&name, b"seed")
             .expect_err("the marker cannot be made");
         assert!(!scope.exists(), "the directory was not made");
-        std::fs::remove_dir(marker_of(&scope)).expect("the obstruction removed");
+        std::fs::remove_file(marker_of(&scope)).expect("the obstruction removed");
         opened
             .store
             .set(&name, b"seed")
@@ -2004,6 +2039,29 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&base);
         let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    /// KR-REQ-10.47: on Windows the store makes and confirms its directories in a directory that
+    /// lets this account add directories to it and not files: a marker is a directory, so it asks
+    /// of the directory above only the right that making the directory it marks asks anyway.
+    #[cfg(windows)]
+    #[test]
+    fn directories_are_made_and_confirmed_where_only_directories_may_be_added() {
+        let above = scratch_directory("files-refused");
+        std::fs::create_dir(&above).expect("the directory above the store's");
+        let base = above.join("store");
+        {
+            let _refused = AddingRefused::files(&above);
+            let opened = open_store_in(&base).expect("the store's directory is made and confirmed");
+            assert!(!marked_unconfirmed(&base), "confirmed");
+            let name = SecretName::new("host/x").expect("a name");
+            opened
+                .store
+                .set(&name, b"seed")
+                .expect("a secret is stored in a scope made below it");
+            assert!(!marked_unconfirmed(&base.join("host")), "confirmed");
+        }
+        let _ = std::fs::remove_dir_all(&above);
     }
 
     /// KR-REQ-10.47: a deleted secret's name is flushed out of its directory before the deletion is
