@@ -1390,3 +1390,95 @@ async fn a_headless_host_with_no_owner_device_refuses_every_confirmation() {
     );
     host.stop().await;
 }
+
+/// `proposed_grant`, naming one current approval or one current question.
+fn naming(proposed_grant: &ProposedGrant, approval: bool) -> ProposedGrant {
+    let mut named = proposed_grant.clone();
+    if approval {
+        named
+            .history
+            .named_approvals
+            .insert(kr_protocol::ids::PendingResourceId::new(
+                kr_protocol::scalars::Uuid::from_bytes([0x52; 16]),
+            ));
+    } else {
+        named
+            .history
+            .named_questions
+            .insert(kr_protocol::ids::QuestionId::new(
+                kr_protocol::scalars::Uuid::from_bytes([0x51; 16]),
+            ));
+    }
+    named
+}
+
+/// KR-REQ-10.51: a pairing invitation shows its issuer no preview of a named resource, so the host
+/// gives no challenge to confirm issuing one whose proposal names a current approval or question,
+/// of either kind, and says why; no challenge exists afterwards, and `pair.invite` with such a
+/// proposal issues nothing. The controls are the same proposals without the name, confirmed and
+/// issued as before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pairing_proposal_naming_a_current_approval_or_question_is_given_no_challenge() {
+    let owner_keys = keys();
+    let host = Host::start(&owner_keys).await;
+    let environment = host.environment_id;
+    let mut client = host.client().await;
+    let owner = Signer::OwnerDevice(&owner_keys);
+
+    for (grant_kind, plain) in [
+        (InviteGrantKind::SessionInvitation, viewer()),
+        (
+            InviteGrantKind::PersonalOwner,
+            kr_pairing::grants::personal_owner_grant(),
+        ),
+    ] {
+        for (named, approval) in [("approval", true), ("question", false)] {
+            let proposal = naming(&plain, approval);
+            let refused = calls::request(
+                environment,
+                &mut client,
+                issue_subject(grant_kind, &proposal),
+            )
+            .await
+            .expect_err("no challenge for a proposal naming a current resource");
+            assert_eq!(
+                refused.code,
+                ErrorCode::InvalidArgument,
+                "{grant_kind:?} {named}"
+            );
+            assert!(
+                refused.message.contains(named) && refused.message.contains("preview"),
+                "the refusal says why: {}",
+                refused.message
+            );
+            assert!(
+                calls::pending(&mut client)
+                    .await
+                    .expect("readable")
+                    .pending
+                    .is_empty(),
+                "no challenge exists for it"
+            );
+            assert_eq!(
+                code(
+                    calls::mutate::<_, PairInviteResult>(
+                        environment,
+                        &mut client,
+                        Method::PairInvite,
+                        &invite_params(grant_kind, &proposal),
+                    )
+                    .await
+                ),
+                ErrorCode::OwnerConfirmationRequired,
+                "pair.invite issues nothing for it ({grant_kind:?} {named})"
+            );
+        }
+        let invited = calls::invite_direct(environment, &mut client, grant_kind, &plain, &owner)
+            .await
+            .expect("the same proposal without the name is issued");
+        calls::cancel(environment, &mut client, invited.invitation_id, false)
+            .await
+            .expect("withdrawn");
+    }
+    host.stop().await;
+}
