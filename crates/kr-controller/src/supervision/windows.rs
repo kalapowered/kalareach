@@ -690,6 +690,27 @@ pub enum Standing {
     Owned(Vec<Difference>),
 }
 
+/// What a change to an environment's task did, so the change can be undone.
+///
+/// The prior task is kept as the Task Scheduler exported it, which it takes back exactly.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TaskChange {
+    /// Nothing: the task was already the one asked for, or there was none to remove.
+    Unchanged,
+    /// No task had the name, and the one asked for was registered.
+    Registered,
+    /// The environment's own task, which differed, was registered again as asked.
+    Repaired {
+        /// The task as it was, exported.
+        prior: String,
+    },
+    /// The environment's own task was removed.
+    Removed {
+        /// The task as it was, exported.
+        prior: String,
+    },
+}
+
 /// What the Task Scheduler was asked when it failed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Asked {
@@ -780,15 +801,50 @@ impl std::fmt::Display for TaskError {
     }
 }
 
+/// How the task's last run ended, for all of its runs together: the Task Scheduler keeps one
+/// result for a task whose runs are in parallel, so it says nothing about any one launch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LastResult {
+    /// It has not run since it was registered.
+    NotRun,
+    /// A run is under way.
+    Running,
+    /// The last run ended with this code: zero when it succeeded.
+    Ended(u32),
+}
+
+impl LastResult {
+    /// The result the Task Scheduler reports as a number.
+    #[must_use]
+    pub const fn from_code(code: u32) -> Self {
+        // `SCHED_S_TASK_HAS_NOT_RUN` and `SCHED_S_TASK_RUNNING`.
+        match code {
+            0x0004_1303 => Self::NotRun,
+            0x0004_1301 => Self::Running,
+            code => Self::Ended(code),
+        }
+    }
+}
+
+/// Reads the last result from one line of the Task Scheduler's verbose list in its comma-separated
+/// form, whose seventh field it is.
+///
+/// Every field is quoted and a quote inside one is doubled. The list's words are in the machine's
+/// own language, and this field is a number in every language.
+#[must_use]
+pub fn last_result_in(_line: &str) -> Option<LastResult> {
+    todo!("not built yet")
+}
+
 #[cfg(windows)]
-pub use self::platform::{register, remove, run, standing};
+pub use self::platform::{clear, last_result, register, remove, run, set_up, standing, undo};
 
 /// The calls to the Task Scheduler, through `schtasks.exe` from the system directory.
 #[cfg(windows)]
 mod platform {
     use super::{
-        Asked, Foreign, ForeignReason, RegisteredTask, Standing, TaskDefinition, TaskError,
-        decode_output,
+        Asked, Foreign, ForeignReason, LastResult, RegisteredTask, Standing, TaskChange,
+        TaskDefinition, TaskError, decode_output,
     };
     use crate::supervision::{RunFailure, SERVICE_MANAGER_BOUND, command_within};
 
@@ -840,7 +896,7 @@ mod platform {
 
     /// Reads where `definition`'s task stands, with the task as the Task Scheduler exports it when
     /// this user can read it, and nothing otherwise.
-    fn read(definition: &TaskDefinition) -> Result<(Standing, String), TaskError> {
+    pub(super) fn read(definition: &TaskDefinition) -> Result<(Standing, String), TaskError> {
         let output = schtasks_within(Asked::Query, &["/Query", "/TN", &definition.name, "/XML"])?;
         let foreign = |reason| Foreign {
             name: definition.name.clone(),
@@ -1024,6 +1080,45 @@ mod platform {
             ));
         }
         Ok(())
+    }
+
+    /// Registers `definition` for its environment and says what that changed, so the change can be
+    /// undone.
+    ///
+    /// # Errors
+    ///
+    /// Returns what went wrong: a foreign task, a registration the Task Scheduler refused, or a
+    /// task that did not read back as the one registered.
+    pub fn set_up(_definition: &TaskDefinition) -> Result<TaskChange, TaskError> {
+        todo!("not built yet")
+    }
+
+    /// Removes this environment's own task and says what that changed.
+    ///
+    /// # Errors
+    ///
+    /// Returns what went wrong: a foreign task, or a removal the Task Scheduler refused.
+    pub fn clear(_definition: &TaskDefinition) -> Result<TaskChange, TaskError> {
+        todo!("not built yet")
+    }
+
+    /// Undoes `change`, which [`set_up`] or [`clear`] made for `definition`'s environment.
+    ///
+    /// # Errors
+    ///
+    /// Returns what went wrong: a foreign task under the name, or a change the Task Scheduler
+    /// refused.
+    pub fn undo(_definition: &TaskDefinition, _change: &TaskChange) -> Result<(), TaskError> {
+        todo!("not built yet")
+    }
+
+    /// Reads how the task's last run ended, which is one result for all of its runs.
+    ///
+    /// # Errors
+    ///
+    /// Returns what went wrong when the Task Scheduler could not be asked.
+    pub fn last_result(_definition: &TaskDefinition) -> Result<LastResult, TaskError> {
+        todo!("not built yet")
     }
 
     /// Asks the Task Scheduler to run `definition`'s task once, now.
@@ -1979,6 +2074,48 @@ mod tests {
         assert_eq!(read.differences(&definition), Vec::<Difference>::new());
     }
 
+    /// The last result is read from the verbose list's seventh field in whatever language the
+    /// machine's words are in, quoted and with commas inside a field, and as the Task Scheduler's
+    /// two running states or a code.
+    #[test]
+    fn the_last_result_is_read_from_the_verbose_list_in_any_language() {
+        let line = |result: &str, when: &str| {
+            format!(
+                "\"HOST\",\"\\KalaReach-1d6e814d\",\"N/A\",\"Bereit\",\"Nur interaktiv\",\"{when}\",\
+                 \"{result}\",\"N/A\",\"C:\\kr\\kr-controller.exe --starter --runtime-dir \"\"C:\\r\"\"\",\
+                 \"C:\\s\",\"KalaReach environment 1d6e814d\"\r\n"
+            )
+        };
+        assert_eq!(
+            last_result_in(&line("0", "9/25/2026 10:47:32 AM")),
+            Some(LastResult::Ended(0))
+        );
+        assert_eq!(
+            last_result_in(&line("267011", "Freitag, 25. September 2026, 10:47:32")),
+            Some(LastResult::NotRun),
+            "a comma inside a quoted field is the field's"
+        );
+        assert_eq!(
+            last_result_in(&line("267009", "N/A")),
+            Some(LastResult::Running)
+        );
+        assert_eq!(
+            last_result_in(&line("-2147020576", "N/A")),
+            Some(LastResult::Ended(0x8007_10e0)),
+            "a failure code is written as a signed number"
+        );
+        assert_eq!(
+            last_result_in(&line("0x800710E0", "N/A")),
+            Some(LastResult::Ended(0x8007_10e0))
+        );
+        assert_eq!(last_result_in(&line("Bereit", "N/A")), None, "not a number");
+        assert_eq!(
+            last_result_in("\"HOST\",\"\\KalaReach-1d6e814d\""),
+            None,
+            "too short"
+        );
+    }
+
     /// A task that is not this environment's says why: another account's, or this account's for
     /// another environment; one of this environment's own says nothing.
     #[test]
@@ -2203,6 +2340,144 @@ mod tests {
             let _registered = Registered(definition.clone());
             register(&definition).expect("registered");
             run(&definition).expect("the run is started");
+        }
+
+        /// The task as the Task Scheduler exports it, which is what a change keeps of the task it
+        /// changed.
+        fn exported(definition: &TaskDefinition) -> String {
+            let (standing, exported) =
+                super::super::platform::read(definition).expect("the task is read");
+            assert!(
+                matches!(standing, Standing::Owned(_)),
+                "it is the environment's own: {standing:?}"
+            );
+            exported
+        }
+
+        /// The setup step's change says what it did: a free name registered, the environment's own
+        /// task left as it is when it is already the one asked for and registered again when it
+        /// differs, keeping what it was; each of those is undone exactly; and a task that is not
+        /// the environment's is refused and left as it is.
+        #[test]
+        fn a_setup_says_what_it_changed_and_that_is_undone_exactly() {
+            let host = TempHost::create();
+            let definition = definition(&host, &harmless());
+            let _registered = Registered(definition.clone());
+
+            let registered = set_up(&definition).expect("registered");
+            assert_eq!(registered, TaskChange::Registered);
+            assert_eq!(
+                standing(&definition).expect("asked"),
+                Standing::Owned(Vec::new())
+            );
+            assert_eq!(
+                set_up(&definition).expect("asked again"),
+                TaskChange::Unchanged,
+                "the task already asked for is left as it is"
+            );
+            undo(&definition, &registered).expect("undone");
+            assert_eq!(standing(&definition).expect("asked"), Standing::Absent);
+
+            // An installation that has since moved: the environment's own task, stale.
+            let moved = TaskDefinition {
+                starter: host.root().join("moved").join("kr-controller.exe"),
+                ..definition.clone()
+            };
+            set_up(&moved).expect("the earlier installation's task");
+            let before = exported(&moved);
+            let repaired = set_up(&definition).expect("repaired");
+            let TaskChange::Repaired { prior } = &repaired else {
+                panic!("the stale task is repaired: {repaired:?}");
+            };
+            assert_eq!(prior, &before, "and kept as it was");
+            assert_eq!(
+                standing(&definition).expect("asked"),
+                Standing::Owned(Vec::new())
+            );
+            undo(&definition, &repaired).expect("undone");
+            assert_eq!(
+                exported(&moved),
+                before,
+                "the repaired task is put back exactly as it was"
+            );
+        }
+
+        /// Clearing removes only the environment's own task, keeping what it was so the removal
+        /// can be undone exactly; a free name is nothing to remove.
+        #[test]
+        fn a_clear_removes_only_the_environments_own_and_is_undone_exactly() {
+            let host = TempHost::create();
+            let definition = definition(&host, &harmless());
+            let _registered = Registered(definition.clone());
+            assert_eq!(clear(&definition).expect("asked"), TaskChange::Unchanged);
+            set_up(&definition).expect("registered");
+            let before = exported(&definition);
+            let removed = clear(&definition).expect("removed");
+            assert_eq!(
+                removed,
+                TaskChange::Removed {
+                    prior: before.clone()
+                }
+            );
+            assert_eq!(standing(&definition).expect("asked"), Standing::Absent);
+            undo(&definition, &removed).expect("put back");
+            assert_eq!(
+                exported(&definition),
+                before,
+                "the removed task is put back exactly as it was"
+            );
+        }
+
+        /// A task under the environment's name that is not its own is refused by the setup, the
+        /// clear and the undo alike, and is left exactly as it is.
+        #[test]
+        fn another_environments_task_is_refused_by_every_change() {
+            let host = TempHost::create();
+            let ours = definition(&host, &harmless());
+            let theirs = TaskDefinition {
+                environment_id: EnvironmentId::new(kr_ipc::new_uuid()),
+                ..ours.clone()
+            };
+            let _theirs = Registered(theirs.clone());
+            let _ours = Registered(ours.clone());
+            set_up(&theirs).expect("the other environment's task");
+            let before = exported(&theirs);
+            assert!(matches!(set_up(&ours), Err(TaskError::Foreign(_))));
+            assert!(matches!(clear(&ours), Err(TaskError::Foreign(_))));
+            assert!(matches!(
+                undo(&ours, &TaskChange::Registered),
+                Err(TaskError::Foreign(_))
+            ));
+            assert!(matches!(
+                undo(&ours, &TaskChange::Removed { prior: ours.xml() }),
+                Err(TaskError::Foreign(_))
+            ));
+            assert_eq!(exported(&theirs), before, "and it is exactly as it was");
+        }
+
+        /// A task that has not run says so, and once a run of it has ended its result is read.
+        #[test]
+        fn a_tasks_last_result_is_read_before_and_after_a_run() {
+            let host = TempHost::create();
+            let definition = definition(&host, &harmless());
+            let _registered = Registered(definition.clone());
+            set_up(&definition).expect("registered");
+            assert_eq!(last_result(&definition).expect("read"), LastResult::NotRun);
+            run(&definition).expect("the run is started");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            loop {
+                match last_result(&definition).expect("read") {
+                    LastResult::Ended(code) => {
+                        assert_eq!(code, 0, "the program it ran succeeded");
+                        break;
+                    }
+                    running => assert!(
+                        std::time::Instant::now() < deadline,
+                        "the run ended within the bound: {running:?}"
+                    ),
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
         }
     }
 }

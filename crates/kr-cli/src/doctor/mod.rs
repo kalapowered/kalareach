@@ -50,10 +50,100 @@ pub fn with_startup(
 pub const STARTUP_CHECK: &str = "startup-definition";
 
 /// What the check examines.
+#[cfg(unix)]
 const STARTUP_TITLE: &str =
     "The service definition kr new has the service manager start the daemon from";
 
+/// The identifier the standalone start's check is published under on Windows.
+pub const TASK_CHECK: &str = "startup-task";
+
+/// What the standalone start's check examines on Windows.
+#[cfg(windows)]
+const TASK_TITLE: &str = "The scheduled task kr new has start the daemon";
+
+/// The standalone start's check on Windows, when there is anything of it to report: whose the
+/// environment's scheduled task is, whether it is the one this installation registers, and that the
+/// daemon it starts runs only while the user is signed in.
+///
+/// An environment that neither chooses the standalone start nor has a task of its own registered
+/// gets no check.
+#[cfg(windows)]
+fn startup_check(environment: &kr_ipc::paths::EnvironmentPaths) -> Option<DoctorCheck> {
+    use kr_controller::supervision::windows::Standing;
+    use kr_protocol::hostinfo::configuration::ControllerStartup;
+    use kr_protocol::hostinfo::export::Sentence;
+
+    let chosen = crate::startup::Chosen::read(environment);
+    let selected = chosen.controller == Some(ControllerStartup::Standalone);
+    let report = crate::startup::task_report(environment, selected)?;
+    let task = Sentence::new()
+        .stated("the scheduled task of environment ")
+        .identifier(&environment.environment_id());
+    if !selected {
+        return Some(DoctorCheck::new(
+            TASK_CHECK,
+            TASK_TITLE,
+            DoctorStatus::Warning,
+            task.stated(
+                " is still registered, and startup.controller no longer chooses the standalone \
+                 start; nothing uses it",
+            ),
+            Some(
+                "run kr host startup --clear to remove it, or kr host startup --set standalone to \
+                 use it",
+            ),
+        ));
+    }
+    let (status, found, remedy) = match &report.standing {
+        _ if report.usable() => (
+            DoctorStatus::Ok,
+            " is this environment's own and the one this installation registers; the daemon it \
+             starts runs only while you are signed in, so signing out ends it and every session",
+            None,
+        ),
+        Ok(Standing::Owned(differences)) if differences.is_empty() => (
+            DoctorStatus::Failed,
+            " is this environment's own and runs this installation's kr-controller, which is not \
+             there",
+            Some("install kr again, then run kr host startup --set standalone"),
+        ),
+        Ok(Standing::Owned(_)) => (
+            DoctorStatus::Failed,
+            " is this environment's own and differs from the one this installation registers",
+            Some("run kr host startup --set standalone to repair it"),
+        ),
+        Ok(Standing::Absent) => (
+            DoctorStatus::Failed,
+            " is not registered",
+            Some("run kr host startup --set standalone to register it"),
+        ),
+        Ok(Standing::Foreign(_)) => (
+            DoctorStatus::Failed,
+            " is not registered: a task under its name is not this environment's own",
+            Some("remove that task, then run kr host startup --set standalone"),
+        ),
+        Err(_) => (
+            DoctorStatus::Failed,
+            " cannot be read",
+            Some("run kr host startup to see why"),
+        ),
+    };
+    Some(DoctorCheck::new(
+        TASK_CHECK,
+        TASK_TITLE,
+        status,
+        Sentence::new()
+            .stated("startup.controller is ")
+            .term("standalone")
+            .stated(": ")
+            .sentence(&task)
+            .stated(found),
+        remedy,
+    ))
+}
+
 /// The service start's check, when there is anything of it to report.
+#[cfg(unix)]
 fn startup_check(environment: &kr_ipc::paths::EnvironmentPaths) -> Option<DoctorCheck> {
     use kr_protocol::hostinfo::configuration::ControllerStartup;
     use kr_protocol::hostinfo::export::Sentence;
