@@ -125,8 +125,9 @@ pub fn processes_read_during<T>(work: impl FnOnce() -> T) -> (T, Vec<u32>) {
 /// collected, and each one it adopted as the child subreaper when that one's own parent exited.
 ///
 /// What it costs follows the one process, not the host: the kernel keeps the list with each of the
-/// process's threads, and nothing else is read. A kernel that is built without those lists is an
-/// error here rather than an empty answer, so a caller never reads "no children" into it.
+/// process's threads, and nothing else is read. A process that has gone is the parent of nothing.
+/// A kernel that is built without those lists, and a reading that failed for any other reason, is
+/// an error here rather than an empty answer, so a caller never reads "no children" into it.
 ///
 /// # Errors
 ///
@@ -135,6 +136,14 @@ pub fn processes_read_during<T>(work: impl FnOnce() -> T) -> (T, Vec<u32>) {
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn children_of(pid: u32) -> Result<Vec<u32>> {
     platform::children_of(pid)
+}
+
+/// Runs `work`, and `then` after each read it makes on this thread with the process read about and
+/// the file, for the host crates' own tests: what a test uses to change the process tree at a
+/// chosen point in a reading of it.
+#[cfg(all(feature = "testing", any(target_os = "linux", target_os = "android")))]
+pub fn after_each_read<T>(then: impl FnMut(u32, &str) + 'static, work: impl FnOnce() -> T) -> T {
+    platform::after_each_read(then, work)
 }
 
 /// Returns the process identifiers currently in one process group.
@@ -384,14 +393,26 @@ mod platform {
     /// Every question this module asks about one process reads through here, so a test can see
     /// which processes a question read about.
     fn read_process_file(pid: u32, file: &str) -> std::io::Result<String> {
+        let read = std::fs::read_to_string(format!("/proc/{pid}/{file}"));
         #[cfg(feature = "testing")]
-        PROCESS_READS.with(|reads| {
-            if let Some(reads) = reads.borrow_mut().as_mut() {
-                reads.push(pid);
+        {
+            PROCESS_READS.with(|reads| {
+                if let Some(reads) = reads.borrow_mut().as_mut() {
+                    reads.push(pid);
+                }
+            });
+            // Taken out while it runs, so that it can read about processes itself.
+            if let Some(mut then) = AFTER_READ.with(|then| then.borrow_mut().take()) {
+                then(pid, file);
+                AFTER_READ.with(|slot| *slot.borrow_mut() = Some(then));
             }
-        });
-        std::fs::read_to_string(format!("/proc/{pid}/{file}"))
+        }
+        read
     }
+
+    /// What a test runs after each read on this thread: the process read about, and the file.
+    #[cfg(feature = "testing")]
+    type AfterRead = Box<dyn FnMut(u32, &str)>;
 
     #[cfg(feature = "testing")]
     thread_local! {
@@ -399,6 +420,22 @@ mod platform {
         /// no test is.
         static PROCESS_READS: std::cell::RefCell<Option<Vec<u32>>> =
             const { std::cell::RefCell::new(None) };
+        /// What a test runs after each read on this thread, where one is.
+        static AFTER_READ: std::cell::RefCell<Option<AfterRead>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Runs `work`, and `then` after each read it makes on this thread, with the process read
+    /// about and the file.
+    #[cfg(feature = "testing")]
+    pub fn after_each_read<T>(
+        then: impl FnMut(u32, &str) + 'static,
+        work: impl FnOnce() -> T,
+    ) -> T {
+        AFTER_READ.with(|slot| *slot.borrow_mut() = Some(Box::new(then)));
+        let done = work();
+        AFTER_READ.with(|slot| *slot.borrow_mut() = None);
+        done
     }
 
     /// Runs `work` and returns what it returned, with every process this thread read a `/proc`
@@ -517,10 +554,23 @@ mod platform {
 
     pub(super) fn children_of(pid: u32) -> Result<Vec<u32>> {
         let task = format!("/proc/{pid}/task");
-        let threads = std::fs::read_dir(&task)
-            .map_err(|error| unavailable("children of a process", format!("{task}: {error}")))?;
+        let threads = match std::fs::read_dir(&task) {
+            Ok(threads) => threads,
+            // A process that has gone is the parent of nothing: its children went to whoever
+            // adopts them when it exited.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => {
+                return Err(unavailable(
+                    "children of a process",
+                    format!("{task}: {error}"),
+                ));
+            }
+        };
         let mut children = Vec::new();
-        for thread in threads.flatten() {
+        for thread in threads {
+            let thread = thread.map_err(|error| {
+                unavailable("children of a process", format!("{task}: {error}"))
+            })?;
             let Some(tid) = thread.file_name().to_str().map(str::to_owned) else {
                 continue;
             };
