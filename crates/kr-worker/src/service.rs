@@ -275,6 +275,18 @@ impl WorkerService {
         &self.broker
     }
 
+    /// Whether this service still counts `attachment_id` among the attachments made under a
+    /// grant, for the host crates' own tests: an entry holds no lease, so nothing else shows one
+    /// that outlived its attachment.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn holds_granted_attachment(&self, attachment_id: AttachmentId) -> bool {
+        self.granted_attachments
+            .lock()
+            .expect("the granted attachment set is not poisoned")
+            .contains(&attachment_id)
+    }
+
     /// Sets up the backends an integrated invocation is given before it runs, on this session's
     /// broker, and hands them to the session; on Unix it also starts the watch that adopts a
     /// program those backends did not launch.

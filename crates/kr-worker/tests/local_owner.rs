@@ -23,8 +23,8 @@
 //! | --- | --- |
 //! | KR-REQ-10.50 | `a_local_caller_under_a_grant_is_drawn_the_live_screen_alone`, `the_local_owner_is_drawn_the_whole_screen_and_a_device_the_live_screen` |
 //! | KR-REQ-10.49 | `a_local_caller_under_a_grant_is_refused_the_retained_history`, `the_local_owner_reads_the_retained_history_on_either_socket`, `a_local_caller_under_a_grant_reads_the_last_command_only_inside_its_scope`, `the_local_owner_reads_the_last_command_on_either_socket` |
-//! | KR-REQ-10.41 | `a_local_caller_under_a_grant_detaches_only_what_its_own_connection_made`, `the_local_owner_detaches_another_windows_attachment_and_a_device_does_not` |
-//! | KR-REQ-10.45 | `a_revision_takes_the_lease_from_a_local_caller_under_a_grant`, `a_revision_takes_a_devices_lease_and_leaves_the_local_owners` |
+//! | KR-REQ-10.41 | `a_local_caller_under_a_grant_detaches_only_what_its_own_connection_made`, `the_local_owner_detaches_another_windows_attachment_and_a_device_does_not`, `a_detach_refused_for_another_connections_attachment_is_recorded_as_rejected` |
+//! | KR-REQ-10.45 | `a_revision_takes_the_lease_from_a_local_caller_under_a_grant`, `a_revision_takes_a_devices_lease_and_leaves_the_local_owners`, `an_attachment_the_empty_prompt_gesture_detaches_is_no_longer_counted_as_granted` |
 //! | KR-REQ-23.46 | `a_local_caller_under_a_grant_cancels_its_own_intent_and_no_other`, `the_local_owner_cancels_another_actors_intent_and_a_device_does_not` |
 
 mod common;
@@ -60,7 +60,12 @@ use kr_protocol::recovery::{
     EventStream, EventsSubscribeParams, HistoryPageParams, HistoryPageResult, OutputEvent,
 };
 use kr_protocol::rights::ActionRight;
-use kr_protocol::root::{CwdRevision, PromptGeneration, RootCommandBlockParams};
+use kr_protocol::root::{
+    CwdRevision, EditorBufferRevision, EditorFence, EditorKeymap, EditorState,
+    FenceAcknowledgement, FencePublication, KeyQueueSnapshot, PendingReaderInput, PromptGeneration,
+    QueueDrainReport, ReaderContext, ReaderRevision, RootCommandBlockParams, RootEditorEnterParams,
+    RootEditorFenceResult, RootEofDetachParams,
+};
 use kr_protocol::scalars::{CanonicalSet, Digest256, Nullable, TimestampMs, U64, Uuid};
 use kr_protocol::session::{
     ClosureReason, Dimensions, DisplayNumber, SessionReadParams, SessionReadResult, ShellMode,
@@ -69,6 +74,7 @@ use kr_protocol::worker::AuthorityRevisionNotice;
 use kr_shell_integration::contract::events::{BridgeEvent, EofGesture, HooksActivated};
 use kr_shell_integration::contract::fence::LeaseView;
 use kr_shell_integration::contract::qualification::ShellKind;
+use kr_shell_integration::contract::requests::{BridgeAnswer, WorkerRequest};
 use kr_shell_integration::contract::transport::{
     EventOutcome, HandshakeOutcome, WorkerExpectation,
 };
@@ -310,7 +316,7 @@ async fn answer(
 /// One worker service with a real session behind it, and the daemon identity to forward through.
 struct Wired {
     _temp: kr_ipc::testing::TempHost,
-    _service: Arc<WorkerService>,
+    service: Arc<WorkerService>,
     runtime: Arc<SessionRuntime>,
     session_id: SessionId,
     environment_id: kr_protocol::ids::EnvironmentId,
@@ -424,11 +430,32 @@ impl Wired {
         method: Method,
         params: &T,
     ) -> Result<ParamsValue, ProtocolError> {
+        self.forward_action(
+            daemon,
+            actor,
+            rights,
+            method,
+            params,
+            ActionId::new(kr_ipc::new_uuid()),
+        )
+        .await
+    }
+
+    /// Forwards one mutation for `actor` as [`Self::forward`] does, as the action `action_id`.
+    async fn forward_action<T: serde::Serialize>(
+        &self,
+        daemon: &mut LocalClient,
+        actor: &ActorEnvelope,
+        rights: &[ActionRight],
+        method: Method,
+        params: &T,
+        action_id: ActionId,
+    ) -> Result<ParamsValue, ProtocolError> {
         let mutation = MutationRequest {
             request_id: next_request(),
             method: method.into(),
             method_version: MethodVersion::V1,
-            action_id: ActionId::new(kr_ipc::new_uuid()),
+            action_id,
             target: self.target(),
             params: ParamsValue::from_typed(params).expect("encodes"),
             grant_id: Nullable::null(),
@@ -748,6 +775,107 @@ impl Wired {
             .expect("a receipt")
     }
 
+    /// Has the root editor of this managed session enter an empty prompt, as its reader does, and
+    /// returns the fence the worker published to it, which names the attachment holding the keys.
+    async fn fence_at_the_prompt(&mut self) -> EditorFence {
+        let session_id = self.session_id;
+        let editor = EditorState {
+            buffer_empty: true,
+            buffer_revision: EditorBufferRevision::new(1),
+            keymap: EditorKeymap::Emacs,
+            pending: PendingReaderInput::NONE,
+        };
+        let (bridge, _) = self.bridge.as_mut().expect("a managed session");
+        within(
+            "the editor's entry",
+            bridge.send_event(BridgeEvent::EditorEnter(RootEditorEnterParams {
+                session_id,
+                root_process: kr_ipc::identity::current_process_start_identity()
+                    .expect("this process"),
+                prompt_generation: PromptGeneration::new(2),
+                reader_revision: ReaderRevision::new(1),
+                reader_context: ReaderContext::Primary,
+                editor: editor.clone(),
+                cwd_revision: CwdRevision::new(1),
+            })),
+        )
+        .await
+        .expect("enters");
+        within("the fence", async {
+            loop {
+                match bridge
+                    .recv()
+                    .await
+                    .expect("the worker writes to the bridge")
+                {
+                    ToBridge::Request { id, request } => {
+                        if let WorkerRequest::Fence(params) = *request {
+                            bridge
+                                .answer(
+                                    id,
+                                    BridgeAnswer::Fence(RootEditorFenceResult::Acknowledged(
+                                        FenceAcknowledgement {
+                                            fence_id: params.fence_id,
+                                            prompt_generation: PromptGeneration::new(2),
+                                            reader_revision: ReaderRevision::new(1),
+                                            reader_context: ReaderContext::Primary,
+                                            queues: QueueDrainReport::CLEAR,
+                                            snapshot: KeyQueueSnapshot::drained(),
+                                            editor: editor.clone(),
+                                            cwd_revision: CwdRevision::new(1),
+                                        },
+                                    )),
+                                )
+                                .await
+                                .expect("acknowledges");
+                        }
+                    }
+                    ToBridge::FencePublished(FencePublication::Published(fence)) => return fence,
+                    ToBridge::FencePublished(other) => panic!("the fence was withheld: {other:?}"),
+                    _ => {}
+                }
+            }
+        })
+        .await
+    }
+
+    /// Makes the detach gesture at the empty prompt `fence` stands for, as the root editor's
+    /// reader does, and returns once the session has detached the attachment the fence names.
+    async fn detach_at_the_prompt(&mut self, fence: &EditorFence) {
+        let session_id = self.session_id;
+        let (bridge, _) = self.bridge.as_mut().expect("a managed session");
+        within(
+            "the gesture",
+            bridge.send_event(BridgeEvent::EofDetach(RootEofDetachParams {
+                session_id,
+                fence_id: fence.fence_id,
+                prompt_generation: fence.prompt_generation,
+                input_epoch: fence.input_epoch,
+            })),
+        )
+        .await
+        .expect("submits");
+        within("the detach", async {
+            loop {
+                if let ToBridge::EventResult { result, .. } =
+                    bridge.recv().await.expect("the worker answers")
+                {
+                    match *result {
+                        EventOutcome::Detached(detached) => {
+                            assert_eq!(detached.detached_attachment, fence.originating_attachment);
+                            return;
+                        }
+                        EventOutcome::Refused(error) => {
+                            panic!("the gesture was refused: {error:?}")
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        })
+        .await;
+    }
+
     fn close(&self) {
         self.runtime
             .close(ClosureReason::CloseRequested)
@@ -861,7 +989,7 @@ async fn wired_in(script: &str, shell_mode: ShellMode) -> Wired {
     tokio::spawn(Arc::clone(&service).serve(listener));
     Wired {
         _temp: temp,
-        _service: service,
+        service,
         runtime,
         session_id,
         environment_id,
@@ -1332,9 +1460,107 @@ async fn the_local_owner_detaches_another_windows_attachment_and_a_device_does_n
     wired.close();
 }
 
+/// KR-REQ-10.41: a detach a caller may not make is refused before anything changes, and so it is
+/// recorded as a rejection, never dispatched, rather than as an outcome nobody can establish: a
+/// caller under a grant and a paired device each naming another connection's attachment.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_detach_refused_for_another_connections_attachment_is_recorded_as_rejected() {
+    let wired = wired("sleep 120").await;
+    let mut window = wired.window().await;
+    let owners = wired
+        .attach_in(&mut window, &[AttachmentCapability::ObserveTerminal])
+        .await
+        .attachment
+        .attachment_id;
+
+    let mut proxy = wired.daemon(ControllerConnectionRole::Proxy).await;
+    for (actor, number) in [(local_under_a_grant(1), 71_u8), (device(1), 72)] {
+        let action_id = ActionId::new(Uuid::from_bytes([number; 16]));
+        let refused = wired
+            .forward_action(
+                &mut proxy,
+                &actor,
+                &[ActionRight::SessionView],
+                Method::SessionDetach,
+                &detaching(owners),
+                action_id,
+            )
+            .await
+            .expect_err("another connection's attachment is not this caller's to detach");
+        assert_eq!(refused.code, ErrorCode::AmbiguousAttachment, "{refused:?}");
+        let receipt = wired.receipt(actor.actor_id.as_str(), action_id);
+        assert_eq!(
+            receipt.state,
+            ReceiptState::Rejected,
+            "a refusal decided before anything changed is not an unknown outcome: {receipt:?}"
+        );
+        assert_eq!(
+            receipt.error.as_ref().map(|error| error.code),
+            Some(ErrorCode::AmbiguousAttachment),
+            "{receipt:?}"
+        );
+        assert!(
+            wired.attached(owners),
+            "the owner's window is still attached"
+        );
+    }
+
+    drop((window, proxy));
+    wired.close();
+}
+
 // ---------------------------------------------------------------------------------------------
 // KR-REQ-10.45: whose input lease an authority revision fences
 // ---------------------------------------------------------------------------------------------
+
+/// KR-REQ-10.45: the empty-prompt gesture detaches an attachment made under a grant inside the
+/// session, not through the service's own detach, and the service still counts as made under a
+/// grant only attachments the session has: once another attachment is made, the one the gesture
+/// detached is no longer among them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_attachment_the_empty_prompt_gesture_detaches_is_no_longer_counted_as_granted() {
+    let mut wired = managed().await;
+    let caller = local_under_a_grant(1);
+    let observe_and_type = [
+        AttachmentCapability::ObserveTerminal,
+        AttachmentCapability::Input,
+    ];
+    let mut proxy = wired.daemon(ControllerConnectionRole::Proxy).await;
+    let granted = wired
+        .attach_for(&mut proxy, &caller, WATCH_AND_TYPE, &observe_and_type)
+        .await
+        .attachment
+        .attachment_id;
+    wired
+        .acquire_for(&mut proxy, &caller, WATCH_AND_TYPE, granted)
+        .await;
+    assert_eq!(wired.lease_holder(), Some(granted));
+    assert!(wired.service.holds_granted_attachment(granted));
+
+    let fence = wired.fence_at_the_prompt().await;
+    assert_eq!(fence.originating_attachment, granted);
+    wired.detach_at_the_prompt(&fence).await;
+    assert!(!wired.attached(granted), "the gesture detached it");
+
+    let other = wired
+        .attach_for(
+            &mut proxy,
+            &caller,
+            &[ActionRight::SessionView],
+            &[AttachmentCapability::ObserveTerminal],
+        )
+        .await
+        .attachment
+        .attachment_id;
+    assert!(wired.service.holds_granted_attachment(other));
+    assert!(
+        !wired.service.holds_granted_attachment(granted),
+        "the attachment the gesture detached is no longer counted as made under a grant"
+    );
+
+    drop(proxy);
+    wired.close();
+}
 
 /// KR-REQ-10.45: an authority revision takes the input lease from a caller the daemon heard on its
 /// local socket, acting under a grant.
