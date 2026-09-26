@@ -291,7 +291,6 @@ impl ClientSelection {
 /// is not: dropping it clears it, on every path out. It covers the buffers this crate allocates
 /// itself; the intermediate value trees the encoder builds belong to the crate that owns the
 /// encoder, and the cryptography reference records that.
-
 pub(crate) struct Zeroising(pub Vec<u8>);
 
 impl std::fmt::Debug for Zeroising {
