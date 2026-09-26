@@ -5,18 +5,21 @@
 //! bytes, so the page never sees the file: it is told what was dropped, and this reads it and
 //! drives the upload.
 //!
-//! The sequence itself is [`kr_client::uploads::Upload`], which is the client library's and is the
-//! same on every platform. What is here is the part that is this application's: reading the file,
-//! sending each step over the session, and handing back the verified handle.
+//! The sequence itself is the client library's and is the same on every platform: the plan,
+//! [`kr_client::uploads::Upload`], and its driver, [`kr_client::uploads::send`], which reserves,
+//! asks and publishes on the session and sends every chunk on the environment's attachment-chunk
+//! lane. What is here is the part that is this application's: reading the file, naming the host
+//! it goes to, and handing back the verified handle.
 
 use std::io::{Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use kr_client::Session;
-use kr_client::uploads::{Answer, Content, Step, Subject, Upload};
+use kr_client::chunks::ChunkRoute;
+use kr_client::uploads::{Content, Subject, Upload};
+use kr_ipc::paths::EnvironmentPaths;
 use kr_protocol::envelope::ActionTarget;
-use kr_protocol::method::Method;
 use kr_protocol::scalars::Digest256;
 use kr_protocol::transfer::AttachmentHandle;
 
@@ -153,15 +156,47 @@ fn media_type_of(path: &Path) -> String {
     .to_owned()
 }
 
-/// Sends one file to the host and returns the verified handle.
+/// Sends one file to the host on this machine and returns the verified handle.
+///
+/// The host is the one [`crate::connection::connect_local`] reached: the environment `environment_id`
+/// names, under the host paths this process discovers the same way.
 ///
 /// # Errors
 ///
-/// Returns the host's refusal, and the client's own when the file changed while it was being sent.
+/// Returns `RESOURCE_UNAVAILABLE` when the host's paths cannot be read, and whatever [`upload_to`]
+/// returns.
 pub async fn upload(
     session: &Session,
     target: ActionTarget,
     environment_id: kr_protocol::ids::EnvironmentId,
+    session_id: Option<kr_protocol::ids::SessionId>,
+    path: PathBuf,
+) -> Result<AttachmentHandle> {
+    let paths = kr_ipc::paths::HostPaths::discover()
+        .map_err(|error| CommandError::unavailable(format!("no host on this machine: {error}")))?;
+    upload_to(
+        session,
+        &paths.environment(environment_id),
+        target,
+        session_id,
+        path,
+    )
+    .await
+}
+
+/// Sends one file to `environment`, whose controller `session` is connected to, and returns the
+/// verified handle.
+///
+/// The reservation and the publication go on the session and every chunk on the environment's
+/// attachment-chunk endpoint, which is what lets a chunk be the protocol's full size.
+///
+/// # Errors
+///
+/// Returns the host's refusal, and the client's own when the file changed while it was being sent.
+pub async fn upload_to(
+    session: &Session,
+    environment: &EnvironmentPaths,
+    target: ActionTarget,
     session_id: Option<kr_protocol::ids::SessionId>,
     path: PathBuf,
 ) -> Result<AttachmentHandle> {
@@ -174,70 +209,22 @@ pub async fn upload(
     // The name and the media type are the file's own, read here rather than taken from the page:
     // what the handle records is what this client actually opened.
     let subject = Subject {
-        environment_id,
+        environment_id: environment.environment_id(),
         session_id,
         device_id: None,
         declared_media_type: content.media_type().to_owned(),
         original_file_name: content.name().to_owned(),
     };
+    let route = ChunkRoute::local(environment, crate::connection::build_id()?)?;
     let mut plan = Upload::new(subject, Box::new(content));
-    loop {
-        match plan.next()? {
-            Step::Begin(params) => {
-                let settled = session
-                    .mutate(
-                        Method::UploadBegin,
-                        target.clone(),
-                        None,
-                        &Empty {},
-                        &*params,
-                        crate::commands::MUTATION_TTL,
-                    )
-                    .await?;
-                plan.accept(Answer::Begun(Box::new(result_of(&settled)?)))?;
-            }
-            Step::Chunk(params) => {
-                let settled = session
-                    .mutate(
-                        Method::UploadChunk,
-                        target.clone(),
-                        None,
-                        &Empty {},
-                        &*params,
-                        crate::commands::MUTATION_TTL,
-                    )
-                    .await?;
-                plan.accept(Answer::Chunked(Box::new(result_of(&settled)?)))?;
-            }
-            Step::Finish(params) => {
-                let settled = session
-                    .mutate(
-                        Method::UploadFinish,
-                        target.clone(),
-                        None,
-                        &Empty {},
-                        &params,
-                        crate::commands::MUTATION_TTL,
-                    )
-                    .await?;
-                plan.accept(Answer::Finished(Box::new(result_of(&settled)?)))?;
-            }
-            Step::Done(handle) => return Ok(*handle),
-        }
-    }
-}
-
-/// The preconditions this application states, which are none: every one it relies on is a
-/// parameter of the method itself.
-#[derive(Debug, serde::Serialize)]
-struct Empty {}
-
-/// The method's own result, or the failure when the host answered with only a receipt.
-fn result_of<R>(settled: &kr_client::Settled) -> Result<R>
-where
-    R: kr_protocol::wire::WireMessage,
-{
-    settled.to_typed::<R>().map_err(CommandError::from)
+    Ok(kr_client::uploads::send(
+        session,
+        &route,
+        &target,
+        &mut plan,
+        crate::commands::MUTATION_TTL,
+    )
+    .await?)
 }
 
 #[cfg(test)]

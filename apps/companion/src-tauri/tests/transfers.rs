@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use kr_client::Session;
+use kr_client::chunks::ChunkRoute;
 use kr_client::ipc::IpcTransport;
 use kr_controller::service::{Controller, ControllerSetup};
 use kr_controller::supervision::{LaunchOutcome, WorkerLaunch, WorkerSupervisor};
@@ -23,9 +24,10 @@ use kr_protocol::frame::{FRAME_LENGTH_PREFIX_LEN, StreamKind};
 use kr_protocol::ids::{EnvironmentId, TransferId};
 use kr_protocol::limits::UPLOAD_CHUNK_LEN;
 use kr_protocol::method::Method;
-use kr_protocol::scalars::Digest256;
+use kr_protocol::scalars::{Digest256, Nullable};
 use kr_protocol::transfer::{
-    AttachmentHandle, UploadChunkParams, UploadState, UploadStatusParams, UploadStatusResult,
+    AttachmentHandle, DownloadBeginParams, DownloadBeginResult, DownloadSource, UploadChunkParams,
+    UploadState, UploadStatusParams, UploadStatusResult,
 };
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
@@ -162,15 +164,53 @@ async fn upload(
     session: &Session,
     path: PathBuf,
 ) -> companion_tauri::Result<AttachmentHandle> {
-    let environment_id = daemon.environment_id();
-    companion_tauri::transfers::upload(
+    companion_tauri::transfers::upload_to(
         session,
-        ActionTarget::environment(environment_id),
-        environment_id,
+        &daemon.tree.environment(),
+        ActionTarget::environment(daemon.environment_id()),
         None,
         path,
     )
     .await
+}
+
+/// Reads an attachment back through a lane of its own, checking every chunk against the
+/// descriptor the host gave and the whole file against its digest.
+async fn read_back(daemon: &Daemon, session: &Session, handle: &AttachmentHandle) -> Vec<u8> {
+    let download: DownloadBeginResult = session
+        .read(
+            Method::DownloadBegin,
+            &DownloadBeginParams {
+                environment_id: daemon.environment_id(),
+                resume_transfer_id: Nullable::null(),
+                source: Nullable::some(DownloadSource::Attachment {
+                    transfer_id: handle.transfer_id,
+                }),
+                device_id: Nullable::null(),
+            },
+        )
+        .await
+        .expect("the host opens the attachment for reading");
+    let route = ChunkRoute::local(
+        &daemon.tree.environment(),
+        companion_tauri::connection::build_id().expect("a build identity"),
+    )
+    .expect("an addressable route");
+    let mut lane = route
+        .open(download.transfer_id)
+        .await
+        .expect("a lane for the download");
+    let mut whole = Vec::new();
+    for chunk in &download.chunks {
+        let bytes = lane
+            .read_chunk(chunk)
+            .await
+            .expect("every chunk is the one described");
+        whole.extend_from_slice(bytes.as_slice());
+    }
+    assert_eq!(whole.len() as u64, download.byte_len.get());
+    assert_eq!(digest(&whole), download.content_digest);
+    whole
 }
 
 /// Writes `len` bytes of a pattern no two neighbouring chunks share, and returns them.
@@ -222,6 +262,9 @@ async fn a_dropped_file_of_several_full_chunks_reaches_a_verified_handle() {
     verified(&session, &handle, &bytes).await;
     assert_eq!(handle.original_file_name, "capture.bin");
     assert_eq!(handle.environment_id, daemon.environment_id());
+    // And the bytes the host published are the file's, chunk by chunk and whole, read back over
+    // the same kind of lane.
+    assert_eq!(read_back(&daemon, &session, &handle).await, bytes);
 }
 
 /// KR-REQ-14.12: an upload whose chunk connection drops part way resumes from `upload.status`
