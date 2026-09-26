@@ -105,10 +105,11 @@ pub struct Replay {
 
 /// An entry that a part cannot carry even on its own and without its text.
 ///
-/// What an entry carries besides its text is a few numbers and the name of its kind, so only a
-/// part far smaller than the smallest control frame a peer may declare meets one. Answering it
-/// with an empty part that continues at the same entry would have the reader ask for that part
-/// for ever, so it is a refusal instead.
+/// Beside its text an entry carries a few numbers and the name of its kind, and a part's allowance
+/// is what is left of the reader's frame once the rest of the answer is in it, so a small frame
+/// beside a large binding, or an entry whose kind has a long name, can leave too little room for
+/// it. Answering it with an empty part that continues at the same entry would have the reader ask
+/// for that part for ever, so it is a refusal instead.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Uncarried {
     /// The entry's position in the log.
