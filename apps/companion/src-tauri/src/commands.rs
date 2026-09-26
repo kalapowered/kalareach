@@ -48,12 +48,6 @@ pub const NAMED_COMMANDS: &[(&str, Option<Method>)] = &[
     ("session_read", Some(Method::SessionRead)),
     ("session_create", Some(Method::SessionCreate)),
     ("session_close", Some(Method::SessionClose)),
-    // Attachments and the terminal view.
-    ("session_attach", Some(Method::SessionAttach)),
-    ("session_detach", Some(Method::SessionDetach)),
-    ("attachment_configure", Some(Method::AttachmentConfigure)),
-    ("attachment_viewport", Some(Method::AttachmentViewport)),
-    ("terminal_resize", Some(Method::TerminalResize)),
     // The raw terminal view. Its attachment is made on the session's own worker, from native
     // code: the page names a session and a size, never a method.
     ("terminal_view_open", None),
@@ -77,9 +71,7 @@ pub const NAMED_COMMANDS: &[(&str, Option<Method>)] = &[
     ("attachment_upload_status", Some(Method::UploadStatus)),
     ("attachment_image", Some(Method::DownloadBegin)),
     ("attachment_image_chunk", Some(Method::DownloadChunk)),
-    // Events and history.
-    ("events_subscribe", Some(Method::EventsSubscribe)),
-    ("events_snapshot", Some(Method::EventsSnapshot)),
+    // History.
     ("history_page", Some(Method::HistoryPage)),
     ("action_read", Some(Method::ActionRead)),
     ("action_cancel", Some(Method::ActionCancel)),
@@ -185,11 +177,6 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static
         session_read,
         session_create,
         session_close,
-        session_attach,
-        session_detach,
-        attachment_configure,
-        attachment_viewport,
-        terminal_resize,
         terminal_view_open,
         terminal_view_resize,
         terminal_view_close,
@@ -205,8 +192,6 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static
         attachment_upload_status,
         attachment_image,
         attachment_image_chunk,
-        events_subscribe,
-        events_snapshot,
         history_page,
         action_read,
         action_cancel,
@@ -397,16 +382,6 @@ read_command!(
     kr_protocol::receipt::ActionReadParams => kr_protocol::receipt::ActionReadResult
 );
 read_command!(
-    /// Subscribes to a stream from the cursor this client holds.
-    events_subscribe, Method::EventsSubscribe,
-    kr_protocol::recovery::EventsSubscribeParams => kr_protocol::recovery::EventsSubscribeResult
-);
-read_command!(
-    /// Takes a session's snapshot at the cursor the subscription began from.
-    events_snapshot, Method::EventsSnapshot,
-    kr_protocol::recovery::EventsSnapshotParams => kr_protocol::recovery::EventsSnapshotResult
-);
-read_command!(
     /// Reads one page of retained history above the live screen.
     history_page, Method::HistoryPage,
     kr_protocol::recovery::HistoryPageParams => kr_protocol::recovery::HistoryPageResult
@@ -424,28 +399,6 @@ mutate_command!(
 mutate_command!(
     /// Closes a session, after the interface has shown what closing does.
     session_close, Method::SessionClose, kr_protocol::session::SessionCloseParams
-);
-mutate_command!(
-    /// Attaches a view to a session.
-    session_attach, Method::SessionAttach, kr_protocol::attachment::SessionAttachParams
-);
-mutate_command!(
-    /// Detaches a view.
-    session_detach, Method::SessionDetach, kr_protocol::attachment::SessionDetachParams
-);
-mutate_command!(
-    /// Configures what an attachment observes.
-    attachment_configure, Method::AttachmentConfigure,
-    kr_protocol::attachment::AttachmentConfigureParams
-);
-mutate_command!(
-    /// Reports this view's viewport position and dimensions.
-    attachment_viewport, Method::AttachmentViewport,
-    kr_protocol::attachment::AttachmentViewportParams
-);
-mutate_command!(
-    /// Asks for a terminal size.
-    terminal_resize, Method::TerminalResize, kr_protocol::attachment::TerminalResizeParams
 );
 mutate_command!(
     /// Takes the input lease.
@@ -1545,6 +1498,27 @@ mod tests {
             performing(Method::PairRedeem),
             BTreeSet::from(["pairing_start_read"])
         );
+        // A terminal view's calls are the view's own, on its own link: no page method attaches,
+        // subscribes, reports a window, resizes, configures or detaches.
+        for method in [
+            Method::SessionAttach,
+            Method::SessionDetach,
+            Method::AttachmentConfigure,
+            Method::AttachmentViewport,
+            Method::TerminalResize,
+            Method::EventsSubscribe,
+            Method::EventsSnapshot,
+        ] {
+            assert!(!page.contains(&method), "{method} is a page method");
+        }
+        assert_eq!(
+            performing(Method::SessionAttach),
+            BTreeSet::from(["terminal_view_open"])
+        );
+        assert_eq!(
+            performing(Method::SessionDetach),
+            BTreeSet::from(["terminal_view_close", "terminal_view_open"])
+        );
     }
 
     /// KR-REQ-10.06: a review names a reference and nothing else. A request that also carries a
@@ -1617,11 +1591,6 @@ mod tests {
             session_read,
             session_create,
             session_close,
-            session_attach,
-            session_detach,
-            attachment_configure,
-            attachment_viewport,
-            terminal_resize,
             input_acquire,
             input_release,
             input_interrupt,
@@ -1634,8 +1603,6 @@ mod tests {
             attachment_upload_status,
             attachment_image,
             attachment_image_chunk,
-            events_subscribe,
-            events_snapshot,
             history_page,
             action_read,
             action_cancel,
