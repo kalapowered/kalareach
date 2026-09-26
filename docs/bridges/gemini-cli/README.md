@@ -109,7 +109,8 @@ a very large session runs out of memory sooner, and the restart: when Gemini CLI
 The relay of administrator settings serves only a restarted child. A package declares the variable
 as its command integration's, the one pair the package contract permits, and the worker exports it
 beside `KR_REGISTRATION` for an integrated launch. Sessions are created with no command integration
-enabled, and the shell applies an integration only where it adds a flag, so no launch sets it.
+enabled, and the shell does not apply an integration whose entry names no flag, so no launch sets
+it.
 
 An interactive Gemini CLI runs its `SessionEnd` hooks more than once when it exits, with the same
 session and reason (twice in one run, three times in two others), and prints three lines of its own
