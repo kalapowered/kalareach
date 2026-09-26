@@ -56,6 +56,81 @@ pub fn flush_directory(directory: &Path, kind: NameKind) -> std::io::Result<()> 
     }
 }
 
+/// How long [`retry_while_held`] goes on trying a rename again while another program holds a file
+/// it needs, counted on a monotonic clock from the first attempt.
+///
+/// Where a scanner reads each new file, as Windows Defender's real-time protection does, a record
+/// just linked into place was seen held for up to about 1.3 seconds after its rename was first
+/// refused; this is a budget several times that.
+pub const HELD_RENAME_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Runs `rename`, which puts a file or a directory in place under its name, and on Windows runs it
+/// again while another program holds what it renames or what it replaces.
+///
+/// Windows refuses a rename with ERROR_SHARING_VIOLATION while another handle holds the file being
+/// renamed without sharing its deletion, and with ERROR_ACCESS_DENIED while one holds the file it
+/// replaces that way, or anything below a directory being renamed. A program that reads each file
+/// as it is written, a scanner above all, holds a new file so for a moment. Those two refusals are
+/// tried again after a pause that doubles from 2 ms up to 200 ms and never runs past the deadline,
+/// until the rename succeeds, fails any other way, or [`HELD_RENAME_BOUND`] has passed since the
+/// first attempt; then the last refusal is returned unchanged, so the caller reports it as it
+/// always did and nothing was renamed. An access-control list that denies the rename answers
+/// ERROR_ACCESS_DENIED too, and waiting changes nothing about it: it is reported once the bound has
+/// passed. The bound limits the waiting between attempts, not how long one attempt takes or when
+/// the operating system next runs this thread.
+///
+/// Elsewhere `rename` runs once and its answer is returned: macOS and Linux rename a file however
+/// another program holds it.
+///
+/// What the destination is may change while this waits. A caller that checks something about it
+/// just before its rename checks it again inside `rename`, before every attempt.
+///
+/// # Errors
+///
+/// Returns `rename`'s error: the last refusal once the bound has passed, and any other error at
+/// once.
+pub fn retry_while_held(rename: impl FnMut() -> std::io::Result<()>) -> std::io::Result<()> {
+    retry_within(HELD_RENAME_BOUND, rename)
+}
+
+/// [`retry_while_held`] with the bound given, which the tests shorten.
+fn retry_within(
+    bound: std::time::Duration,
+    mut rename: impl FnMut() -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::time::{Duration, Instant};
+        use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION};
+
+        let held = |error: &std::io::Error| {
+            error.raw_os_error().is_some_and(|code| {
+                code == ERROR_SHARING_VIOLATION.cast_signed()
+                    || code == ERROR_ACCESS_DENIED.cast_signed()
+            })
+        };
+        let started = Instant::now();
+        let mut pause = Duration::from_millis(2);
+        loop {
+            let refused = match rename() {
+                Err(error) if held(&error) => error,
+                answer => return answer,
+            };
+            let left = bound.saturating_sub(started.elapsed());
+            if left.is_zero() {
+                return Err(refused);
+            }
+            std::thread::sleep(pause.min(left));
+            pause = pause.saturating_mul(2).min(Duration::from_millis(200));
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = bound;
+        rename()
+    }
+}
+
 /// Flushes one directory through a handle that holds `right` and nothing more.
 ///
 /// `FlushFileBuffers`, which is what synchronising a handle calls, flushes only through a handle
@@ -407,6 +482,176 @@ mod tests {
         drop(unshared);
         flush_held_directory(&held, NameKind::File).expect("and with it gone, the flush is made");
         drop(held);
+    }
+
+    /// A rename that fails any other way than a hold is answered at once, after one attempt, on
+    /// every platform.
+    #[test]
+    fn a_rename_that_fails_another_way_is_tried_once() {
+        let mut attempts = 0;
+        let answer = retry_within(std::time::Duration::from_secs(5), || {
+            attempts += 1;
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+        });
+        assert_eq!(
+            answer.expect_err("refused").kind(),
+            std::io::ErrorKind::NotFound
+        );
+        assert_eq!(attempts, 1);
+    }
+
+    /// Elsewhere than Windows a rename is tried once, whatever it answers.
+    #[cfg(not(windows))]
+    #[test]
+    fn elsewhere_a_refused_rename_is_tried_once() {
+        /// Permission denied, as macOS and Linux number it.
+        const EACCES: i32 = 13;
+
+        let mut attempts = 0;
+        let answer = retry_within(std::time::Duration::from_secs(5), || {
+            attempts += 1;
+            Err(std::io::Error::from_raw_os_error(EACCES))
+        });
+        assert_eq!(answer.expect_err("refused").raw_os_error(), Some(EACCES));
+        assert_eq!(attempts, 1);
+    }
+
+    /// A hold that gives way to another error answers with that error at once.
+    #[cfg(windows)]
+    #[test]
+    fn a_hold_followed_by_another_error_answers_with_the_other_error() {
+        use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
+
+        let mut attempts = 0;
+        let answer = retry_within(std::time::Duration::from_secs(5), || {
+            attempts += 1;
+            if attempts == 1 {
+                Err(std::io::Error::from_raw_os_error(
+                    ERROR_ACCESS_DENIED.cast_signed(),
+                ))
+            } else {
+                Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+            }
+        });
+        assert_eq!(
+            answer.expect_err("refused").kind(),
+            std::io::ErrorKind::NotFound
+        );
+        assert_eq!(attempts, 2);
+    }
+
+    /// A hold that outlasts the bound is answered with the last refusal, unchanged, once the bound
+    /// has passed and not long after.
+    #[cfg(windows)]
+    #[test]
+    fn a_hold_that_outlasts_the_bound_answers_with_its_refusal_unchanged() {
+        use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
+
+        let bound = std::time::Duration::from_millis(300);
+        let started = std::time::Instant::now();
+        let mut attempts = 0;
+        let answer = retry_within(bound, || {
+            attempts += 1;
+            Err(std::io::Error::from_raw_os_error(
+                ERROR_SHARING_VIOLATION.cast_signed(),
+            ))
+        });
+        let took = started.elapsed();
+        assert_eq!(
+            answer.expect_err("refused").raw_os_error(),
+            Some(ERROR_SHARING_VIOLATION.cast_signed())
+        );
+        assert!(attempts > 1, "tried again: {attempts}");
+        assert!(took >= bound, "{took:?}");
+        assert!(took < bound + std::time::Duration::from_secs(2), "{took:?}");
+    }
+
+    /// Holds `file` with a handle that shares reading and writing but not its deletion, as a
+    /// program that reads each file as it is written does for a moment.
+    #[cfg(windows)]
+    fn hold_without_shared_deletion(file: &Path) -> std::fs::File {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+        std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(file)
+            .expect("the file is held")
+    }
+
+    /// A file named `from` and one named `to`, each holding its own name, in a directory of this
+    /// test's own.
+    #[cfg(windows)]
+    fn two_files(name: &str) -> (Scratch, PathBuf, PathBuf) {
+        let root = Scratch::new(name);
+        let (from, to) = (root.0.join("from"), root.0.join("to"));
+        std::fs::write(&from, b"from").expect("the new file");
+        std::fs::write(&to, b"to").expect("the file it replaces");
+        (root, from, to)
+    }
+
+    /// A rename over a file another program holds without sharing its deletion is refused as
+    /// access denied, and is made once that program lets go, within the bound. So is a rename of a
+    /// file held that way, which is refused as a sharing violation.
+    #[cfg(windows)]
+    #[test]
+    fn a_rename_is_made_once_the_file_it_needs_is_let_go() {
+        use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION};
+
+        for (held, refused) in [
+            ("to", ERROR_ACCESS_DENIED),
+            ("from", ERROR_SHARING_VIOLATION),
+        ] {
+            let (_root, from, to) = two_files(&format!("held-{held}"));
+            let holding = hold_without_shared_deletion(if held == "to" { &to } else { &from });
+            assert_eq!(
+                std::fs::rename(&from, &to)
+                    .expect_err("refused while held")
+                    .raw_os_error(),
+                Some(refused.cast_signed()),
+                "{held}"
+            );
+            let started = std::time::Instant::now();
+            let letting_go = std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                drop(holding);
+            });
+            retry_within(std::time::Duration::from_secs(5), || {
+                std::fs::rename(&from, &to)
+            })
+            .unwrap_or_else(|error| panic!("{held}: renamed once let go: {error}"));
+            letting_go.join().expect("let go");
+            assert!(
+                started.elapsed() >= std::time::Duration::from_millis(250),
+                "{held}: not renamed before it was let go"
+            );
+            assert_eq!(std::fs::read(&to).expect("readable"), b"from", "{held}");
+        }
+    }
+
+    /// A file held past the bound is not replaced: the rename is refused with the refusal Windows
+    /// gave, the new file is where it was and the old one holds what it held.
+    #[cfg(windows)]
+    #[test]
+    fn a_file_held_past_the_bound_is_not_replaced() {
+        use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
+
+        let (_root, from, to) = two_files("held-past");
+        let holding = hold_without_shared_deletion(&to);
+        let bound = std::time::Duration::from_millis(300);
+        let started = std::time::Instant::now();
+        let refused = retry_within(bound, || std::fs::rename(&from, &to))
+            .expect_err("refused for as long as it is held");
+        let took = started.elapsed();
+        drop(holding);
+        assert_eq!(
+            refused.raw_os_error(),
+            Some(ERROR_ACCESS_DENIED.cast_signed())
+        );
+        assert!(took >= bound, "{took:?}");
+        assert_eq!(std::fs::read(&from).expect("still there"), b"from");
+        assert_eq!(std::fs::read(&to).expect("readable"), b"to");
     }
 
     /// The flush of a held directory is asked of the operating system through the second handle,
