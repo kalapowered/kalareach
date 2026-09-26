@@ -828,13 +828,14 @@ impl WorkerHost {
         }
     }
 
-    /// Creates a session whose root shell is PowerShell 7, through this host's daemon, and returns it
-    /// with its size.
+    /// Creates a session whose root shell is the Windows command shell, through this host's daemon,
+    /// and returns it with its size.
     ///
-    /// Not the POSIX shell Git for Windows installs: its runtime makes the account's own identity
-    /// the owner of what the processes under it create, where an administrator's processes give
-    /// that to the Administrators group. `kr` run under it would take this test's tree, which an
-    /// administrator's test process made, for another account's, and stop before it asked anything.
+    /// The command shell answers at once and runs what it is given with the worker's own token. Not
+    /// the POSIX shell Git for Windows installs: its runtime makes the account's own identity the
+    /// owner of what the processes under it create, where an administrator's processes give that to
+    /// the Administrators group, so `kr` run under it takes this test's tree, which an
+    /// administrator's test process made, for another account's and stops before it asks anything.
     async fn session(
         &self,
     ) -> (
@@ -854,7 +855,7 @@ impl WorkerHost {
                     "--cwd",
                     &cwd,
                     "--shell",
-                    &kr_worker::testing::powershell(),
+                    &command_shell(),
                 ])
                 .env("KR_RUNTIME_DIR", runtime_root)
                 .env("KR_STATE_DIR", state_root)
@@ -892,6 +893,15 @@ impl Drop for WorkerHost {
     }
 }
 
+/// The Windows command shell, from the system directory.
+fn command_shell() -> String {
+    PathBuf::from(std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into()))
+        .join("System32")
+        .join("cmd.exe")
+        .display()
+        .to_string()
+}
+
 /// KR-REQ-10.53: a console inside a real worker's session is not where the first owner is
 /// confirmed, even with `KR_SESSION` and `KR_ATTACHMENT` removed from it. `kr` asks every live
 /// session's worker whether it is one of its own, and the worker, which put the session's shell in
@@ -907,36 +917,37 @@ async fn the_first_owner_is_not_confirmed_in_a_real_workers_session_without_its_
     let mut terminal = WorkerTerminal::attach(&environment, session_id, dimensions).await;
     let kr_path = kr();
     let roots = format!(
-        "$env:KR_RUNTIME_DIR = '{}'; $env:KR_STATE_DIR = '{}'",
+        "set \"KR_RUNTIME_DIR={}\" & set \"KR_STATE_DIR={}\"",
         host.tree.paths().runtime_root().display(),
         host.tree.paths().state_root().display()
     );
-    // Each marker is put together by the shell, so the line as typed, which the terminal echoes,
-    // does not hold it: only the shell's answer does, once `kr` has ended.
+    // Each marker is escaped as typed, so the line the terminal echoes does not hold it: only what
+    // the shell prints once `kr` has ended does. `if errorlevel` reads kr's exit status when it
+    // runs, not when the line is read.
     terminal
         .type_line(&format!(
-            "{roots}; Remove-Item Env:KR_SESSION, Env:KR_ATTACHMENT -ErrorAction SilentlyContinue; \
-             & '{}' pair invite --owner --direct; ('KR' + '-exit-') + $LASTEXITCODE",
+            "{roots} & set \"KR_SESSION=\" & set \"KR_ATTACHMENT=\" & \"{}\" pair invite --owner \
+             --direct & if errorlevel 1 (echo K^R-refused) else (echo K^R-accepted)",
             kr_path.display()
         ))
         .await;
     let seen = terminal
-        .shown(
-            "KR-exit-",
-            "kr runs in the session with its variables removed",
-        )
+        .shown("KR-", "kr runs in the session with its variables removed")
         .await;
     assert!(
         seen.contains(&format!("this process is inside session {session_id}")),
         "the session's worker recognised kr as its own: {seen}"
     );
     assert!(!seen.contains("Type pair"), "nothing was asked: {seen}");
-    assert!(!seen.contains("KR-exit-0"), "and kr refused: {seen}");
+    assert!(
+        seen.contains("KR-refused") && !seen.contains("KR-accepted"),
+        "and kr refused: {seen}"
+    );
 
     terminal
         .type_line(&format!(
-            "$env:KR_SESSION = '{session_id}'; & '{}' pair invite --owner --direct; \
-             ('KR' + '-control-') + $LASTEXITCODE",
+            "set \"KR_SESSION={session_id}\" & \"{}\" pair invite --owner --direct & if errorlevel 1 \
+             (echo K^R-control-refused) else (echo K^R-control-accepted)",
             kr_path.display()
         ))
         .await;
