@@ -2364,4 +2364,46 @@ mod tests {
             Some(42)
         );
     }
+
+    /// How an attachment ended is said without the closure record, which names what the session
+    /// ran.
+    #[test]
+    fn how_an_attachment_ended_renders_without_the_closure_record() {
+        const MARKER: &str = "kr-marker-7c1e";
+        let record = kr_protocol::session::ClosureRecord {
+            session_id: kr_protocol::ids::SessionId::new(kr_protocol::scalars::Uuid::from_bytes(
+                [2; 16],
+            )),
+            session_epoch: kr_protocol::ids::SessionEpoch::V1,
+            reason: kr_protocol::session::ClosureReason::CloseRequested,
+            root_exit_code: kr_protocol::scalars::Nullable::null(),
+            root_signal: kr_protocol::scalars::Nullable::some(MARKER.to_owned()),
+            terminated: Vec::new(),
+            surviving: vec![kr_protocol::session::SurvivingResource {
+                kind: MARKER.to_owned(),
+                detail: MARKER.to_owned(),
+            }],
+            ownership_coverage: kr_protocol::session::OwnershipCoverage::Complete,
+            durability: kr_protocol::session::Durability::Durable,
+            closed_at_ms: kr_protocol::scalars::TimestampMs::new(1),
+        };
+        assert_eq!(
+            format!(
+                "{:?}",
+                AttachOutcome::Closed {
+                    record: Box::new(record),
+                    undelivered: true,
+                }
+            ),
+            "Closed { undelivered: true, .. }"
+        );
+        assert_eq!(
+            format!(
+                "{:?}",
+                AttachOutcome::DeliveryUncertain(Shown::said("not known"))
+            ),
+            "DeliveryUncertain(\"not known\")"
+        );
+        assert_eq!(format!("{:?}", AttachOutcome::Detached), "Detached");
+    }
 }

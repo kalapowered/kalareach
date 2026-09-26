@@ -3509,4 +3509,12 @@ mod tests {
             );
         }
     }
+
+    /// A file moved out of the way is said as moved, never by where it went.
+    #[test]
+    fn a_moved_file_renders_without_its_path() {
+        let moved = Moved::Aside(std::path::PathBuf::from("kr-marker-7c1e"));
+        assert_eq!(format!("{moved:?}"), "Aside(..)");
+        assert_eq!(format!("{:?}", Moved::NotRegular), "NotRegular");
+    }
 }
