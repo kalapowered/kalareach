@@ -97,12 +97,13 @@ pub fn retry_while_held(rename: impl FnMut() -> std::io::Result<()>) -> std::io:
 }
 
 /// [`retry_while_held`] until a deadline the caller took, for a caller whose rename is one part of
-/// an operation that as a whole ends within one bound.
+/// an operation whose waits all share one bound.
 ///
 /// Such a caller takes its deadline as the operation starts, one [`HELD_RENAME_BOUND`] away, and
-/// what it waits for before the rename, a lock among it, spends the same bound. The first attempt
-/// is made whenever this is called, even once the deadline has passed, because a rename nothing
-/// holds is made at once; no later attempt starts after the deadline.
+/// what it waits for before the rename, a lock among it, spends the same bound. The deadline bounds
+/// the waiting and the attempts made again, not how long one attempt or the rest of the operation
+/// takes. The first attempt is made whenever this is called, even once the deadline has passed,
+/// because a rename nothing holds is made at once; no later attempt starts after the deadline.
 ///
 /// # Errors
 ///

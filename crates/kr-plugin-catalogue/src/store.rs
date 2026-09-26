@@ -194,23 +194,30 @@ impl Area {
     /// among them, stops the call.
     fn mark_unconfirmed(&self, marker: &Path) -> CatalogueResult<()> {
         let path = self.path.join(marker);
-        match self.dir.create_dir(marker) {
-            Ok(()) => Ok(()),
-            Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
-                #[cfg(test)]
-                marker_race::run(&path);
-                if self
-                    .dir
-                    .symlink_metadata(marker)
-                    .is_ok_and(|found| found.is_dir())
-                {
-                    Ok(())
-                } else {
-                    Err(CatalogueError::storage(&path, &source))
-                }
+        // Another process's marker is taken away once that process has confirmed the directory,
+        // which can happen between the attempt to make this one and the look at what is there;
+        // this call then makes the marker again. The attempts are bounded, so a name that keeps
+        // coming and going cannot hold the call.
+        for _ in 0..MARKER_ATTEMPTS {
+            let source = match self.dir.create_dir(marker) {
+                Ok(()) => return Ok(()),
+                Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => source,
+                Err(source) => return Err(CatalogueError::storage(&path, &source)),
+            };
+            #[cfg(test)]
+            marker_race::run(&path);
+            match self.dir.symlink_metadata(marker) {
+                Ok(found) if found.is_dir() => return Ok(()),
+                Err(looked) if looked.kind() == std::io::ErrorKind::NotFound => {}
+                _ => return Err(CatalogueError::storage(&path, &source)),
             }
-            Err(source) => Err(CatalogueError::storage(&path, &source)),
         }
+        Err(CatalogueError::StorageUnavailable {
+            detail: format!(
+                "{}: the marker came and went {MARKER_ATTEMPTS} times while it was being left",
+                path.display()
+            ),
+        })
     }
 
     /// Whether anything is at the marker's name `marker` in this directory. Anything there counts,
@@ -322,6 +329,10 @@ fn open_own(path: &Path) -> CatalogueResult<Area> {
 /// asks of the directory it is in only the right to add a directory, which making the directory it
 /// marks asks anyway.
 const UNCONFIRMED: &str = "~unconfirmed";
+
+/// How many times a call tries to leave a marker that another process's confirmation keeps taking
+/// away ([`Area::mark_unconfirmed`]).
+const MARKER_ATTEMPTS: u32 = 8;
 
 /// The name of the marker of the directory `name`: `.<name>~unconfirmed`, in the same directory.
 fn marker_of(name: &Path) -> PathBuf {
