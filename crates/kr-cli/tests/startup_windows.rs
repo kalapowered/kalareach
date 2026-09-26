@@ -1119,6 +1119,235 @@ fn a_missing_foreign_or_stale_task_or_a_missing_daemon_is_named_and_nothing_is_r
     assert_eq!(host.claims(), Vec::<String>::new(), "no request was left");
 }
 
+impl Host {
+    /// An installation of this test's own: `kr`, with a program under the daemon's name beside it
+    /// that is not a daemon, the system's `whoami`, which ends at once whatever it is given. The
+    /// task registered for it starts nothing, whatever `kr new` does.
+    fn installation_without_a_daemon(&self) -> PathBuf {
+        let directory = self.temp.root().join("installed");
+        std::fs::create_dir_all(&directory).expect("an installation of this test's own");
+        kr_ipc::testing::place_program(&support::kr(), &directory.join("kr.exe"));
+        kr_ipc::testing::place_program(
+            &system32("whoami.exe"),
+            &directory.join("kr-controller.exe"),
+        );
+        directory
+    }
+
+    /// Runs the `kr` of `installed` with `arguments` against this tree.
+    fn kr_from(&self, installed: &Path, arguments: &[&str]) -> Output {
+        Command::new(installed.join("kr.exe"))
+            .args(arguments)
+            .env(
+                kr_ipc::paths::RUNTIME_DIR_VARIABLE,
+                self.temp.paths().runtime_root(),
+            )
+            .env(
+                kr_ipc::paths::STATE_DIR_VARIABLE,
+                self.temp.paths().state_root(),
+            )
+            .current_dir(installed)
+            .output()
+            .expect("kr runs")
+    }
+
+    /// The requests left for this environment's starter, as they were written.
+    fn requests(&self) -> Vec<kr_ipc::starter::StartClaim> {
+        let directory = self.environment().start_claims_dir();
+        self.claims()
+            .iter()
+            .filter(|name| name.ends_with(".claim"))
+            .map(|name| {
+                let bytes = std::fs::read(directory.join(name)).expect("the request is read");
+                kr_cbor::from_canonical_slice(&bytes, &kr_cbor::Limits::DEFAULT)
+                    .expect("the request decodes")
+            })
+            .collect()
+    }
+}
+
+/// A Task Scheduler of this test's own under `root`: it writes each call it is given to `calls`,
+/// refuses every run, and answers every other call by running the real one, whose answer it passes
+/// on byte for byte. Returns the `SystemRoot` that names it. It is compiled with the .NET
+/// Framework's own C# compiler, which every supported Windows has.
+fn refusing_task_scheduler(root: &Path, calls: &Path) -> PathBuf {
+    let system_root = root.join("system-root");
+    let system32 = system_root.join("System32");
+    std::fs::create_dir_all(&system32).expect("a system directory of this test's own");
+    let real_root = PathBuf::from(std::env::var_os("SystemRoot").expect("the system's root"));
+    let source = root.join("refusing.cs");
+    std::fs::write(
+        &source,
+        format!(
+            r#"class Refusing {{
+    static int Main(string[] words) {{
+        System.IO.File.AppendAllText(@"{calls}", "schtasks " + string.Join(" ", words) + "
+");
+        if (System.Array.IndexOf(words, "/Run") >= 0) {{
+            return 1;
+        }}
+        var start = new System.Diagnostics.ProcessStartInfo(@"{real}");
+        start.Arguments = string.Join(" ", System.Array.ConvertAll(words, word => """ + word + """));
+        start.UseShellExecute = false;
+        start.RedirectStandardOutput = true;
+        start.RedirectStandardError = true;
+        start.EnvironmentVariables["SystemRoot"] = @"{real_root}";
+        using (var run = System.Diagnostics.Process.Start(start)) {{
+            var error = System.Console.OpenStandardError();
+            var said = System.Threading.Tasks.Task.Run(() => run.StandardError.BaseStream.CopyTo(error));
+            var output = System.Console.OpenStandardOutput();
+            run.StandardOutput.BaseStream.CopyTo(output);
+            said.Wait();
+            run.WaitForExit();
+            output.Flush();
+            error.Flush();
+            return run.ExitCode;
+        }}
+    }}
+}}"#,
+            calls = calls.display(),
+            real = schtasks().display(),
+            real_root = real_root.display()
+        ),
+    )
+    .expect("the Task Scheduler's source");
+    let compiler = PathBuf::from(std::env::var_os("WINDIR").expect("the Windows directory"))
+        .join("Microsoft.NET")
+        .join("Framework64")
+        .join("v4.0.30319")
+        .join("csc.exe");
+    let compiled = Command::new(&compiler)
+        .arg("/nologo")
+        .arg(format!("/out:{}", system32.join("schtasks.exe").display()))
+        .arg(&source)
+        .output()
+        .unwrap_or_else(|error| panic!("the C# compiler at {} runs: {error}", compiler.display()));
+    assert!(
+        compiled.status.success(),
+        "the Task Scheduler of this test's own is compiled: {}",
+        String::from_utf8_lossy(&compiled.stdout)
+    );
+    system_root
+}
+
+/// KR-REQ-07.12: `kr new` has one deadline. However long it waited for the environment's lock, the
+/// request it leaves for the task's starter lapses no later than it stops waiting, and it is
+/// withdrawn before `kr new` says why no daemon answered, so none can be started for it once the
+/// command has given up. The task here runs a program that is not a daemon, so none is.
+#[test]
+fn a_request_lapses_when_kr_new_stops_waiting_however_long_the_lock_held_it() {
+    let host = Host::create();
+    let _task = host.removes_its_task();
+    let installed = host.installation_without_a_daemon();
+    let chose = host.kr_from(
+        &installed,
+        &["--json", "host", "startup", "--set", "standalone"],
+    );
+    assert!(chose.status.success(), "{}", document(&chose, "the choice"));
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(
+            host.environment()
+                .state_dir()
+                .join(kr_cli::service_manager::LOCK_FILE),
+        )
+        .expect("the environment's lock");
+    lock.lock().expect("held by this test");
+    let started = host
+        .new_session_with(&installed.join("kr.exe"))
+        .spawn()
+        .expect("kr new starts");
+    std::thread::sleep(Duration::from_secs(20));
+    lock.unlock().expect("let go");
+    let output = finish(started, "kr new");
+    let stopped = kr_ipc::clock::boot_elapsed_ms();
+    let failed = document(&output, "kr new");
+    assert_eq!(output.status.code(), Some(1), "{failed}");
+    assert_eq!(failed["code"], "ENVIRONMENT_UNAVAILABLE", "{failed}");
+    let message = failed["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("its starter did not take the request")
+            && message.contains("so the request was withdrawn and no daemon was started for it"),
+        "{message}"
+    );
+    let requests = host.requests();
+    assert_eq!(
+        requests.len(),
+        1,
+        "one request was left: {:?}",
+        host.claims()
+    );
+    assert!(
+        requests[0].deadline_boot_ms <= stopped,
+        "the request lapsed by the time kr new stopped waiting: it lapses at {} and kr new had \
+         stopped by {stopped}",
+        requests[0].deadline_boot_ms
+    );
+    assert!(
+        host.claims()
+            .contains(&format!("{}.taken", requests[0].request)),
+        "and it was withdrawn: {:?}",
+        host.claims()
+    );
+}
+
+/// KR-REQ-07.12: a run the Task Scheduler does not make has the request `kr new` left withdrawn at
+/// once, so no starter can take it and no daemon is started for it, and the failure says so in
+/// kr's own words. The Task Scheduler this test puts under a `SystemRoot` of its own answers every
+/// look at the task as the real one does and refuses every run; the task runs a program that is not
+/// a daemon.
+#[test]
+fn a_run_the_task_scheduler_refuses_has_its_request_withdrawn_at_once() {
+    let host = Host::create();
+    let _task = host.removes_its_task();
+    let installed = host.installation_without_a_daemon();
+    let chose = host.kr_from(
+        &installed,
+        &["--json", "host", "startup", "--set", "standalone"],
+    );
+    assert!(chose.status.success(), "{}", document(&chose, "the choice"));
+    let calls = host.temp.root().join("calls.txt");
+    let system_root = refusing_task_scheduler(&host.temp.root().join("refusing"), &calls);
+    let started = Instant::now();
+    let output = finish(
+        host.new_session_with(&installed.join("kr.exe"))
+            .env("SystemRoot", &system_root)
+            .spawn()
+            .expect("kr new"),
+        "kr new",
+    );
+    let failed = document(&output, "kr new");
+    assert_eq!(output.status.code(), Some(1), "{failed}");
+    assert_eq!(failed["code"], "ENVIRONMENT_UNAVAILABLE", "{failed}");
+    let message = failed["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("the Task Scheduler did not run the scheduled task")
+            && message.contains(
+                "the request this command left for its starter was withdrawn, so no control \
+                 daemon was started for it"
+            ),
+        "{message}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "at once, not after the wait: {:?}",
+        started.elapsed()
+    );
+    let asked = std::fs::read_to_string(&calls).unwrap_or_default();
+    assert!(asked.contains("/Run"), "the run was asked for: {asked}");
+    let boot = kr_ipc::identity::boot_identity().expect("this boot");
+    assert!(
+        kr_ipc::starter::take_claim(&host.environment(), &boot, kr_ipc::clock::boot_elapsed_ms())
+            .expect("the requests are read")
+            .is_none(),
+        "no starter can take the request: {:?}",
+        host.claims()
+    );
+}
+
 /// KR-REQ-07.12: a task the Task Scheduler does not start, as it starts none that logs on where the
 /// user is signed in while the user is signed in nowhere, ends `kr new` once it has waited its
 /// bound, with a failure of its own naming where the user has to be signed in; no daemon is
