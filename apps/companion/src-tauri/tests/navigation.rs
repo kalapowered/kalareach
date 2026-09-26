@@ -11,6 +11,10 @@
 //! * Popups: the page asks for a new window at the website. The production handler reports that
 //!   it was asked and refused, and no second web view exists; the control, a handler that creates
 //!   the window, produces one.
+//! * A page that loads again: two pages each hold a raw terminal view of a session a scripted
+//!   worker serves. Reloading one ends that page's view, which detaches and closes its link, and
+//!   leaves the other page's view open: the application's own page-load rule, installed by the same
+//!   function the application's start uses, run by the web view's own load.
 //!
 //! The handlers' reports are the application's own log lines, read through a subscriber this test
 //! installs.
@@ -31,12 +35,17 @@ fn main() {
 }
 
 #[cfg(target_os = "macos")]
+mod scripted_worker;
+
+#[cfg(target_os = "macos")]
 mod macos {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     use tauri::webview::NewWindowResponse;
     use tauri::{AppHandle, Manager as _, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
+
+    use super::scripted_worker::{Challenge, ScriptedWorker};
 
     const WEBSITE: &str = "https://reach.kala.to/";
     const NAVIGATION_REFUSED: &str = "a navigation away from the interface was refused";
@@ -97,14 +106,32 @@ mod macos {
         let messages = Messages::default();
         tracing::subscriber::set_global_default(messages.clone())
             .expect("the check's subscriber is the first");
+        // The scripted workers answer on a runtime of the check's own: the application's own
+        // runtime is where the views run.
+        let runtime = Arc::new(tokio::runtime::Runtime::new().expect("a runtime for the workers"));
+        let (first, second) = runtime.block_on(async {
+            let first = ScriptedWorker::start(Challenge::Answered);
+            let second = ScriptedWorker::start_beside(&first, Challenge::Answered);
+            (first, second)
+        });
+        let workers = Arc::new(Mutex::new(Some((first, second))));
         // A test context: the library already embeds the application's Info.plist, and a second
         // copy is a duplicate symbol.
-        let app = tauri::Builder::default()
-            .build(tauri::generate_context!(
-                "tests/navigation/tauri.conf.json",
-                test = true
-            ))
-            .expect("the check's application builds");
+        let paths = workers
+            .lock()
+            .expect("the workers")
+            .as_ref()
+            .map(|(first, _)| first.paths())
+            .expect("the first worker");
+        let app = companion_tauri::terminal::install(
+            tauri::Builder::default(),
+            companion_tauri::terminal::TerminalViews::at(paths),
+        )
+        .build(tauri::generate_context!(
+            "tests/navigation/tauri.conf.json",
+            test = true
+        ))
+        .expect("the check's application builds");
         // The checks' own verdict. The window loop's return value is not it: on macOS the loop
         // returns 0 whatever code the application exits with, so a failed check would pass.
         let verdict = Arc::new(std::sync::atomic::AtomicI32::new(1));
@@ -115,12 +142,17 @@ mod macos {
                 started = true;
                 let handle = handle.clone();
                 let messages = messages.clone();
+                let runtime = Arc::clone(&runtime);
+                let workers = workers.lock().expect("the workers").take();
                 let recorded = Arc::clone(&recorded);
                 std::thread::spawn(move || {
-                    // A check that panics is a failed check like any other, and must not leave
-                    // the window loop running.
+                    // A failed expectation inside a scripted worker panics this thread; it is
+                    // a failed check like any other, and must not leave the window loop running.
                     let checked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        check(&handle, &messages)
+                        check(&handle, &messages).and_then(|()| {
+                            let (first, second) = workers.expect("the workers, once");
+                            page_load(&handle, &runtime, first, second)
+                        })
                     }))
                     .unwrap_or_else(|_| Err("a check panicked".to_owned()));
                     let code = match checked {
@@ -251,6 +283,75 @@ mod macos {
         // The control's windows have no production handler, so nothing more was refused.
         if messages.count(NAVIGATION_REFUSED) != 1 || messages.count(WINDOW_REFUSED) != 1 {
             return Err("a window without the production handlers reported a refusal".to_owned());
+        }
+        Ok(())
+    }
+    /// The page-load check: two pages each hold a view, and reloading one ends only its own.
+    fn page_load(
+        app: &AppHandle,
+        runtime: &tokio::runtime::Runtime,
+        mut first: ScriptedWorker,
+        mut second: ScriptedWorker,
+    ) -> Result<(), String> {
+        use companion_tauri::terminal::{TerminalViewState, TerminalViews};
+
+        let one = open(app, "view-one", true)?;
+        let _two = open(app, "view-two", true)?;
+        // The initial load's own events have passed before a view is opened on either page.
+        std::thread::sleep(Duration::from_secs(1));
+        let heard: Arc<Mutex<Vec<(u8, TerminalViewState)>>> = Arc::default();
+        let publish = |page: u8| -> companion_tauri::terminal::Publish {
+            let heard = Arc::clone(&heard);
+            Arc::new(move |state| {
+                heard.lock().expect("the record").push((page, state));
+            })
+        };
+        let views = app.state::<TerminalViews>();
+        views.open(
+            "view-one",
+            first.session_id,
+            kr_protocol::session::Dimensions::new(10, 2),
+            publish(1),
+        );
+        views.open(
+            "view-two",
+            second.session_id,
+            kr_protocol::session::Dimensions::new(10, 2),
+            publish(2),
+        );
+        let (mut one_link, mut two_link) = runtime.block_on(async {
+            let mut one_link = first.link().await;
+            one_link.attach().await;
+            let mut two_link = second.link().await;
+            two_link.attach().await;
+            (one_link, two_link)
+        });
+        wait_for("both views attached", Duration::from_secs(10), || {
+            heard.lock().expect("the record").len() == 2
+        })?;
+        if views.held() != 2 {
+            return Err(format!("{} views held, not two", views.held()));
+        }
+
+        one.eval("location.reload()")
+            .map_err(|error| error.to_string())?;
+        let sent = runtime.block_on(async { one_link.closed().await });
+        if sent.len() != 1
+            || sent[0].method != kr_protocol::method::Method::SessionDetach.to_string()
+        {
+            return Err(format!(
+                "the reloaded page's view sent {sent:?} rather than its detach"
+            ));
+        }
+        wait_for("one view left", Duration::from_secs(10), || {
+            views.held() == 1
+        })?;
+        let quiet = runtime.block_on(async { two_link.quiet_for(Duration::from_secs(1)).await });
+        if !quiet {
+            return Err("the other page's view was sent something".to_owned());
+        }
+        if heard.lock().expect("the record").len() != 2 {
+            return Err("a view published after its page loaded again".to_owned());
         }
         Ok(())
     }
