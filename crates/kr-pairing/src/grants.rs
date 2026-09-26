@@ -431,6 +431,81 @@ mod tests {
         ));
     }
 
+    /// `scope`, naming one current question, one current approval, or both.
+    fn naming(scope: HistoryScope, question: bool, approval: bool) -> HistoryScope {
+        let mut named = scope;
+        if question {
+            named
+                .named_questions
+                .insert(kr_protocol::ids::QuestionId::new(Uuid::from_bytes(
+                    [0x51; 16],
+                )));
+        }
+        if approval {
+            named
+                .named_approvals
+                .insert(kr_protocol::ids::PendingResourceId::new(Uuid::from_bytes(
+                    [0x52; 16],
+                )));
+        }
+        named
+    }
+
+    /// A pairing invitation shows its issuer the rights it proposes and no preview of any named
+    /// resource, so a proposal that names a current approval or question is refused, for either
+    /// kind, with the reason, and no grant is issued from it. The controls are the proposals this
+    /// host's own surfaces make: the personal owner grant, and the command line's view-only
+    /// invitation with the live screen and nothing named.
+    #[test]
+    fn a_pairing_proposal_that_names_an_approval_or_a_question_is_refused() {
+        for (named, question, approval) in [("approval", false, true), ("question", true, false)] {
+            let session = session_invitation_grant(
+                0,
+                DEFAULT_SESSION_INVITATION_MS,
+                naming(history(), question, approval),
+            )
+            .expect("a proposal");
+            let owner = personal_owner_grant();
+            let owner = ProposedGrant {
+                history: naming(owner.history.clone(), question, approval),
+                ..owner
+            };
+            for (kind, proposal) in [
+                (GrantKind::SessionInvitation, session),
+                (GrantKind::PersonalOwner, owner),
+            ] {
+                let Err(PairingError::GrantNotPermitted { reason }) =
+                    validate_proposal(&proposal, kind, 0)
+                else {
+                    panic!("a proposal naming a current {named} is refused for {kind:?}");
+                };
+                assert!(
+                    reason.contains(named) && reason.contains("preview"),
+                    "the reason says why: {reason}"
+                );
+                assert!(
+                    matches!(
+                        issue_grant(proposal, kind, 0, &identities(7, 1, 2), None),
+                        Err(PairingError::GrantNotPermitted { .. })
+                    ),
+                    "no grant is issued from it either ({kind:?}, {named})"
+                );
+            }
+        }
+
+        assert!(validate_proposal(&personal_owner_grant(), GrantKind::PersonalOwner, 0).is_ok());
+        let view = session_invitation_grant(
+            0,
+            60 * 60_000,
+            HistoryScope {
+                include_live_screen: true,
+                ..history()
+            },
+        )
+        .expect("a proposal");
+        assert!(validate_proposal(&view, GrantKind::SessionInvitation, 0).is_ok());
+    }
+
     #[test]
     fn an_invitation_that_has_already_expired_is_refused() {
         let proposal = session_invitation_grant(0, 1_000, history()).expect("a proposal");

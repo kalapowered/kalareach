@@ -1225,3 +1225,63 @@ fn an_unused_invitation_is_consumed_as_expired_once_its_deadline_passes() {
         }
     );
 }
+
+/// The suite's proposal, naming one current approval or one current question.
+fn naming(approval: bool) -> ProposedGrant {
+    let mut named = proposal();
+    if approval {
+        named
+            .history
+            .named_approvals
+            .insert(kr_protocol::ids::PendingResourceId::new(Uuid::from_bytes(
+                [0x52; 16],
+            )));
+    } else {
+        named
+            .history
+            .named_questions
+            .insert(kr_protocol::ids::QuestionId::new(Uuid::from_bytes(
+                [0x51; 16],
+            )));
+    }
+    named
+}
+
+/// KR-REQ-10.51: a pairing invitation shows its issuer no preview of a named resource, so a direct
+/// invitation whose proposal names a current approval or question is not issued, even under an
+/// owner's confirmation of exactly that proposal, and nothing is written. The control is the
+/// suite's own proposal, issued as before.
+#[test]
+fn a_direct_invitation_that_names_a_current_approval_or_question_is_not_issued() {
+    let harness = Harness::new();
+    for approval in [true, false] {
+        let named = naming(approval);
+        let confirmed = harness.approval(
+            SensitiveAction::IssueInvitation,
+            kr_protocol::invitation::issuance_digest(
+                kr_protocol::invitation::InviteModeKind::Direct,
+                None,
+                kr_protocol::invitation::InviteGrantKind::SessionInvitation,
+                &named,
+            )
+            .expect("a digest"),
+            None,
+        );
+        let refused = DirectInvitation::issue(
+            &harness.store,
+            &harness.clock,
+            harness.identity(),
+            named,
+            GrantKind::SessionInvitation,
+            &confirmed.by(&harness.issuing_owner, harness.signer()),
+            &mut harness.ledger.borrow_mut(),
+        );
+        assert!(
+            matches!(refused, Err(PairingError::GrantNotPermitted { .. })),
+            "a proposal naming a current {} is not issued",
+            if approval { "approval" } else { "question" }
+        );
+    }
+    assert!(harness.store.snapshot().is_empty(), "nothing was written");
+    assert_eq!(harness.issue().record().state, InvitationState::Open);
+}
