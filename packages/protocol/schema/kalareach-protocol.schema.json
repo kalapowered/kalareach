@@ -8602,7 +8602,7 @@
         },
         "package_digest": {
           "$ref": "#/$defs/Digest256",
-          "description": "The digest of the exact component bytes the trust was granted to."
+          "description": "The hash that package was installed under, which names its exact contents, the decoder\nincluded. The trust is granted to that package and to no other bytes."
         },
         "plugin_id": {
           "$ref": "#/$defs/PluginId",
@@ -10682,7 +10682,7 @@
         },
         "upstream": {
           "$ref": "#/$defs/UpstreamRequestId",
-          "description": "The identifier exactly as the upstream wrote it."
+          "description": "The upstream's identifier, as this host's JSON form of its value.\n\nTwo spellings of one value are one identifier here, which is what a correlation key has to\nbe. The upstream's own spelling of it stays in the frame it arrived in."
         }
       },
       "required": [
