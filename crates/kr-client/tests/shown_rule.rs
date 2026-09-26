@@ -733,6 +733,20 @@ const READ_ATTRIBUTES: [&str; 8] = [
 ];
 
 impl Source {
+    /// Records where the item `name` that `scope` declares may be seen from. An item declared more
+    /// than once, once for each set of `cfg` conditions, with different visibilities, is seen from
+    /// where this reading cannot tell.
+    fn declare_visibility(&mut self, scope: usize, name: &str, visibility: Visibility) {
+        self.visibilities
+            .entry((scope, name.to_owned()))
+            .and_modify(|recorded| {
+                if *recorded != visibility {
+                    *recorded = Visibility::Other;
+                }
+            })
+            .or_insert(visibility);
+    }
+
     fn problem(&mut self, line: usize, item: &str, what: &str) {
         self.problems.push(Finding {
             file: self.name.clone(),
@@ -1110,16 +1124,12 @@ fn read_source(
             Some("struct" | "enum" | "union" | "trait" | "type") => {
                 if let Some(defined) = ident(tokens.get(at + 1)) {
                     source.definitions.insert((scope, defined.to_owned()));
-                    source
-                        .visibilities
-                        .insert((scope, defined.to_owned()), visibility_before(&tokens, at));
+                    source.declare_visibility(scope, defined, visibility_before(&tokens, at));
                 }
             }
             Some("mod") if punct(tokens.get(at + 2), ';') || punct(tokens.get(at + 2), '{') => {
                 if let Some(declared) = ident(tokens.get(at + 1)) {
-                    source
-                        .visibilities
-                        .insert((scope, declared.to_owned()), visibility_before(&tokens, at));
+                    source.declare_visibility(scope, declared, visibility_before(&tokens, at));
                 }
             }
             Some("use") => {
