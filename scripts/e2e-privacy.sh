@@ -53,17 +53,37 @@ fi
 
 # The same rules a gateway origin is held to, applied before the value reaches a log, a signed
 # request or a directory name. Nothing below repeats a value that failed them.
+# A port, when an origin names one: a number from 1 to 65535.
+valid_port() {
+  [[ "$1" =~ ^[1-9][0-9]{0,4}$ ]] && [ "$1" -le 65535 ]
+}
+
+# A host name: labels of letters, digits and inner hyphens, joined by dots.
+host_label='[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?'
 case "$origin" in
   https://*)
     mode=deployment
     authority="${origin#https://}"
+    host="$authority"
+    case "$authority" in
+      *:*)
+        host="${authority%:*}"
+        if ! valid_port "${authority##*:}"; then
+          echo "a deployment's origin is https://<host>, with at most a port from 1 to 65535 after it" >&2
+          exit 2
+        fi
+        ;;
+    esac
+    if ! [[ "$host" =~ ^(${host_label}\.)*${host_label}$ ]]; then
+      echo "a deployment's origin is https://<host>: a host name and nothing else, no path, query, fragment or user information" >&2
+      exit 2
+    fi
     ;;
   http://127.0.0.1:*)
     mode=local
-    authority="${origin#http://}"
     port="${origin#http://127.0.0.1:}"
-    if ! [[ "$port" =~ ^[1-9][0-9]{0,4}$ ]] || [ "$port" -gt 65535 ]; then
-      echo "a loopback origin is http://127.0.0.1:<port>, with a port and nothing after it" >&2
+    if ! valid_port "$port"; then
+      echo "a loopback origin is http://127.0.0.1:<port>, with a port from 1 to 65535 and nothing after it" >&2
       exit 2
     fi
     ;;
@@ -72,20 +92,6 @@ case "$origin" in
     exit 2
     ;;
 esac
-case "$authority" in
-  '')
-    echo "an origin names a host" >&2
-    exit 2
-    ;;
-  *[/?#@]*)
-    echo "an origin carries no path, query, fragment or user information" >&2
-    exit 2
-    ;;
-esac
-if [ -n "${authority//[]A-Za-z0-9.:[-]/}" ]; then
-  echo "an origin is a host and an optional port in printable ASCII, and nothing else" >&2
-  exit 2
-fi
 
 tree=""
 node=""
@@ -238,71 +244,143 @@ later_legs() {
   report 'NOT RUN' phone "waits for physical devices, with a notification in flight at a phone"
 }
 
-# The local deployment: its run directory, its record, and whether everything it started stopped.
+# The local deployment: its run directory, and every process this run started for it.
 run=""
 state=""
+# The deployment's process group. Its leader is the process this run forked for `wrangler dev`, the
+# group's number is the leader's, and `leader_started` is when the kernel says the leader started.
 group=""
+leader_started=""
+# Every process of the deployment, as "<number>|<started>". A member is recorded only while the
+# leader is still the process this run forked: until the leader ends, no other group can take its
+# number, so every member of the group then is this run's. A process is signalled only while its
+# number still names the process that was recorded, never by the group's number alone.
+deployment=()
 stub=""
+stub_started=""
 stub_port=""
 why=""
 stopped=1
+local_complete=0
+removed=0
+finished=0
 
-# Every process of the deployment's process group that is this run's: its command names the run
-# directory or the web tree, which a process of anybody else's does not.
-deployment_processes() {
-  [ -n "$group" ] || return 0
-  local pid command
-  while read -r pid; do
-    command="$(ps -o command= -p "$pid" 2>/dev/null || true)"
-    case "$command" in
-      *"$run"* | *"$tree"*) printf '%s\n' "$pid" ;;
-    esac
-  done < <(ps -axo pid=,pgid= | awk -v group="$group" '$2 == group { print $1 }')
+# Whether a recorded process is still the one recorded.
+still_there() {
+  [ -n "$2" ] && [ "$(process_started "$1")" = "$2" ]
 }
 
-# Asks the deployment to stop, then makes it, and says whether anything of it is left.
+# Whether the deployment's leader is still the process this run forked.
+leader_alive() {
+  [ -n "$group" ] && still_there "$group" "$leader_started"
+}
+
+# The numbers of the processes in the deployment's group now, whoever they are.
+group_now() {
+  ps -axo pid=,pgid= | awk -v group="$group" '$2 == group { print $1 }'
+}
+
+# Records every member of the deployment's group, while its leader is still this run's.
+record_members() {
+  leader_alive || return 0
+  local pid started
+  for pid in $(group_now); do
+    case " ${deployment[*]:-} " in
+      *" $pid|"*) continue ;;
+    esac
+    started="$(process_started "$pid")"
+    if [ -n "$started" ]; then
+      deployment+=("$pid|$started")
+    fi
+  done
+  return 0
+}
+
+# How many recorded processes of the deployment are still the ones recorded.
+deployment_running() {
+  local record pid started count=0
+  for record in "${deployment[@]:-}"; do
+    [ -n "$record" ] || continue
+    IFS='|' read -r pid started <<<"$record"
+    if still_there "$pid" "$started"; then
+      count=$((count + 1))
+    fi
+  done
+  echo "$count"
+}
+
+# Asks the deployment to stop, then makes it, and says whether any of it is left.
 stop_deployment() {
-  local signal pid
+  [ -n "$group" ] || return 0
+  record_members
+  local signal record pid started
   for signal in TERM KILL; do
-    for pid in $(deployment_processes); do
-      kill "-$signal" "$pid" 2>/dev/null || true
+    for record in "${deployment[@]:-}"; do
+      [ -n "$record" ] || continue
+      IFS='|' read -r pid started <<<"$record"
+      if still_there "$pid" "$started"; then
+        kill "-$signal" "$pid" 2>/dev/null || true
+      fi
     done
     for _ in $(seq 1 80); do
-      [ -z "$(deployment_processes)" ] && break
+      [ "$(deployment_running)" -eq 0 ] && break
       sleep 0.25
     done
-    [ -z "$(deployment_processes)" ] && break
+    [ "$(deployment_running)" -eq 0 ] && break
   done
-  if [ -n "$(deployment_processes)" ]; then
+  if [ "$(deployment_running)" -ne 0 ]; then
+    stopped=0
+  fi
+  # Anything still in the group was not recorded, so it is left alone, and reported.
+  if [ -n "$(group_now)" ]; then
     stopped=0
   fi
   group=""
 }
 
-# Runs on exit, whatever the reason.
-# shellcheck disable=SC2329
-cleanup() {
-  if [ "$mode" = local ]; then
-    stop_deployment
-    end_owned_processes
-    if [ -n "$stub" ] && kill -0 "$stub" 2>/dev/null; then
-      stopped=0
-    fi
-    if [ -n "$run" ] && [ -d "$run" ]; then
-      # The later legs never run here, so the exit status says nothing about this directory: it
-      # goes when the local legs ran and passed and everything this run started has stopped.
-      if [ "$stopped" -eq 1 ] && [ "$failed" -eq 0 ] && [ "$local_complete" -eq 1 ]; then
-        rm -rf "${run:?}"
-      elif [ "$stopped" -eq 1 ]; then
-        echo "the local run directory was kept for its evidence: $run"
-      else
-        echo "something this run started did not stop; the run directory was kept: $run"
-        exit 1
-      fi
-    fi
+# Stops the provider stub, and says whether it has gone.
+stop_stub() {
+  [ -n "$stub" ] || return 0
+  end_owned_processes
+  for _ in $(seq 1 40); do
+    still_there "$stub" "$stub_started" || break
+    sleep 0.25
+  done
+  if still_there "$stub" "$stub_started"; then
+    kill -KILL "$stub" 2>/dev/null || true
+    sleep 0.25
+  fi
+  if still_there "$stub" "$stub_started"; then
+    stopped=0
+  fi
+  stub=""
+}
+
+# Removes the run directory when the local legs ran and passed and everything this run started
+# stopped. The later legs never run here, so the exit status says nothing about this directory.
+finish_local() {
+  if [ -n "$run" ] && [ -d "$run" ] && [ "$stopped" -eq 1 ] && [ "$failed" -eq 0 ] &&
+    [ "$local_complete" -eq 1 ]; then
+    rm -rf "${run:?}"
+    removed=1
   fi
 }
-local_complete=0
+
+# Runs on exit, whatever the reason. A run that ended early still stops everything it started and
+# names the directory it kept.
+# shellcheck disable=SC2329
+cleanup() {
+  [ "$mode" = local ] || return 0
+  [ "$finished" -eq 0 ] || return 0
+  stop_deployment
+  stop_stub
+  if [ -n "$run" ] && [ -d "$run" ]; then
+    echo "the run ended early; its directory was kept: $run"
+  fi
+  if [ "$stopped" -eq 0 ]; then
+    echo "something this run started did not stop; see $evidence/deployment.log"
+  fi
+}
 trap cleanup EXIT
 
 # The values a local deployment starts with, and the databases its migrations go to, from the web
@@ -385,7 +463,8 @@ STUB
   "$node" "$run/provider.mjs" "$run/provider.port" "$evidence/provider.log" \
     >>"$evidence/deployment.log" 2>&1 &
   stub=$!
-  remember_process "$stub" "$node"
+  stub_started="$(process_started "$stub")"
+  record_process "$stub" "$stub_started" "$node"
   for _ in $(seq 1 100); do
     [ -s "$run/provider.port" ] && break
     sleep 0.1
@@ -428,6 +507,9 @@ start_deployment() {
     --var "BUILD_VERSION:$version" --test-scheduled --log-level warn) \
     >>"$evidence/deployment.log" 2>&1 &
   group=$!
+  # Read at once: the leader is this shell's own child, so its number names it until it has ended
+  # and been collected here.
+  leader_started="$(process_started "$group")"
   set +m
   # Only an answer carrying this start's own version counts: another Worker serving on the port
   # could otherwise be taken for this one.
@@ -436,12 +518,16 @@ start_deployment() {
     case "$health" in
       *"\"$version\""*)
         case "$health" in
-          *'"environment":"development"'*) return 0 ;;
+          *'"environment":"development"'*)
+            # Serving this run's version: every member of the group now is this run's.
+            record_members
+            return 0
+            ;;
           *) why="the deployment on $origin is not a development one"; return 1 ;;
         esac
         ;;
     esac
-    [ -n "$(deployment_processes)" ] || { why="the deployment stopped before it served"; return 1; }
+    leader_alive || { why="the deployment stopped before it served"; return 1; }
     sleep 0.25
   done
   why="the deployment did not serve on $origin within two minutes"
@@ -478,8 +564,10 @@ else
     report FAILED retained "no local deployment served"
   fi
   stop_deployment
-  end_owned_processes
+  stop_stub
+  finish_local
 fi
+finished=1
 later_legs
 
 echo
@@ -494,18 +582,27 @@ if [ "${#left[@]}" -ne 0 ]; then
   done
 fi
 if [ "$mode" = deployment ]; then
-  echo "  sync: every request identity ended and every collection emptied; the service keeps each identity's receipt for 30 days, a content-free record of each removed object's place, spent nonces and the ledger's record of the run's installation"
-elif [ "$stopped" -eq 1 ]; then
-  echo "  nothing: every process this run started stopped, and nothing was sent anywhere but this machine"
+  # Said only on the leg's own word: a leg that stopped before it gave anything back never says it.
+  if grep -q 'this leg gave back everything it took' "$evidence/sync.log" 2>/dev/null; then
+    echo "  sync: every request identity it presented ended and every collection it wrote emptied; the service keeps each identity's receipt for 30 days, a content-free record of each removed object's place, spent nonces and the ledger's record of the run's installation"
+  else
+    echo "  sync: the leg did not say it gave back what it took, so as far as it got it may have left the collections it wrote besides what the service keeps by its own rules; see $evidence/sync.log"
+  fi
+else
+  if [ "$stopped" -eq 0 ]; then
+    failed=$((failed + 1))
+    echo "  a process this run started did not stop, and the run directory was kept: $run; see $evidence/deployment.log"
+  elif [ "$removed" -eq 1 ]; then
+    echo "  nothing: the local deployment and the provider stub stopped, their state was removed, and nothing was sent anywhere but this machine"
+  else
+    echo "  the local run directory, kept for its evidence: $run"
+  fi
   # The gateway reaches its provider only by first asking the stub for a token, which it never gets.
   if [ -f "$evidence/provider.log" ]; then
     asked="$(grep -c ' POST /token ' "$evidence/provider.log" || true)"
     other="$(grep -c -v ' POST /token ' "$evidence/provider.log" || true)"
     echo "  the push provider's token endpoint, this run's stub, refused ${asked:-0} requests and received ${other:-0} others"
   fi
-else
-  failed=$((failed + 1))
-  echo "  a process this run started did not stop; see $evidence/deployment.log"
 fi
 
 if [ "$failed" -eq 0 ] && [ "$missed" -eq 0 ]; then
