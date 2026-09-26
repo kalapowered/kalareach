@@ -81,6 +81,16 @@ pub enum IpcError {
         #[source]
         source: std::io::Error,
     },
+    /// The process on the other end of a local endpoint could not be shown to run as this account,
+    /// or the endpoint's access policy did not hold.
+    ///
+    /// On Windows the endpoint namespace is shared by every account, so a name another account
+    /// created first is refused here rather than served or trusted. The detail says what was found.
+    #[error("the endpoint's account or access policy could not be verified: {detail}")]
+    PeerAccountRejected {
+        /// What was found instead of this account, or why it could not be established.
+        detail: String,
+    },
     /// A frame was larger than its stream permits, malformed, or not canonical.
     #[error("frame: {0}")]
     Frame(#[from] kr_protocol::frame::FrameError),
@@ -164,6 +174,7 @@ impl IpcError {
             Self::DirectoryNotOwnerOnly { .. }
             | Self::DirectoryAccessRefused { .. }
             | Self::PeerRejected { .. }
+            | Self::PeerAccountRejected { .. }
             | Self::UntrustedFile { .. }
             | Self::RightNotForwarded(_) => ErrorCode::PermissionDenied,
             Self::EnvironmentPrefixCollision { .. } => ErrorCode::EnvironmentUnavailable,

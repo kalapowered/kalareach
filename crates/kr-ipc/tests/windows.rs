@@ -1120,3 +1120,341 @@ fn a_descriptor_directory_swapped_after_its_check_never_returns_the_impostor() {
     );
     assert_ne!(read, impostor, "the impostor is never returned");
 }
+
+// KR-REQ-02.07, KR-REQ-23.10: the endpoint checks the account at both ends.
+//
+// On this platform the endpoint namespace is shared by every account, so the owner-only list is not
+// the only line: the listener proves the caller's account from the connection itself, and a client
+// proves the endpoint it reached is owned by this account before it writes. These cases need a
+// second local account to prove the refusal across accounts, which the hosted runner does not have,
+// so they are ignored there and run on the Windows test machine, where the task's script makes a
+// standard second account and exports it below.
+
+use kr_ipc::endpoint::Connection;
+
+/// The second local account this run was given, or `None` when it was not.
+///
+/// The name and password are exported by the task's native script for this session only; the
+/// password is never written to a log or a file here.
+fn second_account() -> Option<(String, String)> {
+    let user = std::env::var("KR_TEST_SECOND_USER")
+        .ok()
+        .filter(|value| !value.is_empty())?;
+    let password = std::env::var("KR_TEST_SECOND_PASS")
+        .ok()
+        .filter(|value| !value.is_empty())?;
+    Some((user, password))
+}
+
+/// A directory both accounts can read and write, under the machine's own temporary directory with a
+/// list that admits everyone. The owner-only host tree is not reachable by the second account, so a
+/// script it runs and the file it reports through live here instead.
+const MAKE_SHARED_DIR: &str = r#"
+param([string]$Dir)
+$ErrorActionPreference = 'Stop'
+New-Item -ItemType Directory -Force -Path $Dir | Out-Null
+& icacls $Dir /grant '*S-1-1-0:(OI)(CI)F' | Out-Null
+Write-Output 'made'
+"#;
+
+/// Runs a script as the second account. It reads the account from this process's environment, which
+/// the task's script set, so the password never reaches a command line or this file.
+const LAUNCH_AS_SECOND: &str = r#"
+param([string]$Child, [string]$Name, [string]$Status)
+$ErrorActionPreference = 'Stop'
+$user = $env:KR_TEST_SECOND_USER
+$password = $env:KR_TEST_SECOND_PASS
+if (-not $user -or -not $password) { throw 'no second account in the environment' }
+$secure = ConvertTo-SecureString $password -AsPlainText -Force
+$cred = [System.Management.Automation.PSCredential]::new($user, $secure)
+$self = (Get-Process -Id $PID).Path
+Start-Process -FilePath $self -Credential $cred -WindowStyle Hidden -ArgumentList @(
+    '-NoLogo','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',$Child,$Name,$Status
+) | Out-Null
+Write-Output 'launched'
+"#;
+
+/// A named-pipe server, run by the second account, that admits every account so this account's
+/// client can open it, waits for one connection and reports how many bytes it received.
+const FOREIGN_SERVER: &str = r#"
+param([string]$Name, [string]$Status)
+$ErrorActionPreference = 'Stop'
+try {
+    $everyone = [System.Security.Principal.SecurityIdentifier]::new(
+        [System.Security.Principal.WellKnownSidType]::WorldSid, $null)
+    $rule = [System.IO.Pipes.PipeAccessRule]::new(
+        $everyone,
+        [System.IO.Pipes.PipeAccessRights]::FullControl,
+        [System.Security.AccessControl.AccessControlType]::Allow)
+    $list = [System.IO.Pipes.PipeSecurity]::new()
+    $list.AddAccessRule($rule)
+    $server = [System.IO.Pipes.NamedPipeServerStreamAcl]::Create(
+        $Name,
+        [System.IO.Pipes.PipeDirection]::InOut,
+        1,
+        [System.IO.Pipes.PipeTransmissionMode]::Byte,
+        [System.IO.Pipes.PipeOptions]::Asynchronous,
+        0, 0, $list)
+    Set-Content -Path $Status -Value 'ready'
+    $server.WaitForConnection()
+    $buffer = New-Object byte[] 64
+    $read = $server.ReadAsync($buffer, 0, 64)
+    if ($read.Wait(3000)) { $count = $read.Result } else { $count = 0 }
+    Add-Content -Path $Status -Value ("received=" + $count)
+    $server.Dispose()
+} catch {
+    Set-Content -Path $Status -Value ("error=" + $_.Exception.Message)
+}
+"#;
+
+/// A named-pipe client, run by the second account, that connects to this account's listener and
+/// reports whether the server refused it (closed the connection with no data).
+const FOREIGN_CLIENT: &str = r#"
+param([string]$Name, [string]$Status)
+$ErrorActionPreference = 'Stop'
+try {
+    $client = [System.IO.Pipes.NamedPipeClientStream]::new(
+        '.', $Name,
+        [System.IO.Pipes.PipeDirection]::InOut,
+        [System.IO.Pipes.PipeOptions]::Asynchronous)
+    $client.Connect(30000)
+    Set-Content -Path $Status -Value 'connected'
+    $buffer = New-Object byte[] 16
+    try {
+        $read = $client.ReadAsync($buffer, 0, 16)
+        if ($read.Wait(30000)) {
+            if ($read.Result -eq 0) { Add-Content -Path $Status -Value 'refused' }
+            else { Add-Content -Path $Status -Value 'served' }
+        } else { Add-Content -Path $Status -Value 'timeout' }
+    } catch { Add-Content -Path $Status -Value 'refused' }
+    $client.Dispose()
+} catch {
+    Set-Content -Path $Status -Value ("error=" + $_.Exception.Message)
+}
+"#;
+
+/// Creates the shared directory and returns it.
+fn make_shared_dir(host: &TempHost) -> PathBuf {
+    let dir =
+        PathBuf::from(r"C:\Windows\Temp").join(format!("kr-ipc-account-{}", kr_ipc::new_uuid()));
+    let make = script(host, "make-shared-dir", MAKE_SHARED_DIR);
+    output_of(&make, &[&dir.display().to_string()]);
+    dir
+}
+
+/// Writes a script the second account can read, into the shared directory.
+fn write_shared(dir: &Path, name: &str, text: &str) -> PathBuf {
+    let path = dir.join(name);
+    std::fs::write(&path, text).expect("writes the shared script");
+    path
+}
+
+/// Waits until `path` holds a line equal to `token`, or fails after [`PATIENCE`].
+fn wait_for_line(path: &Path, token: &str) {
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        if text.lines().any(|line| line.trim() == token) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "waited for '{token}' in {}; it held:\n{text}",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// KR-REQ-23.10, KR-REQ-02.07: a client refuses a server another account created first, before it
+/// writes anything, and the host cannot bind a name another account holds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires a second local account; run on the Windows test machine"]
+async fn a_client_refuses_a_server_of_another_account_and_the_host_bind_fails() {
+    assert!(
+        second_account().is_some(),
+        "this test needs a second local account in KR_TEST_SECOND_USER/KR_TEST_SECOND_PASS"
+    );
+    let host = TempHost::create();
+    let endpoint = host
+        .environment()
+        .controller_endpoint()
+        .expect("an endpoint");
+    let name = endpoint.as_text();
+
+    let dir = make_shared_dir(&host);
+    let child = write_shared(&dir, "foreign-server.ps1", FOREIGN_SERVER);
+    let status = dir.join("a-status.txt");
+    let launcher = script(&host, "launch-foreign-server", LAUNCH_AS_SECOND);
+
+    let args = [
+        child.display().to_string(),
+        name.clone(),
+        status.display().to_string(),
+    ];
+    tokio::task::spawn_blocking({
+        let launcher = launcher.clone();
+        move || {
+            output_of(
+                &launcher,
+                &args.iter().map(String::as_str).collect::<Vec<_>>(),
+            )
+        }
+    })
+    .await
+    .expect("the launcher runs");
+    let ready = status.clone();
+    tokio::task::spawn_blocking(move || wait_for_line(&ready, "ready"))
+        .await
+        .expect("the foreign server is ready");
+
+    // The client opens the impostor's pipe and refuses it by its owner, before writing a frame.
+    let refused = Connection::connect(&endpoint).await;
+    assert!(
+        matches!(refused, Err(kr_ipc::IpcError::PeerAccountRejected { .. })),
+        "the client refuses a server of another account: {refused:?}"
+    );
+
+    // The host cannot bind a name another account already holds, so it does not start.
+    let bind = Listener::bind(&endpoint);
+    assert!(
+        bind.is_err(),
+        "the host does not bind a name another account holds"
+    );
+
+    // Nothing the client would have sent the host reached the impostor.
+    let received = status.clone();
+    tokio::task::spawn_blocking(move || wait_for_line(&received, "received=0"))
+        .await
+        .expect("no frame reached the impostor");
+}
+
+/// KR-REQ-23.10, KR-REQ-02.07: a listener refuses a caller of another account by its account, even
+/// when the operating system's own list would admit it, and goes on serving the owner.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires a second local account; run on the Windows test machine"]
+async fn a_listener_refuses_a_caller_of_another_account_and_serves_the_owner() {
+    assert!(
+        second_account().is_some(),
+        "this test needs a second local account in KR_TEST_SECOND_USER/KR_TEST_SECOND_PASS"
+    );
+    let host = TempHost::create();
+    let endpoint = host
+        .environment()
+        .worker_endpoint(DisplayNumber::new(1))
+        .expect("an endpoint");
+    let name = endpoint.as_text();
+
+    // A list that admits every account, so the operating system does not keep the second account
+    // out and the listener's own account check is the only thing that refuses it.
+    let listener = Listener::bind_with_access_list(&endpoint, "D:P(A;;GA;;;WD)")
+        .expect("binds a widely-listed endpoint");
+
+    let dir = make_shared_dir(&host);
+    let child = write_shared(&dir, "foreign-client.ps1", FOREIGN_CLIENT);
+    let status = dir.join("b-status.txt");
+    let launcher = script(&host, "launch-foreign-client", LAUNCH_AS_SECOND);
+
+    let args = [
+        child.display().to_string(),
+        name.clone(),
+        status.display().to_string(),
+    ];
+    tokio::task::spawn_blocking({
+        let launcher = launcher.clone();
+        move || {
+            output_of(
+                &launcher,
+                &args.iter().map(String::as_str).collect::<Vec<_>>(),
+            )
+        }
+    })
+    .await
+    .expect("the launcher runs");
+    let connected = status.clone();
+    tokio::task::spawn_blocking(move || wait_for_line(&connected, "connected"))
+        .await
+        .expect("the second account connected");
+
+    // The owner connects with a raw client, because the production client would itself refuse the
+    // widened list; the account check under test is the listener's, on the caller. It retries the
+    // busy pipe until the listener frees an instance after refusing the second account.
+    let owner_path = local_name(&endpoint);
+    let owner = tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt as _;
+        let deadline = tokio::time::Instant::now() + PATIENCE;
+        let mut client = loop {
+            match tokio::net::windows::named_pipe::ClientOptions::new().open(&owner_path) {
+                Ok(client) => break client,
+                Err(error)
+                    if error.raw_os_error() == Some(231)
+                        && tokio::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(error) => panic!("the owner could not connect: {error}"),
+            }
+        };
+        client
+            .write_all(b"owner")
+            .await
+            .expect("the owner writes a marker");
+        client.flush().await.ok();
+        client
+    });
+
+    // The listener skips the second account and hands back the owner's connection.
+    let (mut connection, _peer) = tokio::time::timeout(PATIENCE, listener.accept())
+        .await
+        .expect("the listener accepts in time")
+        .expect("the listener accepts the owner");
+    use tokio::io::AsyncReadExt as _;
+    let mut marker = [0_u8; 5];
+    connection
+        .read_exact(&mut marker)
+        .await
+        .expect("reads the owner's marker");
+    assert_eq!(&marker, b"owner", "the accepted connection is the owner's");
+    let _owner = owner.await.expect("the owner task finishes");
+
+    // The second account's connection was closed by the server rather than served.
+    let refused = status.clone();
+    tokio::task::spawn_blocking(move || wait_for_line(&refused, "refused"))
+        .await
+        .expect("the second account was refused");
+}
+
+/// KR-REQ-23.10, KR-REQ-02.07 control: a connection between two ends of this one account passes end
+/// to end, so the account check does not stand in the way of the owner it protects.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_same_account_connection_passes_end_to_end() {
+    let host = TempHost::create();
+    let endpoint = host
+        .environment()
+        .worker_endpoint(DisplayNumber::new(2))
+        .expect("an endpoint");
+    let listener = Listener::bind(&endpoint).expect("binds an owner-only endpoint");
+    let connecting = endpoint.clone();
+    let client = tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt as _;
+        let mut client = Connection::connect(&connecting)
+            .await
+            .expect("the owner connects to its own endpoint");
+        client.write_all(b"hello").await.expect("the owner writes");
+        client.flush().await.ok();
+        client
+    });
+    let (mut connection, peer) = tokio::time::timeout(PATIENCE, listener.accept())
+        .await
+        .expect("the listener accepts in time")
+        .expect("the listener accepts the owner");
+    assert_eq!(peer.uid, kr_ipc::paths::current_uid());
+    use tokio::io::AsyncReadExt as _;
+    let mut buffer = [0_u8; 5];
+    connection
+        .read_exact(&mut buffer)
+        .await
+        .expect("reads the owner's bytes");
+    assert_eq!(&buffer, b"hello");
+    let _client = client.await.expect("the client task finishes");
+}
