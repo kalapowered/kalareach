@@ -582,10 +582,14 @@ mod platform {
                 .create_tokio()
                 .map_err(|error| {
                     // The first instance is created exclusively, so a name that already exists is
-                    // refused with an access denial whoever holds it: a live listener of this
-                    // account, or a pipe another account made first. Neither can be told from the
-                    // other here, so the refusal says what happened without naming a holder.
-                    if error.kind() == std::io::ErrorKind::PermissionDenied {
+                    // refused whoever holds it: with an access denial, or with "all instances
+                    // busy" when the holder allowed no more instances. The holder may be a live
+                    // listener of this account or a pipe another account made first; neither can be
+                    // told from the other here, so the refusal says what happened without naming a
+                    // holder.
+                    if error.kind() == std::io::ErrorKind::PermissionDenied
+                        || error.raw_os_error() == Some(ERROR_PIPE_BUSY.cast_signed())
+                    {
                         IpcError::socket(
                             "bind (the name is held by another pipe, or its list refuses this \
                              account)",
