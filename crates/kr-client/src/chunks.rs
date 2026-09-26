@@ -276,10 +276,14 @@ impl Issued {
 ///
 /// Which window a call carries is decided by time rather than by how far the reader has got. The
 /// host issues a window for a stated validity and renews it when half of that has passed, so a
-/// window this lane received less than half its validity ago cannot have expired, and a call
-/// carries it. An older one is due for renewal, and a call waits for the reader to deliver the
-/// renewal, until the window it holds would have expired; a lane whose window runs out
-/// unrenewed has lost its connection.
+/// call carries the newest window while the lane received it less than half its validity ago; an
+/// older one is due for renewal, and the call waits for the reader to deliver the renewal, until
+/// the window it holds would have expired by this lane's clock. A lane whose window runs out
+/// unrenewed has lost its connection. This keeps a lane from spending a call on a window it can
+/// see is due. It cannot see the host's clock: a pause between the host issuing a window and this
+/// lane reading it, or a suspension this lane's clock does not count, can leave the host holding a
+/// window expired that the lane took for young. The host refuses a chunk under it, and the upload's
+/// driver sends that chunk once more on a new lane ([`crate::uploads::send`]).
 #[derive(Debug)]
 struct LocalCarrier {
     writer: FrameWriter,
@@ -396,7 +400,8 @@ impl LocalCarrier {
         }
     }
 
-    /// The window a call carries: one this lane received less than half its validity ago.
+    /// The window a call carries: the newest, once this lane received it less than half its
+    /// validity ago.
     ///
     /// # Errors
     ///

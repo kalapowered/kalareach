@@ -294,11 +294,14 @@ anything.
   person's decision.
 - A lane has a reader of its own for as long as it lives, as a session does. It applies each window
   the host renews the moment it arrives, ends the lane at an answer to a call the lane never made,
-  and when it stops, a write the host is no longer reading stops with it. Which window a call
-  carries is decided by time: the host renews a window when half its validity has passed, so a call
-  carries a window the lane received less than half its validity ago, and otherwise waits for the
-  renewal. A lane whose window runs out with no renewal has lost its connection, and the upload
-  opens another.
+  and when it stops, a write the host is no longer reading stops with it. The host renews a window
+  when half its validity has passed, so a call carries the newest window while the lane received it
+  less than half its validity ago, and otherwise waits for the renewal; a lane whose window runs
+  out with no renewal has lost its connection, and the upload opens another. The lane cannot see
+  the host's clock, though: a pause before it read a window, or a suspension its clock does not
+  count, can leave it holding a window the host has let expire. The host refuses a chunk under
+  such a window with `PERMISSION_DENIED`, so the upload sends a chunk refused that way once more on
+  a new lane, whose window the host has just issued, and stops at a second refusal in a row.
 - `ChunkLane::read_chunk` hands back a downloaded chunk only when it is exactly the chunk
   `download.begin` described: its index, its length and its digest. Checking the whole file and
   writing it to a destination belong to whoever publishes the download.
