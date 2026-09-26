@@ -13,7 +13,9 @@
 //!
 //! Holding a screen needs nothing but the protocol, so every client holds it with this module,
 //! including one on a system where the terminal state library that measures text does not build.
-//! Only painting measures text, so only `paint` needs that library.
+//! Only painting measures text, with the pinned Unicode width model, so only `paint` needs that
+//! library. It is present when the `terminal` feature is on, which is the default; a client on a
+//! system with no local terminal takes this library without it and draws the held screen itself.
 //!
 //! # What holding a screen means
 //!
