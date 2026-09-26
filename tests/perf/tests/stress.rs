@@ -1278,17 +1278,24 @@ async fn stress(host: &Host, run: &mut Run) -> Result<Figures, String> {
     let spent_after = process::processor_seconds(&all)?;
     let conditions = window.close();
     let received: Vec<u64> = readers.iter().map(Reader::bytes).collect();
-    // The thread bounds its own measurement; the wait for it is bounded too, so that cleanup runs
-    // whatever the thread does.
+    // The thread bounds its own measurement. The wait for it is bounded too, and never blocks on
+    // it: a thread still running at the deadline is left behind, so cleanup runs and this runtime
+    // can shut down whatever the thread does.
     let (samples, keystroke_conditions) = match latency {
-        Some(handle) => tokio::time::timeout(
-            KEYSTROKES_BOUND,
-            tokio::task::spawn_blocking(move || handle.join()),
-        )
-        .await
-        .map_err(|_| format!("the keystrokes' thread did not end within {KEYSTROKES_BOUND:?}"))?
-        .map_err(|error| format!("the keystrokes' thread: {error}"))?
-        .map_err(|_| "the keystrokes' thread panicked".to_owned())??,
+        Some(handle) => {
+            let deadline = Instant::now() + KEYSTROKES_BOUND;
+            while !handle.is_finished() {
+                if Instant::now() >= deadline {
+                    return Err(format!(
+                        "the keystrokes' thread did not end within {KEYSTROKES_BOUND:?}"
+                    ));
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            handle
+                .join()
+                .map_err(|_| "the keystrokes' thread panicked".to_owned())??
+        }
         None => return Err("the keystrokes never started".to_owned()),
     };
 
