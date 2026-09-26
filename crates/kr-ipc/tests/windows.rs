@@ -222,13 +222,16 @@ $admitted = [KrOwnerProbe]::Open($Pipe)
 Write-Output "refused=$refused admitted=$admitted"
 "#;
 
-/// Connects to a pipe on this machine as its client, says so, and stays connected for a minute.
+/// Connects to a pipe on this machine as its client, sends its opening byte the way every real
+/// caller sends its hello, says so, and stays connected for a minute.
 const CONNECT_AND_WAIT: &str = r"
 param([string]$Name)
 $ErrorActionPreference = 'Stop'
 $client = [System.IO.Pipes.NamedPipeClientStream]::new('.', $Name,
     [System.IO.Pipes.PipeDirection]::InOut)
 $client.Connect(60000)
+$client.WriteByte(1)
+$client.Flush()
 Write-Output 'connected'
 Start-Sleep -Seconds 60
 ";
@@ -1171,11 +1174,13 @@ $self = (Get-Process -Id $PID).Path
 # The child runs in the shared directory, which the second account can reach; the owner-only clone
 # it would otherwise inherit is not readable by that account and the launch would fail silently.
 # Its console output is captured beside the status file so a launch failure is visible.
+# The child runs in the shared directory, which the second account can reach; the owner-only clone
+# it would otherwise inherit is not readable by that account and the launch would fail. Output is
+# not redirected here, because a redirect combined with a credential launch stops the child from
+# starting; the child records its own progress in the status file instead.
 $work = Split-Path -Parent $Status
-$out = Join-Path $work 'child-out.txt'
-$err = Join-Path $work 'child-err.txt'
 Start-Process -FilePath $self -Credential $cred -WorkingDirectory $work -WindowStyle Hidden `
-    -RedirectStandardOutput $out -RedirectStandardError $err -ArgumentList @(
+    -ArgumentList @(
     '-NoLogo','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',$Child,$Name,$Status
 ) | Out-Null
 Write-Output 'launched'
@@ -1185,6 +1190,7 @@ Write-Output 'launched'
 /// client can open it, waits for one connection and reports how many bytes it received.
 const FOREIGN_SERVER: &str = r#"
 param([string]$Name, [string]$Status)
+Set-Content -Path $Status -Value 'started'
 $ErrorActionPreference = 'Stop'
 try {
     $everyone = [System.Security.Principal.SecurityIdentifier]::new(
@@ -1202,7 +1208,7 @@ try {
         [System.IO.Pipes.PipeTransmissionMode]::Byte,
         [System.IO.Pipes.PipeOptions]::Asynchronous,
         0, 0, $list)
-    Set-Content -Path $Status -Value 'ready'
+    Add-Content -Path $Status -Value 'ready'
     $server.WaitForConnection()
     $buffer = New-Object byte[] 64
     $read = $server.ReadAsync($buffer, 0, 64)
@@ -1210,7 +1216,7 @@ try {
     Add-Content -Path $Status -Value ("received=" + $count)
     $server.Dispose()
 } catch {
-    Set-Content -Path $Status -Value ("error=" + $_.Exception.Message)
+    Add-Content -Path $Status -Value ("error=" + $_.Exception.Message)
 }
 "#;
 
@@ -1218,6 +1224,7 @@ try {
 /// reports whether the server refused it (closed the connection with no data).
 const FOREIGN_CLIENT: &str = r#"
 param([string]$Name, [string]$Status)
+Set-Content -Path $Status -Value 'started'
 $ErrorActionPreference = 'Stop'
 try {
     $client = [System.IO.Pipes.NamedPipeClientStream]::new(
@@ -1225,7 +1232,9 @@ try {
         [System.IO.Pipes.PipeDirection]::InOut,
         [System.IO.Pipes.PipeOptions]::Asynchronous)
     $client.Connect(30000)
-    Set-Content -Path $Status -Value 'connected'
+    $client.WriteByte(1)
+    $client.Flush()
+    Add-Content -Path $Status -Value 'connected'
     $buffer = New-Object byte[] 16
     try {
         $read = $client.ReadAsync($buffer, 0, 16)
@@ -1236,7 +1245,7 @@ try {
     } catch { Add-Content -Path $Status -Value 'refused' }
     $client.Dispose()
 } catch {
-    Set-Content -Path $Status -Value ("error=" + $_.Exception.Message)
+    Add-Content -Path $Status -Value ("error=" + $_.Exception.Message)
 }
 "#;
 
