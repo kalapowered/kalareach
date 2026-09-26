@@ -1950,6 +1950,94 @@ mod tests {
         assert_eq!(refusal.reason, VoiceRefusalReason::Unrecognised);
     }
 
+    /// KR-REQ-15.07: a success this client cannot read is an unknown creation. The service answers
+    /// a start with success once it has created the call and holds its reservation, so a success
+    /// whose call cannot be read, or a success status whose body is not the service's envelope, may
+    /// have a call running behind it: never a refusal a person could take for nothing having
+    /// started, and never asked again by itself. The attempt is named where the call names one
+    /// that can be read.
+    #[test]
+    fn kr_req_15_07_a_success_this_client_cannot_read_is_an_unknown_creation() {
+        let unknown = |start: &VoiceStart, attempt: Option<&str>| {
+            assert!(
+                matches!(
+                    start,
+                    VoiceStart::CreationUnknown { attempt_id, .. }
+                        if attempt_id.as_deref() == attempt
+                ),
+                "{attempt:?}: {start:?}"
+            );
+            assert!(!start.may_ask_again(), "{start:?}");
+        };
+        let session: serde_json::Value =
+            serde_json::from_str(&session_answer()).expect("the session answer");
+
+        // A call this client cannot read, which names its attempt.
+        let mut missing = session.clone();
+        missing["data"]
+            .as_object_mut()
+            .expect("the call")
+            .remove("answerSdp");
+        let mut mistyped = session.clone();
+        mistyped["data"]["heartbeatSeconds"] = serde_json::json!("ten");
+        for answer in [missing, mistyped] {
+            let start = read_start_answer(&ServiceHttpAnswer {
+                status: 200,
+                body: answer.to_string().into_bytes(),
+            });
+            unknown(&start, Some("attempt-1"));
+        }
+
+        // A success that names no attempt this client can read.
+        for body in [
+            serde_json::json!({"ok": true}),
+            serde_json::json!({"ok": true, "data": null}),
+            serde_json::json!({"ok": true, "data": "a call"}),
+            serde_json::json!({"ok": true, "data": {"callId": "call-1", "attemptId": 7}}),
+        ] {
+            let start = read_start_answer(&ServiceHttpAnswer {
+                status: 200,
+                body: body.to_string().into_bytes(),
+            });
+            unknown(&start, None);
+        }
+
+        // A success status whose body is not the service's envelope.
+        let truncated = session_answer();
+        let truncated = &truncated[..truncated.len() / 2];
+        for status in [200, 201] {
+            for body in [
+                &b"<html><body>OK</body></html>"[..],
+                &b""[..],
+                truncated.as_bytes(),
+            ] {
+                let start = read_start_answer(&ServiceHttpAnswer {
+                    status,
+                    body: body.to_vec(),
+                });
+                unknown(&start, None);
+            }
+        }
+    }
+
+    /// The controls: an answer that is not a success stays a refusal when this client cannot read
+    /// it, whatever status carried it short of a gateway's.
+    #[test]
+    fn an_unreadable_answer_that_is_not_a_success_stays_a_refusal() {
+        for status in [400, 403, 503] {
+            for body in [&b"<html><body>No</body></html>"[..], &b""[..]] {
+                let start = read_start_answer(&ServiceHttpAnswer {
+                    status,
+                    body: body.to_vec(),
+                });
+                let VoiceStart::Refused(refusal) = &start else {
+                    panic!("{status}: a refusal: {start:?}");
+                };
+                assert_eq!(refusal.reason, VoiceRefusalReason::Unrecognised);
+            }
+        }
+    }
+
     /// A session as the service answers a start with it, in the text it arrives as.
     fn session_answer() -> String {
         serde_json::json!({
@@ -1983,8 +2071,9 @@ mod tests {
     }
 
     /// KR-REQ-04.19: a session answer that names one member twice is not a call this client
-    /// reads. Which call is running would depend on the reader, so no call is running here, and
-    /// nothing asks again with the same offer.
+    /// reads. Which call is running would depend on the reader, so no call is read from it, and
+    /// nothing in it is either: it is a success this client cannot read, an unknown creation that
+    /// names no attempt, and nothing asks again with the same offer.
     #[test]
     fn a_session_answer_that_names_a_member_twice_is_not_a_call_this_client_reads() {
         let answer = session_answer();
@@ -2001,10 +2090,16 @@ mod tests {
             status: 200,
             body: repeated.into_bytes(),
         });
-        let VoiceStart::Refused(refusal) = &start else {
-            panic!("not a call this client reads: {start:?}");
-        };
-        assert_eq!(refusal.reason, VoiceRefusalReason::Unrecognised);
+        assert!(
+            matches!(
+                start,
+                VoiceStart::CreationUnknown {
+                    attempt_id: None,
+                    ..
+                }
+            ),
+            "not a call this client reads: {start:?}"
+        );
         assert!(!start.may_ask_again());
 
         // The control: the same answer naming it once is the call.
