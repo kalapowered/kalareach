@@ -1716,14 +1716,18 @@ impl StagedPackage {
     /// sharing its deletion, which on Windows keeps anything, this store included, from renaming a
     /// directory held that way. The rename then reaches the directory by its name in staging rather
     /// than through a handle, so the directory that arrives in `packages` is compared with the one
-    /// staged by what identifies a directory on its volume whatever its name, read from the staged
-    /// directory's handle before it was closed. Anything else is moved out of `packages` again,
-    /// into staging, where taking the store's lock next removes it, and the activation is refused:
-    /// a directory put in the staged one's place is never left where readers look.
+    /// staged by what identifies a directory on its volume whatever its name. A second handle on
+    /// the staged directory, which does not keep it from being renamed, stays open until that
+    /// comparison is made, so its number on its volume cannot pass to another directory meanwhile
+    /// (see [`Kept`]). Anything else is moved out of `packages` again, into staging, where taking
+    /// the store's lock next removes it, and the activation is refused: a directory put in the
+    /// staged one's place is never left where readers look.
     fn move_into_place(self, packages: &Area, name: &str) -> CatalogueResult<()> {
+        // Taken while the package is whole, so that a failure here drops it as a whole, its
+        // directory's handle before the entry that removes the directory.
+        let (kept, staged) = Kept::open(&self.dir)?;
         let Self { dir, mut entry, .. } = self;
         let destination = packages.path.join(name);
-        let staged = identity(&dir)?;
         let staged_path = dir.path.clone();
         drop(dir);
         #[cfg(test)]
@@ -1736,7 +1740,9 @@ impl StagedPackage {
         entry.remove = false;
         let arrived = open_child(&packages.dir, &destination, Path::new(name), false)
             .and_then(|arrived| identity(&arrived));
-        if arrived.as_ref().is_ok_and(|arrived| *arrived == staged) {
+        let same = arrived.as_ref().is_ok_and(|arrived| *arrived == staged);
+        drop(kept);
+        if same {
             return flushed_after_publication(packages, &destination, NameKind::Directory);
         }
         let refused = format!("{}.refused", entry.name);
@@ -1913,6 +1919,10 @@ impl StagedPackage {
 
 /// What identifies a directory on its volume whatever its name: the volume's number and the
 /// directory's own number on it, as the operating system reports them for the handle.
+///
+/// On Windows the directory's number is the 64-bit file index. NTFS gives every file its own;
+/// ReFS numbers files with 128 bits and does not promise that the 64 reported here are unique, so
+/// on a ReFS volume two directories could compare equal where they are not the same.
 fn identity(directory: &Area) -> CatalogueResult<(u64, u64)> {
     use cap_fs_ext::MetadataExt as _;
 
@@ -1921,6 +1931,81 @@ fn identity(directory: &Area) -> CatalogueResult<(u64, u64)> {
         .dir_metadata()
         .map_err(|source| CatalogueError::storage(&directory.path, &source))?;
     Ok((metadata.dev(), metadata.ino()))
+}
+
+/// A second handle on a staged directory that keeps the directory's number on its volume its own
+/// while the directory is renamed into place, and does not keep the rename from happening.
+///
+/// While a directory is open it cannot be removed for good, so no other directory is given its
+/// number. On Unix this is a copy of the store's own handle, which a rename does not mind. On
+/// Windows the store's handle shares no deletion and would refuse the rename, so this is a handle of
+/// its own that shares everything and may only read the directory's attributes; it is opened by
+/// the directory's name while the store's handle still holds the directory there, and checked to
+/// be on the same directory.
+#[derive(Debug)]
+struct Kept {
+    #[cfg(unix)]
+    _dir: Dir,
+    #[cfg(windows)]
+    _file: cap_std::fs::File,
+}
+
+impl Kept {
+    /// Opens the second handle on `directory` and returns it with what identifies the directory.
+    fn open(directory: &Area) -> CatalogueResult<(Self, (u64, u64))> {
+        #[cfg(test)]
+        if kept_fault::fails() {
+            return Err(CatalogueError::StorageUnavailable {
+                detail: format!(
+                    "{}: the second handle was made to fail",
+                    directory.path.display()
+                ),
+            });
+        }
+        let staged = identity(directory)?;
+        #[cfg(unix)]
+        {
+            let dir = directory
+                .dir
+                .try_clone()
+                .map_err(|source| CatalogueError::storage(&directory.path, &source))?;
+            Ok((Self { _dir: dir }, staged))
+        }
+        #[cfg(windows)]
+        {
+            use cap_fs_ext::MetadataExt as _;
+            use std::os::windows::fs::OpenOptionsExt as _;
+
+            /// The right to read a file's attributes, which is all this handle holds.
+            const FILE_READ_ATTRIBUTES: u32 = 0x0080;
+            /// Reading, writing and deleting are all shared with other handles.
+            const FILE_SHARE_ALL: u32 = 0x0001 | 0x0002 | 0x0004;
+            /// What lets a program open a directory at all.
+            const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+            /// A link under the name is opened as the link rather than followed.
+            const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
+            let file = std::fs::OpenOptions::new()
+                .access_mode(FILE_READ_ATTRIBUTES)
+                .share_mode(FILE_SHARE_ALL)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+                .open(&directory.path)
+                .map_err(|source| CatalogueError::storage(&directory.path, &source))?;
+            let file = cap_std::fs::File::from_std(file);
+            let metadata = file
+                .metadata()
+                .map_err(|source| CatalogueError::storage(&directory.path, &source))?;
+            if (metadata.dev(), metadata.ino()) != staged {
+                return Err(CatalogueError::StorageUnavailable {
+                    detail: format!(
+                        "{} is not the directory the store holds under that name",
+                        directory.path.display()
+                    ),
+                });
+            }
+            Ok((Self { _file: file }, staged))
+        }
+    }
 }
 
 /// Writes a document and requires its rename to be durable before it returns.
@@ -2088,6 +2173,26 @@ pub(crate) mod index_pause {
         if let Some(then) = BEFORE.with(|before| before.borrow_mut().take()) {
             then();
         }
+    }
+}
+
+/// A staged package whose second handle the unit tests make fail, to reach an activation that
+/// stops before anything is renamed.
+#[cfg(test)]
+pub(crate) mod kept_fault {
+    use std::cell::Cell;
+
+    thread_local! {
+        static FAILING: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Makes the next second handle on this thread fail.
+    pub(crate) fn fail() {
+        FAILING.with(|failing| failing.set(true));
+    }
+
+    pub(crate) fn fails() -> bool {
+        FAILING.with(|failing| failing.replace(false))
     }
 }
 
@@ -2372,6 +2477,35 @@ mod tests {
                 .count(),
             0,
             "what was moved out is cleared with the lock"
+        );
+    }
+
+    /// An activation that stops before its rename, here because the second handle that keeps the
+    /// staged directory's number is made to fail, drops the staged package whole: the directory's
+    /// handle is closed before the directory is removed, which on Windows a directory held open
+    /// refuses, so nothing is activated and nothing is left in staging.
+    #[test]
+    fn an_activation_that_stops_before_its_rename_leaves_nothing_in_staging() {
+        let (_directory, store) = store();
+        let digest = PayloadDigest::of(b"manifest");
+        let mut staged = store.stage_package(digest).expect("a staging directory");
+        staged
+            .write(&path("plugin.json"), b"manifest")
+            .expect("written");
+        kept_fault::fail();
+        let refused =
+            owned(|permit| staged.activate(permit)).expect_err("stopped before its rename");
+        assert!(
+            matches!(refused, CatalogueError::StorageUnavailable { .. }),
+            "{refused:?}"
+        );
+        assert!(!store.package_dir(digest).exists(), "nothing is activated");
+        assert_eq!(
+            std::fs::read_dir(store.root.join("staging"))
+                .expect("readable")
+                .count(),
+            0,
+            "nothing is left in staging"
         );
     }
 
