@@ -703,6 +703,18 @@ fn windows() -> Vec<Step> {
             "registry",
         ),
         qualified_only(
+            "the environment's singleton lock",
+            &[
+                "test",
+                "--locked",
+                "-p",
+                "kr-controller",
+                "--lib",
+                "singleton",
+            ],
+            "singleton",
+        ),
+        qualified_only(
             "a worker's breakaway from the daemon's job",
             &[
                 "test",

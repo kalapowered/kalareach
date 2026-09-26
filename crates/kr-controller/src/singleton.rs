@@ -45,7 +45,7 @@ impl SingletonLock {
     /// a registry failure when the generation cannot be advanced.
     pub fn acquire(path: &Path, environment_id: EnvironmentId) -> Result<Self> {
         let file = Self::open(path, environment_id)?;
-        Self::lock(&file, environment_id)?;
+        Self::lock(&file, path, environment_id)?;
         Ok(Self {
             file,
             path: path.to_path_buf(),
@@ -104,14 +104,24 @@ impl SingletonLock {
     }
 
     #[cfg(unix)]
-    fn lock(file: &File, environment_id: EnvironmentId) -> Result<()> {
+    fn lock(file: &File, path: &Path, environment_id: EnvironmentId) -> Result<()> {
         use rustix::fs::{FlockOperation, flock};
 
-        flock(file, FlockOperation::NonBlockingLockExclusive).map_err(|_| {
-            ControllerError::AlreadyRunning {
-                environment: environment_id.to_string(),
-            }
-        })
+        flock(file, FlockOperation::NonBlockingLockExclusive)
+            .map_err(|error| Self::not_locked(error, path, environment_id))
+    }
+
+    /// What a lock that was not taken means.
+    #[cfg(unix)]
+    fn not_locked(
+        error: rustix::io::Errno,
+        path: &Path,
+        environment_id: EnvironmentId,
+    ) -> ControllerError {
+        let _ = (error, path);
+        ControllerError::AlreadyRunning {
+            environment: environment_id.to_string(),
+        }
     }
 
     #[cfg(windows)]
@@ -130,16 +140,22 @@ impl SingletonLock {
             .write(true)
             .share_mode(NO_SHARING)
             .open(path)
-            .map_err(|error| match error.kind() {
-                std::io::ErrorKind::PermissionDenied => ControllerError::AlreadyRunning {
-                    environment: environment_id.to_string(),
-                },
-                _ => ControllerError::Ipc(kr_ipc::IpcError::io(
-                    "open the singleton lock",
-                    path,
-                    error,
-                )),
-            })
+            .map_err(|error| Self::not_opened(error, path, environment_id))
+    }
+
+    /// What an open of the lock file that failed means.
+    #[cfg(windows)]
+    fn not_opened(
+        error: std::io::Error,
+        path: &Path,
+        environment_id: EnvironmentId,
+    ) -> ControllerError {
+        match error.kind() {
+            std::io::ErrorKind::PermissionDenied => ControllerError::AlreadyRunning {
+                environment: environment_id.to_string(),
+            },
+            _ => ControllerError::Ipc(kr_ipc::IpcError::io("open the singleton lock", path, error)),
+        }
     }
 
     #[cfg(windows)]
@@ -147,7 +163,7 @@ impl SingletonLock {
         clippy::unnecessary_wraps,
         reason = "the open itself is the lock on this platform; the signature is shared"
     )]
-    const fn lock(_file: &File, _environment_id: EnvironmentId) -> Result<()> {
+    const fn lock(_file: &File, _path: &Path, _environment_id: EnvironmentId) -> Result<()> {
         // Exclusivity was obtained by the open above. There is nothing further to take.
         Ok(())
     }
@@ -254,5 +270,86 @@ mod tests {
         let error = SingletonLock::acquire(&paths.singleton_lock(), host.environment_id())
             .expect_err("refuses the second");
         assert!(matches!(error, ControllerError::AlreadyRunning { .. }));
+    }
+
+    /// An environment for the refusals below, which read no file.
+    fn environment() -> EnvironmentId {
+        EnvironmentId::new(kr_protocol::scalars::Uuid::from_bytes([7; 16]))
+    }
+
+    /// KR-REQ-24.04: only a lock another holder has is another daemon. A lock the filesystem
+    /// cannot give at all, which some network filesystems answer with `ENOLCK`, is a failure that
+    /// names the lock file: nobody is told another daemon owns the environment, and nothing waits
+    /// for one to let go.
+    #[cfg(unix)]
+    #[test]
+    fn only_a_lock_another_holder_has_is_another_daemon() {
+        let path = Path::new("/environment/singleton.lock");
+        let held = SingletonLock::not_locked(rustix::io::Errno::WOULDBLOCK, path, environment());
+        assert!(
+            matches!(held, ControllerError::AlreadyRunning { .. }),
+            "{held}"
+        );
+        let refused = SingletonLock::not_locked(rustix::io::Errno::NOLCK, path, environment());
+        assert!(
+            !matches!(refused, ControllerError::AlreadyRunning { .. }),
+            "a lock the filesystem cannot give is not another daemon: {refused}"
+        );
+        assert!(
+            refused.to_string().contains("/environment/singleton.lock"),
+            "the failure names the lock file: {refused}"
+        );
+    }
+
+    /// KR-REQ-24.04 on Windows, where the lock is the exclusive open itself: one daemon holds an
+    /// environment at a time, and a second one started beside it is refused as another daemon.
+    #[cfg(windows)]
+    #[test]
+    fn a_second_daemon_is_refused_on_windows_while_the_first_holds_the_environment() {
+        let host = kr_ipc::testing::TempHost::create();
+        let paths = host.environment();
+        let _held = SingletonLock::acquire(&paths.singleton_lock(), host.environment_id())
+            .expect("takes the lock");
+        let error = SingletonLock::acquire(&paths.singleton_lock(), host.environment_id())
+            .expect_err("refuses the second");
+        assert!(
+            matches!(error, ControllerError::AlreadyRunning { .. }),
+            "the second daemon is told the environment is held: {error}"
+        );
+    }
+
+    /// KR-REQ-24.04 on Windows: the open of a file another handle holds fails with a sharing
+    /// violation, which is another daemon. A refused access is not: it is a failure that names the
+    /// lock file.
+    #[cfg(windows)]
+    #[test]
+    fn on_windows_only_a_sharing_violation_is_another_daemon() {
+        const ERROR_SHARING_VIOLATION: i32 = 32;
+        const ERROR_ACCESS_DENIED: i32 = 5;
+        let path = Path::new(r"C:\environment\singleton.lock");
+        let held = SingletonLock::not_opened(
+            std::io::Error::from_raw_os_error(ERROR_SHARING_VIOLATION),
+            path,
+            environment(),
+        );
+        assert!(
+            matches!(held, ControllerError::AlreadyRunning { .. }),
+            "{held}"
+        );
+        let refused = SingletonLock::not_opened(
+            std::io::Error::from_raw_os_error(ERROR_ACCESS_DENIED),
+            path,
+            environment(),
+        );
+        assert!(
+            !matches!(refused, ControllerError::AlreadyRunning { .. }),
+            "a refused access is not another daemon: {refused}"
+        );
+        assert!(
+            refused
+                .to_string()
+                .contains(r"C:\environment\singleton.lock"),
+            "the failure names the lock file: {refused}"
+        );
     }
 }
