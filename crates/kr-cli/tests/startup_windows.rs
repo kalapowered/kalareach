@@ -594,27 +594,45 @@ struct Listed {
 }
 
 /// The processes running `image` whose command line names `root`: one test's own starters, daemons
-/// and workers, since every one of them is told the test's own tree.
-fn listed(image: &str, root: &Path) -> Vec<Listed> {
+/// and workers, since every one of them is told the test's own tree. A list that could not be read
+/// is an error, never an empty list.
+fn listed(image: &str, root: &Path) -> Result<Vec<Listed>, String> {
     let script = format!(
-        "Get-CimInstance Win32_Process -Filter \"Name = '{image}'\" | Where-Object {{ \
-         $_.CommandLine -and $_.CommandLine.Contains('{}') }} | ForEach-Object {{ '{{0}} {{1}} \
-         {{2}}' -f $_.ProcessId, $_.CreationDate.ToFileTimeUtc(), \
-         [int]$_.CommandLine.Contains(' --starter ') }}",
+        "$ErrorActionPreference = 'Stop'; Get-CimInstance Win32_Process -Filter \"Name = \
+         '{image}'\" | Where-Object {{ $_.CommandLine -and $_.CommandLine.Contains('{}') }} | \
+         ForEach-Object {{ '{{0}} {{1}} {{2}}' -f $_.ProcessId, \
+         $_.CreationDate.ToFileTimeUtc(), [int]$_.CommandLine.Contains(' --starter ') }}",
         root.display()
     );
     let output = Command::new(system32("WindowsPowerShell\\v1.0\\powershell.exe"))
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
         .output()
-        .expect("the processes are listed");
+        .map_err(|error| format!("the process list could not be asked for: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "the process list could not be read ({}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
     String::from_utf8_lossy(&output.stdout)
         .lines()
-        .filter_map(|line| {
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
             let mut words = line.split_whitespace();
-            Some(Listed {
-                pid: words.next()?.parse().ok()?,
-                created: words.next()?.parse().ok()?,
-                starter: words.next()? == "1",
+            let mut next = || {
+                words
+                    .next()
+                    .ok_or_else(|| format!("a short line: {line:?}"))
+            };
+            Ok(Listed {
+                pid: next()?
+                    .parse()
+                    .map_err(|_| format!("no process identifier: {line:?}"))?,
+                created: next()?
+                    .parse()
+                    .map_err(|_| format!("no creation time: {line:?}"))?,
+                starter: next()? == "1",
             })
         })
         .collect()
@@ -624,27 +642,37 @@ fn listed(image: &str, root: &Path) -> Vec<Listed> {
 /// counted.
 fn processes(image: &str, root: &Path) -> Vec<u32> {
     listed(image, root)
+        .unwrap_or_else(|error| panic!("{error}"))
         .into_iter()
         .filter(|process| !process.starter)
         .map(|process| process.pid)
         .collect()
 }
 
-/// Ends one listed process, through a handle that is checked to be the process the list described:
-/// an identifier that has passed to another process since is left alone.
-fn end(process: &Listed) {
+/// Ends one listed process, through a handle that is checked to be the process the list described,
+/// and says why it could not when it could not. An identifier that has passed to another process
+/// since is left alone: the process listed has ended.
+fn end(process: &Listed) -> Result<(), String> {
     /// The Unix epoch as a `FILETIME`.
     const UNIX_EPOCH_AS_FILETIME: u64 = 116_444_736_000_000_000;
     let Ok(identity) = kr_ipc::identity::process_start_identity(process.pid) else {
-        return;
+        // No process holds the identifier now, or it cannot be read; the next list says which.
+        return Ok(());
     };
     // The identity counts hundreds of nanoseconds since the Unix epoch, and the list gives the
     // creation time to the microsecond.
     let listed = process.created.saturating_sub(UNIX_EPOCH_AS_FILETIME);
     if identity.start_value.get().abs_diff(listed) >= 10 {
-        return;
+        return Ok(());
     }
-    let _ = kr_ipc::starter::end_process(&identity);
+    match kr_ipc::starter::end_process(&identity) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(format!("process {} did not end when told to", process.pid)),
+        Err(error) => Err(format!(
+            "process {} could not be ended: {error}",
+            process.pid
+        )),
+    }
 }
 
 /// Ends what the task started for this tree when the test ends however it ends, in the order that
@@ -654,9 +682,44 @@ struct EndsWhatItStarted<'a> {
     host: &'a Host,
 }
 
+impl EndsWhatItStarted<'_> {
+    /// Waits until a list that was read says no process running `image` for this tree is left of
+    /// the kind `which` picks, ending each one when `ending`, and says what is left when the wait
+    /// ends first.
+    fn settle(&self, image: &str, which: fn(&Listed) -> bool, ending: bool) -> Result<(), String> {
+        let root = self.host.temp.root();
+        let started = Instant::now();
+        loop {
+            let left: Vec<Listed> = listed(image, root)?.into_iter().filter(which).collect();
+            if left.is_empty() {
+                return Ok(());
+            }
+            let failures: Vec<String> = if ending {
+                left.iter()
+                    .filter_map(|process| end(process).err())
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            if started.elapsed() > LIVENESS_DEADLINE {
+                return Err(format!(
+                    "{image} processes of this test are still running {LIVENESS_DEADLINE:?} later: \
+                     {:?}{}",
+                    left.iter().map(|process| process.pid).collect::<Vec<_>>(),
+                    if failures.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({})", failures.join("; "))
+                    }
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+}
+
 impl Drop for EndsWhatItStarted<'_> {
     fn drop(&mut self) {
-        let root = self.host.temp.root();
         let environment = self.host.environment();
         // No starter runs from here on, and one already running takes nothing: the task goes, and
         // every request left for a starter is withdrawn.
@@ -667,26 +730,24 @@ impl Drop for EndsWhatItStarted<'_> {
         }) {
             let _ = kr_ipc::starter::withdraw_claim(&environment, request);
         }
-        // A starter ends once it has found nothing to take, or has started what it took.
-        let settled = Instant::now();
-        while listed("kr-controller.exe", root)
-            .iter()
-            .any(|process| process.starter)
-            && settled.elapsed() < LIVENESS_DEADLINE
-        {
-            std::thread::sleep(Duration::from_millis(200));
-        }
-        // Then the daemons, which start workers, and then the workers.
-        for image in ["kr-controller.exe", "kr-worker.exe"] {
-            let ending = Instant::now();
-            loop {
-                let left = listed(image, root);
-                if left.is_empty() || ending.elapsed() > LIVENESS_DEADLINE {
-                    break;
-                }
-                left.iter().for_each(end);
-                std::thread::sleep(Duration::from_millis(200));
+        // A starter ends once it has found nothing to take, or has started what it took; then the
+        // daemons, which start workers; then the workers. Each stage is over only when a list that
+        // was read says so.
+        let ended = self
+            .settle("kr-controller.exe", |process| process.starter, false)
+            .and_then(|()| self.settle("kr-controller.exe", |_| true, true))
+            .and_then(|()| self.settle("kr-worker.exe", |_| true, true));
+        if let Err(left) = ended {
+            // What still runs may still write its keys, so they stay: removing them now would
+            // leave them to be written again behind this cleanup, and gone from its record.
+            eprintln!(
+                "the processes this test started were not all ended, so the keys their daemon \
+                 keeps in this account's credential store are left: {left}"
+            );
+            if !std::thread::panicking() {
+                panic!("the processes this test started were not all ended: {left}");
             }
+            return;
         }
         // Only now the keys: nothing that writes them is left.
         if let Ok(store) =
