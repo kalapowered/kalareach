@@ -751,6 +751,92 @@ fn kr_req_11_24_a_withdrawn_grant_reaches_every_release_of_the_package() {
     assert!(matches!(refused, BrokerError::Grant(_)), "{refused}");
 }
 
+/// Brings the store back, as the host's maintenance does: the journal writes its own gap, and the
+/// broker commits its gap and finishes its recovery, with nothing handed over meanwhile.
+fn recover(worker: &mut Worker) {
+    worker
+        .broker
+        .refuse_ledger_writes(false)
+        .expect("the store takes writes again");
+    let now = kr_ipc::now_ms().get();
+    worker.store.recover_journal(now);
+    worker
+        .broker
+        .recover(TimestampMs::new(now))
+        .expect("the gap is committed");
+    worker.broker.reconcile_connected(TimestampMs::new(now));
+}
+
+/// KR-REQ-11.24: a withdrawal the store cannot record takes effect at once, and its record is owed
+/// and written when the store's recovery finishes, with no snapshot after it; the next action that
+/// needs the withdrawn grant is refused then too. A widening the store cannot record is not used
+/// until its record is written, which the recovery's end does as well.
+#[test]
+fn kr_req_11_24_a_grant_change_the_store_cannot_record_is_owed_and_never_widens_first() {
+    let mut worker = Worker::open();
+    let source = worker.claude_code();
+    let first = worker.admit(1, vec![testing::admitted(&source)]);
+    worker.register(1);
+    worker
+        .bind(1, 1, source.package_digest, first)
+        .expect("binds");
+    let mut narrowed = source.clone();
+    narrowed.granted.remove(&PluginCapability::UpstreamAction);
+
+    worker
+        .broker
+        .refuse_ledger_writes(true)
+        .expect("the store is put in query-only mode");
+    worker.admit(2, vec![testing::admitted(&narrowed)]);
+    assert!(
+        !worker.grants(1).holds(BrokerGrant::UpstreamAction),
+        "the withdrawal takes effect whatever the store says"
+    );
+    assert!(
+        worker
+            .row(1)
+            .is_some_and(|row| row.grants.holds(BrokerGrant::UpstreamAction)),
+        "its record is not written yet"
+    );
+
+    recover(&mut worker);
+    assert!(
+        worker
+            .row(1)
+            .is_some_and(|row| !row.grants.holds(BrokerGrant::UpstreamAction)),
+        "the owed record is written once the recovery finishes"
+    );
+    let refused = worker
+        .rich_admission(1, 1)
+        .expect_err("the withdrawn grant stays withdrawn");
+    assert!(matches!(refused, BrokerError::Grant(_)), "{refused}");
+
+    // A widening the store refuses is not used until it is recorded.
+    worker
+        .broker
+        .refuse_ledger_writes(true)
+        .expect("the store is put in query-only mode");
+    worker.admit(3, vec![testing::admitted(&source)]);
+    assert!(
+        !worker.grants(1).holds(BrokerGrant::UpstreamAction),
+        "a widening with no record is not in force"
+    );
+    recover(&mut worker);
+    assert!(
+        worker.grants(1).holds(BrokerGrant::UpstreamAction),
+        "the recovery's end brings the binding to the admissions it holds"
+    );
+    assert!(
+        worker
+            .row(1)
+            .is_some_and(|row| row.grants.holds(BrokerGrant::UpstreamAction)),
+        "record first"
+    );
+    worker
+        .rich_admission(1, 1)
+        .expect("the confirmed grant is in force once recorded");
+}
+
 /// KR-REQ-11.13: a binding stays on its hash across an upgrade, reporting the release it holds;
 /// a new binding takes the new hash, and the old one is not admitted for new bindings any more.
 #[test]
@@ -1520,11 +1606,7 @@ fn kr_req_11_13_a_launch_given_back_after_its_bind_leaves_no_binding_or_row() {
         "the row the store would not remove is still there"
     );
     assert_eq!(
-        worker
-            .broker
-            .owed_removals()
-            .into_iter()
-            .collect::<Vec<_>>(),
+        worker.broker.owed_rows().into_iter().collect::<Vec<_>>(),
         vec![binding(1)],
         "and owed"
     );
@@ -1544,7 +1626,7 @@ fn kr_req_11_13_a_launch_given_back_after_its_bind_leaves_no_binding_or_row() {
         worker.row(1).is_none(),
         "the owed row is removed once the recovery finishes"
     );
-    assert!(worker.broker.owed_removals().is_empty());
+    assert!(worker.broker.owed_rows().is_empty());
 }
 
 /// KR-REQ-11.13: a row a process could not remove before it ended is removed by the next process

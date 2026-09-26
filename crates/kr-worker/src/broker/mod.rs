@@ -745,8 +745,9 @@ struct BrokerState {
     /// What the control daemon's admissions admit, as this worker read them: every binding made
     /// from admissions is made from this, under this lock.
     admitted: binder::Admitted,
-    /// The bindings forgotten whose rows the store has not removed yet.
-    owed_removals: std::collections::BTreeSet<BrokerBindingId>,
+    /// The bindings whose rows the store owes: a live binding's record a write could not bring to
+    /// what it holds, and a forgotten binding's removal.
+    owed_rows: std::collections::BTreeSet<BrokerBindingId>,
     /// The adapter notices still to be written to the session's journal.
     notices: Vec<binder::AdapterNotice>,
     /// Each package with a binding on one of its revoked releases, with those bindings.
@@ -913,7 +914,7 @@ impl Broker {
                 continuous: std::collections::BTreeSet::new(),
                 unrecorded_after: 0,
                 admitted: binder::Admitted::default(),
-                owed_removals: std::collections::BTreeSet::new(),
+                owed_rows: std::collections::BTreeSet::new(),
                 notices: Vec::new(),
                 revoked: BTreeMap::new(),
                 action_refusals: BTreeMap::new(),
@@ -2813,7 +2814,7 @@ impl Broker {
         // The writes go under the lock, which is what makes the reconciliation and the finish one
         // decision, and they take the store's lock without waiting for it: a store another
         // connection is writing refuses them at once, and the upstream asks again.
-        state.promptly(|state| {
+        let answered = state.promptly(|state| {
             let reconciliation = state.reconcile_in(scope, still_open, now)?;
             // This upstream is reconciled. Rich work comes back when every one that owed a
             // reconciliation has given it, and not before.
@@ -2827,7 +2828,14 @@ impl Broker {
             }
             let finished = state.finish_recovery(generation, now)?;
             Ok((reconciliation, Some(finished)))
-        })
+        });
+        drop(state);
+        // The recovery's end brought every binding to the admissions held, which can queue a
+        // notice for the session's journal.
+        if matches!(answered, Ok((_, Some(_)))) {
+            self.notices_ready.notify_one();
+        }
+        answered
     }
 
     /// Reconciles every upstream a recovery owes whose connection is still open, and finishes the
@@ -2856,10 +2864,17 @@ impl Broker {
         if state.volatile.mode() != kr_protocol::gateway::GatewayMode::Recovering {
             return None;
         }
-        state
+        let finished = state
             .promptly(|state| Ok(state.reconcile_connected_in(now)))
             .ok()
-            .flatten()
+            .flatten();
+        drop(state);
+        // The recovery's end brought every binding to the admissions held, which can queue a
+        // notice for the session's journal.
+        if finished.is_some() {
+            self.notices_ready.notify_one();
+        }
+        finished
     }
 
     /// Announces, once, when the next recovery's write waits for the store's lock, for this
@@ -4055,7 +4070,11 @@ impl BrokerState {
         }
         let finished = self.volatile.finish_recovery(generation)?;
         self.continuous.clear();
-        self.settle_owed_removals(now);
+        // Under the lock the fence was lifted under, before any rich work is admitted: the rows
+        // owed are written, and every live binding is brought to the admissions held, which is
+        // where a change the store could not record while it was faulted takes effect.
+        self.settle_owed_rows(now);
+        self.reinstall(now);
         Ok(finished)
     }
 

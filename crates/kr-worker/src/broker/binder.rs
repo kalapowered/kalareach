@@ -252,9 +252,7 @@ impl Broker {
                     })
                     .collect(),
             };
-            state.apply_release_states(now);
-            state.close_ended(now);
-            state.bind_the_unbound(now);
+            state.reinstall(now);
         }
         self.notices_ready.notify_one();
     }
@@ -365,12 +363,12 @@ impl Broker {
         self.state().action_refusals.clone()
     }
 
-    /// Returns the rows of forgotten bindings this broker still owes the ledger, for this host's
-    /// own tests.
+    /// Returns the bindings whose rows this broker still owes the ledger, for this host's own
+    /// tests.
     #[cfg(feature = "testing")]
     #[must_use]
-    pub fn owed_removals(&self) -> BTreeSet<BrokerBindingId> {
-        self.state().owed_removals.clone()
+    pub fn owed_rows(&self) -> BTreeSet<BrokerBindingId> {
+        self.state().owed_rows.clone()
     }
 }
 
@@ -495,7 +493,7 @@ impl BrokerState {
             refused.iter().map(ToString::to_string).collect(),
         );
         self.bindings.insert(binding_id, binding);
-        self.settle_owed_removals(now);
+        self.settle_owed_rows(now);
         Ok(refused)
     }
 
@@ -523,8 +521,14 @@ impl BrokerState {
         self.rederive(binding_id, &target, frame, now)
     }
 
-    /// Writes one binding's new grants and trust, the record first, keeping its actions, its
-    /// fault state and its version. Nothing changes when they are the ones it holds.
+    /// Brings one binding's grants and trust to `target`, keeping its actions, its fault state and
+    /// its version. Nothing changes when they are the ones it holds.
+    ///
+    /// What the binding loses goes at once, whatever the store says: withdrawn authority does not
+    /// wait for a record, and the record is owed until a write succeeds. What it gains is in force
+    /// only once its record is written, so a write that fails leaves the binding holding what it
+    /// kept, and the next installation of the admissions, or the end of the store's recovery,
+    /// tries again.
     fn rederive(
         &mut self,
         binding_id: BrokerBindingId,
@@ -543,6 +547,19 @@ impl BrokerState {
         if let Some(trust) = target.trust.as_ref() {
             trust.validate()?;
         }
+        let kept = kept_within(binding, target);
+        if binding.grants != kept.grants || !same_trust(binding.trust.as_ref(), kept.trust.as_ref())
+        {
+            if let Some(binding) = self.bindings.get_mut(&binding_id) {
+                binding.grants = kept.grants;
+                binding.trust = kept.trust;
+                binding.frame = Some(frame);
+            }
+            self.owed_rows.insert(binding_id);
+        }
+        let Some(binding) = self.bindings.get(&binding_id) else {
+            return Err(BrokerError::unknown(format!("no binding {binding_id}")));
+        };
         let mut changed = binding.clone();
         changed.grants = target.grants.clone();
         changed.trust = target.trust.clone();
@@ -556,8 +573,18 @@ impl BrokerState {
             binding.trust = changed.trust;
             binding.frame = changed.frame;
         }
-        self.settle_owed_removals(now);
+        self.owed_rows.remove(&binding_id);
+        self.settle_owed_rows(now);
         Ok(())
+    }
+
+    /// Brings every live binding to the admissions held, as installing them does: after a
+    /// snapshot, and when the store's recovery finishes, since a change a write could not record
+    /// is owed until then.
+    pub(super) fn reinstall(&mut self, now: TimestampMs) {
+        self.apply_release_states(now);
+        self.close_ended(now);
+        self.bind_the_unbound(now);
     }
 
     /// Brings every live binding made from admissions to the state of the release it holds.
@@ -590,8 +617,9 @@ impl BrokerState {
             };
             // The installed hash takes the installation's effective grants, narrowing or
             // widening; any other release takes its cap, and only narrows. A write that fails
-            // leaves the binding as it was; the fence it raised refuses its rich work until the
-            // recovery, and the next round tries again.
+            // raises the fence, which refuses the binding's rich work until the recovery; the
+            // narrowing is in force meanwhile, and the recovery's end records it and tries the
+            // widening again.
             let _ = match self.admitted_for(binding) {
                 Some(_) => self.regrant_in(binding_id, frame, now),
                 None => {
@@ -749,11 +777,11 @@ impl BrokerState {
     pub(super) fn forget(&mut self, bindings: Vec<BrokerBindingId>, now: TimestampMs) {
         for binding_id in bindings {
             if let Some(binding) = self.bindings.remove(&binding_id) {
-                self.owed_removals.insert(binding_id);
+                self.owed_rows.insert(binding_id);
                 self.revoked_settled(&binding.plugin_id, binding_id);
             }
         }
-        self.settle_owed_removals(now);
+        self.settle_owed_rows(now);
     }
 
     /// Forgets every binding of one instance.
@@ -771,21 +799,29 @@ impl BrokerState {
         self.forget(bindings, now);
     }
 
-    /// Removes the rows owed for forgotten bindings, while the store takes writes.
-    pub(super) fn settle_owed_removals(&mut self, now: TimestampMs) {
+    /// Writes the rows the store owes, while it takes writes: a live binding's record as it now
+    /// stands, and the removal of a forgotten binding's.
+    pub(super) fn settle_owed_rows(&mut self, now: TimestampMs) {
         if !self.volatile.writes_are_durable() {
             return;
         }
-        let owed: Vec<BrokerBindingId> = self.owed_removals.iter().copied().collect();
+        let owed: Vec<BrokerBindingId> = self.owed_rows.iter().copied().collect();
         for binding_id in owed {
-            match self.stored(now, "removing a binding's record", |ledger| {
-                ledger.remove_binding(binding_id)
-            }) {
-                Ok(()) => {
-                    self.owed_removals.remove(&binding_id);
+            let written = match self.bindings.get(&binding_id) {
+                Some(binding) => {
+                    let record = binding.record(TimestampMs::new(0));
+                    self.stored(now, "writing a binding's record", |ledger| {
+                        ledger.put_binding(&record)
+                    })
                 }
-                Err(_) => return,
+                None => self.stored(now, "removing a binding's record", |ledger| {
+                    ledger.remove_binding(binding_id)
+                }),
+            };
+            if written.is_err() {
+                return;
             }
+            self.owed_rows.remove(&binding_id);
         }
     }
 
@@ -823,6 +859,27 @@ fn kept_trust(binding: &Binding, admitted: Derived) -> Derived {
         grants: admitted.grants,
         trust,
     }
+}
+
+/// What a binding keeps of what it holds when its grants and trust become `target`: never more
+/// than either.
+fn kept_within(binding: &Binding, target: &Derived) -> Derived {
+    let grants = BrokerGrants::granted(
+        binding
+            .grants
+            .iter()
+            .filter(|grant| target.grants.holds(*grant)),
+    );
+    let trust = match (binding.trust.as_ref(), target.trust.as_ref()) {
+        (Some(held), Some(target)) if grants.holds(BrokerGrant::ApprovalInterpreter) => {
+            Some(DecodingTrust {
+                may_encode_response: held.may_encode_response && target.may_encode_response,
+                ..held.clone()
+            })
+        }
+        _ => None,
+    };
+    Derived { grants, trust }
 }
 
 /// A binding on a release the admissions do not admit, narrowed by that release's cap: never
