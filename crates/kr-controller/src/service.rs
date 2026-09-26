@@ -1035,6 +1035,7 @@ impl Controller {
         }
         let sessions_in_force = accepted_configuration.sessions;
         let in_force = crate::config::InForce::of(&startup_configuration);
+        let startup_budgets = crate::config::catalogue::budgets_in_force(&startup_configuration);
         // The network and the voice broker come from this same reading, and from nothing a
         // process inherited: section 26 keeps a provider origin out of reach of an environment
         // variable. They apply for as long as this daemon runs.
@@ -1057,6 +1058,9 @@ impl Controller {
             Self::proxy_of(&started)?.as_ref(),
             Arc::clone(&plugin_bridge) as Arc<dyn kr_plugin_catalogue::BrokerBridge>,
         )?);
+        if let Some(budgets) = startup_budgets {
+            catalogue.put_budgets_in_force(budgets);
+        }
         // The change-set service reads every repository through the project service's own opened
         // handles and restricted execution profile, so it takes that service rather than opening
         // a second one.
@@ -7503,6 +7507,11 @@ impl Controller {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) =
             crate::config::InForce::of(&resolver);
+        // The enrolment budgets the catalogue acts on, by the session number's rule: this reading
+        // decides them when it loaded a document, and leaves them as they are when it did not.
+        if let Some(budgets) = crate::config::catalogue::budgets_in_force(&resolver) {
+            self.catalogue.put_budgets_in_force(budgets);
+        }
         // The rights ceiling a paired device's request is decided against, from this reading when
         // it produced a document and as it was when it did not. Before the fence below, so a
         // narrower ceiling decides every request from here on while the work admitted under the
@@ -8232,7 +8241,8 @@ impl Controller {
         // The configuration, its precedence, its overrides and its ceilings. After the checks
         // above because those are about whether this host is working; these are about what it is
         // working from.
-        let budgets = crate::config::catalogue::budgets(&accepted.resolver.ceilings());
+        // The budgets the catalogue acts on, which the acceptance above put in force.
+        let budgets = self.catalogue.budgets_in_force();
         let effective = self.report_configuration(&accepted).await;
         // What the running network and voice services are doing, read from them, against what
         // the same reading of the document selects, so an edit that applies at the next start

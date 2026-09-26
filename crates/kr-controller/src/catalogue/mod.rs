@@ -209,9 +209,10 @@ pub struct CatalogueModule {
     /// computed for: rounds at an unchanged revision reuse it. Nothing a snapshot carries moves
     /// without the revision moving, the bridges included (see [`Self::write`]).
     snapshots: Arc<std::sync::Mutex<Option<CachedSnapshot>>>,
-    /// The enrolment budgets this host's configuration puts in force, as the daemon last read
-    /// them: before every catalogue change, so each enrolment and each synchronisation acts on the
-    /// configuration as it is then, never on one read at open.
+    /// The enrolment budgets this host's configuration puts in force: set at the daemon's start
+    /// and at every acceptance of the configuration after it, by the rule every value in force
+    /// follows (`config::catalogue::budgets_in_force`), and read by each enrolment and each
+    /// synchronisation, never cached at open.
     budgets: std::sync::Mutex<kr_protocol::hostinfo::configuration::EnrolmentBudgets>,
     /// Run at each [`TestingPoint`], for tests that hold a computation there.
     #[cfg(feature = "testing")]
@@ -458,7 +459,8 @@ impl CatalogueModule {
     }
 
     /// Returns the enrolment budgets in force.
-    fn budgets_in_force(&self) -> kr_protocol::hostinfo::configuration::EnrolmentBudgets {
+    #[must_use]
+    pub fn budgets_in_force(&self) -> kr_protocol::hostinfo::configuration::EnrolmentBudgets {
         *self
             .budgets
             .lock()

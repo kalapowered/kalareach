@@ -537,6 +537,46 @@ fn the_catalogue_check_names_what_the_workers_refused_as_a_warning() {
     );
 }
 
+/// The enrolment budgets in force follow the rule the session number follows: a document this
+/// host loaded decides them; one that is absent, of a version this build does not know, or invalid
+/// decides nothing, so no budget from a document the daemon did not accept is ever in force.
+#[test]
+fn only_a_loaded_document_puts_enrolment_budgets_in_force() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let environment = temp.environment();
+    assert_eq!(
+        catalogue::budgets_in_force(&open(&environment)),
+        None,
+        "no document decides nothing"
+    );
+
+    let lowered = ConfiguredEnrolmentBudgets {
+        metadata_bytes: Nullable::some(1024 * 1024),
+        ..ConfiguredEnrolmentBudgets::default()
+    };
+    edit_once(&environment, &Change::Enrolment(lowered)).expect("the owner's budget");
+    let loaded = catalogue::budgets_in_force(&open(&environment)).expect("a loaded document");
+    assert_eq!(loaded.metadata_bytes, 1024 * 1024);
+
+    let path = kr_worker::config::document_path(&environment);
+    let mut invalid: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).expect("the document")).expect("json");
+    invalid["not_a_member"] = serde_json::json!(1);
+    std::fs::write(&path, serde_json::to_vec(&invalid).expect("json")).expect("written");
+    assert_eq!(
+        catalogue::budgets_in_force(&open(&environment)),
+        None,
+        "an invalid document decides nothing"
+    );
+
+    std::fs::write(&path, br#"{"version": 7, "preferences": {}}"#).expect("written");
+    assert_eq!(
+        catalogue::budgets_in_force(&open(&environment)),
+        None,
+        "a version this build does not know decides nothing"
+    );
+}
+
 /// KR-REQ-26.13: a document this build cannot use is never rewritten by an edit.
 #[test]
 fn an_edit_refuses_a_document_at_a_version_this_build_does_not_know() {

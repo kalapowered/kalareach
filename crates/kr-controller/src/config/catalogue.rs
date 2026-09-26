@@ -78,6 +78,22 @@ pub fn budgets(
     super::ceilings::enrolment(ceilings).value
 }
 
+/// Returns the enrolment budgets a reading of this host's configuration puts in force, or `None`
+/// when it decides nothing.
+///
+/// The rule the session number follows (`super::session_limit_in_force`): a document this host
+/// loaded decides the budgets, whether it names them or leaves them to the defaults; one that is
+/// absent, unreadable, of a version this build does not know or invalid decides nothing, and the
+/// budgets already in force stay as they are. So no budget from a document the daemon did not
+/// accept is ever in force. One rule for the daemon's startup and every acceptance after it.
+#[must_use]
+pub fn budgets_in_force(resolver: &kr_worker::config::Resolver) -> Option<EnrolmentBudgets> {
+    if resolver.status().state != kr_protocol::hostinfo::configuration::DocumentState::Loaded {
+        return None;
+    }
+    Some(budgets(&resolver.ceilings()))
+}
+
 /// Builds the catalogue diagnostic from whatever evidence is registered.
 ///
 /// With no source it is `NotApplicable` with the reason stated, because a host that has never
