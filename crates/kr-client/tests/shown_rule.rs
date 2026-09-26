@@ -31,6 +31,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+#[path = "shown_rule/debug.rs"]
+mod debug;
+
 /* -------------------------------------------------------------------------------------------- */
 /* Reading a source                                                                              */
 /* -------------------------------------------------------------------------------------------- */
@@ -46,8 +49,8 @@ enum Token {
     Str(String),
     /// A character or byte literal.
     Char,
-    /// A number.
-    Number,
+    /// A number, as it is written.
+    Number(String),
     /// A lifetime or a label, with its quote.
     Lifetime(String),
 }
@@ -175,6 +178,7 @@ fn lex(text: &str) -> Result<Vec<Located>, String> {
             continue;
         }
         if c.is_ascii_digit() {
+            let start = at;
             while at < chars.len() && identifier_character(chars[at]) {
                 at += 1;
             }
@@ -186,7 +190,7 @@ fn lex(text: &str) -> Result<Vec<Located>, String> {
                 }
             }
             tokens.push(Located {
-                token: Token::Number,
+                token: Token::Number(chars[start..at].iter().collect()),
                 line,
             });
             continue;
@@ -599,6 +603,8 @@ struct Source {
     imports: Vec<Import>,
     /// The scopes that import everything from somewhere, where a bare name cannot be placed.
     globs: BTreeSet<usize>,
+    /// What each of those scopes imports everything from, as a full path.
+    glob_paths: Vec<(usize, Vec<String>)>,
     /// The types, traits and aliases each scope defines.
     definitions: BTreeSet<(usize, String)>,
     /// What this reading cannot follow in it.
@@ -906,6 +912,7 @@ fn read_source(
         children: Vec::new(),
         imports: Vec::new(),
         globs: BTreeSet::new(),
+        glob_paths: Vec::new(),
         definitions: BTreeSet::new(),
         problems: Vec::new(),
     };
@@ -1063,6 +1070,10 @@ fn read_source(
     for (scope, segments, renamed) in found {
         if renamed.as_deref() == Some("*") {
             source.globs.insert(scope);
+            let path = source
+                .relative(&segments, scope)
+                .unwrap_or_else(|| segments.clone());
+            source.glob_paths.push((scope, path));
             continue;
         }
         let path = source
@@ -1094,6 +1105,18 @@ fn crate_sources(
     crate_root: &Path,
     crate_name: &str,
 ) -> Result<Vec<Source>, String> {
+    read_crate(workspace, crate_root, crate_name, true)
+}
+
+/// Every production file of a crate, as [`crate_sources`] reads them. A crate this rule does not
+/// hold is read only for what it declares, so there a module whose file cannot be found or read is
+/// left out rather than refused, and what it declares is a type this reading cannot place.
+fn read_crate(
+    workspace: &Path,
+    crate_root: &Path,
+    crate_name: &str,
+    strict: bool,
+) -> Result<Vec<Source>, String> {
     let mut sources = Vec::new();
     let mut pending = vec![(
         crate_root.to_path_buf(),
@@ -1102,7 +1125,11 @@ fn crate_sources(
         vec![crate_name.to_owned()],
     )];
     while let Some((path, test, root_like, module)) = pending.pop() {
-        let source = read_source(workspace, &path, test, crate_name, module.clone())?;
+        let source = match read_source(workspace, &path, test, crate_name, module.clone()) {
+            Ok(source) => source,
+            Err(_) if !strict => continue,
+            Err(unreadable) => return Err(unreadable),
+        };
         let directory = if root_like {
             path.parent().map(Path::to_path_buf).unwrap_or_default()
         } else {
@@ -1115,8 +1142,10 @@ fn crate_sources(
                 (flat, false)
             } else if nested.exists() {
                 (nested, true)
-            } else {
+            } else if strict {
                 return Err(format!("{}: module {child} has no file", source.name));
+            } else {
+                continue;
             };
             let mut child_module = module.clone();
             child_module.push(child.clone());
@@ -2188,11 +2217,24 @@ struct Scratch {
 impl Scratch {
     /// Writes `files`, each a path under `crates/kr-cli/src` and its text.
     fn new(label: &str, files: &[(&str, &str)]) -> Self {
+        let files: Vec<(String, &str)> = files
+            .iter()
+            .map(|(path, text)| (format!("crates/kr-cli/src/{path}"), *text))
+            .collect();
+        let files: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(path, text)| (path.as_str(), *text))
+            .collect();
+        Self::files(label, &files)
+    }
+
+    /// Writes `files`, each a path under the workspace and its text.
+    fn files(label: &str, files: &[(&str, &str)]) -> Self {
         let workspace =
             std::env::temp_dir().join(format!("kr-shown-rule-{label}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&workspace);
         for (path, text) in files {
-            let path = workspace.join("crates/kr-cli/src").join(path);
+            let path = workspace.join(path);
             std::fs::create_dir_all(path.parent().expect("a directory")).expect("a directory");
             std::fs::write(&path, text).expect("a control file");
         }
