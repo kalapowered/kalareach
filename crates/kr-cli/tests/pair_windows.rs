@@ -828,8 +828,13 @@ impl WorkerHost {
         }
     }
 
-    /// Creates a session whose root shell is the POSIX shell Git for Windows installs, as the host
-    /// tests' sessions have, through this host's daemon, and returns it with its size.
+    /// Creates a session whose root shell is PowerShell 7, through this host's daemon, and returns it
+    /// with its size.
+    ///
+    /// Not the POSIX shell Git for Windows installs: its runtime makes the account's own identity
+    /// the owner of what the processes under it create, where an administrator's processes give
+    /// that to the Administrators group. `kr` run under it would take this test's tree, which an
+    /// administrator's test process made, for another account's, and stop before it asked anything.
     async fn session(
         &self,
     ) -> (
@@ -849,7 +854,7 @@ impl WorkerHost {
                     "--cwd",
                     &cwd,
                     "--shell",
-                    &kr_worker::testing::posix_shell(),
+                    &kr_worker::testing::powershell(),
                 ])
                 .env("KR_RUNTIME_DIR", runtime_root)
                 .env("KR_STATE_DIR", state_root)
@@ -902,7 +907,7 @@ async fn the_first_owner_is_not_confirmed_in_a_real_workers_session_without_its_
     let mut terminal = WorkerTerminal::attach(&environment, session_id, dimensions).await;
     let kr_path = kr();
     let roots = format!(
-        "export KR_RUNTIME_DIR='{}' KR_STATE_DIR='{}'",
+        "$env:KR_RUNTIME_DIR = '{}'; $env:KR_STATE_DIR = '{}'",
         host.tree.paths().runtime_root().display(),
         host.tree.paths().state_root().display()
     );
@@ -910,8 +915,8 @@ async fn the_first_owner_is_not_confirmed_in_a_real_workers_session_without_its_
     // does not hold it: only the shell's answer does, once `kr` has ended.
     terminal
         .type_line(&format!(
-            "{roots}; unset KR_SESSION KR_ATTACHMENT; '{}' pair invite --owner --direct; \
-             printf 'KR-%s-%s\\n' exit \"$?\"",
+            "{roots}; Remove-Item Env:KR_SESSION, Env:KR_ATTACHMENT -ErrorAction SilentlyContinue; \
+             & '{}' pair invite --owner --direct; ('KR' + '-exit-') + $LASTEXITCODE",
             kr_path.display()
         ))
         .await;
@@ -930,8 +935,8 @@ async fn the_first_owner_is_not_confirmed_in_a_real_workers_session_without_its_
 
     terminal
         .type_line(&format!(
-            "KR_SESSION='{session_id}' '{}' pair invite --owner --direct; \
-             printf 'KR-%s-%s\\n' control \"$?\"",
+            "$env:KR_SESSION = '{session_id}'; & '{}' pair invite --owner --direct; \
+             ('KR' + '-control-') + $LASTEXITCODE",
             kr_path.display()
         ))
         .await;
