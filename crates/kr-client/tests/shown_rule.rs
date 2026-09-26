@@ -572,6 +572,53 @@ impl fmt::Display for Finding {
     }
 }
 
+/// Where an item is declared to be seen from, as written in front of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Visibility {
+    /// `pub`.
+    Public,
+    /// `pub(crate)`.
+    Crate,
+    /// `pub(super)`.
+    Super,
+    /// Nothing, or `pub(self)`: the module it is declared in, and the modules inside that one.
+    Private,
+    /// `pub(in …)`.
+    Other,
+}
+
+/// The visibility written in front of the item whose keyword is at `at`, past `unsafe` and `auto`.
+fn visibility_before(tokens: &[Located], at: usize) -> Visibility {
+    let mut at = at;
+    while at > 0 && matches!(ident(tokens.get(at - 1)), Some("unsafe" | "auto")) {
+        at -= 1;
+    }
+    if at == 0 {
+        return Visibility::Private;
+    }
+    if ident(tokens.get(at - 1)) == Some("pub") {
+        return Visibility::Public;
+    }
+    if punct(tokens.get(at - 1), ')') {
+        let close = at - 1;
+        let open = (0..close)
+            .rev()
+            .find(|&open| closing(tokens, open) == Some(close));
+        if let Some(open) = open
+            && open > 0
+            && ident(tokens.get(open - 1)) == Some("pub")
+        {
+            return match (ident(tokens.get(open + 1)), close - open) {
+                (Some("crate"), 2) => Visibility::Crate,
+                (Some("super"), 2) => Visibility::Super,
+                (Some("self"), 2) => Visibility::Private,
+                _ => Visibility::Other,
+            };
+        }
+    }
+    Visibility::Private
+}
+
 /// One name a file imports.
 #[derive(Clone, Debug)]
 struct Import {
@@ -579,8 +626,26 @@ struct Import {
     scope: usize,
     /// The name it is known by there.
     local: String,
-    /// The full path it names.
+    /// The full path it names, or the path as written when it starts with a name the scope
+    /// resolves.
     path: Vec<String>,
+    /// Whether the path is written from the crates' root, `::name`.
+    global: bool,
+    /// Where the imported name may be seen from.
+    visibility: Visibility,
+}
+
+/// One module a file imports everything from.
+#[derive(Clone, Debug)]
+struct Glob {
+    /// The scope the import is written in, as an index into [`Source::scopes`].
+    scope: usize,
+    /// The module's full path, or its path as written, as for an [`Import`].
+    path: Vec<String>,
+    /// Whether the path is written from the crates' root.
+    global: bool,
+    /// Where the names it imports may be seen from, at most.
+    visibility: Visibility,
 }
 
 /// One source file, as the rule reads it.
@@ -601,12 +666,12 @@ struct Source {
     children: Vec<(String, bool)>,
     /// The names each scope imports.
     imports: Vec<Import>,
-    /// The scopes that import everything from somewhere, where a bare name cannot be placed.
-    globs: BTreeSet<usize>,
-    /// What each of those scopes imports everything from, as a full path.
-    glob_paths: Vec<(usize, Vec<String>)>,
+    /// The modules each scope imports everything from.
+    globs: Vec<Glob>,
     /// The types, traits and aliases each scope defines.
     definitions: BTreeSet<(usize, String)>,
+    /// Where each type, trait, alias and module a scope declares may be seen from.
+    visibilities: BTreeMap<(usize, String), Visibility>,
     /// What this reading cannot follow in it.
     problems: Vec<Finding>,
 }
@@ -911,9 +976,9 @@ fn read_source(
         }],
         children: Vec::new(),
         imports: Vec::new(),
-        globs: BTreeSet::new(),
-        glob_paths: Vec::new(),
+        globs: Vec::new(),
         definitions: BTreeSet::new(),
+        visibilities: BTreeMap::new(),
         problems: Vec::new(),
     };
     let mut file_test = test;
@@ -1043,12 +1108,24 @@ fn read_source(
             Some("struct" | "enum" | "union" | "trait" | "type") => {
                 if let Some(defined) = ident(tokens.get(at + 1)) {
                     source.definitions.insert((scope, defined.to_owned()));
+                    source
+                        .visibilities
+                        .insert((scope, defined.to_owned()), visibility_before(&tokens, at));
+                }
+            }
+            Some("mod") if punct(tokens.get(at + 2), ';') || punct(tokens.get(at + 2), '{') => {
+                if let Some(declared) = ident(tokens.get(at + 1)) {
+                    source
+                        .visibilities
+                        .insert((scope, declared.to_owned()), visibility_before(&tokens, at));
                 }
             }
             Some("use") => {
                 let end = (at..tokens.len())
                     .find(|&end| punct(tokens.get(end), ';'))
                     .unwrap_or(tokens.len());
+                let global = punct(tokens.get(at + 1), ':') && punct(tokens.get(at + 2), ':');
+                let visibility = visibility_before(&tokens, at);
                 let mut in_scope = Vec::new();
                 use_tree(
                     &tokens[at + 1..end],
@@ -1060,25 +1137,31 @@ fn read_source(
                 found.extend(
                     in_scope
                         .into_iter()
-                        .map(|(segments, renamed)| (scope, segments, renamed)),
+                        .map(|(segments, renamed)| (scope, segments, renamed, global, visibility)),
                 );
             }
             _ => {}
         }
     }
     source.tokens = tokens;
-    for (scope, segments, renamed) in found {
-        if renamed.as_deref() == Some("*") {
-            source.globs.insert(scope);
-            let path = source
+    for (scope, segments, renamed, global, visibility) in found {
+        // A path from the crates' root names a crate first, whatever the scope declares.
+        let path = if global {
+            segments.clone()
+        } else {
+            source
                 .relative(&segments, scope)
-                .unwrap_or_else(|| segments.clone());
-            source.glob_paths.push((scope, path));
+                .unwrap_or_else(|| segments.clone())
+        };
+        if renamed.as_deref() == Some("*") {
+            source.globs.push(Glob {
+                scope,
+                path,
+                global,
+                visibility,
+            });
             continue;
         }
-        let path = source
-            .relative(&segments, scope)
-            .unwrap_or_else(|| segments.clone());
         let local = match renamed {
             Some(renamed) => renamed,
             None if segments.last().is_some_and(|last| last == "self") => {
@@ -1092,7 +1175,13 @@ fn read_source(
             path
         };
         if local != "_" {
-            source.imports.push(Import { scope, local, path });
+            source.imports.push(Import {
+                scope,
+                local,
+                path,
+                global,
+                visibility,
+            });
         }
     }
     Ok(source)
