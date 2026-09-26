@@ -773,6 +773,20 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
     expect(screen.getByRole('button', { name: 'Move the window down' })).toBeEnabled()
   })
 
+  it('keeps an ended view ended when a move it took before the end is answered after it', async () => {
+    const person = userEvent.setup()
+    const { port, controls } = fakeHost()
+    open(port)
+    await screen.findByTestId('palette-provenance')
+    await person.click(screen.getByRole('tab', { name: 'View' }))
+    wheel({ deltaY: -48 })
+    act(() => {
+      controls.terminalViews[0]?.end('This session has closed.')
+    })
+    await settle()
+    expect(screen.getByTestId('terminal-ended')).toHaveTextContent('This session has closed.')
+  })
+
   it('moves nothing with a drag in control mode', async () => {
     const { port, controls } = fakeHost()
     open(port)

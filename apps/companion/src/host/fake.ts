@@ -2009,13 +2009,15 @@ function fakeTerminalView(
       },
       // Native code applies a move, has the host draw the window there, and says the move is
       // settled with that screen. A view whose moves are held records them and waits for the test;
-      // a view that has ended, or a move not numbered after the last, takes nothing.
+      // a view that has ended, or a move not numbered after the last, takes nothing, and a screen
+      // drawn for a view that ends before it is sent is never sent.
       move: (next) => {
         moves.push(next)
         if (!holdingMoves && !closed && !ended && next.number > applied) {
           place = moved(sessionId, grids.at(-1) ?? grid, place, next)
           applied = next.number
           setTimeout(() => {
+            if (ended) return
             publish({
               state: 'showing',
               attachment,
