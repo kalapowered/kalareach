@@ -13,6 +13,7 @@
 //! daemon, the workers end, the daemon removes their jobs, and only then is the daemon asked to
 //! stop, with the interrupt it answers.
 
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::{Mutex, PoisonError};
@@ -41,6 +42,97 @@ const DISCOVERY: Duration = Duration::from_secs(10);
 
 /// How long one `kr` command is given when a leg cleans up after itself.
 const CLEANUP_COMMAND: Duration = Duration::from_secs(20);
+
+/// How long a wait pauses between two asks of `kr status`, and between two asks of `kr list` while
+/// the daemon has not yet answered.
+const ASK_AGAIN: Duration = Duration::from_millis(200);
+
+/// How long a leg that closed its sessions pauses between two asks of `kr list`.
+const LIST_AGAIN: Duration = Duration::from_millis(250);
+
+/// One deadline for a whole wait, which bounds every step taken inside it.
+///
+/// A wait that compared the time only between its steps, and gave each step a whole bound of its
+/// own, could overrun by as much as one step: a `kr` that answered just before the wait's bound was
+/// followed by one more, given the whole bound again. Here each step is given what is left of the
+/// wait and no more, so a `kr` that answers slowly, or not at all, ends the wait at its deadline
+/// rather than a step's bound after it. What the deadline does not bound is the handover of a
+/// finished `kr`'s output, which [`output_within`] bounds by itself.
+#[derive(Clone, Copy, Debug)]
+struct Deadline {
+    at: Instant,
+}
+
+impl Deadline {
+    /// The deadline `within` from now.
+    fn after(within: Duration) -> Self {
+        Self {
+            at: Instant::now() + within,
+        }
+    }
+
+    /// What is left of the wait, and never more than `step`: the bound for one step inside it.
+    fn bound(self, step: Duration) -> Duration {
+        self.at.saturating_duration_since(Instant::now()).min(step)
+    }
+
+    /// Takes `step` until it gives the answer the wait is for.
+    ///
+    /// Each step is given its bound, which is what is left of the wait and never more than `each`,
+    /// and has to finish within it. Between two steps the wait pauses for `pause`, or for what is
+    /// left when that is less. A step says what it heard when it has not got the answer.
+    ///
+    /// # Errors
+    ///
+    /// Returns what the last step heard when the deadline passes without the answer.
+    fn poll<T>(
+        self,
+        each: Duration,
+        pause: Duration,
+        mut step: impl FnMut(Duration) -> ControlFlow<T, String>,
+    ) -> Result<T, String> {
+        let mut heard = "the deadline passed before anything was asked".to_owned();
+        loop {
+            let bound = self.bound(each);
+            if bound.is_zero() {
+                return Err(heard);
+            }
+            match step(bound) {
+                ControlFlow::Break(answer) => return Ok(answer),
+                ControlFlow::Continue(said) => heard = said,
+            }
+            std::thread::sleep(self.bound(pause));
+        }
+    }
+}
+
+/// Asks for a session's status through `status` until it reports the session closed, within one
+/// deadline `within` from now, and returns that report.
+///
+/// `status` runs `kr status <display> --json` and has to finish within the bound it is given, which
+/// is what is left of the wait.
+///
+/// # Errors
+///
+/// Returns what the last ask heard when the session was not reported closed within `within`.
+fn until_closed(
+    within: Duration,
+    mut status: impl FnMut(Duration) -> Result<Output, String>,
+) -> Result<Value, String> {
+    Deadline::after(within).poll(within, ASK_AGAIN, |bound| match status(bound) {
+        Ok(output) => {
+            if output.status.success()
+                && let Ok(report) = document(&output.stdout)
+                && report["state"] == "closed"
+            {
+                ControlFlow::Break(report)
+            } else {
+                ControlFlow::Continue(String::from_utf8_lossy(&output.stdout).into_owned())
+            }
+        }
+        Err(why) => ControlFlow::Continue(format!("kr status {why}")),
+    })
+}
 
 /// What a host is started with.
 #[derive(Clone, Debug, Default)]
@@ -134,13 +226,12 @@ impl<'r> Host<'r> {
             .unwrap_or_else(|| panic!("the daemon ended at once: {}", self.daemon_said()));
         *self.daemon.lock().unwrap_or_else(PoisonError::into_inner) =
             Some(Daemon { child, identity });
-        let started = Instant::now();
-        loop {
-            if let Ok(output) = self.kr_within(&["list", "--json"], CLEANUP_COMMAND)
-                && output.status.success()
-            {
-                return;
-            }
+        let answered = Deadline::after(LIVENESS).poll(CLEANUP_COMMAND, ASK_AGAIN, |bound| {
+            let heard = match self.kr_within(&["list", "--json"], bound) {
+                Ok(output) if output.status.success() => return ControlFlow::Break(()),
+                Ok(output) => format!("kr list ended with {}", output.status),
+                Err(why) => format!("kr list {why}"),
+            };
             let ended = self
                 .daemon
                 .lock()
@@ -152,12 +243,13 @@ impl<'r> Host<'r> {
                 "the control daemon exited before it answered: {}",
                 self.daemon_said()
             );
-            assert!(
-                started.elapsed() < LIVENESS,
-                "the control daemon did not answer within {LIVENESS:?}: {}",
+            ControlFlow::Continue(heard)
+        });
+        if let Err(heard) = answered {
+            panic!(
+                "the control daemon did not answer within {LIVENESS:?} ({heard}): {}",
                 self.daemon_said()
             );
-            std::thread::sleep(Duration::from_millis(200));
         }
     }
 
@@ -351,27 +443,20 @@ impl<'r> Host<'r> {
 
     /// Waits for `kr status` to report a session closed, and returns that report.
     ///
+    /// The whole wait has one deadline, [`LIVENESS`] from now, and each `kr status` is given what
+    /// is left of it.
+    ///
     /// # Panics
     ///
-    /// Panics when it is not closed within [`LIVENESS`].
+    /// Panics when it is not closed within [`LIVENESS`], with what the last `kr status` said.
     #[must_use]
     pub fn wait_until_closed(&self, display: &str) -> Value {
-        let started = Instant::now();
-        loop {
-            let output = self.kr(&["status", display, "--json"]);
-            if output.status.success()
-                && let Ok(status) = document(&output.stdout)
-                && status["state"] == "closed"
-            {
-                return status;
-            }
-            assert!(
-                started.elapsed() < LIVENESS,
-                "session {display} did not close within {LIVENESS:?}: {}",
-                String::from_utf8_lossy(&output.stdout)
-            );
-            std::thread::sleep(Duration::from_millis(200));
-        }
+        until_closed(LIVENESS, |bound| {
+            self.kr_within(&["status", display, "--json"], bound)
+        })
+        .unwrap_or_else(|heard| {
+            panic!("session {display} did not close within {LIVENESS:?}: {heard}")
+        })
     }
 
     /// Closes every live session, waits for its worker and job to go, then stops the daemon.
@@ -411,32 +496,35 @@ impl<'r> Host<'r> {
         }
     }
 
+    /// Closes every live session and waits until `kr list` names none.
+    ///
+    /// Listing, closing and waiting share one deadline, [`LIVENESS`] from the start, and each `kr`
+    /// is given what is left of it and never more than [`CLEANUP_COMMAND`].
     fn close_sessions(&self) -> Result<(), String> {
+        let deadline = Deadline::after(LIVENESS);
         let mut problems = Vec::new();
-        for session in self.listed_sessions()? {
+        for session in self.listed_sessions(deadline.bound(CLEANUP_COMMAND))? {
             let display = session["display_number"].to_string();
-            let closed = self.kr_within(&["close", &display, "--json"], CLEANUP_COMMAND);
+            let closed = self.kr_within(
+                &["close", &display, "--json"],
+                deadline.bound(CLEANUP_COMMAND),
+            );
             if !closed.is_ok_and(|output| output.status.success()) {
                 problems.push(format!("session {display} could not be closed"));
             }
         }
-        let started = Instant::now();
-        loop {
-            let open = self.listed_sessions();
-            if open.as_ref().is_ok_and(Vec::is_empty) {
-                break;
+        let emptied = deadline.poll(CLEANUP_COMMAND, LIST_AGAIN, |bound| {
+            match self.listed_sessions(bound) {
+                Ok(open) if open.is_empty() => ControlFlow::Break(()),
+                Ok(open) => ControlFlow::Continue(format!(
+                    "{} sessions were still open when the {LIVENESS:?} for closing them had passed",
+                    open.len()
+                )),
+                Err(why) => ControlFlow::Continue(why),
             }
-            if started.elapsed() >= LIVENESS {
-                problems.push(match open {
-                    Ok(open) => format!(
-                        "{} sessions were still open {LIVENESS:?} after they were closed",
-                        open.len()
-                    ),
-                    Err(why) => why,
-                });
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(250));
+        });
+        if let Err(heard) = emptied {
+            problems.push(heard);
         }
         if problems.is_empty() {
             Ok(())
@@ -445,15 +533,15 @@ impl<'r> Host<'r> {
         }
     }
 
-    /// The sessions `kr list` names.
+    /// The sessions `kr list` names, asked within `bound`.
     ///
     /// # Errors
     ///
     /// Returns why the list was not read: a `kr` that did not answer, failed or answered something
     /// that is not a list of sessions has not said that there are none.
-    fn listed_sessions(&self) -> Result<Vec<Value>, String> {
+    fn listed_sessions(&self, bound: Duration) -> Result<Vec<Value>, String> {
         let output = self
-            .kr_within(&["list", "--json"], CLEANUP_COMMAND)
+            .kr_within(&["list", "--json"], bound)
             .map_err(|why| format!("the daemon did not list its sessions: {why}"))?;
         if !output.status.success() {
             return Err(format!(
@@ -569,4 +657,80 @@ pub fn quoted(path: &Path) -> String {
         "a quoted path has no quote in it: {text}"
     );
     format!("'{text}'")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::process::ExitStatusExt as _;
+    use std::process::{ExitStatus, Output};
+    use std::time::{Duration, Instant};
+
+    use super::until_closed;
+
+    /// The bound each wait below is given.
+    const BOUND: Duration = Duration::from_secs(2);
+
+    /// How far past its bound a wait may end: the scheduler's delays and the ending of the step
+    /// that was running when the bound passed. Far less than one step's whole bound, which is what
+    /// a wait that compares the time only between its steps can overrun by.
+    const MARGIN: Duration = Duration::from_millis(500);
+
+    /// What `kr status --json` prints for a session in `state`.
+    fn status(state: &str) -> Output {
+        Output {
+            status: ExitStatus::from_raw(0),
+            stdout: serde_json::json!({ "state": state })
+                .to_string()
+                .into_bytes(),
+            stderr: Vec::new(),
+        }
+    }
+
+    /// A `kr status` that answers at once until the wait is nearly over and then stops answering
+    /// ends the wait at the wait's own deadline. It never reports the session closed, and once it
+    /// stops answering it runs for the whole bound it is given and is ended there, as a `kr` that
+    /// does not finish is.
+    #[test]
+    fn a_status_that_stops_answering_ends_the_wait_at_its_deadline() {
+        let began = Instant::now();
+        let mut asked = 0_u32;
+        let waited = until_closed(BOUND, |bound| {
+            asked += 1;
+            if began.elapsed() < BOUND * 9 / 10 {
+                return Ok(status("closing"));
+            }
+            std::thread::sleep(bound);
+            Err(format!("did not finish within {bound:?}"))
+        });
+        let took = began.elapsed();
+        let heard = waited.expect_err("the session is never reported closed");
+        assert!(
+            took < BOUND + MARGIN,
+            "a wait bounded by {BOUND:?} took {took:?} over {asked} asks, and last heard: {heard}"
+        );
+        assert!(
+            heard.contains("did not finish"),
+            "the wait says what the last ask heard: {heard}"
+        );
+    }
+
+    /// The control: a `kr status` that reports the session closed ends the wait at once, with that
+    /// report.
+    #[test]
+    fn a_status_that_reports_the_session_closed_ends_the_wait_with_that_report() {
+        let began = Instant::now();
+        let mut asked = 0_u32;
+        let report = until_closed(BOUND, |_| {
+            asked += 1;
+            Ok(status("closed"))
+        })
+        .expect("the session is reported closed");
+        assert_eq!(report["state"], "closed");
+        assert_eq!(asked, 1, "the first report that says closed ends the wait");
+        assert!(
+            began.elapsed() < MARGIN,
+            "the wait ended at once rather than after {:?}",
+            began.elapsed()
+        );
+    }
 }
