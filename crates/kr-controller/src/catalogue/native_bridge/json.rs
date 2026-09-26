@@ -4,7 +4,8 @@
 //! A settings document is somebody's. Parsing it into a value and writing the value back would
 //! keep its settings and change its bytes: members reordered, numbers spelled again, and of two
 //! members with one name only the last kept. So this reader keeps the text and records where each
-//! member of each object begins and ends, and an edit splices one member into or out of that text.
+//! member of each object begins and ends, and an edit splices one member into or out of that text,
+//! or one member's value in place of another.
 //! What it reads is strict RFC 8259 with one object at the root. A document it cannot read exactly
 //! is refused rather than guessed at, and a name repeated in any object refuses the whole document:
 //! a repeated member is a setting one reader sees and another does not.
@@ -19,7 +20,7 @@ const MAX_DEPTH: usize = 128;
 
 /// A document, read, with the place of every member of every object.
 #[derive(Clone, Debug)]
-pub(super) struct Document {
+pub(crate) struct Document {
     root: Object,
 }
 
@@ -65,7 +66,7 @@ impl Document {
     /// # Errors
     ///
     /// Returns why the text is not a JSON object this reader can edit exactly, with where.
-    pub(super) fn read(text: &str) -> Result<Self, String> {
+    pub(crate) fn read(text: &str) -> Result<Self, String> {
         let mut reader = Reader { text, at: 0 };
         reader.skip_whitespace();
         if reader.peek() != Some(b'{') {
@@ -80,7 +81,7 @@ impl Document {
     }
 
     /// Returns true when the root object has no members.
-    pub(super) fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.root.members.is_empty()
     }
 
@@ -90,7 +91,7 @@ impl Document {
     /// # Errors
     ///
     /// Returns a refusal naming the member on the way that is not an object.
-    pub(super) fn value_at<'t>(
+    pub(crate) fn value_at<'t>(
         &self,
         text: &'t str,
         path: &[&str],
@@ -131,12 +132,12 @@ impl Document {
 
 /// What an insertion made.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct Inserted {
+pub(crate) struct Inserted {
     /// The document with the member in it.
-    pub(super) text: String,
+    pub(crate) text: String,
     /// How many members on the way to it the insertion created, the leaf not counted. They are the
     /// last ones on the path before the leaf.
-    pub(super) created: usize,
+    pub(crate) created: usize,
 }
 
 /// Returns `text` with the member at `path` set to `value`, creating the objects on the way that
@@ -148,7 +149,7 @@ pub(super) struct Inserted {
 ///
 /// Returns a refusal when the text cannot be read, a member on the way is not an object, or the
 /// member is already there.
-pub(super) fn insert(text: &str, path: &[&str], value: &str) -> Result<Inserted, String> {
+pub(crate) fn insert(text: &str, path: &[&str], value: &str) -> Result<Inserted, String> {
     let document = Document::read(text)?;
     let Some((leaf, ancestors)) = path.split_last() else {
         return Err("the key names no member".to_owned());
@@ -205,7 +206,7 @@ pub(super) fn insert(text: &str, path: &[&str], value: &str) -> Result<Inserted,
 /// # Errors
 ///
 /// Returns a refusal when the text cannot be read or the member is not there.
-pub(super) fn remove(text: &str, path: &[&str], created: usize) -> Result<String, String> {
+pub(crate) fn remove(text: &str, path: &[&str], created: usize) -> Result<String, String> {
     let mut edited = splice_out(text, path)?;
     let ancestors = path.len().saturating_sub(1);
     for depth in (ancestors.saturating_sub(created)..ancestors).rev() {
@@ -242,6 +243,34 @@ fn splice_out(text: &str, path: &[&str]) -> Result<String, String> {
     edited.push_str(&text[..from]);
     edited.push_str(&text[to..]);
     Document::read(&edited)?;
+    Ok(edited)
+}
+
+/// Returns `text` with the value of the member at `path` replaced by `value`, and every other byte
+/// kept, the member's own place and spacing among them.
+///
+/// `value` is JSON text, written as it is.
+///
+/// # Errors
+///
+/// Returns a refusal when the text cannot be read or the member is not there.
+pub(crate) fn replace(text: &str, path: &[&str], value: &str) -> Result<String, String> {
+    let document = Document::read(text)?;
+    let Some((leaf, ancestors)) = path.split_last() else {
+        return Err("the key names no member".to_owned());
+    };
+    let (_, member) = document
+        .object_at(ancestors)
+        .and_then(|object| object.member(leaf))
+        .ok_or_else(|| format!("{} is not there", path.join(".")))?;
+    let mut edited = String::with_capacity(text.len() + value.len());
+    edited.push_str(&text[..member.value_start]);
+    edited.push_str(value);
+    edited.push_str(&text[member.value_end..]);
+    let check = Document::read(&edited)?;
+    if check.value_at(&edited, path)? != Some(value) {
+        return Err(format!("{} could not be placed", path.join(".")));
+    }
     Ok(edited)
 }
 
@@ -578,6 +607,20 @@ mod tests {
                 .expect_err("too deep")
                 .contains("nested")
         );
+    }
+
+    #[test]
+    fn a_value_is_replaced_in_its_place_leaving_every_other_byte() {
+        let original = "{\n\t\"z\": 1,\n\t\"enabledPlugins\": {\"kalareach-channels@skills-dir\": false, \
+                        \"theirs\": true}\n}\n";
+        let replaced = replace(original, &KEY, "{\"a\": [1, 2]}").expect("replaces");
+        assert_eq!(
+            replaced,
+            "{\n\t\"z\": 1,\n\t\"enabledPlugins\": {\"kalareach-channels@skills-dir\": {\"a\": [1, 2]}, \
+             \"theirs\": true}\n}\n"
+        );
+        let refused = replace("{\"enabledPlugins\": {}}", &KEY, "true").expect_err("refuses");
+        assert!(refused.contains("is not there"), "{refused}");
     }
 
     #[test]

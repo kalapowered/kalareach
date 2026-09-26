@@ -12,10 +12,13 @@
 //! * **An entry is guarded rather than assumed.** An installation refuses to replace a server
 //!   entry it did not write. That is what keeps an unrelated `kalareach` entry somebody else
 //!   created from being overwritten and then removed.
-//! * **The agent's file keeps its other settings.** A TOML configuration is edited in place with a
-//!   format-preserving editor, so ordering and comments survive. A JSON configuration is reparsed
-//!   and rewritten, which preserves every setting but normalises the document's layout; that is
-//!   said plainly in the documentation rather than left to be discovered.
+//! * **The agent's file keeps what is not this host's.** A TOML configuration is edited in place
+//!   with a format-preserving editor, so ordering and comments survive. A JSON configuration is read
+//!   with the place of every member, and the entry is spliced into it and out of it with every
+//!   other byte kept ([`json`]), along with the server container when the installation made it. A
+//!   JSON document that names a member twice in any object is refused before anything is written:
+//!   which of the two a reader keeps is the reader's choice, and a rewrite would keep one of the
+//!   person's settings and lose the other.
 //!
 //! The skill files are compiled into this binary, so an installation needs nothing else on disk
 //! and the digests it records are build-time facts.
@@ -29,12 +32,13 @@ use kr_protocol::skill::{
     AgentToolsStatusResult, ChangeManifest, ChangeOperation, InstalledFile, SERVER_NAME,
     SKILL_NAME,
 };
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 
 use crate::catalogue::files::{
     PRIVATE, READABLE, create_directory_durably, digest_of, display, guard_access_controls, hex,
     home_directory, missing_ancestors, read_digest, storage, sync_directory, write_atomically,
 };
+use crate::catalogue::native_bridge::json;
 use crate::error::{ControllerError, Result};
 
 /// The skill instructions, compiled in.
@@ -178,7 +182,7 @@ impl Installer {
         // What this host already did keeps its place. An installation that repairs one file must
         // not drop the claim it holds on the others or on its configuration entry, because a claim
         // it drops is a claim it will later refuse to replace and will not remove.
-        let (previous, carried) = existing.map_or_else(
+        let (previous, carried, containers) = existing.map_or_else(
             || {
                 (
                     ChangeManifest {
@@ -190,18 +194,20 @@ impl Installer {
                         operations: Vec::new(),
                     },
                     Vec::new(),
+                    Vec::new(),
                 )
             },
             // Whatever an earlier attempt was in the middle of stays unresolved until something
             // resolves it. A repair that quietly dropped the note would leave a change nobody can
             // account for and a record that says everything is accounted for.
-            |existing| (existing.manifest, existing.pending),
+            |existing| (existing.manifest, existing.pending, existing.containers),
         );
         let mut record = InstallationRecord {
             version: InstallationRecord::VERSION,
             state: InstallationRecord::INSTALLING.to_owned(),
             manifest: previous,
             pending: carried,
+            containers,
         };
         record.manifest.skill_version = SKILL_VERSION.to_owned();
         record.manifest.root = display(&root);
@@ -260,8 +266,9 @@ impl Installer {
             };
             self.confirm_existing(params, &mut record, &planned)?;
             self.begin(params, &mut record, planned)?;
-            let written = self.write_entry(configuration, params.agent)?;
+            let (written, created) = self.write_entry(configuration, params.agent)?;
             let written = self.keep_provenance(&record, written, &configuration.path);
+            record.note_containers(&written, created);
             self.finish(params, &mut record, written)?;
         }
         // What this run could not account for. Every change it made resolved its own note, and a
@@ -583,12 +590,12 @@ impl Installer {
                     digest,
                     created_document,
                 } => {
-                    let key = entry.rsplit_once('.').map_or("mcpServers", |(key, _)| key);
                     match self.remove_entry(
                         Path::new(path),
-                        key,
+                        entry_key(entry),
                         *digest,
                         *created_document,
+                        record.containers_created(operation),
                         params,
                     )? {
                         Removal::Removed => removed.push(operation.clone()),
@@ -644,10 +651,7 @@ impl Installer {
                     entry,
                     digest,
                     ..
-                } => match self.entry_digest_under(
-                    Path::new(path),
-                    entry.rsplit_once('.').map_or("mcpServers", |(key, _)| key),
-                )? {
+                } => match self.entry_digest_under(Path::new(path), entry_key(entry))? {
                     None => drift.push(format!("{entry} is missing from {path}")),
                     Some(found) if found != *digest => {
                         drift.push(format!("{entry} in {path} has changed"));
@@ -677,12 +681,13 @@ impl Installer {
         entry
     }
 
-    /// Adds the server entry to an agent's configuration, leaving its other settings alone.
+    /// Adds the server entry to an agent's configuration, leaving its other settings alone, and
+    /// returns how many objects on the way to it the edit created.
     fn write_entry(
         &self,
         configuration: &Configuration,
         agent: AgentTarget,
-    ) -> Result<ChangeOperation> {
+    ) -> Result<(ChangeOperation, usize)> {
         let created_document = !configuration.path.exists();
         if let Some(parent) = configuration.path.parent()
             && !parent.exists()
@@ -692,16 +697,19 @@ impl Installer {
         // A shared document gets the same entry whichever agent's installation writes it, so the
         // deadline an individual agent would declare is left out of one.
         let declaring = (!configuration.shared).then_some(agent);
-        let digest = match configuration.format {
-            Format::CodexToml => self.write_toml_entry(&configuration.path, declaring)?,
+        let (digest, created) = match configuration.format {
+            Format::CodexToml => (self.write_toml_entry(&configuration.path, declaring)?, 0),
             format => self.write_json_entry(&configuration.path, format, declaring)?,
         };
-        Ok(ChangeOperation::AddConfigurationEntry {
-            path: display(&configuration.path),
-            entry: format!("{}.{SERVER_NAME}", configuration.format.key()),
-            digest,
-            created_document,
-        })
+        Ok((
+            ChangeOperation::AddConfigurationEntry {
+                path: display(&configuration.path),
+                entry: format!("{}.{SERVER_NAME}", configuration.format.key()),
+                digest,
+                created_document,
+            },
+            created,
+        ))
     }
 
     fn write_toml_entry(&self, path: &Path, agent: Option<AgentTarget>) -> Result<Digest256> {
@@ -750,36 +758,58 @@ impl Installer {
             })
     }
 
+    /// Adds the server entry to a JSON document, one member spliced in and every other byte kept,
+    /// and returns its digest and how many objects on the way to it the edit created.
+    ///
+    /// An entry this host wrote that is already there is replaced in its place, and left alone
+    /// when it already says what this installation would write.
     fn write_json_entry(
         &self,
         path: &Path,
         format: Format,
         agent: Option<AgentTarget>,
-    ) -> Result<Digest256> {
-        let mut document = read_json(path)?;
+    ) -> Result<(Digest256, usize)> {
         let key = format.key();
-        let root = document.as_object_mut().ok_or_else(|| {
-            ControllerError::InvalidArgument(format!("{} is not a JSON object", display(path)))
-        })?;
-        let servers = root
-            .entry(key.to_owned())
-            .or_insert_with(|| Value::Object(Map::new()));
-        let servers = servers.as_object_mut().ok_or_else(|| {
-            ControllerError::InvalidArgument(format!(
-                "{key} in {} is not an object of servers",
-                display(path)
-            ))
-        })?;
-        if servers.contains_key(SERVER_NAME) {
-            self.guard_existing(path, format)?;
+        let members = [key, SERVER_NAME];
+        let value = self.entry_value(format, agent);
+        let entry = value.to_string();
+        let (edited, created) = match read_exact(path)? {
+            // A document this host creates holds the entry and the container on the way to it.
+            None => {
+                let text = serde_json::to_string_pretty(&json!({ key: { SERVER_NAME: value } }))
+                    .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+                (Some(format!("{text}\n")), members.len() - 1)
+            }
+            Some((text, document)) => {
+                let present = document
+                    .value_at(&text, &members)
+                    .map_err(|_| not_servers(key, path))?;
+                match present {
+                    None => {
+                        let inserted = json::insert(&text, &members, &entry)
+                            .map_err(|reason| not_exact(path, &reason))?;
+                        (Some(inserted.text), inserted.created)
+                    }
+                    Some(present) => {
+                        self.guard_existing(path, format)?;
+                        let unchanged = serde_json::from_str::<Value>(present)
+                            .is_ok_and(|present| present == value);
+                        let replaced = (!unchanged)
+                            .then(|| json::replace(&text, &members, &entry))
+                            .transpose()
+                            .map_err(|reason| not_exact(path, &reason))?;
+                        (replaced, 0)
+                    }
+                }
+            }
+        };
+        if let Some(edited) = edited {
+            write_atomically(path, edited.as_bytes(), PRIVATE)?;
         }
-        servers.insert(SERVER_NAME.to_owned(), self.entry_value(format, agent));
-        let text = serde_json::to_string_pretty(&document)
-            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
-        write_atomically(path, format!("{text}\n").as_bytes(), PRIVATE)?;
-        self.entry_digest_under(path, key)?.ok_or_else(|| {
+        let digest = self.entry_digest_under(path, key)?.ok_or_else(|| {
             ControllerError::InvalidArgument(format!("{} did not keep the entry", display(path)))
-        })
+        })?;
+        Ok((digest, created))
     }
 
     /// Refuses a removal that cannot be carried out, without carrying any of it out.
@@ -809,7 +839,10 @@ impl Installer {
         // refused the document would leave the agent with an entry pointing at a skill that is no
         // longer there.
         for operation in &record.manifest.operations {
-            if let ChangeOperation::AddConfigurationEntry { path, .. } = operation {
+            if let ChangeOperation::AddConfigurationEntry { path, entry, .. } = operation {
+                // Read as the removal will read it, so a document it could not edit, one that
+                // names a member twice among them, is refused here rather than half way through.
+                self.entry_digest_under(Path::new(path), entry_key(entry))?;
                 guard_access_controls(Path::new(path), CONFIGURATION_BY_HAND)?;
             }
         }
@@ -912,26 +945,10 @@ impl Installer {
             }
             return Ok(());
         }
-        if text.trim().is_empty() {
-            return Ok(());
-        }
-        let document: Value = serde_json::from_str(&text).map_err(|error| {
-            ControllerError::InvalidArgument(format!("{}: {error}", display(path)))
-        })?;
-        if !document.is_object() {
-            return Err(ControllerError::InvalidArgument(format!(
-                "{} is not a JSON object",
-                display(path)
-            )));
-        }
-        if let Some(container) = document.get(key)
-            && !container.is_object()
-        {
-            return Err(ControllerError::InvalidArgument(format!(
-                "{key} in {} is not an object of servers",
-                display(path)
-            )));
-        }
+        let document = json::Document::read(&text).map_err(|reason| not_exact(path, &reason))?;
+        document
+            .value_at(&text, &[key, SERVER_NAME])
+            .map_err(|_| not_servers(key, path))?;
         Ok(())
     }
 
@@ -1056,13 +1073,15 @@ impl Installer {
                 .and_then(|servers| servers.get(SERVER_NAME));
             return Ok(entry.map(|entry| digest_of(entry.to_string().trim().as_bytes())));
         }
-        let document: Value = serde_json::from_str(&text).map_err(|error| {
+        let document = json::Document::read(&text).map_err(|reason| not_exact(path, &reason))?;
+        // A container that is not an object holds no entry of this host's.
+        let Ok(Some(entry)) = document.value_at(&text, &[key, SERVER_NAME]) else {
+            return Ok(None);
+        };
+        let entry: Value = serde_json::from_str(entry).map_err(|error| {
             ControllerError::InvalidArgument(format!("{}: {error}", display(path)))
         })?;
-        Ok(document
-            .get(key)
-            .and_then(|servers| servers.get(SERVER_NAME))
-            .map(|entry| digest_of(entry.to_string().as_bytes())))
+        Ok(Some(digest_of(entry.to_string().as_bytes())))
     }
 
     /// Removes the server entry, when it is still the one that was written.
@@ -1072,6 +1091,7 @@ impl Installer {
         key: &str,
         digest: Digest256,
         created_document: bool,
+        containers: usize,
         params: &AgentToolsParams,
     ) -> Result<Removal> {
         let Some(present) = self.entry_digest_under(path, key)? else {
@@ -1113,21 +1133,24 @@ impl Installer {
             // The document itself stays, even when this host created it and the entry was the
             // only thing in it. A format-preserving editor keeps comments and spacing that are
             // nobody's business but the author's, and an empty-looking table is not evidence the
-            // file holds nothing of theirs. The JSON branch below can delete one because it
-            // reparses the document and can see that it holds nothing at all.
+            // file holds nothing of theirs. The JSON branch below can delete one because it reads
+            // the document exactly and can see that it holds nothing at all.
             write_atomically(path, document.to_string().as_bytes(), PRIVATE)?;
         } else {
-            let mut document = read_json(path)?;
-            if let Some(root) = document.as_object_mut()
-                && let Some(servers) = root.get_mut(key).and_then(Value::as_object_mut)
-            {
-                // Only the key the record names. A document that holds both shapes keeps whichever
-                // this installation did not write.
-                servers.remove(SERVER_NAME);
-            }
-            let empty = document
-                .as_object()
-                .is_some_and(|root| root.values().all(is_empty_object));
+            let text = read_to_string(path)?.unwrap_or_default();
+            // Only the entry the record names, and the container on the way to it when this
+            // installation made that and nothing else is left in it. A document this host created
+            // had nothing on the way to the entry before it. A document that holds both shapes
+            // keeps whichever this installation did not write.
+            let members = [key, SERVER_NAME];
+            let created = if created_document {
+                members.len() - 1
+            } else {
+                containers
+            };
+            let edited = json::remove(&text, &members, created)
+                .map_err(|reason| not_exact(path, &reason))?;
+            let empty = json::Document::read(&edited).is_ok_and(|document| document.is_empty());
             if created_document && empty {
                 // This host created the document and nothing else was ever added to it.
                 std::fs::remove_file(path).map_err(storage)?;
@@ -1136,9 +1159,7 @@ impl Installer {
                 }
                 return Ok(Removal::Removed);
             }
-            let text = serde_json::to_string_pretty(&document)
-                .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
-            write_atomically(path, format!("{text}\n").as_bytes(), PRIVATE)?;
+            write_atomically(path, edited.as_bytes(), PRIVATE)?;
         }
         Ok(Removal::Removed)
     }
@@ -1445,6 +1466,24 @@ struct InstallationRecord {
     /// never have written would delete somebody else's. It is reported instead.
     #[serde(default)]
     pending: Vec<ChangeOperation>,
+    /// The containers this installation made on the way to the configuration entries it added.
+    ///
+    /// A removal takes each out with its entry when nothing else is left in it, so a document is
+    /// left as the installation found it. A record an earlier build wrote names none, and its
+    /// removal takes the entry alone.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    containers: Vec<Containers>,
+}
+
+/// The containers one installation made on the way to one configuration entry.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct Containers {
+    /// The document, as the entry's operation names it.
+    path: String,
+    /// The entry, as its operation names it.
+    entry: String,
+    /// How many objects on the way to the entry the installation made, counted back from it.
+    made: usize,
 }
 
 impl InstallationRecord {
@@ -1460,6 +1499,43 @@ impl InstallationRecord {
     /// Returns true when the installation finished.
     fn is_complete(&self) -> bool {
         self.state == Self::INSTALLED && self.pending.is_empty()
+    }
+
+    /// Notes that writing `written` made `made` containers on the way to it.
+    ///
+    /// A repair that finds a container there made none, and the one an earlier write made is
+    /// still this installation's, so the larger count is kept.
+    fn note_containers(&mut self, written: &ChangeOperation, made: usize) {
+        let ChangeOperation::AddConfigurationEntry { path, entry, .. } = written else {
+            return;
+        };
+        match self
+            .containers
+            .iter_mut()
+            .find(|noted| noted.entry == *entry && names_path(&noted.path, Path::new(path)))
+        {
+            Some(noted) => {
+                noted.made = noted.made.max(made);
+                noted.path.clone_from(path);
+            }
+            None if made > 0 => self.containers.push(Containers {
+                path: path.clone(),
+                entry: entry.clone(),
+                made,
+            }),
+            None => {}
+        }
+    }
+
+    /// Returns how many containers this installation made on the way to a configuration entry.
+    fn containers_created(&self, operation: &ChangeOperation) -> usize {
+        let ChangeOperation::AddConfigurationEntry { path, entry, .. } = operation else {
+            return 0;
+        };
+        self.containers
+            .iter()
+            .find(|noted| noted.entry == *entry && names_path(&noted.path, Path::new(path)))
+            .map_or(0, |noted| noted.made)
     }
 }
 
@@ -1659,6 +1735,7 @@ fn read_record(text: &str) -> std::result::Result<InstallationRecord, String> {
             state: InstallationRecord::INSTALLING.to_owned(),
             manifest,
             pending: Vec::new(),
+            containers: Vec::new(),
         });
     };
     // An unversioned record is one of two shapes, and only the record itself can say which: the
@@ -1858,18 +1935,40 @@ fn read_to_string(path: &Path) -> Result<Option<String>> {
     }
 }
 
-fn read_json(path: &Path) -> Result<Value> {
-    match read_to_string(path)? {
-        None => Ok(Value::Object(Map::new())),
-        Some(text) if text.trim().is_empty() => Ok(Value::Object(Map::new())),
-        Some(text) => serde_json::from_str(&text).map_err(|error| {
-            ControllerError::InvalidArgument(format!("{}: {error}", display(path)))
-        }),
-    }
+/// Reads a JSON configuration document exactly, with the place of every member, or `None` when
+/// there is none.
+///
+/// The document is somebody's, so it is edited one member at a time with every other byte kept.
+/// A document this reader cannot read exactly is refused, naming it and why: one that names a
+/// member twice in any object among them, because which of the two a reader keeps is the reader's
+/// choice.
+fn read_exact(path: &Path) -> Result<Option<(String, json::Document)>> {
+    let Some(text) = read_to_string(path)? else {
+        return Ok(None);
+    };
+    let document = json::Document::read(&text).map_err(|reason| not_exact(path, &reason))?;
+    Ok(Some((text, document)))
 }
 
-fn is_empty_object(value: &Value) -> bool {
-    value.as_object().is_some_and(Map::is_empty)
+/// The refusal of a JSON document this host cannot edit exactly.
+fn not_exact(path: &Path, reason: &str) -> ControllerError {
+    ControllerError::InvalidArgument(format!(
+        "{} is not a document this host can edit exactly: {reason}",
+        display(path)
+    ))
+}
+
+/// The refusal of a document whose server container is not an object.
+fn not_servers(key: &str, path: &Path) -> ControllerError {
+    ControllerError::InvalidArgument(format!(
+        "{key} in {} is not an object of servers",
+        display(path)
+    ))
+}
+
+/// The key a recorded entry's servers are held under: `mcpServers` for `mcpServers.kalareach`.
+fn entry_key(entry: &str) -> &str {
+    entry.rsplit_once('.').map_or("mcpServers", |(key, _)| key)
 }
 
 /// Returns the command an agent runs to reach the tools.
@@ -3490,6 +3589,49 @@ mod tests {
                 "the document is byte for byte what it was"
             );
         }
+    }
+
+    /// An entry this host wrote that another build of it would write differently, here because the
+    /// command moved, is replaced in its place: the rest of the document keeps every byte, and the
+    /// removal still leaves the document as it was before the first installation.
+    #[test]
+    fn an_entry_this_host_wrote_is_replaced_in_its_place() {
+        let tree = Tree::create();
+        let params = params(AgentTarget::ClaudeCode, InstallScope::User);
+        let document = tree.home().join(".claude.json");
+        let original = "{\n\t\"mcpServers\": {\n\t\t\"theirs\": {\"command\": \"their-server\"}\n\t},\n\t\
+                        \"theme\": \"dark\"\n}\n";
+        std::fs::write(&document, original).expect("writes");
+        tree.installer().install(&params).expect("installs");
+        let first = std::fs::read_to_string(&document).expect("reads");
+        let moved = Installer::new(
+            tree.home(),
+            tree.root.join("state").join("agent-tools"),
+            "/usr/local/bin/kr".to_owned(),
+        );
+        // A file the first installation wrote goes missing, so the second one repairs rather than
+        // finding everything in place.
+        std::fs::remove_file(
+            tree.home()
+                .join(".claude")
+                .join("skills")
+                .join(SKILL_NAME)
+                .join("TOOLS.md"),
+        )
+        .expect("removes one file");
+        moved.install(&params).expect("repairs");
+        let second = std::fs::read_to_string(&document).expect("reads");
+        assert_eq!(
+            second,
+            first.replace("/opt/kalareach/kr", "/usr/local/bin/kr"),
+            "only the entry changed"
+        );
+        moved.remove(&params).expect("removes");
+        assert_eq!(
+            std::fs::read_to_string(&document).expect("reads"),
+            original,
+            "the document is byte for byte what it was"
+        );
     }
 
     /// Where each agent's skills and configuration live under a user's home, name by name.
