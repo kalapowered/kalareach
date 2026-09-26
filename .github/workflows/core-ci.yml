@@ -410,8 +410,10 @@ jobs:
       # decision a worker start makes about breaking away from the daemon's job, the environment's
       # scheduled task and the starter it runs, the real-worker host tests under cargo through that
       # task and from the built executable as the shipping daemon starts a worker, the first-owner
-      # pairing against a real control daemon on loopback, and the contact skill's installation and
-      # removal with the access reader it compares a replacement with. "The attach client" means the part of it that runs
+      # pairing against a real control daemon on loopback, the contact skill's installation and
+      # removal with the access reader it compares a replacement with, the directory secret store
+      # and the libsodium boundary, and the plugin catalogue's package store with the daemon's
+      # catalogue and plugin groups over it. "The attach client" means the part of it that runs
       # here - `crates/kr-cli/tests/attach.rs` is a Unix file, so what passes is that crate's library
       # and its path tests rather than a real attachment. The contact tools run in
       # `crates/kr-cli/tests/contact_windows.rs`, beside the Unix suite, with the tool server
@@ -522,10 +524,26 @@ jobs:
         run: cargo test --locked -p kr-controller --test agent_tools --test contact_skill
 
       # The directory secret store a test run or `--secret-store file` names flushes each name it
-      # writes. Its library only: `tests/libsodium.rs` compares a source path with `/` separators.
-      - name: Test the directory secret store
+      # creates, replaces or removes, a directory made for a secret's scope among them, and reports
+      # a flush that is refused. The crate's whole suite runs, the libsodium boundary among it.
+      - name: Test the directory secret store and the libsodium boundary
         if: ${{ !cancelled() }}
-        run: cargo test --locked -p kr-crypto --lib
+        run: cargo test --locked -p kr-crypto
+
+      # The plugin catalogue's package store on this platform: a package staged in a directory of
+      # its own is renamed into place whole once it is checked, repaired where it lies, and removed
+      # whole to make room, each through directory handles the store opens without following a
+      # link. A directory the store holds open cannot be renamed here, so the store holds none of
+      # the directories it renames.
+      - name: Test the plugin catalogue's package store
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p kr-plugin-catalogue
+
+      # The catalogue and plugin groups through the daemon, over that store: repositories added,
+      # synchronised, pinned and removed, and packages installed, enabled, pinned and removed.
+      - name: Install plugins through the daemon's catalogue
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p kr-controller --test catalogue
 
       # What the originating agent may do with a question on this platform's identities: a caller
       # token works only for the helper it was issued to.

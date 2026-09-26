@@ -781,8 +781,25 @@ fn windows() -> Vec<Step> {
         ),
         Step::cargo(
             Group::Rust,
-            "the directory secret store",
-            &["test", "--locked", "-p", "kr-crypto", "--lib"],
+            "the directory secret store and the libsodium boundary",
+            &["test", "--locked", "-p", "kr-crypto"],
+        ),
+        Step::cargo(
+            Group::Rust,
+            "the plugin catalogue's package store",
+            &["test", "--locked", "-p", "kr-plugin-catalogue"],
+        ),
+        Step::cargo(
+            Group::Rust,
+            "plugins installed through the daemon's catalogue",
+            &[
+                "test",
+                "--locked",
+                "-p",
+                "kr-controller",
+                "--test",
+                "catalogue",
+            ],
         ),
         Step::cargo(
             Group::Rust,
