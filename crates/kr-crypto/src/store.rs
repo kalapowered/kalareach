@@ -305,6 +305,22 @@ impl FileStore {
         path
     }
 
+    /// Flushes each directory from the store's own down to `scope` into the one above it, so that
+    /// each of their names survives a crash.
+    fn flush_scope(&self, scope: &Path) -> Result<()> {
+        let below = scope
+            .strip_prefix(&self.directory)
+            .map_err(|_| CryptoError::SecretStore {
+                message: format!("{} is outside the store", scope.display()),
+            })?;
+        let mut above = self.directory.clone();
+        for part in below.components() {
+            flush(&above, kr_flush::NameKind::Directory)?;
+            above.push(part);
+        }
+        Ok(())
+    }
+
     /// Rejects a path whose own entry or any directory below the store root is a link.
     ///
     /// The root is checked when the store opens. Everything under it is checked on use, because a
@@ -351,6 +367,11 @@ impl SecretStore for FileStore {
         })?;
         self.reject_links(&path)?;
         set_mode(parent, 0o700)?;
+        // A directory's name is an entry in the one above it, and a crash can undo a directory
+        // made just now as it can undo a file's name. Every directory between the store's own and
+        // the secret's is flushed into the one above it before the secret is written: the ones
+        // this write made, and any an earlier write made and could not flush.
+        self.flush_scope(parent)?;
 
         // The staging name starts with a dot, which no valid secret name can produce, and carries
         // the process and a counter, so two concurrent writes never share a file and a write never
@@ -401,13 +422,28 @@ impl SecretStore for FileStore {
             let _ = std::fs::write(&path, &zeroes);
             sodium::memzero(&mut zeroes);
         }
+        let Some(scope) = path.parent() else {
+            return Err(CryptoError::SecretStore {
+                message: "a secret path has a parent directory".to_owned(),
+            });
+        };
         match std::fs::remove_file(&path) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(CryptoError::SecretStore {
-                message: error.to_string(),
-            }),
+            Ok(()) => {}
+            // Nothing here to remove. A deletion before this one may have removed the name and
+            // had its flush refused, so the directory is flushed all the same where it is one.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if !std::fs::symlink_metadata(scope).is_ok_and(|scope| scope.is_dir()) {
+                    return Ok(());
+                }
+            }
+            Err(error) => {
+                return Err(CryptoError::SecretStore {
+                    message: error.to_string(),
+                });
+            }
         }
+        // The name is gone, and stays gone across a crash once its directory is flushed.
+        sync_directory(scope)
     }
 
     #[cfg(unix)]
@@ -584,13 +620,16 @@ pub(crate) fn write_owner_only(path: &Path, secret: &[u8]) -> Result<()> {
         })
 }
 
-/// Flushes the directory a file's name was just created or replaced in, so the name survives a
-/// crash.
+/// Flushes the directory a file's name was just created, replaced or removed in, so the change
+/// survives a crash.
 pub(crate) fn sync_directory(directory: &Path) -> Result<()> {
-    kr_flush::flush_directory(directory, kr_flush::NameKind::File).map_err(|error| {
-        CryptoError::SecretStore {
-            message: format!("sync {}: {error}", directory.display()),
-        }
+    flush(directory, kr_flush::NameKind::File)
+}
+
+/// Flushes `directory` after a name of `kind` in it changed, and reports a flush that is refused.
+fn flush(directory: &Path, kind: kr_flush::NameKind) -> Result<()> {
+    kr_flush::flush_directory(directory, kind).map_err(|error| CryptoError::SecretStore {
+        message: format!("sync {}: {error}", directory.display()),
     })
 }
 
