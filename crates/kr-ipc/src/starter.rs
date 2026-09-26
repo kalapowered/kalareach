@@ -252,6 +252,15 @@ pub fn take_claim(
     Ok(None)
 }
 
+/// Whether the claim for `request` has been taken: a starter created its taken marker.
+///
+/// A command that left a claim and ran the environment's task asks this to tell a task whose
+/// starter never ran from a daemon that was started and did not answer.
+#[must_use]
+pub fn claim_taken(_environment: &EnvironmentPaths, _request: Uuid) -> bool {
+    todo!("not built yet")
+}
+
 /// Reads one claim this host wrote.
 fn read_claim(path: &Path) -> Result<StartClaim> {
     let bytes = crate::paths::read_owner_only_file(path, MAX_RECORD_LEN)?.ok_or_else(|| {
@@ -338,7 +347,7 @@ pub fn clear_recorded_session(environment: &EnvironmentPaths) -> Result<()> {
 pub use self::windows::{
     ChildCommand, ChildRefusal, LaunchListener, LaunchStream, MAX_LAUNCH_FRAME, NamedLock,
     PeerProcess, Reached, StartedChild, account_sid, connect, current_session, current_user_sid,
-    in_any_job, pipe_client_is_this_user, process_facts, start_child,
+    in_any_job, open_log, pipe_client_is_this_user, process_facts, start_child,
 };
 
 #[cfg(all(windows, any(test, feature = "testing")))]
@@ -959,6 +968,19 @@ mod windows {
         Ok(written)
     }
 
+    /// Opens the environment's daemon log for appending and reading, creating it where it is
+    /// absent, and takes it only when it is a regular file whose access-control list grants no
+    /// account this host does not trust.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IpcError::UntrustedFile`](crate::IpcError::UntrustedFile) for a link, something
+    /// other than a regular file, or a list that grants another account, and an I/O failure when
+    /// it cannot be opened or its list cannot be read.
+    pub fn open_log(_path: &Path) -> crate::Result<std::fs::File> {
+        todo!("not built yet")
+    }
+
     /// What a starter is asked to run.
     #[derive(Clone, Copy, Debug)]
     pub struct ChildCommand<'a> {
@@ -972,6 +994,9 @@ mod windows {
         pub environment: &'a [(String, String)],
         /// The login session the child must run in: the daemon's.
         pub session: u32,
+        /// Where the child's standard output and standard error go: a file the starter opened,
+        /// which the child is given and nothing else of the starter's is. `None` gives it neither.
+        pub output: Option<BorrowedHandle<'a>>,
     }
 
     /// A child the starter created, checked and let run.
@@ -2038,6 +2063,34 @@ mod tests {
         );
     }
 
+    /// A command that left a claim can tell whether a starter took it: not before one did, and
+    /// from then on for the rest of the boot, whether the claim was acted on or had lapsed.
+    #[test]
+    fn a_claim_is_known_to_be_taken_once_a_starter_took_it() {
+        let host = TempHost::create();
+        let environment = host.environment();
+        let left = claim(10_000);
+        assert!(
+            !claim_taken(&environment, left.request),
+            "no claim was left yet"
+        );
+        leave_claim(&environment, &left).expect("the claim is left");
+        assert!(
+            !claim_taken(&environment, left.request),
+            "no starter has taken it"
+        );
+        let lapsed = claim(1_000);
+        leave_claim(&environment, &lapsed).expect("a second claim is left");
+        take_claim(&environment, &boot(1), 5_000)
+            .expect("the directory is read")
+            .expect("the live claim is taken");
+        assert!(claim_taken(&environment, left.request), "the live one");
+        assert!(
+            claim_taken(&environment, lapsed.request),
+            "and the lapsed one, which was taken and not acted on"
+        );
+    }
+
     /// Leaving the same request again keeps the claim, and the deadline, it left the first time.
     #[test]
     fn a_request_left_again_keeps_its_first_deadline() {
@@ -2560,6 +2613,7 @@ mod tests {
                 directory: &directory,
                 environment: &[],
                 session,
+                output: None,
             });
             match (plan, outcome) {
                 (JobPlan::Refuse, Err(refusal)) => {
@@ -2588,6 +2642,21 @@ mod tests {
         /// built, and says which case it is.
         const ROLE: &str = "KR_STARTER_TEST_ROLE";
 
+        /// The variable that names the file the helper hands its child as the child's output.
+        const OUTPUT: &str = "KR_STARTER_TEST_OUTPUT";
+
+        /// What a started process is given to run when it has somewhere to write: a line to each of
+        /// its standard output and standard error, and then it ends.
+        fn writing_command() -> (std::path::PathBuf, String) {
+            let shell =
+                std::path::PathBuf::from(std::env::var_os("COMSPEC").expect("a command shell"));
+            let line = format!(
+                "\"{}\" /d /c \"echo to its output& echo to its error 1>&2\"",
+                shell.display()
+            );
+            (shell, line)
+        }
+
         /// Acts as a starter, once its parent has put it in the jobs a case needs.
         #[test]
         #[ignore = "a helper process of the job tests below, which start it themselves"]
@@ -2607,12 +2676,21 @@ mod tests {
             };
             let (shell, line) = waiting_command();
             let directory = std::env::temp_dir();
+            let written = std::env::var_os(OUTPUT).map(|path| {
+                open_log(std::path::Path::new(&path)).expect("the output file this case names")
+            });
+            let (shell, line) = if written.is_some() {
+                writing_command()
+            } else {
+                (shell, line)
+            };
             let outcome = start_child(&ChildCommand {
                 application: &shell,
                 command_line: &line,
                 directory: &directory,
                 environment: &[("KR_STARTER_TEST_MARK".to_owned(), "set".to_owned())],
                 session,
+                output: written.as_ref().map(|file| file.as_handle()),
             });
             match outcome {
                 Ok(started) => println!(
@@ -2632,20 +2710,33 @@ mod tests {
         /// Runs the helper as a starter inside `jobs`, outermost first, and returns the line it
         /// reported with the jobs, which are closed when they are dropped.
         fn starter_in(role: &str, jobs: &[u32]) -> (String, Vec<Job>) {
-            let mut helper =
-                std::process::Command::new(std::env::current_exe().expect("this test executable"))
-                    .args([
-                        "starter::tests::windows::a_starter_in_the_jobs_its_parent_built",
-                        "--exact",
-                        "--ignored",
-                        "--nocapture",
-                        "--test-threads=1",
-                    ])
-                    .env(ROLE, role)
-                    .stdin(std::process::Stdio::piped())
-                    .stdout(std::process::Stdio::piped())
-                    .spawn()
-                    .expect("the helper starts");
+            starter_writing_to(role, jobs, None)
+        }
+
+        /// Runs the helper as [`starter_in`] does, handing its child `output` as the child's
+        /// standard output and standard error when one is given.
+        fn starter_writing_to(
+            role: &str,
+            jobs: &[u32],
+            output: Option<&std::path::Path>,
+        ) -> (String, Vec<Job>) {
+            let mut command =
+                std::process::Command::new(std::env::current_exe().expect("this test executable"));
+            command
+                .args([
+                    "starter::tests::windows::a_starter_in_the_jobs_its_parent_built",
+                    "--exact",
+                    "--ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(ROLE, role)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped());
+            if let Some(output) = output {
+                command.env(OUTPUT, output);
+            }
+            let mut helper = command.spawn().expect("the helper starts");
             let built: Vec<Job> = jobs
                 .iter()
                 .map(|flags| {
@@ -2718,6 +2809,93 @@ mod tests {
                 reported.starts_with("result refused remaining=None")
                     && reported.contains("login session"),
                 "the child was refused and ended: {reported:?}"
+            );
+        }
+
+        /// A directory of one test's own under the temporary directory, removed when dropped.
+        struct Scratch(std::path::PathBuf);
+
+        impl Scratch {
+            fn create() -> Self {
+                let path =
+                    std::env::temp_dir().join(format!("kr-starter-output-{}", crate::new_uuid()));
+                std::fs::create_dir(&path).expect("a directory of this test's own");
+                Self(path)
+            }
+        }
+
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        /// A file the starter hands its child is where the child's standard output and standard
+        /// error both go, appended to what the file already held.
+        #[test]
+        fn a_child_writes_its_output_and_its_errors_to_the_file_it_is_handed() {
+            let directory = Scratch::create();
+            let log = directory.0.join("controller.log");
+            std::fs::write(&log, "an earlier start\r\n").expect("what the log held before");
+            let (reported, _jobs) = starter_writing_to("keeping", &[0], Some(&log));
+            let words: Vec<&str> = reported.split(' ').collect();
+            assert_eq!(&words[..2], ["result", "started"], "started: {reported:?}");
+            let pid: u32 = words[2].parse().expect("a process identifier");
+            let start_value: u64 = words[3].parse().expect("a start value");
+            // The child writes two lines and ends; the number stops naming it once it has.
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while crate::identity::process_start_identity(pid)
+                .is_ok_and(|identity| identity.start_value.get() == start_value)
+            {
+                assert!(
+                    Instant::now() < deadline,
+                    "the child ended within the bound"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            let written = std::fs::read_to_string(&log).expect("the log");
+            assert!(
+                written.starts_with("an earlier start"),
+                "what was there stays: {written:?}"
+            );
+            assert!(
+                written.contains("to its output") && written.contains("to its error"),
+                "both streams reach the file: {written:?}"
+            );
+        }
+
+        /// The daemon log is taken only as a regular file whose list grants no account this host
+        /// does not trust; a new one is created, and one that is there is appended to.
+        #[test]
+        fn a_log_is_opened_only_as_a_regular_file_of_this_users_alone() {
+            use std::io::Write as _;
+
+            let directory = Scratch::create();
+            let log = directory.0.join("controller.log");
+            let mut opened = open_log(&log).expect("a new log is created");
+            opened.write_all(b"first\n").expect("written");
+            drop(opened);
+            let mut opened = open_log(&log).expect("the log is opened again");
+            opened.write_all(b"second\n").expect("appended");
+            drop(opened);
+            assert_eq!(
+                std::fs::read_to_string(&log).expect("the log"),
+                "first\nsecond\n"
+            );
+
+            let folder = directory.0.join("a-directory");
+            std::fs::create_dir(&folder).expect("a directory where the log would be");
+            assert!(open_log(&folder).is_err(), "a directory is not a log");
+
+            let shared = directory.0.join("shared.log");
+            crate::paths::create_file_with_descriptor(&shared, "D:P(A;;GA;;;OW)(A;;FR;;;WD)")
+                .expect("a log everyone may read");
+            assert!(
+                matches!(
+                    open_log(&shared),
+                    Err(crate::IpcError::UntrustedFile { .. })
+                ),
+                "a log another account may read is refused"
             );
         }
     }

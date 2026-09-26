@@ -41,6 +41,9 @@ tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-th
 tokio-util.workspace = true
 
 [dev-dependencies]
+# The Windows start and pairing tests register a test environment's scheduled task and host a
+# daemon that starts its workers through it.
+kr-controller = { workspace = true, features = ["testing"] }
 # The attach tests host a real session and run `kr` against it on a real pseudo-terminal.
 kr-ipc = { workspace = true, features = ["testing"] }
 kr-worker.workspace = true

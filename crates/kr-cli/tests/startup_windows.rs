@@ -24,6 +24,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use kr_controller::supervision::windows::{
     self as scheduled, LogonType, RegisteredTask, Standing, TaskDefinition, decode_output,
@@ -34,6 +35,8 @@ use kr_protocol::ids::EnvironmentId;
 use serde_json::Value;
 
 mod support;
+#[path = "../../kr-controller/tests/teardown/mod.rs"]
+mod teardown;
 
 /// Returns an executable the workspace builds beside this test, when it has been built.
 fn beside_this_test(name: &str) -> Option<PathBuf> {
@@ -470,4 +473,752 @@ fn the_service_start_is_refused_here_with_the_standalone_start_named() {
     );
     assert_eq!(exported(&host.definition().name), None);
     assert!(!host.document().exists());
+}
+
+// `kr new` through the task.
+
+/// The switch that lets a test have the daemon the task starts keep its key in this account's own
+/// credential store, which is where an installed daemon keeps it and where the person's own
+/// credentials are. A run sets it only on a machine that is there to be tested.
+const PLATFORM_STORE_SWITCH: &str = "KR_TEST_PLATFORM_SECRET_STORE";
+
+/// Stops a test that would have the daemon write to this account's credential store, unless the
+/// run says it may.
+fn platform_store_allowed() {
+    assert_eq!(
+        std::env::var(PLATFORM_STORE_SWITCH).as_deref(),
+        Ok("1"),
+        "the daemon this test has the task start keeps its key in this account's credential store; \
+         the test runs only where {PLATFORM_STORE_SWITCH}=1 says it may"
+    );
+}
+
+/// A program in the system directory.
+fn system32(name: &str) -> PathBuf {
+    PathBuf::from(std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into()))
+        .join("System32")
+        .join(name)
+}
+
+/// PowerShell 7, the shell a session here runs.
+fn powershell() -> String {
+    let base = std::env::var_os("ProgramFiles").unwrap_or_else(|| "C:\\Program Files".into());
+    let candidate = PathBuf::from(base)
+        .join("PowerShell")
+        .join("7")
+        .join("pwsh.exe");
+    assert!(
+        candidate.is_file(),
+        "PowerShell 7, the shell a session here runs, is not installed at {}",
+        candidate.display()
+    );
+    candidate.display().to_string()
+}
+
+/// The processes running `image` whose command line names `root`: one test's own daemons and
+/// workers, since every one of them is told the test's own tree.
+fn processes(image: &str, root: &Path) -> Vec<u32> {
+    let script = format!(
+        "Get-CimInstance Win32_Process -Filter \"Name = '{image}'\" | Where-Object {{ \
+         $_.CommandLine -and $_.CommandLine.Contains('{}') }} | ForEach-Object {{ $_.ProcessId }}",
+        root.display()
+    );
+    let output = Command::new(system32("WindowsPowerShell\\v1.0\\powershell.exe"))
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output()
+        .expect("the processes are listed");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.trim().parse().ok())
+        .collect()
+}
+
+/// Ends the daemon the task started for this tree, every worker it started, and removes the keys it
+/// kept in this account's credential store, when the test ends however it ends. Only what names
+/// this test's own tree is ended.
+struct EndsWhatItStarted<'a> {
+    host: &'a Host,
+}
+
+impl Drop for EndsWhatItStarted<'_> {
+    fn drop(&mut self) {
+        for image in ["kr-worker.exe", "kr-controller.exe"] {
+            for pid in processes(image, self.host.temp.root()) {
+                let _ = Command::new(system32("taskkill.exe"))
+                    .args(["/PID", &pid.to_string(), "/F"])
+                    .output();
+            }
+        }
+        if let Ok(store) =
+            kr_crypto::store::PlatformStore::open(kr_ipc::verify::CONTROLLER_SECRET_SERVICE)
+        {
+            let scope = self.host.temp.environment_id().to_string();
+            for purpose in kr_protocol::pairing::KeyPurpose::ALL {
+                if let Ok(name) = kr_crypto::store::SecretName::device_key(&scope, purpose) {
+                    let _ = kr_crypto::store::SecretStore::delete(&store, &name);
+                }
+            }
+        }
+    }
+}
+
+impl Host {
+    /// Has the daemon the task starts for this tree, its workers and its keys go when the test ends.
+    fn ends_what_it_started(&self) -> EndsWhatItStarted<'_> {
+        EndsWhatItStarted { host: self }
+    }
+
+    /// `kr new` for a session of its own, run by `kr` at `program`.
+    fn new_session_with(&self, program: &Path) -> Command {
+        let cwd = self.temp.root().display().to_string();
+        let shell = powershell();
+        let mut command = Command::new(program);
+        command
+            .args([
+                "--json",
+                "new",
+                "--invisible",
+                "--headless",
+                "--cwd",
+                &cwd,
+                "--shell",
+                &shell,
+            ])
+            .env(
+                kr_ipc::paths::RUNTIME_DIR_VARIABLE,
+                self.temp.paths().runtime_root(),
+            )
+            .env(
+                kr_ipc::paths::STATE_DIR_VARIABLE,
+                self.temp.paths().state_root(),
+            )
+            .current_dir(installation())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        command
+    }
+
+    /// `kr new` for a session of its own, run by this installation's `kr`.
+    fn new_session(&self) -> Command {
+        self.new_session_with(&support::kr())
+    }
+
+    /// The requests to start the daemon that are waiting for a starter.
+    fn claims(&self) -> Vec<String> {
+        std::fs::read_dir(self.environment().start_claims_dir())
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
+/// How long a command this file starts is given before the test calls it a failure.
+const LIVENESS_DEADLINE: Duration = Duration::from_secs(120);
+
+/// Waits a bounded time for a command this test started, reading both of its pipes as it goes.
+fn finish(mut child: std::process::Child, what: &str) -> Output {
+    let drain = |pipe: Option<Box<dyn std::io::Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut bytes);
+            }
+            bytes
+        })
+    };
+    let stdout = drain(
+        child
+            .stdout
+            .take()
+            .map(|pipe| Box::new(pipe) as Box<dyn std::io::Read + Send>),
+    );
+    let stderr = drain(
+        child
+            .stderr
+            .take()
+            .map(|pipe| Box::new(pipe) as Box<dyn std::io::Read + Send>),
+    );
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("the command's state") {
+            break status;
+        }
+        if started.elapsed() > LIVENESS_DEADLINE {
+            let _ = child.kill();
+            panic!("{what} did not finish within {LIVENESS_DEADLINE:?}");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    Output {
+        status,
+        stdout: stdout.join().expect("standard output is read"),
+        stderr: stderr.join().expect("standard error is read"),
+    }
+}
+
+/// The build identity this test presents to a daemon.
+fn build() -> kr_protocol::ids::BuildId {
+    kr_protocol::ids::BuildId::new("kr-test/0").expect("a build identifier")
+}
+
+/// Asks an environment's daemon one question.
+fn ask<T: kr_protocol::wire::WireMessage>(
+    environment: &EnvironmentPaths,
+    method: kr_protocol::method::Method,
+    params: &impl serde::Serialize,
+) -> T {
+    let endpoint = environment.controller_endpoint().expect("an endpoint");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    runtime.block_on(async {
+        let mut client = kr_ipc::client::LocalClient::connect(
+            &endpoint,
+            kr_protocol::local::LocalClientKind::Cli,
+            build(),
+        )
+        .await
+        .expect("reaches the daemon");
+        client
+            .request(method, params)
+            .await
+            .expect("the call reaches the daemon")
+            .expect("the daemon answers")
+            .to_typed()
+            .expect("decodes")
+    })
+}
+
+/// The sessions an environment's daemon holds and has not closed.
+fn live_sessions(environment: &EnvironmentPaths) -> Vec<String> {
+    let listed: kr_protocol::session::SessionListResult = ask(
+        environment,
+        kr_protocol::method::Method::SessionList,
+        &kr_protocol::session::SessionListParams {
+            environment_id: kr_protocol::scalars::Nullable::some(environment.environment_id()),
+            include_closed: false,
+        },
+    );
+    listed
+        .sessions
+        .iter()
+        .map(|summary| summary.session_id.to_string())
+        .collect()
+}
+
+/// Closes a session this test created, through the daemon that holds it.
+fn close(host: &Host, session: &str) {
+    let output = host.kr(&["--json", "close", session]);
+    assert!(
+        output.status.success(),
+        "kr close {session}: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+/// KR-REQ-07.12: with the standalone start chosen and no daemon running, three `kr new` at once
+/// each leave a request for the task's starter and run the task; the starters start three daemons,
+/// the environment's singleton lock leaves one, and that one serves every caller: each `kr new`
+/// succeeds with a live session, and the one daemon still running holds all three, at the
+/// environment's first generation. What it writes is in the environment's log. `kr doctor` then
+/// reports the task as this environment's own and the one this installation registers.
+#[test]
+#[ignore = "the daemon the task starts keeps its key in this account's credential store; run with \
+            --ignored where KR_TEST_PLATFORM_SECRET_STORE=1"]
+fn three_first_invocations_at_once_leave_one_daemon_that_serves_every_caller() {
+    platform_store_allowed();
+    let host = Host::create();
+    let _task = host.removes_its_task();
+    let _started = host.ends_what_it_started();
+    let chose = host.kr(&["--json", "host", "startup", "--set", "standalone"]);
+    assert!(chose.status.success(), "{}", document(&chose, "the choice"));
+
+    let running: Vec<std::process::Child> = (0..3)
+        .map(|_| host.new_session().spawn().expect("kr new starts"))
+        .collect();
+    let mut sessions = Vec::new();
+    for (index, child) in running.into_iter().enumerate() {
+        let what = format!("kr new {index}");
+        let output = finish(child, &what);
+        let created = document(&output, &what);
+        assert!(
+            output.status.success(),
+            "{what} created its session: {created}; it said {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(created["state"], "live", "{what}: {created}");
+        sessions.push(
+            created["session_id"]
+                .as_str()
+                .expect("a session identifier")
+                .to_owned(),
+        );
+    }
+
+    let root = host.temp.root();
+    let settled = Instant::now();
+    while processes("kr-controller.exe", root).len() != 1 {
+        assert!(
+            settled.elapsed() < LIVENESS_DEADLINE,
+            "one daemon of this environment is left running: {:?}",
+            processes("kr-controller.exe", root)
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let environment = host.environment();
+    let info: kr_protocol::hostinfo::HostInfoResult =
+        ask(&environment, kr_protocol::method::Method::HostInfo, &());
+    assert_eq!(info.environment_id, host.temp.environment_id());
+    assert_eq!(
+        info.generation.get(),
+        1,
+        "the environment's generation advanced once, for the one daemon that took it"
+    );
+    let live = live_sessions(&environment);
+    for session in &sessions {
+        assert!(
+            live.contains(session),
+            "{session} is the one daemon's: {live:?}"
+        );
+    }
+    let log =
+        std::fs::read_to_string(environment.state_dir().join("controller.log")).unwrap_or_default();
+    assert!(
+        log.contains(&format!(
+            "kr-controller: environment {} generation 1",
+            host.temp.environment_id()
+        )),
+        "what the daemon writes is in the environment's log: {log}"
+    );
+
+    let doctor = host.kr(&["--json", "doctor"]);
+    let report = document(&doctor, "kr doctor");
+    let check = report["doctor"]["checks"]
+        .as_array()
+        .and_then(|checks| checks.iter().find(|check| check["id"] == "startup-task"))
+        .unwrap_or_else(|| panic!("kr doctor reports the task: {report}"));
+    assert_eq!(check["status"], "ok", "{check}");
+
+    for session in &sessions {
+        close(&host, session);
+    }
+}
+
+/// The variable that makes the helper test below act, naming the `kr` it runs.
+const HELPER: &str = "KR_STARTUP_TEST_KR";
+
+/// Runs `kr new` once its parent has put it in the job the case needs, and reports what it did.
+#[test]
+#[ignore = "a helper process of the job test below, which starts it itself"]
+fn a_kr_new_in_the_job_its_parent_built() {
+    use std::io::BufRead as _;
+
+    let Some(kr) = std::env::var_os(HELPER) else {
+        return;
+    };
+    let mut word = String::new();
+    std::io::stdin()
+        .lock()
+        .read_line(&mut word)
+        .expect("the parent's word that the job is in place");
+    let host_root = std::env::var_os("KR_STARTUP_TEST_ROOT").expect("the tree's root");
+    let shell = powershell();
+    let output = Command::new(&kr)
+        .args([
+            "--json",
+            "new",
+            "--invisible",
+            "--headless",
+            "--cwd",
+            &Path::new(&host_root).display().to_string(),
+            "--shell",
+            &shell,
+        ])
+        .current_dir(Path::new(&kr).parent().expect("kr's directory"))
+        .output()
+        .expect("kr new runs");
+    println!(
+        "result {} {}",
+        output.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&output.stdout).replace(['\r', '\n'], " ")
+    );
+}
+
+/// KR-REQ-07.12, KR-REQ-07.58: the daemon the task's starter starts is in none of the jobs of the
+/// command that asked for it. `kr new` runs inside a job that ends its members when it closes; the
+/// job is closed once the command has returned, and the daemon still answers and still holds the
+/// session the command created.
+#[test]
+#[ignore = "the daemon the task starts keeps its key in this account's credential store; run with \
+            --ignored where KR_TEST_PLATFORM_SECRET_STORE=1"]
+fn the_daemon_the_task_starts_is_in_none_of_the_callers_jobs() {
+    use std::io::{BufRead as _, Write as _};
+    use std::os::windows::io::AsHandle as _;
+
+    platform_store_allowed();
+    let host = Host::create();
+    let _task = host.removes_its_task();
+    let _started = host.ends_what_it_started();
+    let chose = host.kr(&["--json", "host", "startup", "--set", "standalone"]);
+    assert!(chose.status.success(), "{}", document(&chose, "the choice"));
+
+    let mut helper = Command::new(std::env::current_exe().expect("this test executable"))
+        .args([
+            "a_kr_new_in_the_job_its_parent_built",
+            "--exact",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(HELPER, support::kr())
+        .env("KR_STARTUP_TEST_ROOT", host.temp.root())
+        .env(
+            kr_ipc::paths::RUNTIME_DIR_VARIABLE,
+            host.temp.paths().runtime_root(),
+        )
+        .env(
+            kr_ipc::paths::STATE_DIR_VARIABLE,
+            host.temp.paths().state_root(),
+        )
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("the helper starts");
+    let job = kr_ipc::starter::Job::create(kr_ipc::starter::KILL_ON_JOB_CLOSE)
+        .expect("a job that ends its members when it closes");
+    job.assign(helper.as_handle())
+        .expect("the helper, and the kr it runs, are in it");
+    writeln!(helper.stdin.take().expect("the helper's input"), "go").expect("the word is given");
+    let lines: Vec<String> = std::io::BufReader::new(helper.stdout.take().expect("its output"))
+        .lines()
+        .map_while(std::result::Result::ok)
+        .collect();
+    let status = helper.wait().expect("the helper ends");
+    assert!(status.success(), "the helper ran cleanly: {lines:?}");
+    let reported = lines
+        .iter()
+        .find_map(|line| line.find("result ").map(|at| line[at + 7..].to_owned()))
+        .unwrap_or_else(|| panic!("the helper reports: {lines:?}"));
+    let (code, created) = reported.split_once(' ').expect("a code and a document");
+    assert_eq!(code, "0", "kr new created its session: {created}");
+    let created: Value = serde_json::from_str(created.trim()).expect("kr new's document");
+    let session = created["session_id"]
+        .as_str()
+        .expect("a session identifier")
+        .to_owned();
+
+    drop(job);
+    std::thread::sleep(Duration::from_secs(1));
+    let environment = host.environment();
+    assert!(
+        live_sessions(&environment).contains(&session),
+        "the daemon outlived the job of the command that asked for it, and holds its session"
+    );
+    close(&host, &session);
+}
+
+/// KR-REQ-07.12, KR-REQ-07.13: with the standalone start chosen, a task that is missing, that is not
+/// this environment's own, or that an earlier installation left, and a daemon missing from beside
+/// `kr`, each end `kr new` with `HOST_NOT_CONFIGURED` and what to do about it, and the task is not
+/// run: no request is left for a starter, and a task that is there has not run.
+#[test]
+fn a_missing_foreign_or_stale_task_or_a_missing_daemon_is_named_and_nothing_is_run() {
+    let host = Host::create();
+    let _task = host.removes_its_task();
+    host.choose("standalone");
+    let name = host.definition().name;
+    let refused = |output: Output, what: &str| -> String {
+        let failed = document(&output, what);
+        assert_eq!(output.status.code(), Some(3), "{what}: {failed}");
+        assert_eq!(failed["code"], "HOST_NOT_CONFIGURED", "{what}: {failed}");
+        failed["message"].as_str().unwrap_or_default().to_owned()
+    };
+
+    let missing = refused(
+        finish(host.new_session().spawn().expect("kr new"), "kr new"),
+        "missing",
+    );
+    assert!(
+        missing.contains(&format!("the scheduled task {name} is not registered"))
+            && missing.contains("run kr host startup --set standalone"),
+        "{missing}"
+    );
+    assert_eq!(host.claims(), Vec::<String>::new(), "no request was left");
+
+    let earlier = TaskDefinition {
+        starter: host.temp.root().join("earlier").join("kr-controller.exe"),
+        ..host.definition()
+    };
+    scheduled::register(&earlier).expect("the earlier installation's task");
+    let stale = refused(
+        finish(host.new_session().spawn().expect("kr new"), "kr new"),
+        "stale",
+    );
+    assert!(
+        stale.contains("is not the one this installation registers")
+            && stale.contains("it runs another program than this installation's kr-controller")
+            && stale.contains("run kr host startup --set standalone to repair it"),
+        "{stale}"
+    );
+    assert_eq!(host.claims(), Vec::<String>::new(), "no request was left");
+    assert_eq!(
+        scheduled::last_result(&earlier).expect("the task is read"),
+        scheduled::LastResult::NotRun,
+        "and the task was not run"
+    );
+    scheduled::remove(&earlier).expect("the earlier task is removed");
+
+    let theirs = TaskDefinition {
+        environment_id: EnvironmentId::new(kr_ipc::new_uuid()),
+        ..host.definition()
+    };
+    let _theirs = Registered(theirs.clone());
+    scheduled::register(&theirs).expect("the other environment's task");
+    let before = exported(&name).expect("the other environment's task is there");
+    let foreign = refused(
+        finish(host.new_session().spawn().expect("kr new"), "kr new"),
+        "foreign",
+    );
+    assert!(
+        foreign.contains("is not this environment's own")
+            && foreign.contains("kr neither replaces nor removes it"),
+        "{foreign}"
+    );
+    assert_eq!(host.claims(), Vec::<String>::new(), "no request was left");
+    assert_eq!(
+        exported(&name).as_deref(),
+        Some(before.as_str()),
+        "and it is as it was"
+    );
+    drop(_theirs);
+
+    let lonely = host.temp.root().join("lonely");
+    std::fs::create_dir_all(&lonely).expect("an installation with no daemon beside kr");
+    let lonely_kr = lonely.join("kr.exe");
+    kr_ipc::testing::place_program(&support::kr(), &lonely_kr);
+    let gone = refused(
+        finish(
+            host.new_session_with(&lonely_kr).spawn().expect("kr new"),
+            "kr new",
+        ),
+        "no daemon",
+    );
+    assert!(gone.contains("and there is none there"), "{gone}");
+    assert_eq!(host.claims(), Vec::<String>::new(), "no request was left");
+}
+
+/// KR-REQ-07.12: a task the Task Scheduler does not start, as it starts none that logs on where the
+/// user is signed in while the user is signed in nowhere, ends `kr new` once it has waited its
+/// bound, with a failure of its own naming where the user has to be signed in; no daemon is
+/// started.
+#[test]
+#[ignore = "it needs an account signed in to no session, which the native run arranges, and the \
+            daemon would keep its key in this account's credential store were one started; run with \
+            --ignored where KR_TEST_PLATFORM_SECRET_STORE=1"]
+fn a_task_the_task_scheduler_does_not_start_is_named_with_where_to_sign_in() {
+    platform_store_allowed();
+    let host = Host::create();
+    let _task = host.removes_its_task();
+    let _started = host.ends_what_it_started();
+    let chose = host.kr(&["--json", "host", "startup", "--set", "standalone"]);
+    assert!(chose.status.success(), "{}", document(&chose, "the choice"));
+    let output = finish(host.new_session().spawn().expect("kr new"), "kr new");
+    let failed = document(&output, "kr new");
+    assert_eq!(output.status.code(), Some(1), "{failed}");
+    assert_eq!(failed["code"], "ENVIRONMENT_UNAVAILABLE");
+    let message = failed["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("its starter did not take the request to start the control daemon")
+            && message.contains("only in a session where you are signed in")
+            && message.contains("sign in to this computer"),
+        "{message}"
+    );
+    assert!(
+        processes("kr-controller.exe", host.temp.root()).is_empty(),
+        "no daemon was started"
+    );
+}
+
+/// A daemon this test hosts for its own tree, starting each worker through the environment's task
+/// as the test helper registered it: with the logon this session allows, `S4U` in session 0, where
+/// the task's starter leaves the worker in no job, and `InteractiveToken` where the user is signed
+/// in, where it leaves the worker in the task's own job. Its keys are in the tree's own directory.
+struct Hosted {
+    runtime: tokio::runtime::Runtime,
+    controller: Option<std::sync::Arc<kr_controller::service::Controller>>,
+    serving: Vec<tokio::task::JoinHandle<kr_controller::Result<()>>>,
+}
+
+impl Hosted {
+    fn start(
+        environment: &EnvironmentPaths,
+        supervisor: Box<dyn kr_controller::supervision::WorkerSupervisor>,
+    ) -> Self {
+        use kr_controller::service::{Controller, ControllerSetup};
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        let environment_id = environment.environment_id();
+        let secrets = environment.secrets_dir();
+        let setup = ControllerSetup {
+            paths: environment.clone(),
+            environment_id,
+            identity: Box::new(move || {
+                let store = kr_crypto::store::open_store_in(&secrets).expect("a secret store");
+                Ok(kr_ipc::verify::ControllerIdentity::open(
+                    store.store.as_ref(),
+                    environment_id,
+                    false,
+                )
+                .expect("an identity"))
+            }),
+            secret_store: kr_crypto::store::StoreSelection::File,
+            boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
+            supervisor,
+            worker_program: installation().join("kr-worker.exe"),
+            build_id: build(),
+            release: "0".to_owned(),
+            shell_packages: None,
+            terminal: Box::new(kr_controller::supervision::NoTerminal),
+        };
+        let (controller, serving) = runtime.block_on(async {
+            let controller = Controller::start(setup).await.expect("the daemon starts");
+            let rendezvous = kr_ipc::endpoint::Listener::bind(
+                &environment.rendezvous_endpoint().expect("an endpoint"),
+            )
+            .expect("binds the rendezvous");
+            let clients = kr_ipc::endpoint::Listener::bind(
+                &environment.controller_endpoint().expect("an endpoint"),
+            )
+            .expect("binds the client endpoint");
+            let serving = vec![
+                tokio::spawn(std::sync::Arc::clone(&controller).serve_rendezvous(rendezvous)),
+                tokio::spawn(std::sync::Arc::clone(&controller).serve_clients(clients)),
+            ];
+            (controller, serving)
+        });
+        Self {
+            runtime,
+            controller: Some(controller),
+            serving,
+        }
+    }
+}
+
+impl Drop for Hosted {
+    fn drop(&mut self) {
+        for task in &self.serving {
+            task.abort();
+        }
+        let controller = self.controller.take();
+        self.runtime.block_on(async move {
+            drop(controller);
+        });
+    }
+}
+
+/// KR-REQ-07.12, KR-REQ-07.69: `kr host startup --clear` removes the environment's task and leaves
+/// a worker that task's starter started running, and its session live: removing a task ends nothing
+/// it started. The worker is in no job where the task logs on without a session (`S4U`), and in the
+/// task's own job where it logs on as the signed-in user (`InteractiveToken`); the run says which.
+#[test]
+fn clearing_the_start_leaves_a_worker_the_environments_task_started_running() {
+    use kr_controller::supervision::windows::testing::{TestTask, built_binary};
+
+    let tree = teardown::Tree::create();
+    let environment = tree.environment();
+    let starter = built_binary("kr-controller").unwrap_or_else(|missing| panic!("{missing}"));
+    let task = TestTask::register(&environment, &starter)
+        .unwrap_or_else(|failure| panic!("the environment's task: {failure}"));
+    let logon = task.definition().logon;
+    let daemon = Hosted::start(
+        &environment,
+        tree.supervisor(Box::new(task.supervisor(&environment))),
+    );
+    let kr = |arguments: &[&str]| {
+        Command::new(support::kr())
+            .args(arguments)
+            .env(
+                kr_ipc::paths::RUNTIME_DIR_VARIABLE,
+                tree.paths().runtime_root(),
+            )
+            .env(kr_ipc::paths::STATE_DIR_VARIABLE, tree.paths().state_root())
+            .current_dir(installation())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("kr starts")
+    };
+    let cwd = tree.root().display().to_string();
+    let shell = powershell();
+    let output = finish(
+        kr(&[
+            "--json",
+            "new",
+            "--invisible",
+            "--headless",
+            "--cwd",
+            &cwd,
+            "--shell",
+            &shell,
+        ]),
+        "kr new",
+    );
+    let created = document(&output, "kr new");
+    assert!(output.status.success(), "{created}");
+    let session = created["session_id"]
+        .as_str()
+        .expect("a session identifier")
+        .to_owned();
+    let worker = kr_ipc::descriptor::read_all(&environment)
+        .expect("the descriptors")
+        .into_iter()
+        .filter_map(|entry| entry.descriptor.ok())
+        .find(|descriptor| descriptor.session_id.to_string() == session)
+        .expect("the session's worker published itself")
+        .process_start_identity;
+    assert_eq!(
+        kr_ipc::identity::process_state(&worker),
+        kr_ipc::identity::ProcessState::Running
+    );
+
+    let output = finish(
+        kr(&["--json", "host", "startup", "--clear"]),
+        "kr host startup --clear",
+    );
+    let cleared = document(&output, "kr host startup --clear");
+    assert!(output.status.success(), "{cleared}");
+    assert_eq!(cleared["task_change"]["change"], "removed", "{cleared}");
+    assert_eq!(
+        scheduled::standing(task.definition()).expect("the task is read"),
+        Standing::Absent
+    );
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(
+        kr_ipc::identity::process_state(&worker),
+        kr_ipc::identity::ProcessState::Running,
+        "a worker the task started, as {}, keeps running once the task is removed",
+        logon.as_str()
+    );
+    assert!(
+        live_sessions(&environment).contains(&session),
+        "and its session is live"
+    );
+    let output = finish(kr(&["--json", "close", &session]), "kr close");
+    assert!(output.status.success(), "{}", document(&output, "kr close"));
+    drop(daemon);
+    println!(
+        "the worker the task started, as {}, outlived the task",
+        logon.as_str()
+    );
 }

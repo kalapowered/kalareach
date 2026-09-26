@@ -827,19 +827,16 @@ async fn managed(
     ))
 }
 
-/// The standalone start runs the daemon in a session of its own, which only Unix has.
-#[cfg(not(unix))]
+/// Has this user's scheduled task for the environment start the daemon, and waits for it to
+/// answer.
+#[cfg(windows)]
 async fn standalone(
     _paths: &HostPaths,
     _environment: &EnvironmentPaths,
     _endpoint: &kr_ipc::paths::Endpoint,
     _bounds: Bounds,
 ) -> Result<(LocalClient, Option<Started>)> {
-    Err(CliError::HostUnavailable(Shown::said(
-        "this environment chooses the standalone start, which runs the control daemon in a \
-         session of its own, and this platform does not have one; start the control daemon, \
-         kr-controller, for it",
-    )))
+    todo!("not built yet")
 }
 
 /// The log a daemon the standalone start runs writes to, opened once and checked.
@@ -2010,6 +2007,12 @@ mod tests {
             .contains("the Task Scheduler did not remove the scheduled task"),
             "a refusal says what was asked and its exit code"
         );
+    }
+
+    /// The daemon a starter starts writes to the log this command reads back.
+    #[test]
+    fn the_starter_writes_the_log_this_command_reads() {
+        assert_eq!(kr_controller::supervision::windows::DAEMON_LOG, LOG_FILE);
     }
 
     /// A way of starting this build does not know is refused by naming the ones it does, and what
