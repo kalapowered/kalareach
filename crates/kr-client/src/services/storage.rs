@@ -1812,4 +1812,20 @@ mod tests {
             }),
         );
     }
+
+    /// A principal says which kind it is, and an installation by its identifier. Never an
+    /// account's identifier, which is the service's text.
+    #[test]
+    fn a_principal_renders_its_kind_and_never_an_account() {
+        renders_only(
+            &StoragePrincipal::Account(NEVER_RENDERED.to_owned()),
+            "Account(..)",
+        );
+        renders_only(
+            &StoragePrincipal::Installation(kr_protocol::ids::InstallationId::new(
+                kr_protocol::scalars::Uuid::from_bytes([3; 16]),
+            )),
+            "Installation(InstallationId(Uuid(03030303-0303-0303-0303-030303030303)))",
+        );
+    }
 }

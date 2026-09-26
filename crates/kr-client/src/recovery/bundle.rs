@@ -1689,4 +1689,17 @@ mod tests {
             &format!("Migrated{{record:{rendered_record},updated_kit_origins:1,..}}"),
         );
     }
+
+    /// A lost write says where it stands, and never the digest of what was sent.
+    #[test]
+    fn a_lost_write_says_where_it_stands_and_never_its_digest() {
+        renders_only(
+            &LostWrite::Unsettled {
+                sent: kr_protocol::scalars::Digest256::from_bytes([1; 32]),
+            },
+            "Unsettled{..}",
+        );
+        renders_only(&LostWrite::Applied, "Applied");
+        renders_only(&LostWrite::Ended { retained: None }, "Ended{retained:None}");
+    }
 }

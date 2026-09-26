@@ -1802,4 +1802,36 @@ mod tests {
         assert!(!said.as_str().contains(MARKER), "{said}");
         assert!(said.as_str().contains("14 bytes"), "{said}");
     }
+
+    /// The two `Debug` macros write what they say: the type's name alone, or the type's name and
+    /// the fields named, each as its own `Debug` writes it, and never another field.
+    #[test]
+    fn the_debug_macros_write_only_the_name_or_the_fields_named() {
+        struct Holding {
+            count: u64,
+            text: String,
+        }
+        crate::debug_as_name!(Holding);
+        struct Counted {
+            count: u64,
+            text: String,
+        }
+        crate::debug_fields!(Counted { count });
+
+        let holding = Holding {
+            count: 3,
+            text: MARKER.to_owned(),
+        };
+        let counted = Counted {
+            count: 3,
+            text: MARKER.to_owned(),
+        };
+        assert_eq!(format!("{holding:?}"), "Holding { .. }");
+        assert_eq!(format!("{counted:?}"), "Counted { count: 3, .. }");
+        assert_eq!(
+            format!("{counted:#?}"),
+            "Counted {\n    count: 3,\n    ..\n}"
+        );
+        let _ = (holding.count, holding.text, counted.text);
+    }
 }
