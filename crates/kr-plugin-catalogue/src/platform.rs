@@ -31,6 +31,9 @@ pub enum Unsupported {
 impl HostPlatform {
     /// Checks a package's platforms against this host.
     ///
+    /// A manifest may name one operating system in several entries, and any of them supports the
+    /// host.
+    ///
     /// # Errors
     ///
     /// Returns which of the two the package does not support: the operating system first, since
@@ -39,11 +42,19 @@ impl HostPlatform {
         let Some(os) = self.os else {
             return Err(Unsupported::OperatingSystem);
         };
-        let Some(listed) = platforms.iter().find(|platform| platform.os == os) else {
+        let mut listed = platforms
+            .iter()
+            .filter(|platform| platform.os == os)
+            .peekable();
+        if listed.peek().is_none() {
             return Err(Unsupported::OperatingSystem);
-        };
+        }
         match self.architecture {
-            Some(architecture) if listed.architectures.contains(&architecture) => Ok(()),
+            Some(architecture)
+                if listed.any(|platform| platform.architectures.contains(&architecture)) =>
+            {
+                Ok(())
+            }
             _ => Err(Unsupported::Architecture),
         }
     }
@@ -120,6 +131,44 @@ mod tests {
         assert_eq!(
             unknown.check(&linux_on(&[Architecture::Aarch64])),
             Err(Unsupported::OperatingSystem)
+        );
+    }
+
+    /// A manifest may name one operating system in several entries, one per architecture, and a
+    /// host is supported by any of them, in either order.
+    #[test]
+    fn every_entry_for_the_operating_system_is_considered() {
+        let split = |first: Architecture, second: Architecture| {
+            vec![
+                PlatformSupport {
+                    os: OperatingSystem::Linux,
+                    architectures: vec![first],
+                },
+                PlatformSupport {
+                    os: OperatingSystem::Linux,
+                    architectures: vec![second],
+                },
+            ]
+        };
+        for architecture in [Architecture::X86_64, Architecture::Aarch64] {
+            let host = HostPlatform {
+                os: Some(OperatingSystem::Linux),
+                architecture: Some(architecture),
+            };
+            for platforms in [
+                split(Architecture::X86_64, Architecture::Aarch64),
+                split(Architecture::Aarch64, Architecture::X86_64),
+            ] {
+                assert_eq!(host.check(&platforms), Ok(()), "{architecture:?}");
+            }
+        }
+        let unknown = HostPlatform {
+            os: Some(OperatingSystem::Linux),
+            architecture: None,
+        };
+        assert_eq!(
+            unknown.check(&split(Architecture::X86_64, Architecture::Aarch64)),
+            Err(Unsupported::Architecture)
         );
     }
 
