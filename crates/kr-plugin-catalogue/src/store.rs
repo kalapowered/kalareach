@@ -193,18 +193,23 @@ impl Area {
     /// process or a call that stopped left it there already. Anything else at that name, a link
     /// among them, stops the call.
     fn mark_unconfirmed(&self, marker: &Path) -> CatalogueResult<()> {
+        let path = self.path.join(marker);
         match self.dir.create_dir(marker) {
             Ok(()) => Ok(()),
-            Err(source)
-                if source.kind() == std::io::ErrorKind::AlreadyExists
-                    && self
-                        .dir
-                        .symlink_metadata(marker)
-                        .is_ok_and(|found| found.is_dir()) =>
-            {
-                Ok(())
+            Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
+                #[cfg(test)]
+                marker_race::run(&path);
+                if self
+                    .dir
+                    .symlink_metadata(marker)
+                    .is_ok_and(|found| found.is_dir())
+                {
+                    Ok(())
+                } else {
+                    Err(CatalogueError::storage(&path, &source))
+                }
             }
-            Err(source) => Err(CatalogueError::storage(&self.path.join(marker), &source)),
+            Err(source) => Err(CatalogueError::storage(&path, &source)),
         }
     }
 
@@ -2241,6 +2246,32 @@ pub(crate) mod publish_fault {
     }
 }
 
+/// What the unit tests run when the marker a call is about to leave is there already, before the
+/// call looks at it, to take it away as another process does once it has confirmed the directory.
+#[cfg(test)]
+pub(crate) mod marker_race {
+    use std::cell::RefCell;
+    use std::path::Path;
+
+    type Then = Box<dyn FnOnce(&Path)>;
+
+    thread_local! {
+        static BEFORE: RefCell<Option<Then>> = const { RefCell::new(None) };
+    }
+
+    /// Runs `then` with the marker's path once, the next time a call on this thread finds a marker
+    /// there already.
+    pub(crate) fn once(then: impl FnOnce(&Path) + 'static) {
+        BEFORE.with(|before| *before.borrow_mut() = Some(Box::new(then)));
+    }
+
+    pub(crate) fn run(marker: &Path) {
+        if let Some(then) = BEFORE.with(|before| before.borrow_mut().take()) {
+            then(marker);
+        }
+    }
+}
+
 /// What the unit tests run just before an index document is opened, to reach a reader whose records
 /// were read before a sync removed the document they name.
 #[cfg(test)]
@@ -2791,6 +2822,24 @@ mod tests {
             "a directory whose confirmation was refused was used without being confirmed"
         );
         Store::open(directory.path(), &key).expect("confirmed by the next open");
+    }
+
+    /// Another process's marker, which that process takes away once it has confirmed the
+    /// directory, can go between this call's attempt to leave its own and its look at what is
+    /// there. The call then leaves its own marker and goes on, and no marker is left once the
+    /// directory is confirmed.
+    #[test]
+    fn a_marker_another_process_takes_away_meanwhile_is_left_again() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let key = EnrolmentKey::generate().expect("a key");
+        let marker = normal(directory.path()).join(marker_of(Path::new(REPOSITORIES)));
+        std::fs::create_dir(&marker).expect("another process's marker");
+        marker_race::once(|marker| std::fs::remove_dir(marker).expect("taken away"));
+        Store::open(directory.path(), &key).expect("opened");
+        assert!(
+            !marker.exists(),
+            "no marker is left once the directory is confirmed"
+        );
     }
 
     /// Opening a layout already confirmed flushes nothing: every directory the layout's directories

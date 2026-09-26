@@ -1670,6 +1670,71 @@ mod tests {
         });
     }
 
+    /// A call whose deadline has passed holds nothing even where the record is free: the deadline
+    /// decides, not only whether another call holds the record. A call with time left holds it.
+    #[test]
+    fn a_call_past_its_deadline_holds_nothing_where_the_record_is_free() {
+        let environment = Environment::create();
+        let store = environment.open();
+        let refused = store
+            .writer(std::time::Instant::now(), "write the machine group record")
+            .map(drop)
+            .expect_err("a call past its deadline");
+        assert_eq!(refused.code(), ErrorCode::StorageUnavailable, "{refused}");
+        drop(
+            store
+                .writer(
+                    std::time::Instant::now() + WAIT,
+                    "write the machine group record",
+                )
+                .expect("a call with time left holds the free record"),
+        );
+    }
+
+    /// A call whose record is let go only after the call's deadline has passed, before the call
+    /// looks again, holds nothing: it waited past its deadline.
+    #[test]
+    fn a_call_whose_record_is_let_go_after_its_deadline_holds_nothing() {
+        let environment = Environment::create();
+        let store = environment.open();
+        let record = environment.record();
+        let held = store
+            .writer(std::time::Instant::now() + WAIT, "hold the record")
+            .expect("holds the record");
+        let (told, locking) = mpsc::channel();
+        seam::watch_lock(&record, told);
+        let bound = Duration::from_millis(200);
+        std::thread::scope(|scope| {
+            let waiter = scope.spawn(|| {
+                store
+                    .writer(
+                        std::time::Instant::now() + bound,
+                        "write the machine group record",
+                    )
+                    .map(drop)
+            });
+            assert!(
+                locking
+                    .recv_timeout(WAIT)
+                    .expect("the waiter came to the record"),
+                "the waiter found the record free"
+            );
+            // Taken once the waiter waits, and kept past its deadline, with the record let go
+            // under it: the waiter looks again only after its deadline has passed.
+            let mut writing = WRITING.lock().unwrap_or_else(PoisonError::into_inner);
+            std::thread::sleep(bound * 3);
+            writing.retain(|holding| *holding != record);
+            drop(writing);
+            LET_GO.notify_all();
+            let refused = waiter
+                .join()
+                .expect("the waiter ran")
+                .expect_err("the waiter holds nothing once its deadline has passed");
+            assert_eq!(refused.code(), ErrorCode::StorageUnavailable, "{refused}");
+        });
+        drop(held);
+    }
+
     /// KR-REQ-03.07: a first start interrupted after any point of its publication, by a failure
     /// or by a crash, leaves no record, so the next start mints a group, or the whole record it
     /// published, which the next start keeps. Nothing it wrote is left behind once the next start
