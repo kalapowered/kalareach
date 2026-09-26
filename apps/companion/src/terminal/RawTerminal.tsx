@@ -307,9 +307,10 @@ export function RawTerminal({
   const dragging = useRef<HeldDrag | null>(null)
   const dragLayer = useRef<HTMLDivElement | null>(null)
   const wheelRest = useRef<WheelRest>(WHEEL_AT_REST)
-  // The newest way to move the window, for the wheel's own listener.
+  // The newest way to move the window, for the wheel's own listener: kept at each commit, so the
+  // wheel never measures a turn in a cell the view has left.
   const panning = useRef({ pan, roomNow, cell: drawnCell })
-  useEffect(() => {
+  useLayoutEffect(() => {
     panning.current = { pan, roomNow, cell: drawnCell }
   })
 
@@ -374,8 +375,9 @@ export function RawTerminal({
 
   // The wheel is read here rather than through a React handler, so that in view mode it can be
   // cancelled before the page scrolls. In control mode it must reach the program unchanged, so this
-  // neither cancels it nor stops it; in view mode this is the owner and cancels it.
-  useEffect(() => {
+  // neither cancels it nor stops it; in view mode this is the owner and cancels it. The listener is
+  // replaced as a change of mode is committed, so no turn after it is routed by the mode before.
+  useLayoutEffect(() => {
     const element = host.current
     if (!element) return
     const onWheel = (event: WheelEvent) => {
