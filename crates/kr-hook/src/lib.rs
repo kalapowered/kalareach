@@ -113,11 +113,8 @@ pub const QUEUED_REPORTS: usize = 64;
 /// [`QUEUED_REPORTS`] lines without waiting, and one writer thread of its own writes them, in
 /// order. A line that finds the queue full is dropped and counted, and the writer says how many
 /// were dropped once it can write again. Whatever reports never waits on standard error.
-#[derive(Clone)]
 pub struct Reports {
-    queue: std::sync::mpsc::SyncSender<Queued>,
-    /// How many lines were dropped since the last one the queue took.
-    dropped: std::sync::Arc<std::sync::Mutex<u64>>,
+    shared: std::sync::Arc<Shared>,
 }
 
 /// The writer of one [`Reports`], which its process waits for, for a bounded time, before it ends.
@@ -125,10 +122,84 @@ pub struct ReportWriter {
     done: std::sync::mpsc::Receiver<()>,
 }
 
-/// One line in the queue, with how many were dropped just before it.
-struct Queued {
-    dropped_before: u64,
-    line: String,
+/// What reporters and the writer share.
+struct Shared {
+    queue: std::sync::Mutex<Queue>,
+    /// Signalled when the queue takes a line or the last reporter goes.
+    changed: std::sync::Condvar,
+}
+
+impl Shared {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Queue> {
+        self.queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// What waits to be written, and how many lines could not wait.
+///
+/// Both are one value under one lock, so the writer's next step is decided from the two at once:
+/// what it says about dropped lines always comes after every line that was queued before them.
+#[derive(Default)]
+struct Queue {
+    entries: std::collections::VecDeque<Entry>,
+    /// How many lines are waiting, not counting the counts between them.
+    lines: usize,
+    /// How many lines were dropped since the last one the queue took.
+    dropped: u64,
+    /// How many [`Reports`] handles are still there. The writer ends once none is and nothing is
+    /// left to write.
+    reporters: usize,
+}
+
+/// One thing the writer says.
+enum Entry {
+    Line(String),
+    /// How many lines were dropped between the line before this and the line after it.
+    Dropped(u64),
+}
+
+impl Queue {
+    /// Takes a line, or counts it as dropped when [`QUEUED_REPORTS`] lines are already waiting. A
+    /// line taken after some were dropped is preceded by their count, which so sits where they
+    /// were. Returns whether it was taken.
+    fn push(&mut self, line: String) -> bool {
+        if self.lines >= QUEUED_REPORTS {
+            self.dropped += 1;
+            return false;
+        }
+        if self.dropped > 0 {
+            self.entries
+                .push_back(Entry::Dropped(std::mem::take(&mut self.dropped)));
+        }
+        self.entries.push_back(Entry::Line(line));
+        self.lines += 1;
+        true
+    }
+
+    /// The next thing to write: the oldest waiting entry, or, once none is left, how many lines
+    /// were dropped since the last one the queue took.
+    fn next(&mut self) -> Option<Entry> {
+        match self.entries.pop_front() {
+            Some(entry) => {
+                if matches!(entry, Entry::Line(_)) {
+                    self.lines -= 1;
+                }
+                Some(entry)
+            }
+            None => (self.dropped > 0).then(|| Entry::Dropped(std::mem::take(&mut self.dropped))),
+        }
+    }
+}
+
+impl Entry {
+    fn text(&self) -> std::borrow::Cow<'_, str> {
+        match self {
+            Self::Line(line) => std::borrow::Cow::Borrowed(line),
+            Self::Dropped(count) => std::borrow::Cow::Owned(dropped_notice(*count)),
+        }
+    }
 }
 
 impl Reports {
@@ -146,65 +217,65 @@ impl Reports {
     /// A thread that cannot be started writes nothing: a diagnostic never costs the caller its
     /// work.
     fn start(mut write: impl FnMut(&[u8]) + Send + 'static) -> (Self, ReportWriter) {
-        let (queue, queued) = std::sync::mpsc::sync_channel::<Queued>(QUEUED_REPORTS);
-        let dropped = std::sync::Arc::new(std::sync::Mutex::new(0_u64));
+        let shared = std::sync::Arc::new(Shared {
+            queue: std::sync::Mutex::new(Queue {
+                reporters: 1,
+                ..Queue::default()
+            }),
+            changed: std::sync::Condvar::new(),
+        });
         let (finished, done) = std::sync::mpsc::channel();
-        let counted = std::sync::Arc::clone(&dropped);
+        let writing = std::sync::Arc::clone(&shared);
         let _ = std::thread::Builder::new()
             .name("kr-hook reports".to_owned())
             .spawn(move || {
-                // Every line the queue took is written by now, so every line dropped since came
-                // after it, and saying how many keeps the order. A line queued meanwhile carries
-                // the count itself, and this finds nothing to say.
-                let say_dropped = |write: &mut dyn FnMut(&[u8])| {
-                    let dropped = std::mem::take(
-                        &mut *counted
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner),
-                    );
-                    if dropped > 0 {
-                        write(dropped_notice(dropped).as_bytes());
-                    }
-                };
+                let mut queue = writing.lock();
                 loop {
-                    let next = match queued.try_recv() {
-                        Ok(next) => next,
-                        Err(std::sync::mpsc::TryRecvError::Empty) => {
-                            say_dropped(&mut write);
-                            match queued.recv() {
-                                Ok(next) => next,
-                                Err(std::sync::mpsc::RecvError) => break,
-                            }
-                        }
-                        // Every sender is gone and the queue is empty.
-                        Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
-                    };
-                    if next.dropped_before > 0 {
-                        write(dropped_notice(next.dropped_before).as_bytes());
+                    if let Some(entry) = queue.next() {
+                        // Written without the lock, so a reporter never waits on standard error.
+                        drop(queue);
+                        write(entry.text().as_bytes());
+                        queue = writing.lock();
+                    } else if queue.reporters == 0 {
+                        break;
+                    } else {
+                        queue = writing
+                            .changed
+                            .wait(queue)
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
                     }
-                    write(next.line.as_bytes());
                 }
-                say_dropped(&mut write);
+                drop(queue);
                 let _ = finished.send(());
             });
-        (Self { queue, dropped }, ReportWriter { done })
+        (Self { shared }, ReportWriter { done })
     }
 
     /// Hands one line to the writer without waiting, or drops and counts it when the queue is full.
     pub fn report(&self, line: &str) {
-        let mut dropped = self
-            .dropped
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let queued = Queued {
-            dropped_before: *dropped,
-            line: format!("kr-hook: {line}\n"),
-        };
-        match self.queue.try_send(queued) {
-            Ok(()) => *dropped = 0,
-            Err(std::sync::mpsc::TrySendError::Full(_)) => *dropped += 1,
-            // The writer is gone, so nothing is written any more, and nothing waits for it.
-            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {}
+        let taken = self.shared.lock().push(format!("kr-hook: {line}\n"));
+        if taken {
+            self.shared.changed.notify_one();
+        }
+    }
+}
+
+impl Clone for Reports {
+    fn clone(&self) -> Self {
+        self.shared.lock().reporters += 1;
+        Self {
+            shared: std::sync::Arc::clone(&self.shared),
+        }
+    }
+}
+
+impl Drop for Reports {
+    fn drop(&mut self) {
+        let mut queue = self.shared.lock();
+        queue.reporters -= 1;
+        if queue.reporters == 0 {
+            drop(queue);
+            self.shared.changed.notify_one();
         }
     }
 }
@@ -392,6 +463,52 @@ mod tests {
             QUEUED_REPORTS + 2,
             "and nothing more when the writer ends"
         );
+    }
+
+    /// The writer's next step is decided from the queue and the count at once, so whatever the
+    /// timing, the count of dropped lines is said after every line queued before them: here after
+    /// a burst that fills the queue once the writer has found it empty, and between the lines on
+    /// either side of the drops when the queue took a line again.
+    #[test]
+    fn the_count_of_dropped_lines_is_said_where_they_were_dropped() {
+        let text = |entry: Entry| entry.text().into_owned();
+        let mut queue = Queue::default();
+        assert!(queue.push("line 0".to_owned()));
+        assert_eq!(queue.next().map(text), Some("line 0".to_owned()));
+        assert!(queue.next().is_none(), "the writer finds the queue empty");
+        for index in 1..=QUEUED_REPORTS {
+            assert!(queue.push(format!("line {index}")));
+        }
+        assert!(
+            !queue.push("dropped".to_owned()),
+            "a full queue drops a line"
+        );
+        let mut said: Vec<String> = std::iter::from_fn(|| queue.next()).map(text).collect();
+        let mut expected: Vec<String> = (1..=QUEUED_REPORTS)
+            .map(|index| format!("line {index}"))
+            .collect();
+        expected.push(dropped_notice(1));
+        assert_eq!(said, expected);
+
+        for index in 0..QUEUED_REPORTS {
+            assert!(queue.push(format!("line {index}")));
+        }
+        for _ in 0..3 {
+            assert!(!queue.push("dropped".to_owned()));
+        }
+        assert_eq!(queue.next().map(text), Some("line 0".to_owned()));
+        assert!(
+            queue.push("after".to_owned()),
+            "the queue took a line again"
+        );
+        said = std::iter::from_fn(|| queue.next()).map(text).collect();
+        assert_eq!(said.len(), QUEUED_REPORTS + 1);
+        assert_eq!(
+            said[QUEUED_REPORTS - 2],
+            format!("line {}", QUEUED_REPORTS - 1)
+        );
+        assert_eq!(said[QUEUED_REPORTS - 1], dropped_notice(3));
+        assert_eq!(said[QUEUED_REPORTS], "after");
     }
 
     /// Lines dropped after the last one queued are counted when the writer ends.
