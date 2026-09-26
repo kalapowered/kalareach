@@ -63,7 +63,13 @@ if ($Mode -eq 'evaluate') {
     } finally { $identity.Dispose() }
     foreach ($line in [System.IO.File]::ReadAllLines($Fixtures)) {
         $case, $sddl = $line -split "`t", 2
-        $descriptor = [System.Security.AccessControl.RawSecurityDescriptor]::new($sddl.Replace('{me}', $me))
+        # A descriptor this platform will not read is said as such, and the next case still runs.
+        try {
+            $descriptor = [System.Security.AccessControl.RawSecurityDescriptor]::new($sddl.Replace('{me}', $me))
+        } catch {
+            Write-Report "$case unreadable $($_.Exception.Message)"
+            continue
+        }
         $refused = Test-KrPipeDescriptor $descriptor $own
         if ($null -eq $refused) { Write-Report "$case accepted" } else { Write-Report "$case refused $refused" }
     }

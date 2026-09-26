@@ -543,7 +543,7 @@ const REFUSED_LISTS: &[(&str, &str, &str)] = &[
     ),
     (
         "missing",
-        "D:NO_ACCESS_CONTROL",
+        "D:PNO_ACCESS_CONTROL",
         "carries no access-control list",
     ),
     (
@@ -572,6 +572,8 @@ const REFUSED_LISTS: &[(&str, &str, &str)] = &[
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_module_refuses_before_its_hello_every_list_the_hosts_client_refuses() {
     let directory = tempfile::tempdir().expect("a temporary directory");
+    // Every case runs and says what went wrong, so one run shows each list's outcome.
+    let mut problems = Vec::new();
     for (case, list, said) in REFUSED_LISTS {
         let case_directory = directory.path().join(case);
         std::fs::create_dir(&case_directory).expect("a directory for the case");
@@ -594,33 +596,31 @@ async fn the_module_refuses_before_its_hello_every_list_the_hosts_client_refuses
         });
 
         let host = Connection::connect(&endpoint).await;
-        assert!(
-            matches!(host, Err(kr_ipc::IpcError::PeerAccountRejected { .. })),
-            "{case}: the host's own client refuses {list}: {host:?}"
-        );
+        if !matches!(host, Err(kr_ipc::IpcError::PeerAccountRejected { .. })) {
+            problems.push(format!(
+                "{case}: the host's own client took {list}: {host:?}"
+            ));
+        }
         let mut client = start_client_at(&name, &case_directory, "hello", &[]);
         let ended = ends(&mut client, || report(&case_directory, "hello")).await;
         let observed = report(&case_directory, "hello");
-        assert!(
-            ended.success() && observed.contains("refused\n"),
-            "{case}: the module refuses {list} ({ended}):\n{observed}"
-        );
+        if !(ended.success() && observed.contains("refused\n")) {
+            problems.push(format!(
+                "{case}: the module did not refuse {list} ({ended}):\n{observed}"
+            ));
+        }
         let traced = trace(&case_directory, "hello");
-        assert!(
-            traced.contains("refused before the hello") && traced.contains(said),
-            "{case}: the trace says why: {traced}"
-        );
+        if !(traced.contains("refused before the hello") && traced.contains(said)) {
+            problems.push(format!("{case}: the trace does not say '{said}': {traced}"));
+        }
         let received = taken.await.expect("the pipe's connections are read");
-        assert_eq!(
-            received.len(),
-            2,
-            "{case}: both clients opened the pipe before they refused it"
-        );
-        assert!(
-            received.iter().all(Vec::is_empty),
-            "{case}: nothing reached the pipe: {received:?}"
-        );
+        if received.len() != 2 || !received.iter().all(Vec::is_empty) {
+            problems.push(format!(
+                "{case}: both clients were to open the pipe and send it nothing: {received:?}"
+            ));
+        }
     }
+    assert!(problems.is_empty(), "{}", problems.join("\n\n"));
 
     // A list with no entry at all admits nobody, the owner included, so the open itself is refused
     // and neither client reaches the pipe.
@@ -723,7 +723,7 @@ const DESCRIPTORS: &[(&str, &str, Option<&str>)] = &[
     ),
     (
         "missing",
-        "O:{me}D:NO_ACCESS_CONTROL",
+        "O:{me}D:PNO_ACCESS_CONTROL",
         Some("carries no access-control list"),
     ),
     (
@@ -756,19 +756,28 @@ async fn the_module_judges_a_descriptor_as_the_hosts_client_does() {
     let ended = ends(&mut client, || report(directory.path(), "evaluate")).await;
     let observed = report(directory.path(), "evaluate");
     assert!(ended.success(), "the check ran ({ended}):\n{observed}");
+    let mut wrong = Vec::new();
     for (case, sddl, refusal) in DESCRIPTORS {
-        let line = observed
+        let Some(line) = observed
             .lines()
             .find(|line| line.split(' ').next() == Some(case))
-            .unwrap_or_else(|| panic!("{case} was judged:\n{observed}"));
-        match refusal {
-            None => assert_eq!(line, format!("{case} accepted"), "{sddl}"),
-            Some(said) => assert!(
-                line.starts_with(&format!("{case} refused ")) && line.contains(said),
-                "{sddl}: {line}"
-            ),
+        else {
+            wrong.push(format!("{case} was not judged"));
+            continue;
+        };
+        let right = match refusal {
+            None => line == format!("{case} accepted"),
+            Some(said) => line.starts_with(&format!("{case} refused ")) && line.contains(said),
+        };
+        if !right {
+            wrong.push(format!("{sddl}: {line}"));
         }
     }
+    assert!(
+        wrong.is_empty(),
+        "{}\n\nthe whole report:\n{observed}",
+        wrong.join("\n")
+    );
 }
 
 /// The second local account this run was given, or `None` when it was not.
