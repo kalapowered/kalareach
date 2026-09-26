@@ -53,7 +53,6 @@ pub const START_BOUND: Duration = Duration::from_secs(30);
 pub const ANSWER_BOUND: Duration = Duration::from_secs(10);
 
 /// How often the endpoint is tried while the command waits.
-#[cfg(unix)]
 const RETRY: Duration = Duration::from_millis(50);
 
 /// The file in an environment's state directory that a daemon the standalone start runs writes to.
@@ -61,11 +60,9 @@ pub const LOG_FILE: &str = "controller.log";
 
 /// The largest the log may be when a start begins. A larger one is emptied first, because a log
 /// nobody rotates must not grow for as long as the host is installed.
-#[cfg(unix)]
 const LOG_LIMIT: u64 = 1024 * 1024;
 
 /// The most of the log a failure reads back.
-#[cfg(unix)]
 const LOG_TAIL: u64 = 4096;
 
 /// What this environment's configuration document chooses about starting its control daemon.
@@ -446,14 +443,12 @@ struct Bounds {
     /// that accepts the connection and never says hello has not answered.
     answer: Duration,
     /// From the moment this command starts a daemon to the moment one answers.
-    #[cfg(unix)]
     start: Duration,
 }
 
 /// The waits `kr new` uses.
 const BOUNDS: Bounds = Bounds {
     answer: ANSWER_BOUND,
-    #[cfg(unix)]
     start: START_BOUND,
 };
 
@@ -576,7 +571,6 @@ fn nothing_listening(error: &kr_ipc::IpcError) -> bool {
 /// what is left of the deadline, and runs `between` after every attempt that failed.
 ///
 /// Returns the connection, or what the last attempt found.
-#[cfg(unix)]
 async fn answered_by(
     endpoint: &kr_ipc::paths::Endpoint,
     deadline: tokio::time::Instant,
@@ -719,7 +713,6 @@ async fn standalone(
 /// daemon's own sentence and names the environment by its identifier. Any other line is whatever
 /// the daemon, or a library it uses, wrote, so the failure says that the log holds one and names
 /// the log, rather than repeating it.
-#[cfg(unix)]
 fn last_line_said(line: &str) -> Shown {
     const HELD: &str = "kr-controller: another control daemon already owns environment ";
     match line
@@ -829,23 +822,151 @@ async fn managed(
 
 /// Has this user's scheduled task for the environment start the daemon, and waits for it to
 /// answer.
+///
+/// The task is checked first, under the environment's lock, as the service start checks its
+/// definition: one that is missing, that is not this environment's own, or that is not the one
+/// this installation registers is `HOST_NOT_CONFIGURED` with the setup action, and nothing is
+/// claimed or run. Then a request to start the daemon is left for the task's starter, and the task
+/// is run. The starter takes the request and starts the daemon installed beside this command, with
+/// its output appended to the log; the Task Scheduler, not this command, is its creator, so it is
+/// in none of this command's jobs. The daemon inherits the environment the Task Scheduler gives the
+/// user, as every process a task starts does. A request no starter took by the time the command
+/// stops waiting is a task the Task Scheduler did not start: it starts one only in a session where
+/// the user is signed in.
 #[cfg(windows)]
 async fn standalone(
     _paths: &HostPaths,
-    _environment: &EnvironmentPaths,
-    _endpoint: &kr_ipc::paths::Endpoint,
-    _bounds: Bounds,
+    environment: &EnvironmentPaths,
+    endpoint: &kr_ipc::paths::Endpoint,
+    bounds: Bounds,
 ) -> Result<(LocalClient, Option<Started>)> {
-    todo!("not built yet")
+    let program = daemon_program()?;
+    if !program.is_file() {
+        return Err(CliError::HostUnavailable(shown!(
+            "the standalone start runs the control daemon installed beside this command, {}, and \
+             there is none there",
+            Shown::root(&program)
+        )));
+    }
+    environment.create()?;
+    // Checked, and emptied when it has grown too large, before the starter opens it: the daemon
+    // appends to it.
+    let log = Log::open(&environment.state_dir().join(LOG_FILE))?;
+    let deadline = tokio::time::Instant::now() + bounds.start;
+    let asking = environment.clone();
+    let asked = tokio::task::spawn_blocking(move || windows::ask(&asking, &program, bounds.start))
+        .await
+        .map_err(|error| {
+            CliError::Other(shown!(
+                "asking this user's scheduled task to start the control daemon failed: {}",
+                Shown::task(&error)
+            ))
+        })??;
+    let started = Started {
+        pid: None,
+        start: ControllerStartup::Standalone,
+        manager: None,
+    };
+    let last = match answered_by(endpoint, deadline, || {}).await {
+        Ok(client) => return Ok((client, Some(started))),
+        Err(last) => last,
+    };
+    if !kr_ipc::starter::claim_taken(environment, asked.request) {
+        return Err(windows::not_taken(environment, bounds.start, asked.session));
+    }
+    let said = log.last_line().map_or_else(
+        || Shown::said("its log holds nothing since it started"),
+        |line| last_line_said(&line),
+    );
+    Err(unanswered(shown!(
+        "the control daemon this user's scheduled task {} started for environment {} did not \
+         answer within {} seconds: {}; {}; what it writes is in {}",
+        task::name(environment.environment_id()),
+        environment.environment_id(),
+        bounds.start.as_secs(),
+        last,
+        said,
+        Shown::root(&log.path)
+    )))
 }
 
 /// The log a daemon the standalone start runs writes to, opened once and checked.
-#[cfg(unix)]
 struct Log {
     file: std::fs::File,
     path: PathBuf,
     /// Where this start's part of it begins.
     from: u64,
+}
+
+impl Log {
+    /// Takes an opened log, emptying it first when it has grown past the limit.
+    fn from_file(file: std::fs::File, path: &std::path::Path) -> Result<Self> {
+        let failed = |error| CliError::Ipc(kr_ipc::IpcError::io("open", path, error));
+        let mut from = file.metadata().map_err(failed)?.len();
+        if from > LOG_LIMIT {
+            file.set_len(0).map_err(failed)?;
+            from = 0;
+        }
+        Ok(Self {
+            file,
+            path: path.to_path_buf(),
+            from,
+        })
+    }
+
+    /// The last line written since this start began, read through the handle that was checked.
+    ///
+    /// Several starts can share the log, so the line is the log's rather than certainly this
+    /// start's daemon's.
+    fn last_line(&self) -> Option<String> {
+        let length = self.file.metadata().ok()?.len();
+        let begin = self.from.max(length.saturating_sub(LOG_TAIL));
+        let mut bytes = vec![0; usize::try_from(length.saturating_sub(begin)).ok()?];
+        let mut read = 0;
+        while read < bytes.len() {
+            match read_at(&self.file, &mut bytes[read..], begin + read as u64) {
+                Ok(0) | Err(_) => break,
+                Ok(count) => read += count,
+            }
+        }
+        bytes.truncate(read);
+        String::from_utf8_lossy(&bytes)
+            .lines()
+            .map(str::trim)
+            .rfind(|line| !line.is_empty())
+            .map(str::to_owned)
+    }
+}
+
+/// Reads from `file` at `offset`, leaving whatever else holds the file to its own position.
+#[cfg(unix)]
+fn read_at(file: &std::fs::File, buffer: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    std::os::unix::fs::FileExt::read_at(file, buffer, offset)
+}
+
+/// Reads from `file` at `offset`. On Windows a positioned read moves this handle's own position,
+/// which nothing here uses: the daemon writes through a handle of its own, and only appends.
+#[cfg(windows)]
+fn read_at(file: &std::fs::File, buffer: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    std::os::windows::fs::FileExt::seek_read(file, buffer, offset)
+}
+
+#[cfg(windows)]
+impl Log {
+    /// Opens the log for appending and reading, never through a link, and takes it only when it is
+    /// a regular file whose list grants no account this host does not trust: the same opening the
+    /// starter gives the daemon.
+    fn open(path: &std::path::Path) -> Result<Self> {
+        let file = kr_ipc::starter::open_log(path).map_err(|error| match error {
+            kr_ipc::IpcError::UntrustedFile { .. } => CliError::HostUnavailable(shown!(
+                "{} is not a file of this user's that only this user can read and write, so the \
+                 control daemon's output is not written to it; remove it and run kr new again",
+                Shown::root(path)
+            )),
+            other => CliError::Ipc(other),
+        })?;
+        Self::from_file(file, path)
+    }
 }
 
 #[cfg(unix)]
@@ -879,16 +1000,7 @@ impl Log {
                 Shown::root(path)
             )));
         }
-        let mut from = about.len();
-        if from > LOG_LIMIT {
-            file.set_len(0).map_err(failed)?;
-            from = 0;
-        }
-        Ok(Self {
-            file,
-            path: path.to_path_buf(),
-            from,
-        })
+        Self::from_file(file, path)
     }
 
     /// A handle a daemon writes its output through: the same open file, appended to.
@@ -896,31 +1008,6 @@ impl Log {
         self.file
             .try_clone()
             .map_err(|error| CliError::Ipc(kr_ipc::IpcError::io("open", &self.path, error)))
-    }
-
-    /// The last line written since this start began, read through the handle that was checked.
-    ///
-    /// Several starts can share the log, so the line is the log's rather than certainly this
-    /// start's daemon's.
-    fn last_line(&self) -> Option<String> {
-        use std::os::unix::fs::FileExt as _;
-
-        let length = self.file.metadata().ok()?.len();
-        let begin = self.from.max(length.saturating_sub(LOG_TAIL));
-        let mut bytes = vec![0; usize::try_from(length.saturating_sub(begin)).ok()?];
-        let mut read = 0;
-        while read < bytes.len() {
-            match self.file.read_at(&mut bytes[read..], begin + read as u64) {
-                Ok(0) | Err(_) => break,
-                Ok(count) => read += count,
-            }
-        }
-        bytes.truncate(read);
-        String::from_utf8_lossy(&bytes)
-            .lines()
-            .map(str::trim)
-            .rfind(|line| !line.is_empty())
-            .map(str::to_owned)
     }
 }
 
@@ -1234,6 +1321,7 @@ pub(crate) fn task_report(environment: &EnvironmentPaths, selected: bool) -> Opt
 #[cfg(windows)]
 mod windows {
     use std::path::Path;
+    use std::time::Duration;
 
     use kr_client::shown;
     use kr_client::shown::Shown;
@@ -1242,6 +1330,7 @@ mod windows {
     };
     use kr_ipc::paths::EnvironmentPaths;
     use kr_protocol::hostinfo::configuration::{Change, ControllerStartup};
+    use kr_protocol::scalars::Uuid;
 
     use super::task;
     use crate::error::{CliError, Result};
@@ -1419,6 +1508,141 @@ mod windows {
             session: kr_ipc::starter::current_session().ok(),
             last_result,
         })
+    }
+
+    /// A request left for the environment's starter, and the task run that is to take it.
+    #[derive(Debug)]
+    pub struct Asked {
+        /// The request the starter takes.
+        pub request: Uuid,
+        /// The login session this command runs in, when it could be read.
+        pub session: Option<u32>,
+    }
+
+    /// Checks the environment's task, leaves a request to start the daemon for its starter, and
+    /// runs it, all under the environment's lock, which is let go before the command waits.
+    ///
+    /// The request lapses `bound` from now: a starter the Task Scheduler runs later than that
+    /// starts nothing for it.
+    pub fn ask(environment: &EnvironmentPaths, program: &Path, bound: Duration) -> Result<Asked> {
+        let definition = definition(environment, program)?;
+        let environment_id = environment.environment_id();
+        let name = task::name(environment_id);
+        let held = crate::service_manager::lock(environment)?;
+        match scheduled::standing(&definition) {
+            Ok(Standing::Owned(differences)) if differences.is_empty() => {}
+            Ok(Standing::Owned(differences)) => {
+                return Err(CliError::HostUnavailable(shown!(
+                    "startup.controller is standalone and the scheduled task {} is not the one \
+                     this installation registers: {}; {} to repair it",
+                    name,
+                    task::differences(&differences),
+                    task::SETUP_ACTION
+                )));
+            }
+            Ok(Standing::Absent) => {
+                return Err(CliError::HostUnavailable(shown!(
+                    "startup.controller is standalone and the scheduled task {} is not registered; \
+                     {}",
+                    name,
+                    task::SETUP_ACTION
+                )));
+            }
+            Ok(Standing::Foreign(foreign)) => {
+                return Err(CliError::HostUnavailable(shown!(
+                    "startup.controller is standalone and a task named {} is registered that is \
+                     not this environment's own: {}; kr neither replaces nor removes it, so remove \
+                     it with schtasks /Delete /TN {}, then {}",
+                    name,
+                    task::foreign(&foreign.reason),
+                    name,
+                    task::SETUP_ACTION
+                )));
+            }
+            Err(error) => {
+                return Err(CliError::HostUnavailable(task::error(
+                    &error,
+                    environment_id,
+                )));
+            }
+        }
+        let boot = kr_ipc::identity::boot_identity().map_err(CliError::Ipc)?;
+        let request = kr_ipc::new_uuid();
+        let lapses = kr_ipc::clock::boot_elapsed_ms()
+            .saturating_add(u64::try_from(bound.as_millis()).unwrap_or(u64::MAX));
+        kr_ipc::starter::leave_claim(
+            environment,
+            &kr_ipc::starter::StartClaim {
+                request,
+                boot,
+                deadline_boot_ms: lapses,
+            },
+        )
+        .map_err(CliError::Ipc)?;
+        if let Err(failure) = scheduled::run(&definition) {
+            let asked = match failure {
+                kr_controller::supervision::RunFailure::NotRun(_) => {
+                    Shown::said("could not be asked to run it")
+                }
+                kr_controller::supervision::RunFailure::Failed(_) => Shown::said("did not run it"),
+            };
+            return Err(CliError::Unfinished {
+                code: kr_protocol::error::ErrorCode::EnvironmentUnavailable,
+                message: shown!(
+                    "the Task Scheduler {} the scheduled task {} for environment {}, so no control \
+                     daemon was started; schtasks /Query /TN {} shows what it holds",
+                    asked,
+                    name,
+                    environment_id,
+                    name
+                ),
+            });
+        }
+        drop(held);
+        Ok(Asked {
+            request,
+            session: kr_ipc::starter::current_session().ok(),
+        })
+    }
+
+    /// The failure of a start whose request no starter took: the Task Scheduler did not start the
+    /// task's starter, which it does only in a session where the user is signed in.
+    pub fn not_taken(
+        environment: &EnvironmentPaths,
+        bound: Duration,
+        session: Option<u32>,
+    ) -> CliError {
+        let environment_id = environment.environment_id();
+        let program = super::daemon_program().ok();
+        let last = program
+            .and_then(|program| definition(environment, &program).ok())
+            .and_then(|definition| scheduled::last_result(&definition).ok())
+            .map_or_else(
+                || Shown::said("its last result cannot be read"),
+                task::last_result,
+            );
+        let here = match session {
+            Some(0) => {
+                Shown::said("; this command runs in no interactive session (login session 0)")
+            }
+            Some(session) => shown!("; this command runs in login session {}", session),
+            None => Shown::said(""),
+        };
+        CliError::Unfinished {
+            code: kr_protocol::error::ErrorCode::EnvironmentUnavailable,
+            message: shown!(
+                "the scheduled task {} was run for environment {} and its starter did not take the \
+                 request to start the control daemon within {} seconds, so no daemon was started: \
+                 the task starts it only in a session where you are signed in{}; sign in to this \
+                 computer, at its console or over remote desktop, and run kr new again ({}, for \
+                 all of the task's runs)",
+                task::name(environment_id),
+                environment_id,
+                bound.as_secs(),
+                here,
+                last
+            ),
+        }
     }
 }
 
