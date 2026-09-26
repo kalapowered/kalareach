@@ -146,11 +146,12 @@ each flag as a JSON string in order, and each variable as `NAME="value"`, nothin
 A host reads the integration only from the verified manifest, never from what an installation says
 about it, and applies it only while the installation holds `command_integration.launch`. For an
 integrated launch the worker exports the declared variables after `KR_REGISTRATION`; the answer for
-an invocation that bypasses the integration names no backend and no variable. Where the flags
-register the forwarder's hook, an object whose `command` is `kr-hook` and whose `args` are the
-package's own name and `hook`, the launch admits that hook running this installation's own
-`kr-hook` and nothing else. A package that installs a native bridge does not register the forwarder
-in its flags, and flags that start the forwarder any other way are refused.
+an invocation that bypasses the integration names no backend and no variable. Nothing is read from
+the flags to decide what a launch admits. A package that installs a native bridge gets the bridge its
+installation put in place, or none where the installation did not. A package that installs none gets
+its own hook, which its flags register as Qoder CLI's inline settings do, naming `kr-hook` as a bare
+command. Either way a bridge is admitted only when it says it is the package's own and runs this
+installation's own `kr-hook`.
 
 ## Capabilities
 

@@ -80,9 +80,10 @@ command integration. It is the route to take if a later Qoder CLI stops reading 
 
 A package declares these two elements as its command integration's flags, as
 [the plugin reference](../../plugins/README.md#command-integration) describes, and the worker takes
-them only from the verified package. Because they start `kr-hook qoder-cli hook`, the worker gives
-such a launch a hook bridge for Qoder CLI on this installation's own `kr-hook`: Qoder CLI finds
-`kr-hook` on the launch's search path, and a hook that runs another copy is refused at admission.
+them only from the verified package. A package that installs no native bridge gets a hook bridge
+for its own application on each integrated launch, on this installation's own `kr-hook`: Qoder CLI
+finds `kr-hook` on the launch's search path, and a hook that runs another copy, or says it is
+another application's, is refused at admission.
 The two elements are added together or not at all, so a Qoder CLI command typed with `--settings`
 of its own runs as typed. Sessions are created with no command integration enabled, and the worker
 holds no installed connector to launch from, so no launch passes these two elements and Qoder CLI

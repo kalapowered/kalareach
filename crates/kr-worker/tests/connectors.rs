@@ -316,117 +316,96 @@ fn kr_req_12_22_qoder_cli_s_flags_give_its_launch_a_hook_bridge_on_this_installa
         .expect_err("another copy of the forwarder");
 }
 
-/// A launch's bridge is the package's own and comes from one place: flags that start the forwarder
-/// for another application, for a channel or with other arguments are refused, and so are flags
-/// that start it beside the native bridge the package installs. The forwarder appears in a flag
-/// only as a hook's own command with its arguments: a shell command that runs it, a path to it and
-/// a flag that is not JSON but names it are refused too, beside a native bridge or not.
+/// A launch's bridge is decided without reading the integration's flags, so whatever they say, in
+/// whatever form they start the forwarder, the launch admits only the package's own bridge: for a
+/// package that installs none, its own hook on this installation's forwarder, and for one that
+/// installs a native bridge, the bridge its installation put in place. A hook that says it is
+/// another application's, or a channel, is refused.
 #[test]
-fn flags_that_start_the_forwarder_for_another_application_a_channel_or_a_second_bridge_are_refused()
-{
+fn whatever_the_flags_say_a_launch_admits_only_the_package_s_own_bridge() {
     let store = Store::new("flags");
-    let shell_form = hooks_running(&serde_json::json!({
-        "type": "command", "command": "kr-hook qoder-cli hook", "timeout": 5
-    }));
-    let path_form = hooks_running(&serde_json::json!({
-        "type": "command", "command": "/opt/kalareach/bin/kr-hook", "args": ["qoder-cli", "hook"]
-    }));
-    let other_case = hooks_running(&serde_json::json!({
-        "type": "command", "command": "KR-Hook", "args": ["qoder-cli", "hook"]
-    }));
-    let qoder_flags = |flags: &[&str]| fixture::Shape {
-        integration: Some(fixture::declaration("qodercli", flags, &[])),
-        ..fixture::Shape::qoder_cli()
+    let launcher = store.forwarder("bin/kr-hook");
+    let declared = |application: &str, surface: BridgeSurface| BridgeDeclaration {
+        application: application.to_owned(),
+        surface,
     };
-    for (shape, what) in [
-        (
-            qoder_flags(&["--settings", &shell_form]),
-            "a shell command that runs the forwarder",
-        ),
-        (
-            qoder_flags(&["--settings", &path_form]),
-            "a path to the forwarder",
-        ),
-        (
-            qoder_flags(&["--settings", &other_case]),
-            "the forwarder spelt in another letter case",
-        ),
-        (
-            qoder_flags(&["--hook-command=kr-hook qoder-cli hook"]),
-            "a flag that is not JSON and names the forwarder",
-        ),
-        (
-            fixture::Shape {
-                integration: Some(fixture::declaration(
-                    "claude",
-                    &["--settings", &shell_form],
-                    &[],
-                )),
-                ..fixture::Shape::claude_code()
-            },
-            "a shell command that runs the forwarder beside the native bridge",
-        ),
-        (
-            fixture::Shape {
-                integration: Some(fixture::declaration(
-                    "qodercli",
-                    &["--settings", &hooks_starting(&["claude-code", "hook"])],
-                    &[],
-                )),
-                ..fixture::Shape::qoder_cli()
-            },
-            "another application's hook",
-        ),
-        (
-            fixture::Shape {
-                integration: Some(fixture::declaration(
-                    "qodercli",
-                    &["--settings", &hooks_starting(&["qoder-cli", "channel"])],
-                    &[],
-                )),
-                ..fixture::Shape::qoder_cli()
-            },
-            "a channel",
-        ),
-        (
-            fixture::Shape {
-                integration: Some(fixture::declaration(
-                    "qodercli",
-                    &[
-                        "--settings",
-                        &hooks_starting(&["qoder-cli", "hook", "extra"]),
-                    ],
-                    &[],
-                )),
-                ..fixture::Shape::qoder_cli()
-            },
-            "arguments the forwarder does not take from a bridge",
-        ),
-        (
-            fixture::Shape {
-                integration: Some(fixture::declaration(
-                    "claude",
-                    &["--settings", &hooks_starting(&["claude-code", "hook"])],
-                    &[],
-                )),
-                ..fixture::Shape::claude_code()
-            },
-            "a hook beside the native bridge the package installs",
-        ),
+    let shell_form = hooks_running(&serde_json::json!({
+        "type": "command", "command": "kr-''hook qoder-cli hook", "timeout": 5
+    }));
+    for flags in [
+        vec![
+            "--settings".to_owned(),
+            hooks_starting(&["claude-code", "hook"]),
+        ],
+        vec![
+            "--settings".to_owned(),
+            hooks_starting(&["qoder-cli", "channel"]),
+        ],
+        vec!["--settings".to_owned(), shell_form.clone()],
+        vec!["--hook-command=kr-hook claude-code hook".to_owned()],
     ] {
-        let source = store.shaped(&shape);
-        let refusal = InstalledConnector::read(source.clone())
-            .map(|connector| connector.plugin_id())
-            .expect_err(what);
-        assert!(
-            refusal.detail.contains("kr-hook"),
-            "{what}: {}",
-            refusal.detail
+        let flags: Vec<&str> = flags.iter().map(String::as_str).collect();
+        let connector = InstalledConnector::read(store.shaped(&fixture::Shape {
+            integration: Some(fixture::declaration("qodercli", &flags, &[])),
+            ..fixture::Shape::qoder_cli()
+        }))
+        .expect("the installed package is read");
+        let bridge = connector
+            .launch_bridge(&launcher)
+            .expect("a package that installs no bridge gets its own hook");
+        assert_eq!(bridge.application, "qoder-cli", "{flags:?}");
+        assert_eq!(
+            bridge.surfaces,
+            [BridgeSurface::Hook].into_iter().collect(),
+            "{flags:?}"
         );
-        let sources = ConnectorSources::new();
-        assert_eq!(sources.replace(vec![source]).len(), 1, "{what}");
-        assert!(sources.is_empty(), "{what}");
+        assert_eq!(bridge.forwarder, launcher, "{flags:?}");
+        bridge
+            .validate(&declared("qoder-cli", BridgeSurface::Hook), Some(&launcher))
+            .expect("the package's own hook");
+        bridge
+            .validate(
+                &declared("claude-code", BridgeSurface::Hook),
+                Some(&launcher),
+            )
+            .expect_err("another application's hook");
+        bridge
+            .validate(
+                &declared("qoder-cli", BridgeSurface::Channel),
+                Some(&launcher),
+            )
+            .expect_err("a channel");
     }
+
+    // A package that installs a native bridge gets that bridge, whatever its flags start.
+    let connector = InstalledConnector::read(store.shaped(&fixture::Shape {
+        integration: Some(fixture::declaration(
+            "claude",
+            &["--settings", &shell_form],
+            &[],
+        )),
+        ..fixture::Shape::claude_code()
+    }))
+    .expect("the installed package is read");
+    assert_eq!(
+        connector.launch_bridge(&launcher),
+        connector.installed_bridge()
+    );
+    assert_ne!(
+        connector
+            .launch_bridge(&launcher)
+            .map(|bridge| bridge.forwarder),
+        Some(launcher.clone()),
+        "the installation's bridge, not one made for the launch"
+    );
+
+    // Without the integration's grant, a package that installs no bridge gets none.
+    let mut source = store.shaped(&fixture::Shape::qoder_cli());
+    source
+        .granted
+        .remove(&PluginCapability::CommandIntegrationLaunch);
+    let connector = InstalledConnector::read(source).expect("the installed package is read");
+    assert!(connector.launch_bridge(&launcher).is_none());
 }
 
 /// A native bridge the installation put in place for another application than the package's own is
