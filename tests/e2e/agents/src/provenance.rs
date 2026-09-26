@@ -122,11 +122,12 @@ pub struct Executed {
     pub command: String,
 }
 
-/// What `lsof` says one process maps: its executable, the first file it lists, with the device
-/// and inode it listed for it, then every other text mapping.
-#[derive(Clone, Debug)]
+/// What `lsof` says one process maps: its executable, the first file it lists, with the name,
+/// device and inode it listed for it, any of which can be absent, then every other text mapping
+/// that has a name.
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Mapping {
-    image: PathBuf,
+    image: Option<PathBuf>,
     device: Option<u64>,
     inode: Option<u64>,
     mapped: Vec<PathBuf>,
@@ -617,18 +618,19 @@ impl Provenance {
         let mapping = mapping.ok_or_else(|| {
             format!("{NOT_PINNED} the image of process {pid} ({command}) could not be read while it runs")
         })?;
-        let (Some(device), Some(inode)) = (mapping.device, mapping.inode) else {
+        let (Some(listed), Some(device), Some(inode)) =
+            (mapping.image.as_ref(), mapping.device, mapping.inode)
+        else {
             return Err(format!(
-                "{NOT_PINNED} the image of process {pid} ({command}), {}, was listed without its \
-                 device or inode",
-                mapping.image.display()
+                "{NOT_PINNED} the image of process {pid} ({command}) was listed without its name, \
+                 device or inode: {mapping:?}"
             ));
         };
         let key = (device, inode);
         let executed = if let Some(executed) = seen.executed.get(&key) {
             executed.clone()
         } else {
-            let image = resolved(&mapping.image);
+            let image = resolved(listed);
             let executed = Executed {
                 image: image.display().to_string(),
                 sha256: hash_mapped(&image, device, inode)?,
@@ -729,9 +731,8 @@ fn mapping_of<'m>(
 /// What each of `pids` maps, as one `lsof` reads it: the executable first, its device and inode,
 /// then every other text mapping. A process that has ended is absent.
 fn mappings(pids: &[u32]) -> Result<BTreeMap<u32, Mapping>, String> {
-    let mut found = BTreeMap::new();
     if pids.is_empty() {
-        return Ok(found);
+        return Ok(BTreeMap::new());
     }
     let list = pids
         .iter()
@@ -746,16 +747,16 @@ fn mappings(pids: &[u32]) -> Result<BTreeMap<u32, Mapping>, String> {
     let output = output_within(lsof, LIVENESS).map_err(|why| {
         format!("{NOT_PINNED} the processes' images could not be read: lsof {why}")
     })?;
-    let text = String::from_utf8_lossy(&output.stdout);
-    // Each process begins with `p`, each of its files with `f`; a file's device, inode and name
-    // follow its `f`, and any of them can be absent. The first file of a process is its
-    // executable, whatever it lacks.
-    let mut pid: Option<u32> = None;
-    let mut file: Option<(Option<u64>, Option<u64>, Option<PathBuf>)> = None;
-    let close = |pid: Option<u32>,
-                 file: Option<(Option<u64>, Option<u64>, Option<PathBuf>)>,
-                 found: &mut BTreeMap<u32, Mapping>| {
-        let (Some(pid), Some((device, inode, Some(path)))) = (pid, file) else {
+    Ok(parse_mappings(&String::from_utf8_lossy(&output.stdout)))
+}
+
+/// Reads `lsof -F pDin` output. Each process begins with `p`, each of its files with `f`; a
+/// file's device, inode and name follow its `f`, and any of them can be absent. The first file of
+/// a process is its executable, kept whatever it lacks; a later file counts only with a name.
+fn parse_mappings(text: &str) -> BTreeMap<u32, Mapping> {
+    type File = (Option<u64>, Option<u64>, Option<PathBuf>);
+    let close = |pid: Option<u32>, file: Option<File>, found: &mut BTreeMap<u32, Mapping>| {
+        let (Some(pid), Some((device, inode, path))) = (pid, file) else {
             return;
         };
         match found.get_mut(&pid) {
@@ -770,9 +771,12 @@ fn mappings(pids: &[u32]) -> Result<BTreeMap<u32, Mapping>, String> {
                     },
                 );
             }
-            Some(mapping) => mapping.mapped.push(path),
+            Some(mapping) => mapping.mapped.extend(path),
         }
     };
+    let mut found = BTreeMap::new();
+    let mut pid: Option<u32> = None;
+    let mut file: Option<File> = None;
     for line in text.lines() {
         let (field, value) = line.split_at(line.len().min(1));
         match field {
@@ -803,7 +807,7 @@ fn mappings(pids: &[u32]) -> Result<BTreeMap<u32, Mapping>, String> {
         }
     }
     close(pid, file.take(), &mut found);
-    Ok(found)
+    found
 }
 
 /// A mapped image's SHA-256, read through one handle on the file whose device and inode the
@@ -887,4 +891,46 @@ fn runtime_root(executable: &Path) -> PathBuf {
 /// A path with its links resolved, or as written when it cannot be.
 fn resolved(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A process's first file is its executable even when `lsof` gives it no name: a later
+    /// mapping never takes its place, so what the process runs is not established.
+    #[test]
+    fn a_first_file_without_a_name_is_kept_as_the_unnamed_executable() {
+        let text = "p42\nftxt\nD0x1000012\ni7\nftxt\nD0x1000012\ni8\nn/usr/lib/dyld\n";
+        let found = parse_mappings(text);
+        assert_eq!(
+            found.get(&42),
+            Some(&Mapping {
+                image: None,
+                device: Some(0x0100_0012),
+                inode: Some(7),
+                mapped: vec![PathBuf::from("/usr/lib/dyld")],
+            })
+        );
+    }
+
+    /// A first file without a device or an inode is kept as the executable, without them.
+    #[test]
+    fn a_first_file_without_its_device_or_inode_is_kept_without_them() {
+        let text = "p7\nftxt\nn/bin/zsh\nftxt\nD0x1000012\ni3\nn/usr/lib/dyld\n";
+        let mapping = parse_mappings(text).remove(&7).expect("the process");
+        assert_eq!(mapping.image, Some(PathBuf::from("/bin/zsh")));
+        assert_eq!((mapping.device, mapping.inode), (None, None));
+    }
+
+    /// Each process's files are its own, and each begins at its `f`.
+    #[test]
+    fn each_process_keeps_its_own_first_file() {
+        let text = "p1\nftxt\nD0x10\ni1\nn/bin/zsh\np2\nftxt\nD0x10\ni2\nn/bin/sh\nftxt\nD0x10\ni3\nn/usr/lib/dyld\n";
+        let found = parse_mappings(text);
+        assert_eq!(found[&1].image, Some(PathBuf::from("/bin/zsh")));
+        assert_eq!((found[&1].device, found[&1].inode), (Some(16), Some(1)));
+        assert_eq!(found[&2].image, Some(PathBuf::from("/bin/sh")));
+        assert_eq!(found[&2].mapped, vec![PathBuf::from("/usr/lib/dyld")]);
+    }
 }
