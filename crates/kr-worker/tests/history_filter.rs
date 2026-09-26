@@ -9,8 +9,9 @@
 //! | --- | --- |
 //! | KR-REQ-10.49 | `one_filter_covers_every_surface_a_grant_reaches`, `a_summary_made_now_from_pre_cutoff_content_is_withheld_or_recomputed`, `derived_data_names_the_interval_and_resources_it_was_built_from` |
 //! | KR-REQ-10.50 | `a_live_only_invitation_is_installed_the_visible_screen_only_when_the_issuer_selected_it`, `the_live_screen_exception_never_reaches_the_buffer_that_is_not_showing`, `attachment_bytes_need_their_own_file_grant`, `voice_context_intersects_the_requesting_device_scope` |
-//! | KR-REQ-10.51 | `a_named_question_is_permitted_and_previewed_although_it_predates_the_cutoff`, `a_pending_resource_snapshot_does_not_bypass_the_filter_without_that_scope` |
+//! | KR-REQ-10.51 | `a_named_question_is_permitted_and_previewed_although_it_predates_the_cutoff`, `a_named_approval_is_excepted_only_while_it_is_current`, `a_pending_resource_snapshot_does_not_bypass_the_filter_without_that_scope` |
 
+use kr_protocol::gateway::PendingState;
 use kr_protocol::grant::{EnvironmentSelector, Grant, GrantExpiry, HistoryScope, SessionSelector};
 use kr_protocol::ids::{
     ApprovalRequestId, AuthorityRevision, DeviceId, GrantId, QuestionId, SessionId,
@@ -418,9 +419,13 @@ fn a_named_question_is_permitted_and_previewed_although_it_predates_the_cutoff()
         &[ActionRight::SessionView],
     )));
 
-    // Created long before the cutoff, and permitted because the invitation names it.
+    // Created long before the cutoff, and permitted because the invitation names it. The approval
+    // is decided by the filter's rule for a name a grant carries, while it is still pending.
     assert_eq!(filter.admit_question(named, 1_000), Ok(()));
-    assert_eq!(filter.admit_approval(&approval, 1_000), Ok(()));
+    assert_eq!(
+        filter.admit_approval(Some(&approval), 1_000, PendingState::Pending),
+        Ok(())
+    );
 
     // The conversation those decisions came from is not thereby opened.
     assert_eq!(
@@ -438,7 +443,7 @@ fn a_named_question_is_permitted_and_previewed_although_it_predates_the_cutoff()
         Err(WithheldReason::NotNamedByTheGrant)
     );
     assert_eq!(
-        filter.admit_approval(&other_approval, 1_000),
+        filter.admit_approval(Some(&other_approval), 1_000, PendingState::Pending),
         Err(WithheldReason::NotNamedByTheGrant)
     );
 
@@ -447,6 +452,104 @@ fn a_named_question_is_permitted_and_previewed_although_it_predates_the_cutoff()
     let preview = live_screen_preview(["Approve: rm -rf /var/tmp/build", "y/N"]);
     assert_eq!(preview.lines.len(), 2);
     assert!(!preview.truncated);
+}
+
+/// Section 10 permits the exact current decisions an invitation names. A named approval is
+/// excepted from the bound while it can still be decided, pending or claimed, and loses the
+/// exception in every state that ends it; an approval nothing names meets the bound in every state.
+/// A grant that keeps no retained history reaches a current named approval and nothing else, and a
+/// grant without `session.view` reaches none, named or not.
+#[test]
+fn a_named_approval_is_excepted_only_while_it_is_current() {
+    let named = approval_id("a-named-approval");
+    let before = CUTOFF_MS - 5_000;
+    let filter = HistoryFilter::new(ViewerScope::from_grant(&grant(
+        scope(Some(CUTOFF_MS), false, &[], std::slice::from_ref(&named)),
+        &[ActionRight::SessionView],
+    )));
+    for state in PendingState::ALL.iter().copied() {
+        let decided = filter.admit_approval(Some(&named), before, state);
+        if state.is_terminal() {
+            assert_eq!(
+                decided,
+                Err(WithheldReason::NotNamedByTheGrant),
+                "an ended approval is an old record: {state:?}"
+            );
+        } else {
+            assert_eq!(decided, Ok(()), "a current named approval: {state:?}");
+        }
+        assert_eq!(
+            filter.admit_approval(None, before, state),
+            Err(WithheldReason::NotNamedByTheGrant),
+            "nothing names it: {state:?}"
+        );
+        assert_eq!(
+            filter.admit_approval(None, CUTOFF_MS, state),
+            Ok(()),
+            "{state:?}"
+        );
+        assert_eq!(
+            filter.admit_approval(Some(&named), CUTOFF_MS + 1, state),
+            Ok(()),
+            "{state:?}"
+        );
+    }
+
+    let live_only = HistoryFilter::new(ViewerScope::from_grant(&grant(
+        scope(None, true, &[], std::slice::from_ref(&named)),
+        &[ActionRight::SessionView],
+    )));
+    assert_eq!(
+        live_only.admit_approval(Some(&named), before, PendingState::Claimed),
+        Ok(())
+    );
+    assert_eq!(
+        live_only.admit_approval(Some(&named), before, PendingState::Expired),
+        Err(WithheldReason::NotNamedByTheGrant)
+    );
+    assert_eq!(
+        live_only.admit_approval(None, CUTOFF_MS + 1, PendingState::Pending),
+        Err(WithheldReason::NotNamedByTheGrant)
+    );
+
+    let blind = HistoryFilter::new(ViewerScope::from_grant(&grant(
+        scope(Some(0), true, &[], std::slice::from_ref(&named)),
+        &[ActionRight::FilesRead],
+    )));
+    assert_eq!(
+        blind.admit_approval(Some(&named), before, PendingState::Pending),
+        Err(WithheldReason::NoSessionView)
+    );
+}
+
+/// The scope a worker builds from what a forwarded read carries is the grant's history scope and
+/// nothing more: it sees the session only when the caller says the grant does, and it never reads
+/// file bytes, which need `files.read` of their own. A grant keeps its own `files.read`.
+#[test]
+fn a_scope_from_a_history_reads_no_file_bytes_and_sees_the_session_only_when_told() {
+    let history = scope(Some(CUTOFF_MS), false, &[], &[]);
+    let told = HistoryFilter::new(ViewerScope::from_history(&history, true));
+    assert_eq!(told.admit_at(Surface::SemanticSnapshot, CUTOFF_MS), Ok(()));
+    assert_eq!(
+        told.admit_at(Surface::SemanticSnapshot, CUTOFF_MS - 1),
+        Err(WithheldReason::BeforeHistoryBound)
+    );
+    assert_eq!(
+        told.admit_attachment_bytes(CUTOFF_MS),
+        Err(WithheldReason::NoFileGrant)
+    );
+    let untold = HistoryFilter::new(ViewerScope::from_history(&history, false));
+    assert_eq!(
+        untold.admit_at(Surface::SemanticSnapshot, CUTOFF_MS),
+        Err(WithheldReason::NoSessionView)
+    );
+    assert!(
+        ViewerScope::from_grant(&grant(
+            history,
+            &[ActionRight::SessionView, ActionRight::FilesRead]
+        ))
+        .reads_files()
+    );
 }
 
 #[test]

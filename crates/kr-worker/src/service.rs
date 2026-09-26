@@ -1603,13 +1603,18 @@ impl WorkerService {
     /// What this worker states about itself in its answer to a hello.
     ///
     /// The clock floor it maps, by the floor's identity, so a control daemon can tell whether this
-    /// worker decides UTC deadlines from the same floor as it does. A worker that maps none states
-    /// none.
+    /// worker decides UTC deadlines from the same floor as it does; a worker that maps none states
+    /// none. And that it reads the history scope a forwarded read carries, which a daemon sends
+    /// only to a worker that says so.
     fn stated_capabilities(&self) -> CanonicalSet<kr_protocol::ids::CapabilityId> {
         self.time
             .floor_identity()
             .map(|identity| kr_protocol::local::utc_floor_capability(identity.as_bytes()))
             .into_iter()
+            .chain(
+                kr_protocol::ids::CapabilityId::new(kr_protocol::local::FORWARDED_HISTORY_SCOPE)
+                    .ok(),
+            )
             .collect()
     }
 
@@ -3073,7 +3078,8 @@ impl WorkerService {
             // is a mutation, and every later operation is checked against what that admission
             // granted rather than against the grant again.
             &Caller::forwarded(&forwarded.actor, &CanonicalSet::new())
-                .until(forwarded.authority_deadline_boot_ms.0.map(U64::get)),
+                .until(forwarded.authority_deadline_boot_ms.0.map(U64::get))
+                .within(forwarded.history.clone()),
         )
     }
 
@@ -4779,43 +4785,38 @@ impl WorkerService {
         encode(&self.broker.agent_capabilities(&params)?)
     }
 
-    /// Answers `agent.snapshot`, through the actor's own history filter.
+    /// Answers `agent.snapshot`, through the caller's own history filter.
     ///
-    /// The shared host-side filter is the one every subsystem reads through. What this passes is
-    /// the lower bound a grant carries, which is the part this worker decides; the answer says how
-    /// much was withheld, so a reader can tell a filtered answer from a complete one either way.
+    /// Section 10's shared host-side filter decides each entry by the moment it was observed, and
+    /// the answer says how much was withheld, so a reader can tell a filtered answer from a
+    /// complete one either way. The local owner reads the whole retained history, exactly as a
+    /// local attachment is drawn the whole screen.
     fn agent_snapshot(&self, params: &ParamsValue, caller: &Caller) -> Result<ParamsValue> {
         let params: kr_protocol::agent::AgentSnapshotParams = parse(params)?;
-        // The local owner reads the whole retained history, exactly as a local attachment is drawn
-        // the whole screen; anybody else acts under a grant and is refused with the reason.
-        Self::owner_only(caller, "an agent snapshot")?;
-        let filter = crate::broker::GrantLowerBound {
-            from: kr_protocol::ids::StreamCursor::new(0),
-        };
+        let filter = Self::history_of(caller, Method::AgentSnapshot, "an agent snapshot")?;
         encode(&self.broker.agent_snapshot(&params, &filter)?)
     }
 
-    /// Refuses a read of retained history to every caller but the local owner.
+    /// Returns the history filter a caller reads `method` through, or the refusal it gets instead.
     ///
-    /// Section 10 narrows the history of the grant a caller acts under, in one place, the shared
-    /// host-side filter, and the grant's history scope does not reach this worker with a forwarded
-    /// read. The local owner holds no grant, so there is nothing to narrow and it reads the whole
-    /// history. Anybody else is refused with the reason rather than answered with more than its
-    /// grant may cover, whichever socket the daemon heard it on: a caller the daemon vouches for
-    /// on its own local socket can name a grant as well as a paired device can.
-    fn owner_only(caller: &Caller, what: &str) -> Result<()> {
-        if caller.is_local_owner() {
-            return Ok(());
-        }
-        Err(WorkerError::Broker(
-            crate::broker::BrokerError::UnsupportedCapability {
+    /// Section 10 narrows the history of the grant a caller acts under in one place, the shared
+    /// host-side filter, and [`Caller::history_filter`] is where a caller becomes one. A caller
+    /// with no filter acts under a grant whose scope did not come with the read, whichever socket
+    /// the daemon heard it on, and it is refused with the reason rather than answered with more
+    /// than its grant may cover.
+    fn history_of(
+        caller: &Caller,
+        method: Method,
+        what: &str,
+    ) -> Result<crate::history_filter::HistoryFilter> {
+        caller.history_filter(method.entry()).ok_or_else(|| {
+            WorkerError::Broker(crate::broker::BrokerError::UnsupportedCapability {
                 detail: format!(
                     "{what} is narrowed to the history scope of the grant a caller acts under, \
-                     and that scope does not reach this worker with a forwarded read; the local \
-                     owner reads it"
+                     and that scope did not come with this read; the local owner reads it"
                 ),
-            },
-        ))
+            })
+        })
     }
 
     /// Answers `agent.commands`: what the bound agent advertises.
@@ -4826,13 +4827,12 @@ impl WorkerService {
 
     /// Answers `agent.approval.inspect`: what an approval's decoder read and what it offered.
     ///
-    /// A local caller reads the whole record, as it reads the whole retained agent history: its
-    /// authority is the operating-system identity the listener authenticated, and section 10's
-    /// history rule narrows a grant, of which there is none. A caller acting under a grant is
-    /// refused with the reason instead, whichever socket the daemon heard it on: the grant's
-    /// history scope does not reach this worker with a forwarded read, so nothing here can hold
-    /// the record to it. A paired device does not get this far, because the method table serves
-    /// the read on the local socket only.
+    /// The record is held to the caller's history filter ([`Caller::history_filter`]): the local
+    /// owner reads the whole record, as it reads the whole retained agent history, and a paired
+    /// device reads it within the history scope of its grant, which the daemon sends with the
+    /// read. A record outside that scope is answered as unknown. A caller acting under a grant
+    /// whose scope did not come with the read is refused with the reason, whichever socket the
+    /// daemon heard it on.
     ///
     /// The original source travels whole with the answer, so the answer is held to what this
     /// connection said it can receive: a peer that declared a smaller control frame is refused
@@ -4844,8 +4844,11 @@ impl WorkerService {
         caller: &Caller,
     ) -> Result<ParamsValue> {
         let params: kr_protocol::agent::AgentApprovalInspectParams = parse(params)?;
-        Self::owner_only(caller, "an approval's record")?;
-        let record = self.broker.inspect_approval(&params)?;
+        let filter =
+            Self::history_of(caller, Method::AgentApprovalInspect, "an approval's record")?;
+        // The scope is decided before the size, so a record outside it is refused as unknown
+        // however large it is, and its size says nothing about whether it exists.
+        let record = self.broker.inspect_approval(&params, &filter)?;
         let measured = Self::answer_bytes(&record);
         if measured > Self::frame_bytes(state) {
             return Err(WorkerError::InvalidArgument(format!(
@@ -5516,6 +5519,12 @@ pub struct Caller {
     /// attachment's capabilities are fixed where it is admitted, and every later operation is
     /// checked against what that admission granted rather than against the grant a second time.
     pub grant_rights: CanonicalSet<kr_protocol::rights::ActionRight>,
+    /// The history scope of the grant the daemon decided this caller's read under, when one came
+    /// with it.
+    ///
+    /// Only a forwarded read carries one ([`Self::within`]); [`Self::history_filter`] is where it
+    /// is used.
+    pub history: Option<kr_protocol::grant::HistoryScope>,
 }
 
 impl Caller {
@@ -5530,6 +5539,7 @@ impl Caller {
             validated_revision: None,
             authority_deadline_boot_ms: None,
             grant_rights: CanonicalSet::new(),
+            history: None,
         }
     }
 
@@ -5547,6 +5557,7 @@ impl Caller {
             validated_revision: actor.grant_revision.as_ref().copied(),
             authority_deadline_boot_ms: None,
             grant_rights: grant_rights.clone(),
+            history: None,
         }
     }
 
@@ -5555,6 +5566,47 @@ impl Caller {
     pub const fn until(mut self, authority_deadline_boot_ms: Option<u64>) -> Self {
         self.authority_deadline_boot_ms = authority_deadline_boot_ms;
         self
+    }
+
+    /// Returns the same caller, reading within the history scope the daemon sent with its read.
+    #[must_use]
+    pub fn within(mut self, history: Option<kr_protocol::grant::HistoryScope>) -> Self {
+        self.history = history;
+        self
+    }
+
+    /// Returns the shared history filter this caller reads `entry`'s method through, or `None`
+    /// when nothing here can hold its answer to the grant it acts under.
+    ///
+    /// The one place a caller becomes a history filter. A scope that came with the read decides,
+    /// whoever carries it: it is the grant's, and a scope never widens what a caller reads. It sees
+    /// the session when the method's entry always requires `session.view`, because the daemon
+    /// checked every right the entry names before it forwarded the read. Without a scope, only the
+    /// local owner reads, and it reads everything: its authority is the operating-system identity
+    /// the listener authenticated, and there is no grant to narrow. Anybody else acts under a grant
+    /// whose scope did not come with the read.
+    #[must_use]
+    pub fn history_filter(
+        &self,
+        entry: &kr_protocol::authority::MethodEntry,
+    ) -> Option<crate::history_filter::HistoryFilter> {
+        use crate::history_filter::{HistoryFilter, ViewerScope};
+
+        if let Some(history) = &self.history {
+            let session_view = entry.required_rights.iter().any(|required| {
+                required.when == kr_protocol::authority::RightCondition::Always
+                    && required.authority
+                        == kr_protocol::authority::RequiredAuthority::Right {
+                            right: kr_protocol::rights::ActionRight::SessionView,
+                        }
+            });
+            return Some(HistoryFilter::new(ViewerScope::from_history(
+                history,
+                session_view,
+            )));
+        }
+        self.is_local_owner()
+            .then(|| HistoryFilter::new(ViewerScope::owner()))
     }
 
     /// Returns true when this caller reached the host over a network transport.
