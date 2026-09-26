@@ -2357,9 +2357,13 @@ impl WorkerService {
 
     /// Forgets an attachment that has gone, so the set holds only attachments that exist.
     ///
-    /// Every way an attachment ends comes through here: its own detach, its connection going, and
-    /// a withdrawal taking it back. A set that only grew would keep one entry per attachment made
-    /// under a grant for as long as this worker ran.
+    /// Every way this service ends an attachment comes through here: its own detach, its
+    /// connection going, and a withdrawal taking it back. A set that only grew would keep one entry
+    /// per attachment made under a grant for as long as this worker ran. The one removal that does
+    /// not is the detach gesture at an empty root prompt, which the session makes when the root
+    /// editor's reader asks for it; that entry stays until the attachment's connection goes, and
+    /// no lease is held under it by then, because the session released the lease with the
+    /// attachment.
     fn forget_granted_attachment(&self, attachment_id: AttachmentId) {
         self.granted_attachments
             .lock()
@@ -5169,9 +5173,13 @@ impl WorkerService {
                 // would let bytes already handed to the writer reach the application after the
                 // attachment that sent them had gone.
                 self.runtime.flush_locked(session);
-                let result = outcome?;
+                // The attachment itself is gone either way too: a succession the kernel refused
+                // leaves the geometry where it was, not the attachment. So this connection and the
+                // fence stop holding it before the result is looked at, or a failed succession
+                // would leave both naming an attachment the session no longer has.
                 state.remove_attachment(attachment_id);
                 self.forget_granted_attachment(attachment_id);
+                let result = outcome?;
                 Ok((encode(&result)?, AfterEffect::None))
             }
             Method::SessionClose => {
