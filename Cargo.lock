@@ -4622,7 +4622,6 @@ dependencies = [
  "rustix",
  "serde",
  "sysctl",
- "sysinfo",
  "thiserror 2.0.20",
  "tokio",
  "uuid",

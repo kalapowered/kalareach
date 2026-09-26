@@ -571,7 +571,25 @@ Boot and process-start identities come from the kernel:
 | --- | --- | --- |
 | Linux | `/proc/sys/kernel/random/boot_id` | `/proc/<pid>/stat` field 22 |
 | macOS | `kern.bootsessionuuid` | `proc_pidinfo(PROC_PIDTBSDINFO)` |
-| Windows | the recorded boot time | `GetProcessTimes`: the creation time in hundreds of nanoseconds since 1970 |
+| Windows | the kernel's boot counter and its System process's creation time | `GetProcessTimes`: the creation time in hundreds of nanoseconds since 1970 |
+
+Windows gives an ordinary account no identifier for a boot. The Windows boot identity is therefore
+a pair of records the kernel keeps for its boot: the boot counter it publishes in the page it shares
+with every process (`KUSER_SHARED_DATA.BootId`), and the time it recorded when it created its
+System process, process 4, which it keeps for as long as it runs. Neither record changes while the
+kernel runs. A clock set, a sleep, a hibernation, or a hypervisor setting the clock after pausing
+the machine leaves both as they were, so every read in one boot gives the same value. A restart
+creates a new System process, recorded at the clock the kernel starts from plus the time the kernel
+took to start, to the hundred nanoseconds, and it usually advances the counter too. The pair repeats
+only when both records repeat, which takes a real-time clock that reads the same instant at two
+starts (a dead battery can reset one), the same startup time to the hundred nanoseconds, and a
+counter that did not advance because a start went unrecorded. A repeat would take the new boot for
+the old one and measure the old boot's continuous deadlines on the new boot's clock.
+
+A build before this one identified a Windows boot by its boot time in whole seconds. Its boot
+record, its workers' descriptors, and the deadlines and checkpoints it bound to the current boot
+all read as an earlier boot once, after the upgrade. The daemon closes the sessions that build
+recorded, as it would after a restart, and `kr bind` skips its workers' descriptors.
 
 A process identifier alone is never enough. Every ownership check compares the start value as well,
 so a recycled identifier reads as a different process. A query the operating system refuses is

@@ -8,7 +8,7 @@
 //! | --- | --- | --- |
 //! | Linux, Android | `/proc/sys/kernel/random/boot_id` | `/proc/<pid>/stat` field 22 |
 //! | macOS | `kern.bootsessionuuid` | `proc_pidinfo(PROC_PIDTBSDINFO)` |
-//! | Windows | the recorded boot time | `GetProcessTimes`: the creation time in hundreds of nanoseconds |
+//! | Windows | the kernel's boot counter and its System process's creation time | `GetProcessTimes`: the creation time in hundreds of nanoseconds |
 //! | iOS and the other Apple mobile systems | refused by name | refused by name |
 //!
 //! Android is Linux and reads the same two files. The Apple mobile systems are the one case where
@@ -17,7 +17,12 @@
 //! identifier. Every call there refuses and says so, because a host that is handed a stub is a
 //! host that believes something nobody established.
 //!
-//! The Windows boot time comes from `sysinfo`, which reports it as the wall clock minus the uptime.
+//! Windows gives an ordinary account no identifier for a boot, so a Windows boot identity is a pair
+//! of records the kernel keeps for its boot: the boot counter it publishes in the page it shares
+//! with every process, and the time it recorded when it created the System process, which it keeps
+//! for as long as it runs. Neither changes while the kernel runs, and `windows_boot::value` says
+//! what the pair guarantees across a restart.
+//!
 //! A process's creation time comes from the kernel, through `GetProcessTimes`, in the hundreds of
 //! nanoseconds the kernel records it in, so two processes created under one identifier within one
 //! second carry two start values. A worker of the previous build states its start in whole
@@ -1020,7 +1025,7 @@ mod platform {
 mod platform {
     use super::{
         BootIdentity, BootIdentitySource, ProcessQuery, ProcessStartSource, ProcessState, Result,
-        WindowsReading, process_times, unavailable,
+        WindowsReading, boot_records, process_times, unavailable, windows_boot,
     };
 
     pub(super) fn processes_in_group(_group: u32) -> Result<Vec<u32>> {
@@ -1039,14 +1044,18 @@ mod platform {
         Ok(None)
     }
 
+    /// Reads the kernel's boot counter and its System process's creation time, the pair
+    /// `windows_boot::value` makes this boot's identity of, afresh on every call.
     pub(super) fn boot_identity() -> Result<BootIdentity> {
-        let boot = sysinfo::System::boot_time();
-        if boot == 0 {
-            return Err(unavailable("boot identity", "boot time is not available"));
-        }
+        let list =
+            windows_boot::read_process_list(boot_records::query_process_list).map_err(|why| {
+                unavailable("boot identity", format!("the kernel's process list: {why}"))
+            })?;
+        let created = windows_boot::system_process_created(&list.bytes(), list.base())?;
+        let value = windows_boot::value(boot_records::boot_count(), created);
         Ok(BootIdentity {
             source: BootIdentitySource::BootTime,
-            value: kr_protocol::scalars::Bytes::new(boot.to_be_bytes().to_vec()),
+            value: kr_protocol::scalars::Bytes::new(value.to_vec()),
         })
     }
 
@@ -1112,8 +1121,8 @@ mod platform {
     }
 }
 
-/// The one place in this module that leaves safe Rust: opening a Windows process and reading its
-/// times.
+/// One of the two places in this module that leave safe Rust: opening a Windows process and reading
+/// its times.
 ///
 /// The crate denies unsafe code and relaxes the rule here, beside `clock::windows` and
 /// `paths::windows`, because the kernel's record of when a process was created, and whether it has
@@ -1242,6 +1251,61 @@ mod process_times {
     }
 }
 
+/// The other place in this module that leaves safe Rust: the kernel's records of a Windows boot,
+/// its process list and the boot counter in the page it shares with every process.
+///
+/// The crate denies unsafe code and relaxes the rule here, as for [`process_times`]: the list is an
+/// `ntdll` call and the counter a read of memory the kernel maps, and neither has a safe interface.
+/// Each function does one of the two and nothing else; `windows_boot` decides what the answers
+/// mean.
+#[cfg(windows)]
+mod boot_records {
+    #![expect(
+        unsafe_code,
+        reason = "the kernel's process list is an ntdll call and its boot counter lies in the page \
+                  it shares with every process, and neither has a safe interface"
+    )]
+
+    use windows_sys::Wdk::System::SystemInformation::{
+        NtQuerySystemInformation, SystemProcessInformation,
+    };
+    use windows_sys::Wdk::System::SystemServices::KUSER_SHARED_DATA;
+
+    /// Where the kernel maps `KUSER_SHARED_DATA`, the page it shares read-only with every process:
+    /// `MM_SHARED_USER_DATA_VA`, one address in every process on every Windows.
+    const SHARED_USER_DATA: usize = 0x7FFE_0000;
+
+    /// Asks the kernel for its process list in `buffer`, and returns its status and the length it
+    /// wrote, or needed.
+    pub(super) fn query_process_list(buffer: &mut [u64]) -> (i32, u32) {
+        let capacity = u32::try_from(size_of_val(buffer)).unwrap_or(u32::MAX);
+        let mut returned = 0_u32;
+        // SAFETY: `buffer` is at least `capacity` bytes of initialised, eight-byte-aligned memory
+        // that this call borrows mutably, and `returned` is a live local; the kernel writes at
+        // most `capacity` bytes into the one and a length into the other, and keeps neither
+        // pointer.
+        let status = unsafe {
+            NtQuerySystemInformation(
+                SystemProcessInformation,
+                buffer.as_mut_ptr().cast(),
+                capacity,
+                &raw mut returned,
+            )
+        };
+        (status, returned)
+    }
+
+    /// Returns the boot counter the kernel publishes as `KUSER_SHARED_DATA.BootId`.
+    pub(super) fn boot_count() -> u32 {
+        let address = SHARED_USER_DATA + std::mem::offset_of!(KUSER_SHARED_DATA, BootId);
+        // SAFETY: the kernel maps `KUSER_SHARED_DATA` readable at `SHARED_USER_DATA` into every
+        // process for the whole of its life, and `BootId` is a four-byte field at the offset the
+        // SDK declares for it, which is four-byte aligned. The read is volatile because the kernel,
+        // not this program, writes the page.
+        unsafe { std::ptr::read_volatile(std::ptr::with_exposed_provenance::<u32>(address)) }
+    }
+}
+
 /// Where the start value of a Windows reading comes from.
 const WINDOWS_START_SOURCE: ProcessStartSource = ProcessStartSource::WindowsProcessCreationTime;
 
@@ -1320,6 +1384,246 @@ pub fn windows_answer(pid: u32, reading: WindowsReading, now: u64) -> ProcessQue
         WINDOWS_START_SOURCE,
         since_epoch,
     ))
+}
+
+/// The Windows boot identity, made from what the kernel wrote.
+///
+/// Nothing here asks the kernel; `boot_records` does, on Windows. What its answers mean, and every
+/// check they must pass, is decided here in safe code, so the tests check it on every platform with
+/// lists laid out the way the kernel lays them out.
+#[cfg(any(windows, test))]
+mod windows_boot {
+    use super::{Result, unavailable};
+
+    /// The System process's identifier in the kernel's process list, on every Windows this host
+    /// runs on.
+    pub(super) const SYSTEM_PROCESS: u64 = 4;
+
+    /// The image name the kernel gives the System process.
+    pub(super) const SYSTEM_PROCESS_NAME: &str = "System";
+
+    // Where the fields read here lie in one entry of the kernel's process list,
+    // `SYSTEM_PROCESS_INFORMATION`, in bytes from the start of the entry, on 64-bit Windows.
+
+    /// The distance to the next entry, or zero after the last: four bytes.
+    pub(super) const ENTRY_NEXT: usize = 0;
+    /// The process's creation time: a signed eight-byte count of hundreds of nanoseconds since
+    /// 1601. The SDK declares these bytes reserved, `Reserved1[24..32]`, and the kernel keeps the
+    /// creation time there; the native tests compare it with the one `GetProcessTimes` gives.
+    pub(super) const ENTRY_CREATED: usize = 32;
+    /// The length in bytes of the image name, a counted UTF-16 string: two bytes.
+    pub(super) const ENTRY_NAME_LENGTH: usize = 56;
+    /// The address of the image name's characters, which the kernel writes into the same list.
+    pub(super) const ENTRY_NAME_ADDRESS: usize = 64;
+    /// The process's identifier: eight bytes.
+    pub(super) const ENTRY_PROCESS: usize = 80;
+    /// The bytes of an entry read here, through the identifier. No entry is shorter.
+    pub(super) const ENTRY_READ: usize = 88;
+
+    // The offsets above are the SDK's own on the target this is built for.
+    #[cfg(windows)]
+    const _: () = {
+        use std::mem::offset_of;
+
+        use windows_sys::Win32::Foundation::UNICODE_STRING;
+        use windows_sys::Win32::System::WindowsProgramming::SYSTEM_PROCESS_INFORMATION as Entry;
+
+        assert!(offset_of!(Entry, NextEntryOffset) == ENTRY_NEXT);
+        assert!(offset_of!(Entry, Reserved1) + 24 == ENTRY_CREATED);
+        assert!(
+            offset_of!(Entry, ImageName) + offset_of!(UNICODE_STRING, Length) == ENTRY_NAME_LENGTH
+        );
+        assert!(
+            offset_of!(Entry, ImageName) + offset_of!(UNICODE_STRING, Buffer) == ENTRY_NAME_ADDRESS
+        );
+        assert!(offset_of!(Entry, UniqueProcessId) == ENTRY_PROCESS);
+        assert!(offset_of!(Entry, UniqueProcessId) + size_of::<usize>() == ENTRY_READ);
+    };
+
+    /// The kernel's answer that a buffer is too short for its process list,
+    /// `STATUS_INFO_LENGTH_MISMATCH`.
+    pub(super) const LIST_TOO_SHORT: i32 = 0xC000_0004_u32.cast_signed();
+
+    /// How long the first buffer for the process list is, in bytes: room for a few hundred
+    /// processes and their threads.
+    pub(super) const LIST_FIRST: usize = 512 * 1024;
+
+    /// The longest buffer the list is read into, in bytes. A list that does not fit is not read.
+    pub(super) const LIST_MOST: usize = 64 * 1024 * 1024;
+
+    /// How many times the list is asked for before the answer is that it could not be read.
+    pub(super) const LIST_CALLS: usize = 8;
+
+    /// The kernel's process list as one call wrote it.
+    pub(super) struct ProcessList {
+        /// The buffer the kernel wrote into: eight-byte aligned, and kept where it is for as long
+        /// as this is, since the addresses inside the list point into it.
+        words: Vec<u64>,
+        /// How many of its bytes the kernel wrote.
+        written: usize,
+    }
+
+    impl ProcessList {
+        /// The bytes the kernel wrote, and none of the rest of the buffer.
+        pub(super) fn bytes(&self) -> Vec<u8> {
+            self.words
+                .iter()
+                .flat_map(|word| word.to_ne_bytes())
+                .take(self.written)
+                .collect()
+        }
+
+        /// The address the kernel wrote the list at, which the addresses inside it count from.
+        pub(super) fn base(&self) -> usize {
+            self.words.as_ptr().addr()
+        }
+    }
+
+    /// Reads the kernel's process list through `query`, which fills the buffer it is given and
+    /// returns the kernel's status and the length it wrote, or needed.
+    ///
+    /// The list changes between two calls, so a call the kernel says was too short is followed by
+    /// one with room for what it said it needed and half as much again, for at most
+    /// [`LIST_CALLS`] calls and a buffer of at most [`LIST_MOST`] bytes. Only a call the kernel
+    /// says succeeded is read, and only as far as the length it says it wrote.
+    pub(super) fn read_process_list(
+        mut query: impl FnMut(&mut [u64]) -> (i32, u32),
+    ) -> std::result::Result<ProcessList, String> {
+        let mut length = LIST_FIRST;
+        for _ in 0..LIST_CALLS {
+            let mut words = vec![0_u64; length.div_ceil(8)];
+            let capacity = words.len() * 8;
+            let (status, reported) = query(&mut words);
+            let reported = usize::try_from(reported).unwrap_or(usize::MAX);
+            if status == LIST_TOO_SHORT {
+                length = reported
+                    .saturating_add(reported / 2)
+                    .max(capacity.saturating_mul(2))
+                    .min(LIST_MOST);
+                continue;
+            }
+            if status < 0 {
+                return Err(format!(
+                    "the kernel would not list the processes: status {status:#010x}"
+                ));
+            }
+            if reported > capacity {
+                return Err(format!(
+                    "the kernel said it wrote {reported} bytes into a buffer of {capacity}"
+                ));
+            }
+            return Ok(ProcessList {
+                words,
+                written: reported,
+            });
+        }
+        Err(format!(
+            "the list did not fit in {length} bytes in {LIST_CALLS} calls"
+        ))
+    }
+
+    /// Returns the creation time the kernel recorded for the System process, from `list`, the
+    /// bytes of its process list, which it wrote at the address `base`.
+    ///
+    /// Every entry must hold the fields read from it before any is read, and the next entry must
+    /// lie after them. The System process is the entry for identifier 4, and it must carry the
+    /// System process's name, a counted string that must lie inside the list; its creation time
+    /// must be a time. Anything else establishes nothing, and says why.
+    pub(super) fn system_process_created(list: &[u8], base: usize) -> Result<u64> {
+        let refused =
+            |why: String| unavailable("boot identity", format!("the kernel's process list {why}"));
+        let mut at = 0_usize;
+        loop {
+            let entry = list.get(at..).unwrap_or_default();
+            if entry.len() < ENTRY_READ {
+                return Err(refused(format!("ends inside the entry at byte {at}")));
+            }
+            let next =
+                usize::try_from(u32::from_le_bytes(field(entry, ENTRY_NEXT))).unwrap_or(usize::MAX);
+            if next != 0 && next < ENTRY_READ {
+                return Err(refused(format!(
+                    "has an entry at byte {at} that the next one overlaps"
+                )));
+            }
+            if u64::from_le_bytes(field(entry, ENTRY_PROCESS)) == SYSTEM_PROCESS {
+                let name = image_name(list, base, entry)
+                    .map_err(|why| refused(format!("gives process {SYSTEM_PROCESS} {why}")))?;
+                if name != SYSTEM_PROCESS_NAME {
+                    return Err(refused(format!(
+                        "names process {SYSTEM_PROCESS} {name:?}, not the System process"
+                    )));
+                }
+                let created = i64::from_le_bytes(field(entry, ENTRY_CREATED));
+                return u64::try_from(created)
+                    .ok()
+                    .filter(|created| *created > 0)
+                    .ok_or_else(|| {
+                        refused(format!(
+                            "gives the System process a creation time of {created}"
+                        ))
+                    });
+            }
+            if next == 0 {
+                return Err(refused(format!("has no process {SYSTEM_PROCESS}")));
+            }
+            at = at.checked_add(next).ok_or_else(|| {
+                refused(format!(
+                    "has an entry at byte {at} whose next one lies past any list"
+                ))
+            })?;
+        }
+    }
+
+    /// The `N` bytes at `at` in `bytes`, which the caller has checked hold them.
+    fn field<const N: usize>(bytes: &[u8], at: usize) -> [u8; N] {
+        let mut field = [0_u8; N];
+        field.copy_from_slice(&bytes[at..at + N]);
+        field
+    }
+
+    /// Reads an entry's image name: a counted string of UTF-16 characters, which the kernel writes
+    /// into the list itself and points to by address.
+    fn image_name(list: &[u8], base: usize, entry: &[u8]) -> std::result::Result<String, String> {
+        let length = usize::from(u16::from_le_bytes(field(entry, ENTRY_NAME_LENGTH)));
+        let address = u64::from_le_bytes(field(entry, ENTRY_NAME_ADDRESS));
+        let characters = usize::try_from(address)
+            .ok()
+            .and_then(|address| address.checked_sub(base))
+            .filter(|_| length % 2 == 0)
+            .and_then(|start| list.get(start..start.checked_add(length)?))
+            .ok_or_else(|| {
+                format!("a name of {length} bytes at {address:#x}, outside the list at {base:#x}")
+            })?;
+        let units: Vec<u16> = characters
+            .chunks_exact(2)
+            .map(|unit| u16::from_le_bytes([unit[0], unit[1]]))
+            .collect();
+        String::from_utf16(&units).map_err(|_| "a name that is not UTF-16".to_owned())
+    }
+
+    /// The Windows boot identity's value: the kernel's boot counter, then the creation time it
+    /// recorded for its System process, four and eight bytes, most significant first.
+    ///
+    /// Every read in one boot gives the same value. The kernel publishes the counter once, when it
+    /// starts, and records a process's creation time once, when it creates the process; it creates
+    /// the System process when it starts and keeps it until it stops. A clock set, a sleep, a
+    /// hibernation, or a hypervisor setting the clock after pausing the machine, leaves both as
+    /// they were.
+    ///
+    /// A restart gives another value. The new kernel creates a new System process and records its
+    /// creation as the clock it starts from plus the time it took to start, to the hundred
+    /// nanoseconds, so unless the clock went back across the restart by at least the earlier
+    /// boot's uptime, that time alone is later. It normally advances the counter as well. The pair
+    /// repeats only if both parts do: a real-time clock that reads the same instant at both starts,
+    /// as one a dead battery resets can; the same startup time to the hundred nanoseconds; and a
+    /// counter that did not advance because a start went unrecorded. A repeat would take the new
+    /// boot for the old one, and apply the old boot's continuous deadlines to the new boot's clock.
+    pub(super) fn value(boot_count: u32, system_created: u64) -> [u8; 12] {
+        let mut value = [0_u8; 12];
+        value[..4].copy_from_slice(&boot_count.to_be_bytes());
+        value[4..].copy_from_slice(&system_created.to_be_bytes());
+        value
+    }
 }
 
 #[cfg(test)]
@@ -1775,6 +2079,264 @@ mod tests {
             ),
             ProcessQuery::CannotEstablish(_)
         ));
+    }
+
+    /// When a System process could have been created: 2026-09-21T08:43:08.6406893Z, in hundreds of
+    /// nanoseconds since 1601.
+    const SYSTEM_CREATED: i64 = 134_344_537_886_406_893;
+
+    /// Where a built process list is taken to have been written. Any address serves: nothing
+    /// follows one, and an address in the list only says where in the list something lies.
+    const LIST_BASE: usize = 0x0231_7000_0000;
+
+    /// The length of the fixed part of an entry in the kernel's process list on 64-bit Windows,
+    /// before the entry's thread records and its name.
+    const ENTRY_FIXED: usize = 256;
+
+    /// A process list laid out the way the kernel lays one out, built entry by entry: each entry's
+    /// fixed part, then its name's characters, at an address counted from [`LIST_BASE`].
+    struct BuiltList {
+        bytes: Vec<u8>,
+        last: Option<usize>,
+    }
+
+    impl BuiltList {
+        const fn new() -> Self {
+            Self {
+                bytes: Vec::new(),
+                last: None,
+            }
+        }
+
+        /// Adds an entry for `process`, named `name`, created at `created`.
+        fn entry(mut self, process: u64, name: &str, created: i64) -> Self {
+            use windows_boot::{
+                ENTRY_CREATED, ENTRY_NAME_ADDRESS, ENTRY_NAME_LENGTH, ENTRY_NEXT, ENTRY_PROCESS,
+            };
+            let start = self.bytes.len();
+            if let Some(last) = self.last {
+                let next = u32::try_from(start - last).expect("a list this short");
+                self.bytes[last + ENTRY_NEXT..last + ENTRY_NEXT + 4]
+                    .copy_from_slice(&next.to_le_bytes());
+            }
+            let characters: Vec<u8> = name.encode_utf16().flat_map(u16::to_le_bytes).collect();
+            let address = if characters.is_empty() {
+                0
+            } else {
+                u64::try_from(LIST_BASE + start + ENTRY_FIXED).expect("an address")
+            };
+            let length = u16::try_from(characters.len()).expect("a name this short");
+            let mut entry = vec![0_u8; ENTRY_FIXED];
+            entry[ENTRY_CREATED..ENTRY_CREATED + 8].copy_from_slice(&created.to_le_bytes());
+            entry[ENTRY_NAME_LENGTH..ENTRY_NAME_LENGTH + 2].copy_from_slice(&length.to_le_bytes());
+            entry[ENTRY_NAME_ADDRESS..ENTRY_NAME_ADDRESS + 8]
+                .copy_from_slice(&address.to_le_bytes());
+            entry[ENTRY_PROCESS..ENTRY_PROCESS + 8].copy_from_slice(&process.to_le_bytes());
+            entry.extend(&characters);
+            entry.resize(entry.len().next_multiple_of(8), 0);
+            self.bytes.extend(entry);
+            self.last = Some(start);
+            self
+        }
+
+        fn bytes(self) -> Vec<u8> {
+            self.bytes
+        }
+    }
+
+    /// A list as a host has it: the idle process, which the kernel names nothing, the System
+    /// process, and one more.
+    fn host_list(system_created: i64, other_created: i64) -> Vec<u8> {
+        BuiltList::new()
+            .entry(0, "", 0)
+            .entry(4, "System", system_created)
+            .entry(128, "Registry", other_created)
+            .bytes()
+    }
+
+    /// Where the System process's entry starts in [`host_list`]: after the idle process's fixed
+    /// part, since it has no name.
+    const SYSTEM_ENTRY: usize = ENTRY_FIXED;
+
+    fn created_in(list: &[u8]) -> Result<u64> {
+        windows_boot::system_process_created(list, LIST_BASE)
+    }
+
+    #[test]
+    fn a_windows_boot_identity_is_the_boot_counter_and_the_system_process_creation_time() {
+        let created = u64::try_from(SYSTEM_CREATED).expect("a creation time");
+        let value = windows_boot::value(3, created);
+        assert_eq!(value[..4], 3_u32.to_be_bytes());
+        assert_eq!(value[4..], created.to_be_bytes());
+        // One boot: the same counter and the same creation time, read again, are the same identity.
+        assert_eq!(windows_boot::value(3, created), value);
+        // Either part changing is another boot, whether or not the other changed with it: a counter
+        // that advanced while the creation time repeated, a creation time that moved while the
+        // counter repeated, and both.
+        assert_ne!(windows_boot::value(4, created), value);
+        assert_ne!(windows_boot::value(3, created + 1), value);
+        assert_ne!(windows_boot::value(4, created + 1), value);
+        assert_ne!(windows_boot::value(2, created), value);
+        assert_ne!(windows_boot::value(3, created - 1), value);
+    }
+
+    #[test]
+    fn the_system_process_creation_time_is_read_from_its_own_entry() {
+        let created = u64::try_from(SYSTEM_CREATED).expect("a creation time");
+        assert_eq!(
+            created_in(&host_list(SYSTEM_CREATED, SYSTEM_CREATED + 12_345))
+                .expect("the System process"),
+            created
+        );
+        // Every other process may start, end or change in between two reads; only the System
+        // process's own entry decides.
+        let busier = BuiltList::new()
+            .entry(0, "", 0)
+            .entry(4, "System", SYSTEM_CREATED)
+            .entry(812, "svchost.exe", SYSTEM_CREATED + 99)
+            .entry(9_000, "pwsh.exe", SYSTEM_CREATED + 5_000_000_000)
+            .bytes();
+        assert_eq!(created_in(&busier).expect("the System process"), created);
+        // Where the System process is not second, it is still found.
+        let later = BuiltList::new()
+            .entry(0, "", 0)
+            .entry(128, "Registry", SYSTEM_CREATED)
+            .entry(4, "System", SYSTEM_CREATED + 7)
+            .bytes();
+        assert_eq!(created_in(&later).expect("the System process"), created + 7);
+        // Another boot's System process was created at another time.
+        assert_eq!(
+            created_in(&host_list(SYSTEM_CREATED + 1, 0)).expect("the System process"),
+            created + 1
+        );
+    }
+
+    #[test]
+    fn a_process_list_that_does_not_name_the_system_process_names_no_boot() {
+        let without = BuiltList::new()
+            .entry(0, "", 0)
+            .entry(128, "Registry", SYSTEM_CREATED)
+            .bytes();
+        assert!(created_in(&without).is_err(), "no process 4");
+        let renamed = BuiltList::new()
+            .entry(0, "", 0)
+            .entry(4, "Registry", SYSTEM_CREATED)
+            .bytes();
+        assert!(
+            created_in(&renamed).is_err(),
+            "process 4 under another name"
+        );
+        let unnamed = BuiltList::new()
+            .entry(0, "", 0)
+            .entry(4, "", SYSTEM_CREATED)
+            .bytes();
+        assert!(created_in(&unnamed).is_err(), "process 4 with no name");
+        for created in [0, -1, i64::MIN] {
+            assert!(
+                created_in(&host_list(created, 1)).is_err(),
+                "{created} is not a creation time"
+            );
+        }
+        // The same list read as if written somewhere else: the name's address points at other
+        // bytes of the list, before it, or past it.
+        let list = host_list(SYSTEM_CREATED, 1);
+        for base in [LIST_BASE + 8, LIST_BASE + list.len() * 2, 0] {
+            assert!(
+                windows_boot::system_process_created(&list, base).is_err(),
+                "a list read at {base:#x} rather than where it was written"
+            );
+        }
+    }
+
+    #[test]
+    fn a_process_list_that_points_outside_itself_names_no_boot() {
+        use windows_boot::{ENTRY_NAME_LENGTH, ENTRY_NEXT, ENTRY_READ};
+
+        let list = host_list(SYSTEM_CREATED, 1);
+        assert!(created_in(&list).is_ok());
+        let with = |at: usize, bytes: &[u8]| {
+            let mut changed = list.clone();
+            changed[at..at + bytes.len()].copy_from_slice(bytes);
+            changed
+        };
+        // Shorter than an entry's fields, or cut inside the System process's entry.
+        assert!(created_in(&[]).is_err());
+        assert!(created_in(&list[..ENTRY_READ - 1]).is_err());
+        assert!(created_in(&list[..SYSTEM_ENTRY + ENTRY_READ - 1]).is_err());
+        // A next entry that overlaps this one's fields, or lies past the end.
+        assert!(created_in(&with(ENTRY_NEXT, &8_u32.to_le_bytes())).is_err());
+        assert!(created_in(&with(ENTRY_NEXT, &u32::MAX.to_le_bytes())).is_err());
+        // A name whose length is odd, or runs past the end of the list.
+        let name_length = SYSTEM_ENTRY + ENTRY_NAME_LENGTH;
+        assert!(created_in(&with(name_length, &11_u16.to_le_bytes())).is_err());
+        assert!(created_in(&with(name_length, &65_534_u16.to_le_bytes())).is_err());
+    }
+
+    #[test]
+    fn the_process_list_is_asked_for_again_with_room_while_it_grows() {
+        use windows_boot::{LIST_FIRST, LIST_TOO_SHORT};
+
+        let list = host_list(SYSTEM_CREATED, 1);
+        let needed = LIST_FIRST + 100_000;
+        let mut offered = Vec::new();
+        let read = windows_boot::read_process_list(|buffer| {
+            offered.push(size_of_val(buffer));
+            if size_of_val(buffer) < needed {
+                return (LIST_TOO_SHORT, u32::try_from(needed).expect("a length"));
+            }
+            for (word, chunk) in buffer.iter_mut().zip(list.chunks(8)) {
+                let mut bytes = [0_u8; 8];
+                bytes[..chunk.len()].copy_from_slice(chunk);
+                *word = u64::from_ne_bytes(bytes);
+            }
+            (0, u32::try_from(list.len()).expect("a length"))
+        })
+        .expect("the list, on the second call");
+        assert_eq!(
+            offered.len(),
+            2,
+            "one call too short, one that fits: {offered:?}"
+        );
+        assert!(
+            offered[1] >= needed + needed / 2,
+            "the second call has room for what the kernel said it needed, and more: {offered:?}"
+        );
+        assert_eq!(
+            read.bytes(),
+            list,
+            "only the bytes the kernel wrote are read"
+        );
+        assert_eq!(
+            read.base() % 8,
+            0,
+            "the kernel is given an eight-byte-aligned buffer"
+        );
+    }
+
+    #[test]
+    fn a_process_list_the_kernel_refuses_or_keeps_outgrowing_is_not_read() {
+        use windows_boot::{LIST_CALLS, LIST_MOST, LIST_TOO_SHORT};
+
+        let access_denied = 0xC000_0022_u32.cast_signed();
+        assert!(matches!(
+            windows_boot::read_process_list(|_| (access_denied, 0)),
+            Err(ref why) if why.contains("0xc0000022")
+        ));
+        let mut calls = 0;
+        let mut largest = 0;
+        let outgrown = windows_boot::read_process_list(|buffer| {
+            calls += 1;
+            largest = largest.max(size_of_val(buffer));
+            (LIST_TOO_SHORT, u32::MAX)
+        });
+        assert!(outgrown.is_err());
+        assert_eq!(calls, LIST_CALLS);
+        assert!(largest <= LIST_MOST, "{largest} bytes");
+        // A length longer than the buffer is not a length the kernel wrote into it.
+        let overlong = windows_boot::read_process_list(|buffer| {
+            (0, u32::try_from(size_of_val(buffer) + 8).expect("a length"))
+        });
+        assert!(overlong.is_err());
     }
 
     #[cfg(target_os = "macos")]
