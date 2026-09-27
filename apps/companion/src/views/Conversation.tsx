@@ -56,10 +56,12 @@ import {
   applyNodes,
   nodeItem,
   nodesAbove,
+  setAnchor,
   setFollowing,
   setWindowStart,
   visibleNodes,
   WINDOW_SIZE,
+  type Anchor,
   type ConversationItem
 } from '../model/conversation'
 import {
@@ -152,6 +154,12 @@ export function Conversation({
   } | null>(null)
   const scroller = useRef<HTMLDivElement | null>(null)
   const anchor = useRef<{ nodeId: string; offsetTop: number } | null>(null)
+  // Where the reader was when this view was last left, read once as the view opens, and where
+  // they are now, kept as they scroll.
+  const [initialPosition] = useState<Anchor | null>(() =>
+    state.conversation.following ? null : state.conversation.anchor
+  )
+  const position = useRef<Anchor | null>(null)
   const agent = state.agent
 
   // A package's presentation arrives as nodes on the host's event stream. One batch per animation
@@ -538,6 +546,13 @@ export function Conversation({
     if (!element) return
     const atBottom = atScrollerEnd(element)
     const atTop = element.scrollTop < NEAR_TOP
+    // Where the reader is, kept for a return to this view: the node they are looking at and how far
+    // it is from the top, or nothing at the live end, which is where a return puts them anyway.
+    const reading = anchorOf(element)
+    position.current =
+      atBottom || reading === null
+        ? null
+        : { nodeId: reading.nodeId, offset: reading.offsetTop - element.scrollTop }
     update((current) => {
       const conversation = current.conversation
       const last = lastWindowStart(conversation.nodes.length)
@@ -592,6 +607,39 @@ export function Conversation({
         : current
     })
   }, [state.conversation.windowStart, state.conversation.nodes.length, update])
+
+  // At the live end the view keeps up with what arrives. A reader who scrolled away is not
+  // following, and nothing moves under them.
+  useLayoutEffect(() => {
+    const element = scroller.current
+    if (!element || !state.conversation.following) return
+    element.scrollTop = element.scrollHeight
+  }, [state.conversation.following, state.conversation.nodes.length, state.conversation.windowStart])
+
+  // A return to this view, from the terminal or from another session, puts the reader back where
+  // they were: at the live end if they were following, and otherwise at the node they were
+  // looking at, the same distance from the top. Leaving records it in the session's own store.
+  useLayoutEffect(() => {
+    const element = scroller.current
+    position.current = initialPosition
+    if (!element || initialPosition === null) return
+    const node = element.querySelector<HTMLElement>(
+      `[data-node-id="${cssEscape(initialPosition.nodeId)}"]`
+    )
+    if (node) element.scrollTop = node.offsetTop - initialPosition.offset
+  }, [initialPosition])
+  useEffect(
+    () => () => {
+      const kept = position.current
+      update((current) => ({
+        ...current,
+        conversation: current.conversation.following
+          ? current.conversation
+          : setAnchor(current.conversation, kept)
+      }))
+    },
+    [update]
+  )
 
   const noAgent = agent.instances !== null && agent.instance === null
   const withheld = withheldTotal(agent.withheld)

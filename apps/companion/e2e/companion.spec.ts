@@ -213,6 +213,76 @@ test.describe('the attention inbox', () => {
   })
 })
 
+// KR-REQ-13.15: the conversation keeps up with new entries only while the reader is at its live
+// end, leaves a reader who scrolled away where they are, and a change of view and back returns them
+// to the same place.
+test.describe('the conversation keeps its place', () => {
+  const MAIN = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
+
+  /** Records `count` entries of the main agent, and has the page read them at once. */
+  async function written(page: Page, count: number, from: number): Promise<void> {
+    await page.evaluate(
+      ({ session, count, from }) => {
+        for (let index = 0; index < count; index += 1) {
+          window.krTestHost?.records.appendEntry(
+            session,
+            'message',
+            `Entry ${from + index}: ${'a line that wraps across the conversation '.repeat(4)}`
+          )
+        }
+        document.dispatchEvent(new Event('visibilitychange'))
+      },
+      { session: MAIN, count, from }
+    )
+  }
+
+  /** The node the reader is looking at and how far its top is from the top of the view. */
+  const reading = (scroll: Locator) =>
+    scroll.evaluate((element) => {
+      for (const node of element.querySelectorAll<HTMLElement>('[data-node-id]')) {
+        if (node.offsetTop + node.offsetHeight > element.scrollTop) {
+          return { id: node.dataset.nodeId ?? '', offset: Math.round(node.offsetTop - element.scrollTop) }
+        }
+      }
+      return null
+    })
+
+  const atEnd = (scroll: Locator) =>
+    scroll.evaluate((element) => element.scrollHeight - element.scrollTop - element.clientHeight < 4)
+
+  test('follows only at the live end, and returns the reader to their place', async ({ page }) => {
+    await openSession(page)
+    const scroll = page.getByTestId('conversation-scroll')
+    await written(page, 40, 1)
+    await expect(scroll.locator('[data-node-id$=":45"]')).toBeAttached()
+    await expect.poll(() => atEnd(scroll)).toBe(true)
+
+    // At the live end, a new entry is followed.
+    await written(page, 1, 41)
+    await expect(scroll.locator('[data-node-id$=":46"]')).toBeAttached()
+    await expect.poll(() => atEnd(scroll)).toBe(true)
+
+    // Scrolled away, the reader stays where they are when another arrives.
+    await scroll.evaluate((element) => {
+      element.scrollTop = element.scrollHeight / 3
+    })
+    await expect(scroll).toHaveAttribute('data-following', 'false')
+    const before = await reading(scroll)
+    expect(before).not.toBeNull()
+    await written(page, 1, 42)
+    await expect(scroll.locator('[data-node-id$=":47"]')).toBeAttached()
+    expect(await reading(scroll)).toEqual(before)
+
+    // To the terminal and back: the same node, the same distance from the top.
+    await page.getByRole('tab', { name: 'Terminal' }).click()
+    await page.getByTestId('raw-terminal').waitFor()
+    await page.getByRole('tab', { name: 'Conversation' }).click()
+    await expect(scroll).toBeVisible()
+    await expect.poll(() => reading(scroll)).toEqual(before)
+    await page.screenshot({ path: shot(`conversation-place-13.15-${test.info().project.name}`) })
+  })
+})
+
 test.describe('sessions', () => {
   test('a row carries the number, the directory, the attachments and the state', async ({
     page

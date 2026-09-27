@@ -275,7 +275,10 @@ export function Session({
       ) : null}
 
       {pane === 'semantic' ? (
+        // One view of the conversation per session: it opens where the person left that session's
+        // conversation, and records where they leave it.
         <Conversation
+          key={sessionId}
           sessionId={sessionId}
           subject={subject}
           connected={connected}
