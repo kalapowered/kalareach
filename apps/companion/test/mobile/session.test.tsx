@@ -494,16 +494,17 @@ describe("the phone's raw terminal view (KR-REQ-08.02, 13.18)", () => {
           )
         })
       }
-      // Two fingers 100 pixels apart move to 160: a pinch outwards, one step larger.
+      // Two fingers 100 pixels apart move to 160: a pinch outwards to 1.6 times, which leaves the
+      // text at the step nearest that.
       finger('pointerdown', 1, 100)
       finger('pointerdown', 2, 200)
       finger('pointermove', 2, 260)
       finger('pointerup', 2, 260)
       finger('pointerup', 1, 100)
-      expect(await screen.findByText('Zoom 113%')).toBeInTheDocument()
-      // Cells of 9 by 18 now: 35 across and 22 down.
+      expect(await screen.findByText('Zoom 150%')).toBeInTheDocument()
+      // Cells of 12 by 24 now: 26 across and 16 down.
       await waitFor(() => {
-        expect(controls.terminalViews[0]?.grids.at(-1)).toEqual({ columns: 35, rows: 22 })
+        expect(controls.terminalViews[0]?.grids.at(-1)).toEqual({ columns: 26, rows: 16 })
       })
       expect(controls.terminalViews).toHaveLength(1)
     } finally {
@@ -755,8 +756,42 @@ describe("the phone's raw terminal view (KR-REQ-08.02, 13.18)", () => {
       finger('pointermove', 2, 260, 100)
       finger('pointerup', 2, 260, 100)
       finger('pointerup', 1, 100, 108)
-      expect(await screen.findByText('Zoom 113%')).toBeInTheDocument()
+      expect(await screen.findByText('Zoom 150%')).toBeInTheDocument()
       expect(controls.terminalViews[0]?.moves).toEqual([])
+    } finally {
+      restore()
+    }
+  })
+
+  // KR-REQ-13.06, 13.17: gesture motion tracks the finger and can reverse during the movement. The
+  // text scales with the fingers while they pinch, follows them back when they reverse, and the zoom
+  // changes once, to the step nearest where they end; a pinch that comes back where it began changes
+  // nothing.
+  it('scales the text with the fingers while they pinch, and follows them back', async () => {
+    const restore = measured()
+    try {
+      const { port } = fakeHost()
+      await onTerminal(port)
+      await waitFor(() => {
+        expect(screen.getAllByTestId('mobile-terminal-line').length).toBeGreaterThan(0)
+      })
+      const layer = () =>
+        screen.getByTestId('mobile-terminal').querySelector<HTMLElement>('.m-terminal-grid')?.parentElement
+      const scaled = () => /scale\(([\d.]+)\)/.exec(layer()?.style.transform ?? '')?.[1] ?? '1'
+      finger('pointerdown', 1, 100, 100)
+      finger('pointerdown', 2, 200, 100)
+      finger('pointermove', 2, 250, 100)
+      expect(scaled()).toBe('1.5')
+      // Towards each other: smaller, but never past the smallest step.
+      finger('pointermove', 2, 150, 100)
+      expect(scaled()).toBe('0.75')
+      // Back where they began.
+      finger('pointermove', 2, 200, 100)
+      expect(scaled()).toBe('1')
+      finger('pointerup', 2, 200, 100)
+      finger('pointerup', 1, 100, 100)
+      expect(layer()?.style.transform).toBe('')
+      expect(screen.getByText('Zoom 100%')).toBeInTheDocument()
     } finally {
       restore()
     }

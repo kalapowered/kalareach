@@ -145,7 +145,10 @@ failures, and offers nothing to decide. Elapsed time is reported as elapsed time
 Control mode and view mode, as on the desktop. In control mode the program inside the terminal owns
 the touch, exactly as it owns the wheel, and the view's own pan does not exist: a pan control that
 took a one-finger drag would make a pager or an editor unusable. A pinch zooms in either mode,
-because nothing on the wire carries a pinch, so zooming takes nothing from anyone.
+because nothing on the wire carries a pinch, so zooming takes nothing from anyone. The text scales
+with the fingers while they pinch and follows them back if they reverse; when they lift, the zoom
+takes the step nearest where they ended, and a pinch that comes back to where it began changes
+nothing.
 
 ## Coming back
 

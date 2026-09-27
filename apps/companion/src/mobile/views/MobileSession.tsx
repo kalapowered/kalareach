@@ -1043,6 +1043,15 @@ export function MobileSession({
   )
 }
 
+/** The zoom step nearest `scale`. */
+function nearestZoom(scale: number): number {
+  let nearest = 0
+  ZOOM_STEPS.forEach((step, index) => {
+    if (Math.abs(step - scale) < Math.abs((ZOOM_STEPS[nearest] ?? step) - scale)) nearest = index
+  })
+  return nearest
+}
+
 /** Where a file's upload stands, in words. */
 const UPLOAD_WORDS: Readonly<Record<DraftAttachment['upload'], string>> = {
   uploading: 'uploading',
@@ -1133,6 +1142,9 @@ function RawTerminal({
   // The one-finger drag in control mode, which turns the program's wheel: its finger, where it began
   // counting rows from, the rows it has counted, and where the finger is.
   const turning = useRef<{ pointer: number; origin: number; counted: number; last: Point } | null>(null)
+  // The pinch in progress: the zoom step it began at and how far apart the fingers were. While it
+  // lasts the screen is scaled with the fingers, and the zoom takes the step nearest where they end.
+  const pinching = useRef<{ zoom: number; spread: number } | null>(null)
   // One cell in pixels, measured once laid out at each zoom and screen, for drawing the shift.
   const [cell, setCell] = useState<CellSize | null>(null)
   useLayoutEffect(() => {
@@ -1148,6 +1160,36 @@ function RawTerminal({
     const layer = dragLayer.current
     if (layer === null) return
     layer.style.transform = at.x === 0 && at.y === 0 ? '' : `translate(${at.x}px, ${at.y}px)`
+  }
+
+  /**
+   * Scales the screen with the fingers while a pinch lasts, from the point between them, so the
+   * text grows and shrinks as they move and follows them back if they reverse. Nothing is sent:
+   * the zoom changes once, when the pinch ends.
+   */
+  const drawPinch = (factor: number, around: Point | null) => {
+    const layer = dragLayer.current
+    if (layer === null) return
+    if (factor === 1 || around === null) {
+      layer.style.transform = ''
+      layer.style.transformOrigin = ''
+      return
+    }
+    const box = layer.getBoundingClientRect()
+    layer.style.transformOrigin = `${around.x - box.left}px ${around.y - box.top}px`
+    layer.style.transform = `scale(${factor})`
+  }
+
+  /** The scale the fingers have reached, as a factor of the zoom the pinch began at. */
+  const pinchFactor = (held: { zoom: number; spread: number }): number => {
+    const [first, second] = [...pointers.current.values()]
+    if (first === undefined || second === undefined || held.spread === 0) return 1
+    const spread = Math.hypot(first.x - second.x, first.y - second.y)
+    const from = ZOOM_STEPS[held.zoom] ?? 1
+    const lowest = ZOOM_STEPS[0]
+    const highest = ZOOM_STEPS[ZOOM_STEPS.length - 1] ?? from
+    const reached = Math.min(highest, Math.max(lowest, (from * spread) / held.spread))
+    return reached / from
   }
 
   /** Ends the drag in progress, sending nothing: its part not sent is dropped. */
@@ -1178,8 +1220,12 @@ function RawTerminal({
     start.current = null
     dragging.current = null
     turning.current = null
+    pinching.current = null
     const layer = dragLayer.current
-    if (layer !== null) layer.style.transform = ''
+    if (layer !== null) {
+      layer.style.transform = ''
+      layer.style.transformOrigin = ''
+    }
   }, [openingKey, mode, ended])
   // A new cell size: a drag begins again from where the finger is, and its part not sent is dropped.
   const cellWidth = cell?.width
@@ -1226,6 +1272,11 @@ function RawTerminal({
     rebase()
     if (dragging.current?.pointer === pointer) dropDrag()
     if (turning.current?.pointer === pointer) turning.current = null
+    if (pinching.current !== null && pointers.current.size < 2) {
+      // A pinch the browser ended changes nothing.
+      pinching.current = null
+      drawPinch(1, null)
+    }
   }
 
   const gestureFrom = (event: React.PointerEvent): TouchGesture => {
@@ -1281,11 +1332,25 @@ function RawTerminal({
         } else {
           if (dragging.current !== null) dropDrag()
           turning.current = null
+          if (pointers.current.size === 2) {
+            pinching.current = { zoom, spread: start.current?.spread ?? 0 }
+          }
         }
       }}
       onPointerMove={(event) => {
         if (!pointers.current.has(event.pointerId)) return
         pointers.current.set(event.pointerId, { x: event.clientX, y: event.clientY })
+        const pinch = pinching.current
+        if (pinch !== null) {
+          const [first, second] = [...pointers.current.values()]
+          drawPinch(
+            pinchFactor(pinch),
+            first !== undefined && second !== undefined
+              ? { x: (first.x + second.x) / 2, y: (first.y + second.y) / 2 }
+              : null
+          )
+          return
+        }
         const turned = turning.current
         if (turned !== null && turned.pointer === event.pointerId) {
           // A turn for each row the finger has crossed since the last, sent at the session's cell
@@ -1319,6 +1384,9 @@ function RawTerminal({
       onPointerUp={(event) => {
         if (!pointers.current.has(event.pointerId)) return
         const outcome = routeGesture(mode, gestureFrom(event))
+        const pinch = pinching.current
+        // A pinch ends on the zoom step nearest where the fingers left the text.
+        const target = pinch === null ? null : nearestZoom((ZOOM_STEPS[pinch.zoom] ?? 1) * pinchFactor(pinch))
         pointers.current.delete(event.pointerId)
         // A finger leaving changes what the gesture is measured from, so the origin is taken
         // again from the fingers still down. Keeping the old one makes the next gesture jump by
@@ -1336,7 +1404,12 @@ function RawTerminal({
         // A finger turning the program's wheel sends nothing more as it lifts: a part of a row is no
         // turn, so a tap sends nothing.
         if (turning.current?.pointer === event.pointerId) turning.current = null
-        if (outcome.kind === 'zoom') onZoom(outcome.steps)
+        if (pinch !== null) {
+          pinching.current = null
+          drawPinch(1, null)
+          // A pinch too small to be one changes nothing, as an unsteady two-finger touch should not.
+          if (outcome.kind === 'zoom' && target !== null) onZoom(target - pinch.zoom)
+        }
       }}
       onPointerCancel={(event) => {
         forget(event.pointerId)
