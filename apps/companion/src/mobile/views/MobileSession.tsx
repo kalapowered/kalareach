@@ -1169,14 +1169,20 @@ function RawTerminal({
    */
   const drawPinch = (factor: number, around: Point | null) => {
     const layer = dragLayer.current
+    const surface = surfaceRef.current
     if (layer === null) return
-    if (factor === 1 || around === null) {
+    if (factor === 1 || around === null || surface === null) {
       layer.style.transform = ''
       layer.style.transformOrigin = ''
       return
     }
-    const box = layer.getBoundingClientRect()
-    layer.style.transformOrigin = `${around.x - box.left}px ${around.y - box.top}px`
+    // The point between the fingers, in the layer's own box as it is laid out. The layer's drawn
+    // box already carries the scale of the fingers' last movement, and an origin taken from it
+    // would move with every movement and carry the text away from under them.
+    const frame = surface.getBoundingClientRect()
+    const left = frame.left + surface.clientLeft + layer.offsetLeft - surface.scrollLeft
+    const top = frame.top + surface.clientTop + layer.offsetTop - surface.scrollTop
+    layer.style.transformOrigin = `${around.x - left}px ${around.y - top}px`
     layer.style.transform = `scale(${factor})`
   }
 

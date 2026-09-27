@@ -3262,3 +3262,61 @@ test.describe('a new session and its shell', () => {
     expect(engine).not.toBe('')
   })
 })
+
+// KR-REQ-13.17: a pinch on the phone's terminal scales the text around the point between the
+// fingers, as far as they go and back, and settles on a zoom step only when they lift. Two fingers
+// are sent through Chromium's own input pipeline, which WebKit's driver has no way to do.
+test.describe('the phone terminal under two fingers', () => {
+  test.use({ hasTouch: true, viewport: { width: 412, height: 915 } })
+
+  test('scales around the point between the fingers as they spread and come back, and settles on lifting', async ({
+    page,
+    browserName
+  }) => {
+    test.skip(browserName !== 'chromium', 'two touches at once are sent through the Chromium protocol')
+    await page.goto(`/harness.html?surface=android&session=8a7b6c50-22bb-4c3d-8e4f-000000000101`)
+    await page.getByRole('tab', { name: 'Terminal' }).click()
+    const line = page.getByTestId('mobile-terminal-line').nth(4)
+    await expect(line).toContainText('test result')
+    const surface = page.getByTestId('mobile-terminal')
+    const box = await surface.boundingBox()
+    if (!box) throw new Error('the terminal has no box')
+    const between = { x: box.x + box.width / 2, y: box.y + box.height / 2 }
+    const session = await page.context().newCDPSession(page)
+    const fingers = (spread: number) =>
+      [-1, 1].map((side, id) => ({ x: between.x + (side * spread) / 2, y: between.y, id }))
+    // Where the line's corner is drawn, once the frame that takes in the last movement is drawn:
+    // the engine hands a page its touch movements a frame at a time.
+    const glyph = () =>
+      line.evaluate(
+        (element) =>
+          new Promise<{ x: number; y: number }>((resolve) => {
+            requestAnimationFrame(() => {
+              requestAnimationFrame(() => {
+                const first = element.getBoundingClientRect()
+                resolve({ x: first.left, y: first.top })
+              })
+            })
+          })
+      )
+
+    const at = await glyph()
+    await session.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: fingers(100) })
+    for (const spread of [120, 140, 160, 180, 160, 140]) {
+      await session.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: fingers(spread) })
+      const factor = spread / 100
+      // What was under a point stays under it as the text grows: the line's corner is scaled
+      // away from the point between the fingers by exactly the factor they reached.
+      const now = await glyph()
+      expect(now.x, `across at ${factor}`).toBeCloseTo(between.x + (at.x - between.x) * factor, 0)
+      expect(now.y, `down at ${factor}`).toBeCloseTo(between.y + (at.y - between.y) * factor, 0)
+    }
+    await page.screenshot({ path: shot(`phone-pinch-13.17-${test.info().project.name}`) })
+    await session.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] })
+    // Lifted at 1.4: the step nearest is 150%, and the text is drawn at it with no scale left over.
+    await expect(page.getByText('Zoom 150%')).toBeVisible()
+    expect(
+      await surface.evaluate((element) => (element.firstElementChild as HTMLElement).style.transform)
+    ).toBe('')
+  })
+})
