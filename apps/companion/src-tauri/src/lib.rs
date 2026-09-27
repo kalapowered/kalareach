@@ -9,7 +9,8 @@
 //!   WebView (bundled React)                native backend                 host
 //!   ─────────────────────────   invoke     ──────────────────   kr-client  ────
 //!   session_list            ────────────▶  Method::SessionList ──────────▶ session.list
-//!   composer_submit         ────────────▶  Method::AgentPromptSubmit ────▶ agent.prompt.submit
+//!   agent_prompt_submit     ────────────▶  Method::AgentPromptSubmit ────▶ agent.prompt.submit,
+//!                                                                          on the session's worker
 //!   open_external           ────────────▶  scheme policy, then the platform opener
 //!   …one command per operation, and nothing that names a method itself
 //! ```
@@ -22,6 +23,7 @@
 //! that list as data, and the crate's tests hold the handler list and the allowlist to each other.
 
 pub mod account;
+pub mod agent;
 pub mod commands;
 pub mod connection;
 pub mod device;
@@ -37,6 +39,7 @@ pub mod target;
 pub mod terminal;
 pub mod transfers;
 pub mod verify;
+pub mod worker;
 
 pub mod audio;
 
@@ -67,6 +70,8 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(companion_platform::init())
         .manage(AppState::new())
+        // The links to each session's own worker, which the agent's calls travel on.
+        .manage(agent::WorkerLinks::local())
         .invoke_handler(commands::handlers());
     // The raw terminal views, and the rule that ends a page's views when it loads again.
     terminal::install(builder, terminal::TerminalViews::local())

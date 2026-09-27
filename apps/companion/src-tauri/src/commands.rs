@@ -69,13 +69,43 @@ pub const NAMED_COMMANDS: &[(&str, Option<Method>)] = &[
     ("attachment_upload_status", Some(Method::UploadStatus)),
     ("attachment_image", Some(Method::DownloadBegin)),
     ("attachment_image_chunk", Some(Method::DownloadChunk)),
-    // History.
+    // History. A live session's is read from its own worker, and a closed one's from the host's
+    // archive.
     ("history_page", Some(Method::HistoryPage)),
     ("action_read", Some(Method::ActionRead)),
     ("action_cancel", Some(Method::ActionCancel)),
     // Questions.
     ("question_read", Some(Method::QuestionRead)),
     ("question_answer", Some(Method::QuestionAnswer)),
+    // The agent. Each goes to the session's own worker, which checks the caller itself: the page
+    // supplies the method's parameters, and the link, the envelope and its target are native
+    // code's.
+    ("agent_capabilities", Some(Method::AgentCapabilities)),
+    ("agent_snapshot", Some(Method::AgentSnapshot)),
+    ("agent_commands", Some(Method::AgentCommands)),
+    ("agent_approval_inspect", Some(Method::AgentApprovalInspect)),
+    ("agent_prompt_submit", Some(Method::AgentPromptSubmit)),
+    ("agent_prompt_queue", Some(Method::AgentPromptQueue)),
+    ("agent_turn_steer", Some(Method::AgentTurnSteer)),
+    ("agent_turn_cancel", Some(Method::AgentTurnCancel)),
+    ("agent_approval_respond", Some(Method::AgentApprovalRespond)),
+    ("session_agents", None),
+    // Attention and review.
+    ("attention_read", Some(Method::AttentionRead)),
+    ("attention_acknowledge", Some(Method::AttentionAcknowledge)),
+    ("review_read", Some(Method::ReviewRead)),
+    ("review_acknowledge", Some(Method::ReviewAcknowledge)),
+    // Change sets.
+    ("changeset_read", Some(Method::ChangesetRead)),
+    // Sharing: the devices an invitation can go to, what one would carry, issuing it and the
+    // grants issued.
+    ("device_list", Some(Method::DeviceList)),
+    ("grant_notices", None),
+    ("grant_create", Some(Method::GrantCreate)),
+    ("grant_list", Some(Method::GrantList)),
+    // Packages.
+    ("plugin_list", Some(Method::PluginList)),
+    ("catalogue_list", Some(Method::CatalogueList)),
     // Pairing.
     ("pairing_set_origin", None),
     ("pairing_view", None),
@@ -170,6 +200,10 @@ pub const NATIVE_METHODS: &[(&str, &[Method])] = &[
         ],
     ),
     ("terminal_view_close", &[Method::SessionDetach]),
+    // The page names a session; native code reads the snapshot of its agent instances and of every
+    // request its broker is arbitrating, following the pages of that one snapshot, on the
+    // session's own worker.
+    ("session_agents", &[Method::EventsSnapshot]),
 ];
 
 /// The command handlers, in the form Tauri registers.
@@ -204,6 +238,27 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static
         action_cancel,
         question_read,
         question_answer,
+        agent_capabilities,
+        agent_snapshot,
+        agent_commands,
+        agent_approval_inspect,
+        agent_prompt_submit,
+        agent_prompt_queue,
+        agent_turn_steer,
+        agent_turn_cancel,
+        agent_approval_respond,
+        session_agents,
+        attention_read,
+        attention_acknowledge,
+        review_read,
+        review_acknowledge,
+        changeset_read,
+        device_list,
+        grant_notices,
+        grant_create,
+        grant_list,
+        plugin_list,
+        catalogue_list,
         pairing_set_origin,
         pairing_view,
         pairing_start_code,
@@ -247,7 +302,7 @@ struct NoParams {}
 /// declared size and digest on an upload. A second copy in a separate map would be a second place
 /// for them to disagree.
 #[derive(Debug, Serialize)]
-struct NoPreconditions {}
+pub(crate) struct NoPreconditions {}
 
 /// Parses the page's parameters into the method's own type.
 fn decode<T: serde::de::DeserializeOwned>(params: Value) -> Result<T> {
@@ -294,6 +349,24 @@ fn settled(answer: &kr_client::Settled) -> Result<Settled> {
     })
 }
 
+/// What the page is told of one submitted mutation.
+///
+/// A submission whose outcome the host never confirmed still has an identity, and the interface
+/// needs it: that is the action it asks about rather than resubmits.
+fn submitted(
+    answer: std::result::Result<kr_client::Settled, kr_client::ClientError>,
+) -> Result<Settled> {
+    match answer {
+        Ok(value) => settled(&value),
+        Err(kr_client::ClientError::SubmissionUncertain { action_id }) => Ok(Settled {
+            receipt: None,
+            value: None,
+            action_id: Some(action_id.to_string()),
+        }),
+        Err(error) => Err(CommandError::from(error)),
+    }
+}
+
 /// Declares a command that performs one read and nothing else.
 macro_rules! read_command {
     ($(#[$meta:meta])* $name:ident, $method:expr, () => $result:ty) => {
@@ -330,20 +403,64 @@ macro_rules! mutate_command {
             let typed: $params = decode(params)?;
             let target = subject.target(state.environment_id()?)?;
             let session = state.session()?;
-            let answer = session
-                .mutate($method, target, None, &NoPreconditions {}, &typed, MUTATION_TTL)
-                .await;
-            match answer {
-                Ok(value) => settled(&value),
-                // A submission whose outcome the host never confirmed still has an identity, and
-                // the interface needs it: that is the action it asks about rather than resubmits.
-                Err(kr_client::ClientError::SubmissionUncertain { action_id }) => Ok(Settled {
-                    receipt: None,
-                    value: None,
-                    action_id: Some(action_id.to_string()),
-                }),
-                Err(error) => Err(CommandError::from(error)),
-            }
+            submitted(
+                session
+                    .mutate($method, target, None, &NoPreconditions {}, &typed, MUTATION_TTL)
+                    .await,
+            )
+        }
+    };
+}
+
+/// Declares a command that performs one read on the session's own worker.
+///
+/// The parameters name the session and the exact agent instance, and the read goes to that
+/// session's worker and to nothing else.
+macro_rules! agent_read_command {
+    ($(#[$meta:meta])* $name:ident, $method:expr, $params:ty => $result:ty) => {
+        $(#[$meta])*
+        #[tauri::command]
+        pub async fn $name(
+            links: State<'_, crate::agent::WorkerLinks>,
+            params: Value,
+        ) -> Result<Value> {
+            let typed: $params = decode(params)?;
+            let answer: $result = links
+                .read(typed.subject.session_id, $method, &typed)
+                .await?;
+            encode(&answer)
+        }
+    };
+}
+
+/// Declares a command that submits one agent mutation to the session's own worker.
+///
+/// The parameters name the session, the instance and the binding revision they were prepared
+/// against, and the envelope's target is built from exactly those, so the two cannot disagree.
+/// `$check` refuses what the parameters' own type cannot, before anything is sent.
+macro_rules! agent_mutate_command {
+    ($(#[$meta:meta])* $name:ident, $method:expr, $params:ty, $check:expr) => {
+        $(#[$meta])*
+        #[tauri::command]
+        pub async fn $name(
+            links: State<'_, crate::agent::WorkerLinks>,
+            params: Value,
+        ) -> Result<Settled> {
+            let typed: $params = decode(params)?;
+            let check: fn(&$params) -> std::result::Result<(), &'static str> = $check;
+            check(&typed).map_err(CommandError::invalid)?;
+            let target = typed.target;
+            submitted(
+                links
+                    .mutate(
+                        target.subject.session_id,
+                        target.subject.application_instance_id,
+                        target.binding_revision,
+                        $method,
+                        &typed,
+                    )
+                    .await?,
+            )
         }
     };
 }
@@ -388,11 +505,28 @@ read_command!(
     action_read, Method::ActionRead,
     kr_protocol::receipt::ActionReadParams => kr_protocol::receipt::ActionReadResult
 );
-read_command!(
-    /// Reads one page of retained history above the live screen.
-    history_page, Method::HistoryPage,
-    kr_protocol::recovery::HistoryPageParams => kr_protocol::recovery::HistoryPageResult
-);
+/// Reads one page of a session's retained output, from the cursor and within the byte bound the
+/// page names.
+///
+/// A live session's output is its worker's, so the page is read on the session's own worker link;
+/// the control daemon serves the archive of a session whose worker has ended, and refuses a live
+/// one. Which it is follows from whether the session's worker has a descriptor on this machine.
+#[tauri::command]
+pub async fn history_page(
+    state: State<'_, AppState>,
+    links: State<'_, crate::agent::WorkerLinks>,
+    params: Value,
+) -> Result<Value> {
+    let typed: kr_protocol::recovery::HistoryPageParams = decode(params)?;
+    let page: kr_protocol::recovery::HistoryPageResult = if links.serves(typed.session_id)? {
+        links
+            .read(typed.session_id, Method::HistoryPage, &typed)
+            .await?
+    } else {
+        state.session()?.read(Method::HistoryPage, &typed).await?
+    };
+    encode(&page)
+}
 read_command!(
     /// Reads how much of an upload the host already holds.
     attachment_upload_status, Method::UploadStatus,
@@ -447,6 +581,166 @@ mutate_command!(
     /// Cancels a pending action.
     action_cancel, Method::ActionCancel, kr_protocol::receipt::ActionCancelParams
 );
+
+agent_read_command!(
+    /// Reads what the bound agent can do now, with the evidence behind each capability, and the
+    /// binding the answer is about.
+    agent_capabilities, Method::AgentCapabilities,
+    kr_protocol::agent::AgentCapabilitiesParams => kr_protocol::agent::AgentCapabilitiesResult
+);
+agent_read_command!(
+    /// Reads one part of the bound agent's semantic history, filtered as the caller's authority
+    /// requires, from the node the page names.
+    agent_snapshot, Method::AgentSnapshot,
+    kr_protocol::agent::AgentSnapshotParams => kr_protocol::agent::AgentSnapshotResult
+);
+agent_read_command!(
+    /// Reads the commands the bound agent advertises.
+    agent_commands, Method::AgentCommands,
+    kr_protocol::agent::AgentCommandsParams => kr_protocol::agent::AgentCommandsResult
+);
+agent_read_command!(
+    /// Reads what an installed decoder read of one approval request and the decisions it offered,
+    /// with the request's original bytes, so a person can check the one against the other before
+    /// answering.
+    agent_approval_inspect, Method::AgentApprovalInspect,
+    kr_protocol::agent::AgentApprovalInspectParams => kr_protocol::agent::AgentApprovalInspectResult
+);
+agent_mutate_command!(
+    /// Submits a prompt to the bound agent: a draft or inline text, and never both.
+    agent_prompt_submit, Method::AgentPromptSubmit, kr_protocol::agent::AgentPromptParams,
+    kr_protocol::agent::AgentPromptParams::validate
+);
+agent_mutate_command!(
+    /// Queues a prompt behind the bound agent's current turn: a draft or inline text, and never
+    /// both.
+    agent_prompt_queue, Method::AgentPromptQueue, kr_protocol::agent::AgentPromptParams,
+    kr_protocol::agent::AgentPromptParams::validate
+);
+agent_mutate_command!(
+    /// Steers the turn the bound agent is running.
+    agent_turn_steer, Method::AgentTurnSteer, kr_protocol::agent::AgentSteerParams,
+    |_| Ok(())
+);
+agent_mutate_command!(
+    /// Cancels the turn the bound agent is running, by the upstream's own identifier for it.
+    agent_turn_cancel, Method::AgentTurnCancel, kr_protocol::agent::AgentCancelParams,
+    |_| Ok(())
+);
+agent_mutate_command!(
+    /// Answers one approval request with one of the decisions its decoder offered.
+    agent_approval_respond, Method::AgentApprovalRespond,
+    kr_protocol::agent::AgentApprovalRespondParams, |_| Ok(())
+);
+
+/// Reads a session's live agent instances and every request its broker is still arbitrating.
+///
+/// The page names the session. The snapshot is taken on the session's own worker, every page of it
+/// is read before anything is answered, and what the page is told is the instances and the
+/// requests, not the snapshot's cursors.
+#[tauri::command]
+pub async fn session_agents(
+    links: State<'_, crate::agent::WorkerLinks>,
+    session_id: String,
+) -> Result<crate::agent::SessionAgents> {
+    let session_id: kr_protocol::ids::SessionId = session_id
+        .parse()
+        .map_err(|_| CommandError::invalid("that is not a session identifier"))?;
+    links.agents(session_id).await
+}
+
+read_command!(
+    /// Reads the attention inbox this computer's owner sees.
+    attention_read, Method::AttentionRead,
+    kr_protocol::attention::AttentionReadParams => kr_protocol::attention::AttentionReadResult
+);
+mutate_command!(
+    /// Records that this computer's owner has seen attention items, each at the revision shown.
+    attention_acknowledge, Method::AttentionAcknowledge,
+    kr_protocol::attention::AttentionAcknowledgeParams
+);
+read_command!(
+    /// Reads review state: which completed turns and change sets wait for review, at which
+    /// versions.
+    review_read, Method::ReviewRead,
+    kr_protocol::attention::ReviewReadParams => kr_protocol::attention::ReviewReadResult
+);
+mutate_command!(
+    /// Records that one exact version was reviewed. It approves nothing and changes no file.
+    review_acknowledge, Method::ReviewAcknowledge,
+    kr_protocol::attention::ReviewAcknowledgeParams
+);
+read_command!(
+    /// Reads one exact version of a change set, with every version of it.
+    changeset_read, Method::ChangesetRead,
+    kr_protocol::changeset::ChangesetReadParams => kr_protocol::changeset::ChangesetReadResult
+);
+read_command!(
+    /// Lists the devices paired with this host, which is who an invitation can be issued to.
+    device_list, Method::DeviceList,
+    kr_protocol::sharing::DeviceListParams => kr_protocol::sharing::DeviceListResult
+);
+mutate_command!(
+    /// Issues one invitation: a grant to a paired device, carrying the notices its issuer was
+    /// shown. The host refuses one whose notices differ from what the grant actually carries.
+    grant_create, Method::GrantCreate, kr_protocol::sharing::GrantCreateParams
+);
+read_command!(
+    /// Lists the grants this host has issued.
+    grant_list, Method::GrantList,
+    kr_protocol::sharing::GrantListParams => kr_protocol::sharing::GrantListResult
+);
+read_command!(
+    /// Lists the packages installed in an environment.
+    plugin_list, Method::PluginList,
+    kr_protocol::catalogue::PluginListParams => kr_protocol::catalogue::PluginListResult
+);
+read_command!(
+    /// Lists the package repositories an environment has enrolled.
+    catalogue_list, Method::CatalogueList,
+    kr_protocol::catalogue::CatalogueListParams => kr_protocol::catalogue::CatalogueListResult
+);
+
+/// What an invitation with one role and its explicit choices would carry, before it is issued.
+#[derive(Debug, Serialize)]
+pub struct GrantNotices {
+    /// The actions the selection compiles to. The host authorises from these, never from a role.
+    pub actions: Vec<kr_protocol::rights::ActionRight>,
+    /// Every notice those actions carry, with the fixed sentence that states it.
+    pub notices: Vec<GrantNotice>,
+}
+
+/// One consequence of a grant, as the issuer is shown it.
+#[derive(Debug, Serialize)]
+pub struct GrantNotice {
+    /// Which notice it is. An issuance names these back as the notices its issuer accepted.
+    pub notice: kr_protocol::sharing::AuthorityNotice,
+    /// The sentence that states it, in the host's own words.
+    pub sentence: &'static str,
+}
+
+/// Says what an invitation would carry: the actions its role and choices compile to, and the
+/// notices those actions carry, each in the one sentence that states it.
+///
+/// The notices come from the protocol's own table, so no surface decides for itself that an action
+/// is harmless or words a consequence more softly than the host does. It reaches nothing: the page
+/// asks before it issues, and issuing sends the same notices back for the host to check.
+#[tauri::command]
+pub fn grant_notices(selection: Value) -> Result<GrantNotices> {
+    let selection: kr_protocol::sharing::RoleSelection = decode(selection)?;
+    let actions = selection.actions();
+    let notices = kr_protocol::sharing::AuthorityNotice::for_actions(actions.iter())
+        .iter()
+        .map(|notice| GrantNotice {
+            notice: *notice,
+            sentence: notice.sentence(),
+        })
+        .collect();
+    Ok(GrantNotices {
+        actions: actions.iter().copied().collect(),
+        notices,
+    })
+}
 read_command!(
     /// Reads what a voice session started now would reach, and who would be able to read it.
     ///
@@ -790,15 +1084,7 @@ pub async fn voice_delegate(
                 .await
         }
     };
-    match answer {
-        Ok(value) => settled(&value),
-        Err(kr_client::ClientError::SubmissionUncertain { action_id }) => Ok(Settled {
-            receipt: None,
-            value: None,
-            action_id: Some(action_id.to_string()),
-        }),
-        Err(error) => Err(CommandError::from(error)),
-    }
+    submitted(answer)
 }
 
 read_command!(
@@ -1322,6 +1608,10 @@ mod tests {
     ) {
         let app = tauri::test::mock_builder()
             .manage(AppState::new())
+            // No host runs here, so no session's worker can be reached either.
+            .manage(crate::agent::WorkerLinks::with(std::sync::Arc::new(|| {
+                Err("this test runs no host".to_owned())
+            })))
             .invoke_handler(handler)
             .build(tauri::test::mock_context(tauri::test::noop_assets()))
             .expect("an application");
@@ -1405,7 +1695,6 @@ mod tests {
             "storage.upload.create",
             "storage.object.delete",
             "authority.sync",
-            "grant.create",
             "pair.invite",
             "pair.confirm",
             "terminal.geometry.transfer",
@@ -1480,6 +1769,12 @@ mod tests {
                 "terminal_view_move",
                 "terminal_view_open",
                 "terminal_view_resize",
+                // The session's agent instances and pending requests, which native code reads on
+                // the session's own worker from a session the page names.
+                "session_agents",
+                // What an invitation would carry, from the protocol's own table. It reaches
+                // nothing.
+                "grant_notices",
             ])
         );
     }
@@ -1568,6 +1863,12 @@ mod tests {
                 "terminal_view_open",
                 "terminal_view_resize"
             ])
+        );
+        // A session's agent instances and pending requests are read by one command, which follows
+        // every page of one snapshot itself.
+        assert_eq!(
+            performing(Method::EventsSnapshot),
+            BTreeSet::from(["session_agents"])
         );
         // The view's input goes through one command: taking and giving back the lease, and every
         // write under it.
@@ -1667,6 +1968,25 @@ mod tests {
             action_cancel,
             question_read,
             question_answer,
+            agent_capabilities,
+            agent_snapshot,
+            agent_commands,
+            agent_approval_inspect,
+            agent_prompt_submit,
+            agent_prompt_queue,
+            agent_turn_steer,
+            agent_turn_cancel,
+            agent_approval_respond,
+            attention_read,
+            attention_acknowledge,
+            review_read,
+            review_acknowledge,
+            changeset_read,
+            device_list,
+            grant_create,
+            grant_list,
+            plugin_list,
+            catalogue_list,
             voice_prepare,
             voice_start,
             voice_stop,
@@ -1873,6 +2193,116 @@ mod tests {
             refusal_code("export_asciicast", recording(&chosen_recording)).as_deref(),
             Some("PERMISSION_DENIED"),
             "one dialog is one write"
+        );
+    }
+
+    /// KR-REQ-10.01: the two commands whose calls native code builds itself read what the page sent
+    /// before anything else. The session whose agents are read has to be a session identifier; an
+    /// invitation's selection has to be one, with nothing the selection does not declare.
+    #[test]
+    fn the_agents_read_and_an_invitations_notices_read_what_the_page_sent_first() {
+        let (_app, window) = page_with(tauri::generate_handler![session_agents, grant_notices]);
+        assert_eq!(
+            refusal_of(
+                &window,
+                "session_agents",
+                serde_json::json!({ "sessionId": "the session I was looking at" })
+            )
+            .as_deref(),
+            Some("INVALID_ARGUMENT")
+        );
+        assert_eq!(
+            refusal_of(
+                &window,
+                "session_agents",
+                serde_json::json!({ "sessionId": "44444444-4444-4444-8444-444444444444" })
+            )
+            .as_deref(),
+            Some("RESOURCE_UNAVAILABLE"),
+            "a session identifier is taken, and stops only where no host is there to reach"
+        );
+        let mut selection = serde_json::json!({
+            "role": "viewer",
+            "history_from_cursor_ms": null,
+            "include_live_screen": false,
+            "include_question_respond": true,
+            "named_questions": [],
+            "named_approvals": []
+        });
+        assert_eq!(
+            refusal_of(
+                &window,
+                "grant_notices",
+                serde_json::json!({ "selection": selection.clone() })
+            ),
+            None
+        );
+        selection["and_also"] = serde_json::json!("everything");
+        assert_eq!(
+            refusal_of(
+                &window,
+                "grant_notices",
+                serde_json::json!({ "selection": selection })
+            )
+            .as_deref(),
+            Some("INVALID_ARGUMENT")
+        );
+    }
+
+    /// KR-REQ-10.42, KR-REQ-25.08: a viewer asked to answer the agent's questions carries the
+    /// notice that an answer is input the agent acts on under its own permissions, in the
+    /// protocol's own sentence, which says it is not a restricted sandbox. A plain viewer carries
+    /// no notice at all, and a controller carries the account one too.
+    #[test]
+    fn an_invitations_notices_are_the_protocols_own_sentences() {
+        let notices_of = |role: &str, answering: bool| {
+            grant_notices(serde_json::json!({
+                "role": role,
+                "history_from_cursor_ms": null,
+                "include_live_screen": false,
+                "include_question_respond": answering,
+                "named_questions": [],
+                "named_approvals": []
+            }))
+            .expect("a selection")
+        };
+        let plain = notices_of("viewer", false);
+        assert!(plain.notices.is_empty());
+        assert_eq!(
+            plain.actions,
+            vec![kr_protocol::rights::ActionRight::SessionView]
+        );
+
+        let answering = notices_of("viewer", true);
+        assert!(
+            answering
+                .actions
+                .contains(&kr_protocol::rights::ActionRight::QuestionRespond),
+            "the explained option adds question.respond"
+        );
+        let sentences: Vec<&str> = answering
+            .notices
+            .iter()
+            .map(|notice| notice.sentence)
+            .collect();
+        assert_eq!(
+            sentences,
+            vec![kr_protocol::sharing::AuthorityNotice::AgentPermissions.sentence()]
+        );
+        assert!(sentences[0].contains("This is not a restricted sandbox."));
+
+        let controller: Vec<kr_protocol::sharing::AuthorityNotice> =
+            notices_of("controller", false)
+                .notices
+                .iter()
+                .map(|notice| notice.notice)
+                .collect();
+        assert_eq!(
+            controller,
+            vec![
+                kr_protocol::sharing::AuthorityNotice::AccountAccess,
+                kr_protocol::sharing::AuthorityNotice::AgentPermissions
+            ]
         );
     }
 

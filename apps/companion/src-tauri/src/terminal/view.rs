@@ -31,7 +31,6 @@ use kr_protocol::envelope::{
 };
 use kr_protocol::ids::{ActionId, RequestId, SessionId};
 use kr_protocol::input::{InputAcquireParams, InputReleaseParams, InputWriteParams};
-use kr_protocol::local::LocalClientKind;
 use kr_protocol::method::{Method, MethodVersion};
 use kr_protocol::recovery::{EventStream, EventsSubscribeParams};
 use kr_protocol::scalars::{Bytes, CanonicalSet, DurationMs, Nullable, U64};
@@ -177,28 +176,14 @@ async fn open(
     dimensions: Dimensions,
 ) -> Result<Opened, String> {
     let paths = locate()?;
-    let descriptor = kr_ipc::descriptor::read(&paths, session_id)
-        .map_err(|error| {
-            format!(
-                "This session's details could not be read: {}",
-                Shown::ipc(&error)
-            )
-        })?
-        .ok_or_else(|| "This session is not running on this computer.".to_owned())?;
-    let endpoint = kr_ipc::paths::Endpoint::from_path(&descriptor.endpoint)
-        .map_err(|error| format!("This session could not be reached: {}", Shown::ipc(&error)))?;
-    let build_id = crate::connection::build_id().map_err(|error| error.message)?;
-    let mut client = LocalClient::connect(&endpoint, LocalClientKind::Cli, build_id)
-        .await
-        .map_err(|error| format!("This session could not be reached: {}", Shown::ipc(&error)))?;
     // A descriptor is data on disk. Nothing is sent until the worker behind the endpoint has signed
     // a challenge only the descriptor's key could answer.
-    client.verify_worker(&descriptor).await.map_err(|error| {
-        format!(
-            "This session's worker could not prove who it is: {}",
-            Shown::ipc(&error)
-        )
-    })?;
+    let crate::worker::Reached {
+        mut client,
+        descriptor,
+    } = crate::worker::reach(&paths, session_id)
+        .await
+        .map_err(crate::worker::Unreached::words)?;
     let mut requested = CanonicalSet::new();
     requested.insert(AttachmentCapability::ObserveTerminal);
     // Able to take the input lease, which asking for this does not do: only the person's own take

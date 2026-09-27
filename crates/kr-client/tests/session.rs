@@ -2020,6 +2020,60 @@ async fn the_local_path_is_a_socket_and_the_remote_path_is_iroh_behind_one_seam(
     serving_remotely.abort();
 }
 
+/// A connection the caller opened itself, as a client that has a session's worker prove its key
+/// before anything else crosses the connection does, carries the same session a connection the
+/// library opened carries: the host's own stamp of the caller, and reads and mutations over it.
+#[tokio::test]
+async fn a_connection_the_caller_opened_and_checked_carries_a_session() {
+    let tree = kr_ipc::testing::TempHost::create();
+    let endpoint = tree
+        .paths()
+        .environment(tree.environment_id())
+        .controller_endpoint()
+        .expect("a controller endpoint");
+    let listener = kr_ipc::endpoint::Listener::bind(&endpoint).expect("a local endpoint");
+    let script = Arc::new(HostScript::default());
+    let serving = spawn_local_host(listener, Arc::clone(&script));
+
+    let client = kr_ipc::client::LocalClient::connect(
+        &endpoint,
+        kr_protocol::local::LocalClientKind::Cli,
+        kr_cli_build_id(),
+    )
+    .await
+    .expect("a local connection");
+    let transport = kr_client::ipc::IpcTransport::over(client);
+    assert_eq!(
+        transport.context().peer.uid.get(),
+        u64::from(kr_ipc::paths::current_uid()),
+        "the host's stamp of the caller travels with the connection it was made on"
+    );
+
+    let session = Session::start(transport.shared()).expect("a session");
+    let listing: SessionList = session
+        .read(Method::SessionList, &Empty {})
+        .await
+        .expect("a listing over the handed-over connection");
+    assert_eq!(listing, SessionList { count: 2 });
+    let settled = session
+        .mutate(
+            Method::SessionCreate,
+            ActionTarget::environment(EnvironmentId::new(Uuid::from_bytes([9; 16]))),
+            None,
+            &Empty {},
+            &Empty {},
+            DurationMs::new(120_000),
+        )
+        .await
+        .expect("a settlement over the handed-over connection");
+    assert_eq!(
+        settled.receipt().expect("a receipt").state,
+        ReceiptState::Accepted
+    );
+    session.close();
+    serving.abort();
+}
+
 /// The build identity a command line presents. It is a client build, not a host's.
 fn kr_cli_build_id() -> BuildId {
     BuildId::new("kr/0.1.0+test").expect("a build identity")

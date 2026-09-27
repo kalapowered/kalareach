@@ -306,6 +306,8 @@ pub struct Call {
     pub method: String,
     pub params: ParamsValue,
     pub kind: CallKind,
+    /// What a mutation's envelope says it acts on; a read carries none.
+    pub target: Option<kr_protocol::envelope::ActionTarget>,
 }
 
 impl Call {
@@ -330,12 +332,14 @@ impl Link {
                 method: request.method.to_string(),
                 params: request.params,
                 kind: CallKind::Request,
+                target: None,
             },
             ControlFrame::Mutation(mutation) => Call {
                 request_id: mutation.request_id,
                 method: mutation.method.to_string(),
                 params: mutation.params,
                 kind: CallKind::Mutation,
+                target: Some(mutation.target),
             },
             other => panic!("the view sent {other:?} rather than a call"),
         }
@@ -366,12 +370,14 @@ impl Link {
                         method: request.method.to_string(),
                         params: request.params,
                         kind: CallKind::Request,
+                        target: None,
                     }),
                     Ok(ControlFrame::Mutation(mutation)) => sent.push(Call {
                         request_id: mutation.request_id,
                         method: mutation.method.to_string(),
                         params: mutation.params,
                         kind: CallKind::Mutation,
+                        target: Some(mutation.target),
                     }),
                     Ok(_) => {}
                     Err(_) => return,

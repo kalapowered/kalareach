@@ -88,8 +88,20 @@ impl IpcTransport {
         // A client, not a controller: a controller connection is the one that speaks for a
         // generation, and this library is what an attachment and a command line use.
         let client = LocalClient::connect(endpoint, LocalClientKind::Cli, build_id).await?;
+        Ok(Self::over(client))
+    }
+
+    /// Carries a connection the caller has already opened and checked.
+    ///
+    /// A session worker's endpoint is named by a descriptor on disk, and a descriptor is only data:
+    /// before anything else crosses the connection the caller has the worker prove it holds the
+    /// descriptor's key. That exchange is the caller's, on the client it opened, and this takes the
+    /// client over once it is done. It is taken before any call, so nothing the host pushed is
+    /// still held on it.
+    #[must_use]
+    pub fn over(client: LocalClient) -> Self {
         let (reader, writer, acknowledgement) = client.into_halves();
-        Ok(Self {
+        Self {
             connection_id: acknowledgement.connection_id,
             limits: acknowledgement.max_receive,
             initial_action_window: acknowledgement.action_window,
@@ -105,7 +117,7 @@ impl IpcTransport {
             closed: AtomicBool::new(false),
             ending: tokio::sync::Notify::new(),
             claimed: AtomicBool::new(false),
-        })
+        }
     }
 
     /// Returns the freshness context the host stamped on this connection.

@@ -46,6 +46,21 @@ pub struct Connection {
 }
 
 impl Connection {
+    /// A connection over a local transport, belonging to the environment the host stamped on the
+    /// handshake.
+    ///
+    /// # Errors
+    ///
+    /// Returns the client library's refusal to start a session on the transport.
+    pub fn over(transport: kr_client::ipc::IpcTransport) -> Result<Self> {
+        let environment_id = transport.context().environment_id;
+        let session = Session::start(transport.shared())?;
+        Ok(Self {
+            session: Arc::new(session),
+            environment_id,
+        })
+    }
+
     /// The session every command goes through.
     #[must_use]
     pub fn session(&self) -> Arc<Session> {
@@ -104,11 +119,7 @@ pub async fn connect_local() -> Result<Connection> {
     let transport = kr_client::ipc::IpcTransport::connect(&endpoint, build_id()?)
         .await
         .map_err(absent_host)?;
-    let session = Session::start(transport.shared())?;
-    Ok(Connection {
-        session: Arc::new(session),
-        environment_id,
-    })
+    Connection::over(transport)
 }
 
 /// Names the ordinary case of no host running before it reaches the window.

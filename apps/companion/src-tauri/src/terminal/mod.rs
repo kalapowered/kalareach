@@ -71,14 +71,7 @@ impl TerminalViews {
     /// connection finds its control daemon.
     #[must_use]
     pub fn local() -> Self {
-        Self::with(Arc::new(|| {
-            let paths = kr_ipc::paths::HostPaths::discover()
-                .map_err(|error| format!("There is no host on this computer: {error}"))?;
-            let environment_id = paths
-                .open_environment_id()
-                .map_err(|error| format!("There is no host on this computer: {error}"))?;
-            Ok(paths.environment(environment_id))
-        }))
+        Self::with(Arc::new(crate::worker::this_machine))
     }
 
     /// The views of the host whose environment `paths` names.
