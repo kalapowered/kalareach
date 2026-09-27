@@ -285,6 +285,9 @@ mod tests {
         }
     }
 
+    /// KR-REQ-11.46: visibility is a declarative predicate: a boolean combination of facts the host
+    /// already knows, here a right, a negated binding state and a presentation flag, which is true
+    /// exactly when each fact holds.
     #[test]
     fn a_predicate_is_a_boolean_combination_of_known_facts() {
         let predicate = Predicate::All {
@@ -320,6 +323,8 @@ mod tests {
         )));
     }
 
+    /// KR-REQ-11.46: the grammar is bounded: a predicate nested past the depth limit, a combinator
+    /// past the width limit and an empty combinator are each refused.
     #[test]
     fn depth_and_width_are_bounded() {
         let mut predicate = Predicate::Always {};
@@ -349,6 +354,8 @@ mod tests {
         );
     }
 
+    /// KR-REQ-11.46: visibility is never a script: an expression under an operator the grammar does
+    /// not define, or carried beside a term it does, does not read as a predicate.
     #[test]
     fn the_grammar_has_no_script_form() {
         // A script, an expression string or a regular expression is not representable: every
@@ -360,6 +367,8 @@ mod tests {
         assert!(serde_json::from_value::<Predicate>(with_extra).is_err());
     }
 
+    /// KR-REQ-11.46: evaluation is total: a fact the host has no evidence for is false rather than
+    /// an error, and negating it shows the control without granting anything.
     #[test]
     fn evaluation_is_total_over_unknown_facts() {
         let predicate = Predicate::Capability {

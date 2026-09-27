@@ -538,6 +538,9 @@ mod tests {
         }
     }
 
+    /// KR-REQ-11.46: what a client reads as a visibility rule is the grammar and never a script: an
+    /// expression string, a function, an unknown operator, a script beside a term, a bare boolean
+    /// and a number are all refused, and the grammar's own term reads.
     #[test]
     fn a_predicate_is_a_predicate_and_never_a_script() {
         // Anything that is not one of the grammar's terms is not a predicate. A string that looks
@@ -565,6 +568,9 @@ mod tests {
         );
     }
 
+    /// KR-REQ-11.46: the client holds a predicate to the grammar's bounds: one deeper or wider than
+    /// the grammar admits, or an empty combinator, hides its control as outside the grammar, and a
+    /// predicate exactly at either bound is shown.
     #[test]
     fn a_predicate_outside_the_bounds_hides_the_control_and_says_so() {
         // Deeper than the grammar admits.
@@ -861,6 +867,9 @@ mod tests {
         assert!(refusal.to_string().contains("The agent is busy"));
     }
 
+    /// KR-REQ-11.46: a package cannot put a script, a stylesheet, a React component, a WebView or
+    /// HTML on a screen: each becomes an unsupported-content block that names its kind and carries
+    /// none of the source, stylesheet, module, address or markup, and no control.
     #[test]
     fn a_node_this_build_cannot_read_becomes_a_block_that_carries_no_action() {
         let known = serde_json::json!({

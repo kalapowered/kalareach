@@ -605,6 +605,8 @@ mod tests {
         );
     }
 
+    /// KR-REQ-11.46: HTML, a script, a WebView, React and a stylesheet are not node kinds, so a
+    /// package's document cannot carry one.
     #[test]
     fn a_package_cannot_inject_markup_as_a_node_kind() {
         for kind in ["html", "script", "webview", "react", "style"] {
