@@ -463,6 +463,17 @@ export type PaletteRequest =
  */
 export type PalettePreset = 'light' | 'dark'
 /**
+ * What the foreground of a session is doing.
+ *
+ * Application state is reported separately from the lifecycle state and from transport
+ * reachability; a busy agent and an unreachable client are different facts.
+ */
+export type ApplicationState = 'shell_ready' | 'agent_busy' | 'awaiting_input' | 'awaiting_approval'
+/**
+ * A host-derived desktop session identity binding OS user, boot identity and login-session generation.
+ */
+export type DesktopSessionId = string
+/**
  * What one of the control daemon's connections to a worker is for.
  *
  * A daemon needs more than one connection to a worker, because a worker's attachments,
@@ -527,10 +538,6 @@ export type CapabilityInvalidation =
   | 'os_permission'
   | 'desktop_generation'
   | 'worker_profile'
-/**
- * A host-derived desktop session identity binding OS user, boot identity and login-session generation.
- */
-export type DesktopSessionId = string
 /**
  * The catalogue generation a plugin package was resolved against.
  */
@@ -704,13 +711,6 @@ export type EnvironmentAccess = 'wsl_distribution' | 'container' | 'ssh_host' | 
  * One transport connection, allocated by the host during hello.
  */
 export type ConnectionId = string
-/**
- * What the foreground of a session is doing.
- *
- * Application state is reported separately from the lifecycle state and from transport
- * reachability; a busy agent and an unreachable client are different facts.
- */
-export type ApplicationState = 'shell_ready' | 'agent_busy' | 'awaiting_input' | 'awaiting_approval'
 /**
  * The event streams a session publishes.
  */
@@ -6791,6 +6791,7 @@ export interface WorkerReady {
    */
   endpoint: string
   root_process: ProcessStartIdentity2
+  session: SessionSummary
   /**
    * One KalaReach terminal session.
    */
@@ -6838,6 +6839,235 @@ export interface ProcessStartIdentity2 {
   start_value: string
 }
 /**
+ * The session as this worker describes it once its root shell is running.
+ *
+ * The daemon keeps it from the moment it records the worker, so a read that meets the worker
+ * on its way out is answered from the worker's own words, even where the create that started
+ * the worker stopped waiting before this report arrived.
+ */
+export interface SessionSummary {
+  /**
+   * What the foreground is doing, where the host knows.
+   */
+  application_state: ApplicationState | null
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  attachment_count: string
+  /**
+   * The final record, once the session has closed.
+   */
+  closure: ClosureRecord | null
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  created_at_ms: string
+  /**
+   * The working directory the root shell started in.
+   */
+  cwd: string
+  desktop: DesktopBinding
+  dimensions: Dimensions4
+  /**
+   * The local alias.
+   */
+  display_number: string
+  /**
+   * The environment that owns it.
+   */
+  environment_id: string
+  /**
+   * The root shell's process identity while the session is running.
+   */
+  root_process: ProcessStartIdentity4 | null
+  /**
+   * The session epoch, fixed at 1 in protocol version 1.
+   */
+  session_epoch: string
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+  /**
+   * How the root shell is integrated. A `native_compat` session is labelled everywhere it is
+   * reported.
+   */
+  shell_mode: 'managed' | 'native_compat'
+  /**
+   * The executable actually launched as the root shell.
+   */
+  shell_path: string
+  /**
+   * The lifecycle state.
+   */
+  state: 'creating' | 'live' | 'closing' | 'closed'
+  /**
+   * How long the worker's execution context lasts.
+   */
+  worker_profile: 'desktop_bound' | 'headless_user'
+}
+/**
+ * The final record of one closed session.
+ */
+export interface ClosureRecord {
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  closed_at_ms: string
+  /**
+   * Whether the record was written durably.
+   */
+  durability: 'durable' | 'volatile'
+  /**
+   * Whether every owned process was accounted for.
+   */
+  ownership_coverage: 'complete' | 'incomplete'
+  /**
+   * Why it closed.
+   */
+  reason:
+    | 'close_requested'
+    | 'root_exit'
+    | 'root_signal'
+    | 'root_launch_failed'
+    | 'worker_crash'
+    | 'desktop_lost'
+    | 'host_shutdown'
+  /**
+   * The root shell's exit status, when it exited normally.
+   */
+  root_exit_code: U64 | null
+  /**
+   * The signal that terminated the root shell, when one did, named as the platform names it.
+   * The host reports what it was told rather than inventing a number for it.
+   */
+  root_signal: string | null
+  /**
+   * The session epoch, fixed at 1 in protocol version 1.
+   */
+  session_epoch: string
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+  /**
+   * Resources known to survive, such as an explicitly brokered desktop resource.
+   */
+  surviving: SurvivingResource[]
+  /**
+   * The owned processes the closure terminated, with their start identities.
+   */
+  terminated: TerminatedProcess[]
+}
+/**
+ * A resource the session did not take with it.
+ *
+ * Most entries are resources that outlive a session by design, such as a brokered desktop
+ * resource. An entry is also how a host says it *could not establish* that something ended: a
+ * closure written without a confirmed death names the session's own worker here rather than
+ * among the processes it terminated, because the host did not terminate it and cannot say it
+ * stopped.
+ */
+export interface SurvivingResource {
+  /**
+   * A description for the user.
+   */
+  detail: string
+  /**
+   * What kind of resource it is.
+   */
+  kind: string
+}
+/**
+ * One process the closure terminated.
+ */
+export interface TerminatedProcess {
+  /**
+   * True when the process needed forced termination after the grace period.
+   */
+  forced: boolean
+  identity: ProcessStartIdentity3
+  /**
+   * The executable name, for diagnostics.
+   */
+  name: string | null
+}
+/**
+ * The process and its start identity, so a reused identifier is not mistaken for it.
+ */
+export interface ProcessStartIdentity3 {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  pid: string
+  /**
+   * Where the start value came from.
+   */
+  source:
+    | 'linux_proc_stat'
+    | 'macos_proc_bsd_info'
+    | 'windows_process_creation_time'
+    | 'windows_process_start_seconds'
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  start_value: string
+}
+/**
+ * The login session a desktop-bound worker is tied to.
+ */
+export interface DesktopBinding {
+  /**
+   * The desktop session this worker is bound to, for a desktop-bound profile.
+   */
+  desktop_session_id: DesktopSessionId | null
+  /**
+   * The login-session generation the binding was taken at.
+   */
+  login_generation: U64 | null
+}
+/**
+ * A terminal geometry in columns and rows.
+ *
+ * Every constraint of section 8 is checked by [`Dimensions::validate`] before anything is
+ * allocated: 1 to 2,048 columns, 1 to 1,024 rows and at most 262,144 cells, all three at once.
+ */
+export interface Dimensions4 {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  columns: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  rows: string
+}
+/**
+ * A process and the kernel's record of when it started.
+ *
+ * Every ownership check compares both fields. A process identifier alone can be reused by an
+ * unrelated program within milliseconds of the original exiting, so the host never terminates,
+ * adopts or trusts a process on its identifier alone.
+ */
+export interface ProcessStartIdentity4 {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  pid: string
+  /**
+   * Where the start value came from.
+   */
+  source:
+    | 'linux_proc_stat'
+    | 'macos_proc_bsd_info'
+    | 'windows_process_creation_time'
+    | 'windows_process_start_seconds'
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  start_value: string
+}
+/**
  * A fresh challenge sent to a worker's private endpoint.
  */
 export interface WorkerVerifyChallenge {
@@ -6859,7 +7089,7 @@ export interface WorkerVerifyProof {
    * The endpoint the challenge arrived on.
    */
   endpoint: string
-  process_start_identity: ProcessStartIdentity3
+  process_start_identity: ProcessStartIdentity5
   protocol_version: ProtocolVersion4
   /**
    * The session epoch, fixed at 1 in protocol version 1.
@@ -6888,9 +7118,13 @@ export interface BootIdentity3 {
   value: string
 }
 /**
- * The worker's process identity.
+ * A process and the kernel's record of when it started.
+ *
+ * Every ownership check compares both fields. A process identifier alone can be reused by an
+ * unrelated program within milliseconds of the original exiting, so the host never terminates,
+ * adopts or trusts a process on its identifier alone.
  */
-export interface ProcessStartIdentity3 {
+export interface ProcessStartIdentity5 {
   /**
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
@@ -9460,113 +9694,6 @@ export interface ReceiveLimits2 {
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   max_send_queue_bytes: string
-}
-/**
- * The final record of one closed session.
- */
-export interface ClosureRecord {
-  /**
-   * A UTC timestamp in milliseconds, as a decimal string in JSON.
-   */
-  closed_at_ms: string
-  /**
-   * Whether the record was written durably.
-   */
-  durability: 'durable' | 'volatile'
-  /**
-   * Whether every owned process was accounted for.
-   */
-  ownership_coverage: 'complete' | 'incomplete'
-  /**
-   * Why it closed.
-   */
-  reason:
-    | 'close_requested'
-    | 'root_exit'
-    | 'root_signal'
-    | 'root_launch_failed'
-    | 'worker_crash'
-    | 'desktop_lost'
-    | 'host_shutdown'
-  /**
-   * The root shell's exit status, when it exited normally.
-   */
-  root_exit_code: U64 | null
-  /**
-   * The signal that terminated the root shell, when one did, named as the platform names it.
-   * The host reports what it was told rather than inventing a number for it.
-   */
-  root_signal: string | null
-  /**
-   * The session epoch, fixed at 1 in protocol version 1.
-   */
-  session_epoch: string
-  /**
-   * One KalaReach terminal session.
-   */
-  session_id: string
-  /**
-   * Resources known to survive, such as an explicitly brokered desktop resource.
-   */
-  surviving: SurvivingResource[]
-  /**
-   * The owned processes the closure terminated, with their start identities.
-   */
-  terminated: TerminatedProcess[]
-}
-/**
- * A resource the session did not take with it.
- *
- * Most entries are resources that outlive a session by design, such as a brokered desktop
- * resource. An entry is also how a host says it *could not establish* that something ended: a
- * closure written without a confirmed death names the session's own worker here rather than
- * among the processes it terminated, because the host did not terminate it and cannot say it
- * stopped.
- */
-export interface SurvivingResource {
-  /**
-   * A description for the user.
-   */
-  detail: string
-  /**
-   * What kind of resource it is.
-   */
-  kind: string
-}
-/**
- * One process the closure terminated.
- */
-export interface TerminatedProcess {
-  /**
-   * True when the process needed forced termination after the grace period.
-   */
-  forced: boolean
-  identity: ProcessStartIdentity4
-  /**
-   * The executable name, for diagnostics.
-   */
-  name: string | null
-}
-/**
- * The process and its start identity, so a reused identifier is not mistaken for it.
- */
-export interface ProcessStartIdentity4 {
-  /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
-   */
-  pid: string
-  /**
-   * Where the start value came from.
-   */
-  source:
-    | 'linux_proc_stat'
-    | 'macos_proc_bsd_info'
-    | 'windows_process_creation_time'
-    | 'windows_process_start_seconds'
-  /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
-   */
-  start_value: string
 }
 /**
  * One revision of a collection's membership, signed by the member that issued it.
@@ -12514,7 +12641,7 @@ export interface EventsSnapshotResult {
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   oldest_retained_cursor: string
-  session: SessionSummary
+  session: SessionSummary1
   /**
    * A UTC timestamp in milliseconds, as a decimal string in JSON.
    */
@@ -12607,7 +12734,7 @@ export interface InputLeaseState {
 /**
  * The session.
  */
-export interface SessionSummary {
+export interface SessionSummary1 {
   /**
    * What the foreground is doing, where the host knows.
    */
@@ -12635,13 +12762,13 @@ export interface SessionSummary {
    */
   display_number: string
   /**
-   * One installed OS, distribution or container environment and OS user.
+   * The environment that owns it.
    */
   environment_id: string
   /**
    * The root shell's process identity while the session is running.
    */
-  root_process: ProcessStartIdentity5 | null
+  root_process: ProcessStartIdentity4 | null
   /**
    * The session epoch, fixed at 1 in protocol version 1.
    */
@@ -12664,67 +12791,9 @@ export interface SessionSummary {
    */
   state: 'creating' | 'live' | 'closing' | 'closed'
   /**
-   * How long a worker's execution context lasts.
-   *
-   * The profile is recorded on every worker. It decides what a logout means: a desktop-bound worker
-   * is closed with `desktop_lost` when its login-session generation ends, while a headless worker
-   * survives logout where the platform's user service manager does.
+   * How long the worker's execution context lasts.
    */
   worker_profile: 'desktop_bound' | 'headless_user'
-}
-/**
- * The login session a desktop-bound worker is tied to.
- */
-export interface DesktopBinding {
-  /**
-   * The desktop session this worker is bound to, for a desktop-bound profile.
-   */
-  desktop_session_id: DesktopSessionId | null
-  /**
-   * The login-session generation the binding was taken at.
-   */
-  login_generation: U64 | null
-}
-/**
- * A terminal geometry in columns and rows.
- *
- * Every constraint of section 8 is checked by [`Dimensions::validate`] before anything is
- * allocated: 1 to 2,048 columns, 1 to 1,024 rows and at most 262,144 cells, all three at once.
- */
-export interface Dimensions4 {
-  /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
-   */
-  columns: string
-  /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
-   */
-  rows: string
-}
-/**
- * A process and the kernel's record of when it started.
- *
- * Every ownership check compares both fields. A process identifier alone can be reused by an
- * unrelated program within milliseconds of the original exiting, so the host never terminates,
- * adopts or trusts a process on its identifier alone.
- */
-export interface ProcessStartIdentity5 {
-  /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
-   */
-  pid: string
-  /**
-   * Where the start value came from.
-   */
-  source:
-    | 'linux_proc_stat'
-    | 'macos_proc_bsd_info'
-    | 'windows_process_creation_time'
-    | 'windows_process_start_seconds'
-  /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
-   */
-  start_value: string
 }
 /**
  * Parameters of `events.subscribe`.
@@ -22581,7 +22650,11 @@ export interface EditorFence {
   root_process: ProcessStartIdentity7
 }
 /**
- * The root shell process, with the kernel's record of when it started.
+ * A process and the kernel's record of when it started.
+ *
+ * Every ownership check compares both fields. A process identifier alone can be reused by an
+ * unrelated program within milliseconds of the original exiting, so the host never terminates,
+ * adopts or trusts a process on its identifier alone.
  */
 export interface ProcessStartIdentity7 {
   /**
@@ -23230,6 +23303,17 @@ export interface SessionCloseResult {
    */
   durability: 'durable' | 'volatile'
   /**
+   * The session as its worker described it in this answer: `closing` once the close is
+   * admitted, or `closed` with its record.
+   *
+   * The daemon keeps it for a read that meets the worker on its way out. It is absent where
+   * there is no worker's description to give: in the answer of a worker built before this
+   * member, in a host's own answer from a recorded closure, and in an answer to a caller whose
+   * authority does not reach the session's description. It is absent from the wire when it is
+   * absent, so such an answer is byte for byte what a reader built before this member expects.
+   */
+  session?: SessionSummary2 | null
+  /**
    * One KalaReach terminal session.
    */
   session_id: string
@@ -23237,6 +23321,70 @@ export interface SessionCloseResult {
    * The state at the moment of the reply.
    */
   state: 'creating' | 'live' | 'closing' | 'closed'
+}
+/**
+ * What a client knows about one session.
+ */
+export interface SessionSummary2 {
+  /**
+   * What the foreground is doing, where the host knows.
+   */
+  application_state: ApplicationState | null
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  attachment_count: string
+  /**
+   * The final record, once the session has closed.
+   */
+  closure: ClosureRecord | null
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  created_at_ms: string
+  /**
+   * The working directory the root shell started in.
+   */
+  cwd: string
+  desktop: DesktopBinding
+  dimensions: Dimensions4
+  /**
+   * The local alias.
+   */
+  display_number: string
+  /**
+   * The environment that owns it.
+   */
+  environment_id: string
+  /**
+   * The root shell's process identity while the session is running.
+   */
+  root_process: ProcessStartIdentity4 | null
+  /**
+   * The session epoch, fixed at 1 in protocol version 1.
+   */
+  session_epoch: string
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+  /**
+   * How the root shell is integrated. A `native_compat` session is labelled everywhere it is
+   * reported.
+   */
+  shell_mode: 'managed' | 'native_compat'
+  /**
+   * The executable actually launched as the root shell.
+   */
+  shell_path: string
+  /**
+   * The lifecycle state.
+   */
+  state: 'creating' | 'live' | 'closing' | 'closed'
+  /**
+   * How long the worker's execution context lasts.
+   */
+  worker_profile: 'desktop_bound' | 'headless_user'
 }
 /**
  * Parameters of `session.create`.
@@ -23312,12 +23460,12 @@ export interface SessionCreateResult {
    * execution and never creates a second session.
    */
   presentation_error: ProtocolError | null
-  session: SessionSummary1
+  session: SessionSummary3
 }
 /**
- * The created session.
+ * What a client knows about one session.
  */
-export interface SessionSummary1 {
+export interface SessionSummary3 {
   /**
    * What the foreground is doing, where the host knows.
    */
@@ -23345,13 +23493,13 @@ export interface SessionSummary1 {
    */
   display_number: string
   /**
-   * One installed OS, distribution or container environment and OS user.
+   * The environment that owns it.
    */
   environment_id: string
   /**
    * The root shell's process identity while the session is running.
    */
-  root_process: ProcessStartIdentity5 | null
+  root_process: ProcessStartIdentity4 | null
   /**
    * The session epoch, fixed at 1 in protocol version 1.
    */
@@ -23374,11 +23522,7 @@ export interface SessionSummary1 {
    */
   state: 'creating' | 'live' | 'closing' | 'closed'
   /**
-   * How long a worker's execution context lasts.
-   *
-   * The profile is recorded on every worker. It decides what a logout means: a desktop-bound worker
-   * is closed with `desktop_lost` when its login-session generation ends, while a headless worker
-   * survives logout where the platform's user service manager does.
+   * How long the worker's execution context lasts.
    */
   worker_profile: 'desktop_bound' | 'headless_user'
 }
@@ -23598,74 +23742,6 @@ export interface SessionListResult {
   sessions: SessionSummary2[]
 }
 /**
- * What a client knows about one session.
- */
-export interface SessionSummary2 {
-  /**
-   * What the foreground is doing, where the host knows.
-   */
-  application_state: ApplicationState | null
-  /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
-   */
-  attachment_count: string
-  /**
-   * The final record, once the session has closed.
-   */
-  closure: ClosureRecord | null
-  /**
-   * A UTC timestamp in milliseconds, as a decimal string in JSON.
-   */
-  created_at_ms: string
-  /**
-   * The working directory the root shell started in.
-   */
-  cwd: string
-  desktop: DesktopBinding
-  dimensions: Dimensions4
-  /**
-   * The local alias.
-   */
-  display_number: string
-  /**
-   * One installed OS, distribution or container environment and OS user.
-   */
-  environment_id: string
-  /**
-   * The root shell's process identity while the session is running.
-   */
-  root_process: ProcessStartIdentity5 | null
-  /**
-   * The session epoch, fixed at 1 in protocol version 1.
-   */
-  session_epoch: string
-  /**
-   * One KalaReach terminal session.
-   */
-  session_id: string
-  /**
-   * How the root shell is integrated. A `native_compat` session is labelled everywhere it is
-   * reported.
-   */
-  shell_mode: 'managed' | 'native_compat'
-  /**
-   * The executable actually launched as the root shell.
-   */
-  shell_path: string
-  /**
-   * The lifecycle state.
-   */
-  state: 'creating' | 'live' | 'closing' | 'closed'
-  /**
-   * How long a worker's execution context lasts.
-   *
-   * The profile is recorded on every worker. It decides what a logout means: a desktop-bound worker
-   * is closed with `desktop_lost` when its login-session generation ends, while a headless worker
-   * survives logout where the platform's user service manager does.
-   */
-  worker_profile: 'desktop_bound' | 'headless_user'
-}
-/**
  * Parameters of `session.read`.
  */
 export interface SessionReadParams {
@@ -23709,7 +23785,7 @@ export interface SessionReadResult {
    * none.
    */
   outstanding_launches: U64 | null
-  session: SessionSummary3
+  session: SessionSummary4
 }
 /**
  * How a session starts its root shell and what may be launched inside it.
@@ -23744,7 +23820,7 @@ export interface LaunchProfile1 {
 /**
  * What a client knows about one session.
  */
-export interface SessionSummary3 {
+export interface SessionSummary4 {
   /**
    * What the foreground is doing, where the host knows.
    */
@@ -23772,13 +23848,13 @@ export interface SessionSummary3 {
    */
   display_number: string
   /**
-   * One installed OS, distribution or container environment and OS user.
+   * The environment that owns it.
    */
   environment_id: string
   /**
    * The root shell's process identity while the session is running.
    */
-  root_process: ProcessStartIdentity5 | null
+  root_process: ProcessStartIdentity4 | null
   /**
    * The session epoch, fixed at 1 in protocol version 1.
    */
@@ -23801,11 +23877,7 @@ export interface SessionSummary3 {
    */
   state: 'creating' | 'live' | 'closing' | 'closed'
   /**
-   * How long a worker's execution context lasts.
-   *
-   * The profile is recorded on every worker. It decides what a logout means: a desktop-bound worker
-   * is closed with `desktop_lost` when its login-session generation ends, while a headless worker
-   * survives logout where the platform's user service manager does.
+   * How long the worker's execution context lasts.
    */
   worker_profile: 'desktop_bound' | 'headless_user'
 }

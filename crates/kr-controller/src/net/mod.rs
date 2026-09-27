@@ -1371,6 +1371,8 @@ impl Controller {
                         state: kr_protocol::session::SessionState::Closed,
                         durability: closure.durability,
                         closure: kr_protocol::scalars::Nullable::some(closure),
+                        // The record is the answer, and no worker is left to describe the session.
+                        session: None,
                     })
                 }
                 None => Err(ControllerError::UnknownSession {

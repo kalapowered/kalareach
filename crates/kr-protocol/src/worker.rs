@@ -339,6 +339,12 @@ pub struct WorkerReady {
     pub shell_path: String,
     /// The geometry the shell started at.
     pub dimensions: crate::session::Dimensions,
+    /// The session as this worker describes it once its root shell is running.
+    ///
+    /// The daemon keeps it from the moment it records the worker, so a read that meets the worker
+    /// on its way out is answered from the worker's own words, even where the create that started
+    /// the worker stopped waiting before this report arrived.
+    pub session: crate::session::SessionSummary,
 }
 
 /// A worker's challenge to a controller that wants to speak for a generation.

@@ -928,6 +928,16 @@ pub struct SessionCloseResult {
     pub durability: Durability,
     /// The final record, once closure has finished.
     pub closure: Nullable<ClosureRecord>,
+    /// The session as its worker described it in this answer: `closing` once the close is
+    /// admitted, or `closed` with its record.
+    ///
+    /// The daemon keeps it for a read that meets the worker on its way out. It is absent where
+    /// there is no worker's description to give: in the answer of a worker built before this
+    /// member, in a host's own answer from a recorded closure, and in an answer to a caller whose
+    /// authority does not reach the session's description. It is absent from the wire when it is
+    /// absent, so such an answer is byte for byte what a reader built before this member expects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<SessionSummary>,
 }
 
 #[cfg(test)]

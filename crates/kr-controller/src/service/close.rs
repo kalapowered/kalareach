@@ -87,6 +87,8 @@ impl Controller {
                     state: SessionState::Closed,
                     durability: closure.durability,
                     closure: Nullable::some(closure),
+                    // The record is the answer, and no worker is left to describe the session.
+                    session: None,
                 }),
                 None => Err(ControllerError::UnknownSession {
                     session: params.session_id.to_string(),

@@ -29894,6 +29894,17 @@
           "$ref": "#/$defs/Durability",
           "description": "Whether the closure was recorded durably."
         },
+        "session": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionSummary"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The session as its worker described it in this answer: `closing` once the close is\nadmitted, or `closed` with its record.\n\nThe daemon keeps it for a read that meets the worker on its way out. It is absent where\nthere is no worker's description to give: in the answer of a worker built before this\nmember, in a host's own answer from a recorded closure, and in an answer to a caller whose\nauthority does not reach the session's description. It is absent from the wire when it is\nabsent, so such an answer is byte for byte what a reader built before this member expects."
+        },
         "session_id": {
           "$ref": "#/$defs/SessionId",
           "description": "The session that is closing or has closed."
@@ -34288,6 +34299,10 @@
           "$ref": "#/$defs/ProcessStartIdentity",
           "description": "The root shell's process identity."
         },
+        "session": {
+          "$ref": "#/$defs/SessionSummary",
+          "description": "The session as this worker describes it once its root shell is running.\n\nThe daemon keeps it from the moment it records the worker, so a read that meets the worker\non its way out is answered from the worker's own words, even where the create that started\nthe worker stopped waiting before this report arrived."
+        },
         "session_id": {
           "$ref": "#/$defs/SessionId",
           "description": "The session the worker owns."
@@ -34302,7 +34317,8 @@
         "endpoint",
         "root_process",
         "shell_path",
-        "dimensions"
+        "dimensions",
+        "session"
       ],
       "type": "object"
     },

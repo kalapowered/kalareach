@@ -252,6 +252,7 @@ fn serve_scripted(
                                     state: SessionState::Closing,
                                     durability: Durability::Durable,
                                     closure: Nullable::null(),
+                                    session: None,
                                 },
                             )]
                         }

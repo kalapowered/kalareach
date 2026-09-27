@@ -1913,6 +1913,7 @@ async fn hosted_worker() -> Hosted {
             root_process: session.root_identity().expect("a root process"),
             shell_path: "/bin/sh".to_owned(),
             dimensions: session.geometry().dimensions,
+            session: session.summary(),
         }
     };
     writer
