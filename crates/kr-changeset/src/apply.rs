@@ -1911,6 +1911,16 @@ fn install(
                 Ok(Some(conflict)) => return ControlFlow::Break(Ok(conflict)),
                 Err(error) => return ControlFlow::Break(Err(error)),
             }
+            // The protection the copy carries is still the destination's: a list, an account or a
+            // mode given to the destination while the rename waits would otherwise go with the
+            // file the copy replaces, and the read-back after it would find what was carried.
+            if carried.from_destination && !published_with(&here, &leaf_name, &carried) {
+                return ControlFlow::Break(Ok(Installed::Unresolved(
+                    "the destination's permissions changed while this host was publishing over \
+                     it, so it published nothing"
+                        .to_owned(),
+                )));
+            }
             // A test's fault acts once, before the first attempt.
             #[cfg(feature = "fault-injection")]
             if let Some(act) = before_rename.take()
@@ -2316,6 +2326,8 @@ struct CarriedPermissions {
     access_control: kr_transfer::AccessControl,
     #[cfg(any(unix, windows))]
     owner: kr_transfer::FileOwner,
+    /// Whether it was read from a destination that was there, rather than what a new file gets.
+    from_destination: bool,
 }
 
 /// Puts the destination's own protection on the staged copy before it is renamed over it.
@@ -2358,6 +2370,7 @@ fn carry_permissions(
     let Ok(staged_owner) = staged.owner() else {
         return Ok(None);
     };
+    let from_destination = existing.is_some();
     let (mode, target_acl, owner) = existing.unwrap_or((
         if executable { 0o755 } else { 0o644 },
         kr_transfer::AccessControl::None,
@@ -2395,6 +2408,7 @@ fn carry_permissions(
         mode,
         access_control: target_acl,
         owner,
+        from_destination,
     };
     if !staged_carries(staged, &carried) {
         return Ok(None);
@@ -2500,6 +2514,7 @@ fn carry_permissions(
             read_only: false,
             access_control: acl,
             owner: staged_owner,
+            from_destination: false,
         }));
     };
     // A destination this platform will not let a rename replace, and one whose copy this host
@@ -2528,6 +2543,7 @@ fn carry_permissions(
         read_only,
         access_control: target_acl,
         owner,
+        from_destination: true,
     };
     // Read the copy's own protection back before anything is renamed, while the destination is
     // still untouched rather than only after the rename, where nothing can be put back.
@@ -3371,6 +3387,60 @@ pub fn destination_policy() -> (InclusionPolicy, CapturePolicy) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A destination given other protection after it was carried onto the copy no longer carries
+    /// what was carried, which is what the check before every attempt at the rename asks and what
+    /// stops a replacement that would take that protection away.
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+    #[test]
+    fn a_destination_given_other_protection_no_longer_carries_what_was_carried() {
+        let root = tempfile::tempdir().expect("a directory");
+        std::fs::write(root.path().join("notes.txt"), b"notes\n").expect("the destination");
+        let authority = AuthorisedDirectory::open_root(
+            kr_protocol::ids::EnvironmentId::new(kr_protocol::scalars::Uuid::from_bytes([9; 16])),
+            root.path(),
+        )
+        .expect("opens the tree");
+        let leaf = RelativeName::parse("notes.txt").expect("a name");
+        let staged = authority
+            .create_new(&RelativeName::parse("staged").expect("a name"))
+            .expect("a copy");
+        let carried = carry_permissions(&authority, &leaf, &staged, false)
+            .expect("reads")
+            .expect("the destination's protection is carried");
+        assert!(carried.from_destination);
+        assert!(
+            published_with(&authority, &leaf, &carried),
+            "the destination carries what was read from it"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            let mode = std::fs::metadata(root.path().join("notes.txt"))
+                .expect("reads its mode")
+                .permissions()
+                .mode();
+            std::fs::set_permissions(
+                root.path().join("notes.txt"),
+                std::fs::Permissions::from_mode((mode ^ 0o040) & 0o7777),
+            )
+            .expect("somebody changes its mode");
+        }
+        #[cfg(windows)]
+        {
+            let output = std::process::Command::new("icacls.exe")
+                .arg(root.path().join("notes.txt"))
+                .args(["/grant", "*S-1-1-0:(R)"])
+                .output()
+                .expect("icacls starts");
+            assert!(output.status.success(), "icacls: {output:?}");
+        }
+        assert!(
+            !published_with(&authority, &leaf, &carried),
+            "a destination given other protection no longer carries what was carried"
+        );
+    }
 
     #[test]
     fn a_direct_apply_states_what_it_cannot_promise() {
