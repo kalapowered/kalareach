@@ -779,6 +779,10 @@ export type HelloReply =
  */
 export type CommandIntegrationUnavailable = 'platform' | 'no_launcher' | 'too_large'
 /**
+ * One release of the host: its version and the first twelve hexadecimal digits of its commit.
+ */
+export type ReleaseName = string
+/**
  * A managed account identifier minted by the service. It names the payer; it is not authority.
  */
 export type AccountId = string
@@ -2074,6 +2078,8 @@ export interface KalaReachProtocol {
   host_doctor_result?: HostDoctorResult
   host_info_result?: HostInfoResult
   host_selection?: HostSelection
+  host_update_handover_params?: HostUpdateHandoverParams
+  host_update_handover_result?: HostUpdateHandoverResult
   /**
    * Every identifier in the identity and object model. This is a vocabulary rather than a message: it exists so each identifier has one named type.
    */
@@ -14300,6 +14306,41 @@ export interface ProtocolVersion7 {
   minor: number
 }
 /**
+ * `host.update.handover` parameters.
+ */
+export interface HostUpdateHandoverParams {
+  /**
+   * The step to take.
+   */
+  step: 'prepare' | 'stop' | 'resume'
+  /**
+   * The release the host is being updated to, which a create refused meanwhile is told.
+   */
+  target: string
+}
+/**
+ * `host.update.handover` result: how the daemon was started, which a daemon of the release that
+ * replaces it is started like.
+ */
+export interface HostUpdateHandoverResult {
+  /**
+   * The arguments it was started with, its program's own name left out.
+   */
+  arguments: string[]
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  pid: string
+  /**
+   * The release this daemon runs, where it runs an installed one.
+   */
+  release: ReleaseName | null
+  /**
+   * The directory it was started in.
+   */
+  working_directory: string
+}
+/**
  * What a reviewer would see, before the workspace exists.
  *
  * Section 14 requires the create interface to preview what will be included. This is that
@@ -14958,6 +14999,7 @@ export interface MethodEntry {
     | 'delivery.destination.secret.set'
     | 'privacy.set'
     | 'privacy.status'
+    | 'host.update.handover'
     | 'pair.invite'
     | 'pair.redeem'
     | 'pair.finish'
@@ -23334,6 +23376,7 @@ export interface ServiceRequestPayload {
     | 'delivery.destination.secret.set'
     | 'privacy.set'
     | 'privacy.status'
+    | 'host.update.handover'
     | 'pair.invite'
     | 'pair.redeem'
     | 'pair.finish'

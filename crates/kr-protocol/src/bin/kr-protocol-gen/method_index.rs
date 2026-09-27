@@ -88,6 +88,10 @@ const AUTOMATION: Document = Document {
     path: "automation/README.md",
     label: "Automation",
 };
+const HOST_UPDATES: Document = Document {
+    path: "host/updates.md",
+    label: "Host updates",
+};
 
 const fn at(document: Document, heading: &'static str) -> Option<Section> {
     Some(Section { document, heading })
@@ -106,6 +110,7 @@ pub(crate) const fn described_in(method: Method) -> Option<Section> {
         Method::EnvironmentCapabilities => at(PLATFORMS, "What may be done on a desktop"),
         Method::DeliveryDestinationSecretSet => at(DELIVERY, "Credentials"),
         Method::PrivacySet | Method::PrivacyStatus => at(HOST, "Privacy mode"),
+        Method::HostUpdateHandover => at(HOST_UPDATES, "The handover"),
 
         Method::PairInvite | Method::PairFinish | Method::PairConfirm => {
             at(PAIRING, "The exchange")

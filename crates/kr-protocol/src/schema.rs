@@ -217,6 +217,7 @@ use crate::transfer::{
     UploadChunkResult, UploadFinishParams, UploadFinishResult, UploadStatusParams,
     UploadStatusResult,
 };
+use crate::update::{HostUpdateHandoverParams, HostUpdateHandoverResult};
 use crate::voice::{
     VoiceActionPlan, VoiceConfirmationProof, VoiceConfirmationRequest, VoiceContextParams,
     VoiceContextResult, VoiceContextSelection, VoiceDelegateParams, VoiceDelegateResult,
@@ -431,6 +432,8 @@ pub fn protocol_schema() -> Value {
         "host_doctor_result" => HostDoctorResult,
         "host_info_result" => HostInfoResult,
         "host_selection" => HostSelection,
+        "host_update_handover_params" => HostUpdateHandoverParams,
+        "host_update_handover_result" => HostUpdateHandoverResult,
         "input_acquire_params" => InputAcquireParams,
         "input_acquire_result" => InputAcquireResult,
         "input_interrupt_params" => InputInterruptParams,
