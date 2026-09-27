@@ -1016,12 +1016,16 @@ async fn a_revocation_a_worker_has_not_fenced_is_pending_and_not_a_success() {
     let said = String::from_utf8_lossy(&output.stdout);
     assert!(said.contains("is pending"), "{said}");
     assert!(!said.contains("Revoked device"), "{said}");
+    // The worker's detail is its own text, said as its class and its length.
+    let detail = "the worker has not answered yet";
     assert!(
         said.contains(&format!(
-            "session {session}: pending (the worker has not answered yet)"
+            "session {session}: pending ([message withheld, {} bytes])",
+            detail.len()
         )),
         "{said}"
     );
+    assert!(!said.contains(detail), "{said}");
     assert_eq!(
         *asked.lock().expect("the record"),
         [
