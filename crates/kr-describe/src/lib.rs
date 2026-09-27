@@ -4,9 +4,9 @@
 //! CPU-only model that names sessions usefully, on an 8 GiB laptop, without touching the shell's
 //! input path, without claiming anything it cannot verify, and without becoming the reason a
 //! terminal feels slow. This crate is that feature, less the model: the llama.cpp runtime, the
-//! check that a downloaded model file is the recorded one and the benchmark live in
-//! `kr-describe-model`, which builds on this crate. A process that links this crate alone links no
-//! inference library, and still names every session.
+//! description process's executable, the check that a downloaded model file is the recorded one and
+//! the benchmark live in `kr-describe-model`, which builds on this crate. A process that links this
+//! crate alone links no inference library, and still names every session.
 //!
 //! | Module | What it owns |
 //! | --- | --- |

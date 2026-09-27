@@ -92,8 +92,9 @@ Section 22's defaults, which are what a qualification is measured against:
 | Process memory ceiling | 4 GiB |
 | Execution deadline, after dequeue | 30 s |
 
-The deadline starts at dequeue, and loading a model is inside it: a job that spent twenty seconds
-waiting for weights has ten left, not another thirty.
+The deadline starts at dequeue. A model loads before any job leaves the queue, under a five-minute
+deadline of its own, so a slow load costs the queue's wait and never a job's thirty seconds. The
+cold start is reported on its own.
 
 The memory a resident model costs is accounted for item by item — weights, mapping overhead, the
 key-value cache, other caches, batch buffers and the runtime's own allocations — because a 1.5 GiB
@@ -117,8 +118,12 @@ state is `resource_paused`, the reason is named, and the deterministic titles ar
 - Turning descriptions off is one setting, and it stops admission and dispatch as well as unloading
   what is mapped.
 
-The 4 GiB process ceiling is checked against the process rather than against the profile's estimate:
-a run that has grown past it unloads and reports `resource_paused`.
+The 4 GiB ceiling is the description process's, and it is checked against that process rather than
+the profile's estimate. The daemon reads the process's resident set every second while it loads or
+runs a job and ends it past the ceiling, and the process ends a job itself when it passes the
+ceiling between tokens. A description whose job took the process past the ceiling stays published.
+The process is ended after it, and inference pauses with `memory_pressure` until the next load may
+happen.
 
 CPU-only is two settings rather than one. Zero GPU layers keeps every layer's weights on the
 processor; turning the library's *operation* offload off keeps the arithmetic there too, because the
@@ -128,8 +133,9 @@ Metal backend in whether or not it is wanted: its manifest enables that feature 
 rather than behind an option, so what makes this build CPU-only is the two settings rather than the
 absence of the backend from the binary.
 
-Inference runs at the background scheduling class each platform offers — `SCHED_BATCH` on Linux,
-the lowest ordinary thread priority elsewhere — and the report says which mechanism was applied. No
+The description process's model thread runs at the background scheduling class each platform
+offers (`SCHED_BATCH` on Linux, the lowest ordinary thread priority elsewhere), and the process says
+which mechanism it applied when it starts. No
 IO class is applied in this build, and the qualification matrix records that rather than claiming
 it.
 
@@ -144,7 +150,11 @@ ordinary job is served. That is the whole fairness bound, and it means a quiet s
 in four however busy the host is.
 
 The cadence is the measured service time multiplied by the number of eligible sessions, floored at
-the thirty-second cooldown. Thirty seconds is a *minimum*, not a promise: when demand exceeds
+the thirty-second cooldown, and it is also when an ordinary session is described again: not before
+the cadence has passed since its last job. So the cadence a client is shown is the one the queue
+runs at. Foreground and attention work waits for the cooldown alone.
+
+Thirty seconds is a *minimum*, not a promise: when demand exceeds
 capacity, a client is shown how long its job has been queued, when it last succeeded, and whether
 the description it is looking at is current, delayed or stale. There is no state that means
 "probably current".
@@ -160,6 +170,10 @@ application, the selected thread, the task intent and completion. Not tokens, no
 keystrokes. Changes inside the debounce window collapse into one revision, and the window starts at
 the *first* pending change, so a long active turn still gets useful text every couple of seconds
 instead of waiting for a quiet moment that never arrives.
+
+A change that arrives while the session's job is running waits. It becomes the next revision once
+the job has ended, so the job's result is judged at the revision it was built from, and a session in
+a busy turn is still described rather than refused every time.
 
 The input is bounded directory and repository metadata plus recent authorised semantic events.
 Raw keystrokes, hidden input, environment values, file bodies and whole histories are excluded, and
@@ -178,11 +192,14 @@ Grammar-constrained JSON with four fields: a `title` of at most 64 Unicode codep
 produced at.
 
 Every result is validated again before it is published, because a grammar is a constraint on
-generation rather than a guarantee about a process. A result is refused when it is malformed, when
-it carries a field this build does not know, when a control character reaches a field, when either
-bound is exceeded, when the session epoch is wrong, when the context or the binding has changed
-since the job was admitted, when the model has since been remapped, when privacy mode's generation
-has moved, or when a person has pinned the name. Nothing is tidied into acceptability.
+generation rather than a guarantee about a process. It is judged against what is in force when it
+arrives, not when its job was sent. A result is refused when it is malformed, when it carries a
+field this build does not know, when a control character reaches a field, when either bound is
+exceeded, when the session has closed or its epoch is wrong, when the context or the binding has
+changed since the job was admitted, when the model has since been remapped, when privacy mode's
+generation has moved, or when a person has pinned the name. A result that arrives after descriptions
+were turned off is not published either; its job keeps its place in the queue. Nothing is tidied
+into acceptability.
 
 A refusal costs nothing: the session keeps the title it had.
 
@@ -192,6 +209,11 @@ A pinned name is the one a person chose, and generated text never replaces one. 
 store of their own beside the session journal, so they survive the session closing, the worker
 exiting and the host restarting. Clearing a pin is an explicit action and the only thing that
 removes one.
+
+A pin is written through a connection of its own while descriptions are published through another,
+so the store checks for a pin and writes a description in one statement. A pin that commits first
+stops the write, and one that commits after it finds the description there and still wins, because
+a pin is always shown first. A description stopped by a pin is not counted as a success.
 
 The same store holds each generated description's provenance: which profile produced it, at which
 revision, at which context revision, over which cursor interval and when.
@@ -220,24 +242,60 @@ for that session.
 Descriptions are produced, stored and shown on this host. None of them is uploaded, so there is no
 copy elsewhere for privacy mode to offer a separate deletion of.
 
+## The description process
+
+The model runs in a process of its own, `kr-describe-inference`, one per execution environment. The
+control daemon starts it as its own child the first time work is due, in the directory the daemon
+names and with no environment beyond what the daemon gives it. Nothing in it outlives the daemon:
+the two talk over the child's standard input and output, and when the daemon goes, the child's input
+ends, and it cancels its job and exits.
+
+They speak section 23's frame, a four-byte length and one KR-CBOR-1 object, through the protocol's
+own codec. The daemon says hello, and the process answers with its build, its target, its start
+identity and the background class it runs under; the daemon speaks only to a process of its own
+release. After that the daemon sends a load, then jobs one at a time, and cancellations, and every
+answer names the work it answers. An answer for work nobody is waiting for is dropped and counted.
+
+The daemon holds the process to its bounds, and ends it outright when it breaks one:
+
+| Bound | Limit |
+| --- | --- |
+| Answering hello | 10 s |
+| A load | its own deadline of five minutes, and 2 s more |
+| A job | its thirty seconds from dequeue, and 2 s more |
+| Answering a cancellation | 2 s |
+| The resident set, read every second during a load or a job | 4 GiB |
+
+The process holds itself to them as well, so no end depends on the daemon alone. Its watchdog ends
+it when its control thread has spent two seconds on one request, which is a daemon that stopped
+reading its answers, and when a load or a job runs two seconds past its deadline. Before its first
+load it takes the environment's lock, `describe-inference.lock` in the runtime directory, and keeps
+it until it exits, so a process a replacement daemon starts loads nothing until the old one has
+gone.
+
+A process loads one model in its life. Unloading a model ends the process, whatever the reason: an
+idle host, a pause, descriptions turned off, or a failure. The next load starts a new one.
+
 ## Lifecycle and failure
 
-The model stays mapped while there is work and sessions to justify it, and a host with no sessions
+The model stays loaded while there is work and sessions to justify it, and a host with no sessions
 at all unloads after fifteen minutes.
 
-The model factory takes the job's cancellation token and remaining execution deadline. A load that is
-cancelled or exceeds the deadline is aborted and any loaded memory is released immediately; the llama.cpp
-binding aborts via its load progress callback. A load or inference failure releases the model and nothing else;
-a cancellation and a passed deadline simply publish nothing. The store, the pins, the provenance, every session
-and every deterministic title survive untouched, and the next tick maps the model again. The job
-that was running is not retried; the session's next meaningful change queues another.
+A load is cancelled when its reason goes: descriptions turned off, a pause, or no work left for it.
+A job is cancelled when privacy mode fences its session, when its session closes, when a pause
+arrives, or when a caller cancels it, and a job stopped for a pause keeps its place in the queue. A
+cancellation and a passed deadline publish nothing.
+
+A process that exits, breaks the wire or is ended for breaking a bound takes the model with it and
+nothing else. The store, the pins, the provenance, every session and every deterministic title
+survive. The job it was running is queued again once, with its aging position, and if the next
+process fails it as well it is not retried. The next load waits a second after the first failure,
+twice as long after each failure that follows, up to five minutes, and a published description
+resets the wait.
 
 The runtime is a crate of its own, `kr-describe-model`, built on the description service in
 `kr-describe`, which holds no model: a process that links the service alone, as the control daemon
-does, has no inference library anywhere in its dependency graph. The runtime runs inside the process
-that links it, so what is restarted is the model rather than a process. A failure the library cannot report as an error is a failure of the process it is
-in, and the separate inference process that would contain one is named in the qualification matrix
-as work that has not been done.
+does, has no inference library anywhere in its dependency graph.
 
 ## Measuring it
 
@@ -267,10 +325,12 @@ A budget the run misses is named as a qualification target that was not met and 
 non-zero, after it has measured everything else it can still measure: a benchmark that stopped at
 the first breach would answer one question by withholding the rest.
 
-`cargo test -p kr-describe` never downloads weights. It drives a deterministic runtime behind the
-same identity checks, which is what makes the rules — fairness, rejection, unloading, privacy —
-testable in milliseconds. What it cannot answer is whether the text is any good, and that is what
-the benchmark is for.
+`cargo test -p kr-describe` never downloads weights. It starts a stub description process, the same
+serving code over a model that answers from the prompt, and drives it over real pipes, so the rules
+(fairness, rejection, unloading, privacy) and the process's bounds are tested in seconds. `cargo
+test -p kr-describe-model` runs the real process with the real weights where the benchmark's cache
+holds them, and says so where it does not. Neither can answer whether the text is any good, and
+that is what the benchmark is for.
 
 ## The qualification matrix
 

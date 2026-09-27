@@ -305,9 +305,9 @@ static BUILTIN: &[Row] = &[
     },
     Row {
         case: Case::Cancellation,
-        not_covered: "the test cancels before the runtime starts and proves nothing is published; interrupting a running decode is the benchmark's",
+        not_covered: "the test cancels a load and a job inside a running stub process over its real pipes and proves nothing is published; a real decode stopped between tokens is the real-weights test's, and how fast that is across hosts is the benchmark's",
         evidence: Evidence::Test {
-            name: "a_cancelled_job_publishes_nothing_and_keeps_the_title_it_had",
+            name: "a_cancellation_reaches_the_process_during_a_load_and_a_decode",
         },
         targets: EVERY_TARGET,
     },
