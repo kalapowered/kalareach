@@ -3150,3 +3150,410 @@ fn kr_close_is_closing_at_once_then_grace_force_drain_and_a_final_status() {
          {missed:?}"
     );
 }
+
+/* ------------------------------------------------------------------------------------------ */
+/* A worker of another build                                                                   */
+/* ------------------------------------------------------------------------------------------ */
+
+/// How long `kr attach` is given to say that it cannot show a session whose worker is of another
+/// build, and to stop.
+///
+/// Saying so takes the worker's answer to the hello and its proof, which take milliseconds; the
+/// bound is for a loaded machine. A `kr` still running at the end of it is waiting for a screen it
+/// cannot read, and has said nothing about why.
+const OTHER_BUILD_BOUND: Duration = Duration::from_secs(20);
+
+/// The display number a worker of another build publishes its session under: far above any the
+/// daemon gives out in one test.
+const OTHER_BUILD_DISPLAY: u64 = 900;
+
+/// What a worker of another build says about itself in its answer to the hello.
+#[derive(Clone, Debug)]
+enum Stated {
+    /// Nothing, as a worker of a build before the statement says: its answer to the hello names no
+    /// build, and every screen it sends opens with the reset that build wrote.
+    Nothing,
+}
+
+/// The reset that opens a screen, as a worker of an earlier build writes it: before a screen named
+/// the revision of the window it is drawn for, so without that member.
+#[derive(serde::Serialize)]
+struct EarlierReset {
+    projection_generation: kr_protocol::scalars::U64,
+    cursor: kr_protocol::scalars::U64,
+    reason: kr_protocol::projection::ProjectionResetReason,
+}
+
+/// A worker of another build, serving a session the daemon never created.
+///
+/// A worker outlives an upgrade, so a `kr` of this build can meet one. This one publishes its
+/// descriptor where `kr` looks for a session's, proves itself with a key of its own as a session's
+/// worker does, and answers an attach, the input lease and a subscription the way a worker does.
+/// What sets it apart is what it states about its build, and the screens it sends.
+struct AnotherBuild {
+    environment: EnvironmentPaths,
+    session_id: SessionId,
+    /// Every method a client asked of it, in the order asked.
+    asked: Arc<Mutex<Vec<String>>>,
+    /// The runtime its endpoint is served on; the endpoint goes with it.
+    runtime: Option<tokio::runtime::Runtime>,
+}
+
+impl AnotherBuild {
+    /// Publishes a session under [`OTHER_BUILD_DISPLAY`] and serves it as a worker that states
+    /// `stated`.
+    fn start(host: &Host, stated: Stated) -> Self {
+        use kr_protocol::hello::PROTOCOL_VERSION;
+        use kr_protocol::session::DisplayNumber;
+        use kr_protocol::worker::WorkerDescriptor;
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("a runtime for the worker");
+        let environment = host.environment();
+        let session_id = SessionId::new(kr_ipc::new_uuid());
+        let boot = kr_ipc::identity::boot_identity().expect("a boot identity");
+        let process =
+            kr_ipc::identity::current_process_start_identity().expect("a process identity");
+        let identity = Arc::new(
+            kr_ipc::verify::WorkerIdentity::generate(
+                session_id,
+                SessionEpoch::V1,
+                boot.clone(),
+                process.clone(),
+                PROTOCOL_VERSION,
+            )
+            .expect("a session key"),
+        );
+        let display = DisplayNumber::new(OTHER_BUILD_DISPLAY);
+        let endpoint = environment.worker_endpoint(display).expect("an endpoint");
+        let descriptor = WorkerDescriptor {
+            session_id,
+            session_epoch: SessionEpoch::V1,
+            environment_id: host.tree().environment_id(),
+            display_number: display,
+            boot_identity: boot,
+            process_start_identity: process,
+            protocol_version: PROTOCOL_VERSION,
+            endpoint: endpoint.as_text(),
+            worker_public_key: *identity.public_key(),
+            worker_profile: kr_protocol::identity::WorkerProfile::HeadlessUser,
+            published_at_ms: kr_protocol::scalars::TimestampMs::new(0),
+        };
+        let listener = {
+            let _entered = runtime.enter();
+            Listener::bind(&endpoint).expect("binds the endpoint")
+        };
+        kr_ipc::descriptor::publish(&environment, &descriptor).expect("publishes the descriptor");
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&asked);
+        runtime.spawn(async move {
+            while let Ok((connection, peer)) = listener.accept().await {
+                tokio::spawn(serve_as_another_build(
+                    connection,
+                    peer,
+                    descriptor.clone(),
+                    Arc::clone(&identity),
+                    stated.clone(),
+                    Arc::clone(&recorded),
+                ));
+            }
+        });
+        Self {
+            environment,
+            session_id,
+            asked,
+            runtime: Some(runtime),
+        }
+    }
+
+    /// Every method a client has asked of this worker so far.
+    fn asked(&self) -> Vec<String> {
+        self.asked
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+}
+
+impl Drop for AnotherBuild {
+    fn drop(&mut self) {
+        let _ = kr_ipc::descriptor::retire(&self.environment, self.session_id);
+        if let Some(runtime) = self.runtime.take() {
+            runtime.shutdown_background();
+        }
+    }
+}
+
+/// Serves one connection as a worker of another build does.
+async fn serve_as_another_build(
+    connection: kr_ipc::endpoint::Connection,
+    peer: kr_ipc::peer::PeerIdentity,
+    descriptor: kr_protocol::worker::WorkerDescriptor,
+    identity: Arc<kr_ipc::verify::WorkerIdentity>,
+    stated: Stated,
+    asked: Arc<Mutex<Vec<String>>>,
+) {
+    use kr_protocol::attachment::{
+        AttachmentSummary, GeometryState, PresentationReason, TerminalPresentationMode,
+    };
+    use kr_protocol::envelope::{Notification, Outcome, ParamsValue, Response};
+    use kr_protocol::hello::{ActionWindow, PROTOCOL_VERSION};
+    use kr_protocol::ids::{
+        ActionWindowId, AttachmentOrdinal, ConnectionId, EventSequence, EventType, GeometryEpoch,
+        StreamId,
+    };
+    use kr_protocol::local::{LocalHelloAck, LocalRole};
+    use kr_protocol::scalars::{DurationMs, TimestampMs, U64};
+
+    let (mut reader, mut writer) =
+        kr_ipc::framed::split(connection, kr_protocol::frame::StreamKind::Control);
+    let Ok(ControlFrame::Hello(hello)) = reader.read_message::<ControlFrame>().await else {
+        return;
+    };
+    let connection_id = ConnectionId::new(kr_ipc::new_uuid());
+    let acknowledgement = LocalHelloAck {
+        selected_version: PROTOCOL_VERSION,
+        role: LocalRole::Worker,
+        connection_id,
+        environment_id: descriptor.environment_id,
+        boot_identity: descriptor.boot_identity.clone(),
+        peer: peer.to_wire(),
+        action_window: ActionWindow {
+            action_window_id: ActionWindowId::new("another-build").expect("a window identifier"),
+            connection_id,
+            boot_epoch: kr_ipc::identity::boot_epoch(&descriptor.boot_identity)
+                .expect("a boot epoch"),
+            issued_at_ms: TimestampMs::new(kr_ipc::now_ms().get()),
+            valid_for_ms: DurationMs::new(60_000),
+        },
+        capabilities: CanonicalSet::new(),
+        max_receive: hello.max_receive,
+    };
+    let Stated::Nothing = stated;
+    if writer
+        .write_message(&ControlFrame::HelloAck(Box::new(acknowledgement)))
+        .await
+        .is_err()
+    {
+        return;
+    }
+    let attachment_id = AttachmentId::new(kr_ipc::new_uuid());
+    let answer = |request_id, value: ParamsValue| {
+        ControlFrame::Response(Response {
+            request_id,
+            outcome: Outcome::Ok(value),
+        })
+    };
+    let note = |method: String| {
+        asked
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(method);
+    };
+    while let Ok(frame) = reader.read_message::<ControlFrame>().await {
+        let (reply, then_a_screen) = match frame {
+            ControlFrame::VerifyChallenge(challenge) => (
+                ControlFrame::VerifyProof(
+                    identity
+                        .answer(&challenge, &descriptor.endpoint)
+                        .expect("a proof"),
+                ),
+                false,
+            ),
+            ControlFrame::Mutation(mutation) => {
+                note(mutation.method.to_string());
+                match mutation.method.method() {
+                    Some(Method::SessionAttach) => {
+                        let Ok(asked_for) = mutation.params.to_typed::<SessionAttachParams>()
+                        else {
+                            return;
+                        };
+                        let result = SessionAttachResult {
+                            attachment: AttachmentSummary {
+                                attachment_id,
+                                ordinal: AttachmentOrdinal::new(1),
+                                mode: asked_for.mode,
+                                claim_geometry: asked_for.claim_geometry,
+                                dimensions: asked_for.dimensions,
+                                presentation: Nullable::some(TerminalPresentationMode::Viewport),
+                                presentation_reason: Some(PresentationReason::NoTerminalProfile),
+                                terminal_profile_id: asked_for.terminal_profile_id.clone(),
+                                granted: asked_for.requested.clone(),
+                                attached_at_ms: TimestampMs::new(kr_ipc::now_ms().get()),
+                            },
+                            geometry: GeometryState {
+                                owner: Nullable::some(attachment_id),
+                                epoch: GeometryEpoch::new(1),
+                                dimensions: asked_for
+                                    .dimensions
+                                    .0
+                                    .unwrap_or(INVISIBLE_DEFAULT_DIMENSIONS),
+                            },
+                            output_cursor: U64::ZERO,
+                        };
+                        (
+                            answer(
+                                mutation.request_id,
+                                ParamsValue::from_typed(&result).expect("encodes"),
+                            ),
+                            false,
+                        )
+                    }
+                    Some(Method::InputAcquire) => {
+                        let result = InputAcquireResult {
+                            lease: kr_protocol::input::InputLeaseState {
+                                epoch: InputLeaseEpoch::new(1),
+                                holder: Nullable::some(attachment_id),
+                                connection_id: Nullable::some(connection_id),
+                                next_sequence: InputSequence::new(0),
+                            },
+                            discarded_bytes: U64::ZERO,
+                            closed_open_paste: false,
+                        };
+                        (
+                            answer(
+                                mutation.request_id,
+                                ParamsValue::from_typed(&result).expect("encodes"),
+                            ),
+                            false,
+                        )
+                    }
+                    _ => continue,
+                }
+            }
+            ControlFrame::Request(request) => {
+                note(request.method.to_string());
+                if request.method.method() != Some(Method::EventsSubscribe) {
+                    continue;
+                }
+                let result = kr_protocol::recovery::EventsSubscribeResult {
+                    stream_id: StreamId::new(kr_worker::service::OUTPUT_STREAM)
+                        .expect("a stream name"),
+                    from_cursor: U64::ZERO,
+                    oldest_retained_cursor: U64::ZERO,
+                    gap: Nullable::null(),
+                    agent_resources: kr_protocol::projection::AgentResourceSnapshot {
+                        snapshot_id: U64::ZERO,
+                        stream_generation: U64::ZERO,
+                        cursor: U64::ZERO,
+                        resources: Vec::new(),
+                        continue_after: Nullable::null(),
+                    },
+                    agent_instances: kr_protocol::projection::AgentInstanceList {
+                        sequence: U64::ZERO,
+                        instances: Vec::new(),
+                    },
+                };
+                (
+                    answer(
+                        request.request_id,
+                        ParamsValue::from_typed(&result).expect("encodes"),
+                    ),
+                    true,
+                )
+            }
+            _ => continue,
+        };
+        if writer.write_message(&reply).await.is_err() {
+            return;
+        }
+        if then_a_screen {
+            // Every subscription is sent a screen, and a `kr` that cannot read one asks again. A
+            // worker answers at once; this one waits a moment first, so the exchange a test is
+            // watching cannot fill the machine.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let reset = Notification {
+                stream_id: StreamId::new(kr_worker::service::OUTPUT_STREAM).expect("a stream name"),
+                sequence: EventSequence::new(0),
+                event_type: EventType::new(kr_protocol::projection::PROJECTION_RESET_EVENT)
+                    .expect("an event type"),
+                payload: ParamsValue::from_typed(&EarlierReset {
+                    projection_generation: U64::new(1),
+                    cursor: U64::ZERO,
+                    reason: kr_protocol::projection::ProjectionResetReason::Attached,
+                })
+                .expect("encodes"),
+            };
+            if writer
+                .write_message(&ControlFrame::Notification(reset))
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+    }
+}
+
+/// Opens a window that attaches to the session of a worker of another build, and returns the
+/// status `kr attach` ended with and what the terminal was sent, or fails with what it had been
+/// sent when `kr` was still attached at [`OTHER_BUILD_BOUND`].
+fn attach_to_another_build(host: &Host, worker: &AnotherBuild) -> (Window, i32, String) {
+    const FINISHED: &str = "attach-finished-";
+    let window = Window::open(
+        host,
+        &format!(
+            "{kr} attach --no-probe {OTHER_BUILD_DISPLAY}; printf '\\n{FINISHED}%s\\n' \"$?\"; \
+             IFS= read -r _",
+            kr = quoted(&kr()),
+        ),
+    );
+    let started = Instant::now();
+    loop {
+        let shown = String::from_utf8_lossy(&window.screen.since(0)).into_owned();
+        if let Some(at) = shown.find(FINISHED) {
+            let rest = &shown[at + FINISHED.len()..];
+            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            // Only once the line is whole: a status is followed by the end of its line.
+            if rest[digits.len()..].starts_with(['\r', '\n']) {
+                let status = digits.parse().expect("a status");
+                return (window, status, shown);
+            }
+        }
+        assert!(
+            started.elapsed() < OTHER_BUILD_BOUND,
+            "kr was still attached to the worker of another build after {:?} and had said nothing \
+             about why it showed no screen; it asked the worker for {:?}, and the terminal was \
+             sent: {}",
+            started.elapsed(),
+            worker.asked(),
+            shown.escape_debug()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// A `kr` of this build attached to a session whose worker is of an earlier build, as a worker
+/// that outlived an upgrade is, says that it cannot show the session and why, names what to do,
+/// and stops. It asks nothing of the session first: no attachment is made, no size is claimed and
+/// no input lease is taken. What it must not do is attach, be sent screens it cannot read and wait
+/// on them without a word.
+#[test]
+fn kr_names_a_worker_of_an_earlier_build_and_stops_rather_than_waiting_on_its_screens() {
+    let host = Host::start();
+    let worker = AnotherBuild::start(&host, Stated::Nothing);
+    let (window, status, shown) = attach_to_another_build(&host, &worker);
+    assert_eq!(status, 8, "the status of a refused request: {shown}");
+    for said in [
+        "UNSUPPORTED_SCHEMA",
+        "session 900",
+        "an earlier build",
+        "kr close 900",
+        "a kr of the worker's build",
+    ] {
+        assert!(
+            shown.contains(said),
+            "kr says {said:?}: {}",
+            shown.escape_debug()
+        );
+    }
+    let asked = worker.asked();
+    assert!(
+        asked.is_empty(),
+        "nothing of the session is asked for before the refusal: {asked:?}"
+    );
+    window.wait_until_put_back("the terminal to be back as kr found it");
+}
