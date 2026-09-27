@@ -321,22 +321,30 @@ pub fn record_key_scan(part: &str, variable: &str, scan: &KeyScan, removed_ms: u
 }
 
 /// One file of the person's home that a part must leave as it found it, as it was at one moment:
-/// its path relative to the home, and its SHA-256, or none where it did not exist.
+/// its path relative to the home, its SHA-256, or none where it did not exist, and whether those
+/// same bytes held one of the needles it was read for.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Guarded {
     /// The path relative to the person's home.
     pub relative: String,
     /// The file's SHA-256, where it exists.
     pub sha256: Option<[u8; 32]>,
+    /// Whether the bytes hashed held one of the needles.
+    pub holds: bool,
 }
 
-/// Reads each of `files`, relative to `home`, for [`Guarded`]: a file that cannot be read, other
-/// than one that does not exist, is an error, since nothing about it could be compared.
+/// Reads each of `files`, relative to `home`, once, for [`Guarded`]: its digest and whether it
+/// holds one of `needles` come from the same read. A file that cannot be read, other than one that
+/// does not exist, is an error, since nothing about it could be compared.
 ///
 /// # Errors
 ///
 /// Returns the file that could not be read, and why.
-pub fn guarded_files(home: &Path, files: &[String]) -> Result<Vec<Guarded>, String> {
+pub fn guarded_files(
+    home: &Path,
+    files: &[String],
+    needles: &[&str],
+) -> Result<Vec<Guarded>, String> {
     files
         .iter()
         .map(|relative| {
@@ -345,10 +353,17 @@ pub fn guarded_files(home: &Path, files: &[String]) -> Result<Vec<Guarded>, Stri
                 Ok(bytes) => Ok(Guarded {
                     relative: relative.clone(),
                     sha256: Some(kr_cbor::sha256(&bytes)),
+                    holds: needles.iter().any(|needle| {
+                        !needle.is_empty()
+                            && bytes
+                                .windows(needle.len())
+                                .any(|window| window == needle.as_bytes())
+                    }),
                 }),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Guarded {
                     relative: relative.clone(),
                     sha256: None,
+                    holds: false,
                 }),
                 Err(error) => Err(format!("~/{relative}: {error}")),
             }

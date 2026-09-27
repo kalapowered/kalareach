@@ -122,6 +122,11 @@ pub struct Account {
     /// person's own, and what its output holds when it loads none.
     #[serde(default)]
     pub isolated: Option<Status>,
+    /// Files that would load the person's own settings, hooks or servers into the agent, none of
+    /// which may exist before it starts: `{config}` names the configuration directory of the run's
+    /// own and `{work}` the working directory.
+    #[serde(default)]
+    pub absent: Vec<String>,
     /// Where the agent keeps its configuration in these parts, where it is not the home.
     #[serde(default)]
     pub config_directory: Option<ConfigDirectory>,
@@ -179,6 +184,10 @@ pub struct Account {
     /// What marks the line of a conversation file that records the answer to a tool approval:
     /// the command's result, or its refusal.
     pub decision_line: String,
+    /// What marks the line of a conversation file that records a prompt queued behind a running
+    /// turn, where the agent writes one.
+    #[serde(default)]
+    pub queued_line: Option<String>,
     /// Text the screen shows while a turn runs.
     pub busy: String,
     /// A slash command that calls no model and changes no conversation, and the text it shows.

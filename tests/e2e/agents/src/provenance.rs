@@ -150,7 +150,7 @@ struct Seen {
     samples: u64,
     /// The system's own programs seen running as another user beneath a session, which the kernel
     /// will not describe: by number and the file each runs.
-    other_users: Vec<serde_json::Value>,
+    other_users: Vec<(u32, PathBuf)>,
 }
 
 /// What a stage's sessions ran, checked as they ran it.
@@ -473,6 +473,17 @@ impl Provenance {
         }
     }
 
+    /// The system's own programs seen running as another user beneath the sessions, by number and
+    /// the file each runs, for the run's closing check to find ended.
+    #[must_use]
+    pub fn system_programs(&self) -> Vec<(u32, PathBuf)> {
+        self.seen
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .other_users
+            .clone()
+    }
+
     /// What the stage's sessions searched and ran, for the part's evidence.
     #[must_use]
     pub fn evidence(&self) -> serde_json::Value {
@@ -484,6 +495,7 @@ impl Provenance {
             .processes
             .keys()
             .map(|identity| identity.pid.get())
+            .chain(seen.other_users.iter().map(|(pid, _)| u64::from(*pid)))
             .collect();
         json!({
             "session_path": *self.seen_path.lock().unwrap_or_else(PoisonError::into_inner),
@@ -492,7 +504,11 @@ impl Provenance {
             "launches": seen.launches,
             "executed": executed,
             "pids": pids,
-            "system_programs_of_another_user": seen.other_users,
+            "system_programs_of_another_user": seen
+                .other_users
+                .iter()
+                .map(|(pid, image)| json!({ "pid": pid, "image": image }))
+                .collect::<Vec<_>>(),
             "ended_before_read": seen.unread,
         })
     }
@@ -553,9 +569,24 @@ impl Provenance {
                                 entry.pid,
                                 &error.to_string(),
                             ) {
-                                let found = json!({ "pid": entry.pid, "image": path });
-                                if !seen.other_users.contains(&found) {
-                                    seen.other_users.push(found);
+                                // What it started could not be followed back to it, so it may
+                                // start nothing.
+                                if let Some(child) =
+                                    table.iter().find(|child| child.parent == entry.pid)
+                                {
+                                    problem(
+                                        &mut seen,
+                                        format!(
+                                            "{NOT_PINNED} the system program {} (process {}) beneath a session started process {}, which cannot be followed back to it",
+                                            path.display(),
+                                            entry.pid,
+                                            child.pid
+                                        ),
+                                    );
+                                    continue;
+                                }
+                                if !seen.other_users.iter().any(|(pid, _)| *pid == entry.pid) {
+                                    seen.other_users.push((entry.pid, path));
                                 }
                                 continue;
                             }

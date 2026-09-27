@@ -252,7 +252,7 @@ fn staged(
             .chain(&login.account.shared)
             .cloned()
             .collect();
-        let before = guarded_files(&login.person_home, &files).unwrap_or_else(|why| {
+        let before = guarded_files(&login.person_home, &files, &[]).unwrap_or_else(|why| {
             panic!("part {part}: a file of the person's that must not change cannot be read: {why}")
         });
         let item = login
@@ -288,6 +288,9 @@ fn staged(
     let writers = if closed.load(std::sync::atomic::Ordering::SeqCst) {
         Ok(())
     } else if needs_login {
+        for (pid, path) in provenance.system_programs() {
+            run.note_system_program(pid, &path);
+        }
         run.end_everything();
         run.remove_loaded_jobs();
         run.nothing_running().map(|_| ())
@@ -345,24 +348,20 @@ fn staged(
     let mut watched_evidence = None;
     let mut watched_stop = Vec::new();
     if let (Some(login), Some((files, before, item))) = (login.as_ref(), watched.as_ref()) {
-        match guarded_files(&login.person_home, files) {
+        let root_text = root.display().to_string();
+        match guarded_files(
+            &login.person_home,
+            files,
+            &[mark.as_str(), root_text.as_str()],
+        ) {
             Ok(after) => {
                 record_guarded(part, before, &after);
-                let root_text = root.display().to_string();
                 let mut entries = Vec::new();
                 for (first, second) in before.iter().zip(&after) {
                     let changed = first.sha256 != second.sha256;
                     let shared = login.account.shared.contains(&first.relative);
-                    let names_run = changed
-                        && std::fs::read(login.person_home.join(&first.relative)).is_ok_and(
-                            |bytes| {
-                                [mark.as_str(), root_text.as_str()].iter().any(|needle| {
-                                    bytes
-                                        .windows(needle.len())
-                                        .any(|window| window == needle.as_bytes())
-                                })
-                            },
-                        );
+                    // The digest and the search are of the same bytes.
+                    let names_run = changed && second.holds;
                     if changed && (!shared || names_run) {
                         watched_stop.push(format!("~/{} changed", first.relative));
                     }
@@ -648,6 +647,9 @@ fn run_part(
         }
         ending.outcome
     });
+    for (pid, path) in provenance.system_programs() {
+        run.note_system_program(pid, &path);
+    }
     let checked = run
         .closing_check()
         .unwrap_or_else(|left| panic!("still running after part {part}: {left}"));
@@ -1308,6 +1310,32 @@ fn login_holds(stage: &Stage<'_, '_>, variables: &[(String, String)]) {
             isolated.shows
         );
     }
+    for path in absent_paths(stage) {
+        assert!(
+            !path.exists(),
+            "{ISOLATION_UNPROVEN} {} exists, which would load the person's own settings, hooks or \
+             servers into the agent",
+            path.display()
+        );
+    }
+}
+
+/// The files the build list says must not exist before the agent starts, with `{config}` and
+/// `{work}` made the run's configuration and working directories.
+fn absent_paths(stage: &Stage<'_, '_>) -> Vec<PathBuf> {
+    let account = stage.login.expect("a part with a login").account();
+    let config = stage
+        .run
+        .root()
+        .join(CONFIG_DIRECTORY)
+        .display()
+        .to_string();
+    let work = stage.run.work().display().to_string();
+    account
+        .absent
+        .iter()
+        .map(|path| PathBuf::from(path.replace("{config}", &config).replace("{work}", &work)))
+        .collect()
 }
 
 /// A random number below `bound`, from the system's random source.
@@ -1420,6 +1448,10 @@ fn account_evidence(stage: &Stage<'_, '_>, turns: u64) -> serde_json::Value {
         "turns": turns,
         "budget_spent": login.ledger.spent().ok(),
         "budget_limit": login.ledger.limit(),
+        "isolation": {
+            "servers": login.account.isolated.as_ref().map(|isolated| json!({ "command": isolated.arguments, "said": isolated.shows })),
+            "absent_before_start": absent_paths(stage),
+        },
     })
 }
 
@@ -3058,6 +3090,10 @@ struct Order {
     before: Running,
     /// The reading just after.
     after: Running,
+    /// Whether the agent writes a record of a prompt it queued behind a running turn.
+    records_queue: bool,
+    /// Its record of the second prompt, queued, where it wrote one.
+    queued_record: Option<usize>,
     /// The running turn's reply that finished its work.
     first_finished: Option<usize>,
     /// The second prompt.
@@ -3078,6 +3114,15 @@ fn check_queued(order: &Order) -> Result<(), String> {
             "the second prompt was not entered while a turn ran: just before {:?}, just after {:?}",
             order.before, order.after
         )),
+        (finished, _, _)
+            if order.records_queue
+                && !matches!((order.queued_record, finished), (Some(queued), Some(done)) if queued < done) =>
+        {
+            Err(format!(
+                "the agent's conversation does not record the second prompt as queued before the \
+                 turn finished: {order:?}"
+            ))
+        }
         (Some(finished), Some(prompt), Some(answered))
             if finished < prompt && prompt < answered =>
         {
@@ -3223,10 +3268,23 @@ fn slash_commands_interrupts_queued_prompts_and_steering_each_work_from_a_device
             None,
             &[&format!("{mark}-r"), &account.prompt_line],
         );
+        // Where the agent writes its own record of a prompt it queued, that record ties the second
+        // prompt to the running turn; where it writes none, the view's reading just after must
+        // show the turn still running as well.
+        let queued_record = account.queued_line.as_ref().and_then(|marker| {
+            first_line_with(&conversation, first_prompt, &[&format!("{mark}-r"), marker])
+        });
         let queue = Order {
-            busy_at_submission: before_queue.holds() && after_queue.unfinished,
+            busy_at_submission: before_queue.holds()
+                && if account.queued_line.is_some() {
+                    after_queue.unfinished
+                } else {
+                    after_queue.holds()
+                },
             before: before_queue,
             after: after_queue,
+            records_queue: account.queued_line.is_some(),
+            queued_record,
             first_finished: first_line_with(
                 &conversation,
                 first_prompt,
@@ -3249,7 +3307,8 @@ fn slash_commands_interrupts_queued_prompts_and_steering_each_work_from_a_device
                         ("q", &format!("{mark}-q")),
                         ("r", &format!("{mark}-r")),
                         ("done", &queued_done),
-                        ("sum", &queued_sum)
+                        ("sum", &queued_sum),
+                        ("queued", account.queued_line.as_deref().unwrap_or("\u{0}"))
                     ]
                 )
             )
@@ -3258,6 +3317,7 @@ fn slash_commands_interrupts_queued_prompts_and_steering_each_work_from_a_device
         let mut checker = vec![
             json!({ "check": "queued", "wrong": "entered with no turn running", "rejected": check_queued(&Order { busy_at_submission: false, ..queue }).is_err() }),
             json!({ "check": "queued", "wrong": "the prompt joined before the turn finished", "rejected": check_queued(&Order { second_prompt: queue.first_finished.map(|line| line.saturating_sub(1)), ..queue }).is_err() }),
+            json!({ "check": "queued", "wrong": "the agent kept no record of the prompt as queued", "rejected": !queue.records_queue || check_queued(&Order { queued_record: None, ..queue }).is_err() }),
         ];
         let steering = if account.steers {
             let (steer_question, steer_sum) = sum_question();
@@ -3314,6 +3374,8 @@ fn slash_commands_interrupts_queued_prompts_and_steering_each_work_from_a_device
                 busy_at_submission: before_steer.holds() && after_steer.unfinished,
                 before: before_steer,
                 after: after_steer,
+                records_queue: false,
+                queued_record: None,
                 first_finished: first_line_with(
                     &steered_conversation,
                     steered_prompt,

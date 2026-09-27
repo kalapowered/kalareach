@@ -927,7 +927,8 @@ pub fn beneath(run: &Run, ancestor: &ProcessStartIdentity, what: &str) -> Vec<Ag
                 ProcessQuery::Present(identity) => identity,
                 ProcessQuery::Gone => continue,
                 // One of the system's own programs running as another user is none of the
-                // agent's processes to follow.
+                // agent's processes; the run's own search above noted it, and failed had it
+                // started anything.
                 ProcessQuery::CannotEstablish(error)
                     if kr_e2e_m1b::run::system_program_of_another_user(
                         entry.pid,
