@@ -32,6 +32,7 @@ pub mod admissions;
 pub mod bridge;
 pub mod evidence;
 pub(crate) mod files;
+pub mod integrations;
 pub mod native_bridge;
 
 use std::sync::Arc;

@@ -747,6 +747,9 @@ pub struct Controller {
     admissions_due: Arc<tokio::sync::Notify>,
     /// Why admissions could not be handed over lately, for the doctor's catalogue check.
     admission_notes: std::sync::Mutex<Vec<String>>,
+    /// The reader of admitted packages a session's command integrations are filled from, which
+    /// checks each package once.
+    integrations: Arc<crate::catalogue::integrations::Integrations>,
     /// The environment's grants and invitations, which the sharing and device method groups act on.
     sharing: Arc<crate::sharing::SharingService>,
     /// The environment's voice service: the coordinator and the seams it reads and proposes
@@ -1282,6 +1285,7 @@ impl Controller {
             plugin_bridge,
             admissions_due: Arc::new(tokio::sync::Notify::new()),
             admission_notes: std::sync::Mutex::new(Vec::new()),
+            integrations: Arc::new(crate::catalogue::integrations::Integrations::new()),
             accepted_configuration: Mutex::new(accepted_configuration),
             in_force: std::sync::Mutex::new(in_force),
             started,
@@ -4189,7 +4193,7 @@ impl Controller {
                 "this reservation has no recorded create request, so nothing can be launched from it",
             )
         })?;
-        let create = recorded_create(recorded).map_err(|error| {
+        let mut create = recorded_create(recorded).map_err(|error| {
             ControllerError::registry(format!(
                 "the recorded create request cannot be read: {error}"
             ))
@@ -4215,6 +4219,10 @@ impl Controller {
             Nullable::null()
         };
         let admissions = self.first_admissions(reservation.session_id).await;
+        // The session's command integrations are fixed here, when it is launched: from the
+        // admissions its worker is handed first, read by a worker's own rules, and the
+        // configuration in force now.
+        create.launch_profile.command_integrations = self.session_integrations(&admissions).await;
         let plugins = admissions
             .first()
             .map(|first| kr_protocol::admission::AdmissionsHeader {
@@ -4239,6 +4247,39 @@ impl Controller {
             },
             admissions,
         ))
+    }
+
+    /// The command integrations a session launched with `admissions` gets: one for each
+    /// connector whose integration applies there, on where the configuration in force names its
+    /// package. None where nothing is admitted, or where the packages cannot be read in time, which
+    /// is noted for the doctor: the worker then runs every command as typed.
+    async fn session_integrations(
+        &self,
+        admissions: &[kr_protocol::admission::PluginAdmissions],
+    ) -> Vec<kr_protocol::session::CommandIntegration> {
+        let packages: Vec<kr_protocol::admission::AdmittedPackage> = admissions
+            .iter()
+            .flat_map(|part| part.packages.iter().cloned())
+            .collect();
+        if packages.is_empty() {
+            return Vec::new();
+        }
+        let enabled = self.in_force().command_integrations;
+        let integrations = Arc::clone(&self.integrations);
+        let read = tokio::task::spawn_blocking(move || {
+            crate::catalogue::integrations::entries(&integrations.read(&packages), &enabled)
+        });
+        match tokio::time::timeout(WORKER_EXCHANGE, read).await {
+            Ok(Ok(entries)) => entries,
+            Ok(Err(_)) | Err(_) => {
+                self.note_admissions(
+                    "a session's command integrations could not be read from its admissions in \
+                     time, so it was launched with none"
+                        .to_owned(),
+                );
+                Vec::new()
+            }
+        }
     }
 
     /// Waits for the launcher's reported identity to reach the registry.
@@ -8494,6 +8535,16 @@ impl Controller {
         // nothing measured.
         if let Some(refusal) = create.palette_refusal() {
             return Err(ControllerError::InvalidArgument(refusal));
+        }
+        // A session's command integrations are its environment's: the configuration turns them on
+        // and the host fills them in when the session is launched. A request that could name one
+        // could turn on an integration the owner did not.
+        if !create.launch_profile.command_integrations.is_empty() {
+            return Err(ControllerError::InvalidArgument(
+                "a create request names no command integration: a session applies the ones its \
+                 environment's configuration turns on"
+                    .to_owned(),
+            ));
         }
         let digest = kr_protocol::digest::mutation_digest(mutation, actor_id)
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
