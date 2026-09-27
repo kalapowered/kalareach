@@ -331,6 +331,10 @@ pub struct EnvironmentPrivacy {
     backup: Arc<BackupService>,
     delivery: Arc<DeliveryModule>,
     descriptions: Arc<DescribeModule>,
+    /// Where this module's own tests stop an enabling: its record written, inside the backup
+    /// store's hold, before the backup fence goes up.
+    #[cfg(test)]
+    after_record: crate::attention::Pause,
 }
 
 #[derive(Debug)]
@@ -386,6 +390,8 @@ impl EnvironmentPrivacy {
             backup,
             delivery,
             descriptions,
+            #[cfg(test)]
+            after_record: crate::attention::Pause::default(),
         })
     }
 
@@ -454,7 +460,12 @@ impl EnvironmentPrivacy {
         // withholding production, and the steps below try it again.
         let record = &mut inner.record;
         let _raised = self.backup.raise_fence_recorded(generation, now_ms, || {
-            record.enable(generation, &owing, now_ms)
+            let recorded = record.enable(generation, &owing, now_ms);
+            #[cfg(test)]
+            if recorded.is_ok() {
+                self.after_record.wait();
+            }
+            recorded
         })?;
         inner.mode = mode;
         inner.changed_at_ms = now_ms;
@@ -1268,8 +1279,8 @@ impl Record {
         std::fs::create_dir_all(state_dir).map_err(ControllerError::registry)?;
         let connection =
             Connection::open(state_dir.join(PRIVACY_RECORD)).map_err(ControllerError::registry)?;
-        // Another reader of the record holds it for a moment at most; a write waits that long
-        // rather than refusing the change.
+        // A write that finds the record held by another connection waits for it, up to five
+        // seconds, rather than refusing the change at once.
         connection
             .busy_timeout(std::time::Duration::from_secs(5))
             .map_err(ControllerError::registry)?;
@@ -3028,41 +3039,21 @@ mod tests {
         assert!(!report.completion.is_complete());
     }
 
-    /// The record and the backup fence are one step for backup production. With the record's
-    /// write held back by another reader, an enabling waits inside the backup's own hold, and a
-    /// backup production decision made meanwhile waits too, and then finds the fence up.
+    /// The record and the backup fence are one step for backup production. An enabling stopped
+    /// once its record is written, before the fence, still holds the backup store: a backup
+    /// production decision made then waits, and finds the fence up.
     #[test]
-    fn a_backup_decision_made_while_the_record_is_written_waits_and_finds_the_fence_up() {
+    fn a_backup_decision_made_once_the_record_is_written_waits_and_finds_the_fence_up() {
         let host = Host::open();
         let publication = host.publication_on_the_wire(1);
-        let holder = Connection::open(host.root.path().join(PRIVACY_RECORD)).expect("the record");
-        holder
-            .execute_batch("BEGIN EXCLUSIVE")
-            .expect("the record is held");
+        let (arrived, release) = host.privacy.after_record.arm();
         std::thread::scope(|scope| {
+            // Owned here, so a failed assertion lets the stopped enabling go on rather than wait.
+            let release = release;
             let enabling = scope.spawn(|| host.privacy.enable(&[], at(10)));
-            // Wait until the backup store is held: a read of it that does not come back in half a
-            // second is waiting for the enabling, which holds it while its record is held back.
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-            loop {
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "the enabling never held the store"
-                );
-                let (read_tx, read_rx) = std::sync::mpsc::channel();
-                let backup = &host.backup;
-                scope.spawn(move || {
-                    let _ = backup.fenced_at();
-                    let _ = read_tx.send(());
-                });
-                if read_rx
-                    .recv_timeout(std::time::Duration::from_millis(500))
-                    .is_err()
-                {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
+            arrived
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .expect("the record is written");
             let (answered_tx, answered_rx) = std::sync::mpsc::channel();
             let backup = &host.backup;
             scope.spawn(move || {
@@ -3074,11 +3065,9 @@ mod tests {
                 answered_rx
                     .recv_timeout(std::time::Duration::from_millis(300))
                     .is_err(),
-                "a backup decision waits while the boundary is being recorded"
+                "no backup decision falls between the record and the fence"
             );
-            holder
-                .execute_batch("COMMIT")
-                .expect("the record is let go");
+            release.send(()).expect("the enabling goes on");
             let report = enabling
                 .join()
                 .expect("the enabling finishes")
