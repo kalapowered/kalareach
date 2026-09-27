@@ -7512,6 +7512,11 @@
           "const": "no_launcher",
           "description": "No launcher, `kr-hook`, is installed beside this host's worker: every invocation runs as\ntyped.",
           "type": "string"
+        },
+        {
+          "const": "too_large",
+          "description": "The integrations the configuration turns on add more flags together than one session\ncarries, and this one is among the largest, which a session is launched without.",
+          "type": "string"
         }
       ]
     },

@@ -771,7 +771,7 @@ export type HelloReply =
 /**
  * Why a session created now could not launch through a command integration on this host.
  */
-export type CommandIntegrationUnavailable = 'platform' | 'no_launcher'
+export type CommandIntegrationUnavailable = 'platform' | 'no_launcher' | 'too_large'
 /**
  * A managed account identifier minted by the service. It names the payer; it is not authority.
  */
