@@ -514,8 +514,8 @@ fn origin_of(source: ValueSource, origin: &str) -> Asked {
 
 /// Renders this host's effective configuration.
 ///
-/// The host's own sentences are said as it wrote them; this host's own locations whole
-/// ([`location`]); each other text field, and each value, by the class it is made of
+/// The host's own sentences are said as it wrote them; this host's own locations, and where each
+/// value came from, whole; each other text field, and each value, by the class it is made of
 /// ([`configured`]).
 #[must_use]
 pub fn configuration_report(effective: &EffectiveConfiguration) -> Document {

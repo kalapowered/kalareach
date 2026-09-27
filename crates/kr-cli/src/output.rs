@@ -1,13 +1,14 @@
 //! What this program writes on standard output, and the only way anything is written there.
 //!
 //! Standard output is read by a person at a terminal somebody may be sharing and by scripts that
-//! keep what they read, so it follows the rule a diagnostic follows ([`kr_client::shown`]), with one
-//! addition: content the person asked this command for is shown to them, marked as such.
+//! keep what they read, so it follows the rule a diagnostic follows
+//! ([`kr_client::shown`](mod@kr_client::shown)), with one addition: content the person asked this
+//! command for is shown to them, marked as such.
 //!
 //! * [`say`] writes one [`Shown`]: this program's words, `Plain` values, and what a reducer or a
 //!   door decided may be said.
-//! * [`line`] writes one [`Line`], composed ([`stdout_line!`](crate::stdout_line)) from a template
-//!   of this program's own and parts that are each `Plain` or [`Asked`].
+//! * [`line`](fn@line) writes one [`Line`], composed ([`stdout_line!`](crate::stdout_line)) from a
+//!   template of this program's own and parts that are each `Plain` or [`Asked`].
 //! * [`document`] writes one `--json` [`Document`], built from `Shown`, numbers, switches, `Asked`,
 //!   documents and lists of them. There is no conversion into one from a string or a JSON value.
 //!
@@ -62,8 +63,8 @@ pub enum Request {
 
 /// Content the person asked to read.
 ///
-/// It has no `Display` and no `Debug`, and nothing turns it into a [`Shown`]: this module writes it,
-/// into a line or a document on standard output, and nothing else reads it.
+/// It has no `Display` and no `Debug`, and nothing turns it into a [`Shown`]: this module writes
+/// it, into a line or a document on standard output, and nothing else reads it.
 pub struct Asked {
     request: Request,
     text: String,
