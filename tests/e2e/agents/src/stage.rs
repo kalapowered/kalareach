@@ -926,6 +926,17 @@ pub fn beneath(run: &Run, ancestor: &ProcessStartIdentity, what: &str) -> Vec<Ag
             let identity = match query_process(entry.pid) {
                 ProcessQuery::Present(identity) => identity,
                 ProcessQuery::Gone => continue,
+                // One of the system's own programs running as another user is none of the
+                // agent's processes to follow.
+                ProcessQuery::CannotEstablish(error)
+                    if kr_e2e_m1b::run::system_program_of_another_user(
+                        entry.pid,
+                        &error.to_string(),
+                    )
+                    .is_some() =>
+                {
+                    continue;
+                }
                 ProcessQuery::CannotEstablish(error) => {
                     panic!(
                         "process {} beneath {what} could not be identified: {error}",

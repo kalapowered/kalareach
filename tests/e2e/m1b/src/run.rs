@@ -394,6 +394,14 @@ impl Run {
                     ProcessQuery::Present(identity) => identity,
                     // It has ended since the table was read.
                     ProcessQuery::Gone => continue,
+                    // One of the system's own programs running as another user is not this run's
+                    // to end, and ends by itself.
+                    ProcessQuery::CannotEstablish(error)
+                        if system_program_of_another_user(entry.pid, &error.to_string())
+                            .is_some() =>
+                    {
+                        continue;
+                    }
                     ProcessQuery::CannotEstablish(error) => {
                         return Err(format!(
                             "process {} beneath {what} could not be identified: {error}",
@@ -494,6 +502,41 @@ impl Drop for Run {
             self.leg,
             self.root.display()
         );
+    }
+}
+
+/// The file `pid` runs, where it is one of the system's own programs running as another user: a
+/// set-user-ID program a person's tools start, such as `/bin/ps` or `/usr/bin/top`. The kernel
+/// will not describe such a process to this user (`error`, from reading its identity, says
+/// "Operation not permitted"), and it still says which file the process runs; that file lies in a
+/// directory the system's integrity protection covers. Such a process is neither a build under
+/// test nor anything a run started or can end: it ends by itself.
+#[must_use]
+pub fn system_program_of_another_user(pid: u32, error: &str) -> Option<PathBuf> {
+    const SYSTEM: [&str; 6] = [
+        "/bin/",
+        "/sbin/",
+        "/usr/bin/",
+        "/usr/sbin/",
+        "/usr/libexec/",
+        "/System/",
+    ];
+    if !error.contains("errno = 1,") {
+        return None;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let path = PathBuf::from(libproc::proc_pid::pidpath(i32::try_from(pid).ok()?).ok()?);
+        let text = path.display().to_string();
+        SYSTEM
+            .iter()
+            .any(|prefix| text.starts_with(prefix))
+            .then_some(path)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (pid, SYSTEM);
+        None
     }
 }
 
@@ -745,4 +788,42 @@ fn built_directory() -> PathBuf {
         directory.pop();
     }
     directory
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_set_user_id_system_program_is_told_by_the_file_it_runs() {
+        // `top` is set-user-ID root on macOS: the kernel will not describe it to its own user.
+        let mut child = std::process::Command::new("/usr/bin/top")
+            .args(["-l", "30", "-s", "1"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("top starts");
+        let started = Instant::now();
+        let refused = loop {
+            match query_process(child.id()) {
+                ProcessQuery::CannotEstablish(error) => break Some(error.to_string()),
+                _ if started.elapsed() < Duration::from_secs(5) => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                _ => break None,
+            }
+        };
+        let told = refused
+            .as_deref()
+            .and_then(|error| system_program_of_another_user(child.id(), error));
+        let _ = child.kill();
+        let _ = child.wait();
+        let error = refused.expect("the kernel refuses to describe a set-user-ID program");
+        assert_eq!(told, Some(PathBuf::from("/usr/bin/top")), "{error}");
+        assert_eq!(
+            system_program_of_another_user(std::process::id(), "errno = 2, gone"),
+            None,
+            "only a refusal is taken for another user"
+        );
+    }
 }

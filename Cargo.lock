@@ -4594,6 +4594,7 @@ dependencies = [
  "kr-term",
  "kr-transport",
  "kr-worker",
+ "libproc",
  "portable-pty",
  "rustix",
  "rustls-platform-verifier",
