@@ -68,9 +68,14 @@ struct Holding {
     resources: Vec<PendingResource>,
     /// How many resources one page carries; nought carries them all in one.
     page: usize,
-    /// Whether the next continuation of a snapshot is answered `RESYNC_REQUIRED`, once.
-    resync_once: bool,
-    /// The answer to `agent.approval.inspect` for each resource the broker has a record of.
+    /// Which snapshot the pages are cut from; a continuation of any other is answered
+    /// `RESYNC_REQUIRED`.
+    snapshot_id: u64,
+    /// What the resources become once the next continuation is asked for, which ends the snapshot
+    /// being read.
+    changes_to: Option<Vec<PendingResource>>,
+    /// The answer to `agent.approval.inspect` for each resource the broker has a record of, from its
+    /// ledger when the live arbitration no longer holds it.
     records: BTreeMap<PendingResourceId, Result<AgentApprovalInspectResult, ProtocolError>>,
     /// The session's questions, by identity.
     questions: BTreeMap<QuestionId, Question>,
@@ -96,7 +101,11 @@ impl Holding {
         let start = match params.agent_resources_from.as_ref() {
             None => 0,
             Some(from) => {
-                if std::mem::take(&mut self.resync_once) {
+                if let Some(changed) = self.changes_to.take() {
+                    self.resources = changed;
+                    self.snapshot_id += 1;
+                }
+                if from.snapshot_id.get() != self.snapshot_id {
                     return Err(ProtocolError::new(
                         ErrorCode::ResyncRequired,
                         "the snapshot this continues has ended",
@@ -138,7 +147,7 @@ impl Holding {
             oldest_retained_cursor: U64::new(0),
             taken_at_ms: kr_ipc::now_ms(),
             agent_resources: kr_protocol::projection::AgentResourceSnapshot {
-                snapshot_id: U64::new(7),
+                snapshot_id: U64::new(self.snapshot_id),
                 stream_generation: U64::new(1),
                 cursor: U64::new(1),
                 resources,
@@ -152,19 +161,16 @@ impl Holding {
     }
 
     /// Answers `agent.approval.inspect`, as a worker does: a resource of another instance, or one
-    /// it holds no record of, is refused as unknown.
+    /// it holds no record of, is refused as unknown. Every played approval is of one instance.
     fn record(&self, request: &Request) -> Result<ParamsValue, ProtocolError> {
         let params: AgentApprovalInspectParams = request
             .params
             .to_typed()
             .map_err(|error| ProtocolError::new(ErrorCode::InvalidArgument, error.to_string()))?;
-        let held_there = self.resources.iter().any(|resource| {
-            resource.resource_id == params.resource_id
-                && resource.application_instance_id == params.subject.application_instance_id
-        });
+        let of_the_instance = params.subject.application_instance_id == instance(0x41);
         match self.records.get(&params.resource_id) {
             Some(Err(error)) => Err(error.clone()),
-            Some(Ok(record)) if held_there => Ok(encoded(record)),
+            Some(Ok(record)) if of_the_instance => Ok(encoded(record)),
             _ => Err(ProtocolError::new(
                 ErrorCode::StaleSession,
                 "that application instance has no interpreted approval by that identity",
@@ -954,12 +960,12 @@ async fn kr_req_10_51_a_share_names_at_most_thirty_two_decisions() {
     let limit = kr_protocol::sharing::MAX_NAMED_RESOURCES;
     let longest = kr_protocol::question::MAX_QUESTION_BYTES;
     let (world, holding) = world(Holding::default(), holds_question_reads()).await;
-    let approvals: Vec<PendingResource> = (0..20_u8)
+    let approvals: Vec<PendingResource> = (0..33_u8)
         .map(|byte| approval(0x90 + byte, 1_000))
         .collect();
     {
         let mut held = holding.lock().expect("held");
-        for byte in 0..20_u8 {
+        for byte in 0..33_u8 {
             let asked = question(
                 world.session_id,
                 0xb0 + byte,
@@ -995,11 +1001,12 @@ async fn kr_req_10_51_a_share_names_at_most_thirty_two_decisions() {
             .collect::<Vec<_>>()
     };
 
-    // Thirty-three, in three mixes: refused before the worker is asked, and nothing written.
+    // Thirty-three questions, thirty-three approvals, and a mix: each refused before the worker is
+    // asked, and nothing written.
     let before = grants_written(&world);
     for (action, (named_questions, named_approvals)) in [
-        (questions(20), resources(13)),
-        (questions(13), resources(20)),
+        (questions(33), resources(0)),
+        (questions(0), resources(33)),
         (questions(17), resources(16)),
     ]
     .into_iter()
@@ -1025,7 +1032,11 @@ async fn kr_req_10_51_a_share_names_at_most_thirty_two_decisions() {
         holding.lock().expect("held").asked.is_empty(),
         "the worker is asked nothing"
     );
-    assert_eq!(grants_written(&world), before, "nothing is written");
+    assert_eq!(
+        grants_written(&world),
+        before,
+        "nothing is written: a grant and its invitation are one commit"
+    );
 
     // Thirty-two, sixteen of each, every text as long as it may be.
     let mutation = share(
@@ -1061,18 +1072,42 @@ async fn kr_req_10_51_a_share_names_at_most_thirty_two_decisions() {
     world.serving.abort();
 }
 
+/// The page each `events.snapshot` the daemon asked for continues after, in the order asked: `None`
+/// for a first page.
+fn pages_asked(holding: &Mutex<Holding>) -> Vec<Option<(u64, PendingResourceId)>> {
+    holding
+        .lock()
+        .expect("held")
+        .asked
+        .iter()
+        .filter(|request| request.method.method() == Some(Method::EventsSnapshot))
+        .map(|request| {
+            request
+                .params
+                .to_typed::<EventsSnapshotParams>()
+                .expect("snapshot parameters")
+                .agent_resources_from
+                .0
+                .map(|from| (from.snapshot_id.get(), from.after_resource_id))
+        })
+        .collect()
+}
+
 /// KR-REQ-10.51: the snapshot the named approvals are found in is read to its end, so an approval
-/// on a later page is found; a snapshot that ends part way through is read again from its first
-/// page, and nothing is decided from the part read before it ended.
+/// on its last page is found. A snapshot that ends part way through, because what the broker holds
+/// changed, is read again from its first page, as the snapshot it has become, and nothing is
+/// decided from the part read before it ended.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_10_51_a_named_approval_is_found_on_a_later_page_after_a_resynchronisation() {
-    let resources: Vec<PendingResource> =
-        (0..3_u8).map(|byte| approval(0xc0 + byte, 1_000)).collect();
-    let named = resources.last().cloned().expect("three");
+    let before: Vec<PendingResource> = (0..3_u8).map(|byte| approval(0xc0 + byte, 1_000)).collect();
+    let named = approval(0xc5, 1_000);
+    let mut after = before[1..].to_vec();
+    after.push(named.clone());
     let (world, holding) = world(
         Holding {
             page: 1,
-            resync_once: true,
+            snapshot_id: 7,
+            changes_to: Some(after.clone()),
             ..Holding::default()
         },
         holds_question_reads(),
@@ -1089,7 +1124,7 @@ async fn kr_req_10_51_a_named_approval_is_found_on_a_later_page_after_a_resynchr
                 relayed_request("d"),
             )),
         );
-        held.resources.clone_from(&resources);
+        held.resources.clone_from(&before);
     }
 
     let result = result_of(
@@ -1106,41 +1141,127 @@ async fn kr_req_10_51_a_named_approval_is_found_on_a_later_page_after_a_resynchr
     );
     assert_eq!(result.preview.named_approvals.len(), 1);
 
-    // The pages asked for: the first, a continuation the worker could no longer serve, then the
-    // first again and each continuation to the end.
-    let held = holding.lock().expect("held");
-    let pages: Vec<Option<PendingResourceId>> = held
-        .asked
-        .iter()
-        .filter(|request| request.method.method() == Some(Method::EventsSnapshot))
-        .map(|request| {
-            request
-                .params
-                .to_typed::<EventsSnapshotParams>()
-                .expect("snapshot parameters")
-                .agent_resources_from
-                .0
-                .map(|from| from.after_resource_id)
-        })
-        .collect();
+    // The first page of snapshot 7, a continuation of it the worker could no longer serve, then
+    // the first page of snapshot 8 and each continuation of it to its end.
     assert_eq!(
-        pages,
+        pages_asked(&holding),
         vec![
             None,
-            Some(resources[0].resource_id),
+            Some((7, before[0].resource_id)),
             None,
-            Some(resources[0].resource_id),
-            Some(resources[1].resource_id),
+            Some((8, after[0].resource_id)),
+            Some((8, after[1].resource_id)),
         ]
     );
-    drop(held);
+    world.serving.abort();
+}
+
+/// KR-REQ-10.51: an approval the part of a snapshot read before it ended held, and the snapshot it
+/// became does not, is not current here, even when the broker's ledger still answers for its
+/// record: a share naming it is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_10_51_an_approval_gone_from_the_snapshot_read_again_is_not_current() {
+    let gone = approval(0xc6, 1_000);
+    let before = vec![gone.clone(), approval(0xc7, 1_000)];
+    let after = vec![approval(0xc7, 1_000), approval(0xc8, 1_000)];
+    let (world, holding) = world(
+        Holding {
+            page: 1,
+            snapshot_id: 7,
+            changes_to: Some(after),
+            ..Holding::default()
+        },
+        holds_question_reads(),
+    )
+    .await;
+    {
+        let mut held = holding.lock().expect("held");
+        held.records.insert(
+            gone.resource_id,
+            Ok(record_of(
+                &gone,
+                PendingState::Pending,
+                "Still in the ledger",
+                relayed_request("e"),
+            )),
+        );
+        held.resources = before;
+    }
+    let refused = refusal_of(
+        shared(
+            &world,
+            &share(
+                world.environment_id,
+                world.session_id,
+                0x42,
+                naming(5_000, &[], &[gone.resource_id]),
+            ),
+        )
+        .await,
+    );
+    assert_eq!(refused.code, ErrorCode::InvalidArgument, "{refused:?}");
+    assert!(refused.message.contains("no current record"), "{refused:?}");
+    world.serving.abort();
+}
+
+/// KR-REQ-10.51: a snapshot is read to its last page even when every named approval was on its
+/// first, so the worker keeps no part of it for this daemon's link.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_10_51_a_snapshot_is_read_to_its_end_after_the_named_approval() {
+    let resources: Vec<PendingResource> =
+        (0..3_u8).map(|byte| approval(0xd8 + byte, 1_000)).collect();
+    let named = resources[0].clone();
+    let (world, holding) = world(
+        Holding {
+            page: 1,
+            snapshot_id: 7,
+            ..Holding::default()
+        },
+        holds_question_reads(),
+    )
+    .await;
+    {
+        let mut held = holding.lock().expect("held");
+        held.records.insert(
+            named.resource_id,
+            Ok(record_of(
+                &named,
+                PendingState::Pending,
+                "On the first page",
+                relayed_request("f"),
+            )),
+        );
+        held.resources.clone_from(&resources);
+    }
+    let result = result_of(
+        shared(
+            &world,
+            &share(
+                world.environment_id,
+                world.session_id,
+                0x43,
+                naming(5_000, &[], &[named.resource_id]),
+            ),
+        )
+        .await,
+    );
+    assert_eq!(result.preview.named_approvals.len(), 1);
+    assert_eq!(
+        pages_asked(&holding),
+        vec![
+            None,
+            Some((7, resources[0].resource_id)),
+            Some((7, resources[1].resource_id)),
+        ]
+    );
     world.serving.abort();
 }
 
 /// KR-REQ-10.51: a share whose session's worker cannot be asked is not decided. A worker whose
 /// link fails leaves the action unfinished, so the same request is told its outcome is not known
-/// rather than a refusal it might not deserve. A session with no worker this host knows is refused
-/// as unknown, and that is the action's answer.
+/// rather than a refusal it might not deserve, and so does a worker that answers with a transient
+/// refusal of its own, which the share is given as the worker gave it. A session with no worker
+/// this host knows is refused as unknown, and that is the action's answer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_10_51_a_share_whose_worker_cannot_be_asked_is_not_decided() {
     let named = approval(0xd1, 1_000);
@@ -1163,6 +1284,30 @@ async fn kr_req_10_51_a_share_whose_worker_cannot_be_asked_is_not_decided() {
     );
     let failed = refusal_of(shared(&world, &mutation).await);
     assert_eq!(failed.code, ErrorCode::ResourceUnavailable, "{failed:?}");
+    let again = refusal_of(shared(&world, &mutation).await);
+    assert_eq!(again.code, ErrorCode::OutcomeUnknown, "{again:?}");
+
+    // A worker that answers, and cannot read its own store: its refusal is the share's, and it
+    // says nothing about the action either.
+    {
+        let mut held = holding.lock().expect("held");
+        held.ends_on_inspect = false;
+        held.records.insert(
+            named.resource_id,
+            Err(ProtocolError::new(
+                ErrorCode::StorageUnavailable,
+                "the approval ledger could not be read",
+            )),
+        );
+    }
+    let mutation = share(
+        world.environment_id,
+        world.session_id,
+        0x53,
+        naming(5_000, &[], &[named.resource_id]),
+    );
+    let failed = refusal_of(shared(&world, &mutation).await);
+    assert_eq!(failed.code, ErrorCode::StorageUnavailable, "{failed:?}");
     let again = refusal_of(shared(&world, &mutation).await);
     assert_eq!(again.code, ErrorCode::OutcomeUnknown, "{again:?}");
 
@@ -1848,16 +1993,22 @@ async fn kr_req_10_51_a_device_reads_the_decisions_its_grant_names_while_they_ar
         questions_in(connection.read(&questions(1)).await),
         vec![named_question.question_id]
     );
-    let read = connection.read(&record(2, &named_approval)).await;
-    assert!(
-        matches!(
-            &read,
-            ControlFrame::Response(Response {
-                outcome: Outcome::Ok(_),
-                ..
-            })
-        ),
-        "the named approval's record is read: {read:?}"
+    let read = match connection.read(&record(2, &named_approval)).await {
+        ControlFrame::Response(Response {
+            outcome: Outcome::Ok(value),
+            ..
+        }) => value
+            .to_typed::<AgentApprovalInspectResult>()
+            .expect("an approval's record"),
+        other => panic!("the named approval's record is not read: {other:?}"),
+    };
+    assert_eq!(read.resource_id, named_approval.resource_id);
+    assert_eq!(read.state, PendingState::Pending);
+    assert_eq!(read.recorded_at, named_approval.recorded_at);
+    assert_eq!(
+        read.decoding.source_bytes.as_slice(),
+        relayed_request("named").as_slice(),
+        "the request as the channel relayed it"
     );
     let withheld = refused(connection.read(&record(3, &other_approval)).await);
     assert_eq!(withheld.code, ErrorCode::StaleSession, "{withheld:?}");
