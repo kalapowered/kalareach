@@ -131,10 +131,10 @@ jobs:
           cargo doc --locked --no-deps \
             -p companion-platform -p companion-tauri -p kr-attention -p kr-automation \
             -p kr-backup-integration -p kr-cbor -p kr-changeset -p kr-client -p kr-conformance \
-            -p kr-e2e-agents -p kr-flush -p kr-hook -p kr-ipc -p kr-pairing -p kr-plugin-host \
-            -p kr-plugin-runtime -p kr-plugin-sdk -p kr-plugin-service -p kr-privacy-integration \
-            -p kr-protocol -p kr-shell-integration -p kr-sync-integration -p kr-transport \
-            -p kr-worker
+            -p kr-crypto -p kr-e2e-agents -p kr-flush -p kr-hook -p kr-ipc -p kr-pairing \
+            -p kr-plugin-host -p kr-plugin-runtime -p kr-plugin-sdk -p kr-plugin-service \
+            -p kr-privacy-integration -p kr-protocol -p kr-shell-integration \
+            -p kr-sync-integration -p kr-transport -p kr-worker
           cargo doc --locked --no-deps -p kr-client --no-default-features
 
       # The project service encloses every Git invocation in a boundary the kernel applies, and what

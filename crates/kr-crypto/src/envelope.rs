@@ -182,7 +182,7 @@ pub(crate) fn unpadded_len(opened: &[u8]) -> Result<usize> {
 /// Pads a notification preview's canonical plaintext to its declared size bucket, ISO/IEC 7816-4.
 ///
 /// Section 20 rounds notifications to 1 KiB buckets up to 16 KiB. It is the padding every
-/// envelope gets, [`pad_to_bucket`], behind the one bound only a notification preview has.
+/// envelope gets, `pad_to_bucket`, behind the one bound only a notification preview has.
 ///
 /// # Errors
 ///
