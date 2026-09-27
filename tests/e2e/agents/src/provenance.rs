@@ -159,6 +159,13 @@ struct Seen {
     identified: BTreeMap<ProcessStartIdentity, String>,
 }
 
+/// The processes a look has published, and whether the part has been halted.
+#[derive(Debug, Default)]
+struct Published {
+    processes: Vec<ProcessStartIdentity>,
+    halted: bool,
+}
+
 /// What a stage's sessions ran, checked as they ran it.
 pub struct Provenance {
     marks: Vec<PathBuf>,
@@ -170,10 +177,11 @@ pub struct Provenance {
     seen_path: Mutex<Option<String>>,
     seen: Mutex<Seen>,
     roots: Mutex<Vec<ProcessStartIdentity>>,
-    /// Every process a look found beneath the sessions, published as soon as the look has walked
-    /// the sessions and before it reads their images, under a lock of its own that is held only to
-    /// read or extend it: what a stop reads without waiting on a look.
-    published: Mutex<Vec<ProcessStartIdentity>>,
+    /// Every process a look found beneath the sessions, published the moment the look takes it as
+    /// theirs, under a lock of its own that is held only to read or extend it: what a stop reads
+    /// without waiting on a look. Once the part is halted ([`Provenance::halt`]), a process
+    /// published after that is killed as it is published.
+    published: Mutex<Published>,
     stopped: AtomicBool,
 }
 
@@ -214,7 +222,7 @@ impl Provenance {
             seen_path: Mutex::new(None),
             seen: Mutex::new(Seen::default()),
             roots: Mutex::new(Vec::new()),
-            published: Mutex::new(Vec::new()),
+            published: Mutex::new(Published::default()),
             stopped: AtomicBool::new(false),
         }
     }
@@ -497,14 +505,32 @@ impl Provenance {
             .collect()
     }
 
-    /// Every process a look has found beneath the sessions so far, as soon as it walked them, read
-    /// without waiting on a look that is reading images.
+    /// Halts the part, as a stop does, and returns every process a look has published so far,
+    /// read without waiting on a look: from here on a look kills each process it would publish,
+    /// so every process it takes is either in what this returns or killed by the look.
     #[must_use]
-    pub fn published(&self) -> Vec<ProcessStartIdentity> {
-        self.published
+    pub fn halt(&self) -> Vec<ProcessStartIdentity> {
+        let mut published = self
+            .published
             .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
+            .unwrap_or_else(PoisonError::into_inner);
+        published.halted = true;
+        published.processes.clone()
+    }
+
+    /// Publishes a process a look has taken as the sessions', or kills it where the part has been
+    /// halted.
+    fn publish(&self, identity: &ProcessStartIdentity) {
+        let mut published = self
+            .published
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if published.halted {
+            kr_e2e_m1b::run::signal(identity, rustix::process::Signal::KILL);
+        }
+        if !published.processes.contains(identity) {
+            published.processes.push(identity.clone());
+        }
     }
 
     /// The sessions' root shells the looks walk from.
@@ -682,20 +708,10 @@ impl Provenance {
                     seen.identified
                         .entry(identity.clone())
                         .or_insert_with(|| entry.command.clone());
+                    // Published at once, before anything else is looked at.
+                    self.publish(&identity);
                     found.push((identity.clone(), entry.command.clone()));
                     under.push(identity);
-                }
-            }
-        }
-        // What the walk found goes out before the images are read, which can take a while.
-        {
-            let mut published = self
-                .published
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            for (identity, _) in &found {
-                if !published.contains(identity) {
-                    published.push(identity.clone());
                 }
             }
         }
