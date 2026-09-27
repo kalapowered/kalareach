@@ -43,7 +43,7 @@
 //! and before reconciling that service, starting delivery or serving any request, so work an
 //! earlier process left behind is fenced before anything can resume it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
@@ -769,9 +769,12 @@ impl EnvironmentPrivacy {
     }
 
     /// Brings what this record knows of the sessions' workers into line with the daemon's: each
-    /// session in `live` has a worker running, and each tracked session that `recorded` no longer
-    /// lists has ended. A session in neither keeps what was known of it, because a worker this
-    /// daemon has not reached yet is not one that has ended.
+    /// session in `live` has a worker running, and each session this record follows or holds an
+    /// obligation for that neither `live` nor `recorded` lists has ended, because no worker is
+    /// recorded for it that could answer. That covers a session that closed before privacy mode was
+    /// turned on and whose output is still on the disk, and every obligation a restart read back
+    /// before any worker was seen. A session `recorded` lists and `live` does not keeps what was
+    /// known of it, because a worker this daemon has not reached yet is not one that has ended.
     ///
     /// # Errors
     ///
@@ -783,13 +786,16 @@ impl EnvironmentPrivacy {
         recorded: &[SessionId],
         now_ms: TimestampMs,
     ) -> Result<()> {
-        let ended: Vec<SessionId> = self
-            .inner()
-            .sessions
-            .keys()
-            .filter(|session_id| !recorded.contains(session_id) && !live.contains(session_id))
-            .copied()
-            .collect();
+        let ended: BTreeSet<SessionId> = {
+            let inner = self.inner();
+            inner
+                .sessions
+                .keys()
+                .chain(inner.obligations.keys())
+                .filter(|session_id| !recorded.contains(session_id) && !live.contains(session_id))
+                .copied()
+                .collect()
+        };
         for session_id in ended {
             self.note_session_ended(session_id);
         }
@@ -1251,7 +1257,9 @@ impl EnvironmentPrivacy {
                 )),
             }
         }
-        if !inner.mode.is_enabled() {
+        // An environment that never turned privacy mode on owes its workers nothing: none is told
+        // anything at the initial generation, so none has an answer to wait for.
+        if !inner.mode.is_enabled() && inner.mode.generation() > PrivacyGeneration::INITIAL {
             // Turning privacy mode off finishes once every live session holds the new generation
             // with nothing of its own still owed; until then its worker's own account is carried.
             let generation = inner.mode.generation();
@@ -3396,5 +3404,62 @@ mod tests {
                 "it was decided after the backup service stopped at the boundary"
             );
         });
+    }
+
+    /// A session that closed before privacy mode was turned on, whose output is still on the
+    /// disk, owes its cleanup like every other; but no worker is recorded for it that could
+    /// answer, so once the daemon has looked at its workers the session is taken as ended: its
+    /// obligation stays, reported with the archive named as what holds its output, and it does not
+    /// hold turning privacy mode off back. The same holds after a restart, which reads the
+    /// obligation back before any worker has been seen.
+    #[test]
+    fn a_session_with_no_worker_recorded_is_ended_and_does_not_hold_disabling_back() {
+        let host = Host::open();
+        host.privacy
+            .enable(&[session(9)], at(0), &standing)
+            .expect("privacy mode is enabled");
+        let host = host.restarted();
+        host.privacy.resume(at(10));
+        host.privacy
+            .sessions_seen(&[], &[], at(20))
+            .expect("the workers are seen");
+        let report = host.privacy.report_now(at(30));
+        assert_eq!(report.obligations.len(), 1);
+        assert_eq!(report.obligations[0].standing, Standing::WorkerEnded);
+        let reasons = unavailable(&report, "sessions");
+        assert!(
+            reasons.iter().any(|reason| reason.contains("archive")),
+            "{reasons:?}"
+        );
+        let report = host
+            .privacy
+            .disable(at(40), &standing)
+            .expect("an ended session does not hold privacy mode on");
+        assert!(!report.enabled);
+        assert_eq!(
+            report.obligations.len(),
+            1,
+            "its obligation stays until something shows its output is gone"
+        );
+    }
+
+    /// An environment that never turned privacy mode on owes its workers nothing: none is told
+    /// anything at the initial generation, so the report is complete with workers running, and
+    /// asking to turn it off answers that it is off and complete.
+    #[test]
+    fn an_environment_that_never_turned_privacy_mode_on_owes_its_workers_nothing() {
+        let host = Host::open();
+        host.privacy
+            .sessions_seen(&[session(1), session(2)], &[session(1), session(2)], at(0))
+            .expect("the workers are seen");
+        assert!(host.privacy.notices_due(at(10)).is_empty());
+        let report = host.privacy.report_now(at(20));
+        assert!(report.completion.is_complete(), "{:?}", report.completion);
+        let report = host
+            .privacy
+            .disable(at(30), &standing)
+            .expect("privacy mode is already off");
+        assert!(!report.enabled);
+        assert!(report.completion.is_complete(), "{:?}", report.completion);
     }
 }
