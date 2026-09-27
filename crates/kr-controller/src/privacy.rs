@@ -1722,6 +1722,7 @@ mod tests {
         }
 
         /// Opens the privacy record again over the same subsystems, as a daemon's next start does.
+        #[cfg(unix)]
         fn reopen_privacy(&mut self) {
             self.privacy = EnvironmentPrivacy::open(
                 self.root.path(),

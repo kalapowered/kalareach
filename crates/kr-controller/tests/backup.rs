@@ -3410,7 +3410,7 @@ fn a_removal_whose_directory_cannot_be_flushed_keeps_its_obligation_until_it_can
     std::fs::create_dir_all(&state).expect("the state directory");
     let producer = Producer::generate();
     let objects = [stage(1, "a.cbor", b"one")];
-    let mut service = BackupService::open(&state).expect("a backup service");
+    let service = BackupService::open(&state).expect("a backup service");
     service
         .reconcile(TimestampMs::new(4_000))
         .expect("the startup reconciliation a service opens unready without");
