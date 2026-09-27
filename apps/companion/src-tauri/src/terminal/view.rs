@@ -439,17 +439,11 @@ impl View {
                     self.window.installed(screen);
                     self.held = self.window.holds(screen.window_revision);
                 }
-                if !self.held {
-                    self.show();
-                }
-                self.follow_the_keyboard();
+                self.screen_changed();
                 None
             }
             Applied::Updated(_) => {
-                if !self.held {
-                    self.show();
-                }
-                self.follow_the_keyboard();
+                self.screen_changed();
                 None
             }
             Applied::Refused(_) => self.recover().await,
@@ -787,6 +781,18 @@ impl View {
             return None;
         }
         self.write_input(take, bytes, taken).await
+    }
+
+    /// Tells the page of the screen the view now holds, unless it waits for its report's answer.
+    /// Control that screen ends goes first, so the page is never told of such a screen with the view
+    /// in control: the screen and the end go in one state, or the end alone while the screen waits.
+    fn screen_changed(&mut self) {
+        let ended = !self.keyboard_supplied() && self.lease.unsupported();
+        if !self.held {
+            self.show();
+        } else if ended {
+            self.control_changed();
+        }
     }
 
     /// Ends control at once when the screen the view holds says the program reads keys in a form

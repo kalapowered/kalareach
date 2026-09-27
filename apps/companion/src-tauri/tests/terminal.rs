@@ -3216,6 +3216,45 @@ async fn a_program_asking_for_what_the_view_cannot_send_ends_control_at_once() {
     .await;
 }
 
+/// KR-REQ-08.61: a screen saying the program reads keys in a form the view does not produce is never
+/// published with the view in control: control ends before the page is told of the screen, which
+/// comes with the words, in one state.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unsupported_screen_is_never_published_with_the_view_in_control() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page_view = Page::new(worker.paths());
+    let mut lease = WorkerLease::default();
+    let (_view, mut link) =
+        controlling_keys(&page_view, &mut worker, 3, Keys::kitty(1), &mut lease).await;
+    let at = reporting(Mouse::Sgr).keys(Keys::kitty(1));
+    let seen = page_view.states(3).len();
+    lease.negotiate(Negotiated::Kitty(5));
+    applied(
+        &page_view,
+        &mut link,
+        3,
+        &keys_delta(&at, 40, 41, Keys::kitty(5)),
+    )
+    .await;
+    page_view
+        .newest(3, |state| control(state) == (1, "watching".to_owned()))
+        .await;
+    let after = page_view.states(3).split_off(seen);
+    assert!(
+        after
+            .iter()
+            .all(|state| state["control"]["state"] != "controlling"),
+        "{after:#?}"
+    );
+    assert_eq!(
+        after.first().map(|state| state["control"]["ended"].clone()),
+        Some(json!(
+            "Control ended: the program now reads keys in a form this view cannot send."
+        )),
+        "the screen and the end of control go in one state"
+    );
+}
+
 /// KR-REQ-08.61: a take the session grants just before the program changes to a form the view does
 /// not produce, whose answer reaches the view after the screen that says so, ends as the answer
 /// arrives: the page is never told the view controls the program, the granted epoch goes back once,
