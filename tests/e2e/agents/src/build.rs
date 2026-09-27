@@ -102,8 +102,10 @@ pub struct Account {
     pub stored: String,
     /// Whose home the agent runs with.
     pub home: AccountHome,
-    /// Whether the run's home searches the person's login keychain, borrowed: the run never
-    /// creates or deletes a keychain for it.
+    /// Whether the login is an item of the person's login keychain: a run's home searches that
+    /// keychain, borrowed, and the run never creates or deletes a keychain for it; and the agent's
+    /// sessions run in the person's desktop, as a person's own do, since a headless session reads
+    /// the keychain as one it may not ask to unlock.
     #[serde(default)]
     pub login_keychain: bool,
     /// The variable the login is, where it is one: the harness hands its value over on a pipe.
