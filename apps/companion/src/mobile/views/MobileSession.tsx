@@ -433,15 +433,18 @@ export function MobileSession({
     [draft, lifecycle, port, say, sessionId]
   )
 
-  // Focus that was on a terminal key or in the program's keyboard when control ends goes to the mode
-  // button, which takes control again, or once the view has ended to Attach again: a key that can no
-  // longer be pressed, or a field that has gone, is no place to leave it. While a software keyboard
-  // is up the bar holding the mode button is hidden, and the focus goes there once it is back.
+  // Focus that a terminal key, the program's keyboard or the mode button held when control or the
+  // view ends goes to the mode button, which takes control again, or once the view has ended to
+  // Attach again: a key that can no longer be pressed, a field that has gone, or a disabled button,
+  // is no place to leave it. While a software keyboard is up the bar holding the mode button is
+  // hidden, and the focus goes there once it is back.
   const terminalEnded = terminal?.state === 'ended'
   const focusedInComposer = useFocusWhenControlEnds({
-    controlling,
+    state: terminalEnded ? 'ended' : (control?.state ?? 'none'),
     heldFor: (element) =>
-      element?.closest('.m-accessory') != null || element?.matches('[data-program-keyboard]') === true,
+      element?.closest('.m-accessory') != null ||
+      element?.matches('[data-program-keyboard]') === true ||
+      element?.id === modeButtonId,
     destination: () => document.getElementById(terminalEnded ? attachAgainId : modeButtonId)
   })
 

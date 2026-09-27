@@ -334,12 +334,12 @@ export function RawTerminal({
   const sentenceId = useId()
   const attachAgainId = useId()
 
-  // Focus that was in the program's keyboard when control ends goes to the mode button, which takes
-  // control again, or once the view has ended to Attach again: a field that has gone is no place to
-  // leave it.
-  const focusedInSurface = useFocusWhenControlEnds({
-    controlling,
-    heldFor: (element) => element?.matches('[data-program-keyboard]') === true,
+  // Focus that the program's keyboard or the mode button held when control or the view ends goes to
+  // the mode button, which takes control again, or once the view has ended to Attach again: a field
+  // that has gone, or a button that is disabled, is no place to leave it.
+  const focusedInView = useFocusWhenControlEnds({
+    state: ended ? 'ended' : (control?.state ?? 'none'),
+    heldFor: (element) => element?.matches('[data-program-keyboard]') === true || element?.id === modeButtonId,
     destination: () => document.getElementById(ended ? attachAgainId : modeButtonId)
   })
 
@@ -553,7 +553,7 @@ export function RawTerminal({
   }
 
   return (
-    <section className="raw-terminal" data-testid="raw-terminal" data-mode={mode}>
+    <section className="raw-terminal" data-testid="raw-terminal" data-mode={mode} onFocus={focusedInView}>
       <header className="terminal-heading">
         <span className="row">
           <Badge tone={control?.state === 'controlling' ? 'accent' : 'neutral'} data-testid="terminal-mode">
@@ -658,7 +658,6 @@ export function RawTerminal({
           onLostPointerCapture={(event) => {
             if (event.pointerId === dragging.current?.pointer) dropDrag()
           }}
-          onFocus={focusedInSurface}
           onClick={() => {
             // A click that selects nothing is the person turning to the program; one that selects
             // text leaves the focus where the selection can be copied from.

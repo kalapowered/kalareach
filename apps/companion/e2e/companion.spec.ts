@@ -993,6 +993,35 @@ test.describe("the program's keyboard", () => {
     await expect(page.getByRole('button', { name: 'Take control' })).toBeFocused()
   })
 
+  test("the phone's focus stays where the person put it while a software keyboard was up, when control ended under it", async ({
+    page
+  }) => {
+    await page.setViewportSize({ width: 390, height: 844 })
+    await page.goto(`/harness.html?surface=ios&session=${SESSION}`)
+    await page.getByRole('tab', { name: 'Terminal' }).click()
+    await expect(page.getByTestId('mobile-terminal-line').first()).toContainText('$ cargo')
+    await takeControl(page)
+    await page.getByLabel('Type to the program').focus()
+    const cover = (inset: number) =>
+      page.evaluate((covered) => {
+        document.documentElement.style.setProperty('--keyboard', `${covered}px`)
+      }, inset)
+    await cover(336)
+    await expect(page.locator('.m-terminal-hud')).toBeHidden()
+    await page.evaluate(() => {
+      window.krTestHost?.terminalViews.at(-1)?.loseControl()
+    })
+    await expect(page.getByLabel('Type to the program')).toHaveCount(0)
+    // The person puts the focus on the draft and takes it away again before the bar returns.
+    await page.getByLabel('Message this session').evaluate((field) => {
+      ;(field as HTMLTextAreaElement).focus()
+      ;(field as HTMLTextAreaElement).blur()
+    })
+    await cover(0)
+    await expect(page.getByRole('button', { name: 'Take control' })).toBeVisible()
+    await expect(page.getByRole('button', { name: 'Take control' })).not.toBeFocused()
+  })
+
   test("the phone's draft field moves on with Control-Tab and back with Control-Shift-Tab while the view watches", async ({
     page
   }) => {

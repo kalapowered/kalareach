@@ -1084,6 +1084,77 @@ describe("the phone's raw terminal view (KR-REQ-08.02, 13.18)", () => {
     }
   })
 
+  it('moves the focus from the mode button to Attach again when the view ends', async () => {
+    const { port, controls } = fakeHost()
+    const person = await onTerminal(port)
+    await waitFor(() => {
+      expect(screen.getAllByTestId('mobile-terminal-line').length).toBeGreaterThan(0)
+    })
+    await takeControl(person, controls)
+    screen.getByRole('button', { name: 'Look around' }).focus()
+    act(() => {
+      controls.terminalViews[0]?.end('The session ended.')
+    })
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Attach again' })).toHaveFocus()
+    })
+  })
+
+  it('pays the focus owed once the mode button can take it, unless the person put it on another control first', async () => {
+    // The bar that holds the mode button is hidden while a software keyboard is up: here, while
+    // `hidden` holds, nothing in the bar is shown.
+    let hidden = true
+    Object.defineProperty(HTMLElement.prototype, 'checkVisibility', {
+      configurable: true,
+      value(this: HTMLElement) {
+        return !(hidden && this.closest('.m-terminal-hud') !== null)
+      }
+    })
+    try {
+      for (const elsewhere of [false, true]) {
+        hidden = true
+        const { port, controls } = fakeHost()
+        const person = await onTerminal(port)
+        await waitFor(() => {
+          expect(screen.getAllByTestId('mobile-terminal-line').length).toBeGreaterThan(0)
+        })
+        await takeControl(person, controls)
+        programKeyboard()?.focus()
+        act(() => {
+          controls.terminalViews[0]?.loseControl()
+        })
+        await waitFor(() => {
+          expect(programKeyboard()).toBeNull()
+        })
+        expect(screen.getByRole('button', { name: 'Take control' }), String(elsewhere)).not.toHaveFocus()
+        if (elsewhere) {
+          // Put on another control and let go again, with no commit between.
+          const draft = screen.getByLabelText('Message this session')
+          draft.focus()
+          draft.blur()
+        }
+        hidden = false
+        // A new screen commits with no change of the focus, and finds the mode button shown.
+        act(() => {
+          controls.terminalViews[0]?.show()
+        })
+        await act(async () => {
+          await new Promise((resolve) => {
+            setTimeout(resolve, 0)
+          })
+        })
+        if (elsewhere) {
+          expect(screen.getByRole('button', { name: 'Take control' }), 'settled').not.toHaveFocus()
+        } else {
+          expect(screen.getByRole('button', { name: 'Take control' }), 'paid').toHaveFocus()
+        }
+        cleanup()
+      }
+    } finally {
+      Reflect.deleteProperty(HTMLElement.prototype, 'checkVisibility')
+    }
+  })
+
   it('owes no focus to a view the person left: coming back to the terminal leaves the focus where it is', async () => {
     const { port, controls } = fakeHost()
     const person = await onTerminal(port)

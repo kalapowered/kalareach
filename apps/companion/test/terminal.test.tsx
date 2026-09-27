@@ -1338,6 +1338,37 @@ describe("the desktop's keys reach the program while the view controls it (KR-RE
     }
   })
 
+  it('moves the focus from the mode button to Attach again when the view ends, while taking control too', async () => {
+    for (const taking of [false, true]) {
+      const person = userEvent.setup()
+      const restore = laidOut()
+      try {
+        const { port, controls } = fakeHost()
+        if (taking) controls.holdTerminalControl()
+        const { unmount } = open(port)
+        await screen.findByTestId('palette-provenance')
+        if (taking) {
+          await person.click(screen.getByRole('button', { name: 'Take control' }))
+          expect(modeBadge()).toBe('Taking control…')
+        } else {
+          await takeControl(person, controls)
+        }
+        const mode = screen.getByRole('button', { name: 'Look around' })
+        mode.focus()
+        act(() => {
+          controls.terminalViews[0]?.end('The session ended.')
+        })
+        await waitFor(() => {
+          expect(screen.getByRole('button', { name: 'Attach again' }), String(taking)).toHaveFocus()
+        })
+        expect(screen.getByRole('button', { name: 'Take control' })).toBeDisabled()
+        unmount()
+      } finally {
+        restore()
+      }
+    }
+  })
+
   it('moves the focus to the mode button when control ends with the focus in the program keyboard', async () => {
     const person = userEvent.setup()
     const restore = laidOut()
