@@ -35,8 +35,9 @@ use kr_protocol::method::Method;
 use kr_protocol::scalars::Nullable;
 
 use crate::cli::{
-    PluginArguments, PluginCommand, PluginInstallArguments, PluginListArguments,
-    PluginPinArguments, PluginRepoArguments, PluginRepoCommand, PluginRepoPinArguments,
+    PluginArguments, PluginCommand, PluginInstallArguments, PluginIntegrationCommand,
+    PluginListArguments, PluginPinArguments, PluginRepoArguments, PluginRepoCommand,
+    PluginRepoPinArguments,
 };
 use crate::daemon::{Daemon, identifier};
 use crate::error::{CliError, Result};
@@ -56,8 +57,78 @@ pub async fn run(paths: &HostPaths, command: PluginCommand, json: bool) -> Resul
         PluginCommand::Pin(arguments) => pin(paths, &arguments, json).await,
         PluginCommand::Enable(arguments) => enable(paths, &arguments, true, json).await,
         PluginCommand::Disable(arguments) => enable(paths, &arguments, false, json).await,
+        PluginCommand::Integration(command) => integration(paths, &command, json).await,
         PluginCommand::Repo(command) => repo(paths, command, json).await,
     }
+}
+
+/// `kr plugin integration enable` and `disable`.
+///
+/// One validated edit of the host's own `command_integrations` list in this environment's
+/// configuration, written the way every preference is, and then the daemon's diagnostics, which is
+/// what puts the document in force and says what a new session now applies and from which rung: a
+/// profile's list, where one is selected, decides over the host's.
+async fn integration(
+    paths: &HostPaths,
+    command: &PluginIntegrationCommand,
+    json: bool,
+) -> Result<()> {
+    use kr_protocol::hostinfo::HostDoctorResult;
+    use kr_protocol::hostinfo::configuration::{COMMAND_INTEGRATIONS, Change, ValueSource};
+
+    let (arguments, enabled) = match command {
+        PluginIntegrationCommand::Enable(arguments) => (arguments, true),
+        PluginIntegrationCommand::Disable(arguments) => (arguments, false),
+    };
+    let plugin = plugin_identifier(&arguments.plugin)?;
+    let environment = crate::resolve::select(paths, arguments.selector.environment.as_deref())?;
+    let revision = crate::doctor::configuration::apply(
+        &environment.paths,
+        &Change::CommandIntegration {
+            plugin_id: plugin.as_str().to_owned(),
+            enabled,
+        },
+    )?;
+    let mut daemon = Daemon::open(paths, &arguments.selector).await?;
+    let diagnosed: HostDoctorResult = daemon.read(Method::HostDoctor, &()).await?;
+    let in_force = diagnosed
+        .configuration
+        .values
+        .iter()
+        .find(|value| value.key == COMMAND_INTEGRATIONS.key);
+    if json {
+        report::print_json(&serde_json::json!({
+            "ok": true,
+            "environment_id": daemon.environment_id().to_string(),
+            "plugin_id": plugin.as_str(),
+            "enabled": enabled,
+            "revision": revision.to_string(),
+            "in_force": in_force.map(|value| serde_json::json!({
+                "value": value.value(),
+                "source": value.source.as_str(),
+                "origin": value.origin.as_ref().cloned(),
+            })),
+        }));
+        return Ok(());
+    }
+    println!(
+        "{plugin}'s command integration is {} in this host's list, for sessions created from now \
+         on (configuration revision {revision})",
+        if enabled { "on" } else { "off" }
+    );
+    if let Some(value) = in_force {
+        println!(
+            "a new session applies the command integrations of: {}",
+            value.value()
+        );
+        if value.source == ValueSource::Profile {
+            println!(
+                "the selected profile's list decides that, over this host's own list; change the \
+                 profile in the configuration document to change it"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Runs one `kr plugin repo` command.

@@ -514,9 +514,26 @@ pub enum PluginCommand {
     Enable(PluginArguments),
     /// Disable an installed plugin without removing it.
     Disable(PluginArguments),
+    /// Turn an installed plugin's command integration on or off for new sessions.
+    #[command(subcommand)]
+    Integration(PluginIntegrationCommand),
     /// Manage the repositories plugins come from and the trust placed in them.
     #[command(subcommand)]
     Repo(PluginRepoCommand),
+}
+
+/// One `kr plugin integration` operation.
+///
+/// Which integrations a session applies is the environment's configuration, fixed when the session
+/// is created: the owner confirmed what an integration may add when the release was installed, and
+/// these turn it on or off for the sessions created from then on.
+#[derive(Subcommand)]
+pub enum PluginIntegrationCommand {
+    /// Turn it on: the package's command, typed at a managed prompt of a new session, starts with
+    /// the flags and variables the package declares.
+    Enable(PluginArguments),
+    /// Turn it off: in a new session the package's command runs exactly as typed.
+    Disable(PluginArguments),
 }
 
 /// `kr plugin list`.
@@ -548,7 +565,7 @@ pub struct PluginInstallArguments {
     pub selector: EnvironmentSelector,
 }
 
-/// `kr plugin remove`, `kr plugin enable` and `kr plugin disable`.
+/// `kr plugin remove`, `kr plugin enable`, `kr plugin disable` and `kr plugin integration`.
 #[derive(Args)]
 pub struct PluginArguments {
     /// The installed package.
