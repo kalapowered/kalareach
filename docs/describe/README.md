@@ -168,12 +168,14 @@ figure would hide the difference.
 The context revision advances on meaningful changes only: the working directory, the foreground
 application, the selected thread, the task intent and completion. Not tokens, not spinners, not
 keystrokes. Changes inside the debounce window collapse into one revision, and the window starts at
-the *first* pending change, so a long active turn still gets useful text every couple of seconds
-instead of waiting for a quiet moment that never arrives.
+the *first* pending change, so a long active turn still reaches a new revision every couple of
+seconds instead of waiting for a quiet moment that never arrives.
 
-A change that arrives while the session's job is running waits. It becomes the next revision once
-the job has ended, so the job's result is judged at the revision it was built from, and a session in
-a busy turn is still described rather than refused every time.
+A change that settles while the session's job is running moves the revision on, so that job's
+result, which describes the session as it was, is refused as a changed context. The job is cancelled
+at once rather than left to finish, and the new revision is described once the session's cooldown
+has passed. A change still inside its debounce when the answer arrives refuses nothing: the answer
+is judged at the revision in force, and the change settles after it.
 
 The input is bounded directory and repository metadata plus recent authorised semantic events.
 Raw keystrokes, hidden input, environment values, file bodies and whole histories are excluded, and
@@ -282,9 +284,9 @@ The model stays loaded while there is work and sessions to justify it, and a hos
 at all unloads after fifteen minutes.
 
 A load is cancelled when its reason goes: descriptions turned off, a pause, or no work left for it.
-A job is cancelled when privacy mode fences its session, when its session closes, when a pause
-arrives, or when a caller cancels it, and a job stopped for a pause keeps its place in the queue. A
-cancellation and a passed deadline publish nothing.
+A job is cancelled when privacy mode fences its session, when its session closes, when a change to
+the session settles, when a pause arrives, or when a caller cancels it, and a job stopped for a
+pause keeps its place in the queue. A cancellation and a passed deadline publish nothing.
 
 A process that exits, breaks the wire or is ended for breaking a bound takes the model with it and
 nothing else. The store, the pins, the provenance, every session and every deterministic title

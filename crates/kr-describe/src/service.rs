@@ -438,6 +438,8 @@ enum Stop {
     Closed,
     /// Inference paused, or was turned off.
     Paused,
+    /// The session's revision moved on, so the result would describe what it was.
+    Superseded,
 }
 
 impl Stop {
@@ -521,8 +523,6 @@ pub struct DescriptionService {
     counts: JobCounts,
     /// Sessions whose job failed once and is queued again: a second failure is not retried.
     retried: BTreeSet<SessionId>,
-    /// Sessions whose changes waited under their running job, with the priority last given.
-    waited: BTreeMap<SessionId, Priority>,
 }
 
 impl std::fmt::Debug for DescriptionService {
@@ -596,7 +596,6 @@ impl DescriptionService {
             restart: Restart::default(),
             counts: JobCounts::default(),
             retried: BTreeSet::new(),
-            waited: BTreeMap::new(),
         }
     }
 
@@ -857,7 +856,6 @@ impl DescriptionService {
         self.events.remove(session_id);
         self.generations.remove(session_id);
         self.live_sessions.remove(session_id);
-        self.waited.remove(session_id);
         // The fence and the debt go only when the cleanup they describe has actually finished.
         // A closed session whose generated row this host could not remove still has one, and
         // lowering its fence would let a later read show it; clearing its debt would let
@@ -914,11 +912,8 @@ impl DescriptionService {
 
     /// Advances a session's revision when its debounce has elapsed, and queues a job when it does.
     ///
-    /// A session whose job is in the process does not advance: its changes wait, pending, until the
-    /// job has ended, and then become one revision at once, with the priority given here. Advancing
-    /// under a running job would refuse its result as a changed context, and a session that never
-    /// stops changing would never be described: section 22 coalesces events *so a long active turn
-    /// can receive useful text without invalidating every job*.
+    /// A revision that advances while the session's job is in the process refuses that job's
+    /// result, which describes the session as it was; the next job describes it as it is now.
     pub fn settle(
         &mut self,
         session_id: &SessionId,
@@ -928,33 +923,8 @@ impl DescriptionService {
         if self.fence.is_fenced(session_id) {
             return None;
         }
-        if self
-            .job
-            .as_ref()
-            .is_some_and(|dispatched| dispatched.job.session_id == *session_id)
-        {
-            self.waited.insert(*session_id, priority);
-            return None;
-        }
-        self.settle_with(session_id, priority, now, false)
-    }
-
-    /// Settles a session's pending changes into a queued job: once the debounce has elapsed, or at
-    /// once.
-    fn settle_with(
-        &mut self,
-        session_id: &SessionId,
-        priority: Priority,
-        now: Reading,
-        at_once: bool,
-    ) -> Option<Enqueued> {
         let tracker = self.trackers.get_mut(session_id)?;
-        let settled = if at_once {
-            tracker.settle_pending()
-        } else {
-            tracker.settle(now)
-        };
-        let Settled::Advanced { revision, .. } = settled else {
+        let Settled::Advanced { revision, .. } = tracker.settle(now) else {
             return None;
         };
         let facts = tracker.facts();
@@ -1170,10 +1140,7 @@ impl DescriptionService {
                 .job
                 .take()
                 .unwrap_or_else(|| unreachable!("the job was just found"));
-            let (session_id, priority) = (dispatched.job.session_id, dispatched.job.priority);
-            let outcome = self.finish_job(dispatched, answer, now)?;
-            self.settle_after_job(&session_id, priority, now);
-            return Ok(outcome);
+            return self.finish_job(dispatched, answer, now);
         }
         self.counts.dropped_answers = self.counts.dropped_answers.saturating_add(1);
         Ok(Outcome::Dropped { id })
@@ -1191,9 +1158,7 @@ impl DescriptionService {
     pub fn process_ended(&mut self, why: ProcessEnd, now: Reading) -> Result<Vec<Outcome>> {
         let mut outcomes = Vec::new();
         if let Some(dispatched) = self.job.take() {
-            let (session_id, priority) = (dispatched.job.session_id, dispatched.job.priority);
             outcomes.push(self.job_ended_with_process(dispatched, why));
-            self.settle_after_job(&session_id, priority, now);
         }
         if let Model::Loading { cancel_sent, .. } = &self.model {
             let load_why = match why {
@@ -1222,22 +1187,6 @@ impl DescriptionService {
         Ok(outcomes)
     }
 
-    /// Settles what changed while a session's job was in the process, now that the job has ended.
-    ///
-    /// Those changes waited for the job and have had their coalescing, so they become one revision
-    /// at once, queued with the priority the host last gave or, when it gave none while the job
-    /// ran, the job's own.
-    fn settle_after_job(&mut self, session_id: &SessionId, priority: Priority, now: Reading) {
-        let priority = self.waited.remove(session_id).unwrap_or(priority);
-        if self
-            .trackers
-            .get(session_id)
-            .is_some_and(|tracker| tracker.pending() > 0)
-        {
-            let _ = self.settle_with(session_id, priority, now, true);
-        }
-    }
-
     /// Decides whether the work in flight stops, and says to cancel it once when it does.
     fn stop_in_flight(&mut self, conditions: &HostConditions) -> Option<Instruction> {
         let enabled = self.settings.enabled;
@@ -1247,10 +1196,13 @@ impl DescriptionService {
             }
             let session_id = dispatched.job.session_id;
             let cancelled = dispatched.cancellation.is_cancelled();
+            let ran_at = dispatched.produced_under.context_revision;
             let stop = if cancelled {
                 Stop::Cancelled
             } else if !self.live_sessions.contains(&session_id) {
                 Stop::Closed
+            } else if self.revision(&session_id) != Some(ran_at) {
+                Stop::Superseded
             } else if !enabled || self.paused_now(conditions, true) {
                 Stop::Paused
             } else {

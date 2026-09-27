@@ -230,6 +230,7 @@ fn a_description_is_published_through_the_process() {
 /// What changes while a job is in the process.
 #[derive(Clone, Copy, Debug)]
 enum Change {
+    NewDirectory,
     Closed,
     NewEpoch,
     NewBinding,
@@ -241,12 +242,13 @@ enum Change {
 }
 
 /// KR-REQ-22.19: each change the host applies while a job is in the process refuses the result that
-/// comes back: a closed session, a new epoch, a new binding, a pin, privacy mode's fence, a new
-/// privacy generation, descriptions turned off, and a cancellation. The control is the same job
-/// with nothing changed, which is published.
+/// comes back: a new directory that has settled, a closed session, a new epoch, a new binding, a
+/// pin, privacy mode's fence, a new privacy generation, descriptions turned off, and a
+/// cancellation. The control is the same job with nothing changed, which is published.
 #[test]
 fn each_change_while_a_job_is_in_the_process_refuses_its_result() {
     for change in [
+        Change::NewDirectory,
         Change::Closed,
         Change::NewEpoch,
         Change::NewBinding,
@@ -263,6 +265,14 @@ fn each_change_while_a_job_is_in_the_process_refuses_its_result() {
         let state = rig.state();
         let service = rig.service();
         match change {
+            Change::NewDirectory => {
+                self::change(service, &session(1), "crates", at(3_100));
+                assert!(
+                    service
+                        .settle(&session(1), Priority::Ordinary, at(5_100))
+                        .is_some()
+                );
+            }
             Change::Closed => service.session_closed(&session(1), at(3_100)),
             Change::NewEpoch => {
                 service.session_opened(session(1), SessionEpoch::new(2), binding());
@@ -293,7 +303,7 @@ fn each_change_while_a_job_is_in_the_process_refuses_its_result() {
             Change::Disabled => service.set_enabled(false),
             Change::Cancelled => assert!(service.cancel_running(&session(1))),
         }
-        let reports = rig.until(&roomy(), at(3_200), "the answer", |reports, _| {
+        let reports = rig.until(&roomy(), at(5_200), "the answer", |reports, _| {
             a_job_ended(reports)
         });
         let ended: Vec<&Outcome> = outcomes(&reports)
@@ -301,6 +311,9 @@ fn each_change_while_a_job_is_in_the_process_refuses_its_result() {
             .filter(|outcome| !matches!(outcome, Outcome::ProcessEnded { .. }))
             .collect();
         let refused = match (change, ended.as_slice()) {
+            (Change::NewDirectory, [Outcome::Rejected { rejection, .. }]) => {
+                matches!(rejection, Rejection::ChangedContext { .. })
+            }
             (Change::Closed, [Outcome::Rejected { rejection, .. }]) => {
                 *rejection == Rejection::SessionClosed
             }
@@ -338,7 +351,7 @@ fn each_change_while_a_job_is_in_the_process_refuses_its_result() {
     queue(rig.service(), &session(1), Priority::Ordinary, at(0));
     rig.job_sent(at(3_000));
     rig.answer_arrives();
-    let reports = rig.until(&roomy(), at(3_200), "the answer", |reports, _| {
+    let reports = rig.until(&roomy(), at(5_200), "the answer", |reports, _| {
         a_job_ended(reports)
     });
     assert!(
@@ -1138,4 +1151,79 @@ fn a_pause_while_a_job_runs_cancels_it_and_keeps_its_place() {
         "{reports:?}"
     );
     assert_eq!(rig.driver.started(), 2);
+}
+
+/// KR-REQ-22.16: a change that settles while a job is in the process would refuse its result, so
+/// the service cancels the job there at once rather than wait for an answer it would refuse. The
+/// process stays, and the new revision is described once the session's cooldown has passed. The
+/// control is a change still inside its debounce, which leaves the job to publish.
+#[test]
+fn a_change_that_settles_while_a_job_runs_cancels_it_in_the_process() {
+    let mut rig = Rig::new(&Script {
+        generate_ms: 2_000,
+        ..Script::default()
+    });
+    queue(rig.service(), &session(1), Priority::Ordinary, at(0));
+    rig.job_sent(at(3_000));
+    let pid = rig.driver.pid();
+    change(rig.service(), &session(1), "crates", at(3_100));
+    assert!(
+        rig.service()
+            .settle(&session(1), Priority::Ordinary, at(5_100))
+            .is_some()
+    );
+    let reports = rig.until(&roomy(), at(5_100), "the cancelled job", |reports, _| {
+        a_job_ended(reports)
+    });
+    // The process answered the cancellation: an answer that finished the job would have been
+    // refused as a changed context instead.
+    assert_eq!(
+        outcomes(&reports),
+        vec![&Outcome::Cancelled {
+            session_id: session(1)
+        }]
+    );
+    assert_eq!(rig.driver.pid(), pid, "the process was not ended");
+    let next = 3_000 + Budgets::DEFAULTS.session_cooldown_ms;
+    let reports = rig.until(&roomy(), at(next), "the new revision", |reports, _| {
+        a_job_ended(reports)
+    });
+    assert!(
+        outcomes(&reports).iter().any(
+            |outcome| matches!(outcome, Outcome::Published { session_id, .. } if *session_id == session(1))
+        ),
+        "{reports:?}"
+    );
+    assert_eq!(
+        rig.driver
+            .service()
+            .store()
+            .generated(&session(1))
+            .expect("a read")
+            .expect("a description")
+            .revision,
+        kr_describe::context::ContextRevision::new(2)
+    );
+    assert_eq!(rig.driver.pid(), pid);
+
+    // The control: a change inside its debounce leaves the job to publish.
+    let mut rig = Rig::new(&Script {
+        generate_ms: 300,
+        ..Script::default()
+    });
+    queue(rig.service(), &session(1), Priority::Ordinary, at(0));
+    rig.job_sent(at(3_000));
+    change(rig.service(), &session(1), "crates", at(3_100));
+    assert_eq!(
+        rig.service()
+            .settle(&session(1), Priority::Ordinary, at(4_000)),
+        None
+    );
+    let reports = rig.until(&roomy(), at(4_000), "the description", |reports, _| {
+        a_job_ended(reports)
+    });
+    assert!(
+        matches!(outcomes(&reports)[..], [Outcome::Published { .. }]),
+        "{reports:?}"
+    );
 }

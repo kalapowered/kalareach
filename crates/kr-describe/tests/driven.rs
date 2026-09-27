@@ -6,6 +6,7 @@ mod support;
 use kr_describe::budget::{Budgets, GIB};
 use kr_describe::context::{ContextRevision, ContextSignal};
 use kr_describe::metadata::RepositoryFacts;
+use kr_describe::output::Rejection;
 use kr_describe::profile::catalogue::MetGates;
 use kr_describe::queue::Priority;
 use kr_describe::resource::{
@@ -93,52 +94,103 @@ fn produced(prompt: &str, peak_rss_bytes: u64) -> Answered {
     }
 }
 
-/// KR-REQ-22.16: a change that arrives while its session's job is in the process waits, pending,
-/// until the job has ended, so the job's result is published; the change then becomes the next
-/// revision at once, queued with the priority the host last gave. The control is the same change
-/// with no job in flight, which settles when its debounce has passed.
+/// KR-REQ-22.16: a change that settles while its session's job is in the process moves the
+/// revision, so the job's result, which describes the session as it was, is refused as a changed
+/// context, and the job is cancelled at once rather than left to finish; the new revision is
+/// described next. The control is a change still inside its debounce when the answer arrives, which
+/// leaves the result standing.
 #[test]
-fn a_change_while_its_job_runs_waits_and_becomes_the_next_revision() {
+fn a_change_that_settles_while_its_job_runs_refuses_the_result() {
     let mut service = service();
     queue(&mut service, &session(1), "kalareach", at(0));
     let Instruction::Generate { id, request, .. } = loaded(&mut service, at(3_000)) else {
         panic!("the job is sent");
     };
     change(&mut service, &session(1), "crates", at(3_100));
-    assert_eq!(
-        service.settle(&session(1), Priority::Foreground, at(10_000)),
-        None,
-        "the revision does not move under a running job"
+    assert!(
+        service
+            .settle(&session(1), Priority::Ordinary, at(5_100))
+            .is_some(),
+        "the change settles once its debounce has passed, job or no job"
     );
-    assert_eq!(service.revision(&session(1)), Some(ContextRevision::new(1)));
+    assert_eq!(service.revision(&session(1)), Some(ContextRevision::new(2)));
+    assert_eq!(
+        service.next(&roomy(), at(5_100)).expect("an instruction"),
+        Instruction::Cancel {
+            id,
+            work: Work::Job
+        },
+        "the job is cancelled at once"
+    );
+    let outcome = service
+        .finished(id, produced(&request.prompt, 0), at(5_200))
+        .expect("the answer");
+    assert_eq!(
+        outcome,
+        Outcome::Rejected {
+            session_id: session(1),
+            rejection: Rejection::ChangedContext {
+                expected: ContextRevision::new(2),
+                found: ContextRevision::new(1)
+            }
+        }
+    );
+    assert!(
+        service
+            .store()
+            .generated(&session(1))
+            .expect("a read")
+            .is_none()
+    );
+
+    // The new revision is described once the session's cooldown has passed.
+    let next = at(3_000 + Budgets::DEFAULTS.session_cooldown_ms);
+    let Instruction::Generate { id, request, .. } = service.next(&roomy(), next).expect("a job")
+    else {
+        panic!("the new revision's job is sent");
+    };
     assert!(matches!(
         service
-            .finished(id, produced(&request.prompt, 0), at(10_500))
+            .finished(id, produced(&request.prompt, 0), next.after_ms(500))
             .expect("the answer"),
         Outcome::Published { .. }
     ));
     assert_eq!(
-        service.revision(&session(1)),
-        Some(ContextRevision::new(2)),
-        "the change that waited is the next revision"
+        service
+            .store()
+            .generated(&session(1))
+            .expect("a read")
+            .expect("a description")
+            .revision,
+        ContextRevision::new(2)
     );
-    let waiting = service.scheduler().jobs();
-    assert_eq!(waiting.len(), 1);
-    assert_eq!(waiting[0].session_id, session(1));
-    assert_eq!(waiting[0].priority, Priority::Foreground);
-    assert_eq!(waiting[0].context.revision(), ContextRevision::new(2));
 
-    // The control: with no job in flight a change settles once its debounce has passed.
-    queue(&mut service, &session(2), "kalareach", at(20_000));
-    change(&mut service, &session(2), "crates", at(22_100));
+    // The control: a change still inside its debounce when the answer arrives leaves the result
+    // standing, and settles after it.
+    let mut service = self::service();
+    queue(&mut service, &session(1), "kalareach", at(0));
+    let Instruction::Generate { id, request, .. } = loaded(&mut service, at(3_000)) else {
+        panic!("the job is sent");
+    };
+    change(&mut service, &session(1), "crates", at(3_100));
     assert_eq!(
-        service.settle(&session(2), Priority::Ordinary, at(24_000)),
+        service.settle(&session(1), Priority::Ordinary, at(4_000)),
         None,
         "not before the debounce"
     );
+    assert!(matches!(
+        service.next(&roomy(), at(4_000)).expect("an instruction"),
+        Instruction::Wait { .. }
+    ));
+    assert!(matches!(
+        service
+            .finished(id, produced(&request.prompt, 0), at(4_000))
+            .expect("the answer"),
+        Outcome::Published { .. }
+    ));
     assert!(
         service
-            .settle(&session(2), Priority::Ordinary, at(24_200))
+            .settle(&session(1), Priority::Ordinary, at(5_100))
             .is_some()
     );
 }
