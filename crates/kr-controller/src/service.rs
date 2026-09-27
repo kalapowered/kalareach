@@ -8416,15 +8416,14 @@ impl Controller {
                 .map(|path| std::env::split_paths(&path).collect())
                 .unwrap_or_default(),
             backends: kr_worker::broker::process::ManagedProcess::publishes_credential_file(),
-            // A worker runs an integrated invocation through the launcher beside it.
+            // A worker runs an integrated invocation through the launcher beside it, held to the
+            // rule the worker holds it to.
             launcher: self.worker_program.parent().is_some_and(|directory| {
-                directory
-                    .join(if cfg!(windows) {
-                        "kr-hook.exe"
-                    } else {
-                        "kr-hook"
-                    })
-                    .is_file()
+                kr_worker::broker::commands::runnable(&directory.join(if cfg!(windows) {
+                    "kr-hook.exe"
+                } else {
+                    "kr-hook"
+                }))
             }),
         };
         let integrations = Arc::clone(&self.integrations);

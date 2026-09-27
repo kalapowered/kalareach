@@ -764,15 +764,9 @@ impl CommandBackends {
                 launcher.display()
             ));
         }
-        let metadata = std::fs::metadata(&launcher).map_err(|error| {
-            format!(
-                "the launcher {} cannot be read: {error}",
-                launcher.display()
-            )
-        })?;
-        if !metadata.is_file() || !is_executable(&metadata) {
+        if !runnable(&launcher) {
             return Err(format!(
-                "the launcher {} is not an executable file",
+                "the launcher {} is not a file this account may execute",
                 launcher.display()
             ));
         }
@@ -1765,19 +1759,21 @@ fn check_executable(executable: &str) -> std::result::Result<(), String> {
 
 /// Whether `path` is a regular file this account may execute: what a launcher, and an executable a
 /// command resolves to, are held to wherever this host needs to know that one would run.
+///
+/// The kernel is asked, for this account, rather than the mode read: an execute bit for another
+/// account, or one an access list withdraws, runs nothing here.
 #[must_use]
 pub fn runnable(path: &Path) -> bool {
-    std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file())
+    std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file()) && executable_here(path)
 }
 
 #[cfg(unix)]
-fn is_executable(metadata: &std::fs::Metadata) -> bool {
-    use std::os::unix::fs::PermissionsExt as _;
-    metadata.permissions().mode() & 0o111 != 0
+fn executable_here(path: &Path) -> bool {
+    rustix::fs::access(path, rustix::fs::Access::EXEC_OK).is_ok()
 }
 
 #[cfg(not(unix))]
-const fn is_executable(_metadata: &std::fs::Metadata) -> bool {
+const fn executable_here(_path: &Path) -> bool {
     true
 }
 

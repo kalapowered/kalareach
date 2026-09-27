@@ -32,7 +32,8 @@ kr-transport.workspace = true
 libc.workspace = true
 portable-pty.workspace = true
 rusqlite = { workspace = true, features = ["bundled"] }
-rustix = { workspace = true, features = ["event", "param", "process", "termios", "time"] }
+# `fs` for whether this account may execute a file, which the kernel answers for its own reasons.
+rustix = { workspace = true, features = ["event", "fs", "param", "process", "termios", "time"] }
 serde.workspace = true
 # An executable an integrated invocation runs is hashed through the one descriptor its identity is
 # read from, a megabyte at a time, rather than read whole into memory first.

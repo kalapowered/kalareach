@@ -19,7 +19,7 @@
 //! signed qualification record gives that executable's digest.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use kr_protocol::admission::AdmittedPackage;
@@ -398,21 +398,7 @@ fn resolve_with(command: &str, search_path: &[PathBuf], extensions: &[String]) -
                 .iter()
                 .map(move |extension| directory.join(format!("{command}{extension}")))
         })
-        .find(|candidate| runnable(candidate))
-}
-
-/// Whether `path` is a file this account may run.
-fn runnable(path: &Path) -> bool {
-    std::fs::metadata(path).is_ok_and(|metadata| {
-        #[cfg(unix)]
-        let permitted = {
-            use std::os::unix::fs::PermissionsExt as _;
-            metadata.permissions().mode() & 0o111 != 0
-        };
-        #[cfg(not(unix))]
-        let permitted = true;
-        metadata.is_file() && permitted
-    })
+        .find(|candidate| kr_worker::broker::commands::runnable(candidate))
 }
 
 /// The doctor's check of the command integrations: whether every integration the configuration
