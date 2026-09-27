@@ -1297,8 +1297,8 @@ mod tests {
         assert_eq!(placement.cells_clipped, 0);
     }
 
-    /// A run whose text the pinned model measures at another width than its cells is replaced by
-    /// blank cells, counted, rather than drawn somewhere else.
+    /// KR-REQ-04.04: a run whose text the pinned model measures at another width than its cells is
+    /// replaced by blank cells, counted, rather than drawn somewhere else.
     #[test]
     fn a_run_whose_text_disagrees_with_its_cells_is_blank_and_counted() {
         let placement = place(&run_of(2, 5, "abc"), window(0, 20));
@@ -1306,7 +1306,8 @@ mod tests {
         assert!(placement.run_replaced);
     }
 
-    /// A mark with no base in its run occupies no cell and becomes no piece, and it is counted.
+    /// KR-REQ-04.04: a mark with no base in its run occupies no cell and becomes no piece, and it
+    /// is counted.
     #[test]
     fn a_cluster_of_no_cells_is_counted_and_produces_no_piece() {
         let placement = place(&run_of(0, 2, "\u{301}xy"), window(0, 20));
@@ -1315,8 +1316,8 @@ mod tests {
         assert!(!placement.run_replaced);
     }
 
-    /// A wide cluster the window's edge cuts becomes a blank cell for each of its cells inside the
-    /// window, at either edge, and the cells outside are counted.
+    /// KR-REQ-04.04: a wide cluster the window's edge cuts becomes a blank cell for each of its
+    /// cells inside the window, at either edge, and the cells outside are counted.
     #[test]
     fn a_wide_cluster_cut_by_the_windows_edge_is_blank_inside_it() {
         let left = place(&run_of(0, 4, "\u{4e2d}\u{4e2d}"), window(1, 3));
@@ -1331,8 +1332,8 @@ mod tests {
         assert_eq!(right.cells_clipped, 1);
     }
 
-    /// A run wholly outside the window is clipped and nothing else: its text is not measured, so
-    /// a disagreement there is not counted as a replacement.
+    /// KR-REQ-04.04: a run wholly outside the window is clipped and nothing else: its text is not
+    /// measured, so a disagreement there is not counted as a replacement.
     #[test]
     fn a_run_outside_the_window_is_clipped_and_not_measured() {
         let placement = place(&run_of(12, 4, "far away"), window(0, 10));

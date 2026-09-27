@@ -523,6 +523,8 @@ describe('the raw terminal', () => {
     expect(stretchesOf(line).map((stretch) => stretch.column)).toEqual([0, 2, 3, 5, 6])
   })
 
+  // KR-REQ-04.04: on a phone, a piece in exactly its cells, and one the phone cannot reproduce as
+  // counted blank cells, with the pieces after it where they were.
   it('draws a piece on a phone in exactly its cells, and one a phone cannot measure as blank cells', () => {
     const at = (column: number, cells: number, text: string) => ({
       column,

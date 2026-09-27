@@ -573,6 +573,8 @@ test.describe('the raw terminal', () => {
     expect(offsets?.down ?? Number.POSITIVE_INFINITY).toBeLessThan(0.5)
   })
 
+  // KR-REQ-04.04: in a real engine, each piece stays in a box of its own at its canonical cells,
+  // clipped to them, and no piece shifts the ones after it.
   test('draws every piece in a box of its own at its cells, whatever the browser makes of its text', async ({
     page
   }) => {

@@ -142,6 +142,7 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
     expect(drawn().slice(0, 2)).toEqual(['abcd', 'efgh'])
   })
 
+  // KR-REQ-04.04: each piece in a box of its own at exactly its canonical cells, clipped to them.
   it('draws each piece in a box of its own at exactly its cells, whatever its text', async () => {
     const { port, controls } = fakeHost()
     controls.holdTerminalViews()

@@ -541,8 +541,8 @@ mod tests {
             .collect()
     }
 
-    /// KR-REQ-13.08: a phone, which has no width model to measure with, places a run of printable
-    /// ASCII whose cells are its scalars, clipped to the window.
+    /// KR-REQ-13.08 and KR-REQ-04.04: a phone, which has no width model to measure with, places a
+    /// run of printable ASCII whose cells are its scalars, clipped to the window.
     #[test]
     fn a_phone_places_a_run_of_plain_ascii() {
         let placed = plain(&run(2, 5, "hello"), 0, 20);
@@ -552,8 +552,8 @@ mod tests {
         assert_eq!(texts(&clipped), vec![("ell", 3, 3)]);
     }
 
-    /// Any other run is blank across its cells on a phone, and counted, rather than drawn at a
-    /// width nobody measured.
+    /// KR-REQ-04.04: any other run is blank across its cells on a phone, and counted, rather than
+    /// drawn at a width nobody measured.
     #[test]
     fn a_phone_leaves_any_other_run_blank_and_counts_it() {
         for text in ["h\u{e9}llo", "\u{4e2d}\u{6587}x", "a\u{7}bcd", "ab"] {
