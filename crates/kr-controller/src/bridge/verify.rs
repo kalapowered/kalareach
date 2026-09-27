@@ -34,7 +34,8 @@ use crate::bridge::invoke::{self, Refusal};
 ///
 /// Returns the [`Refusal`] naming what stopped it: a helper that would not start, a stream that
 /// failed, a destination that refused the opening frame, an environment that answered with an
-/// identity the enrolment does not name, or the destination's own error for the read.
+/// identity the enrolment does not name, the destination's own error for the read, or a helper
+/// that could not be ended once it had answered.
 pub async fn through_bridge(
     actor: &ActorEnvelope,
     enrolment: &EnvironmentEnrolment,
@@ -67,7 +68,11 @@ pub async fn through_bridge(
     };
     // The bridge is over as soon as it has answered. Nothing here holds one open: a refresh is a
     // look, and a helper left running inside a distribution would be a process nobody asked for.
-    let _ = invocation.close().await;
+    // A helper that could not be ended is that process, so it is the answer: what the destination
+    // said is not worth a process nobody accounts for, and nothing it established is kept.
+    if let Err(unended @ Refusal::Unkillable { .. }) = invocation.close().await {
+        return Err(unended);
+    }
     match answer.outcome {
         Outcome::Ok(_) => Ok(verification),
         Outcome::Error(error) => Err(Refusal::Destination(error)),

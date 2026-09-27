@@ -49,6 +49,14 @@ use crate::bridge::launch::{self, BridgeCommand, LaunchError};
 /// the bridge, so a destination that goes quiet costs one refusal rather than a stuck refresh.
 pub const SILENCE_LIMIT: std::time::Duration = std::time::Duration::from_secs(20);
 
+/// How long this host waits for a helper to go once it has killed it.
+///
+/// Ending a process is ordinarily immediate. One that outlives its kill (a Windows process whose
+/// termination waits on I/O that cannot be cancelled, or a Unix process in uninterruptible sleep)
+/// would otherwise hold the caller for as long as it lasted, so past this the helper is reported by
+/// name and let go.
+pub const KILL_LIMIT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Why this host will not open a bridge for a request, or will not go on using one.
 ///
 /// Each variant is one cause, and each says what happened. A person reading a connection
@@ -117,6 +125,18 @@ pub enum Refusal {
         /// How long it was given.
         waited: std::time::Duration,
     },
+    /// A helper this host started could not be ended, and may still be running.
+    ///
+    /// Section 7's supervision asks for what survived to be named rather than claimed ended. This
+    /// host has let go of the helper, its streams and the caller, and no longer waits for it.
+    Unkillable {
+        /// The program this host started.
+        program: String,
+        /// Its process identifier, where the platform gave one.
+        pid: Option<u32>,
+        /// What happened when it was killed.
+        detail: String,
+    },
 }
 
 impl core::fmt::Display for Refusal {
@@ -171,6 +191,22 @@ impl core::fmt::Display for Refusal {
                 "the destination said nothing for {} seconds",
                 waited.as_secs()
             ),
+            Self::Unkillable {
+                program,
+                pid,
+                detail,
+            } => match pid {
+                Some(pid) => write!(
+                    formatter,
+                    "{program} (process {pid}) could not be ended: {detail}; it may still be \
+                     running, and this host no longer waits for it"
+                ),
+                None => write!(
+                    formatter,
+                    "{program} could not be ended: {detail}; it may still be running, and this \
+                     host no longer waits for it"
+                ),
+            },
         }
     }
 }
@@ -200,7 +236,8 @@ impl From<Refusal> for crate::error::ControllerError {
             | Refusal::NotAnAcknowledgement
             | Refusal::ProtocolMajor { .. }
             | Refusal::WrongRole { .. }
-            | Refusal::Silent { .. } => Self::supervision(refusal.to_string()),
+            | Refusal::Silent { .. }
+            | Refusal::Unkillable { .. } => Self::supervision(refusal.to_string()),
         }
     }
 }
@@ -219,6 +256,8 @@ pub struct Opening {
 /// A bridge that is open: the helper is running and has acknowledged the opening frame.
 #[derive(Debug)]
 pub struct Invocation {
+    /// The program the helper was started with, which names it if it cannot be ended.
+    program: String,
     /// The running helper.
     child: tokio::process::Child,
     /// The helper's standard input, which carries frames to the destination.
@@ -254,6 +293,7 @@ impl Opening {
             });
         }
         Ok(Invocation {
+            program: self.command.program,
             child,
             stdin,
             stdout,
@@ -270,18 +310,59 @@ impl Opening {
 ///
 /// # Errors
 ///
-/// As [`Opening::launch`], less the identity check.
+/// As [`Opening::launch`], less the identity check, and [`Refusal::Unkillable`] for a helper that
+/// answered and then could not be ended.
 pub async fn discover(
     command: &BridgeCommand,
     hello: &BridgeHello,
 ) -> Result<BridgeHelloAck, Refusal> {
-    let (mut child, stdin, stdout, acknowledgement) = start_and_acknowledge(command, hello).await?;
+    let (child, stdin, stdout, acknowledgement) = start_and_acknowledge(command, hello).await?;
     drop(stdin);
     drop(stdout);
-    // The child is killed on drop, and waiting for it here keeps the process from being reaped by
-    // the runtime after this function has already returned.
-    let _ = child.kill().await;
+    // Discovery carries no request, so the helper is ended as soon as it has answered, and waited
+    // for here so the runtime is not left to collect it after this function has returned.
+    end(child, &command.program, KILL_LIMIT).await?;
     Ok(acknowledgement)
+}
+
+/// Kills a helper this host started, and waits no longer than `limit` for it to go.
+///
+/// Section 7's supervision is the rule: what this host ended it may report as ended, and what it
+/// could not end it names rather than claims. Past the bound the helper's handle is dropped, which
+/// asks for the kill once more, and the runtime collects the process if it ever ends; nothing here
+/// holds it, its streams or the caller any longer.
+async fn end(
+    mut child: tokio::process::Child,
+    program: &str,
+    limit: std::time::Duration,
+) -> Result<(), Refusal> {
+    let pid = child.id();
+    ended_within(child.kill(), limit)
+        .await
+        .map_err(|detail| Refusal::Unkillable {
+            program: program.to_owned(),
+            pid,
+            detail,
+        })
+}
+
+/// Waits for an ending that has been asked for, no longer than `limit`, and says why it did not
+/// come.
+///
+/// This is the whole of the decision apart from the process, so a test can hand it an ending that
+/// never comes: no process a test can start outlives its kill.
+async fn ended_within<F>(ending: F, limit: std::time::Duration) -> Result<(), String>
+where
+    F: core::future::Future<Output = std::io::Result<()>>,
+{
+    match tokio::time::timeout(limit, ending).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(format!("killing it failed: {error}")),
+        Err(_elapsed) => Err(format!(
+            "it had not gone {} seconds after it was killed",
+            limit.as_secs()
+        )),
+    }
 }
 
 /// Starts the helper, exchanges the opening frames, and checks the version and the role.
@@ -397,21 +478,31 @@ impl Invocation {
     ///
     /// # Errors
     ///
-    /// Returns [`Refusal::Stream`] when the helper could not be waited for.
-    pub async fn close(mut self) -> Result<(), Refusal> {
+    /// Returns [`Refusal::Stream`] when the helper could not be waited for, [`Refusal::Silent`]
+    /// when it did not end on its own and was ended, and [`Refusal::Unkillable`] when it could not
+    /// be ended either.
+    pub async fn close(self) -> Result<(), Refusal> {
+        self.close_within(SILENCE_LIMIT, KILL_LIMIT).await
+    }
+
+    /// [`Self::close`], with the two bounds named.
+    async fn close_within(
+        mut self,
+        silence: std::time::Duration,
+        kill_limit: std::time::Duration,
+    ) -> Result<(), Refusal> {
         drop(self.stdin);
-        match tokio::time::timeout(SILENCE_LIMIT, self.child.wait()).await {
+        match tokio::time::timeout(silence, self.child.wait()).await {
             Ok(Ok(_status)) => Ok(()),
             Ok(Err(error)) => Err(Refusal::Stream {
                 detail: error.to_string(),
             }),
             // A helper that will not end on its own is ended here rather than left running: the
-            // caller asked for one exchange, and it is over.
+            // caller asked for one exchange, and it is over. One that will not end at the kill
+            // either is named and let go rather than waited for.
             Err(_elapsed) => {
-                let _ = self.child.kill().await;
-                Err(Refusal::Silent {
-                    waited: SILENCE_LIMIT,
-                })
+                end(self.child, &self.program, kill_limit).await?;
+                Err(Refusal::Silent { waited: silence })
             }
         }
     }
@@ -827,6 +918,140 @@ mod tests {
         );
     }
 
+    /// The opening frame a local invocation writes.
+    #[cfg(unix)]
+    fn hello() -> BridgeHello {
+        BridgeHello {
+            protocol_version: kr_protocol::hello::PROTOCOL_VERSION,
+            build_id: build(),
+            origin_environment_id: here(),
+            origin_ingress: ActorIngress::LocalIpc,
+            already_bridged: false,
+            target: BridgeTarget::Controller,
+        }
+    }
+
+    /// The acknowledgement a destination daemon gives, as the environment [`here`] names.
+    #[cfg(unix)]
+    fn acknowledgement() -> BridgeHelloAck {
+        let connection_id = ConnectionId::new(Uuid::from_bytes([7; 16]));
+        BridgeHelloAck {
+            protocol_version: kr_protocol::hello::PROTOCOL_VERSION,
+            environment_id: here(),
+            os_user: "kala".to_owned(),
+            role: LocalRole::Controller,
+            connection_id,
+            boot_identity: kr_protocol::identity::BootIdentity {
+                source: kr_protocol::identity::BootIdentitySource::LinuxBootId,
+                value: kr_protocol::scalars::Bytes::new(b"boot".to_vec()),
+            },
+            max_frame_len: kr_protocol::scalars::U64::new(65_536),
+            action_window: kr_protocol::hello::ActionWindow {
+                action_window_id: kr_protocol::ids::ActionWindowId::new("w-bridge")
+                    .expect("a window"),
+                connection_id,
+                boot_epoch: kr_protocol::ids::BootEpoch::new(1),
+                issued_at_ms: TimestampMs::new(100),
+                valid_for_ms: kr_protocol::scalars::DurationMs::new(120_000),
+            },
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_helper_that_outlives_its_kill_is_named_and_let_go_rather_than_waited_for() {
+        // No process a test can start outlives its kill. One that does is in uninterruptible
+        // sleep, or is a Windows process whose termination waits on I/O that cannot be cancelled,
+        // and from here either is an ending that never comes. The clock is the test's own, so the
+        // bound costs no real time; the outer one is how a wait with no end shows as a failure.
+        let started = tokio::time::Instant::now();
+        let detail = tokio::time::timeout(
+            KILL_LIMIT * 4,
+            ended_within(std::future::pending(), KILL_LIMIT),
+        )
+        .await
+        .expect("the helper is let go at the kill bound rather than waited for")
+        .expect_err("an ending that never came is not reported as one");
+        let waited = started.elapsed();
+        assert!(
+            waited >= KILL_LIMIT && waited < KILL_LIMIT * 2,
+            "let go after {waited:?}"
+        );
+        assert!(
+            detail.contains(&format!(
+                "{} seconds after it was killed",
+                KILL_LIMIT.as_secs()
+            )),
+            "{detail}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_kill_that_could_not_be_made_is_reported_rather_than_taken_as_an_ending() {
+        let detail = ended_within(
+            async { Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)) },
+            KILL_LIMIT,
+        )
+        .await
+        .expect_err("a helper that was not killed is not reported as ended");
+        assert!(detail.starts_with("killing it failed"), "{detail}");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_helper_that_goes_at_the_kill_is_ended_and_nothing_is_reported() {
+        let child = tokio::process::Command::new("/bin/sleep")
+            .arg("600")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("sleep starts");
+        end(child, "/bin/sleep", KILL_LIMIT)
+            .await
+            .expect("a helper that goes at the kill is ended, and nothing is reported");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_helper_that_ignores_its_closed_input_is_ended_at_the_silence_bound_as_before() {
+        // The helper answers the opening frame and then waits on something other than its input,
+        // so closing that input does not end it. The bridge waits out the silence bound, kills it
+        // and says it was silent: a helper that goes at the kill is ended as it always was. The
+        // bound is short and the clock is real, because the ending is a real process's.
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let answer = directory.path().join("answer");
+        std::fs::write(
+            &answer,
+            FrameCodec::new(StreamKind::Control)
+                .encode_message(&BridgeFrame::HelloAck(Box::new(acknowledgement())))
+                .expect("the acknowledgement encodes"),
+        )
+        .expect("the answer is written");
+        let opening = Opening {
+            command: BridgeCommand {
+                program: "/bin/sh".to_owned(),
+                arguments: vec![
+                    "-c".to_owned(),
+                    "cat \"$1\"; exec sleep 600".to_owned(),
+                    "sh".to_owned(),
+                    answer
+                        .to_str()
+                        .expect("a temporary path is text")
+                        .to_owned(),
+                ],
+            },
+            environment_id: here(),
+            hello: hello(),
+        };
+        let invocation = opening
+            .launch()
+            .await
+            .expect("the helper answered as the enrolled environment");
+        let silence = std::time::Duration::from_millis(200);
+        assert_eq!(
+            invocation.close_within(silence, KILL_LIMIT).await,
+            Err(Refusal::Silent { waited: silence })
+        );
+    }
+
     #[test]
     fn every_failure_class_says_something_different() {
         // A diagnostic that named two causes the same way would send whoever reads it to the wrong
@@ -870,6 +1095,11 @@ mod tests {
             Refusal::Silent {
                 waited: SILENCE_LIMIT,
             },
+            Refusal::Unkillable {
+                program: "wsl.exe".to_owned(),
+                pid: Some(4242),
+                detail: "it had not gone 5 seconds after it was killed".to_owned(),
+            },
         ];
         let mut messages: Vec<String> = refusals.iter().map(ToString::to_string).collect();
         messages.sort();
@@ -911,5 +1141,18 @@ mod tests {
             matches!(closed, crate::error::ControllerError::SessionClosed { .. }),
             "{closed:?}"
         );
+        // A helper this host could not end is this host's supervision failing, and the message
+        // names the process so a person can find it.
+        let unended: crate::error::ControllerError = Refusal::Unkillable {
+            program: "wsl.exe".to_owned(),
+            pid: Some(4242),
+            detail: "it had not gone 5 seconds after it was killed".to_owned(),
+        }
+        .into();
+        assert!(
+            matches!(&unended, crate::error::ControllerError::Supervision { .. }),
+            "{unended:?}"
+        );
+        assert!(unended.to_string().contains("process 4242"), "{unended}");
     }
 }

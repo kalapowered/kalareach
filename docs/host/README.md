@@ -1350,7 +1350,7 @@ The child is `kr bridge --stdio` inside the destination. It authenticates to tha
 own control daemon or session worker over local IPC, and carries protocol frames on its standard
 input and output. Standard error stays diagnostic, so a warning there cannot corrupt the stream.
 
-Four things about that invocation are deliberate.
+Five things about that invocation are deliberate.
 
 * **It is an argument vector, never a command line.** A distribution called `My Distro`, a
   container identifier beginning with a dash and a helper path containing a quotation mark each
@@ -1364,6 +1364,10 @@ Four things about that invocation are deliberate.
 * **No authority is read from the environment.** The helper's rights inside the destination are
   the rights of the operating-system user the enrolment names, established there by peer
   credentials. A forwarded variable confers nothing.
+* **Every wait on a helper is bounded.** A destination that says nothing for twenty seconds ends
+  the bridge, and the helper is killed with it. A helper still there five seconds after it was
+  killed is not waited for either: a refresh names it by its process identifier as possibly still
+  running, and records nothing it established.
 
 ### What may cross a bridge
 
