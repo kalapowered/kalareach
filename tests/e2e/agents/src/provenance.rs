@@ -533,6 +533,7 @@ impl Provenance {
         let pids: std::collections::BTreeSet<u64> = seen
             .processes
             .keys()
+            .chain(seen.identified.keys())
             .map(|identity| identity.pid.get())
             .chain(seen.other_users.iter().map(|(pid, _)| u64::from(*pid)))
             .collect();

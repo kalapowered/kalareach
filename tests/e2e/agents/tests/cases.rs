@@ -285,21 +285,15 @@ fn staged(
     // What the part left is read only once nothing it started still runs: after the closing
     // check, or, after a part that stopped part way, once the run has ended everything and found
     // nothing left. The run's directory is still there then.
-    let writers = if closed.load(std::sync::atomic::Ordering::SeqCst) {
+    let closed_now = closed.load(std::sync::atomic::Ordering::SeqCst);
+    if !closed_now {
+        // A part that stopped before its close: what the sampler found, and could not find, goes
+        // to the run, whose own close, now or when it is dropped, requires it ended.
+        hand_over(&provenance, &run);
+    }
+    let writers = if closed_now {
         Ok(())
     } else if needs_login {
-        for (pid, path) in provenance.system_programs() {
-            run.note_system_program(pid, &path);
-        }
-        for (pid, path) in run.system_programs() {
-            provenance.note_system_program(pid, &path);
-        }
-        for why in provenance.untracked() {
-            run.undiscovered(&why);
-        }
-        for (identity, command) in provenance.identified() {
-            run.record(identity, &format!("beneath a session: {command}"));
-        }
         run.end_everything();
         run.remove_loaded_jobs();
         run.nothing_running().map(|_| ())
@@ -510,6 +504,25 @@ fn staged(
     }
 }
 
+/// Gives the run what the provenance sampler found beneath the sessions, before any close: each
+/// process it took, which the close requires ended; what it could not find, on which the close
+/// fails; and the system programs every search noted, which go to both, so the close requires each
+/// ended and the evidence names each.
+fn hand_over(provenance: &Provenance, run: &Run) {
+    for (pid, path) in provenance.system_programs() {
+        run.note_system_program(pid, &path);
+    }
+    for (pid, path) in run.system_programs() {
+        provenance.note_system_program(pid, &path);
+    }
+    for why in provenance.untracked() {
+        run.undiscovered(&why);
+    }
+    for (identity, command) in provenance.identified() {
+        run.record(identity, &format!("beneath a session: {command}"));
+    }
+}
+
 /// What a part changed in the person's agent directories since `before`: its own conversations,
 /// the files it created holding its marker or the run's directory, removed, and every other change
 /// reported; the files it had that were rewritten or changed and too large to compare; and whether
@@ -656,22 +669,7 @@ fn run_part(
         }
         ending.outcome
     });
-    // Every search's system programs, the provenance sampler's and the run's own, go to both: the
-    // close requires each ended, and the evidence names each.
-    for (pid, path) in provenance.system_programs() {
-        run.note_system_program(pid, &path);
-    }
-    for (pid, path) in run.system_programs() {
-        provenance.note_system_program(pid, &path);
-    }
-    // What the sampler could not find, the close cannot have found ended either; and what it did
-    // find, the close requires ended.
-    for why in provenance.untracked() {
-        run.undiscovered(&why);
-    }
-    for (identity, command) in provenance.identified() {
-        run.record(identity, &format!("beneath a session: {command}"));
-    }
+    hand_over(provenance, run);
     let checked = run
         .closing_check()
         .unwrap_or_else(|left| panic!("still running after part {part}: {left}"));
