@@ -1063,6 +1063,10 @@ async fn an_update_replaces_the_daemon_and_a_live_session_keeps_its_release() {
         .unwrap_or(Value::Null);
     assert_eq!(first["held"], true, "{versions}");
     assert_eq!(first["previous"], false, "{versions}");
+    assert_eq!(
+        first["sequence"], 1,
+        "a release's sequence is read from it: {versions}"
+    );
 
     // The control: once the session closes nothing holds the first release, and the next update
     // takes it away.
