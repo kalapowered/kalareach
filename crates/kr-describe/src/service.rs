@@ -834,7 +834,9 @@ impl DescriptionService {
         self.live_sessions.insert(session_id);
         // A session opened afresh starts with a context of its own, and owes nothing to what an
         // earlier job of the same identifier went through: one still in the process, one waiting
-        // in the queue with the old context, or the retry an earlier failure used up.
+        // in the queue with the old context, or the retry an earlier failure used up. The semantic
+        // events its earlier self recorded go too, as they do when a session closes.
+        self.events.remove(&session_id);
         self.outlive_job_of(&session_id);
         self.scheduler.cancel(&session_id);
         self.retried.remove(&session_id);

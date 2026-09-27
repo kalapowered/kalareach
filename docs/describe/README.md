@@ -190,10 +190,10 @@ most one job behind the session, and the revision catches up as soon as it lands
 host whose jobs take longer than the debounce would refuse every job the turn produced.
 
 A job whose session closes, or opens again, before it ends describes a session that has gone. It is
-stopped, what it produced is refused, it is never queued again, and it leaves no mark on the
-session there now, whatever that session's epoch, binding and revision happen to be. A session
-opened again also drops the job it had waiting in the queue, which was built from the context it
-had, and the retry an earlier failure had used.
+stopped, what it produced is refused, it is never queued again, and it leaves no mark on the session
+there now, whatever that session's epoch, binding and revision happen to be. A session opened again
+also drops the job it had waiting in the queue, which was built from the context it had, the
+semantic events it had recorded, and the retry an earlier failure had used.
 
 The input is bounded directory and repository metadata plus recent authorised semantic events.
 Raw keystrokes, hidden input, environment values, file bodies and whole histories are excluded, and

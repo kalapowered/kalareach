@@ -6,7 +6,9 @@ mod support;
 use std::time::Duration;
 
 use kr_describe::budget::{Budgets, GIB};
-use kr_describe::context::{ContextRevision, ContextSignal};
+use kr_describe::context::{
+    ContextRevision, ContextSignal, ProjectText, SemanticEvent, SemanticEventKind,
+};
 use kr_describe::metadata::RepositoryFacts;
 use kr_describe::output::Rejection;
 use kr_describe::profile::catalogue::MetGates;
@@ -1452,6 +1454,46 @@ fn a_pause_between_a_failure_and_its_retry_keeps_the_retry_used() {
         "{ended:?}"
     );
     assert_eq!(service.scheduler().queued(), 0);
+}
+
+/// KR-REQ-22.16: a session opened again starts with no semantic events of its earlier self. An
+/// event recorded before the session is opened again, without a close between, reaches no prompt
+/// of the session there now. The control is the same session left alone, whose next prompt
+/// carries the event.
+#[test]
+fn a_session_opened_again_carries_no_earlier_events() {
+    for reopened in [true, false] {
+        let mut service = service();
+        service.session_opened(session(1), SessionEpoch::V1, binding());
+        assert!(service.note_event(
+            &session(1),
+            SemanticEvent {
+                cursor: 1,
+                kind: SemanticEventKind::CommandAccepted,
+                summary:
+                    ProjectText::new("cargo publish from the earlier session").expect("a summary"),
+            }
+        ));
+        if reopened {
+            service.session_opened(session(1), SessionEpoch::V1, binding());
+        }
+        change(&mut service, &session(1), "docs", at(0));
+        assert!(
+            service
+                .settle(&session(1), Priority::Ordinary, at(2_000))
+                .is_some()
+        );
+        let (_, _, request) = next_job(&mut service, at(3_000));
+        assert_eq!(
+            request
+                .prompt
+                .contains("cargo publish from the earlier session"),
+            !reopened,
+            "reopened {reopened}: {}",
+            request.prompt
+        );
+        assert!(request.prompt.contains("docs"), "{}", request.prompt);
+    }
 }
 
 /// Builds a service over a store of the test's own.
