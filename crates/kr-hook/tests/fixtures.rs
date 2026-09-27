@@ -19,6 +19,12 @@
 //! and the inline JSON that follows it, in `fixtures/bridges/qoder-cli/flags.json`, pinned the same
 //! way.
 //!
+//! What a launch adds comes from each release's own command integration, which its manifest
+//! declares. The manifests of the three released packages are under `fixtures/plugins/released/`,
+//! copied byte for byte from the plugins repository at `c1c2c3afaf370157a44909464504773096c9b19a`,
+//! and pinned by their SHA-256 digests, which are the package hashes an owner confirms at
+//! installation.
+//!
 //! | Row | What proves it |
 //! | --- | --- |
 //! | KR-REQ-11.42 | every test below: the registration and the forwarder agree |
@@ -26,6 +32,7 @@
 //! | KR-REQ-12.20 | `the_gemini_cli_extension_registers_its_three_events_as_plain_words` |
 //! | KR-REQ-12.22 | `the_qoder_cli_flags_pass_its_hooks_in_exec_form_and_nothing_else` |
 //! | KR-REQ-12.27 | the Gemini CLI and Qoder CLI registration tests: every timeout the forwarder's deadline fits inside |
+//! | KR-REQ-12.18, KR-REQ-12.20, KR-REQ-12.22 | `the_released_declarations_are_what_a_launch_adds`: each release's command integration |
 
 use kr_hook::cli::{ClaudeCode, Cli, Command, Hooks};
 
@@ -375,4 +382,98 @@ fn the_gemini_cli_extension_registers_its_three_events_as_plain_words() {
         serde_json::json!({"source": "/dev/null/kalareach", "type": "local"}),
         "the install record names a local source nothing can exist under"
     );
+}
+
+/// A released package's manifest, as the plugins repository published it.
+fn released(package: &str) -> Vec<u8> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/plugins/released/kalareach")
+        .join(package)
+        .join("0.4.0/plugin.json");
+    std::fs::read(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()))
+}
+
+/// The command integration a released manifest declares, which the package contract accepts: it
+/// names one of the package's own executables, adds only flags and sets only variables the contract
+/// permits, and the package asks for the capability that confirms it.
+fn declared(package: &str) -> kr_plugin_sdk::integration::CommandIntegration {
+    use kr_plugin_sdk::capability::PluginCapability;
+    let manifest: kr_plugin_sdk::plugin::PluginManifest =
+        serde_json::from_slice(&released(package)).expect("the released manifest reads");
+    let integration = manifest
+        .command_integration
+        .clone()
+        .unwrap_or_else(|| panic!("{package} declares a command integration"));
+    assert_eq!(
+        integration.problems(&manifest.match_rules),
+        Vec::<String>::new(),
+        "{package}'s declaration is one the package contract accepts"
+    );
+    assert!(
+        manifest
+            .capabilities
+            .iter()
+            .any(|request| request.capability == PluginCapability::CommandIntegrationLaunch),
+        "{package} asks for the capability that confirms its integration"
+    );
+    integration
+}
+
+/// Each released manifest is the package its release names: the file's SHA-256 digest is the
+/// package hash the development generation's signed index gives that release, so a change to a
+/// release's declaration is a deliberate new copy.
+#[test]
+fn the_released_manifests_are_the_pinned_packages() {
+    for (package, digest) in [
+        (
+            "claude-code",
+            "4459b1c66bf63415455dcba780501c7a8771638172acc7218e9472fa58444d88",
+        ),
+        (
+            "gemini-cli",
+            "4022d82656b5fbb7ad4e380978194ef3c2fa08aa669ff1890559e2b57a5e567b",
+        ),
+        (
+            "qoder-cli",
+            "d26c69197ec46528fd36da257e601a1c6153aeeb76999355a2eab55d6bb1d927",
+        ),
+    ] {
+        assert_eq!(sha256(&released(package)), digest, "{package}");
+    }
+}
+
+/// KR-REQ-12.18, KR-REQ-12.20, KR-REQ-12.22: what each release's integration adds to a launch.
+/// Claude Code's channel flag and the plugin it names, and no variable; Gemini CLI's one variable,
+/// which makes the launched process run the session, and no flag; Qoder CLI's two elements, which
+/// are the pinned registration this suite checks above, and no variable.
+#[test]
+fn the_released_declarations_are_what_a_launch_adds() {
+    let claude = declared("claude-code");
+    assert_eq!(claude.command, "claude");
+    assert_eq!(
+        claude.flags,
+        [
+            "--dangerously-load-development-channels",
+            "plugin:kalareach-channels@skills-dir"
+        ]
+    );
+    assert!(claude.variables.is_empty());
+
+    let gemini = declared("gemini-cli");
+    assert_eq!(gemini.command, "gemini");
+    assert!(gemini.flags.is_empty());
+    assert_eq!(
+        gemini.variables,
+        [kr_plugin_sdk::integration::IntegrationVariable {
+            name: "GEMINI_CLI_NO_RELAUNCH".to_owned(),
+            value: "true".to_owned(),
+        }]
+    );
+
+    let qoder = declared("qoder-cli");
+    assert_eq!(qoder.command, "qodercli");
+    let pinned: Vec<String> =
+        serde_json::from_slice(&fixture("qoder-cli", "flags.json")).expect("the two elements");
+    assert_eq!(qoder.flags, pinned, "the release declares the pinned registration");
+    assert!(qoder.variables.is_empty());
 }

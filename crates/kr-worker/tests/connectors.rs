@@ -10,6 +10,7 @@
 //! | KR-REQ-12.07 | an integrated command resolves to the connector its installed package carries, and to nothing else; its command, flags and variables are the verified manifest's, and apply only while `command_integration.launch` is granted |
 //! | KR-REQ-11.34 | the table a channel is served with is the installed package's own |
 //! | KR-REQ-12.22 | Qoder CLI's launch flags give its launch a hook bridge on this installation's own forwarder, for Qoder CLI and nothing else |
+//! | KR-REQ-12.18, KR-REQ-12.20, KR-REQ-12.22 | the test packages declare the command integrations the released packages declare |
 
 use std::path::{Path, PathBuf};
 
@@ -502,4 +503,35 @@ fn kr_req_12_07_a_manifest_altered_to_declare_other_flags_is_refused() {
     let sources = ConnectorSources::new();
     assert_eq!(sources.replace(vec![source]).len(), 1);
     assert!(sources.for_command(fixture::COMMAND).is_none());
+}
+
+/// The manifest of a released package, as core pins it.
+fn released(package: &str) -> serde_json::Value {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/plugins/released/kalareach")
+        .join(package)
+        .join("0.4.0/plugin.json");
+    let bytes = std::fs::read(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+    serde_json::from_slice(&bytes).expect("the released manifest is JSON")
+}
+
+/// KR-REQ-12.18, KR-REQ-12.20, KR-REQ-12.22: the packages these tests install declare exactly the
+/// command integrations the released packages declare, grant statement included, so every launch
+/// these suites make adds what a release adds.
+#[test]
+fn the_test_packages_declare_the_released_integrations() {
+    for (shape, package) in [
+        (fixture::Shape::claude_code(), "claude-code"),
+        (fixture::Shape::gemini_cli(&[]), "gemini-cli"),
+        (fixture::Shape::qoder_cli(), "qoder-cli"),
+    ] {
+        assert_eq!(
+            shape.integration.as_ref(),
+            Some(&released(package)["command_integration"]),
+            "{package}"
+        );
+    }
+    let claude = &released("claude-code")["command_integration"];
+    assert_eq!(claude["command"], fixture::COMMAND);
+    assert_eq!(claude["flags"], serde_json::json!(fixture::FLAGS));
 }

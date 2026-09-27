@@ -4598,6 +4598,7 @@ dependencies = [
  "clap",
  "kr-crypto",
  "kr-ipc",
+ "kr-plugin-sdk",
  "kr-protocol",
  "kr-worker",
  "rmcp",

@@ -47,6 +47,9 @@ kr-worker = { workspace = true, features = ["testing"] }
 # A launch's tests wait for the stand-in application's end without collecting it, and end the
 # process group it leads, through the kernel's own calls rather than by reading what `ps` prints.
 rustix = { workspace = true, features = ["process"] }
+# The released packages' manifests are read and their command integrations checked by the
+# package contract's own rules.
+kr-plugin-sdk.workspace = true
 # The bridge files the plugin package installs are pinned here by their SHA-256 digests.
 sha2.workspace = true
 tokio = { workspace = true, features = ["io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
