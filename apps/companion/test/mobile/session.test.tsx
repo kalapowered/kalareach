@@ -9,7 +9,7 @@
 
 import { Profiler, type ReactNode } from 'react'
 import { describe, expect, it, vi } from 'vitest'
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 
 import type { DocumentNode } from '@kalareach/plugin-sdk'
@@ -1015,7 +1015,7 @@ describe("the phone's raw terminal view (KR-REQ-08.02, 13.18)", () => {
     expect(programInputs(controls)).toHaveLength(4)
   })
 
-  it('says why a key did not reach the program where the mode says what it does, until one does', async () => {
+  it('says why a key did not reach the program beside its keyboard, until a key that goes', async () => {
     const { port, controls } = fakeHost()
     controls.holdTerminalViews()
     controls.holdTerminalMoves()
@@ -1030,17 +1030,90 @@ describe("the phone's raw terminal view (KR-REQ-08.02, 13.18)", () => {
     await waitFor(() => {
       expect(screen.getByRole('button', { name: 'Escape' })).toBeEnabled()
     })
-    await person.click(screen.getByRole('button', { name: 'Escape' }))
+    const keyboard = programKeyboard()
+    if (keyboard === null) throw new Error('no program keyboard')
+    fireEvent.keyDown(keyboard, { key: 'q', code: 'KeyQ' })
     const refused = "That key did not reach the program: the view is waiting for the session's screen."
-    expect(await screen.findByText(refused)).toBeInTheDocument()
+    // Above the field, which stays in view with a software keyboard up, and in the field's own
+    // status for a screen reader; not in the bar, which a software keyboard hides.
+    await waitFor(() => {
+      expect(screen.getAllByText(refused)).toHaveLength(2)
+    })
+    expect(keyboard.parentElement?.querySelector('[role="status"]')?.textContent).toBe(refused)
+    expect(document.querySelector('.m-terminal-hud')?.textContent).not.toContain(refused)
     act(() => {
       controls.terminalViews[0]?.show()
     })
+    // The release of the refused press is taken and writes nothing: the words stay.
+    fireEvent.keyUp(keyboard, { key: 'q', code: 'KeyQ' })
+    await act(async () => {
+      await new Promise((resolve) => {
+        setTimeout(resolve, 0)
+      })
+    })
+    expect(screen.getAllByText(refused)).toHaveLength(2)
     await person.click(screen.getByRole('button', { name: 'Escape' }))
     await waitFor(() => {
       expect(screen.queryByText(refused)).toBeNull()
     })
-    expect(programInputs(controls)).toEqual([key('Escape', 'press'), key('Escape', 'release')])
+    expect(programInputs(controls)).toEqual([
+      key('q', 'release'),
+      key('Escape', 'press'),
+      key('Escape', 'release')
+    ])
+  })
+
+  it('moves the focus to Attach again when the view ends with it in the program keyboard or on a terminal key', async () => {
+    for (const where of ['keyboard', 'key'] as const) {
+      const { port, controls } = fakeHost()
+      const person = await onTerminal(port)
+      await waitFor(() => {
+        expect(screen.getAllByTestId('mobile-terminal-line').length).toBeGreaterThan(0)
+      })
+      await takeControl(person, controls)
+      if (where === 'keyboard') programKeyboard()?.focus()
+      else screen.getByRole('button', { name: 'Escape' }).focus()
+      act(() => {
+        controls.terminalViews[0]?.end('The session ended.')
+      })
+      await waitFor(() => {
+        expect(screen.getByRole('button', { name: 'Attach again' })).toHaveFocus()
+      })
+      expect(screen.getByRole('button', { name: 'Take control' })).toBeDisabled()
+      cleanup()
+    }
+  })
+
+  it('moves on from the draft field with Control-Tab and back with Control-Shift-Tab, and leaves it Tab', async () => {
+    const { port, controls } = fakeHost()
+    controls.holdTerminalControl()
+    const person = await onTerminal(port)
+    await waitFor(() => {
+      expect(screen.getAllByTestId('mobile-terminal-line').length).toBeGreaterThan(0)
+    })
+    await person.type(screen.getByLabelText('Message this session'), 'ls')
+    const field = screen.getByLabelText('Message this session')
+    for (const state of ['watching', 'taking'] as const) {
+      if (state === 'taking') await person.click(screen.getByRole('button', { name: 'Take control' }))
+      // The chord's default is prevented and the field moves the focus itself; a browser does
+      // nothing with Control-Tab in a field.
+      field.focus()
+      expect(fireEvent.keyDown(field, { key: 'Tab', code: 'Tab', ctrlKey: true }), state).toBe(false)
+      expect(screen.getByRole('button', { name: 'Send' }), state).toHaveFocus()
+      field.focus()
+      expect(
+        fireEvent.keyDown(field, { key: 'Tab', code: 'Tab', ctrlKey: true, shiftKey: true }),
+        state
+      ).toBe(false)
+      // Back past the terminal keys, which wait for control, to the status's More.
+      expect(screen.getByRole('button', { name: 'More' }), state).toHaveFocus()
+      // Tab and Shift-Tab are the platform's.
+      field.focus()
+      expect(fireEvent.keyDown(field, { key: 'Tab', code: 'Tab' }), state).toBe(true)
+      expect(fireEvent.keyDown(field, { key: 'Tab', code: 'Tab', shiftKey: true }), state).toBe(true)
+      expect(field, state).toHaveFocus()
+    }
+    expect(programInputs(controls)).toEqual([])
   })
 
   it('returns to view mode when control ends, says why, and moves focus from a key that can no longer be pressed', async () => {

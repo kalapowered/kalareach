@@ -965,6 +965,52 @@ test.describe("the program's keyboard", () => {
     expect(await page.getByLabel('Type to the program').inputValue()).toBe('​')
   })
 
+  test("the phone's focus goes to the mode button once a software keyboard has gone, when control ends under it", async ({
+    page
+  }) => {
+    await page.setViewportSize({ width: 390, height: 844 })
+    await page.goto(`/harness.html?surface=ios&session=${SESSION}`)
+    await page.getByRole('tab', { name: 'Terminal' }).click()
+    await expect(page.getByTestId('mobile-terminal-line').first()).toContainText('$ cargo')
+    await takeControl(page)
+    await page.getByLabel('Type to the program').focus()
+    // A software keyboard over the page hides the bar that holds the mode button.
+    const cover = (inset: number) =>
+      page.evaluate((covered) => {
+        document.documentElement.style.setProperty('--keyboard', `${covered}px`)
+      }, inset)
+    await cover(336)
+    await expect(page.locator('.m-terminal-hud')).toBeHidden()
+    await page.evaluate(() => {
+      window.krTestHost?.terminalViews.at(-1)?.loseControl()
+    })
+    await expect(page.getByLabel('Type to the program')).toHaveCount(0)
+    // The mode button is hidden with the bar, and takes no focus yet.
+    await expect(page.getByRole('button', { name: 'Take control', includeHidden: true })).toBeHidden()
+    await expect(page.getByRole('button', { name: 'Take control', includeHidden: true })).not.toBeFocused()
+    // The field gone, the keyboard goes: the bar is back, and the focus goes to the mode button.
+    await cover(0)
+    await expect(page.getByRole('button', { name: 'Take control' })).toBeFocused()
+  })
+
+  test("the phone's draft field moves on with Control-Tab and back with Control-Shift-Tab while the view watches", async ({
+    page
+  }) => {
+    await page.setViewportSize({ width: 390, height: 844 })
+    await page.goto(`/harness.html?surface=android&session=${SESSION}`)
+    await page.getByRole('tab', { name: 'Terminal' }).click()
+    await expect(page.getByTestId('mobile-terminal-line').first()).toContainText('$ cargo')
+    const field = page.getByLabel('Message this session')
+    await field.fill('ls')
+    await field.focus()
+    await page.keyboard.press('Control+Tab')
+    await expect(page.getByRole('button', { name: 'Send' })).toBeFocused()
+    await field.focus()
+    await page.keyboard.press('Control+Shift+Tab')
+    await expect(page.getByRole('button', { name: 'More' })).toBeFocused()
+    await expect(field).toHaveValue('ls')
+  })
+
   for (const surface of ['ios', 'android'] as const) {
     test(`the phone's field is the program's keyboard while the view controls it, on ${surface}`, async ({
       page
@@ -1241,6 +1287,9 @@ test.describe("the phone's room for its terminal", () => {
     { width: 390, height: 844, keyboard: 336, rows: 14, typing: 10 }
   ] as const
 
+  /** Where a screenshot for this browser goes, so each engine keeps its own. */
+  const shotFor = (name: string): string => shot(`${name}-${test.info().project.name}`)
+
   /** Opens the harness in one colour mode, whatever the system's. */
   async function inTheme(page: Page, theme: 'light' | 'dark'): Promise<void> {
     await page.addInitScript((mode) => {
@@ -1371,6 +1420,38 @@ test.describe("the phone's room for its terminal", () => {
         })
       }
     }
+  }
+
+  // Why a paste did not reach the program stays in view above the program's keyboard with a software
+  // keyboard up, and the terminal keeps its floor while it does.
+  for (const surface of ['ios', 'android'] as const) {
+    test(`keeps room on ${surface} at 320×720 while it says why a paste did not go, with the keyboard up`, async ({
+      page
+    }) => {
+      const phone = PHONES[0]
+      await page.setViewportSize({ width: phone.width, height: phone.height })
+      await page.goto(`/harness.html?surface=${surface}&session=${SESSION_MAIN}`)
+      await page.getByRole('tab', { name: 'Terminal' }).click()
+      await expect(page.getByTestId('mobile-terminal-line').first()).toContainText('$ cargo')
+      await takeControl(page)
+      const field = page.getByLabel('Type to the program')
+      await field.focus()
+      await keyboard(page, phone.keyboard)
+      await expect(page.locator('.m-terminal-hud')).toBeHidden()
+      await page.evaluate((text) => {
+        const data = new DataTransfer()
+        data.setData('text/plain', text)
+        document.activeElement?.dispatchEvent(
+          new ClipboardEvent('paste', { clipboardData: data, bubbles: true, cancelable: true })
+        )
+      }, 'x'.repeat(64 * 1024))
+      const words = page.locator('.m-unsent')
+      await expect(words).toHaveText('That paste did not reach the program: it is longer than one input can carry.')
+      await expect(words).toBeInViewport({ ratio: 1 })
+      await expect(field).toBeInViewport({ ratio: 1 })
+      await expectRoom(page, FLOOR, 'while it says why')
+      await page.screenshot({ path: shotFor(`terminal-unsent-13.17-${surface}-320x720`) })
+    })
   }
 
   // A person's own larger text size: every size given in rem grows with it. The field still shows

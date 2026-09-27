@@ -73,8 +73,9 @@ import {
   type HeldDrag,
   type Point
 } from '../../terminal/pan'
-import { useProgramKeyboard, type Latched } from '../../terminal/keyboard'
-import { SENTINEL } from '../../terminal/keys'
+import { useFocusWhenControlEnds } from '../../terminal/focus'
+import { moveFocus, useProgramKeyboard, type Latched } from '../../terminal/keyboard'
+import { focusEscape, readingOf, SENTINEL } from '../../terminal/keys'
 import { FALLBACK_GRID, useTerminalView } from '../../terminal/view'
 import { AccessoryRow } from '../components/keys'
 import { AttachmentPicker } from '../components/picker'
@@ -157,6 +158,7 @@ export function MobileSession({
   const statusId = useId()
   const modeButtonId = useId()
   const sendId = useId()
+  const attachAgainId = useId()
   const keysHelpId = useId()
   // Whether a software keyboard hides part of the session.
   const [keyboardUp, setKeyboardUp] = useState(false)
@@ -432,21 +434,16 @@ export function MobileSession({
   )
 
   // Focus that was on a terminal key or in the program's keyboard when control ends goes to the mode
-  // button, which takes control again: a key that can no longer be pressed, or a field that has
-  // gone, is no place to leave it.
-  const lastFocused = useRef<Element | null>(null)
-  const wasControlling = useRef(controlling)
-  useLayoutEffect(() => {
-    if (wasControlling.current && !controlling) {
-      const onKey = (element: Element | null) =>
-        element?.closest('.m-accessory') != null || element?.matches('[data-program-keyboard]') === true
-      const active = document.activeElement
-      if (onKey(active) || ((active === null || active === document.body) && onKey(lastFocused.current))) {
-        document.getElementById(modeButtonId)?.focus()
-      }
-    }
-    wasControlling.current = controlling
-  }, [controlling, modeButtonId])
+  // button, which takes control again, or once the view has ended to Attach again: a key that can no
+  // longer be pressed, or a field that has gone, is no place to leave it. While a software keyboard
+  // is up the bar holding the mode button is hidden, and the focus goes there once it is back.
+  const terminalEnded = terminal?.state === 'ended'
+  const focusedInComposer = useFocusWhenControlEnds({
+    controlling,
+    heldFor: (element) =>
+      element?.closest('.m-accessory') != null || element?.matches('[data-program-keyboard]') === true,
+    destination: () => document.getElementById(terminalEnded ? attachAgainId : modeButtonId)
+  })
 
   const mine = lifecycle.state.submissions.filter((submission) =>
     isForSession(submission.localId, sessionId)
@@ -473,6 +470,7 @@ export function MobileSession({
   ) : null
   // Send changes place when the composer changes form, and focus that was on it goes with it: a
   // control taken away from under the focus would leave a keyboard nowhere.
+  const lastFocused = useRef<Element | null>(null)
   const wasLine = useRef(asLine)
   useLayoutEffect(() => {
     if (wasLine.current !== asLine) {
@@ -494,6 +492,14 @@ export function MobileSession({
       aria-describedby={hint ? `composer-why-${sessionId}` : undefined}
       onChange={(event) => {
         setDraft(edit(draft, event.target.value, Date.now()))
+      }}
+      onKeyDown={(event) => {
+        // Control-Tab and Control-Shift-Tab move on from the field as they do from the program's
+        // keyboard; Tab and Shift-Tab are left to the platform.
+        const escape = focusEscape(readingOf(event.nativeEvent))
+        if (escape === null) return
+        event.preventDefault()
+        moveFocus(event.currentTarget, escape)
       }}
     />
   )
@@ -520,6 +526,9 @@ export function MobileSession({
       ) : null}
       <span id={keysHelpId} className="visually-hidden">
         Tab goes to the program; Control-Tab moves on.
+      </span>
+      <span className="visually-hidden" role="status">
+        {unsent}
       </span>
     </span>
   )
@@ -636,7 +645,7 @@ export function MobileSession({
                 title="This terminal has ended"
                 detail={terminal.reason}
                 action={
-                  <Button data-testid="attach-again" onClick={again}>
+                  <Button id={attachAgainId} data-testid="attach-again" onClick={again}>
                     Attach again
                   </Button>
                 }
@@ -683,6 +692,7 @@ export function MobileSession({
           className="m-composer-body"
           onFocus={(event) => {
             lastFocused.current = event.target
+            focusedInComposer(event)
           }}
         >
           {pane === 'terminal' ? (
@@ -747,8 +757,7 @@ export function MobileSession({
                     ) : null}
                     <p>
                       <span role="status">
-                        {unsent ??
-                          describeMode(control ?? { number: 0, state: 'watching', ended: null }, frame?.wheel ?? null)}
+                        {describeMode(control ?? { number: 0, state: 'watching', ended: null }, frame?.wheel ?? null)}
                       </span>{' '}
                       {terminal === null ? (
                         <span data-testid="terminal-presentation" data-presentation="attaching">
@@ -834,6 +843,14 @@ export function MobileSession({
            * field's line: however long it runs, the line keeps the composer's floor.
            */}
           {pane === 'terminal' ? reason : null}
+          {typingToProgram && unsent !== null ? (
+            // Why an input did not reach the program stands above the program's keyboard, where it
+            // stays in view with a software keyboard up, until an input reaches it. The field's own
+            // status says it to a screen reader.
+            <p className="m-hint m-unsent" aria-hidden="true">
+              {unsent}
+            </p>
+          ) : null}
           {/*
            * The field keeps its place in every form the composer takes, so a change of form never
            * takes it away from under the person typing in it. As the composer's line it is one line

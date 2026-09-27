@@ -1287,21 +1287,52 @@ describe("the desktop's keys reach the program while the view controls it (KR-RE
       })
       await takeControl(person, controls)
       // No screen yet: the view cannot say how the program reads keys.
-      await person.click(screen.getByTestId('terminal-surface').firstElementChild as HTMLElement)
-      await person.keyboard('q')
+      const refused = "That key did not reach the program: the view is waiting for the session's screen."
+      const keyboard = programKeyboard()
+      if (keyboard === null) throw new Error('no program keyboard')
+      fireEvent.keyDown(keyboard, { key: 'q', code: 'KeyQ' })
       await waitFor(() => {
-        expect(sentence()).toBe("That key did not reach the program: the view is waiting for the session's screen.")
+        expect(sentence()).toBe(refused)
       })
       expect(modeBadge()).toBe('Control')
       expect(programInputs(controls)).toEqual([])
       act(() => {
         controls.terminalViews[0]?.show()
       })
-      await person.keyboard('q')
+      // The release of the refused press is taken and writes nothing: the words stay.
+      fireEvent.keyUp(keyboard, { key: 'q', code: 'KeyQ' })
+      await settle()
+      expect(programInputs(controls)).toEqual([key('q', 'release')])
+      expect(sentence()).toBe(refused)
+      // A press that goes ends them.
+      fireEvent.keyDown(keyboard, { key: 'w', code: 'KeyW' })
       await waitFor(() => {
         expect(sentence()).toBe('Your keys go to the program; Control-Tab moves on. The program gets the wheel.')
       })
-      expect(programInputs(controls)).toEqual([key('q', 'press'), key('q', 'release')])
+      expect(programInputs(controls)).toEqual([key('q', 'release'), key('w', 'press')])
+    } finally {
+      restore()
+    }
+  })
+
+  it('moves the focus to Attach again when the view ends with the focus in the program keyboard', async () => {
+    const person = userEvent.setup()
+    const restore = laidOut()
+    try {
+      const { port, controls } = fakeHost()
+      open(port)
+      await screen.findByTestId('palette-provenance')
+      await takeControl(person, controls)
+      programKeyboard()?.focus()
+      act(() => {
+        controls.terminalViews[0]?.end('The session ended.')
+      })
+      await waitFor(() => {
+        expect(programKeyboard()).toBeNull()
+      })
+      // The mode button waits for a view to control: Attach again is where the person goes on.
+      expect(screen.getByRole('button', { name: 'Take control' })).toBeDisabled()
+      expect(screen.getByRole('button', { name: 'Attach again' })).toHaveFocus()
     } finally {
       restore()
     }

@@ -64,6 +64,7 @@ import {
   selectionRule,
   type PlacedCursor
 } from './frame'
+import { useFocusWhenControlEnds } from './focus'
 import { cellUnder, wheelPixels, wheelTurns } from './input'
 import { useProgramKeyboard } from './keyboard'
 import { applePlatform, SENTINEL } from './keys'
@@ -331,21 +332,16 @@ export function RawTerminal({
   const { attach, composing, focus } = useProgramKeyboard({ controlTake, toProgram, refuse, apple })
   const modeButtonId = useId()
   const sentenceId = useId()
+  const attachAgainId = useId()
 
   // Focus that was in the program's keyboard when control ends goes to the mode button, which takes
-  // control again: a field that has gone is no place to leave it.
-  const lastFocused = useRef<Element | null>(null)
-  const wasControlling = useRef(controlling)
-  useLayoutEffect(() => {
-    if (wasControlling.current && !controlling) {
-      const active = document.activeElement
-      const nowhere = active === null || active === document.body
-      if (nowhere && lastFocused.current?.matches('[data-program-keyboard]') === true) {
-        document.getElementById(modeButtonId)?.focus()
-      }
-    }
-    wasControlling.current = controlling
-  }, [controlling, modeButtonId])
+  // control again, or once the view has ended to Attach again: a field that has gone is no place to
+  // leave it.
+  const focusedInSurface = useFocusWhenControlEnds({
+    controlling,
+    heldFor: (element) => element?.matches('[data-program-keyboard]') === true,
+    destination: () => document.getElementById(ended ? attachAgainId : modeButtonId)
+  })
 
   // The drag in progress, a wheel's part of a cell carried to its next move of the window, and a
   // wheel's part of a row carried to its next turn of the program's wheel. The part of the drag not
@@ -599,7 +595,7 @@ export function RawTerminal({
       {state?.state === 'ended' ? (
         <div className="banner warning row between" role="status" data-testid="terminal-ended">
           <span>{state.reason}</span>
-          <Button data-testid="attach-again" onClick={again}>
+          <Button id={attachAgainId} data-testid="attach-again" onClick={again}>
             Attach again
           </Button>
         </div>
@@ -662,9 +658,7 @@ export function RawTerminal({
           onLostPointerCapture={(event) => {
             if (event.pointerId === dragging.current?.pointer) dropDrag()
           }}
-          onFocus={(event) => {
-            lastFocused.current = event.target
-          }}
+          onFocus={focusedInSurface}
           onClick={() => {
             // A click that selects nothing is the person turning to the program; one that selects
             // text leaves the focus where the selection can be copied from.

@@ -103,7 +103,8 @@ export interface TerminalViewing {
   readonly refuse: (words: string) => void
   /**
    * Why the person's last input did not reach the program, while the view still controls it under
-   * the take it was made under and no input has reached the program since; null otherwise.
+   * the take it was made under and no press, repeat, text or paste has reached the program since;
+   * null otherwise.
    */
   readonly unsent: string | null
 }
@@ -416,10 +417,15 @@ export function useTerminalView(
       const take = controlTake()
       if (open?.view == null || take === null) return Promise.resolve()
       const answer = inTurn(open, open.view, { ...input, take })
-      // An input that reaches the program ends the words of one that did not. A refusal of control
-      // that has just ended is said by the view's own state; any other refusal says why here.
+      // An input that reaches the program ends the words of one that did not. Native code writes a
+      // press, a repeat, text and a paste whenever it takes them; it can take a release or a wheel
+      // turn and write nothing, as for the release of a press it refused, so neither ends them. A
+      // refusal of control that has just ended is said by the view's own state; any other refusal
+      // says why here.
+      const writes = input.kind === 'text' || input.kind === 'paste' || (input.kind === 'key' && input.event !== 'release')
       answer.then(
         () => {
+          if (!writes) return
           setUnsentInput((current) =>
             current?.sessionId === open.sessionId && current.attempt === open.attempt ? null : current
           )
