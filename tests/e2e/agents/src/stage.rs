@@ -489,12 +489,16 @@ pub struct OwnHome {
     pub worker_profile: serde_json::Value,
     /// Whether the host named a desktop the session is bound to.
     pub bound_to_a_desktop: bool,
+    /// What `security show-keychain-info` exited with in the session, where it said: 36, user
+    /// interaction not allowed, is a keychain a program in the session cannot read.
+    pub keychain_info_status: Option<i64>,
 }
 
 /// Starts a session the way a person does, `kr new` at a terminal with no choice of execution
 /// context, so the host gives it the one it gives every session, with `home` as the session's home
-/// and no agent; reads the default keychain its shell sees with `security default-keychain`, which
-/// changes nothing; and ends the session.
+/// and no agent; reads the default keychain its shell sees with `security default-keychain`, and
+/// whether a program there can read it with `security show-keychain-info`, neither of which changes
+/// anything; and ends the session.
 ///
 /// The session's shell reads the run's own startup file, not the person's, so nothing of theirs
 /// runs; what the keychain search depends on, the home the session names, is theirs.
@@ -566,12 +570,34 @@ pub fn default_keychain_of_a_session(
         .find(|row| row.contains(".keychain") && !row.contains("security default-keychain"))
         .map(|row| row.trim().to_owned())
         .expect("a keychain row");
+    // Whether a program in the session can read that keychain: the status alone, as 1000 more than
+    // itself so the line that shows it is not the command's own echo, and nothing it printed.
+    window.type_text(
+        b"/usr/bin/security show-keychain-info >/dev/null 2>&1; echo kr-keychain-probe-$(( $? + 1000 ))\r",
+    );
+    let rows = window.wait_for_screen(
+        "kr-keychain-probe-1",
+        "the session says how its keychain answered",
+    );
+    let keychain_info_status = rows
+        .iter()
+        .find_map(|row| {
+            let at = row.find("kr-keychain-probe-1")?;
+            row[at + "kr-keychain-probe-".len()..]
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+                .parse::<i64>()
+                .ok()
+        })
+        .map(|shown| shown - 1000);
     window.type_text(b"exit\r");
     let _ = window.exit_code(LIVENESS);
     OwnHome {
         default_keychain: named,
         worker_profile: created[0]["worker_profile"].clone(),
         bound_to_a_desktop: created[0]["desktop"]["desktop_session_id"].is_string(),
+        keychain_info_status,
     }
 }
 
