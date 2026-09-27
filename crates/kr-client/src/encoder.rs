@@ -813,6 +813,18 @@ fn legacy_character(
         && let Some(byte) = control_byte(character)
     {
         if modify_other_keys < 2 {
+            if modify_other_keys == 1
+                && modifiers.alt
+                && modifiers.shift
+                && !('@'..='~').contains(&character)
+            {
+                // Space, `2` to `8`, `/` and `?` have their control characters from X11 rather
+                // than from their letter, and xterm reports this chord on them at level one as
+                // Shift and Control alone.
+                return Err(Unsupported::NotExpressible {
+                    what: "Alt with Shift and Control on this key",
+                });
+            }
             // Alt is the escape prefix, and it goes in front of the control byte rather than in
             // front of the letter: Control-Alt-C is an escape and then the byte Control-C is, not
             // an escape and then a `c`.
@@ -1796,6 +1808,27 @@ mod tests {
             spelled(on('1', '1', CONTROL_ALT), LEVEL_TWO),
             b"\x1b[27;7;49~"
         );
+        // X11 gives Space, `2` to `8`, `/` and `?` their control characters, and xterm reports them
+        // at level 1 with Shift, Control and Alt as Shift and Control alone, so that chord is
+        // refused; a letter's control character keeps the escape prefix.
+        let all = Modifiers {
+            shift: true,
+            alt: true,
+            control: true,
+            superkey: false,
+        };
+        for (base, produced) in [(' ', ' '), ('2', '2'), ('/', '?')] {
+            assert_eq!(
+                key(on(base, produced, all), LEVEL_ONE),
+                Err(Unsupported::NotExpressible {
+                    what: "Alt with Shift and Control on this key"
+                }),
+                "{produced}"
+            );
+        }
+        assert_eq!(spelled(on('a', 'A', all), LEVEL_ONE), b"\x1b\x01");
+        assert_eq!(spelled(on(' ', ' ', all), LEGACY), b"\x1b\x00");
+        assert_eq!(spelled(on(' ', ' ', all), LEVEL_TWO), b"\x1b[27;8;32~");
     }
 
     /// KR-REQ-08.59: Control and a character is what X11 makes of it, which is what xterm sends,
