@@ -9,7 +9,7 @@
 //! | --- | --- |
 //! | KR-REQ-10.49 | `one_filter_covers_every_surface_a_grant_reaches`, `a_summary_made_now_from_pre_cutoff_content_is_withheld_or_recomputed`, `derived_data_names_the_interval_and_resources_it_was_built_from` |
 //! | KR-REQ-10.50 | `a_live_only_invitation_is_installed_the_visible_screen_only_when_the_issuer_selected_it`, `the_live_screen_exception_never_reaches_the_buffer_that_is_not_showing`, `attachment_bytes_need_their_own_file_grant`, `voice_context_intersects_the_requesting_device_scope` |
-//! | KR-REQ-10.51 | `a_named_question_is_permitted_and_previewed_although_it_predates_the_cutoff`, `a_named_approval_is_excepted_only_while_it_is_current`, `a_pending_resource_snapshot_does_not_bypass_the_filter_without_that_scope` |
+//! | KR-REQ-10.51 | `a_named_question_is_permitted_and_previewed_although_it_predates_the_cutoff`, `a_named_question_is_excepted_only_while_it_is_open`, `a_named_approval_is_excepted_only_while_it_is_current`, `a_pending_resource_snapshot_does_not_bypass_the_filter_without_that_scope` |
 
 use kr_protocol::gateway::PendingState;
 use kr_protocol::grant::{EnvironmentSelector, Grant, GrantExpiry, HistoryScope, SessionSelector};
@@ -17,6 +17,7 @@ use kr_protocol::ids::{
     AuthorityRevision, DeviceId, GrantId, PendingResourceId, QuestionId, SessionId,
 };
 use kr_protocol::projection::{ProjectedBuffer, ProjectionEvent, ProjectionResetReason};
+use kr_protocol::question::QuestionState;
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{CanonicalSet, Nullable, TimestampMs, U64, Uuid};
 use kr_term::lane::LaneGate;
@@ -422,7 +423,10 @@ fn a_named_question_is_permitted_and_previewed_although_it_predates_the_cutoff()
 
     // Created long before the cutoff, and permitted because the invitation names it. The approval
     // is decided by the filter's rule for a name a grant carries, while it is still pending.
-    assert_eq!(filter.admit_question(named, 1_000), Ok(()));
+    assert_eq!(
+        filter.admit_question(named, 1_000, QuestionState::Pending),
+        Ok(())
+    );
     assert_eq!(
         filter.admit_approval(approval, 1_000, PendingState::Pending),
         Ok(())
@@ -440,7 +444,7 @@ fn a_named_question_is_permitted_and_previewed_although_it_predates_the_cutoff()
 
     // And another question from the same period is not named, so it is not permitted.
     assert_eq!(
-        filter.admit_question(unnamed, 1_000),
+        filter.admit_question(unnamed, 1_000, QuestionState::Pending),
         Err(WithheldReason::NotNamedByTheGrant)
     );
     assert_eq!(
@@ -524,6 +528,80 @@ fn a_named_approval_is_excepted_only_while_it_is_current() {
     );
 }
 
+/// Section 10 permits the exact current decisions an invitation names, and a question is one while
+/// it can still be answered. A named question is excepted from the bound while it is pending, and
+/// loses the exception once it is answered, cancelled or has expired; a question nothing names
+/// meets the bound in every state. A grant that keeps no retained history reaches an open named
+/// question and nothing else, and a grant without `session.view` reaches none, named or not.
+#[test]
+fn a_named_question_is_excepted_only_while_it_is_open() {
+    let named = question_id(0x75);
+    let unnamed = question_id(0x76);
+    let before = CUTOFF_MS - 5_000;
+    let filter = HistoryFilter::new(ViewerScope::from_grant(&grant(
+        scope(Some(CUTOFF_MS), false, &[named], &[]),
+        &[ActionRight::SessionView],
+    )));
+    for state in [
+        QuestionState::Pending,
+        QuestionState::Answered,
+        QuestionState::Cancelled,
+        QuestionState::Expired,
+    ] {
+        let decided = filter.admit_question(named, before, state);
+        if state.is_resolved() {
+            assert_eq!(
+                decided,
+                Err(WithheldReason::NotNamedByTheGrant),
+                "a resolved question is an old record: {state}"
+            );
+        } else {
+            assert_eq!(decided, Ok(()), "an open named question: {state}");
+        }
+        assert_eq!(
+            filter.admit_question(unnamed, before, state),
+            Err(WithheldReason::NotNamedByTheGrant),
+            "nothing names it: {state}"
+        );
+        assert_eq!(
+            filter.admit_question(unnamed, CUTOFF_MS, state),
+            Ok(()),
+            "{state}"
+        );
+        assert_eq!(
+            filter.admit_question(named, CUTOFF_MS + 1, state),
+            Ok(()),
+            "{state}"
+        );
+    }
+
+    let live_only = HistoryFilter::new(ViewerScope::from_grant(&grant(
+        scope(None, true, &[named], &[]),
+        &[ActionRight::SessionView],
+    )));
+    assert_eq!(
+        live_only.admit_question(named, before, QuestionState::Pending),
+        Ok(())
+    );
+    assert_eq!(
+        live_only.admit_question(named, before, QuestionState::Answered),
+        Err(WithheldReason::NotNamedByTheGrant)
+    );
+    assert_eq!(
+        live_only.admit_question(unnamed, CUTOFF_MS + 1, QuestionState::Pending),
+        Err(WithheldReason::NotNamedByTheGrant)
+    );
+
+    let blind = HistoryFilter::new(ViewerScope::from_grant(&grant(
+        scope(Some(0), true, &[named], &[]),
+        &[ActionRight::FilesRead],
+    )));
+    assert_eq!(
+        blind.admit_question(named, before, QuestionState::Pending),
+        Err(WithheldReason::NoSessionView)
+    );
+}
+
 /// The scope a worker builds from what a forwarded read carries is the grant's history scope and
 /// nothing more: it sees the session only when the caller says the grant does, and it never reads
 /// file bytes, which need `files.read` of their own. A grant keeps its own `files.read`.
@@ -565,11 +643,14 @@ fn a_pending_resource_snapshot_does_not_bypass_the_filter_without_that_scope() {
     // A question that is still pending now, created before the cutoff. Being pending is not an
     // exception: without the named scope the ordinary bound applies.
     assert_eq!(
-        filter.admit_question(pending, 1_000),
+        filter.admit_question(pending, 1_000, QuestionState::Pending),
         Err(WithheldReason::NotNamedByTheGrant)
     );
     // One created after the cutoff is served on the ordinary rule, named or not.
-    assert_eq!(filter.admit_question(pending, 20_000), Ok(()));
+    assert_eq!(
+        filter.admit_question(pending, 20_000, QuestionState::Pending),
+        Ok(())
+    );
 
     // And a snapshot taken now of that pending resource carries the same answer, because the
     // decision reads when the content was produced rather than when the snapshot was taken.
@@ -601,7 +682,7 @@ fn a_grant_without_session_view_reaches_no_surface() {
         );
     }
     assert_eq!(
-        filter.admit_question(question_id(7), 0),
+        filter.admit_question(question_id(7), 0, QuestionState::Pending),
         Err(WithheldReason::NoSessionView),
         "a named question is still session content"
     );

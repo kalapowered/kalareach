@@ -1894,16 +1894,21 @@ impl WorkerService {
     ///
     /// The clock floor it maps, by the floor's identity, so a control daemon can tell whether this
     /// worker decides UTC deadlines from the same floor as it does; a worker that maps none states
-    /// none. And that it reads the history scope a forwarded read carries, which a daemon sends
-    /// only to a worker that says so.
+    /// none. That it reads the history scope a forwarded read carries, which a daemon sends only to
+    /// a worker that says so, and that it holds a question read to that scope, without which a
+    /// daemon sends it no question read with one.
     fn stated_capabilities(&self) -> CanonicalSet<kr_protocol::ids::CapabilityId> {
         self.time
             .floor_identity()
             .map(|identity| kr_protocol::local::utc_floor_capability(identity.as_bytes()))
             .into_iter()
             .chain(
-                kr_protocol::ids::CapabilityId::new(kr_protocol::local::FORWARDED_HISTORY_SCOPE)
-                    .ok(),
+                [
+                    kr_protocol::local::FORWARDED_HISTORY_SCOPE,
+                    kr_protocol::local::FORWARDED_QUESTION_SCOPE,
+                ]
+                .into_iter()
+                .filter_map(|capability| kr_protocol::ids::CapabilityId::new(capability).ok()),
             )
             .collect()
     }
@@ -2930,7 +2935,7 @@ impl WorkerService {
             Method::ActionRead => self.action_read(&caller.actor_id, &request.params),
             Method::InputWrite => self.input_write(state, &request.params, caller),
             Method::QuestionReadOwn => self.question_read_own(state, &request.params),
-            Method::QuestionRead => self.question_read(&request.params),
+            Method::QuestionRead => self.question_read(&request.params, caller),
             Method::AgentCapabilities => self.agent_capabilities(&request.params),
             Method::AgentSnapshot => self.agent_snapshot(state, &request.params, caller),
             Method::AgentCommands => self.agent_commands(&request.params),
@@ -5219,15 +5224,43 @@ impl WorkerService {
         encode(&result)
     }
 
-    /// Reads the questions an answering actor may see.
-    fn question_read(&self, params: &ParamsValue) -> Result<ParamsValue> {
+    /// Reads the questions an answering actor may see, through the caller's own history filter.
+    ///
+    /// A question is session content: what an application asked, the context it gave and, once
+    /// there is one, the answer. Section 10's shared filter decides each by its caller's scope
+    /// ([`crate::history_filter::HistoryFilter::admit_question`]): one asked at or after the moment
+    /// the grant reaches back to is read in any state, and one the grant names however early it
+    /// was asked, while it is open. The local owner reads every question, and a caller acting
+    /// under a grant whose scope did not come with the read is refused with the reason
+    /// ([`Self::history_of`]). A read naming one question the scope does not reach is refused
+    /// rather than answered as if the question did not exist.
+    fn question_read(&self, params: &ParamsValue, caller: &Caller) -> Result<ParamsValue> {
         let params: kr_protocol::question::QuestionReadParams = parse(params)?;
+        let filter = Self::history_of(caller, Method::QuestionRead, "a question")?;
         {
             let session = self.runtime.session();
             Self::check_session(&session, params.session_id)?;
         }
         let (result, _) = self.questions.read(&params, self.question_clock())?;
-        encode(&result)
+        let admitted = |question: &kr_protocol::question::Question| {
+            filter
+                .admit_question(
+                    question.question_id,
+                    question.created_at_ms.get(),
+                    question.state,
+                )
+                .is_ok()
+        };
+        if params.question_id.is_present() && !result.questions.iter().all(admitted) {
+            return Err(WorkerError::PermissionDenied {
+                detail: "this question was asked before the moment the grant this read is made \
+                         under reaches back to, and the grant does not name it while it is open"
+                    .to_owned(),
+            });
+        }
+        encode(&kr_protocol::question::QuestionReadResult {
+            questions: result.questions.into_iter().filter(admitted).collect(),
+        })
     }
 
     /// Answers `agent.capabilities`: what this installation can do, with its evidence.

@@ -9,6 +9,7 @@
 //! * it is drawn the screen that is showing, and never the buffer behind it;
 //! * it is not served the session's retained output;
 //! * it is given the last command only when its history scope reaches it;
+//! * it reads the questions its history scope admits, one its grant names only while it is open;
 //! * it detaches the attachments its own connection made, and no other;
 //! * an authority revision takes its input lease away;
 //! * it cancels its own undispatched intents, and no other actor's.
@@ -23,6 +24,7 @@
 //! | --- | --- |
 //! | KR-REQ-10.50 | `a_local_caller_under_a_grant_is_drawn_the_live_screen_alone`, `the_local_owner_is_drawn_the_whole_screen_and_a_device_the_live_screen` |
 //! | KR-REQ-10.49 | `a_local_caller_under_a_grant_is_refused_the_retained_history`, `the_local_owner_reads_the_retained_history_on_either_socket`, `a_local_caller_under_a_grant_reads_the_last_command_only_inside_its_scope`, `the_local_owner_reads_the_last_command_on_either_socket` |
+//! | KR-REQ-10.51 | `a_local_caller_under_a_grant_reads_only_the_questions_its_scope_admits`, `the_local_owner_reads_every_question_on_either_socket`, `a_worker_states_that_it_holds_a_question_read_to_its_scope` |
 //! | KR-REQ-10.41 | `a_local_caller_under_a_grant_detaches_only_what_its_own_connection_made`, `the_local_owner_detaches_another_windows_attachment_and_a_device_does_not`, `a_detach_refused_for_another_connections_attachment_is_recorded_as_rejected`, `a_detach_whose_succession_fails_after_its_marker_stays_unknown` |
 //! | KR-REQ-10.45 | `a_revision_takes_the_lease_from_a_local_caller_under_a_grant`, `a_revision_takes_a_devices_lease_and_leaves_the_local_owners`, `an_attachment_the_empty_prompt_gesture_detaches_is_no_longer_counted_as_granted`, `the_empty_prompt_gesture_leaves_nothing_of_a_granted_attachment_behind`, `a_granted_attachment_detached_through_the_service_at_the_prompt_is_let_go_at_once` |
 //! | KR-REQ-23.46 | `a_local_caller_under_a_grant_cancels_its_own_intent_and_no_other`, `the_local_owner_cancels_another_actors_intent_and_a_device_does_not` |
@@ -1527,6 +1529,31 @@ async fn a_local_caller_under_a_grant_reads_only_the_questions_its_scope_admits(
         );
         drop(proxy);
     }
+    wired.close();
+}
+
+/// KR-REQ-10.51: a worker says, in its answer to the daemon's hello, that it holds a question read
+/// to the scope the read carries, beside saying that it reads one: a daemon sends a question read
+/// with a scope only to a worker that says both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_worker_states_that_it_holds_a_question_read_to_its_scope() {
+    let wired = wired("sleep 120").await;
+    let daemon = within(
+        "the daemon's connection",
+        LocalClient::connect(&wired.endpoint, LocalClientKind::Controller, build()),
+    )
+    .await
+    .expect("connects as the daemon");
+    let stated = &daemon.acknowledgement().capabilities;
+    assert!(
+        kr_protocol::local::reads_history_scopes(stated),
+        "stated: {stated:?}"
+    );
+    assert!(
+        kr_protocol::local::holds_question_reads_to_scopes(stated),
+        "stated: {stated:?}"
+    );
+    drop(daemon);
     wired.close();
 }
 

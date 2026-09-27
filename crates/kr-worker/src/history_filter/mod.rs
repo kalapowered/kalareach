@@ -40,6 +40,7 @@ use std::collections::BTreeSet;
 use kr_protocol::gateway::{PendingKind, PendingState};
 use kr_protocol::grant::{Grant, HistoryScope};
 use kr_protocol::ids::{PendingResourceId, QuestionId};
+use kr_protocol::question::QuestionState;
 use kr_protocol::rights::ActionRight;
 use kr_protocol::sharing::LiveScreenPreview;
 
@@ -600,11 +601,13 @@ impl HistoryFilter {
         }
     }
 
-    /// Decides about one current question, which an invitation may name explicitly.
+    /// Decides about one question, which an invitation may name while it is open.
     ///
-    /// A named question is permitted whenever it was created, which is the whole of section 10's
-    /// exception: the invitation permits those exact current decisions, not the conversation they
-    /// came from. An unnamed question follows the ordinary bound.
+    /// Section 10 permits the exact *current* decisions an invitation names, not the conversation
+    /// they came from. So a named question is admitted however early it was asked only while it
+    /// can still be answered, pending; once it has been answered, cancelled or has expired it is an
+    /// old record like any other, and the ordinary bound decides, as it does for a question
+    /// nothing names.
     ///
     /// # Errors
     ///
@@ -613,8 +616,10 @@ impl HistoryFilter {
         &self,
         question_id: QuestionId,
         created_at_ms: u64,
+        state: QuestionState,
     ) -> std::result::Result<(), WithheldReason> {
-        if self.scope.named_questions.contains(&question_id) && self.scope.session_view {
+        let named = self.scope.named_questions.contains(&question_id);
+        if named && !state.is_resolved() && self.scope.session_view {
             return Ok(());
         }
         self.admit_at(Surface::LoadedConversation, created_at_ms)
@@ -887,12 +892,49 @@ mod tests {
             },
             &[ActionRight::SessionView],
         )));
-        assert_eq!(filter.admit_question(named, 10), Ok(()));
         assert_eq!(
-            filter.admit_question(other, 10),
+            filter.admit_question(named, 10, QuestionState::Pending),
+            Ok(())
+        );
+        assert_eq!(
+            filter.admit_question(other, 10, QuestionState::Pending),
             Err(WithheldReason::NotNamedByTheGrant),
             "naming one decision does not open the conversation it came from"
         );
+    }
+
+    #[test]
+    fn a_named_question_is_permitted_only_while_it_is_open() {
+        let named = QuestionId::new(Uuid::from_bytes([7; 16]));
+        let filter = HistoryFilter::new(ViewerScope::from_grant(&grant(
+            HistoryScope {
+                lower_bound_ms: Nullable::some(TimestampMs::new(1_000)),
+                include_live_screen: false,
+                named_questions: CanonicalSet::from_iter([named]),
+                named_approvals: CanonicalSet::from_iter([]),
+            },
+            &[ActionRight::SessionView],
+        )));
+        assert_eq!(
+            filter.admit_question(named, 10, QuestionState::Pending),
+            Ok(())
+        );
+        for ended in [
+            QuestionState::Answered,
+            QuestionState::Cancelled,
+            QuestionState::Expired,
+        ] {
+            assert_eq!(
+                filter.admit_question(named, 10, ended),
+                Err(WithheldReason::NotNamedByTheGrant),
+                "a {ended} question from before the bound is an old record"
+            );
+            assert_eq!(
+                filter.admit_question(named, 1_000, ended),
+                Ok(()),
+                "and one asked at the bound is inside it, in any state"
+            );
+        }
     }
 
     #[test]
