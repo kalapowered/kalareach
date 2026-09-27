@@ -31,7 +31,7 @@ use kr_plugin_service::launcher::{
 };
 use kr_plugin_service::protocol::{ComponentSource, HostDescriptor, Notice};
 use kr_plugin_service::vocabulary::{
-    BindingActivity, BindingFacts, ScopedSourceEvent, SourceProvenance,
+    BindingActivity, BindingFacts, BindingId, ScopedSourceEvent, SourceProvenance,
 };
 use kr_protocol::attachment::{
     AttachMode, AttachmentCapability, SessionAttachParams, SessionAttachResult,
@@ -931,15 +931,16 @@ async fn kr_req_05_07_a_plugin_host_crash_kills_no_worker_and_loses_no_request()
 
 // KR-REQ-11.39: the terminal path is never behind a component.
 //
-// Everything here is measured, and everything is measured *while* a component is inside a call
-// rather than merely after one was asked for. The component is the slow one: it spends most of
-// every observe deadline and then answers, so a queue of observations against it is a component
-// continuously running, with no fault and no disabling. A component that faulted would be disabled
-// after three calls, and the window this test measures would be a window with nothing running in
-// it.
+// Everything here is measured while a component is working, and what keeps it working is this
+// test, not an amount of work sized for some machine. The binding is given observations at a
+// steady pace until the test opens a gate, so there is a component at work for the whole window
+// and after it, however fast or slow the machine is. Each call is one short observation that ends
+// far inside its deadline, so a slow or loaded machine does not turn the component's work into
+// faults. A binding that faulted or was disabled would leave a window with nothing running in it,
+// so either fails the test.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_11_39_a_terminal_drains_and_is_answered_while_a_component_runs() {
-    let Some(slow) = component("slow-observe") else {
+    let Some(well_behaved) = component("well-behaved") else {
         return;
     };
     let host = Host::create();
@@ -950,65 +951,39 @@ async fn kr_req_11_39_a_terminal_drains_and_is_answered_while_a_component_runs()
     let mut terminal = session.attach().await;
 
     let started = host.start_plugin_host().await;
-    let mut plugin = host.plugin_client().await;
-    let installed = host.install("slow-observe", &slow);
+    let plugin = host.plugin_client().await;
+    let installed = host.install("well-behaved", &well_behaved);
     let binding = new_binding_id();
     plugin
         .register(
             binding,
-            &identity("slow-observe", installed.digest),
-            &facts("slow-observe"),
+            &identity("well-behaved", installed.digest),
+            &facts("well-behaved"),
             "/bin/sh",
             &installed,
         )
         .await
-        .expect("the slow binding registers");
+        .expect("the binding registers");
+    let plugin = Arc::new(plugin);
 
     // Where the session had got to before the component was given anything to do.
     let before = collect(&mut terminal, Duration::from_millis(400)).await;
     let before = String::from_utf8_lossy(&before).into_owned();
     highest_line(&before).expect("the shell is producing numbered output");
 
-    // Enough observations to keep the binding's thread inside the component for the whole window
-    // below. They are handed over by the path a worker's terminal loop uses, which waits for
-    // nothing: no frame is written and no answer is read.
-    let mut handed = Vec::new();
-    for index in 0..400 {
-        let offered = std::time::Instant::now();
-        let handoff = plugin.offer(binding, &scrape(&format!("se-{index}"), "output"));
-        handed.push(offered.elapsed());
-        assert!(
-            matches!(
-                handoff,
-                kr_plugin_service::client::Handoff::Accepted
-                    | kr_plugin_service::client::Handoff::Refused { .. }
-            ),
-            "the handoff was {handoff:?}"
-        );
-    }
-    let slowest = handed.iter().max().copied().unwrap_or_default();
-    assert!(
-        slowest < Duration::from_millis(50),
-        "handing an observation over took {slowest:?}, so the terminal path waited on the runtime"
-    );
+    // The component's work, held open until the gate opens. Observations are handed over by the
+    // path a worker's terminal loop uses, which waits for nothing: no frame is written and no
+    // answer is read.
+    let registered = finished_calls(&plugin).await;
+    let (open, gate) = tokio::sync::oneshot::channel();
+    let supplying = tokio::spawn(supply(Arc::clone(&plugin), binding, gate));
 
-    // The component is inside a call once it has drawn something for an observation. Waiting for
-    // that is what makes the window below a window with a component running in it.
-    let entered = std::time::Instant::now();
-    let mut observed = false;
-    while !observed && entered.elapsed() < Duration::from_secs(10) {
-        match tokio::time::timeout(Duration::from_millis(200), plugin.notice()).await {
-            Ok(Some(Notice::Document { call, .. })) if call == "observe" => observed = true,
-            Ok(Some(Notice::Disabled { reason, .. })) => {
-                panic!("the binding disabled itself before the window: {reason}")
-            }
-            Ok(Some(Notice::Fault { detail, .. })) => {
-                panic!("the component faulted before the window: {detail}")
-            }
-            Ok(Some(Notice::Document { .. }) | Some(Notice::Gap { .. })) | Ok(None) | Err(_) => {}
-        }
-    }
-    assert!(observed, "the component never entered an observation");
+    // The component is at work once it has finished a call for one of those observations. Waiting
+    // for that is what makes the window below a window with a component running in it.
+    assert!(
+        calls_finished_after(&plugin, registered).await,
+        "the component never finished an observation"
+    );
 
     // Now, with the component running, the session has to keep producing and the host has to keep
     // answering the shell's questions. A shell that was not answered would stop at its `dd` and
@@ -1021,22 +996,14 @@ async fn kr_req_11_39_a_terminal_drains_and_is_answered_while_a_component_runs()
         .or_else(|| highest_line(&before))
         .expect("the shell is producing numbered output");
 
-    // Shorter than the work queued against the component, so the component is inside a call for
-    // the whole of it rather than for part of it. The call count is what turns that from an
+    // The gate is shut for the whole of the window, so the component is being given observations
+    // throughout it rather than for part of it. The call count is what turns that from an
     // expectation into evidence: it counts calls the component finished, so a count that grew
     // across the window is a component that was executing inside it.
     let window = std::time::Instant::now();
-    let before_calls = plugin
-        .health()
-        .await
-        .expect("a health report")
-        .component_calls;
+    let before_calls = finished_calls(&plugin).await;
     let during = collect(&mut terminal, Duration::from_millis(800)).await;
-    let after_calls = plugin
-        .health()
-        .await
-        .expect("a health report")
-        .component_calls;
+    let after_calls = finished_calls(&plugin).await;
     // Measured from before the first sample to after the second, so the bound below covers the
     // whole stretch the two samples bracket rather than the collection alone.
     let bracketed = window.elapsed();
@@ -1070,26 +1037,11 @@ async fn kr_req_11_39_a_terminal_drains_and_is_answered_while_a_component_runs()
         "the window was shorter than it was asked to be"
     );
 
-    // And the component was still inside a call when that window closed, rather than having
-    // finished its work partway through and left the rest of the window measuring nothing. A
-    // document for an observation arriving now is a component that is still working through the
-    // queue this test put in front of it.
-    let still = std::time::Instant::now();
-    let mut running = false;
-    while !running && still.elapsed() < Duration::from_secs(5) {
-        match tokio::time::timeout(Duration::from_millis(200), plugin.notice()).await {
-            Ok(Some(Notice::Document { call, .. })) if call == "observe" => running = true,
-            Ok(Some(Notice::Disabled { reason, .. })) => {
-                panic!("the binding disabled itself during the window: {reason}")
-            }
-            Ok(Some(Notice::Fault { detail, .. })) => {
-                panic!("the component faulted during the window: {detail}")
-            }
-            Ok(Some(Notice::Document { .. }) | Some(Notice::Gap { .. })) | Ok(None) | Err(_) => {}
-        }
-    }
+    // And the component was still at work when that window closed, rather than having stopped
+    // partway through and left the rest of the window measuring nothing: with the gate still shut,
+    // it goes on finishing calls after the window.
     assert!(
-        running,
+        calls_finished_after(&plugin, after_calls).await,
         "the component had stopped working before the window closed"
     );
     let health = plugin.health().await.expect("a health report");
@@ -1098,6 +1050,14 @@ async fn kr_req_11_39_a_terminal_drains_and_is_answered_while_a_component_runs()
         "the binding did not last the window this test measured"
     );
     assert_eq!(health.connection_bindings, 1);
+
+    // The gate opens only now, and the component is given nothing more.
+    let _ = open.send(());
+    let slowest = supplying.await.expect("the observations were supplied");
+    assert!(
+        slowest < Duration::from_millis(50),
+        "handing an observation over took {slowest:?}, so the terminal path waited on the runtime"
+    );
 
     // And what the terminal produced goes to the runtime by the same handoff, which is what a
     // worker's observation path does with its output.
@@ -1111,8 +1071,92 @@ async fn kr_req_11_39_a_terminal_drains_and_is_answered_while_a_component_runs()
         "the drained output could not be handed to the runtime: {handed_back:?}"
     );
 
+    // No call the component made was a fault, and the binding was never disabled. A fault or a
+    // disabling is never dropped from the notice queue, so every one there has been is still in it.
+    let mut plugin = Arc::into_inner(plugin).expect("the supply has let go of the client");
+    while let Some(notice) = plugin.try_notice() {
+        match notice {
+            Notice::Fault { call, detail, .. } => {
+                panic!("the component faulted in {call}: {detail}")
+            }
+            Notice::Disabled { reason, .. } => panic!("the binding disabled itself: {reason}"),
+            Notice::Document { .. } | Notice::Gap { .. } => {}
+        }
+    }
+
     started.kill();
     let _ = launcher::retire_descriptor(&environment);
+}
+
+/// How often a binding is given an observation while a test holds its work open.
+const OBSERVATION_PACE: Duration = Duration::from_millis(2);
+
+/// Gives a binding one observation each [`OBSERVATION_PACE`] until the gate opens, and returns how
+/// long the slowest handoff took.
+///
+/// This is what holds a component's work open. Observations handed over in advance last as long as
+/// the machine takes to work through them, which is a guess about the machine: on a fast one the
+/// component finishes before a window closes, and a component given enough work in each call to
+/// outlast a window on a fast one runs past its deadline on a slow one. Supplied until the test
+/// says otherwise, the component has work for as long as the gate is shut, at any speed.
+///
+/// An observation is handed over by the path a worker's terminal loop uses, which waits for
+/// nothing. A gate dropped without being opened ends the supply as well, so a test that fails
+/// before it opens the gate leaves nothing running.
+async fn supply(
+    plugin: Arc<PluginClient>,
+    binding: BindingId,
+    mut gate: tokio::sync::oneshot::Receiver<()>,
+) -> Duration {
+    let mut pace = tokio::time::interval(OBSERVATION_PACE);
+    pace.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut slowest = Duration::ZERO;
+    for index in 0_u64.. {
+        tokio::select! {
+            biased;
+            _ = &mut gate => break,
+            _ = pace.tick() => {}
+        }
+        let offered = std::time::Instant::now();
+        let handoff = plugin.offer(binding, &scrape(&format!("se-{index}"), "output"));
+        slowest = slowest.max(offered.elapsed());
+        assert!(
+            matches!(
+                handoff,
+                kr_plugin_service::client::Handoff::Accepted
+                    | kr_plugin_service::client::Handoff::Refused { .. }
+            ),
+            "the handoff was {handoff:?}"
+        );
+    }
+    slowest
+}
+
+/// Returns how many calls into a component this connection's bindings have finished.
+async fn finished_calls(plugin: &PluginClient) -> u64 {
+    plugin
+        .health()
+        .await
+        .expect("a health report")
+        .component_calls
+}
+
+/// Waits until this connection's bindings have finished more than `past` calls, and says whether
+/// they did.
+///
+/// A liveness bound rather than a measurement: it fails when the calls never come, and a loaded
+/// machine that takes a while is slow rather than broken.
+async fn calls_finished_after(plugin: &PluginClient, past: u64) -> bool {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if finished_calls(plugin).await > past {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 /// Returns the directory a running process is in, as the kernel reports it.
