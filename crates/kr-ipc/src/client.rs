@@ -159,6 +159,12 @@ impl LocalClient {
             held_bytes: 0,
         };
         if kind == LocalClientKind::Controller {
+            // A control daemon speaks to a worker only at a compatibility level its release
+            // retains, and this release retains its own. The worker's answer says its level before
+            // anything else is exchanged, so a worker at another level is refused here, before its
+            // challenge is read and before any generation is presented: no path that adopts a
+            // worker can take one this daemon cannot read or write the frames of.
+            refuse_an_unretained_level(client.acknowledgement.build.as_ref())?;
             // A worker offers its generation challenge as soon as a controller announces itself, so
             // the nonce is bound to this connection from its first frame. It is held until the
             // token is presented and used exactly once.
@@ -824,6 +830,33 @@ impl LocalClient {
 /// A count of frames is not a bound on memory: one notification can carry a whole batch of output,
 /// so the bound is in the same bytes section 9 states a send queue in. A frame that cannot be
 /// encoded is charged everything, which refuses it rather than admitting something unmeasured.
+/// Refuses a worker whose stated build is at a compatibility level this build's control daemon
+/// does not retain, and a worker that states no build, which is of a build before the statement.
+///
+/// This release retains only its own level ([`kr_protocol::update::THIS_LEVEL`]): the frames of any
+/// other are frames this build may not read, and a worker of another level is one an update to
+/// this release waits for rather than meets.
+///
+/// # Errors
+///
+/// Returns [`IpcError::UnretainedLevel`] naming what the worker stated.
+pub fn refuse_an_unretained_level(stated: Option<&kr_protocol::local::LocalBuild>) -> Result<()> {
+    match stated {
+        Some(build) if kr_protocol::update::THIS_LEVEL.admits(build.protocol_version) => Ok(()),
+        Some(build) => Err(IpcError::UnretainedLevel {
+            worker: format!(
+                "{} with protocol {}",
+                build.build_id, build.protocol_version
+            ),
+            level: kr_protocol::update::THIS_LEVEL.to_string(),
+        }),
+        None => Err(IpcError::UnretainedLevel {
+            worker: "a build that states no protocol version".to_owned(),
+            level: kr_protocol::update::THIS_LEVEL.to_string(),
+        }),
+    }
+}
+
 fn charge(frame: &ControlFrame) -> usize {
     kr_cbor::to_canonical_value(frame)
         .map(|value| kr_cbor::encoded_len(&value).saturating_add(FRAME_LENGTH_PREFIX_LEN))

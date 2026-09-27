@@ -138,6 +138,17 @@ pub enum IpcError {
     /// ([`kr_protocol::local::may_travel_to_a_worker`]).
     #[error("{0} never travels to a worker")]
     RightNotForwarded(kr_protocol::rights::ActionRight),
+    /// A control daemon reached a worker at a compatibility level its release does not retain.
+    #[error(
+        "the worker runs {worker}, and this control daemon speaks to workers at protocol level \
+         {level} only"
+    )]
+    UnretainedLevel {
+        /// What the worker stated about its build, or that it stated none.
+        worker: String,
+        /// The level this daemon's release retains.
+        level: String,
+    },
     /// A host identity could not be read from the operating system.
     #[error("{what}: {detail}")]
     IdentityUnavailable {
@@ -188,7 +199,9 @@ impl IpcError {
             Self::Frame(error) => error.code(),
             Self::UnexpectedMessage(_) | Self::TruncatedFrame { .. } => ErrorCode::InvalidArgument,
             Self::PeerClosed => ErrorCode::ResourceUnavailable,
-            Self::VersionMismatch { .. } => ErrorCode::UnsupportedSchema,
+            Self::VersionMismatch { .. } | Self::UnretainedLevel { .. } => {
+                ErrorCode::UnsupportedSchema
+            }
         }
     }
 

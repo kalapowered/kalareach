@@ -143,7 +143,9 @@ pub(super) fn handshake(
                 },
                 capabilities: stated.clone(),
                 max_receive: ReceiveLimits::default(),
-                build: None,
+                build: Some(kr_protocol::local::LocalBuild::this(
+                    BuildId::new("kr-worker/0").ok()?,
+                )),
             })),
             ControlFrame::GenerationChallenge(GenerationChallenge {
                 nonce: kr_ipc::verify::fresh_challenge()
