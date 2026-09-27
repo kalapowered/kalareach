@@ -11,6 +11,10 @@
 //! | Windows | the kernel's boot counter and its System process's creation time | `GetProcessTimes`: the creation time in hundreds of nanoseconds |
 //! | iOS and the other Apple mobile systems | refused by name | refused by name |
 //!
+//! A macOS kernel that publishes no boot session identifier is refused by name. Its boot time is not
+//! read instead, because the kernel moves that when the clock is set, which would make one boot read
+//! as two; macOS 14 and later, the releases a host runs on, publish the identifier.
+//!
 //! Android is Linux and reads the same two files. The Apple mobile systems are the one case where
 //! the facility is not there at all: an application runs in a sandbox that cannot enumerate
 //! processes, cannot read another process's start time, and cannot read the boot session
@@ -951,8 +955,8 @@ mod macos_boot {
     /// The control that holds the kernel's identifier for its boot.
     pub(super) const BOOT_SESSION_CONTROL: &str = "kern.bootsessionuuid";
 
-    /// The control that holds the time the kernel reckons it booted at.
-    pub(super) const BOOT_TIME_CONTROL: &str = "kern.boottime";
+    /// The control that holds the kernel's release, such as `23.6.0`.
+    const RELEASE_CONTROL: &str = "kern.osrelease";
 
     /// A macOS kernel's controls.
     pub(super) trait Kernel {
@@ -969,7 +973,13 @@ mod macos_boot {
         (!text.is_empty()).then(|| text.to_owned())
     }
 
-    /// Reads the identity of the kernel's current boot.
+    /// Reads the identity of the kernel's current boot: the boot session identifier it publishes.
+    ///
+    /// A kernel that publishes none is refused, by its release and by what the host needs. Its
+    /// boot time is not taken instead: the kernel moves that when the clock is set, so a host
+    /// running across a clock set would read one boot as two and take its own sessions for those
+    /// of an earlier boot. Every kernel of the macOS releases the host runs on, macOS 14 and
+    /// later, publishes the identifier.
     pub(super) fn boot_identity(kernel: &impl Kernel) -> Result<BootIdentity> {
         if let Some(value) = text(kernel, BOOT_SESSION_CONTROL) {
             return Ok(BootIdentity {
@@ -977,15 +987,17 @@ mod macos_boot {
                 value: kr_protocol::scalars::Bytes::new(value.into_bytes()),
             });
         }
-        // Older kernels do not publish a boot session identifier. The boot time changes with every
-        // boot too, so it answers the same question with a different unit.
-        let bytes = kernel
-            .read(BOOT_TIME_CONTROL)
-            .map_err(|detail| unavailable("boot identity", detail))?;
-        Ok(BootIdentity {
-            source: BootIdentitySource::BootTime,
-            value: kr_protocol::scalars::Bytes::new(bytes),
-        })
+        let named = text(kernel, RELEASE_CONTROL).map_or_else(
+            || "this kernel, which does not say its release,".to_owned(),
+            |release| format!("this kernel, Darwin {release},"),
+        );
+        Err(unavailable(
+            "boot identity",
+            format!(
+                "{named} publishes no boot session identifier ({BOOT_SESSION_CONTROL}), which the \
+                 host needs to tell one boot from another; macOS 14 and later publish one"
+            ),
+        ))
     }
 }
 

@@ -603,6 +603,12 @@ Boot and process-start identities come from the kernel:
 | macOS | `kern.bootsessionuuid` | `proc_pidinfo(PROC_PIDTBSDINFO)` |
 | Windows | the kernel's boot counter and its System process's creation time | `GetProcessTimes`: the creation time in hundreds of nanoseconds since 1970 |
 
+A macOS kernel that publishes no boot session identifier is refused by name, with its release, and
+the host does not start on it. Its boot time is not used instead: the kernel moves the boot time
+when the clock is set, so a host running across a clock set would read one boot as two and take its
+own sessions for an earlier boot's. macOS 14 and later, the releases the host runs on, publish the
+identifier.
+
 Windows gives an ordinary account no identifier for a boot. The Windows boot identity is therefore
 a pair of records the kernel keeps for its boot: the boot counter it publishes in the page it shares
 with every process (`KUSER_SHARED_DATA.BootId`), and the time it recorded when it created its
