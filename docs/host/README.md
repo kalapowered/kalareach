@@ -2370,21 +2370,28 @@ reserved capacity, so a session well inside its own 128 MiB is still evicted whe
 1 GiB. "The first applicable limit" names which bound is doing the work, which is what a person
 looking at a gap is told; it does not mean checking one instead of the others.
 
-The session cap is the spool's own capacity, so the append path keeps it close: the eviction runs
-after the write rather than before it, so one large append is over the bound until that eviction,
-and a segment this host could not unlink stays. The host bound is applied on the worker's
-maintenance tick, from a reading of the environment's whole spool directory, so two sessions
-writing at once can take the host past it until the next tick. Neither bound is a reservation and
-neither is enforced ahead of the write.
+The session cap is the spool's own capacity, and it holds before the write: an append gives up the
+oldest segments to make room for each piece before that piece is written, so no append stands over
+the bound, and the range it gave up reads as a gap whose cause is the session cap. A spool that
+cannot make room - a segment it cannot remove, a boundary it cannot write - or cannot open or write
+a segment stops taking output at that cursor rather than writing past the cap. It keeps everything
+it holds: those segments are still counted, still served, collected by every retention pass and
+removed by a purge, and a pass that could not remove one says so. While it is stopped, the resident
+window keeps new output only within the room the spool has left, so the two together stay within
+the cap, and the range neither keeps reads as a gap with the cause `spool_unavailable`. A retention
+pass that finds the spool can make room again writes what the window still holds past the stop and
+lets the spool take output again.
+
+The host bound is applied on the worker's maintenance tick, from a reading of the environment's
+whole spool directory, so two sessions writing at once can take the host past it until the next
+tick. It is not a reservation, and it is not enforced ahead of the write.
 
 Eviction is not quiet. A retention pass records the cursor range it took and the bound that took
 it, and a reader asking for a cursor inside that range is told both: `history.page` returns the
-range as a gap with a cause. The spool's own capacity is the exception: when an append rotates past
-the session cap the oldest segment goes with it, and that drop carries no recorded cause, so the
-range reads as a gap without one until a retention pass records the bound it was over. A spool that
-has evicted everything writes down where its output got to before it deletes what supports that, so
-a session reopened over an empty directory continues its cursor and reports the range that went
-rather than starting again at nought.
+range as a gap with a cause. A spool that has evicted everything writes down where its output got
+to before it deletes what supports that, so a session reopened over an empty directory continues
+its cursor and reports the range that went rather than starting again at nought. The boundary it
+writes is where the session's output reached, including output the spool did not take.
 
 A hole *inside* the retained range is reported too. A range between two segments that nothing
 holds - a segment deleted from under the session or lost with its disk, or a newest segment gone

@@ -977,6 +977,13 @@ fn a_boundary_this_host_cannot_publish_stops_the_eviction_it_describes() {
         taken.is_empty(),
         "nothing is deleted while the boundary is unpublished"
     );
+    assert!(
+        history
+            .left_behind()
+            .is_some_and(|why| why.contains("boundary")),
+        "and the pass says why it removed nothing: {:?}",
+        history.left_behind()
+    );
     assert_eq!(history.oldest_retained_cursor(), retained);
     assert_eq!(
         history.page(0, 64).expect("a page").bytes.len(),
@@ -1410,6 +1417,200 @@ fn a_contiguous_spool_pages_from_end_to_end_with_no_gap() {
     std::fs::remove_dir_all(&directory).ok();
 }
 
+/// What the spool's segment files hold on the disk, counted from the directory itself.
+fn segment_bytes_on_disk(directory: &std::path::Path) -> u64 {
+    std::fs::read_dir(directory)
+        .expect("reads the spool")
+        .flatten()
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "out"))
+        .filter_map(|entry| entry.metadata().ok())
+        .filter(std::fs::Metadata::is_file)
+        .map(|metadata| metadata.len())
+        .sum()
+}
+
+/// Pages a history from `from` to its end, and returns the first gap it is told about and every
+/// byte it is given. A page stops where the resident window starts, so a whole read takes more
+/// than one.
+fn read_to_end(
+    history: &kr_worker::history::OutputHistory,
+    from: u64,
+) -> (Option<kr_protocol::recovery::HistoryGap>, Vec<u8>) {
+    let mut cursor = from;
+    let mut first_gap = None;
+    let mut bytes = Vec::new();
+    for _ in 0..64 {
+        let page = history.page(cursor, 64).expect("a page");
+        if first_gap.is_none() {
+            first_gap = page.gap.0;
+        }
+        bytes.extend_from_slice(page.bytes.as_slice());
+        if page.next_cursor.get() >= history.next_cursor() {
+            return (first_gap, bytes);
+        }
+        cursor = page.next_cursor.get();
+    }
+    panic!("paging from {from} never reached the end");
+}
+
+#[test]
+fn an_append_larger_than_the_room_left_makes_room_first_and_names_the_session_cap() {
+    // KR-REQ-20.20, the session cap held before the write. An append that would take the session
+    // past its cap gives up the oldest output first, so no append stands over the bound, and the
+    // range it gave up is a gap that names the bound that took it.
+    let directory = std::env::temp_dir().join(format!("kr-persist-cap-{}", kr_ipc::new_uuid()));
+    let mut history =
+        kr_worker::history::OutputHistory::with_spool(4, &directory, SpoolLayout::new(8, 32))
+            .expect("a spool");
+    history.append(&[b'a'; 24]);
+    // Eight bytes of room are left, and one append asks for sixteen.
+    history.append(&[b'b'; 16]);
+    assert_eq!(
+        history.retained_bytes(),
+        32,
+        "at the cap rather than over it"
+    );
+    assert!(segment_bytes_on_disk(&directory) <= 32);
+    assert_eq!(history.oldest_retained_cursor(), 8);
+    let (gap, bytes) = read_to_end(&history, 0);
+    let gap = gap.expect("the range the append made room with is a gap");
+    assert_eq!((gap.from_cursor.get(), gap.to_cursor.get()), (0, 8));
+    assert_eq!(
+        gap.cause,
+        Some(HistoryGapCause::SessionCapacity),
+        "the reader is told which bound took it"
+    );
+    assert_eq!(bytes, [[b'a'; 16], [b'b'; 16]].concat());
+
+    // One append larger than the whole cap keeps its newest bytes, and never more than the cap.
+    // Room is made a segment at a time, so what is kept is within one segment of the cap.
+    history.append(&[b'c'; 100]);
+    let retained = history.retained_bytes();
+    assert!(retained <= 32 && retained > 32 - 8, "{retained}");
+    assert!(segment_bytes_on_disk(&directory) <= 32);
+    assert_eq!(history.oldest_retained_cursor(), 140 - retained);
+    let (gap, bytes) = read_to_end(&history, 0);
+    assert_eq!(
+        gap.and_then(|gap| gap.cause),
+        Some(HistoryGapCause::SessionCapacity)
+    );
+    assert_eq!(bytes, vec![b'c'; usize::try_from(retained).expect("small")]);
+    assert!(history.suspended().is_none(), "nothing stopped the spool");
+    std::fs::remove_dir_all(&directory).ok();
+}
+
+#[test]
+fn appends_under_the_session_cap_keep_everything_and_leave_no_gap() {
+    // The control for the test above: with room to spare nothing is given up.
+    let directory =
+        std::env::temp_dir().join(format!("kr-persist-under-cap-{}", kr_ipc::new_uuid()));
+    let mut history =
+        kr_worker::history::OutputHistory::with_spool(4, &directory, SpoolLayout::new(8, 64))
+            .expect("a spool");
+    history.append(&[b'a'; 24]);
+    history.append(&[b'b'; 16]);
+    assert_eq!(history.retained_bytes(), 40);
+    assert_eq!(segment_bytes_on_disk(&directory), 40);
+    let (gap, bytes) = read_to_end(&history, 0);
+    assert!(gap.is_none());
+    assert_eq!(
+        bytes,
+        [[b'a'; 24].as_slice(), [b'b'; 16].as_slice()].concat()
+    );
+    assert!(history.evictions().is_empty());
+    std::fs::remove_dir_all(&directory).ok();
+}
+
+#[test]
+fn a_segment_that_cannot_be_removed_stops_the_spool_rather_than_standing_over_the_cap() {
+    // KR-REQ-20.20. Making room can fail: the oldest segment is there and cannot be removed. The
+    // write that needed the room is not made, so the cap still holds; the segment that did not go
+    // is still counted, still served and still tried by every later pass; and a reader past the
+    // point the spool stopped is told why.
+    let directory = std::env::temp_dir().join(format!("kr-persist-stuck-{}", kr_ipc::new_uuid()));
+    let mut history =
+        kr_worker::history::OutputHistory::with_spool(4, &directory, SpoolLayout::new(8, 32))
+            .expect("a spool");
+    history.append(&[b'a'; 24]);
+    // A directory stands where the oldest segment's file was, so no platform removes it as one.
+    let oldest = segment_file(&directory, 0);
+    std::fs::remove_file(&oldest).expect("removes the oldest segment's file");
+    std::fs::create_dir(&oldest).expect("puts a directory in its place");
+    std::fs::write(oldest.join("in-the-way"), b"x").expect("and something in it");
+
+    history.append(&[b'b'; 16]);
+    assert_eq!(
+        history.retained_bytes(),
+        32,
+        "nothing was written past the cap, and the segment that could not go is still counted"
+    );
+    let (stopped_at, why) = history
+        .suspended()
+        .expect("the spool stopped taking output");
+    assert_eq!(stopped_at, 32);
+    assert!(why.contains("could not be removed"), "{why}");
+    // What the spool still holds is still served.
+    let held = history.page(8, 64).expect("a page");
+    assert!(!held.gap.is_present());
+    assert_eq!(
+        held.bytes.as_slice(),
+        [&[b'a'; 16][..], &[b'b'; 8][..]].concat().as_slice()
+    );
+    // A reader past the point the spool stopped is told why the range is not there.
+    let past = history.page(32, 64).expect("a page");
+    let gap = past
+        .gap
+        .0
+        .unwrap_or_else(|| panic!("the range past the stop is a gap: {past:?}"));
+    assert_eq!(gap.from_cursor.get(), 32);
+    assert_eq!(gap.cause, Some(HistoryGapCause::SpoolUnavailable));
+
+    // The next pass tries again and says what it could not remove.
+    let over = OutputRetention::new(
+        std::time::Duration::from_secs(7 * 24 * 60 * 60),
+        1 << 30,
+        24,
+    );
+    assert!(
+        history
+            .apply_retention(over, 32, kr_ipc::now_ms(), true)
+            .is_empty()
+    );
+    assert!(
+        history
+            .left_behind()
+            .is_some_and(|why| why.contains("could not be removed")),
+        "{:?}",
+        history.left_behind()
+    );
+    assert_eq!(
+        history.suspended().map(|(at, _)| at),
+        Some(32),
+        "a spool that still cannot make room stays stopped where it stopped"
+    );
+    // Once the obstacle is gone the next pass no longer counts the segment, leaves nothing behind
+    // and lets the spool take output again. The range it could not take stays a gap that says why.
+    std::fs::remove_dir_all(&oldest).expect("clears the way");
+    history.apply_retention(over, 32, kr_ipc::now_ms(), true);
+    assert!(
+        history.left_behind().is_none(),
+        "{:?}",
+        history.left_behind()
+    );
+    assert!(
+        history.suspended().is_none(),
+        "the spool takes output again"
+    );
+    history.append(&[b'c'; 8]);
+    assert!(history.retained_bytes() <= 32);
+    let (gap, bytes) = read_to_end(&history, 32);
+    let gap = gap.expect("the range the spool could not take is a gap");
+    assert_eq!((gap.from_cursor.get(), gap.to_cursor.get()), (32, 40));
+    assert_eq!(gap.cause, Some(HistoryGapCause::SpoolUnavailable));
+    assert_eq!(bytes, [b'c'; 8]);
+    std::fs::remove_dir_all(&directory).ok();
+}
+
 #[test]
 fn a_clock_this_host_cannot_prove_stops_the_age_bound_and_not_the_caps() {
     // KR-REQ-20.20 against section 9's collection rule: removing output because it is seven days
@@ -1527,10 +1728,11 @@ fn the_spool_writes_its_boundary_before_it_deletes_what_supports_it() {
 
 #[test]
 #[cfg(unix)]
-fn a_purge_reaches_the_files_a_lost_spool_left_on_the_disk() {
-    // A write failure drops the spool so nothing more is appended to a store that is failing.
-    // What it wrote before that is still on the disk. A privacy purge that answered "nothing to
-    // remove" because the handle had gone would be reporting a removal it never made, and the
+fn a_spool_that_stops_taking_output_keeps_what_it_wrote_counted_served_and_purgeable() {
+    // A spool that cannot open a segment stops taking output rather than being dropped, so what it
+    // wrote before that stays in its account: counted against the cap, served to a reader,
+    // collected by retention and removed by a purge. A privacy purge that answered "nothing to
+    // remove" because the spool had gone would be reporting a removal it never made, and the
     // archive could still be served those segments afterwards.
     use std::os::unix::fs::PermissionsExt as _;
     let directory = std::env::temp_dir().join(format!("kr-persist-lost-{}", kr_ipc::new_uuid()));
@@ -1553,11 +1755,24 @@ fn a_purge_reaches_the_files_a_lost_spool_left_on_the_disk() {
         history.append(&[b'y'; 64]);
     }
     std::fs::set_permissions(&directory, mode).expect("puts the permissions back");
-    let page = history.page(0, 1024).expect("a page");
+    let (stopped_at, why) = history
+        .suspended()
+        .expect("the spool stopped taking output");
+    assert_eq!(stopped_at, 8 * 64);
+    assert!(why.contains("could not be opened"), "{why}");
     assert_eq!(
-        page.gap.as_ref().and_then(|gap| gap.cause),
+        history.retained_bytes(),
+        8 * 64 + 4,
+        "what it wrote is still counted, beside the resident window"
+    );
+    let held = history.page(0, 1024).expect("a page");
+    assert!(!held.gap.is_present(), "what it wrote is still served");
+    assert_eq!(held.bytes.as_slice(), &[b'x'; 8 * 64]);
+    let past = history.page(8 * 64, 1024).expect("a page");
+    assert_eq!(
+        past.gap.as_ref().and_then(|gap| gap.cause),
         Some(HistoryGapCause::SpoolUnavailable),
-        "the spool was lost rather than evicted"
+        "the range the spool could not take is its storage's rather than a bound's"
     );
 
     let discarded = history.discard_retained();
@@ -1575,7 +1790,7 @@ fn a_purge_reaches_the_files_a_lost_spool_left_on_the_disk() {
         .collect();
     assert!(
         left.is_empty(),
-        "a lost spool's segments are gone after the purge: {left:?}"
+        "a stopped spool's segments are gone after the purge: {left:?}"
     );
     // The boundary stays on the disk, because it is where this session's output got to rather
     // than content. A reader that comes to the directory afterwards - the archive does exactly

@@ -103,10 +103,26 @@ impl SpoolLayout {
     };
 
     /// Builds a layout, keeping the segment size within the capacity.
+    ///
+    /// A segment larger than the capacity could not be written without standing over it, so the
+    /// segment is cut to the capacity; and a spool holds at least one byte, because one that could
+    /// hold nothing would be a spool that makes room it can never use.
     #[must_use]
     pub const fn new(segment_bytes: u64, capacity_bytes: u64) -> Self {
+        let capacity_bytes = if capacity_bytes == 0 {
+            1
+        } else {
+            capacity_bytes
+        };
+        let segment_bytes = if segment_bytes == 0 {
+            1
+        } else if segment_bytes > capacity_bytes {
+            capacity_bytes
+        } else {
+            segment_bytes
+        };
         Self {
-            segment_bytes: if segment_bytes == 0 { 1 } else { segment_bytes },
+            segment_bytes,
             capacity_bytes,
         }
     }
@@ -138,19 +154,15 @@ pub struct OutputHistory {
     /// Privacy mode disables content-history retention prospectively, which is this: what arrives
     /// while it is false reaches the live parser and the attachments and is not kept.
     retaining: bool,
-    /// Whether this session was given a spool and then lost it.
+    /// The ranges the spool could not take while it was stopped, newest last.
     ///
-    /// A write failure narrows the retained range to the resident window, and that is a different
-    /// answer from a bound being reached: it is reported as one rather than as retention.
-    spool_lost: bool,
-    /// Where a spool this session lost kept what it had already written.
-    ///
-    /// The spool is dropped on a write failure so nothing more is appended to a store that is
-    /// failing. What it wrote before that is still on the disk, and is still content this session
-    /// can be asked to remove: a privacy purge that answered "nothing to remove" because the
-    /// handle had gone would be reporting a removal it never made. Keeping the directory is what
-    /// lets the purge reach those files.
-    lost_spool_directory: Option<PathBuf>,
+    /// A stopped spool keeps what it holds and takes nothing more, so the output that arrives
+    /// meanwhile is retained only as far as the resident window can keep it within the cap. A
+    /// range that ended up held by neither is a range this host lost to its storage rather than to
+    /// a bound, and a reader asking for it is told that, even after the spool takes output again.
+    unretained: VecDeque<(u64, u64)>,
+    /// Why the last retention pass left output it was asked to remove, when it did.
+    left_behind: Option<String>,
     /// What retention took, newest last.
     ///
     /// A gap is reported by the cursors a page carries, and those say what is gone. This says
@@ -172,8 +184,8 @@ impl OutputHistory {
             next_cursor: 0,
             spool: None,
             retaining: true,
-            spool_lost: false,
-            lost_spool_directory: None,
+            unretained: VecDeque::new(),
+            left_behind: None,
             resident_marks: VecDeque::new(),
             evictions: VecDeque::new(),
         }
@@ -244,8 +256,17 @@ impl OutputHistory {
 
     /// Appends output and returns the cursor those bytes start at.
     ///
-    /// Appending never fails on a full spool: a write failure disables the spool and narrows the
-    /// retained range to the resident window, which is reported as a gap rather than as success.
+    /// The session cap holds before the write, not after it: the spool gives up its oldest
+    /// segments to make room for each piece of an append before that piece is written, so one
+    /// large append never stands over the bound, and the range it gave up reads as a gap that
+    /// names the session cap.
+    ///
+    /// Appending never fails. A spool that cannot make room, write a segment or publish its
+    /// boundary stops taking output at that cursor and keeps everything it holds: indexed, served,
+    /// counted against the cap and tried again by every retention pass. What arrives while it is
+    /// stopped is retained in the resident window only as far as the spool's remaining room
+    /// allows, so the two layers together stay within the cap, and the range neither holds reads
+    /// as a gap whose cause is the spool rather than a bound.
     pub fn append(&mut self, bytes: &[u8]) -> u64 {
         let start = self.next_cursor;
         if bytes.is_empty() {
@@ -257,21 +278,29 @@ impl OutputHistory {
             // is gone rather than served later output under an earlier cursor.
             self.next_cursor += bytes.len() as u64;
             self.resident_start = self.next_cursor;
+            if let Some(spool) = self.spool.as_mut() {
+                spool.note_position(self.next_cursor);
+            }
             return start;
         }
+        let now = kr_ipc::now_ms();
         if let Some(spool) = self.spool.as_mut()
-            && spool.append(start, bytes).is_err()
+            && let Some((from_cursor, to_cursor, gone)) = spool.append(start, bytes)
         {
-            // Losing the spool costs history, not correctness: the resident window still serves
-            // recent output and everything older reads as an explicit gap. Where it wrote is kept,
-            // because those files are still there and are still this session's to remove.
-            self.lost_spool_directory = self.spool.as_ref().map(|spool| spool.directory.clone());
-            self.spool = None;
-            self.spool_lost = true;
+            self.record_eviction(Eviction {
+                limit: RetentionLimit::SessionCap,
+                from_cursor,
+                to_cursor,
+                bytes: gone,
+                at_ms: now,
+            });
         }
         self.resident.extend(bytes.iter().copied());
         self.next_cursor += bytes.len() as u64;
-        let now_ms = kr_ipc::now_ms().get();
+        if let Some(spool) = self.spool.as_mut() {
+            spool.note_position(self.next_cursor);
+        }
+        let now_ms = now.get();
         match self.resident_marks.back_mut() {
             // Still inside the current interval, measured from when the interval began.
             Some(mark) if now_ms.saturating_sub(mark.started_at_ms) < RESIDENT_MARK_MS => {
@@ -288,8 +317,100 @@ impl OutputHistory {
             self.resident.drain(..excess);
             self.resident_start += excess as u64;
         }
+        self.bound_past_suspension();
         self.trim_marks();
         start
+    }
+
+    /// Keeps the output a stopped spool could not take within the room the spool has left.
+    ///
+    /// The session cap is on what the session retains, which is the spool and the resident window
+    /// together. While the spool takes everything, the window is the newest part of it and adds
+    /// nothing; once the spool has stopped, the window holds output the spool does not, and that
+    /// output fits only in the room the spool has left. What does not fit is not retained: the
+    /// terminal still shows it and every attachment still receives it.
+    fn bound_past_suspension(&mut self) {
+        let Some(spool) = self.spool.as_ref() else {
+            return;
+        };
+        let Some(stopped) = spool.suspended_at() else {
+            return;
+        };
+        let room = spool
+            .layout
+            .capacity_bytes
+            .saturating_sub(spool.total_bytes);
+        let past = self.resident_start.max(stopped);
+        if self.next_cursor.saturating_sub(past) <= room {
+            return;
+        }
+        let keep_from = self.next_cursor - room;
+        let excess = usize::try_from(keep_from.saturating_sub(self.resident_start))
+            .unwrap_or(usize::MAX)
+            .min(self.resident.len());
+        self.resident.drain(..excess);
+        self.resident_start += excess as u64;
+    }
+
+    /// Records one eviction, keeping the newest [`MAX_RECORDED_EVICTIONS`].
+    fn record_eviction(&mut self, eviction: Eviction) {
+        self.evictions.push_back(eviction);
+        while self.evictions.len() > MAX_RECORDED_EVICTIONS {
+            self.evictions.pop_front();
+        }
+    }
+
+    /// Returns where the spool stopped taking output, and why, while it has.
+    #[must_use]
+    pub fn suspended(&self) -> Option<(u64, &str)> {
+        self.spool.as_ref().and_then(Spool::suspension)
+    }
+
+    /// Returns why the last retention pass left output it was asked to remove, when it did.
+    ///
+    /// A pass that could not remove a segment says so here rather than reporting what it managed
+    /// as though it were everything: the segment is still on the disk, still counted and still
+    /// served, and the next pass tries it again.
+    #[must_use]
+    pub fn left_behind(&self) -> Option<&str> {
+        self.left_behind.as_deref()
+    }
+
+    /// Lets a stopped spool take output again, once it can.
+    ///
+    /// Each retention pass asks. The spool makes room for what the resident window holds past the
+    /// point it stopped and writes that; only when both succeed does it take output again, from
+    /// where the window's copy begins. The range before that is output neither layer kept, and it
+    /// is recorded as that. A spool that still cannot make room or write stays stopped where it
+    /// first stopped.
+    fn try_resume(&mut self) {
+        let Some(spool) = self.spool.as_mut() else {
+            return;
+        };
+        let Some(stopped) = spool.suspended_at() else {
+            return;
+        };
+        let from = self.resident_start.max(stopped);
+        let offset = usize::try_from(from.saturating_sub(self.resident_start)).unwrap_or(0);
+        let pending: Vec<u8> = self.resident.iter().skip(offset).copied().collect();
+        let Some(evicted) = spool.resume(from, &pending) else {
+            return;
+        };
+        if let Some((from_cursor, to_cursor, gone)) = evicted {
+            self.record_eviction(Eviction {
+                limit: RetentionLimit::SessionCap,
+                from_cursor,
+                to_cursor,
+                bytes: gone,
+                at_ms: kr_ipc::now_ms(),
+            });
+        }
+        if from > stopped {
+            self.unretained.push_back((stopped, from));
+            while self.unretained.len() > MAX_RECORDED_EVICTIONS {
+                self.unretained.pop_front();
+            }
+        }
     }
 
     /// Drops the marks for output the resident window no longer holds.
@@ -400,20 +521,9 @@ impl OutputHistory {
             segments: 0,
             left_behind: None,
         };
+        // A spool that stopped taking output still indexes every segment it wrote, so the purge
+        // reaches all of them through the index: nothing it wrote is out of its account.
         let Some(spool) = self.spool.as_mut() else {
-            // A spool this session lost still has files where it left them, and they are what a
-            // purge is owed. Answering "nothing to remove" over them would call the removal
-            // complete over output the archive can still be served.
-            if let Some(directory) = self.lost_spool_directory.clone() {
-                let (bytes, segments, left_behind) =
-                    remove_spool_files(&directory, self.next_cursor);
-                discarded.bytes += bytes;
-                discarded.segments += segments;
-                discarded.left_behind = left_behind;
-                if discarded.left_behind.is_none() {
-                    self.lost_spool_directory = None;
-                }
-            }
             return discarded;
         };
         if !spool.record_boundary() {
@@ -425,19 +535,27 @@ impl OutputHistory {
             return discarded;
         }
         while !spool.segments.is_empty() {
-            let went = spool.drop_oldest();
-            if went == 0 {
-                // A segment this host could not unlink is content it was asked to remove and has
-                // not. It stays in the accounting and the failure is reported rather than the
-                // removal being called complete over a file a reader can still be served.
-                discarded.left_behind = Some(format!(
-                    "{} of this session's spool segments could not be removed",
-                    spool.segments.len()
-                ));
-                break;
+            match spool.drop_oldest() {
+                Ok(went) => {
+                    discarded.bytes += went;
+                    discarded.segments += 1;
+                }
+                Err(reason) => {
+                    // A segment this host could not unlink is content it was asked to remove and
+                    // has not. It stays in the accounting and the failure is reported rather than
+                    // the removal being called complete over a file a reader can still be served.
+                    discarded.left_behind = Some(format!(
+                        "{} of this session's spool segments could not be removed: {reason}",
+                        spool.segments.len()
+                    ));
+                    break;
+                }
             }
-            discarded.bytes += went;
-            discarded.segments += 1;
+        }
+        if discarded.left_behind.is_none() {
+            // An empty spool is owed nothing, so one that had stopped takes output again once
+            // retention does.
+            spool.clear_suspension();
         }
         discarded
     }
@@ -481,6 +599,7 @@ impl OutputHistory {
         let mut taken = Vec::new();
         let expires_before = retention.expires_before(now_ms).get();
         let mut files_removed = 0;
+        self.left_behind = None;
         // A segment whose file has gone is not retained, and a pass that counted it would evict
         // output this session did not need to give up.
         if let Some(spool) = self.spool.as_mut() {
@@ -519,7 +638,7 @@ impl OutputHistory {
                 RetentionLimit::SessionCap
             };
             let start = spool.oldest_cursor().unwrap_or(self.resident_start);
-            let dropped = spool.drop_at_least(over);
+            let (dropped, left_behind) = spool.drop_at_least(over);
             if dropped > 0 {
                 let after = spool.oldest_cursor().unwrap_or(self.resident_start);
                 taken.push(Eviction {
@@ -530,14 +649,25 @@ impl OutputHistory {
                     at_ms: now_ms,
                 });
             }
+            if left_behind.is_some() {
+                self.left_behind = left_behind;
+            }
         }
 
         for eviction in &taken {
-            self.evictions.push_back(*eviction);
-            while self.evictions.len() > MAX_RECORDED_EVICTIONS {
-                self.evictions.pop_front();
-            }
+            self.record_eviction(*eviction);
         }
+        if let Some(spool) = self.spool.as_mut()
+            && spool.suspended_at().is_some()
+        {
+            // A stopped spool's directory says where the session's output reached, so a reader
+            // of it after the session has gone - the archive - is told the range it did not take
+            // rather than a spool that simply ended where it stopped. Best effort: a directory
+            // that cannot be written is one this pass tries again.
+            let _ = spool.record_boundary();
+        }
+        // A spool that stopped taking output is asked each pass whether it can take it again.
+        self.try_resume();
         taken
     }
 
@@ -563,9 +693,14 @@ impl OutputHistory {
         now_ms: TimestampMs,
     ) -> (Option<Eviction>, u64) {
         let before = self.oldest_retained_cursor();
+        let held_before = self.retained_bytes();
         let mut file_bytes = 0;
         if let Some(spool) = self.spool.as_mut() {
-            file_bytes += spool.drop_older_than(expires_before);
+            let (dropped, left_behind) = spool.drop_older_than(expires_before);
+            file_bytes += dropped;
+            if left_behind.is_some() {
+                self.left_behind = left_behind;
+            }
         }
         // The window's own marks say how far this host can prove the expired output reaches.
         // Every byte before the first interval whose newest byte is *not* expired is one this
@@ -595,7 +730,7 @@ impl OutputHistory {
                 limit: RetentionLimit::Age,
                 from_cursor: before,
                 to_cursor: after,
-                bytes: after - before,
+                bytes: held_before.saturating_sub(self.retained_bytes()),
                 at_ms: now_ms,
             }),
             file_bytes,
@@ -604,15 +739,24 @@ impl OutputHistory {
 
     /// Returns why a cursor is no longer retained, when this host recorded a reason.
     fn cause_of(&self, cursor: u64) -> Option<HistoryGapCause> {
-        if self.spool_lost
+        let spool_stopped_before = self
+            .spool
+            .as_ref()
+            .and_then(Spool::suspended_at)
+            .is_some_and(|stopped| cursor >= stopped);
+        if spool_stopped_before
+            || self
+                .unretained
+                .iter()
+                .any(|&(from, to)| cursor >= from && cursor < to)
             || self
                 .spool
                 .as_ref()
                 .is_some_and(|spool| spool.unreadable_boundary)
         {
-            // Either the spool could not be written, or it recorded where its output got to and
-            // this host cannot read it back. Both leave a range this host cannot account for, and
-            // both are a different answer from a bound being reached.
+            // The spool stopped taking output before this cursor, or it recorded where its output
+            // got to and this host cannot read it back. Both leave a range this host cannot
+            // account for, and both are a different answer from a bound being reached.
             return Some(HistoryGapCause::SpoolUnavailable);
         }
         self.evictions
@@ -763,6 +907,10 @@ impl Held {
 /// archive would have nothing to report a gap from.
 const BOUNDARY_FILE: &str = "boundary";
 
+/// What a retention pass says when it could not publish the boundary, and so removed nothing.
+const BOUNDARY_UNWRITTEN: &str =
+    "this session's spool boundary could not be written, so nothing it supports was removed";
+
 /// Fixed-size segment files holding output older than the resident window.
 #[derive(Debug)]
 struct Spool {
@@ -783,6 +931,22 @@ struct Spool {
     /// closing a file for each of them makes the session's own output path the slowest thing in
     /// the host. The handle is kept for as long as the segment is the one being appended to.
     open_segment: Option<(PathBuf, std::fs::File)>,
+    /// Where this spool stopped taking output, and why, when it has.
+    ///
+    /// A spool that could not make room, open or write a segment, or publish its boundary takes
+    /// nothing more until a retention pass finds that it can, and keeps everything it already
+    /// holds: dropping it would take its files out of the account while they were still on the
+    /// disk, and out of reach of the passes that collect them.
+    suspended: Option<Suspension>,
+}
+
+/// Where a spool stopped taking output, and why.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Suspension {
+    /// The first cursor the spool did not take.
+    at: u64,
+    /// What stopped it, in words a person can act on.
+    reason: String,
 }
 
 #[derive(Clone, Debug)]
@@ -880,6 +1044,7 @@ impl Spool {
             boundary,
             unreadable_boundary: recorded == RecordedBoundary::Unreadable,
             open_segment: None,
+            suspended: None,
         })
     }
 
@@ -893,75 +1058,234 @@ impl Spool {
         self.segments.front().map(|segment| segment.start)
     }
 
-    fn append(&mut self, start: u64, bytes: &[u8]) -> Result<()> {
+    /// Remembers where the session's output has reached, whether this spool took it or not.
+    ///
+    /// It is what the boundary publishes. A spool that stopped, or that retention was turned off
+    /// for, did not take everything; its boundary still says where the output got to, so a spool
+    /// reopened over this directory continues the session's cursor rather than reusing cursors
+    /// already given out, and a reader is told the range it does not hold.
+    fn note_position(&mut self, cursor: u64) {
+        self.boundary = self.boundary.max(cursor);
+    }
+
+    /// Writes one append, making room for each piece before it is written, and returns the range
+    /// the append gave up to make that room: its first cursor, the first cursor still held, and
+    /// how many bytes went.
+    ///
+    /// A piece never needs more than one segment of room, and the layout keeps a segment within
+    /// the capacity, so once the older segments have gone the room is there; the segment a piece
+    /// is written into is never the one given up for it. A cursor that does not continue the
+    /// newest segment starts a new one, because a segment's bytes are the cursors from its start
+    /// in order.
+    ///
+    /// Nothing here stands over the capacity. When the room cannot be made, or a segment cannot be
+    /// opened or written, the spool stops at the first cursor it did not take, keeps everything it
+    /// holds, and takes nothing more until a retention pass finds that it can.
+    fn append(&mut self, start: u64, bytes: &[u8]) -> Option<(u64, u64, u64)> {
+        if self.suspended.is_some() {
+            return None;
+        }
+        let mut evicted: Option<(u64, u64, u64)> = None;
         let mut written = 0_usize;
         while written < bytes.len() {
+            let cursor = start + written as u64;
             let now_ms = kr_ipc::now_ms().get();
-            let needs_new_segment = self.segments.back().is_none_or(|segment| {
+            let rotate = self.segments.back().is_none_or(|segment| {
                 segment.len >= self.layout.segment_bytes
                     || now_ms.saturating_sub(segment.started_at_ms) >= SEGMENT_ROTATION_MS
+                    || segment.end() != cursor
             });
-            if needs_new_segment {
-                let segment_start = start + written as u64;
-                self.segments.push_back(Segment {
-                    start: segment_start,
-                    len: 0,
-                    path: self.directory.join(format!("{segment_start:020}.out")),
-                    started_at_ms: now_ms,
-                    written_at_ms: now_ms,
-                });
-            }
-            let segment_bytes = self.layout.segment_bytes;
-            let segment = self.segments.back_mut().expect("a segment exists");
-            let room = usize::try_from(segment_bytes - segment.len).unwrap_or(usize::MAX);
-            let take = room.min(bytes.len() - written);
-            let path = segment.path.clone();
-            let segment_len = take;
-            // Borrowed separately from the segment, because the handle lives beside the index
-            // rather than inside it: a segment that is evicted takes its entry, not this handle.
-            let handle = match self.open_segment.as_mut() {
-                Some((open, file)) if *open == path => file,
-                _ => {
-                    let file = open_segment(&path)?;
-                    self.open_segment = Some((path.clone(), file));
-                    &mut self
-                        .open_segment
-                        .as_mut()
-                        .expect("the handle was just installed")
-                        .1
-                }
+            let room = if rotate {
+                self.layout.segment_bytes
+            } else {
+                self.segments
+                    .back()
+                    .map_or(self.layout.segment_bytes, |segment| {
+                        self.layout.segment_bytes.saturating_sub(segment.len)
+                    })
             };
-            append_open(handle, &bytes[written..written + segment_len])?;
-            let segment = self.segments.back_mut().expect("a segment exists");
-            segment.len += take as u64;
-            self.boundary = self.boundary.max(segment.start + segment.len);
-            // The newest byte's time, not the oldest: a segment is past its retention only when
-            // everything in it is, which is the direction that cannot delete output too early.
-            segment.written_at_ms = kr_ipc::now_ms().get();
-            self.total_bytes += take as u64;
+            let take = usize::try_from(room)
+                .unwrap_or(usize::MAX)
+                .min(bytes.len() - written);
+            match self.make_room(take as u64, !rotate, cursor) {
+                Ok(Some((from, to, gone))) => {
+                    evicted = Some(evicted.map_or((from, to, gone), |(first, _, before)| {
+                        (first, to, before + gone)
+                    }));
+                }
+                Ok(None) => {}
+                Err(reason) => {
+                    self.suspend(cursor, reason);
+                    break;
+                }
+            }
+            if rotate {
+                let path = self.directory.join(format!("{cursor:020}.out"));
+                match open_segment(&path) {
+                    Ok(file) => {
+                        self.open_segment = Some((path.clone(), file));
+                        self.segments.push_back(Segment {
+                            start: cursor,
+                            len: 0,
+                            path,
+                            started_at_ms: now_ms,
+                            written_at_ms: now_ms,
+                        });
+                    }
+                    Err(error) => {
+                        self.suspend(
+                            cursor,
+                            format!(
+                                "segment {} could not be opened: {error}",
+                                segment_name(&path)
+                            ),
+                        );
+                        break;
+                    }
+                }
+            }
+            if let Err(reason) = self.write_newest(&bytes[written..written + take]) {
+                self.suspend(cursor, reason);
+                break;
+            }
             written += take;
         }
-        let _ = self.evict();
+        evicted
+    }
+
+    /// Writes bytes at the end of the newest segment, and counts them once they are there.
+    fn write_newest(&mut self, bytes: &[u8]) -> std::result::Result<(), String> {
+        let Some(segment) = self.segments.back() else {
+            return Err("no segment was open to write into".to_owned());
+        };
+        let path = segment.path.clone();
+        let written_before = segment.len;
+        // Borrowed separately from the segment, because the handle lives beside the index rather
+        // than inside it: a segment that is evicted takes its entry, not this handle.
+        let handle = match self.open_segment.as_mut() {
+            Some((open, file)) if *open == path => file,
+            _ => {
+                let file = open_segment(&path).map_err(|error| {
+                    format!(
+                        "segment {} could not be opened: {error}",
+                        segment_name(&path)
+                    )
+                })?;
+                self.open_segment = Some((path.clone(), file));
+                &mut self
+                    .open_segment
+                    .as_mut()
+                    .expect("the handle was just installed")
+                    .1
+            }
+        };
+        if let Err(error) = append_open(handle, bytes) {
+            // A write that failed part way leaves bytes the index does not name. They are cut
+            // back where the platform allows, so a reopened spool does not read them as a segment
+            // longer than the one this host counted.
+            let _ = handle.set_len(written_before);
+            return Err(format!(
+                "segment {} could not be written: {error}",
+                segment_name(&path)
+            ));
+        }
+        let segment = self.segments.back_mut().expect("a segment exists");
+        segment.len += bytes.len() as u64;
+        self.boundary = self.boundary.max(segment.end());
+        // The newest byte's time, not the oldest: a segment is past its retention only when
+        // everything in it is, which is the direction that cannot delete output too early.
+        segment.written_at_ms = kr_ipc::now_ms().get();
+        self.total_bytes += bytes.len() as u64;
         Ok(())
     }
 
-    fn evict(&mut self) -> u64 {
-        if self.total_bytes <= self.layout.capacity_bytes || self.segments.len() < 2 {
-            return 0;
+    /// Gives up the oldest segments until `needed` more bytes fit within the capacity.
+    ///
+    /// The boundary is published before the first segment goes, as every eviction publishes it.
+    /// `keep_newest` keeps the segment the bytes are about to be written into. Returns the range
+    /// that went, or why the room could not be made: a boundary that could not be written, or a
+    /// segment that could not be removed and is still counted.
+    fn make_room(
+        &mut self,
+        needed: u64,
+        keep_newest: bool,
+        cursor: u64,
+    ) -> std::result::Result<Option<(u64, u64, u64)>, String> {
+        if self.total_bytes.saturating_add(needed) <= self.layout.capacity_bytes {
+            return Ok(None);
         }
         if !self.record_boundary() {
-            // The boundary could not be published, so nothing that supports it is deleted.
-            return 0;
+            return Err(
+                "this session's spool boundary could not be written, so nothing was removed to \
+                 make room"
+                    .to_owned(),
+            );
         }
-        let mut dropped = 0;
-        while self.total_bytes > self.layout.capacity_bytes && self.segments.len() > 1 {
-            let went = self.drop_oldest();
-            if went == 0 {
-                break;
+        let from = self.oldest_cursor().unwrap_or(cursor);
+        let mut gone = 0;
+        while self.total_bytes.saturating_add(needed) > self.layout.capacity_bytes {
+            if self.segments.is_empty() || (keep_newest && self.segments.len() == 1) {
+                return Err(format!(
+                    "{needed} bytes do not fit within this session's spool capacity of {} bytes",
+                    self.layout.capacity_bytes
+                ));
             }
-            dropped += went;
+            gone += self.drop_oldest()?;
         }
-        dropped
+        Ok(Some((from, self.oldest_cursor().unwrap_or(cursor), gone)))
+    }
+
+    /// Stops taking output at `at`, for `reason`, unless it has already stopped.
+    ///
+    /// The first stop is the one kept, because it is where the output this spool did not take
+    /// begins.
+    fn suspend(&mut self, at: u64, reason: String) {
+        if self.suspended.is_none() {
+            self.suspended = Some(Suspension { at, reason });
+        }
+    }
+
+    /// Returns the first cursor this spool did not take, while it has stopped.
+    fn suspended_at(&self) -> Option<u64> {
+        self.suspended.as_ref().map(|suspension| suspension.at)
+    }
+
+    /// Returns where this spool stopped taking output, and why.
+    fn suspension(&self) -> Option<(u64, &str)> {
+        self.suspended
+            .as_ref()
+            .map(|suspension| (suspension.at, suspension.reason.as_str()))
+    }
+
+    /// Takes output again, because nothing it held is left to be owed anything.
+    fn clear_suspension(&mut self) {
+        self.suspended = None;
+    }
+
+    /// Takes output again from `from`, writing `pending` there first, when it can.
+    ///
+    /// Room is made for what is pending, and for at least one byte, before anything is written,
+    /// so a spool whose oldest segment still cannot be removed stays stopped rather than stopping
+    /// again at the next append. Returns `None` while it still cannot: it stays stopped where it
+    /// first stopped, whatever this attempt ran into. Otherwise returns the range it gave up.
+    fn resume(&mut self, from: u64, pending: &[u8]) -> Option<Option<(u64, u64, u64)>> {
+        let held = self.suspended.take()?;
+        let made = match self.make_room((pending.len() as u64).max(1), false, from) {
+            Ok(made) => made,
+            Err(_) => {
+                self.suspended = Some(held);
+                return None;
+            }
+        };
+        let written = self.append(from, pending);
+        if self.suspended.is_some() {
+            self.suspended = Some(held);
+            return None;
+        }
+        Some(match (made, written) {
+            (Some((first, _, before)), Some((_, to, gone))) => Some((first, to, before + gone)),
+            (made, written) => made.or(written),
+        })
     }
 
     /// Removes the oldest segment and returns how many bytes went.
@@ -970,12 +1294,12 @@ impl Spool {
     /// of what says where the output got to: a crash between the delete and the write would put
     /// the spool back in the condition the boundary exists to prevent.
     ///
-    /// A file this host could not remove stays in the accounting. Dropping the entry while the
-    /// bytes were still on disk would make the spool report less than it holds, and the next
-    /// capacity pass would then delete something it did not need to.
-    fn drop_oldest(&mut self) -> u64 {
+    /// A file this host could not remove stays in the accounting, and the refusal names it.
+    /// Dropping the entry while the bytes were still on disk would make the spool report less than
+    /// it holds, and the next capacity pass would then delete something it did not need to.
+    fn drop_oldest(&mut self) -> std::result::Result<u64, String> {
         let Some(segment) = self.segments.front().cloned() else {
-            return 0;
+            return Ok(0);
         };
         // The newest segment can also be the oldest, and retention may take it: the handle it is
         // being written through is dropped with it, so the next append opens a new one.
@@ -989,11 +1313,16 @@ impl Spool {
         match std::fs::remove_file(&segment.path) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => return 0,
+            Err(error) => {
+                return Err(format!(
+                    "segment {} could not be removed: {error}",
+                    segment_name(&segment.path)
+                ));
+            }
         }
         self.segments.pop_front();
         self.total_bytes -= segment.len;
-        segment.len
+        Ok(segment.len)
     }
 
     /// Publishes the boundary before anything that supports it is deleted.
@@ -1010,23 +1339,24 @@ impl Spool {
         true
     }
 
-    /// Removes the segments that are entirely past the retention period.
+    /// Removes the segments that are entirely past the retention period, and says what it could
+    /// not remove.
     ///
     /// Retention runs between appends rather than inside one, so it may take every segment: the
     /// next append starts a new one, and what stays readable meanwhile is the resident window.
-    /// The eviction the capacity bound does inside an append keeps its own guard, because there
-    /// the newest segment is the one being written to.
-    fn drop_older_than(&mut self, expires_before: u64) -> u64 {
+    /// The room an append makes keeps its own guard, because there the newest segment is the one
+    /// being written to.
+    fn drop_older_than(&mut self, expires_before: u64) -> (u64, Option<String>) {
         if self
             .segments
             .front()
             .is_none_or(|segment| segment.written_at_ms >= expires_before)
         {
-            return 0;
+            return (0, None);
         }
         if !self.record_boundary() {
             // The boundary could not be published, so nothing that supports it is deleted.
-            return 0;
+            return (0, Some(BOUNDARY_UNWRITTEN.to_owned()));
         }
         let mut dropped = 0;
         while self
@@ -1034,33 +1364,32 @@ impl Spool {
             .front()
             .is_some_and(|segment| segment.written_at_ms < expires_before)
         {
-            let went = self.drop_oldest();
-            if went == 0 {
-                break;
+            match self.drop_oldest() {
+                Ok(went) => dropped += went,
+                Err(reason) => return (dropped, Some(reason)),
             }
-            dropped += went;
         }
-        dropped
+        (dropped, None)
     }
 
-    /// Removes the oldest segments until at least `bytes` have gone.
-    fn drop_at_least(&mut self, bytes: u64) -> u64 {
+    /// Removes the oldest segments until at least `bytes` have gone, and says what it could not
+    /// remove.
+    fn drop_at_least(&mut self, bytes: u64) -> (u64, Option<String>) {
         if bytes == 0 || self.segments.is_empty() {
-            return 0;
+            return (0, None);
         }
         if !self.record_boundary() {
             // The boundary could not be published, so nothing that supports it is deleted.
-            return 0;
+            return (0, Some(BOUNDARY_UNWRITTEN.to_owned()));
         }
         let mut dropped = 0;
         while dropped < bytes && !self.segments.is_empty() {
-            let went = self.drop_oldest();
-            if went == 0 {
-                break;
+            match self.drop_oldest() {
+                Ok(went) => dropped += went,
+                Err(reason) => return (dropped, Some(reason)),
             }
-            dropped += went;
         }
-        dropped
+        (dropped, None)
     }
 
     /// Returns when the oldest retained segment was last written.
@@ -1219,65 +1548,6 @@ fn read_boundary(directory: &Path) -> RecordedBoundary {
     }
 }
 
-/// Removes what a lost spool left on the disk, and says what is still there.
-///
-/// This is the purge path for a spool whose handle has gone: the segment files are ordinary files
-/// in a directory this session owns, and removing them is what makes a privacy cleanup true
-/// rather than merely reported. A file this host cannot unlink, and a directory it cannot read,
-/// are named rather than counted as removed.
-///
-/// The boundary is written first and kept. It says where this session's output got to, which is
-/// what makes the range that went read as a gap rather than as a session that started at nought,
-/// and it is a number rather than content, so privacy mode has no reason to take it.
-fn remove_spool_files(directory: &Path, boundary: u64) -> (u64, u64, Option<String>) {
-    if !write_boundary(directory, boundary) {
-        return (
-            0,
-            0,
-            Some(
-                "this session's spool boundary could not be written, so what its lost spool left \
-                 was kept rather than deleted behind a range nothing could account for"
-                    .to_owned(),
-            ),
-        );
-    }
-    let Ok(entries) = std::fs::read_dir(directory) else {
-        return (
-            0,
-            0,
-            Some(format!(
-                "this session's spool directory at {} could not be read, so what it holds was \
-                 left where it was",
-                directory.display()
-            )),
-        );
-    };
-    let mut bytes = 0;
-    let mut removed = 0;
-    let mut left = 0;
-    for entry in entries {
-        // An entry this host could not even read is an entry it cannot say it removed.
-        let Ok(entry) = entry else {
-            left += 1;
-            continue;
-        };
-        let path = entry.path();
-        if path.file_name().is_some_and(|name| name == BOUNDARY_FILE) {
-            continue;
-        }
-        let size = entry.metadata().map(|data| data.len()).unwrap_or_default();
-        if std::fs::remove_file(&path).is_ok() {
-            bytes += size;
-            removed += 1;
-        } else {
-            left += 1;
-        }
-    }
-    let left_behind =
-        (left > 0).then(|| format!("{left} of this session's spool files could not be removed"));
-    (bytes, removed, left_behind)
-}
-
 /// Writes the boundary down, replacing it in one step, and says whether it is published.
 ///
 /// The temporary file and the rename are what make it one step: a crash during the write leaves
@@ -1337,19 +1607,25 @@ fn create_owner_only(directory: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(directory)
 }
 
-fn open_segment(path: &Path) -> Result<std::fs::File> {
+fn open_segment(path: &Path) -> std::io::Result<std::fs::File> {
     std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
-        .map_err(|error| WorkerError::storage("open an output spool segment", error))
 }
 
-fn append_open(file: &mut std::fs::File, bytes: &[u8]) -> Result<()> {
+fn append_open(file: &mut std::fs::File, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write as _;
 
     file.write_all(bytes)
-        .map_err(|error| WorkerError::storage("write an output spool segment", error))
+}
+
+/// Names a segment by its file, which is what a person looking at the spool directory sees.
+fn segment_name(path: &Path) -> String {
+    path.file_name().map_or_else(
+        || path.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    )
 }
 
 /// Reads up to `len` bytes of a segment from `offset`, fewer only where the file ends.
