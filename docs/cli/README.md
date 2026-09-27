@@ -714,7 +714,7 @@ bound to the session this process is running in. Outside a session every tool an
 | 6 | The command needed a terminal, or the terminal could not be changed |
 | 7 | No terminal application could be opened |
 | 8 | The host refused the request |
-| 9 | An update of this host waits: a live session runs at a level the new release does not retain, something does not answer, or another update is running. Nothing was replaced, and whatever the update stopped runs again |
+| 9 | An update of this host waits: a live session runs at a level the new release does not retain, something does not answer, or another install or update is running. Nothing was replaced, and whatever the update stopped runs again |
 
 `kr attach`, and `kr new` when it attaches, exit 0 when the session closed cleanly, 1 when it closed
 any other way, and 3 when the connection ended before a whole closure record arrived. [When the
@@ -1320,6 +1320,10 @@ waits, starts again whatever it stopped, and exits with 9, naming what holds it:
 ```text
 kr: the update to 0.3.0+9f1c2b3a4d5e waits: session 7 runs kr-worker/0.2.0+4254aa6e62e5 with protocol 0.45.0, which the control daemon of 0.3.0+9f1c2b3a4d5e does not speak; run kr host update again once that has changed
 ```
+
+A control daemon the update stopped that does not start again, from either release, makes it exit
+with 1 and name the daemon; the update stays recorded, and the next `kr host update` starts that
+daemon before anything else.
 
 With `--json`, `kr host update` answers with `source`, `target`, whether it only checked
 (`checked_only`), the environments whose daemons it started again (`restarted`) and the releases it

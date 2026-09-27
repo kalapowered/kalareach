@@ -85,6 +85,19 @@ impl TestStore {
         );
         program
     }
+
+    /// Makes a release current, under the locks every switch is made under.
+    fn switch(&self, release: &ReleaseName) {
+        let update = self
+            .store
+            .try_lock_update()
+            .expect("locks")
+            .expect("nothing else updates");
+        let install = self.store.lock_install().expect("the install lock");
+        self.store
+            .switch(release, &update, &install)
+            .expect("the release is current");
+    }
 }
 
 impl Drop for TestStore {
@@ -138,12 +151,7 @@ fn a_program_started_through_current_keeps_its_release_after_the_switch() {
     let two = release("0.2.0+bbbbbbbbbbbb");
     let program = test.install(&one);
     test.install(&two);
-    {
-        let held = test.store.lock_install().expect("the install lock");
-        test.store
-            .switch(&one, &held)
-            .expect("the first release is current");
-    }
+    test.switch(&one);
     let talk = test.root.join("talk");
     std::fs::create_dir(&talk).expect("a directory to talk through");
     let mut child = std::process::Command::new(test.store.stable(Program::Kr))
@@ -157,12 +165,7 @@ fn a_program_started_through_current_keeps_its_release_after_the_switch() {
     wait_for(&talk.join("started"));
 
     // The update happens while the program runs.
-    {
-        let held = test.store.lock_install().expect("the install lock");
-        test.store
-            .switch(&two, &held)
-            .expect("the second release is current");
-    }
+    test.switch(&two);
     let update = test
         .store
         .try_lock_update()
