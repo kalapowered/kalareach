@@ -194,6 +194,73 @@ impl Registry {
         Self::prepare(connection, environment_id)
     }
 
+    /// Opens a registry that already exists, to read what it records and nothing else.
+    ///
+    /// Nothing is created, brought forward, repaired or settled: the file is opened read-only, and
+    /// it is refused unless it records exactly the schema version this build reads and holds the
+    /// tables the workers and the closures are read from. A registry that lost one of those tables
+    /// would otherwise read as recording no worker at all, and that is the one answer a question
+    /// about who may still hold a session's stores must never get by accident. The explicit
+    /// journal import reads its evidence through this.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the file is not there or cannot be
+    /// opened, when it records another schema version or none, and when a table it is read from
+    /// is missing.
+    pub fn open_to_read(
+        path: impl AsRef<std::path::Path>,
+        environment_id: EnvironmentId,
+    ) -> Result<Self> {
+        let connection = Connection::open_with_flags(
+            path.as_ref(),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(ControllerError::registry)?;
+        let versions: Vec<i64> = {
+            let mut statement = connection
+                .prepare("SELECT version FROM schema_version")
+                .map_err(ControllerError::registry)?;
+            statement
+                .query_map([], |row| row.get(0))
+                .map_err(ControllerError::registry)?
+                .collect::<rusqlite::Result<_>>()
+                .map_err(ControllerError::registry)?
+        };
+        if versions != [SCHEMA_VERSION] {
+            let recorded = match versions.as_slice() {
+                [] => "no schema version".to_owned(),
+                [version] => format!("schema version {version}"),
+                many => format!("{} schema versions", many.len()),
+            };
+            return Err(ControllerError::RegistryUnavailable {
+                detail: format!(
+                    "this registry records {recorded}, and this build reads one as it is only at \
+                     schema version {SCHEMA_VERSION}"
+                ),
+            });
+        }
+        for table in ["workers", "tombstones"] {
+            let present: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    [table],
+                    |row| row.get(0),
+                )
+                .map_err(ControllerError::registry)?;
+            if present == 0 {
+                return Err(ControllerError::RegistryUnavailable {
+                    detail: format!("this registry has no {table} table"),
+                });
+            }
+        }
+        Ok(Self {
+            connection,
+            environment_id,
+            current_process: kr_ipc::identity::current_process,
+        })
+    }
+
     /// Opens a registry that exists only for the life of this process.
     ///
     /// # Errors
@@ -2326,5 +2393,68 @@ mod tests {
             kr_ipc::identity::process_state(&ended),
             kr_ipc::identity::ProcessState::Ended
         );
+    }
+
+    /// A worker row of session `byte`, run by process `pid`.
+    fn worker_row(byte: u8, pid: u64) -> WorkerRecord {
+        WorkerRecord {
+            session_id: session(byte),
+            display_number: DisplayNumber::new(u64::from(byte)),
+            public_key: AuthorisationKey::from_bytes([byte; 32]),
+            process_identity: ProcessStartIdentity::new(pid, ProcessStartSource::LinuxProcStat, 7),
+            endpoint: format!("/tmp/kr-registry-test-{byte}.sock"),
+            profile: WorkerProfile::HeadlessUser,
+            state: SessionState::Live,
+            acknowledged_revision: AuthorityRevision::new(0),
+        }
+    }
+
+    #[test]
+    fn a_registry_opened_to_read_is_read_as_it_is_or_refused() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let path = directory.path().join("registry.sqlite3");
+        Registry::open_to_read(&path, environment()).expect_err("there is no registry to read");
+        assert!(!path.exists(), "reading made no registry");
+
+        Registry::open(&path, environment())
+            .expect("a registry")
+            .adopt_worker(&worker_row(1, 4_001))
+            .expect("records a worker");
+        let read = Registry::open_to_read(&path, environment()).expect("a registry reads");
+        assert_eq!(
+            read.workers().expect("reads the workers"),
+            vec![worker_row(1, 4_001)]
+        );
+        assert_eq!(read.closure(session(1)).expect("reads the closures"), None);
+        drop(read);
+
+        // What it is asked is read as it is. Another version is not brought forward to be read,
+        // and a table that has gone is not made again, empty, to be read as saying nothing.
+        let change = |sql: &str| {
+            Connection::open(&path)
+                .expect("a second connection")
+                .execute_batch(sql)
+                .expect("changes the registry");
+        };
+        change("UPDATE schema_version SET version = version - 1;");
+        let refused =
+            Registry::open_to_read(&path, environment()).expect_err("another version is refused");
+        assert!(refused.to_string().contains("schema version"), "{refused}");
+        change("UPDATE schema_version SET version = version + 1;");
+        for table in ["tombstones", "workers"] {
+            change(&format!("DROP TABLE {table};"));
+            let refused = Registry::open_to_read(&path, environment())
+                .expect_err("a registry without a table it is read from is refused");
+            assert!(refused.to_string().contains(table), "{refused}");
+        }
+        let tables: i64 = Connection::open(&path)
+            .expect("a second connection")
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name IN ('tombstones', 'workers')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("reads the schema");
+        assert_eq!(tables, 0, "reading repaired nothing");
     }
 }

@@ -1113,6 +1113,15 @@ fn publish_descriptor(
 // KR-REQ-24.30: a journal older than the ladder, refused by name and imported explicitly
 // ---------------------------------------------------------------------------------------------
 
+/// Opens the environment's registry as a daemon does, creating it on first use.
+fn registry(archive: &ArchiveService) -> kr_controller::registry::Registry {
+    kr_controller::registry::Registry::open(
+        archive.paths().registry_database(),
+        archive.paths().environment_id(),
+    )
+    .expect("the registry")
+}
+
 /// Writes the journal the first build of this schema wrote, version 1 with one receipt, where the
 /// session's journal belongs.
 fn write_version_one_journal(archive: &ArchiveService, session_id: SessionId) {
@@ -1187,6 +1196,7 @@ fn the_importer_brings_a_closed_sessions_version_one_journal_forward_once() {
     // archive then reads the imported one.
     use kr_controller::archive::ImportOutcome;
     let (_temp, archive) = host();
+    drop(registry(&archive));
     let old = session();
     write_version_one_journal(&archive, old);
     let ended = kr_ipc::identity::ended_process_identity(1);
@@ -1265,11 +1275,7 @@ fn a_journal_a_worker_may_still_own_is_not_imported() {
     let unconfirmed = session();
     write_version_one_journal(&archive, unconfirmed);
     {
-        let mut registry = kr_controller::registry::Registry::open(
-            archive.paths().registry_database(),
-            archive.paths().environment_id(),
-        )
-        .expect("the registry");
+        let mut registry = registry(&archive);
         let mut record = closure(unconfirmed, ClosureReason::WorkerCrash);
         record.surviving = vec![SurvivingResource {
             kind: "unaccounted_worker".to_owned(),
@@ -1296,6 +1302,245 @@ fn a_journal_a_worker_may_still_own_is_not_imported() {
                 .expect("reads the version"),
             1,
             "a journal a worker may still own is left alone"
+        );
+    }
+}
+
+/// What the import did with one session's journal.
+fn outcome_of(
+    imported: &[kr_controller::archive::JournalImport],
+    session_id: SessionId,
+) -> kr_controller::archive::ImportOutcome {
+    imported
+        .iter()
+        .find(|done| done.session_id == session_id)
+        .map(|done| done.outcome.clone())
+        .expect("the session is reported")
+}
+
+/// Asserts that a journal was refused because a worker may still own it, for a reason that says
+/// `why`, and that it is still at version 1.
+#[track_caller]
+fn refused_as_owned(
+    archive: &ArchiveService,
+    outcome: &kr_controller::archive::ImportOutcome,
+    session_id: SessionId,
+    why: &str,
+) {
+    use kr_controller::archive::{ImportOutcome, RefusalCause};
+    match outcome {
+        ImportOutcome::Refused {
+            cause: RefusalCause::WorkerMayRemain,
+            reason,
+        } => assert!(reason.contains(why), "the refusal says {why:?}: {reason}"),
+        other => panic!("{session_id} was not refused as a worker's: {other:?}"),
+    }
+    assert_eq!(
+        Journal::recorded_schema_version(archive.paths().journal_database(session_id))
+            .expect("reads the version"),
+        1,
+        "the journal is left as it was"
+    );
+}
+
+#[test]
+fn a_registry_that_lost_a_table_it_is_asked_is_not_read_as_recording_no_worker() {
+    // The registry's worker rows and its closures are two of the three things that say whether a
+    // worker may still hold a journal. A registry that lost either table would read as saying
+    // there is no worker at all, so the import reads the registry as it is, repairs nothing in it,
+    // and refuses what it cannot ask.
+    for table in ["workers", "tombstones"] {
+        let (_temp, archive) = host();
+        drop(registry(&archive));
+        rusqlite::Connection::open(archive.paths().registry_database())
+            .expect("a second connection")
+            .execute_batch(&format!("DROP TABLE {table};"))
+            .expect("the table goes");
+        let session_id = session();
+        write_version_one_journal(&archive, session_id);
+        let imported = archive
+            .import_journals()
+            .expect("the environment is walked");
+        refused_as_owned(
+            &archive,
+            &outcome_of(&imported, session_id),
+            session_id,
+            table,
+        );
+        let recreated: i64 = rusqlite::Connection::open(archive.paths().registry_database())
+            .expect("a second connection")
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [table],
+                |row| row.get(0),
+            )
+            .expect("reads the schema");
+        assert_eq!(
+            recreated, 0,
+            "the import did not make a new, empty {table} table"
+        );
+    }
+}
+
+#[test]
+fn a_registry_of_another_schema_version_is_not_read() {
+    // A registry this build would have to bring forward, or could not read, is not evidence this
+    // build can weigh, so nothing below the ladder is imported against it.
+    let (_temp, archive) = host();
+    drop(registry(&archive));
+    rusqlite::Connection::open(archive.paths().registry_database())
+        .expect("a second connection")
+        .execute(
+            "UPDATE schema_version SET version = ?1",
+            [kr_controller::registry::SCHEMA_VERSION + 1],
+        )
+        .expect("the version moves");
+    let session_id = session();
+    write_version_one_journal(&archive, session_id);
+    let imported = archive
+        .import_journals()
+        .expect("the environment is walked");
+    refused_as_owned(
+        &archive,
+        &outcome_of(&imported, session_id),
+        session_id,
+        "schema version",
+    );
+}
+
+#[test]
+fn an_environment_without_a_registry_imports_nothing_below_the_ladder() {
+    // A journal is only ever written under a daemon, and a daemon keeps a registry. One that has
+    // gone took with it what would say whether a worker may still be there.
+    let (_temp, archive) = host();
+    let old = session();
+    write_version_one_journal(&archive, old);
+    let current = session();
+    {
+        let mut journal = journal_for(&archive, current);
+        journal
+            .record_session(&summary(current))
+            .expect("records the summary");
+    }
+    let imported = archive
+        .import_journals()
+        .expect("the environment is walked");
+    refused_as_owned(&archive, &outcome_of(&imported, old), old, "no registry");
+    assert_eq!(
+        outcome_of(&imported, current),
+        kr_controller::archive::ImportOutcome::Untouched {
+            version: kr_worker::persistence::migration::CURRENT
+        },
+        "a journal inside the ladder needs no registry to be left alone"
+    );
+    assert!(
+        !archive.paths().registry_database().exists(),
+        "the import made no registry"
+    );
+}
+
+#[test]
+fn a_live_worker_recorded_only_in_the_registry_keeps_its_journal() {
+    // No descriptor and no closure: the registry's worker row alone names a process the kernel
+    // says is running.
+    let (_temp, archive) = host();
+    let session_id = session();
+    write_version_one_journal(&archive, session_id);
+    registry(&archive)
+        .adopt_worker(&kr_controller::registry::WorkerRecord {
+            session_id,
+            display_number: DisplayNumber::new(1),
+            public_key: kr_protocol::scalars::AuthorisationKey::from_bytes([7; 32]),
+            process_identity: kr_ipc::identity::current_process_start_identity()
+                .expect("an identity"),
+            endpoint: "/tmp/kr-archive-test.sock".to_owned(),
+            profile: kr_protocol::identity::WorkerProfile::HeadlessUser,
+            state: kr_protocol::session::SessionState::Live,
+            acknowledged_revision: kr_protocol::ids::AuthorityRevision::new(0),
+        })
+        .expect("records the worker");
+    let imported = archive
+        .import_journals()
+        .expect("the environment is walked");
+    refused_as_owned(
+        &archive,
+        &outcome_of(&imported, session_id),
+        session_id,
+        "registry names its worker",
+    );
+}
+
+/// Sets a directory's mode for as long as it lives, and gives it back its owner's full access.
+#[cfg(unix)]
+struct Mode(std::path::PathBuf);
+
+/// The directory that holds one path a fence removes.
+#[cfg(unix)]
+type HeldBy = fn(&ArchiveService) -> std::path::PathBuf;
+
+#[cfg(unix)]
+impl Mode {
+    fn read_only(path: std::path::PathBuf) -> Self {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o500))
+            .expect("the directory is made read-only");
+        Self(path)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Mode {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn what_is_left_of_an_ended_worker_that_cannot_be_removed_stops_the_import() {
+    // Death is confirmed, so the descriptor and the endpoint are fenced before the journal is
+    // opened. A path that is already gone is fenced; one that is still there after the attempt
+    // is not, and the journal is left alone rather than opened beside it.
+    use kr_controller::archive::{ImportOutcome, RefusalCause};
+    let ended = kr_ipc::identity::ended_process_identity(1);
+    let held_by: [(&str, HeldBy); 2] = [
+        ("the descriptor", |archive| {
+            archive.paths().descriptors_dir()
+        }),
+        ("the endpoint", |archive| {
+            archive.paths().runtime_dir().to_path_buf()
+        }),
+    ];
+    for (held, directory) in held_by {
+        let (_temp, archive) = host();
+        drop(registry(&archive));
+        let session_id = session();
+        write_version_one_journal(&archive, session_id);
+        publish_descriptor(&archive, session_id, &ended);
+        let endpoint = archive
+            .paths()
+            .worker_endpoint(DisplayNumber::new(1))
+            .expect("an endpoint");
+        std::fs::write(endpoint.as_path(), b"a socket").expect("the endpoint's file");
+        let imported = {
+            let _held = Mode::read_only(directory(&archive));
+            archive
+                .import_journals()
+                .expect("the environment is walked")
+        };
+        match outcome_of(&imported, session_id) {
+            ImportOutcome::Refused {
+                cause: RefusalCause::NotFenced,
+                ..
+            } => {}
+            other => panic!("{held} could not be removed, and the import went on: {other:?}"),
+        }
+        assert_eq!(
+            Journal::recorded_schema_version(archive.paths().journal_database(session_id))
+                .expect("reads the version"),
+            1,
+            "the journal is left as it was"
         );
     }
 }

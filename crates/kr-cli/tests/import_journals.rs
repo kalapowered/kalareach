@@ -82,6 +82,11 @@ fn document(output: &Output) -> Value {
 fn a_version_one_journal_is_imported_once_while_the_environment_is_stopped() {
     let temp = kr_ipc::testing::TempHost::create();
     let paths = temp.environment();
+    // The registry the environment's daemon kept, which records no worker for this session.
+    drop(
+        kr_controller::registry::Registry::open(paths.registry_database(), temp.environment_id())
+            .expect("the registry"),
+    );
     let session_id = SessionId::new(kr_ipc::new_uuid());
     let journal = paths.journal_database(session_id);
     write_version_one_journal(&journal);

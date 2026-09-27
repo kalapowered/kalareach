@@ -6,8 +6,10 @@
 //! session's journal is opened only when nothing this host can read says its worker may still be
 //! there - the registry's worker row, a closure in the registry that never confirmed its worker's
 //! end, and the published descriptor - and a source this host cannot read counts as saying so.
-//! What is left of a worker whose end is confirmed, its descriptor and its endpoint, is fenced
-//! before the journal is opened, as recovery ownership fences it.
+//! The registry is read as it is, never brought forward or repaired, and an environment without
+//! one has nothing to say about its workers, so nothing below the ladder is imported there. What is
+//! left of a worker whose end is confirmed, its descriptor and its endpoint, is fenced before the
+//! journal is opened, and a path that is still there after that is a refusal.
 
 use kr_protocol::identity::ProcessStartIdentity;
 use kr_protocol::ids::SessionId;
@@ -62,9 +64,9 @@ pub enum ImportOutcome {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RefusalCause {
     /// Something this host can read says the session's worker may still be there, or a source
-    /// that would say so cannot be read.
+    /// that would say so cannot be read or is not there.
     WorkerMayRemain,
-    /// What is left of a worker whose end is confirmed could not be fenced.
+    /// What is left of a worker whose end is confirmed is still there after it was fenced.
     NotFenced,
     /// The journal's recorded version could not be read.
     VersionUnreadable,
@@ -91,7 +93,7 @@ impl RefusalCause {
             Self::WorkerMayRemain => {
                 "a worker may still own it, or what would say whether one does cannot be read"
             }
-            Self::NotFenced => "what is left of its ended worker could not be fenced",
+            Self::NotFenced => "what is left of its ended worker could not be removed",
             Self::VersionUnreadable => "its schema version could not be read",
             Self::Unreadable => "it holds something the importer does not read",
         }
@@ -110,25 +112,29 @@ impl ArchiveService {
     ///
     /// The caller holds the environment's singleton lock, which is what makes this the only
     /// process touching these files: `kr host import-journals` takes it before it calls this. The
-    /// registry is opened only when it is there, under that lock, as a daemon starting would open
-    /// it; an environment with no registry has no worker rows or closures to ask.
+    /// registry is read as it is, with [`Registry::open_to_read`]: one that is not there, is at
+    /// another schema version or has lost a table it is asked is not evidence this host can weigh,
+    /// so every journal below the ladder is refused by name, and a journal inside it is left alone
+    /// as always.
     ///
     /// # Errors
     ///
-    /// Returns an error when the journal directory or an existing registry cannot be read: without
-    /// them this host cannot say which journals a worker may still hold, and it imports none.
+    /// Returns an error when the journal directory cannot be read: without it this host cannot say
+    /// which journals there are, and it imports none.
     pub fn import_journals(&self) -> Result<Vec<JournalImport>> {
         let path = self.paths().registry_database();
         let registry = match path.try_exists() {
-            Ok(true) => Some(Registry::open(&path, self.paths().environment_id())?),
-            Ok(false) => None,
-            Err(error) => {
-                return Err(ControllerError::InvalidArgument(format!(
-                    "{} could not be looked for, so this host cannot say which journals a worker \
-                     may still hold: {error}",
-                    path.display()
-                )));
-            }
+            Ok(true) => Registry::open_to_read(&path, self.paths().environment_id())
+                .map_err(|error| format!("the registry could not be read: {error}")),
+            Ok(false) => Err(
+                "this environment has no registry, so nothing says whether a worker may still \
+                 hold its journals"
+                    .to_owned(),
+            ),
+            Err(error) => Err(format!(
+                "{} could not be looked for: {error}",
+                path.display()
+            )),
         };
         let mut done = Vec::new();
         for session_id in self.journals_on_disk()? {
@@ -143,7 +149,11 @@ impl ArchiveService {
 
     /// Imports one session's journal, when it is older than the ladder and nothing says its
     /// worker may still be there.
-    fn import_one(&self, registry: Option<&Registry>, session_id: SessionId) -> ImportOutcome {
+    fn import_one(
+        &self,
+        registry: std::result::Result<&Registry, &String>,
+        session_id: SessionId,
+    ) -> ImportOutcome {
         let path = self.paths().journal_database(session_id);
         let version = match Journal::recorded_schema_version(&path) {
             Ok(version) => version,
@@ -164,13 +174,19 @@ impl ArchiveService {
                 reason,
             };
         }
-        if let Some((display_number, identity)) = evidence.ended
-            && let Err(error) = self.take_ownership(session_id, display_number, &identity)
-        {
-            return ImportOutcome::Refused {
-                cause: RefusalCause::NotFenced,
-                reason: error.to_string(),
-            };
+        if let Some((display_number, identity)) = evidence.ended {
+            if let Err(error) = self.take_ownership(session_id, display_number, &identity) {
+                return ImportOutcome::Refused {
+                    cause: RefusalCause::NotFenced,
+                    reason: error.to_string(),
+                };
+            }
+            if let Some(left) = self.left_after_fencing(session_id, display_number) {
+                return ImportOutcome::Refused {
+                    cause: RefusalCause::NotFenced,
+                    reason: left,
+                };
+            }
         }
         match import_journal(&path) {
             Ok(Imported::Imported { from, to, receipts }) => {
@@ -184,54 +200,98 @@ impl ArchiveService {
         }
     }
 
-    /// Asks everything this host can read whether the session's worker may still be there.
-    fn evidence_of_a_worker(&self, registry: Option<&Registry>, session_id: SessionId) -> Evidence {
-        let mut ended = None;
-        if let Some(registry) = registry {
-            match registry.workers() {
-                Ok(rows) => {
-                    if let Some(row) = rows.iter().find(|row| row.session_id == session_id) {
-                        if !confirmed_ended(&row.process_identity) {
-                            return Evidence {
-                                remains: Some(
-                                    "the registry names its worker, and the kernel has not said \
-                                     that process ended"
-                                        .to_owned(),
-                                ),
-                                ended: None,
-                            };
-                        }
-                        ended = Some((row.display_number, row.process_identity.clone()));
-                    }
-                }
+    /// Removes what is left of a worker whose end is confirmed - its descriptor and, where it is a
+    /// file, its endpoint - and says what is still there, or `None` when nothing is.
+    ///
+    /// Taking ownership has already tried, and it carries on past a path it could not remove,
+    /// because recovery does. An import does not: a path that is already gone is fenced, and one
+    /// that could not be removed stops the journal being opened. A named pipe is not a file and
+    /// goes with the process that served it, so on Windows there is only the descriptor.
+    fn left_after_fencing(
+        &self,
+        session_id: SessionId,
+        display_number: DisplayNumber,
+    ) -> Option<String> {
+        #[cfg_attr(not(unix), allow(unused_mut))]
+        let mut paths = vec![self.paths().descriptor_file(session_id)];
+        #[cfg(unix)]
+        match self.paths().worker_endpoint(display_number) {
+            Ok(endpoint) => paths.push(endpoint.as_path().to_path_buf()),
+            Err(error) => return Some(format!("its endpoint could not be named: {error}")),
+        }
+        #[cfg(not(unix))]
+        let _ = display_number;
+        for path in paths {
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => {
-                    return Evidence {
-                        remains: Some(format!("the registry's workers could not be read: {error}")),
-                        ended: None,
-                    };
+                    return Some(format!("{} could not be removed: {error}", path.display()));
                 }
             }
-            match registry.closure(session_id) {
-                Ok(Some(closure))
-                    if closure
-                        .surviving
-                        .iter()
-                        .any(|resource| resource.kind == UNACCOUNTED_WORKER) =>
-                {
-                    return Evidence {
-                        remains: Some(
-                            "its closure lists a worker whose end was never confirmed".to_owned(),
-                        ),
-                        ended: None,
-                    };
+        }
+        None
+    }
+
+    /// Asks everything this host can read whether the session's worker may still be there.
+    fn evidence_of_a_worker(
+        &self,
+        registry: std::result::Result<&Registry, &String>,
+        session_id: SessionId,
+    ) -> Evidence {
+        let registry = match registry {
+            Ok(registry) => registry,
+            Err(reason) => {
+                return Evidence {
+                    remains: Some(reason.clone()),
+                    ended: None,
+                };
+            }
+        };
+        let mut ended = None;
+        match registry.workers() {
+            Ok(rows) => {
+                if let Some(row) = rows.iter().find(|row| row.session_id == session_id) {
+                    if !confirmed_ended(&row.process_identity) {
+                        return Evidence {
+                            remains: Some(
+                                "the registry names its worker, and the kernel has not said that \
+                                 process ended"
+                                    .to_owned(),
+                            ),
+                            ended: None,
+                        };
+                    }
+                    ended = Some((row.display_number, row.process_identity.clone()));
                 }
-                Ok(_) => {}
-                Err(error) => {
-                    return Evidence {
-                        remains: Some(format!("its closure could not be read: {error}")),
-                        ended: None,
-                    };
-                }
+            }
+            Err(error) => {
+                return Evidence {
+                    remains: Some(format!("the registry's workers could not be read: {error}")),
+                    ended: None,
+                };
+            }
+        }
+        match registry.closure(session_id) {
+            Ok(Some(closure))
+                if closure
+                    .surviving
+                    .iter()
+                    .any(|resource| resource.kind == UNACCOUNTED_WORKER) =>
+            {
+                return Evidence {
+                    remains: Some(
+                        "its closure lists a worker whose end was never confirmed".to_owned(),
+                    ),
+                    ended: None,
+                };
+            }
+            Ok(_) => {}
+            Err(error) => {
+                return Evidence {
+                    remains: Some(format!("its closure could not be read: {error}")),
+                    ended: None,
+                };
             }
         }
         match kr_ipc::descriptor::read(self.paths(), session_id) {
