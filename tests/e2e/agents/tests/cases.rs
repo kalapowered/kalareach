@@ -4996,9 +4996,10 @@ fn a_local_and_a_remote_answer_raced_to_one_approval_resolve_it_once() {
         let mark = stage.mark.to_owned();
         // The command names its log by its absolute path, so where the agent runs it does not
         // change what it writes, and it stays on one line of the agent's dialog: its marker is the
-        // part's mark cut short, and the prompt carries the whole mark beside it.
+        // part's mark cut to its last six characters, and the prompt carries the whole mark beside
+        // it.
         let log = stage.run.work().join("a");
-        let tag = format!("kr{}", &mark[mark.len() - 8..]);
+        let tag = format!("kr{}", &mark[mark.len() - 6..]);
         let command = format!("echo {tag} >> {}", log.display());
         assert!(
             account.approval.command_line.as_deref().unwrap_or("").len() + command.len() + 8
