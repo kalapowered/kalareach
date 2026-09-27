@@ -3,6 +3,8 @@
 
 mod support;
 
+use std::time::Duration;
+
 use kr_describe::budget::{Budgets, GIB};
 use kr_describe::context::{ContextRevision, ContextSignal};
 use kr_describe::metadata::RepositoryFacts;
@@ -25,17 +27,7 @@ use kr_protocol::ids::{SessionEpoch, SessionId};
 use support::{MAC, at, binding, built_in, native, roomy, session};
 
 fn service() -> DescriptionService {
-    DescriptionService::new(
-        HostPlacement {
-            environment: native(1),
-            data_access: None,
-            target: MAC.to_owned(),
-        },
-        built_in(),
-        MetGates::default(),
-        ResourceSettings::default(),
-        DescriptionStore::in_memory().expect("a store in memory"),
-    )
+    service_over(DescriptionStore::in_memory().expect("a store in memory"))
 }
 
 /// Opens a session and settles one change in its directory into a queued job.
@@ -666,4 +658,120 @@ fn every_attempt_is_measured_however_it_ends() {
     );
     assert_eq!(measured(&service).0, 3);
     assert_eq!(measured(&service).2, 3);
+}
+
+/// KR-REQ-22.19: a job stays running until its description is in the store. While its publication
+/// waits for the store, a thread holding the running job's handle sees it running, and a
+/// cancellation from there either stops the description reaching the store or is told it came too
+/// late only once the description is there. A publication the store refuses ends the job with the
+/// error, and only then. The control is the handle once each outcome is complete, which has
+/// nothing running and nothing in flight.
+#[test]
+fn a_job_stays_running_until_its_description_is_in_the_store() {
+    let root = tempfile::tempdir().expect("a directory");
+    let path = root.path().to_path_buf();
+    let mut service = service_over(DescriptionStore::open(&path).expect("a store"));
+    queue(&mut service, &session(1), "kalareach", at(0));
+    let Instruction::Generate { id, request, .. } = loaded(&mut service, at(3_000)) else {
+        panic!("the job is sent");
+    };
+    let other = write_lock(&path);
+    let running = service.running_job().clone();
+    let watching = {
+        let path = path.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            let while_waiting = running.is_running(&session(1));
+            let stopped = running.cancel(&session(1));
+            let stored = DescriptionStore::open(&path)
+                .expect("a third connection")
+                .generated(&session(1))
+                .expect("a read")
+                .is_some();
+            (while_waiting, stopped, stored)
+        })
+    };
+    let committing = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(900));
+        other
+            .execute_batch("COMMIT")
+            .expect("the write lock is released");
+    });
+    let outcome = service
+        .finished(id, produced(&request.prompt, 0), at(3_500))
+        .expect("the answer");
+    committing.join().expect("the committing thread");
+    let (while_waiting, stopped, stored) = watching.join().expect("the watching thread");
+    assert!(while_waiting, "the job runs while its publication waits");
+    if stopped {
+        assert_eq!(
+            outcome,
+            Outcome::Cancelled {
+                session_id: session(1)
+            }
+        );
+        assert!(!stored, "a cancellation in time stops the write");
+    } else {
+        assert!(matches!(outcome, Outcome::Published { .. }), "{outcome:?}");
+        assert!(stored, "too late only once the description is in the store");
+    }
+    // The control: with the outcome complete, nothing is running or in flight.
+    assert!(!service.running_job().is_running(&session(1)));
+    assert_eq!(service.in_flight(), 0);
+
+    // A publication the store refuses: the job runs until the store gives up, and then ends.
+    change(&mut service, &session(1), "crates", at(40_000));
+    assert!(
+        service
+            .settle(&session(1), Priority::Ordinary, at(42_000))
+            .is_some()
+    );
+    let Instruction::Generate { id, request, .. } =
+        service.next(&roomy(), at(42_000)).expect("a job")
+    else {
+        panic!("the job is sent");
+    };
+    let other = write_lock(&path);
+    let running = service.running_job().clone();
+    let watching = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        running.is_running(&session(1))
+    });
+    let refused = service.finished(id, produced(&request.prompt, 0), at(42_500));
+    other
+        .execute_batch("ROLLBACK")
+        .expect("the write lock is released");
+    assert!(refused.is_err(), "{refused:?}");
+    assert!(
+        watching.join().expect("the watching thread"),
+        "the job runs while the store is waited for"
+    );
+    assert!(!service.running_job().is_running(&session(1)));
+    assert_eq!(service.in_flight(), 0);
+}
+
+/// Builds a service over a store of the test's own.
+fn service_over(store: DescriptionStore) -> DescriptionService {
+    DescriptionService::new(
+        HostPlacement {
+            environment: native(1),
+            data_access: None,
+            target: MAC.to_owned(),
+        },
+        built_in(),
+        MetGates::default(),
+        ResourceSettings::default(),
+        store,
+    )
+}
+
+/// Opens a second connection to a store on disk that holds its write lock, taken before anything
+/// else could write.
+fn write_lock(root: &std::path::Path) -> rusqlite::Connection {
+    let other = rusqlite::Connection::open(root.join("descriptions.sqlite3"))
+        .expect("a second connection to the same store");
+    other
+        .execute_batch("BEGIN IMMEDIATE")
+        .expect("the second connection takes the write lock");
+    other
 }

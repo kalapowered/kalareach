@@ -244,7 +244,8 @@ the cancellation token and the whole-job deadline inside it, so a fence raised f
 token that fired between generation and publication publishes nothing. The write itself goes through
 the job's token, so a cancellation that arrives while the description is being written waits for it
 and is told it was too late, rather than deleting the description an earlier, uncancelled job left
-for that session.
+for that session. The job counts as running, and as in flight, until its outcome is complete, the
+write included, so nobody is told a job is past cancelling before its description is in the store.
 
 Descriptions are produced, stored and shown on this host. None of them is uploaded, so there is no
 copy elsewhere for privacy mode to offer a separate deletion of.

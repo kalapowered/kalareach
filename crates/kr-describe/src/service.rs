@@ -1427,9 +1427,10 @@ impl DescriptionService {
         answer: Answered,
         now: Reading,
     ) -> Result<Outcome> {
-        let session_id = dispatched.job.session_id;
-        self.running.finished();
-        self.in_flight.reconciled(&session_id);
+        // The job stays running, and in flight, until its outcome is complete, publication
+        // included: a cancellation from another thread is told it was too late only once the
+        // description is in the store, and privacy mode's reconciliation waits for the write.
+        let _in_flight = InFlightRecords::of(self, dispatched.job.session_id);
         let execution_ms = self.measure(&dispatched, now);
         let (bytes, peak_rss_bytes) = match answer {
             Answered::Produced {
@@ -1643,8 +1644,7 @@ impl DescriptionService {
         now: Reading,
     ) -> Outcome {
         let session_id = dispatched.job.session_id;
-        self.running.finished();
-        self.in_flight.reconciled(&session_id);
+        let _in_flight = InFlightRecords::of(self, session_id);
         self.measure(&dispatched, now);
         match why {
             ProcessEnd::PastDeadline => {
@@ -1714,6 +1714,32 @@ impl DescriptionService {
     const fn take_id(&mut self) -> u64 {
         self.next_id = self.next_id.wrapping_add(1);
         self.next_id
+    }
+}
+
+/// The records of a job in the process that another thread reads: the handle that cancels it
+/// and privacy mode's count of work in flight. They are cleared when this goes out of scope,
+/// which is when the job's outcome is complete, publication included, and on every early return.
+struct InFlightRecords {
+    running: RunningJob,
+    in_flight: InFlight,
+    session_id: SessionId,
+}
+
+impl InFlightRecords {
+    fn of(service: &DescriptionService, session_id: SessionId) -> Self {
+        Self {
+            running: service.running.clone(),
+            in_flight: service.in_flight.clone(),
+            session_id,
+        }
+    }
+}
+
+impl Drop for InFlightRecords {
+    fn drop(&mut self) {
+        self.running.finished();
+        self.in_flight.reconciled(&self.session_id);
     }
 }
 
