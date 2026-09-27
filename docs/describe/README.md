@@ -347,7 +347,8 @@ the first breach would answer one question by withholding the rest.
 serving code over a model that answers from the prompt, and drives it over real pipes, so the rules
 (fairness, rejection, unloading, privacy) and the process's bounds are tested in seconds. `cargo
 test -p kr-describe-model` runs the real process with the real weights where the benchmark's cache
-holds them, and says so where it does not. Neither can answer whether the text is any good, and
+holds them, including a job it is told to cancel, which the model has to stop itself, and says so
+where it does not. Neither can answer whether the text is any good, and
 that is what the benchmark is for.
 
 ## The qualification matrix

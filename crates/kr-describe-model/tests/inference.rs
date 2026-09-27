@@ -5,13 +5,17 @@
 //! The weights are the selected profile's, read from the cache `scripts/bench-descriptions.sh`
 //! fills, and never written. A host without them says so and runs nothing.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime};
 
 use kr_describe::budget::GIB;
-use kr_describe::context::{ContextBinding, ContextSignal};
+use kr_describe::context::{ContextBinding, ContextBuilder, ContextRevision, ContextSignal};
 use kr_describe::environment::{EnvironmentKind, ExecutionEnvironment, build_target};
 use kr_describe::metadata::RepositoryFacts;
+use kr_describe::output::{DESCRIPTION_GRAMMAR, prompt};
+use kr_describe::profile::ModelProfile;
 use kr_describe::profile::catalogue::{Catalogue, MetGates};
 use kr_describe::queue::Priority;
 use kr_describe::resource::{HostConditions, PowerSource, ResourceSettings, ThermalState};
@@ -19,8 +23,11 @@ use kr_describe::service::{DescriptionService, HostPlacement, Outcome};
 use kr_describe::store::DescriptionStore;
 use kr_describe::supervise::{Driver, Launch, Report};
 use kr_describe::time::Reading;
+use kr_describe::wire::{
+    Answer, AssetFile, JobEnd, JobLimits, Request, WIRE_VERSION, frame_of, read_message,
+};
 use kr_protocol::ids::{EnvironmentId, SessionEpoch, SessionId};
-use kr_protocol::scalars::Uuid;
+use kr_protocol::scalars::{U64, Uuid};
 
 /// Where the benchmark keeps the weights on this platform, or where this run is told they are.
 fn cache_directory() -> Option<PathBuf> {
@@ -76,50 +83,76 @@ fn queue(service: &mut DescriptionService, session_id: SessionId, intent: &str) 
     );
 }
 
+/// The executable and the real weights, placed in a directory of the test's own on the internal
+/// disk as the daemon places them: `<models>/<profile>/<revision>/<file>`.
+struct Placed {
+    _directory: tempfile::TempDir,
+    program: PathBuf,
+    models: PathBuf,
+    runtime: PathBuf,
+    profile: ModelProfile,
+}
+
+impl Placed {
+    /// Places the process and the weights, or says why this host cannot and returns nothing.
+    fn real_weights() -> Option<Self> {
+        let catalogue = Catalogue::builtin().expect("this build's profiles");
+        let profile = catalogue.default_profile().clone();
+        let weights = profile
+            .assets()
+            .iter()
+            .find(|asset| asset.role == "weights")
+            .expect("the profile names its weights")
+            .clone();
+        let Some(cached) = cache_directory().map(|cache| cache.join(&weights.file_name)) else {
+            eprintln!("the real-weights test did not run: this host has no home directory");
+            return None;
+        };
+        if std::fs::metadata(&cached).map(|about| about.len()).ok() != Some(weights.bytes) {
+            eprintln!(
+                "the real-weights test did not run: {} is not on this host",
+                cached.display()
+            );
+            return None;
+        }
+        let directory = tempfile::tempdir().expect("a directory on the internal disk");
+        let program = directory.path().join(format!(
+            "kr-describe-inference{}",
+            std::env::consts::EXE_SUFFIX
+        ));
+        kr_ipc::testing::place_program(
+            Path::new(env!("CARGO_BIN_EXE_kr-describe-inference")),
+            &program,
+        );
+        let models = directory.path().join("models");
+        let placed = models
+            .join(profile.profile_id())
+            .join(profile.revision().get().to_string());
+        std::fs::create_dir_all(&placed).expect("the model directory");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&cached, placed.join(&weights.file_name)).expect("the weights");
+        #[cfg(not(unix))]
+        std::fs::hard_link(&cached, placed.join(&weights.file_name)).expect("the weights");
+        let runtime = directory.path().join("runtime");
+        std::fs::create_dir_all(&runtime).expect("the runtime directory");
+        Some(Self {
+            _directory: directory,
+            program,
+            models,
+            runtime,
+            profile,
+        })
+    }
+}
+
 /// The real model loads, describes a session inside its deadline or ends the job at it, and stops
 /// a job it is told to cancel; the process is never ended to do any of it.
 #[test]
 fn the_description_process_runs_the_real_model() {
-    let catalogue = Catalogue::builtin().expect("this build's profiles");
-    let profile = catalogue.default_profile().clone();
-    let weights = profile
-        .assets()
-        .iter()
-        .find(|asset| asset.role == "weights")
-        .expect("the profile names its weights")
-        .clone();
-    let Some(cached) = cache_directory().map(|cache| cache.join(&weights.file_name)) else {
-        eprintln!("the real-weights test did not run: this host has no home directory");
+    let Some(placed) = Placed::real_weights() else {
         return;
     };
-    if std::fs::metadata(&cached).map(|about| about.len()).ok() != Some(weights.bytes) {
-        eprintln!(
-            "the real-weights test did not run: {} is not on this host",
-            cached.display()
-        );
-        return;
-    }
-    let directory = tempfile::tempdir().expect("a directory on the internal disk");
-    let program = directory.path().join(format!(
-        "kr-describe-inference{}",
-        std::env::consts::EXE_SUFFIX
-    ));
-    kr_ipc::testing::place_program(
-        Path::new(env!("CARGO_BIN_EXE_kr-describe-inference")),
-        &program,
-    );
-    let models = directory.path().join("models");
-    let placed = models
-        .join(profile.profile_id())
-        .join(profile.revision().get().to_string());
-    std::fs::create_dir_all(&placed).expect("the model directory");
-    #[cfg(unix)]
-    std::os::unix::fs::symlink(&cached, placed.join(&weights.file_name)).expect("the weights");
-    #[cfg(not(unix))]
-    std::fs::hard_link(&cached, placed.join(&weights.file_name)).expect("the weights");
-    let runtime = directory.path().join("runtime");
-    std::fs::create_dir_all(&runtime).expect("the runtime directory");
-
+    let catalogue = Catalogue::builtin().expect("this build's profiles");
     let service = DescriptionService::new(
         HostPlacement {
             environment: ExecutionEnvironment::new(
@@ -137,11 +170,11 @@ fn the_description_process_runs_the_real_model() {
     let mut driver = Driver::new(
         service,
         Launch {
-            program,
-            arguments: vec!["--runtime-dir".into(), runtime.clone().into()],
-            working_directory: runtime,
+            program: placed.program.clone(),
+            arguments: vec!["--runtime-dir".into(), placed.runtime.clone().into()],
+            working_directory: placed.runtime.clone(),
             environment: Vec::new(),
-            models,
+            models: placed.models.clone(),
         },
         "kr-describe-tests/0".to_owned(),
     );
@@ -215,6 +248,130 @@ fn the_description_process_runs_the_real_model() {
         })),
         "{reports:?}"
     );
+}
+
+/// The real model stops a job it is told to cancel, between chunks of its prompt or tokens of its
+/// output, and the process answers that job `ended` as cancelled. A model that ran the job to its
+/// end would answer `produced`: the daemon's outcome would still be a cancellation, because the
+/// daemon's own token is cancelled, so only the process's answer tells the two apart. Spoken to
+/// over its own pipes, as the daemon's driver speaks to it.
+#[test]
+fn the_real_model_stops_a_job_it_is_told_to_cancel() {
+    let Some(placed) = Placed::real_weights() else {
+        return;
+    };
+    let mut child = Command::new(&placed.program)
+        .arg("--runtime-dir")
+        .arg(&placed.runtime)
+        .current_dir(&placed.runtime)
+        .env_clear()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("the description process starts");
+    let mut input = child.stdin.take().expect("its input");
+    let mut output = child.stdout.take().expect("its output");
+    let (tell, answers) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        while let Ok(Some(answer)) = read_message::<Answer>(&mut output) {
+            if tell.send(answer).is_err() {
+                return;
+            }
+        }
+    });
+    let mut send = |request: &Request| {
+        let frame = frame_of(request).expect("a request frames");
+        input
+            .write_all(&frame)
+            .and_then(|()| input.flush())
+            .expect("the request is written");
+    };
+
+    send(&Request::Hello {
+        build: "kr-describe-tests/0".to_owned(),
+        wire: U64::new(WIRE_VERSION),
+    });
+    let ready = answers.recv_timeout(Duration::from_secs(10));
+    assert!(matches!(ready, Ok(Answer::Ready { .. })), "{ready:?}");
+    let profile = &placed.profile;
+    let directory = placed
+        .models
+        .join(profile.profile_id())
+        .join(profile.revision().get().to_string());
+    send(&Request::Load {
+        id: U64::new(1),
+        profile_id: profile.profile_id().to_owned(),
+        revision: U64::new(profile.revision().get()),
+        assets: profile
+            .assets()
+            .iter()
+            .map(|asset| AssetFile {
+                file_name: asset.file_name.clone(),
+                path: directory
+                    .join(&asset.file_name)
+                    .to_string_lossy()
+                    .into_owned(),
+            })
+            .collect(),
+        deadline_ms: U64::new(400_000),
+    });
+    let loaded = answers.recv_timeout(Duration::from_secs(400));
+    assert!(
+        matches!(&loaded, Ok(Answer::Loaded { id, .. }) if id.get() == 1),
+        "{loaded:?}"
+    );
+
+    let context = ContextBuilder::new(
+        EnvironmentId::new(Uuid::from_bytes([0x81; 16])),
+        session(3),
+        SessionEpoch::V1,
+        ContextBinding::new("tests"),
+        ContextRevision::new(1),
+    )
+    .directory("kalareach")
+    .intent("check the pairing flow and the host approval screen")
+    .build();
+    send(&Request::Generate {
+        id: U64::new(2),
+        prompt: prompt(&context),
+        grammar: DESCRIPTION_GRAMMAR.to_owned(),
+        limits: JobLimits {
+            context_tokens: U64::new(4_096),
+            max_output_tokens: U64::new(128),
+            cpu_threads: U64::new(4),
+        },
+        deadline_ms: U64::new(30_000),
+        ceiling_bytes: U64::new(4 * GIB),
+    });
+    // Long enough for the model thread to be inside the job, well short of the job's end.
+    std::thread::sleep(Duration::from_millis(500));
+    send(&Request::Cancel { id: U64::new(2) });
+    let asked = Instant::now();
+    let answer = answers.recv_timeout(Duration::from_secs(30));
+    eprintln!(
+        "the real model answered its cancellation in {:?}: {answer:?}",
+        asked.elapsed()
+    );
+    assert!(
+        matches!(
+            &answer,
+            Ok(Answer::Ended { id, why: JobEnd::Cancelled, .. }) if id.get() == 2
+        ),
+        "the model stopped the job itself: {answer:?}"
+    );
+
+    // Its input ends, and so does it.
+    drop(input);
+    let give_up = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("its status") {
+            break status;
+        }
+        assert!(Instant::now() < give_up, "the process outlived its input");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(status.success(), "{status:?}");
 }
 
 /// Turns at the real clock until `done` holds, waiting for the process between turns.
