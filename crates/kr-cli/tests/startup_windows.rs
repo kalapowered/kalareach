@@ -90,12 +90,29 @@ fn exported(name: &str) -> Option<String> {
 }
 
 /// Removes a task a test registered, however the test ends, and only while it is its environment's
-/// own.
+/// own. A removal that fails fails the test: the task left behind could run for the next one.
 struct Registered(TaskDefinition);
 
 impl Drop for Registered {
     fn drop(&mut self) {
-        let _ = scheduled::remove(&self.0);
+        match scheduled::remove(&self.0) {
+            // Another environment's task under the name is not this test's to remove, and none of
+            // this test's is left.
+            Ok(_) | Err(scheduled::TaskError::Foreign(_)) => {}
+            Err(error) => left_behind(&format!(
+                "the task {} could not be removed: {error}",
+                self.0.name
+            )),
+        }
+    }
+}
+
+/// Fails the test that left something behind, unless it is failing already: a panic while another
+/// one unwinds would end the whole run and hide both.
+fn left_behind(what: &str) {
+    eprintln!("{what}");
+    if !std::thread::panicking() {
+        panic!("{what}");
     }
 }
 
@@ -778,13 +795,22 @@ impl Drop for EndsWhatItStarted<'_> {
     fn drop(&mut self) {
         let environment = self.host.environment();
         // No starter runs from here on, and one already running takes nothing: the task goes, and
-        // every request left for a starter is withdrawn.
-        let _ = scheduled::remove(&self.host.definition());
+        // every request left for a starter is withdrawn. Either one failing leaves a starter
+        // something to act on after the test, so the cleanup goes on and then fails the test.
+        let mut left = Vec::new();
+        match scheduled::remove(&self.host.definition()) {
+            Ok(_) | Err(scheduled::TaskError::Foreign(_)) => {}
+            Err(error) => left.push(format!("the task could not be removed: {error}")),
+        }
         for request in self.host.claims().iter().filter_map(|name| {
             name.strip_suffix(".claim")
                 .and_then(|request| request.parse().ok())
         }) {
-            let _ = kr_ipc::starter::withdraw_claim(&environment, request);
+            if let Err(error) = kr_ipc::starter::withdraw_claim(&environment, request) {
+                left.push(format!(
+                    "the request {request} could not be withdrawn: {error}"
+                ));
+            }
         }
         // A starter ends once it has found nothing to take, or has started what it took; then the
         // daemons, which start workers; then the workers. Each stage is over only when a list that
@@ -793,16 +819,14 @@ impl Drop for EndsWhatItStarted<'_> {
             .settle("kr-controller.exe", |process| process.starter, false)
             .and_then(|()| self.settle("kr-controller.exe", |_| true, true))
             .and_then(|()| self.settle("kr-worker.exe", |_| true, true));
-        if let Err(left) = ended {
+        if let Err(running) = ended {
             // What still runs may still write its keys, so they stay: removing them now would
             // leave them to be written again behind this cleanup, and gone from its record.
-            eprintln!(
+            left.push(format!(
                 "the processes this test started were not all ended, so the keys their daemon \
-                 keeps in this account's credential store are left: {left}"
-            );
-            if !std::thread::panicking() {
-                panic!("the processes this test started were not all ended: {left}");
-            }
+                 keeps in this account's credential store are left: {running}"
+            ));
+            left_behind(&left.join("; "));
             return;
         }
         // Only now the keys: nothing that writes them is left.
@@ -822,6 +846,9 @@ impl Drop for EndsWhatItStarted<'_> {
                     }
                 }
             }
+        }
+        if !left.is_empty() {
+            left_behind(&left.join("; "));
         }
     }
 }
