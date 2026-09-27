@@ -494,7 +494,10 @@ impl Writer {
         };
         self.move_to(line, 0);
         // The row is drawn from an empty line, so a shorter row does not leave the tail of
-        // whatever the terminal had there before.
+        // whatever the terminal had there before. The line is emptied in the plain rendition: a
+        // terminal erases with the pen it holds, and the pen the row above was left in would
+        // otherwise colour, underline or reverse every blank cell of this one.
+        self.rendition(Rendition::default());
         self.csi(b"K");
         let mut clipped = false;
         for run in &row.runs {
@@ -1153,10 +1156,10 @@ mod tests {
             Keyboard::Install,
             Scope::WholeScreen,
         );
-        // Line three, cleared, then the text.
+        // Line three, cleared in the plain rendition, then the text.
         assert_eq!(
             rendered.bytes,
-            b"\x1b[3;1H\x1b[K\x1b[1G\x1b[0mtext".to_vec()
+            b"\x1b[3;1H\x1b[0m\x1b[K\x1b[1Gtext".to_vec()
         );
     }
 
@@ -1312,7 +1315,52 @@ mod tests {
             Scope::WholeScreen,
         );
         // Canonical row 11 is the second line shown; canonical column 6 is the third column shown.
-        assert_eq!(rendered.bytes, b"\x1b[2;1H\x1b[K\x1b[3G\x1b[0mab".to_vec());
+        assert_eq!(rendered.bytes, b"\x1b[2;1H\x1b[0m\x1b[K\x1b[3Gab".to_vec());
+    }
+
+    /// A row that ends in a reverse, coloured or underlined run leaves the terminal's pen in that
+    /// rendition, and a terminal erases with the pen it holds. The next row is emptied in the plain
+    /// rendition, so its blank cells are blank as they are in the session, not a bar of the
+    /// previous row's colour.
+    #[test]
+    fn a_row_is_emptied_in_the_plain_rendition_whatever_the_row_above_ended_in() {
+        let mut above = row(0, 0, "title");
+        above.runs[0].rendition = Rendition {
+            reverse: true,
+            background: Colour::Indexed(4),
+            ..Rendition::default()
+        };
+        let rendered = render(
+            &[
+                RestoreOp::PaintRow { row: above },
+                RestoreOp::PaintRow {
+                    row: row(1, 0, "ab"),
+                },
+            ],
+            viewport(3, 8),
+            Keyboard::Install,
+            Scope::WholeScreen,
+        );
+        let mut terminal = kr_term::engine::Engine::new(kr_term::engine::EngineConfig {
+            size: GridSize::new(8, 3),
+            ..kr_term::engine::EngineConfig::DEFAULT
+        })
+        .expect("a terminal");
+        let _ = terminal.feed(&rendered.bytes, 0);
+        let rows = terminal.grid().visible_rows();
+        let styled: Vec<&Run> = rows[1]
+            .runs
+            .iter()
+            .filter(|run| run.rendition != Rendition::default())
+            .collect();
+        assert!(
+            styled.is_empty(),
+            "the second line holds only plain cells, and holds {styled:?}"
+        );
+        assert!(
+            rows[0].runs.iter().any(|run| run.rendition.reverse),
+            "while the first keeps its own rendition"
+        );
     }
 
     #[test]
