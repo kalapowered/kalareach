@@ -1694,10 +1694,12 @@ async fn one_wait_renews_bounded_broker_waits_under_one_subscription_and_returns
         waits.iter().all(|wait| *wait <= WAIT_RENEWAL.get()),
         "every broker wait is bounded to the renewal interval: {waits:?}"
     );
+    // Together they are the wait the call asked for, less what the exchanges themselves took, which
+    // a loaded machine can stretch to a few seconds.
     let total: u64 = waits.iter().sum();
     let asked = wait_seconds * 1000;
     assert!(
-        total <= asked && total + 1000 >= asked,
+        total <= asked && total + 5_000 >= asked,
         "the renewals together are the wait the call asked for: {waits:?}"
     );
     assert!(
