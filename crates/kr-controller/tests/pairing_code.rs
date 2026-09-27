@@ -593,3 +593,250 @@ fn reads_as_a_code(code: &str) -> bool {
             .iter()
             .all(|part| part.chars().all(|character| BASE58.contains(character)))
 }
+
+/// The variable that asks [`the_pairings_the_log_check_reads`] to run, naming the directory it
+/// writes what it knows to.
+const LOG_CHECK: &str = "KR_PAIRING_LOG_CHECK";
+
+/// Every file under `directory`, in a stable order.
+fn files_under(directory: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut found = Vec::new();
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return found;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            found.extend(files_under(&path));
+        } else {
+            found.push(path);
+        }
+    }
+    found.sort();
+    found
+}
+
+/// Every form a pairing secret travels in, as bytes a file could hold.
+fn secret_forms(secrets: &serde_json::Value) -> Vec<Vec<u8>> {
+    let text = |key: &str| secrets[key].as_str().expect("a written secret").to_owned();
+    let direct: Vec<u8> =
+        serde_json::from_value(secrets["direct_secret"].clone()).expect("the direct secret");
+    let lower: String = direct.iter().map(|byte| format!("{byte:02x}")).collect();
+    let url = kr_protocol::scalars::to_base64url(&direct);
+    let standard = format!("{}=", url.replace('-', "+").replace('_', "/"));
+    let code = text("code");
+    let mut forms = vec![
+        text("code_secret").into_bytes(),
+        code.clone().into_bytes(),
+        code.replace('-', "").into_bytes(),
+        direct.clone(),
+        lower.to_uppercase().into_bytes(),
+        lower.into_bytes(),
+        url.into_bytes(),
+        standard.into_bytes(),
+        text("direct_qr_text").into_bytes(),
+    ];
+    forms.sort();
+    forms.dedup();
+    forms
+}
+
+fn carries(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
+/// Runs a real short-code pairing and a real direct pairing when [`LOG_CHECK`] names a directory,
+/// and does nothing otherwise. [`pairing_secrets_reach_no_log_and_no_diagnostics`] runs this as a
+/// process of its own, so everything the daemon writes to the standard streams is in the log that
+/// process keeps. It writes the two secrets and the host's diagnostics to the directory, and checks
+/// every file of the host's own tree itself before the tree goes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_pairings_the_log_check_reads() {
+    let Some(out) = std::env::var_os(LOG_CHECK).map(std::path::PathBuf::from) else {
+        return;
+    };
+    let owner_keys = keys();
+    let host = Host::start(&owner_keys).await;
+    let environment = host.environment_id;
+    let mut client = host.client().await;
+    let owner = Signer::OwnerDevice(&owner_keys);
+
+    // A short-code pairing through the room.
+    let invited = invite_code(
+        environment,
+        &mut client,
+        InviteGrantKind::SessionInvitation,
+        &viewer(),
+        &owner,
+    )
+    .await;
+    let (origin, code) = code_of(&invited);
+    let by_code = Device::create().await;
+    let mut candidate = CodeCandidate::start(&host.room, by_code.candidate(), &origin, &code)
+        .await
+        .expect("admitted");
+    candidate.confirm().await.expect("the host proved the code");
+    candidate
+        .send_bundle()
+        .await
+        .expect("the host took the bundle");
+    let (connection, _session, _finished) = candidate.finish().await;
+    calls::confirm_candidate(environment, &mut client, invited.invitation_id, &owner)
+        .await
+        .expect("the code pairing commits");
+    connection.close(0u32.into(), b"paired");
+
+    // A direct pairing from the QR.
+    let direct = calls::invite_direct(
+        environment,
+        &mut client,
+        InviteGrantKind::SessionInvitation,
+        &viewer(),
+        &owner,
+    )
+    .await
+    .expect("a direct invitation");
+    let by_qr = Device::create().await;
+    let (connection, _candidate, _value) = calls::redeem(&by_qr.candidate(), &direct).await;
+    let confirmed =
+        calls::confirm_candidate(environment, &mut client, direct.invitation_id, &owner)
+            .await
+            .expect("the direct pairing commits");
+    connection.close(0u32.into(), b"paired");
+    let kr_protocol::invitation::InviteEntry::Direct { qr_text } = &direct.entry else {
+        panic!("a direct invitation is offered as a QR");
+    };
+    let secrets = serde_json::json!({
+        "code": code,
+        "code_secret": &code.replace('-', "")[4..],
+        "direct_secret": calls::direct_payload(&direct).secret.expose().to_vec(),
+        "direct_qr_text": qr_text.as_str(),
+    });
+
+    // The diagnostics: the owner's report, a paired device's, and a support bundle composed from
+    // the owner's.
+    let owners: kr_protocol::hostinfo::HostDoctorResult = client
+        .request(Method::HostDoctor, &())
+        .await
+        .expect("the call reaches the daemon")
+        .expect("host.doctor is served on the local socket")
+        .to_typed()
+        .expect("a report");
+    let record = host
+        .network()
+        .devices()
+        .record_for_device(confirmed.device_id)
+        .expect("the registry reads")
+        .expect("the device paired from the QR");
+    let session = net_support::connect(&host, &by_qr, &record).await;
+    let devices: kr_protocol::hostinfo::HostDoctorResult = session
+        .read(Method::HostDoctor, &())
+        .await
+        .expect("host.doctor is served to the device");
+    session.close();
+    let bundle = kr_protocol::hostinfo::ComposedBundle::new(
+        kr_protocol::scalars::TimestampMs::new(0),
+        Vec::new(),
+        Vec::new(),
+        owners.clone(),
+        Vec::new(),
+    );
+    std::fs::create_dir_all(&out).expect("the output directory");
+    for (name, value) in [
+        ("secrets.json", secrets.clone()),
+        (
+            "doctor-owner.json",
+            serde_json::to_value(&owners).expect("JSON"),
+        ),
+        (
+            "doctor-device.json",
+            serde_json::to_value(&devices).expect("JSON"),
+        ),
+        ("bundle.json", serde_json::to_value(&bundle).expect("JSON")),
+    ] {
+        std::fs::write(out.join(name), value.to_string()).expect("written");
+    }
+
+    // Every file the host keeps in its own tree, its registry and its journals among them.
+    let forms = secret_forms(&secrets);
+    for file in files_under(host.tree().root()) {
+        let bytes = std::fs::read(&file).unwrap_or_default();
+        for form in &forms {
+            assert!(
+                !carries(&bytes, form),
+                "a pairing secret is in {}",
+                file.display()
+            );
+        }
+    }
+    host.stop().await;
+}
+
+/// KR-REQ-10.12 and KR-REQ-10.35: pairing secrets never reach the daemon's log or its
+/// diagnostics. A real short-code pairing and a real direct pairing run in a process of their own,
+/// whose standard output and error are its log. Afterwards neither the code's six secret
+/// characters, the code as a whole, the direct invitation's secret in any encoding it travels in,
+/// nor the QR text that carries it, is in that log, in the owner's or the paired device's
+/// `host.doctor`, in a support bundle composed from the owner's, or in any file of the host's
+/// own tree.
+#[test]
+fn pairing_secrets_reach_no_log_and_no_diagnostics() {
+    let directory = tempfile::TempDir::new().expect("a directory on the internal disk");
+    let program = directory.path().join("pairing-code-tests");
+    kr_ipc::testing::place_program(
+        &std::env::current_exe().expect("this test's own binary"),
+        &program,
+    );
+    let out = directory.path().join("out");
+    let log = directory.path().join("daemon.log");
+    let written = std::fs::File::create(&log).expect("the log");
+    let status = std::process::Command::new(&program)
+        .args([
+            "--exact",
+            "the_pairings_the_log_check_reads",
+            "--nocapture",
+            "--test-threads",
+            "1",
+        ])
+        .env(LOG_CHECK, &out)
+        .current_dir(directory.path())
+        .stdin(std::process::Stdio::null())
+        .stdout(written.try_clone().expect("the log again"))
+        .stderr(written)
+        .status()
+        .expect("the pairings run");
+    let logged = std::fs::read(&log).expect("the log reads");
+    assert!(
+        status.success(),
+        "the pairings ran: {}",
+        String::from_utf8_lossy(&logged)
+    );
+    let secrets: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(out.join("secrets.json")).expect("the pairings wrote their secrets"),
+    )
+    .expect("JSON");
+    assert_eq!(
+        secrets["code_secret"].as_str().map(str::len),
+        Some(6),
+        "{secrets}"
+    );
+    let forms = secret_forms(&secrets);
+    for name in [
+        "daemon.log",
+        "out/doctor-owner.json",
+        "out/doctor-device.json",
+        "out/bundle.json",
+    ] {
+        let bytes = std::fs::read(directory.path().join(name)).expect("the file reads");
+        assert!(!bytes.is_empty(), "{name} holds what was written");
+        for form in &forms {
+            assert!(
+                !carries(&bytes, form),
+                "a pairing secret is in {name}: {}",
+                String::from_utf8_lossy(form)
+            );
+        }
+    }
+}
