@@ -527,6 +527,7 @@ mod tests {
                     integration_version: planted.clone(),
                 }),
                 entries: vec![EntryReport {
+                    file: std::path::PathBuf::from(format!("/{planted}/.profile")),
                     path: format!("/{planted}/.profile"),
                     reason: "the file an interactive login reads",
                     installed: true,

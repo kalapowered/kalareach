@@ -233,13 +233,14 @@ fn the_configurable_defaults_are_shown_with_their_value_and_source() {
 /// configuration's own sentences.
 #[test]
 fn planted_text_in_the_diagnostics_shows_only_where_it_was_asked_for() {
-    use crate::output::planted::{only_asked_or_host_text, planted};
+    use crate::output::planted::{only_asked_lines, only_asked_or_host_text, planted};
     use crate::shown::marker::MARKER;
 
     let door = |text: &dyn Fn() -> String| text().matches(MARKER).count();
     let mut shown = std::collections::BTreeSet::new();
+    let mut integrations = std::collections::BTreeSet::new();
     for result in planted::<HostDoctorResult>() {
-        only_asked_or_host_text(
+        integrations.extend(only_asked_or_host_text(
             "kr doctor",
             &doctor(&result),
             &[
@@ -248,9 +249,14 @@ fn planted_text_in_the_diagnostics_shows_only_where_it_was_asked_for() {
                 "checks[].detail",
                 "checks[].remedy",
             ],
-        );
+        ));
+        // A command integration's lines show only what was asked for; what the host adds about
+        // its state is said as its class and its length.
+        for report in &result.command_integrations {
+            only_asked_lines("kr doctor", &integration_lines(report, "", ""));
+        }
         // A check's lines are the host's words, through the door and nowhere else.
-        let said: usize = doctor_lines(&result, true)
+        let said: usize = check_lines(&result, true)
             .iter()
             .map(|line| line.as_str().matches(MARKER).count())
             .sum();
@@ -321,6 +327,23 @@ fn planted_text_in_the_diagnostics_shows_only_where_it_was_asked_for() {
     ] {
         assert!(shown.contains(asked), "{asked} shows what was asked for");
     }
+    // KR-REQ-07.45: what the doctor is asked to show of each command integration.
+    for asked in [
+        "command_integrations[].plugin_id",
+        "command_integrations[].version",
+        "command_integrations[].command",
+        "command_integrations[].flags[]",
+        "command_integrations[].variables[].name",
+        "command_integrations[].variables[].value",
+        "command_integrations[].executable",
+        "command_integrations[].executable_version",
+    ] {
+        assert!(
+            integrations.contains(asked),
+            "{asked} shows what was asked for"
+        );
+    }
+    assert!(!integrations.contains("command_integrations[].reason"));
 }
 
 /// The marker this file plants in every text-bearing field of a reply.
