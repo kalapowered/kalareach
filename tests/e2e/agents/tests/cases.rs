@@ -20,8 +20,9 @@ use std::time::Duration;
 
 use kr_client::cursors::StreamCursors;
 use kr_e2e_agents::account::{
-    Ledger, borrow_login_keychain, changes, conversation_id, files_holding, key_from_descriptor,
-    now_ms, record_key_scan, remove_created, snapshot,
+    Ledger, borrow_login_keychain, changes, conversation_id, files_holding, guarded_files,
+    key_from_descriptor, keychain_item_modified, now_ms, record_guarded, record_key_scan,
+    remove_created, snapshot,
 };
 use kr_e2e_agents::build::{Account, AccountHome, Action, Build, Inputs, Launch, quote};
 use kr_e2e_agents::detect::{
@@ -73,6 +74,15 @@ const SHOT: &str = "kalareach-shot.png";
 /// it, the agent did not reach its composer with it, or the agent showed that it is signed out. A
 /// part that says so stops its agent.
 const LOGIN_UNPROVEN: &str = "the agent's login is not established:";
+
+/// How a part says it could not show that the agent loads none of the person's own servers. A
+/// part that says so stops its agent before it starts.
+const ISOLATION_UNPROVEN: &str =
+    "the agent's isolation from the person's own servers is not established:";
+
+/// The directory of the run's own an agent keeps its configuration in, where its build list entry
+/// names one, in the run's directory.
+const CONFIG_DIRECTORY: &str = "agent-config";
 
 /// A one-pixel PNG.
 const PNG: &[u8] = &[
@@ -232,6 +242,26 @@ fn staged(
             before.unread().join("; ")
         );
     }
+    // The person's files no part may change, and those their own programs also write, as the part
+    // finds them; and when the login's keychain item was last written.
+    let watched = login.as_ref().map(|login| {
+        let files: Vec<String> = login
+            .account
+            .guarded
+            .iter()
+            .chain(&login.account.shared)
+            .cloned()
+            .collect();
+        let before = guarded_files(&login.person_home, &files).unwrap_or_else(|why| {
+            panic!("part {part}: a file of the person's that must not change cannot be read: {why}")
+        });
+        let item = login
+            .account
+            .keychain_item
+            .as_ref()
+            .map(|service| keychain_item_modified(&login.person_home, service));
+        (files, before, item)
+    });
     let run = Run::start(&format!("part {part}"));
     let root = run.root().to_path_buf();
     let provenance = Provenance::new(&inputs.build, &run, &shell, part);
@@ -272,6 +302,16 @@ fn staged(
         .as_ref()
         .and_then(|login| login.key.as_ref())
         .map(|(name, value)| (name.clone(), files_holding(&root, value.as_bytes())));
+    // The configuration directory of the run's own goes whatever became of the part, and is
+    // checked gone.
+    let config_gone = login
+        .as_ref()
+        .filter(|login| login.account.config_directory.is_some())
+        .map(|_| {
+            let directory = root.join(CONFIG_DIRECTORY);
+            let _ = std::fs::remove_dir_all(&directory);
+            !directory.exists()
+        });
     drop(run);
     let mut key_evidence = None;
     let mut key_failure = None;
@@ -300,9 +340,62 @@ fn staged(
             "run_gone": gone,
         }));
     }
+    // The person's watched files as the part leaves them: a guarded one changed, or a shared one
+    // changed and naming the run's directory or the part's mark, stops the agent.
+    let mut watched_evidence = None;
+    let mut watched_stop = Vec::new();
+    if let (Some(login), Some((files, before, item))) = (login.as_ref(), watched.as_ref()) {
+        match guarded_files(&login.person_home, files) {
+            Ok(after) => {
+                record_guarded(part, before, &after);
+                let root_text = root.display().to_string();
+                let mut entries = Vec::new();
+                for (first, second) in before.iter().zip(&after) {
+                    let changed = first.sha256 != second.sha256;
+                    let shared = login.account.shared.contains(&first.relative);
+                    let names_run = changed
+                        && std::fs::read(login.person_home.join(&first.relative)).is_ok_and(
+                            |bytes| {
+                                [mark.as_str(), root_text.as_str()].iter().any(|needle| {
+                                    bytes
+                                        .windows(needle.len())
+                                        .any(|window| window == needle.as_bytes())
+                                })
+                            },
+                        );
+                    if changed && (!shared || names_run) {
+                        watched_stop.push(format!("~/{} changed", first.relative));
+                    }
+                    entries.push(json!({ "file": format!("~/{}", first.relative), "changed": changed, "shared": shared, "names_run": names_run }));
+                }
+                let item_after = login
+                    .account
+                    .keychain_item
+                    .as_ref()
+                    .map(|service| keychain_item_modified(&login.person_home, service));
+                let rewritten = match (item, &item_after) {
+                    (Some(Some(first)), Some(Some(second))) => Some(first != second),
+                    _ => None,
+                };
+                watched_evidence = Some(json!({
+                    "files": entries,
+                    "keychain_item_rewritten": rewritten,
+                    "config_directory_removed": config_gone,
+                }));
+            }
+            Err(why) => watched_stop.push(format!(
+                "a file of the person's that must not change cannot be read after the part: {why}"
+            )),
+        }
+    }
+    if config_gone == Some(false) {
+        watched_stop
+            .push("the run's configuration directory is still there after its removal".to_owned());
+    }
     // Why the agent stops here, if it does: something the part started outlived it, the person's
-    // directories could not be read whole afterwards, or the agent rewrote a file it had there.
-    let mut stop = Vec::new();
+    // directories could not be read whole afterwards, the agent rewrote a file it had there, or a
+    // file of the person's that must not change did.
+    let mut stop = watched_stop;
     if let Err(left) = &writers {
         stop.push(format!(
             "something the part started still ran after the run ended everything, so what it \
@@ -335,12 +428,15 @@ fn staged(
             // numbers its sessions ran, and whether its agent stops, before its failure goes on.
             if needs_login {
                 let said = panic_text(&*panic);
-                if said.starts_with(LOGIN_UNPROVEN) {
+                if said.starts_with(LOGIN_UNPROVEN) || said.starts_with(ISOLATION_UNPROVEN) {
                     stop.push(said.clone());
                 }
                 let mut evidence = serde_json::Map::new();
                 evidence.insert("provenance".to_owned(), provenance.evidence());
                 evidence.insert("login_held".to_owned(), json!(login_held));
+                if let Some(watched) = &watched_evidence {
+                    evidence.insert("person_files".to_owned(), watched.clone());
+                }
                 if let Some((report, _, _)) = &home {
                     evidence.insert("person_home".to_owned(), report.clone());
                 }
@@ -373,6 +469,9 @@ fn staged(
     if let Some(evidence) = outcome.evidence.as_object_mut() {
         if needs_login {
             evidence.insert("login_held".to_owned(), json!(login_held));
+        }
+        if let Some(watched) = &watched_evidence {
+            evidence.insert("person_files".to_owned(), watched.clone());
         }
         if let Some((report, _, _)) = &home {
             evidence.insert("person_home".to_owned(), report.clone());
@@ -479,8 +578,12 @@ fn run_part(
     // an agent whose login is a keychain item, the person's login keychain, borrowed.
     let keychain = match login {
         Some(login) if login.account.login_keychain => {
-            borrow_login_keychain(&run.home(), &login.person_home)
-                .unwrap_or_else(|why| panic!("the run's home searches the login keychain: {why}"));
+            // The person's own home searches their login keychain already; a run's home is given it.
+            if login.account.home == AccountHome::Run {
+                borrow_login_keychain(&run.home(), &login.person_home).unwrap_or_else(|why| {
+                    panic!("the run's home searches the login keychain: {why}")
+                });
+            }
             None
         }
         _ => RunKeychain::create(&run.home()),
@@ -867,7 +970,43 @@ fn prepare_login(stage: &Stage<'_, '_>) -> (Installation, Variables, Variables) 
     if let Some((name, value)) = &login.key {
         variables.push((name.clone(), value.clone()));
     }
+    for (name, value) in &login.account.variables {
+        variables.retain(|(existing, _)| existing != name);
+        variables.push((name.clone(), value.clone()));
+    }
+    if let Some(config) = &login.account.config_directory {
+        let directory = stage.run.root().join(CONFIG_DIRECTORY);
+        if !directory.is_dir() {
+            kr_ipc::paths::create_private_tree(stage.run.root(), &directory)
+                .expect("the run's configuration directory");
+        }
+        for (relative, content) in &config.files {
+            let path = directory.join(relative);
+            assert!(
+                path.starts_with(&directory) && !relative.contains(".."),
+                "a configuration file stays in its directory: {relative}"
+            );
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).expect("the configuration file's directory");
+            }
+            std::fs::write(&path, content).expect("writes the configuration file");
+        }
+        variables.retain(|(existing, _)| existing != &config.variable);
+        variables.push((config.variable.clone(), directory.display().to_string()));
+    }
     (installation, setup, variables)
+}
+
+/// Where the agent keeps its conversations in a part with a login: under its configuration
+/// directory of the run's own where it has one, and under the home it runs with otherwise.
+fn conversations_root(stage: &Stage<'_, '_>) -> PathBuf {
+    let login = stage.login.expect("a part with a login");
+    let base = if login.account.config_directory.is_some() {
+        stage.run.root().join(CONFIG_DIRECTORY)
+    } else {
+        login_home(stage)
+    };
+    base.join(&login.account.conversations)
 }
 
 /// The home the agent runs with in a part with a login.
@@ -1100,47 +1239,58 @@ fn keychain_readable_in_a_session(stage: &Stage<'_, '_>, variables: &[(String, S
     );
 }
 
-/// Checks, where the build list names the agent's status command, that the login holds: the
+/// Checks, where the build list names the agent's status command, that the login holds, and where
+/// it names its isolation command, that the agent loads no server of the person's own: each
 /// command, run as the agent runs, with its variables, home and working directory, says so without
-/// calling a model. Its output is read for that text alone and never kept or printed.
+/// calling a model. Their output is read for that text alone and never kept or printed.
 fn login_holds(stage: &Stage<'_, '_>, variables: &[(String, String)]) {
     let account = stage.login.expect("a part with a login").account();
-    let Some(status) = &account.status else {
-        return;
+    let says = |status: &kr_e2e_agents::build::Status| {
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("exec \"$0\" \"$@\"")
+            .arg(&stage.build.command)
+            .args(&status.arguments)
+            .env_clear()
+            .envs(
+                variables
+                    .iter()
+                    .map(|(name, value)| (name.as_str(), value.as_str())),
+            )
+            .current_dir(stage.run.work())
+            .stdin(std::process::Stdio::null());
+        output_within(command, LIVENESS).is_ok_and(|output| {
+            let said: String = String::from_utf8_lossy(&output.stdout)
+                .chars()
+                .chain(String::from_utf8_lossy(&output.stderr).chars())
+                .filter(|character| !character.is_whitespace())
+                .collect();
+            let wanted: String = status
+                .shows
+                .chars()
+                .filter(|character| !character.is_whitespace())
+                .collect();
+            output.status.success() && said.contains(&wanted)
+        })
     };
-    let mut command = std::process::Command::new("/bin/sh");
-    command
-        .arg("-c")
-        .arg("exec \"$0\" \"$@\"")
-        .arg(&stage.build.command)
-        .args(&status.arguments)
-        .env_clear()
-        .envs(
-            variables
-                .iter()
-                .map(|(name, value)| (name.as_str(), value.as_str())),
-        )
-        .current_dir(stage.run.work())
-        .stdin(std::process::Stdio::null());
-    let holds = output_within(command, LIVENESS).is_ok_and(|output| {
-        let said: String = String::from_utf8_lossy(&output.stdout)
-            .chars()
-            .chain(String::from_utf8_lossy(&output.stderr).chars())
-            .filter(|character| !character.is_whitespace())
-            .collect();
-        let wanted: String = status
-            .shows
-            .chars()
-            .filter(|character| !character.is_whitespace())
-            .collect();
-        output.status.success() && said.contains(&wanted)
-    });
-    assert!(
-        holds,
-        "{LOGIN_UNPROVEN} `{} {}` did not say that it holds",
-        stage.build.command,
-        status.arguments.join(" ")
-    );
+    if let Some(status) = &account.status {
+        assert!(
+            says(status),
+            "{LOGIN_UNPROVEN} `{} {}` did not say that it holds",
+            stage.build.command,
+            status.arguments.join(" ")
+        );
+    }
+    if let Some(isolated) = &account.isolated {
+        assert!(
+            says(isolated),
+            "{ISOLATION_UNPROVEN} `{} {}` did not say {:?}",
+            stage.build.command,
+            isolated.arguments.join(" "),
+            isolated.shows
+        );
+    }
 }
 
 /// A random number below `bound`, from the system's random source.
@@ -2890,7 +3040,7 @@ fn slash_commands_interrupts_queued_prompts_and_steering_each_work_from_a_device
     on_account_stage("2a", TEST, |stage| {
         let account = stage.login.expect("a part with a login").account();
         let (_installation, _setup, variables) = prepare_login(stage);
-        let conversations = login_home(stage).join(&account.conversations);
+        let conversations = conversations_root(stage);
         let mut logged = Logged::start(stage, &variables, "the agent's session", "2a", &[], None);
         let shown = detect(stage, &logged.agent.session);
         let detected = check_detected(&launched(stage, &logged.agent), &shown);
@@ -3238,7 +3388,7 @@ fn a_local_and_a_remote_answer_raced_to_one_approval_resolve_it_once() {
         );
         let ran = executions(&log, &mark);
         loser_reached_nothing(ran).unwrap_or_else(|why| panic!("one resolution: {why}"));
-        let conversations = login_home(stage).join(&account.conversations);
+        let conversations = conversations_root(stage);
         let conversation = conversation_of(&conversations, &mark, &account.prompt_line)
             .unwrap_or_else(|| {
                 panic!(
@@ -3415,7 +3565,7 @@ fn a_disconnection_after_the_agent_took_a_prompt_leaves_one_reply_and_no_duplica
         let mut logged = Logged::start(stage, &variables, "the agent's session", "4", &[], None);
         let shown = detect(stage, &logged.agent.session);
         let detected = check_detected(&launched(stage, &logged.agent), &shown);
-        let conversations = login_home(stage).join(&account.conversations);
+        let conversations = conversations_root(stage);
         let mark = stage.mark.to_owned();
         let upper = mark.to_uppercase();
         let (begin, end) = (format!("{upper}-START"), format!("{upper}-END"));
@@ -3668,7 +3818,7 @@ fn a_second_process_on_the_same_saved_conversation_is_another_execution_not_merg
     on_account_stage("7", TEST, |stage| {
         let account = stage.login.expect("a part with a login").account();
         let (_installation, _setup, variables) = prepare_login(stage);
-        let conversations = login_home(stage).join(&account.conversations);
+        let conversations = conversations_root(stage);
         let mut first = Logged::start(stage, &variables, "session A", "7", &[], None);
         let shown_first = detect(stage, &first.agent.session);
         let mark = stage.mark.to_owned();

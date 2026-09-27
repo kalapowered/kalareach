@@ -320,6 +320,106 @@ pub fn record_key_scan(part: &str, variable: &str, scan: &KeyScan, removed_ms: u
         .unwrap_or_else(|error| panic!("the key-scan file {}: {error}", path.display()));
 }
 
+/// One file of the person's home that a part must leave as it found it, as it was at one moment:
+/// its path relative to the home, and its SHA-256, or none where it did not exist.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Guarded {
+    /// The path relative to the person's home.
+    pub relative: String,
+    /// The file's SHA-256, where it exists.
+    pub sha256: Option<[u8; 32]>,
+}
+
+/// Reads each of `files`, relative to `home`, for [`Guarded`]: a file that cannot be read, other
+/// than one that does not exist, is an error, since nothing about it could be compared.
+///
+/// # Errors
+///
+/// Returns the file that could not be read, and why.
+pub fn guarded_files(home: &Path, files: &[String]) -> Result<Vec<Guarded>, String> {
+    files
+        .iter()
+        .map(|relative| {
+            let path = home.join(relative);
+            match std::fs::read(&path) {
+                Ok(bytes) => Ok(Guarded {
+                    relative: relative.clone(),
+                    sha256: Some(kr_cbor::sha256(&bytes)),
+                }),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Guarded {
+                    relative: relative.clone(),
+                    sha256: None,
+                }),
+                Err(error) => Err(format!("~/{relative}: {error}")),
+            }
+        })
+        .collect()
+}
+
+/// Appends one line to the file beside the key-scan file the harness named: the part, and each
+/// guarded file's SHA-256 before and after, in hexadecimal, so the comparison can be checked
+/// without the files; the record itself says only whether each changed.
+///
+/// # Panics
+///
+/// Panics when the harness named a file that cannot be written.
+pub fn record_guarded(part: &str, before: &[Guarded], after: &[Guarded]) {
+    let Some(path) = std::env::var_os(KEY_SCAN_VARIABLE)
+        .filter(|value| !value.is_empty())
+        .map(|value| PathBuf::from(value).with_file_name("guarded-files.jsonl"))
+    else {
+        return;
+    };
+    let hex = |digest: &Option<[u8; 32]>| {
+        digest.map(|bytes| {
+            bytes
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        })
+    };
+    let files: Vec<Value> = before
+        .iter()
+        .zip(after)
+        .map(|(first, second)| {
+            json!({ "file": format!("~/{}", first.relative), "before": hex(&first.sha256), "after": hex(&second.sha256) })
+        })
+        .collect();
+    let mut line = serde_json::to_vec(&json!({ "part": part, "files": files }))
+        .expect("the guarded files are JSON");
+    line.push(b'\n');
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .and_then(|mut file| file.write_all(&line))
+        .unwrap_or_else(|error| panic!("the guarded-files file {}: {error}", path.display()));
+}
+
+/// When the person's login keychain says the item `service`, for the account `USER` names, was
+/// last modified: its attributes only, read with the person's home, never its value. `None` when
+/// the item or its time cannot be read.
+#[must_use]
+pub fn keychain_item_modified(home: &Path, service: &str) -> Option<String> {
+    let account = std::env::var("USER").ok()?;
+    let mut command = Command::new("/usr/bin/security");
+    command
+        .args(["find-generic-password", "-s", service, "-a", &account])
+        .env_clear()
+        .env("HOME", home)
+        .env("PATH", "/usr/bin:/bin");
+    let output = output_within(command, LIVENESS).ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    // The attribute line reads `"mdat"<timedate>=0x... "20260927120000Z\000"`; only its date is
+    // kept, and every other line, the account's name among them, is dropped here.
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find(|line| line.trim_start().starts_with("\"mdat\""))
+        .and_then(|line| line.split('"').nth(3).map(str::to_owned))
+}
+
 /// The variable naming the file descriptor the harness passes a login's value on: a pipe, so the
 /// value is in no file and in no process's environment until the agent's session is given it.
 pub const KEY_DESCRIPTOR_VARIABLE: &str = "KR_AGENTS_KEY_FD";
