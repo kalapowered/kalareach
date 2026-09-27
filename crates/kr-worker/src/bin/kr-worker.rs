@@ -544,15 +544,13 @@ fn managed_package(specification: &WorkerLaunchSpec) -> Result<Option<ShellPacka
 
 /// Returns this installation's launcher, the `kr-hook` beside this executable in every packaged
 /// layout, where it is there.
+///
+/// This worker's own release's: a session's launches go through the launcher it was started with,
+/// whatever release an update has made current since.
 fn installed_launcher() -> Option<std::path::PathBuf> {
-    let beside = std::env::current_exe()
+    let beside = kr_ipc::install::this_process()
         .ok()?
-        .parent()?
-        .join(if cfg!(windows) {
-            "kr-hook.exe"
-        } else {
-            "kr-hook"
-        });
+        .own(kr_ipc::install::Program::Hook);
     beside.is_file().then_some(beside)
 }
 

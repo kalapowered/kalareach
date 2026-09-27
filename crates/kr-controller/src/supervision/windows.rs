@@ -2022,7 +2022,8 @@ mod launching {
             Ok(None) => return StarterExit::Done,
             Err(_) => return StarterExit::Unusable,
         };
-        let (Ok(program), Ok(session)) = (std::env::current_exe(), starter::current_session())
+        let (Ok(program), Ok(session)) =
+            (kr_ipc::install::image_path(), starter::current_session())
         else {
             return StarterExit::Unusable;
         };

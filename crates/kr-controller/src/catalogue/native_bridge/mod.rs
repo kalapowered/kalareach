@@ -108,8 +108,10 @@ pub struct BridgeHost {
 
 impl BridgeHost {
     /// This host's own: journals in the environment's state directory, each application's
-    /// directory under the account's home, the daemon's search path, and the `kr-hook` beside the
-    /// daemon, where every packaged installation puts it.
+    /// directory under the account's home, the daemon's search path, and the `kr-hook` an update
+    /// replaces: through the store's `current` for a daemon of an installed release, so a
+    /// registration keeps naming the forwarder across updates, and beside the daemon otherwise,
+    /// where every packaged installation puts it.
     #[must_use]
     pub fn discover(state_dir: &Path) -> Self {
         Self {
@@ -120,9 +122,9 @@ impl BridgeHost {
             search_path: std::env::var_os("PATH")
                 .map(|path| std::env::split_paths(&path).collect())
                 .unwrap_or_default(),
-            forwarder: std::env::current_exe()
+            forwarder: kr_ipc::install::this_process()
                 .ok()
-                .and_then(|path| path.parent().map(|directory| directory.join(FORWARDER)))
+                .map(|running| running.stable(kr_ipc::install::Program::Hook))
                 .filter(|path| path.is_file()),
             #[cfg(feature = "testing")]
             signed_records: Vec::new(),

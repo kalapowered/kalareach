@@ -42,6 +42,8 @@ testing = []
 # The tests act exactly when a held rename was refused, through the retry's own seam.
 kr-flush = { workspace = true, features = ["testing"] }
 kr-ipc = { workspace = true, features = ["testing"] }
+# The store's tests write the release manifests every process of a release reads at its start.
+serde_json.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 
 # The workspace forbids unsafe code, which a crate that asks the kernel directly cannot honour. This

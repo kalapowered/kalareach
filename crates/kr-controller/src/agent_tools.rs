@@ -1920,19 +1920,17 @@ fn entry_key(entry: &str) -> &str {
 
 /// Returns the command an agent runs to reach the tools.
 ///
-/// The `kr` beside this daemon when there is one, so an installation from a build that is not on
-/// the path still reaches that build; otherwise the plain command name, which the person's path
-/// resolves.
+/// The `kr` an update replaces when this daemon is of an installed release: the path through the
+/// store's `current`, which an agent's configuration keeps naming across updates, so an agent that
+/// starts after an update runs the new release's tools. Outside a store, the `kr` beside this
+/// daemon when there is one, so an installation from a build that is not on the path still reaches
+/// that build. Otherwise the plain command name, which the person's path resolves.
 fn entry_command() -> String {
-    std::env::current_exe()
+    kr_ipc::install::this_process()
         .ok()
-        .and_then(|path| path.parent().map(|parent| parent.join(client_name())))
+        .map(|running| running.stable(kr_ipc::install::Program::Kr))
         .filter(|path| path.is_file())
         .map_or_else(|| "kr".to_owned(), |path| display(&path))
-}
-
-const fn client_name() -> &'static str {
-    if cfg!(windows) { "kr.exe" } else { "kr" }
 }
 
 /// Returns the skill package's own files, for a check that they are what the manifest says.

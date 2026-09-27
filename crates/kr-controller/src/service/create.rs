@@ -394,13 +394,14 @@ impl Controller {
 
     /// Returns the client executable a terminal window runs.
     ///
-    /// Beside this daemon's own, because they are installed together and a host with two
-    /// installations must open the one it is running.
+    /// This daemon's own release's `kr`, because they are installed together and a host with two
+    /// installations, or two releases side by side, must open the one it is running: the window
+    /// attaches to a worker this daemon launched, and that worker is of this daemon's release.
     fn attach_program(&self) -> PathBuf {
-        std::env::current_exe()
-            .ok()
-            .and_then(|path| path.parent().map(|parent| parent.join("kr")))
-            .unwrap_or_else(|| PathBuf::from("kr"))
+        kr_ipc::install::this_process().map_or_else(
+            |_| PathBuf::from("kr"),
+            |running| running.own(kr_ipc::install::Program::Kr),
+        )
     }
 
     /// Resolves a reservation that never reached a launch, and releases what it was holding.

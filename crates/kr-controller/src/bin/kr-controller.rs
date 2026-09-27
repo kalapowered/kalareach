@@ -238,9 +238,11 @@ fn starter(_arguments: &Arguments) -> ExitCode {
 }
 
 fn default_worker_program() -> PathBuf {
-    // The worker sits beside this executable in every packaged layout.
-    std::env::current_exe()
-        .ok()
-        .and_then(|path| path.parent().map(|parent| parent.join("kr-worker")))
-        .unwrap_or_else(|| PathBuf::from("kr-worker"))
+    // This daemon's own release's worker: it sits beside this executable in every packaged layout,
+    // and a daemon of an installed release starts the worker of that release, never the one an
+    // update has made current since.
+    kr_ipc::install::this_process().map_or_else(
+        |_| PathBuf::from("kr-worker"),
+        |running| running.own(kr_ipc::install::Program::Worker),
+    )
 }

@@ -11,6 +11,7 @@
 //! | --- | --- |
 //! | [`paths`] | The owner-only runtime and state directories, endpoint names and atomic file publication |
 //! | [`identity`] | The host's boot identity, its boot epoch and a process's start identity, read from the kernel |
+//! | [`install`] | The store of installed releases, which release this process runs, and the hold that keeps it on disk |
 //! | [`clock`] | The machine's own continuous clock, which two host processes can compare |
 //! | [`floor`] | The host's one reading of UTC in a boot, a word every host process maps |
 //! | [`peer`] | Peer-credential authentication of a local caller |
@@ -66,6 +67,7 @@ pub mod error;
 pub mod floor;
 pub mod framed;
 pub mod identity;
+pub mod install;
 pub mod paths;
 pub mod peer;
 pub mod starter;

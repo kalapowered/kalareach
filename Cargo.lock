@@ -4663,6 +4663,7 @@ dependencies = [
  "libproc",
  "rustix",
  "serde",
+ "serde_json",
  "sysctl",
  "thiserror 2.0.20",
  "tokio",
