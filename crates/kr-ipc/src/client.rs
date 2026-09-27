@@ -431,14 +431,53 @@ impl LocalClient {
         &mut self,
         notice: kr_protocol::worker::AuthorityRevisionNotice,
     ) -> Result<kr_protocol::worker::AuthorityRevisionAck> {
-        self.writer
-            .write_message(&ControlFrame::AuthorityRevision(notice))
-            .await?;
+        self.acknowledged(
+            &ControlFrame::AuthorityRevision(notice),
+            "the worker refused the authority revision",
+            |frame| match frame {
+                ControlFrame::AuthorityRevisionAck(ack) => Some(ack),
+                _ => None,
+            },
+        )
+        .await
+    }
+
+    /// Tells a worker the environment's privacy generation and waits for its answer: the
+    /// generation its session holds now, and where its own cleanup stands.
+    ///
+    /// # Errors
+    ///
+    /// Returns the worker's refusal, or a transport failure.
+    pub async fn announce_privacy(
+        &mut self,
+        notice: kr_protocol::privacy::PrivacyGenerationNotice,
+    ) -> Result<kr_protocol::privacy::PrivacyGenerationAck> {
+        self.acknowledged(
+            &ControlFrame::PrivacyGeneration(notice),
+            "the worker refused the privacy generation",
+            |frame| match frame {
+                ControlFrame::PrivacyGenerationAck(ack) => Some(*ack),
+                _ => None,
+            },
+        )
+        .await
+    }
+
+    /// Writes one notice and reads until the worker acknowledges it.
+    ///
+    /// What arrives before the answer is this connection's subscription, not an answer to the
+    /// notice: it is kept in arrival order and handed back afterwards. An error response is the
+    /// worker's refusal, named by `refused`. Any other frame is the answer when `acknowledgement`
+    /// takes it, and otherwise is not an answer at all.
+    async fn acknowledged<T>(
+        &mut self,
+        notice: &ControlFrame,
+        refused: &'static str,
+        acknowledgement: impl FnOnce(ControlFrame) -> Option<T>,
+    ) -> Result<T> {
+        self.writer.write_message(notice).await?;
         loop {
             match self.read_socket_frame().await? {
-                ControlFrame::AuthorityRevisionAck(ack) => return Ok(ack),
-                // This connection's subscription, not an answer to the revision. It is kept in
-                // arrival order and handed back afterwards.
                 ControlFrame::Notification(notification) => {
                     self.hold(ControlFrame::Notification(notification))?;
                 }
@@ -447,12 +486,12 @@ impl LocalClient {
                     ..
                 }) => {
                     return Err(IpcError::IdentityUnavailable {
-                        what: "the worker refused the authority revision",
+                        what: refused,
                         detail: error.to_string(),
                     });
                 }
-                _ => {
-                    return Err(IpcError::UnexpectedMessage(
+                frame => {
+                    return acknowledgement(frame).ok_or(IpcError::UnexpectedMessage(
                         "the worker answered something other than an acknowledgement",
                     ));
                 }

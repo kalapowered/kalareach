@@ -1602,7 +1602,7 @@ impl WorkerService {
     }
 
     async fn handle(
-        &self,
+        self: &Arc<Self>,
         state: &mut ConnectionState,
         peer: &PeerIdentity,
         message: ControlFrame,
@@ -1663,6 +1663,9 @@ impl WorkerService {
             }
             ControlFrame::AuthorityRevision(notice) => {
                 Some(self.acknowledge_revision(state, &notice))
+            }
+            ControlFrame::PrivacyGeneration(notice) => {
+                Some(self.take_privacy(state, &notice).await)
             }
             ControlFrame::PluginAdmissions(part) => self.plugin_admissions_part(state, *part).await,
             ControlFrame::Request(request) => {
@@ -2647,6 +2650,85 @@ impl WorkerService {
             revision,
             fence,
         })
+    }
+
+    /// Takes the environment's privacy generation into this session and answers where its cleanup
+    /// stands.
+    ///
+    /// Only the control daemon's authority connection speaks for the environment's privacy record,
+    /// as only it announces an authority revision. A generation that turns privacy mode on raises
+    /// the attention transition first and settles it once the commit has been tried, whatever came
+    /// of it, so no session text answered before the commit leaves the daemon after it. The
+    /// generation the session already holds, in the state it holds it, is not committed again: its
+    /// cleanup is taken again and the answer says where it stands, which is how the daemon asks
+    /// again. An older generation is refused, and so is one this session cannot record.
+    async fn take_privacy(
+        self: &Arc<Self>,
+        state: &ConnectionState,
+        notice: &kr_protocol::privacy::PrivacyGenerationNotice,
+    ) -> ControlFrame {
+        if state.client_kind != LocalClientKind::Controller
+            || state.controller_role != ControllerConnectionRole::Authority
+        {
+            return failure(
+                RequestId::new(0),
+                &ProtocolError::new(
+                    ErrorCode::PermissionDenied,
+                    "only the control daemon's authority connection tells a session its privacy \
+                     generation",
+                ),
+            );
+        }
+        if let Err(error) = self.check_authority(state) {
+            return failure(RequestId::new(0), &error.to_protocol_error());
+        }
+        if notice.environment_id != self.environment_id {
+            return failure(
+                RequestId::new(0),
+                &ProtocolError::new(
+                    ErrorCode::PermissionDenied,
+                    "this worker belongs to another environment",
+                ),
+            );
+        }
+        let generation = crate::privacy::PrivacyGeneration::new(notice.generation.get());
+        let held = self.runtime.session().privacy();
+        let mut attention = self.attention_privacy();
+        let applied = if !notice.enabled {
+            self.runtime
+                .session()
+                .disable_privacy(generation)
+                .map(|_| ())
+        } else if held.generation() == generation && held.is_enabled() {
+            // Committed already, so there is no transition to raise: the cleanup is taken again.
+            self.runtime
+                .session()
+                .enable_privacy(generation, &mut [&mut attention])
+                .map(|_| ())
+        } else {
+            let transition = self.raise_privacy_transition().await;
+            let enabled = self
+                .runtime
+                .session()
+                .enable_privacy(generation, &mut [&mut attention])
+                .map(|_| ());
+            transition.settle().await;
+            enabled
+        };
+        if let Err(error) = applied {
+            return failure(RequestId::new(0), &error.to_protocol_error());
+        }
+        let session = self.runtime.session();
+        let completion = session.reconcile_privacy(&[&attention]);
+        let privacy = session.privacy();
+        let session_id = session.id();
+        drop(session);
+        ControlFrame::PrivacyGenerationAck(Box::new(kr_protocol::privacy::PrivacyGenerationAck {
+            session_id,
+            generation: U64::new(privacy.generation().get()),
+            enabled: privacy.is_enabled(),
+            completion: (&completion).into(),
+        }))
     }
 
     /// Takes the input lease away from a caller acting under a grant, with whatever it had not

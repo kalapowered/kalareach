@@ -409,6 +409,79 @@ impl Completion {
     }
 }
 
+/// What privacy mode stops, as it travels.
+impl From<Disabled> for kr_protocol::privacy::PrivacyDisabled {
+    fn from(disabled: Disabled) -> Self {
+        match disabled {
+            Disabled::ContentHistoryRetention => Self::ContentHistoryRetention,
+            Disabled::DescriptionInference => Self::DescriptionInference,
+            Disabled::Sync => Self::Sync,
+            Disabled::Backup => Self::Backup,
+        }
+    }
+}
+
+/// What is kept, as it travels.
+impl From<&KeptExplicitly> for kr_protocol::privacy::PrivacyKept {
+    fn from(kept: &KeptExplicitly) -> Self {
+        Self {
+            what: kept.what.to_owned(),
+            why: kept.why.to_owned(),
+        }
+    }
+}
+
+/// A copy that had already left, as it travels.
+impl From<&Exported> for kr_protocol::privacy::PrivacyExported {
+    fn from(exported: &Exported) -> Self {
+        Self {
+            kind: exported.kind.clone(),
+            reference: exported.reference.clone(),
+            left_at_ms: exported.left_at_ms,
+            deletable: exported.deletable,
+        }
+    }
+}
+
+/// The completion as it travels: each subsystem by its stable name, each reason as its store gave
+/// it.
+impl From<&Completion> for kr_protocol::privacy::PrivacyCompletion {
+    fn from(completion: &Completion) -> Self {
+        let outstanding = |outstanding: &Outstanding| {
+            outstanding
+                .iter()
+                .map(
+                    |(subsystem, count)| kr_protocol::privacy::PrivacyOutstanding {
+                        subsystem: (*subsystem).to_owned(),
+                        count: kr_protocol::scalars::U64::new(*count),
+                    },
+                )
+                .collect()
+        };
+        match completion {
+            Completion::Complete => Self::Complete,
+            Completion::Reconciling { outstanding: owed } => Self::Reconciling {
+                outstanding: outstanding(owed),
+            },
+            Completion::Unavailable {
+                unavailable,
+                outstanding: owed,
+            } => Self::Unavailable {
+                unavailable: unavailable
+                    .iter()
+                    .map(
+                        |(subsystem, unavailable)| kr_protocol::privacy::PrivacyUnavailable {
+                            subsystem: (*subsystem).to_owned(),
+                            reason: unavailable.reason().to_owned(),
+                        },
+                    )
+                    .collect(),
+                outstanding: outstanding(owed),
+            },
+        }
+    }
+}
+
 /// Where a change another owner recorded stands against the generation in force.
 ///
 /// The environment's record is what advances the generation, and a session applies the one it is
