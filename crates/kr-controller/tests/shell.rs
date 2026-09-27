@@ -178,6 +178,9 @@ fn install_package(root: &Path, kind: ShellKind) {
 // --------------------------------------------------------------------------------------------
 
 /// KR-REQ-07.19, KR-REQ-07.16.
+///
+/// KR-REQ-07.18: a create that asks for a script invocation is refused before anything is spawned,
+/// so it never becomes an interactive shell.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_managed_create_without_a_qualified_package_is_refused_before_anything_is_spawned() {
     let packages = tempfile::tempdir().expect("a directory");

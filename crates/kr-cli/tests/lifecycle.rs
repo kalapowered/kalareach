@@ -1991,6 +1991,9 @@ impl Watch {
 /// KR-REQ-01.01, the local leg; KR-REQ-07.52: a session created on the command line carries an
 /// agent's question to its person, outlives the terminal that made it, is attached again, and ends
 /// when its own shell exits.
+///
+/// KR-REQ-07.02: `kr new --attach`, run in a real terminal against a running daemon, creates the
+/// session and attaches that terminal to it, and the session's shell reads there.
 #[test]
 fn a_session_made_by_kr_new_carries_a_question_outlives_its_terminal_and_ends_with_its_shell() {
     let host = Host::start();

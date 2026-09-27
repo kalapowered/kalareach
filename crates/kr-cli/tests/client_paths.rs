@@ -1,7 +1,7 @@
 //! Which way the command line reaches a host.
 //!
-//! Section 4: the command line is a local IPC client, and remote application access uses
-//! `kr-client` over iroh. Neither half is this crate's to implement. Reaching a host on this
+//! KR-REQ-04.23. Section 4: the command line is a local IPC client, and remote application access
+//! uses `kr-client` over iroh. Neither half is this crate's to implement. Reaching a host on this
 //! machine is `kr-ipc`'s socket or named pipe, and reaching one anywhere else is `kr-client`'s
 //! connection, which is why this crate depends on both and on no transport at all.
 

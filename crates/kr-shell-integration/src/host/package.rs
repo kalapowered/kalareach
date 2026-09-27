@@ -1137,6 +1137,9 @@ mod tests {
         assert!(matches!(fault, PackageFault::Unqualified { .. }), "{fault}");
     }
 
+    /// KR-REQ-07.18: a script request is refused rather than launched as an interactive shell: a
+    /// command string, a login command, a redirect and a command list each name no interactive
+    /// shell, and each is refused as shell integration this host does not support.
     #[test]
     fn a_script_invocation_never_becomes_an_interactive_shell() {
         let root = tempfile::tempdir().expect("a directory");

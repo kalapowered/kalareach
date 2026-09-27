@@ -1827,6 +1827,9 @@ async fn a_lapsed_offline_bound_stops_a_running_subscription_and_leaves_the_gran
 // silently when that binary was absent would report a pass for something it never ran.
 /// KR-REQ-05.02: a paired device reaches a session over the network through the control daemon,
 /// and reads the same session a local client reads through the daemon's local endpoint.
+///
+/// KR-REQ-04.23: remote application access is kr-client's session over iroh, reading what a local
+/// IPC client reads over the daemon's own socket.
 #[ignore = "launches a worker process; run through scripts/end-to-end.sh"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn one_session_runs_over_a_local_socket_and_over_the_network() {
