@@ -4199,17 +4199,25 @@ async fn acquire(
 // `scripts/end-to-end.sh`, which runs it with `--include-ignored`. A suite that skipped itself
 // silently when that binary was absent would report a pass for something it never ran.
 /// KR-REQ-09.20: a client's reconnect acquires a new input stream identity, and the keystrokes the
-/// old stream carried are never replayed.
+/// old stream carried are never replayed: what was left unacknowledged is reported as uncertain
+/// and dropped, not sent again.
 ///
 /// KR-REQ-23.22: a live reconnect is a new connection identity with a new input stream, and old
-/// raw input is never replayed. The device types on one connection and loses it. The next
-/// connection has an identity of its own; input under the old connection's attachment and lease is
-/// refused there and never reaches the shell, and a new attachment's lease starts an input stream
-/// of its own at sequence zero, which the shell runs.
+/// raw input is never replayed. The device types one command and sees it acknowledged, then types
+/// another and loses the connection before that one's answer comes back. What the client carries
+/// across says delivery was uncertain and holds no input. The next connection has an identity of
+/// its own; either command sent again under the old connection's attachment, lease and sequence is
+/// refused there, and a new attachment's lease starts an input stream of its own at sequence zero,
+/// which the shell runs. Afterwards the acknowledged command ran exactly once and the uncertain one
+/// at most once.
 #[ignore = "launches a worker process; run through scripts/end-to-end.sh"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_reconnect_opens_a_new_input_stream_and_replays_no_input() {
     use kr_client::transport::ControlTransport as _;
+
+    /// What the command typed just before the connection is lost prints, and the command itself.
+    const UNCERTAIN: &str = "kalareach-uncertain";
+    const UNCERTAIN_COMMAND: &str = "printf 'kala%s-uncertain\n' reach\n";
 
     let host = Host::create();
     let owner = DeviceKeys::generate().expect("owner keys");
@@ -4221,7 +4229,8 @@ async fn a_reconnect_opens_a_new_input_stream_and_replays_no_input() {
     let device = Device::create(&loopback()).await;
     let record = pair(&daemon, &device, &owner).await;
 
-    // The first connection attaches, takes the input lease and types on it.
+    // The first connection attaches, takes the input lease and types on it. The client keeps its
+    // own record of what it sent on this connection's input stream and what came back.
     let first = NetworkTransport::connect(
         &device.endpoint,
         host_addr_of(&daemon),
@@ -4235,22 +4244,54 @@ async fn a_reconnect_opens_a_new_input_stream_and_replays_no_input() {
     let session = Session::start(Arc::new(first)).expect("a session");
     let attached = attach(&session, environment_id, session_id).await;
     let old = acquire(&session, environment_id, session_id, attached.typing).await;
+    let mut lane = kr_transport::reconnect::InputLane::new(first_connection, old.lease.epoch);
+    let typed = |sequence: u64, command: &str| InputWriteParams {
+        session_id,
+        attachment_id: attached.typing,
+        epoch: old.lease.epoch,
+        sequence: kr_protocol::ids::InputSequence::new(sequence),
+        bytes: kr_protocol::scalars::Bytes::new(command.as_bytes().to_vec()),
+    };
     let mut events = session.events();
+    let sent = lane.next_sequence();
     session
-        .write_input(&InputWriteParams {
-            session_id,
-            attachment_id: attached.typing,
-            epoch: old.lease.epoch,
-            sequence: kr_protocol::ids::InputSequence::new(0),
-            bytes: kr_protocol::scalars::Bytes::new(MARKER_COMMAND.as_bytes().to_vec()),
-        })
+        .write_input(&typed(0, MARKER_COMMAND))
         .await
         .expect("the first command is accepted");
+    lane.acknowledge(sent);
     observe(&session, &mut events, MARKER).await;
 
-    // The connection is lost, and the client carries only its cursors across.
-    let carried = kr_client::reconnect::ClientState::from_session(&session, None).await;
-    session.close();
+    // The second command is handed to the connection, and the connection is lost before its
+    // answer can come back: its delivery is uncertain.
+    lane.next_sequence();
+    {
+        let uncertain = typed(1, UNCERTAIN_COMMAND);
+        let pending = session.write_input(&uncertain);
+        tokio::pin!(pending);
+        let answered = tokio::select! {
+            biased;
+            answered = &mut pending => Some(answered),
+            () = std::future::ready(()) => None,
+        };
+        assert!(
+            answered.is_none(),
+            "the answer came back before the connection could be lost: {answered:?}"
+        );
+        session.close();
+        pending
+            .await
+            .expect_err("the connection ended before the second command's answer");
+    }
+    let carried =
+        kr_client::reconnect::ClientState::from_session(&session, Some(lane.close())).await;
+    assert!(
+        carried.delivery_uncertain(),
+        "the client says the second command's delivery is uncertain"
+    );
+    assert!(
+        carried.submitted.is_empty() && carried.unresolved_actions().is_empty(),
+        "and carries nothing to send again: raw input is no action"
+    );
     drop(session);
 
     let second = NetworkTransport::connect(
@@ -4269,19 +4310,15 @@ async fn a_reconnect_opens_a_new_input_stream_and_replays_no_input() {
     );
     let session = Session::resume(Arc::new(second), carried.cursors).expect("a resumed session");
 
-    // Input under the old connection's attachment and lease carries nothing on this one.
-    let replayed = "printf 'kala%s-replayed\n' reach\n";
-    let refused = session
-        .write_input(&InputWriteParams {
-            session_id,
-            attachment_id: attached.typing,
-            epoch: old.lease.epoch,
-            sequence: kr_protocol::ids::InputSequence::new(1),
-            bytes: kr_protocol::scalars::Bytes::new(replayed.as_bytes().to_vec()),
-        })
-        .await
-        .expect_err("the old connection's input stream is not carried across a reconnect");
-    assert_ne!(refused.code(), ErrorCode::OutcomeUnknown, "{refused}");
+    // A client that replayed would send each command again exactly as it went, under the old
+    // connection's attachment, lease and sequence. Neither is carried on this connection.
+    for (sequence, command) in [(0, MARKER_COMMAND), (1, UNCERTAIN_COMMAND)] {
+        let refused = session
+            .write_input(&typed(sequence, command))
+            .await
+            .expect_err("the old connection's input stream is not carried across a reconnect");
+        assert_ne!(refused.code(), ErrorCode::OutcomeUnknown, "{refused}");
+    }
 
     // A new attachment's lease is a new input stream, and it starts at sequence zero.
     let attached = attach(&session, environment_id, session_id).await;
@@ -4304,13 +4341,13 @@ async fn a_reconnect_opens_a_new_input_stream_and_replays_no_input() {
     assert!(written.forwarded_bytes.get() > 0);
     observe(&session, &mut events, SECOND_MARKER).await;
 
-    // What was refused never reached the shell.
+    // Each command ran as often as it was delivered, and no more: the acknowledged one once, the
+    // uncertain one at most once, and the new stream's once.
     let history = retained_history(&created).await;
-    assert!(history.contains(SECOND_MARKER), "{history:?}");
-    assert!(
-        !history.contains("kalareach-replayed"),
-        "input under the old connection's lease ran: {history:?}"
-    );
+    let ran = |marker: &str| occurrences(history.as_bytes(), marker.as_bytes());
+    assert_eq!(ran(MARKER), 1, "{history:?}");
+    assert!(ran(UNCERTAIN) <= 1, "{history:?}");
+    assert_eq!(ran(SECOND_MARKER), 1, "{history:?}");
 
     session.close();
     close_session(&mut local, &host, session_id).await;
