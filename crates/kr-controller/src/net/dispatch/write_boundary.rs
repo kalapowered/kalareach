@@ -1250,3 +1250,202 @@ fn listing(request_id: u64) -> kr_protocol::envelope::Request {
         .expect("encodes"),
     }
 }
+
+/// A worker's acceptance of a close of `session_id`, with its description of the session.
+fn acceptance(session_id: kr_protocol::ids::SessionId) -> kr_protocol::session::SessionCloseResult {
+    let mut described =
+        crate::service::a_close_a_worker_never_answers::read_result(session_id).session;
+    described.state = kr_protocol::session::SessionState::Closing;
+    kr_protocol::session::SessionCloseResult {
+        session_id,
+        state: kr_protocol::session::SessionState::Closing,
+        durability: kr_protocol::session::Durability::Durable,
+        closure: Nullable::null(),
+        session: Some(described),
+    }
+}
+
+/// The answer that carries `answer` to request 1.
+fn close_answer(answer: &kr_protocol::session::SessionCloseResult) -> ControlFrame {
+    ControlFrame::Response(kr_protocol::envelope::Response {
+        request_id: kr_protocol::ids::RequestId::new(1),
+        outcome: kr_protocol::envelope::Outcome::Ok(
+            kr_protocol::envelope::ParamsValue::from_typed(answer).expect("encodes"),
+        ),
+    })
+}
+
+/// The one close answer `recording` was written, and whether it carried a description at all,
+/// as a member of its own.
+fn written_close(recording: &Recording) -> (kr_protocol::session::SessionCloseResult, bool) {
+    let frames = recording.frames();
+    assert_eq!(frames.len(), 1, "one answer: {frames:?}");
+    let ControlFrame::Response(kr_protocol::envelope::Response {
+        outcome: kr_protocol::envelope::Outcome::Ok(value),
+        ..
+    }) = &frames[0]
+    else {
+        panic!("not the close's answer: {:?}", frames[0]);
+    };
+    let carried = match value.as_value() {
+        kr_cbor::CanonicalValue::Map(map) => map.get("session").is_some(),
+        _ => false,
+    };
+    (value.to_typed().expect("a close answer"), carried)
+}
+
+/// KR-REQ-23.34: a `session.close` answer carries the worker's description of the session only
+/// where the decision it is written under lets the device read the session. With `session.view`
+/// it goes whole; without it the acceptance goes and the description does not, not even as a
+/// member that says nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_close_answer_carries_the_description_only_to_a_device_that_may_read_the_session() {
+    for may_read in [false, true] {
+        let temp = kr_ipc::testing::TempHost::create();
+        let controller = super::super::tests::daemon(&temp).await;
+        let (mut grant, _) = super::super::tests::granted(
+            kr_protocol::grant::GrantExpiry::Never,
+            controller.policy().authority_revision(),
+        );
+        grant.actions = if may_read {
+            [ActionRight::SessionView, ActionRight::SessionClose]
+                .into_iter()
+                .collect()
+        } else {
+            [ActionRight::SessionClose].into_iter().collect()
+        };
+        let device = record_for(&grant);
+        controller.devices().commit(&device).expect("paired");
+        let recording = Arc::new(Recording::default());
+        let connection = super::RemoteConnection::for_test_writing_to(
+            &controller,
+            device,
+            Box::new(Arc::clone(&recording)),
+        );
+        let session_id = kr_protocol::ids::SessionId::new(kr_ipc::new_uuid());
+        let asked = connection
+            .ask(Some(session_id), Method::SessionClose.entry(), false)
+            .expect("the grant admits the close");
+        let accepted = acceptance(session_id);
+
+        assert!(
+            connection
+                .write_answer(super::decision::Answered {
+                    frame: close_answer(&accepted),
+                    asked: Some(asked),
+                })
+                .await,
+            "the connection stands"
+        );
+        let (written, carried) = written_close(&recording);
+        if may_read {
+            assert_eq!(written, accepted, "the answer goes whole");
+        } else {
+            assert_eq!(
+                written,
+                kr_protocol::session::SessionCloseResult {
+                    session: None,
+                    ..accepted
+                },
+                "the acceptance goes without the description"
+            );
+            assert!(!carried, "and no member of it goes either");
+        }
+        drop(controller);
+    }
+}
+
+/// KR-REQ-23.34: a close answer decided under a lease that has ended is written under the
+/// decision taken again as things stand, and that decision decides what it shows. A replacement
+/// lease installed after the end that keeps `session.close` and drops `session.view` lets the
+/// acceptance go without the session's description. The control: a renewal installed while the
+/// lease held continues its run, and the answer goes whole.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_close_answer_written_under_a_replacement_lease_without_view_goes_without_the_description()
+ {
+    for renewed_in_time in [false, true] {
+        let temp = kr_ipc::testing::TempHost::create();
+        let (continuous, wall, clocks) = super::super::tests::manual_clocks();
+        let controller = super::super::tests::daemon_on(&temp, clocks).await;
+        let now = wall.load(Ordering::SeqCst);
+        let organisation = TestOrganisation::new(0x49, now - 60 * 60 * 1000);
+        let (grant, _) = super::super::tests::leased_member(&controller, &organisation, now);
+        let grant = kr_protocol::grant::Grant {
+            actions: [ActionRight::SessionView, ActionRight::SessionClose]
+                .into_iter()
+                .collect(),
+            ..grant
+        };
+        // The member's lease comes to admit closing as well as viewing, while it holds.
+        continuous.advance(Duration::from_secs(1));
+        super::super::tests::renew_member(
+            &controller,
+            &organisation,
+            &grant,
+            now + 1_000,
+            &[ActionRight::SessionView, ActionRight::SessionClose],
+        )
+        .expect("written down")
+        .expect("the renewal installs");
+        let recording = Arc::new(Recording::default());
+        let connection = super::RemoteConnection::for_test_writing_to(
+            &controller,
+            record_for(&grant),
+            Box::new(Arc::clone(&recording)),
+        );
+        let session_id = kr_protocol::ids::SessionId::new(kr_ipc::new_uuid());
+        let asked = connection
+            .ask(Some(session_id), Method::SessionClose.entry(), false)
+            .expect("the lease answers for the close");
+        let accepted = acceptance(session_id);
+
+        if renewed_in_time {
+            continuous.advance(Duration::from_secs(60));
+            super::super::tests::renew_member(
+                &controller,
+                &organisation,
+                &grant,
+                now + 61_000,
+                &[ActionRight::SessionView, ActionRight::SessionClose],
+            )
+            .expect("written down")
+            .expect("the renewal installs");
+            continuous.advance(Duration::from_secs(14 * 60 + 30));
+        } else {
+            continuous.advance(Duration::from_secs(15 * 60 + 30));
+            super::super::tests::renew_member(
+                &controller,
+                &organisation,
+                &grant,
+                now + 61_000,
+                &[ActionRight::SessionClose],
+            )
+            .expect("written down")
+            .expect("the replacement installs");
+        }
+        assert!(
+            connection
+                .write_answer(super::decision::Answered {
+                    frame: close_answer(&accepted),
+                    asked: Some(asked),
+                })
+                .await,
+            "the connection stands"
+        );
+        let (written, carried) = written_close(&recording);
+        if renewed_in_time {
+            assert_eq!(written, accepted, "the renewal lets the whole answer go");
+        } else {
+            assert_eq!(
+                written,
+                kr_protocol::session::SessionCloseResult {
+                    session: None,
+                    ..accepted
+                },
+                "the replacement lets the acceptance go without the description"
+            );
+            assert!(!carried);
+        }
+        drop(controller);
+    }
+}
