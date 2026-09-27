@@ -1460,6 +1460,25 @@ there, in either mode.
 Reaching an environment over the network is a separate matter, and one the bridge takes no part in:
 a remote client connects to that environment's own paired endpoint.
 
+### Running the acceptance
+
+`scripts/e2e-wsl.sh` runs the whole of this on a Windows host with WSL 2, from Git Bash: two
+distributions, each with its own daemon, worker, Linux paths and process identifiers; argument
+vectors across `wsl.exe --exec`; the bridge from Windows to each; the cached listing of a stopped
+distribution; and the bridge in NAT and in mirrored networking. With only one distribution
+registered, it makes a second by exporting and importing the first, removes the installation the
+copy inherited before anything starts in it, and removes the copy at the end. A prerequisite it
+cannot meet is a failure, because a run that could not establish these results has not established
+them.
+
+`scripts/e2e-wsl.sh --self-test` checks that removal on any Linux host, against trees of its own.
+An installation is removed whole and nothing beside it is touched; a name that holds a newline, and
+a root whose own name ends in one, are handled as the names they are; and a root that leads to
+storage the image does not carry, or holds a mount of such storage, is refused before anything is
+removed. The mount needs a namespace of the self-test's own, which root has and a user namespace
+gives. Where the host allows neither, the self-test says that case was not run rather than passing
+it.
+
 ## Who may type
 
 A session has one input lease with an epoch. `input.acquire` takes it immediately: the epoch

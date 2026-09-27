@@ -32,7 +32,366 @@
 #   KR_WSL_SECOND     the name of the second distribution this script makes (default kr-acc-011)
 #   KR_WSL_ROOT       where that distribution's image is written (default /c/kala/wsl)
 #   KR_WSL_KEEP       1 to keep the second distribution and the daemons for inspection
+#
+# `bash scripts/e2e-wsl.sh --self-test` checks the part of step 3 that removes the installation a
+# copied distribution inherited. It runs on a Linux host, with no Windows and no WSL, against trees
+# of its own.
 set -euo pipefail
+
+# A distribution this run imported is a copy of another one, and a copy of an installation is not a
+# second installation: it carries the first one's environment identity, its registry and its
+# staging area, and those name a device and an inode that are different here. The daemon in the
+# copy is right to refuse them, so the copy is given none of it before anything starts in it.
+#
+# Two things have to be right, and neither is guessed at here.
+#
+# **Which directories.** The product derives its runtime and state roots from the directories this
+# OS user's environment names. Every one of those inputs is mirrored into a directory of this run's
+# own, the installed helper is asked where it then reads an account token (which lies directly in
+# the runtime root) and where it publishes the identity it allocates on a first use (which lies
+# directly in the state root), and each answer is mapped back through the input it came from. A
+# root the product names outside every mirrored input is the same absolute path here as it is in
+# the distribution this one was copied from, and is taken as it stands.
+#
+# **Which storage.** A directory that is not there was not inherited, and is left alone. A
+# directory that is there is removed only when the whole of it -- the directory and everything
+# under it -- is on the filesystem the image carries, which is the one the root of this
+# distribution is on. Anything else -- a symbolic link out to storage shared between
+# distributions, a bind mount of somewhere else at its top or at any directory inside it -- is not
+# this copy's to remove and not something a copy can be made independent of, so the run stops
+# before it removes anything and says which path it was.
+#
+# The program runs inside the distribution, with the installed helper as its first argument and the
+# root of the image as its second, which inside a distribution is `/`. It makes its probe under
+# TMPDIR. The self-test below runs the same program on this host, with a stand-in for the helper
+# and a tree of its own for the image.
+# shellcheck disable=SC2016  # the program is expanded where it runs, not here
+inherited_reset='
+    set -e
+    helper="$1"
+    image="$2"
+    probe="$(mktemp -d "${TMPDIR:-/tmp}/kr-acc-probe.XXXXXX")"
+    # Each mirror is owner-only, because a mirror can become a root the product creates its files
+    # in directly, and the product refuses a root anyone else can read.
+    #
+    # The real value of each input is held in a shell variable beside its mirror rather than in a
+    # file of pairs. A path may carry a space, a tab or a trailing blank, and a line of text read
+    # back as two fields would not return the value the product was given.
+    index=0
+    for name in HOME XDG_STATE_HOME XDG_RUNTIME_DIR KR_STATE_DIR KR_RUNTIME_DIR; do
+      eval "value=\${$name-}"
+      [ -n "$value" ] || continue
+      index=$((index + 1))
+      mkdir -m 0700 "$probe/$index"
+      eval "configured_$index=\$value"
+      eval "export $name=\"\$probe/\$index\""
+    done
+    token="$("$helper" --json account token show | tr -d " \n\r" |
+      sed -n "s/.*\"path\":\"\([^\"]*\)\".*/\1/p")"
+    [ -n "$token" ] || {
+      echo "the helper did not say where it reads an account token, so its runtime root is not known" >&2
+      exit 1
+    }
+    # This has no daemon to reach and fails once it has allocated the identity, which is the part
+    # being read here.
+    "$helper" list >/dev/null 2>&1 || true
+    marker="$(find "$probe" -type f -printf "%d %p\n" | sort -n | head -n 1 | cut -d" " -f2-)"
+    [ -n "$marker" ] || {
+      echo "the helper published no identity of its own, so its state root is not known" >&2
+      exit 1
+    }
+    image_device="$(stat -c %d "$image")"
+    for named in "$(dirname "$token")" "$(dirname "$marker")"; do
+      real="$named"
+      mapped=0
+      while [ "$mapped" -lt "$index" ]; do
+        mapped=$((mapped + 1))
+        mirror="$probe/$mapped"
+        case "$named" in
+          "$mirror" | "$mirror"/*)
+            eval "value=\$configured_$mapped"
+            real="$value${named#"$mirror"}"
+            ;;
+        esac
+      done
+      # What the path leads to, not what it says: a component of it may be a link somewhere else.
+      # A command substitution drops every newline at the end of what it reads, and a name can end
+      # in one, so an x follows the answer and only the newline readlink adds is taken off with it.
+      resolved="$(readlink -m "$real" && printf x)"
+      resolved="${resolved%?x}"
+      if [ ! -e "$resolved" ]; then
+        echo "  nothing of the product at $real"
+        continue
+      fi
+      device="$(stat -c %d "$resolved")"
+      [ "$device" = "$image_device" ] || {
+        echo "$real leads to $resolved, which is on storage this image does not carry and may be \
+shared with the distribution this one was copied from" >&2
+        exit 1
+      }
+      # The whole tree, not only its top: a directory inside it can mount storage of its own, and
+      # a removal that walked into one would take something this image does not carry with it.
+      # Nothing is removed until the walk below has found none.
+      #
+      # One walk writes two listings in the same order: the device of each entry on a line of its
+      # own, which holds only digits, and the name of each entry ended by a NUL byte, which no
+      # name can hold. A name can hold a newline, so a listing that ended each name with one would
+      # read the rest of such a name as an entry of its own. The devices decide; a name only says
+      # which entry it was. grep exits 1 when every entry is on this device, and anything above
+      # that is a listing it could not read, which stops the run rather than passing as no
+      # crossing.
+      find "$resolved" -xdev -fprintf "$probe/devices" "%D\n" -fprintf "$probe/names" "%p\0"
+      grep -n -v -x -F -e "$device" "$probe/devices" >"$probe/elsewhere" || [ "$?" -eq 1 ]
+      first="$(head -n 1 "$probe/elsewhere" | cut -d: -f1)"
+      [ -z "$first" ] || {
+        crossing="$(head -z -n "$first" "$probe/names" | tail -z -n 1 | tr -d "\000")"
+        echo "$real holds $crossing, which is on storage this image does not carry and may be \
+shared with the distribution this one was copied from" >&2
+        exit 1
+      }
+      # The same boundary again while removing, so this cannot leave the filesystem it measured
+      # even if something is mounted between the two walks.
+      find "$resolved" -xdev -depth -delete
+      echo "  removed the inherited $real"
+    done
+    rm -rf "${probe:?}"
+'
+
+# The self-test runs the program above on this host, against trees of its own, and checks what it
+# removed and what it left. A stand-in answers for the installed helper: it names the roots the way
+# the product names them on Linux and publishes an identity the way a first use does. Every root a
+# case names lies inside that case's own tree, and the program is given no other environment, so
+# nothing outside the tree can be named, let alone removed.
+self_test_work=""
+self_test_passed=0
+self_test_failed=0
+self_test_not_run=0
+
+self_test_cleanup() {
+  if [ -n "$self_test_work" ]; then
+    rm -rf "${self_test_work:?}"
+  fi
+}
+
+# Runs the removal for one case, with the image it names and the environment it gives. The probe is
+# made in the case's own directory.
+self_test_reset() {
+  local directory="$1" image="$2"
+  shift 2
+  mkdir -p "$directory/tmp" &&
+    env -i PATH="$PATH" TMPDIR="$directory/tmp" "$@" \
+      /bin/sh -c "$inherited_reset" sh "$self_test_work/helper" "$image" >"$directory/said" 2>&1
+}
+
+# An ordinary installation, found through HOME and XDG_RUNTIME_DIR, is removed whole, and what lies
+# beside it is left.
+self_test_ordinary_tree() {
+  local d="$self_test_work/${FUNCNAME[0]}"
+  local state="$d/home/.local/state/kalareach"
+  mkdir -p "$state/sessions" "$d/home/.local/state/beside" "$d/run/kalareach" || return 1
+  printf x >"$state/registry" || return 1
+  printf x >"$state/sessions/one" || return 1
+  printf x >"$d/home/.local/state/beside/kept" || return 1
+  printf x >"$d/run/kalareach/account-token" || return 1
+  self_test_reset "$d" "$self_test_work" HOME="$d/home" XDG_RUNTIME_DIR="$d/run" || return 1
+  [ ! -e "$state" ] && [ ! -e "$d/run/kalareach" ] && [ -f "$d/home/.local/state/beside/kept" ]
+}
+
+# A name that holds a newline is one entry of the tree like any other, and the tree is removed.
+self_test_newline_name() {
+  local d="$self_test_work/${FUNCNAME[0]}"
+  local state="$d/home/.local/state/kalareach"
+  local inner=$'sessions\nsecond line'
+  mkdir -p "$state/$inner" || return 1
+  printf x >"$state/$inner/one" || return 1
+  printf x >"$state/"$'journal\ncontinued' || return 1
+  self_test_reset "$d" "$self_test_work" HOME="$d/home" KR_RUNTIME_DIR="$d/run" || return 1
+  [ ! -e "$state" ]
+}
+
+# An ordinary configured root is removed, and the directory beside it is left.
+self_test_ordinary_root() {
+  local d="$self_test_work/${FUNCNAME[0]}"
+  mkdir -p "$d/state/sessions" "$d/state-beside" || return 1
+  printf x >"$d/state/sessions/one" || return 1
+  printf x >"$d/state-beside/kept" || return 1
+  self_test_reset "$d" "$self_test_work" \
+    HOME="$d/home" KR_STATE_DIR="$d/state" KR_RUNTIME_DIR="$d/run" || return 1
+  [ ! -e "$d/state" ] && [ -f "$d/state-beside/kept" ]
+}
+
+# A configured root whose own name ends in a newline is removed under that name, and the directory
+# whose name is the same without the newline, which is somebody else's, is left.
+self_test_newline_root() {
+  local d="$self_test_work/${FUNCNAME[0]}"
+  local root="$d/state"$'\n'
+  mkdir -p "$root/sessions" "$d/state" || return 1
+  printf x >"$root/sessions/one" || return 1
+  printf x >"$d/state/kept" || return 1
+  self_test_reset "$d" "$self_test_work" \
+    HOME="$d/home" KR_STATE_DIR="$root" KR_RUNTIME_DIR="$d/run" || return 1
+  [ ! -e "$root" ] && [ -f "$d/state/kept" ]
+}
+
+# A root that is a link is resolved: what it leads to is removed, and the link is left.
+self_test_link_root() {
+  local d="$self_test_work/${FUNCNAME[0]}"
+  mkdir -p "$d/elsewhere/state/sessions" || return 1
+  printf x >"$d/elsewhere/state/sessions/one" || return 1
+  ln -s "$d/elsewhere/state" "$d/state" || return 1
+  self_test_reset "$d" "$self_test_work" \
+    HOME="$d/home" KR_STATE_DIR="$d/state" KR_RUNTIME_DIR="$d/run" || return 1
+  [ ! -e "$d/elsewhere/state" ] && [ -L "$d/state" ]
+}
+
+# A root on storage the image does not carry is refused, and nothing is removed. The image handed
+# to the removal is a directory on another filesystem than the tree, which is what a root that
+# leads out of the image looks like from inside it.
+self_test_other_storage() {
+  local d="$self_test_work/${FUNCNAME[0]}" other="" candidate
+  local state="$d/home/.local/state/kalareach"
+  for candidate in /proc /sys /dev /run; do
+    if [ -d "$candidate" ] &&
+      [ "$(stat -c %d "$candidate")" != "$(stat -c %d "$self_test_work")" ]; then
+      other="$candidate"
+      break
+    fi
+  done
+  if [ -z "$other" ]; then
+    echo "  this host has no directory on another filesystem than $self_test_work"
+    return 1
+  fi
+  mkdir -p "$state" || return 1
+  printf x >"$state/registry" || return 1
+  if self_test_reset "$d" "$other" HOME="$d/home" KR_RUNTIME_DIR="$d/run"; then
+    return 1
+  fi
+  grep -q -F -e "leads to $state, which is on storage this image does not carry" "$d/said" &&
+    [ -f "$state/registry" ]
+}
+
+# A directory mounted inside a root is refused before anything is removed. Only a mount of the
+# case's own shows it, so the case runs where this host lets it make one in a namespace of its own,
+# as root or through a user namespace; the mount goes with the namespace. Where it cannot, the case
+# says so rather than passing.
+self_test_mount_inside() {
+  local d="$self_test_work/${FUNCNAME[0]}" status=0
+  local state="$d/home/.local/state/kalareach"
+  local -a enter=(unshare --mount --propagation private)
+  if [ "$(id -u)" != 0 ]; then
+    enter=(unshare --user --map-root-user --mount --propagation private)
+  fi
+  if ! "${enter[@]}" /bin/true >/dev/null 2>&1; then
+    echo "  this host refuses a mount namespace of the case's own: ${enter[*]}"
+    return 77
+  fi
+  mkdir -p "$state/mounted" "$d/tmp" || return 1
+  printf x >"$state/registry" || return 1
+  # shellcheck disable=SC2016  # the script runs in the namespace, with the arguments after it
+  "${enter[@]}" /bin/sh -c 'mount -t tmpfs kr-self-test "$1" && : >"$1/on-other-storage" || exit 90
+      shift
+      exec "$@"' sh "$state/mounted" \
+    env -i PATH="$PATH" TMPDIR="$d/tmp" HOME="$d/home" KR_RUNTIME_DIR="$d/run" \
+    /bin/sh -c "$inherited_reset" sh "$self_test_work/helper" "$self_test_work" \
+    >"$d/said" 2>&1 || status=$?
+  if [ "$status" = 90 ]; then
+    echo "  the mount could not be made: $(cat "$d/said")"
+    return 77
+  fi
+  [ "$status" != 0 ] &&
+    grep -q -F -e "holds $state/mounted, which is on storage this image does not carry" "$d/said" &&
+    [ -f "$state/registry" ]
+}
+
+# Runs one case and says how it ended. A case that fails shows what the removal said.
+self_test_case() {
+  local status=0
+  "$1" || status=$?
+  case "$status" in
+    0)
+      self_test_passed=$((self_test_passed + 1))
+      echo "self-test: ok: $2"
+      ;;
+    77)
+      self_test_not_run=$((self_test_not_run + 1))
+      echo "self-test: not run here: $2"
+      ;;
+    *)
+      self_test_failed=$((self_test_failed + 1))
+      echo "self-test: FAILED: $2"
+      if [ -f "$self_test_work/$1/said" ]; then
+        sed 's/^/    /' "$self_test_work/$1/said"
+      fi
+      ;;
+  esac
+}
+
+self_test() {
+  if [ "$(uname -s)" != Linux ]; then
+    echo "self-test: the removal runs inside a Linux distribution, so its self-test runs on Linux" >&2
+    return 2
+  fi
+  self_test_work="$(mktemp -d "${TMPDIR:-/tmp}/kr-wsl-self-test.XXXXXX")" || return 2
+  trap self_test_cleanup EXIT
+  cat >"$self_test_work/helper" <<'STAND_IN' || return 2
+#!/bin/sh
+# Stands in for the installed helper. It names the roots the way the product names them on Linux,
+# says where it reads an account token, and publishes an identity the way a first use does.
+if [ -n "${KR_RUNTIME_DIR-}" ]; then
+  runtime="$KR_RUNTIME_DIR"
+elif [ -n "${XDG_RUNTIME_DIR-}" ]; then
+  runtime="$XDG_RUNTIME_DIR/kalareach"
+else
+  runtime="$HOME/.cache/kalareach/run"
+fi
+if [ -n "${KR_STATE_DIR-}" ]; then
+  state="$KR_STATE_DIR"
+elif [ -n "${XDG_STATE_HOME-}" ]; then
+  state="$XDG_STATE_HOME/kalareach"
+else
+  state="$HOME/.local/state/kalareach"
+fi
+case "$*" in
+  "--json account token show")
+    printf '{\n  "ok": true,\n  "path": "%s/account-token",\n  "imported": false\n}\n' "$runtime"
+    ;;
+  list)
+    mkdir -p "$state" && printf 'environment\n' >"$state/environment-id"
+    echo "no control daemon is running" >&2
+    exit 1
+    ;;
+  *)
+    echo "the stand-in helper has no answer for: $*" >&2
+    exit 2
+    ;;
+esac
+STAND_IN
+  chmod 0755 "$self_test_work/helper" || return 2
+
+  self_test_case self_test_ordinary_tree \
+    "an ordinary installation is removed whole, and what lies beside it is left"
+  self_test_case self_test_newline_name \
+    "a name that holds a newline is one entry of the tree, and the tree is removed"
+  self_test_case self_test_ordinary_root \
+    "an ordinary configured root is removed, and the directory beside it is left"
+  self_test_case self_test_newline_root \
+    "a configured root whose name ends in a newline is removed, and the name without it is left"
+  self_test_case self_test_link_root \
+    "a root that is a link is resolved, and what it leads to is removed"
+  self_test_case self_test_other_storage \
+    "a root on storage the image does not carry is refused, and nothing is removed"
+  self_test_case self_test_mount_inside \
+    "a directory mounted inside a root is refused before anything is removed"
+
+  echo "self-test: $self_test_passed passed, $self_test_failed failed, $self_test_not_run not run here"
+  [ "$self_test_failed" -eq 0 ]
+}
+
+if [ "${1:-}" = "--self-test" ]; then
+  status=0
+  self_test || status=$?
+  exit "$status"
+fi
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root"
@@ -296,116 +655,21 @@ build_inside() {
   " || fail "$distribution could not build the Linux helper"
 }
 
-# A distribution this run imported is a copy of another one, and a copy of an installation is not a
-# second installation: it carries the first one's environment identity, its registry and its
-# staging area, and those name a device and an inode that are different here. The daemon in the
-# copy is right to refuse them, so the copy is given none of it before anything starts in it.
-#
-# Two things have to be right, and neither is guessed at here.
-#
-# **Which directories.** The product derives its runtime and state roots from the directories this
-# OS user's environment names. Every one of those inputs is mirrored into a directory of this run's
-# own, the installed helper is asked where it then reads an account token (which lies directly in
-# the runtime root) and where it publishes the identity it allocates on a first use (which lies
-# directly in the state root), and each answer is mapped back through the input it came from. A
-# root the product names outside every mirrored input is the same absolute path here as it is in
-# the distribution this one was copied from, and is taken as it stands.
-#
-# **Which storage.** A directory that is not there was not inherited, and is left alone. A
-# directory that is there is removed only when the whole of it -- the directory and everything
-# under it -- is on the filesystem the image carries, which is the one the root of this
-# distribution is on. Anything else -- a symbolic link out to storage shared between
-# distributions, a bind mount of somewhere else at its top or at any directory inside it -- is not
-# this copy's to remove and not something a copy can be made independent of, so the run stops
-# before it removes anything and says which path it was.
-#
-# Only a distribution this run imported is ever handed to this.
+# Gives a distribution this run imported an installation of its own: the program at the top of this
+# script removes the one it inherited. Only a distribution this run imported is ever handed to this.
 clear_inherited_installation() {
   local distribution="$1"
   echo "  $distribution: removing the installation it inherited from the distribution it was copied from"
-  # The script below runs inside the distribution, so it stays unexpanded here and takes the
-  # helper's path as an argument rather than as text this shell substitutes into it.
-  # shellcheck disable=SC2016
-  wsl.exe -d "$distribution" -u "$linux_user" --exec /bin/sh -lc '
-    set -e
-    helper="$1"
-    probe="$(mktemp -d /tmp/kr-acc-probe.XXXXXX)"
-    # Each mirror is owner-only, because a mirror can become a root the product creates its files
-    # in directly, and the product refuses a root anyone else can read.
-    #
-    # The real value of each input is held in a shell variable beside its mirror rather than in a
-    # file of pairs. A path may carry a space, a tab or a trailing blank, and a line of text read
-    # back as two fields would not return the value the product was given.
-    index=0
-    for name in HOME XDG_STATE_HOME XDG_RUNTIME_DIR KR_STATE_DIR KR_RUNTIME_DIR; do
-      eval "value=\${$name-}"
-      [ -n "$value" ] || continue
-      index=$((index + 1))
-      mkdir -m 0700 "$probe/$index"
-      eval "configured_$index=\$value"
-      eval "export $name=\"\$probe/\$index\""
-    done
-    token="$("$helper" --json account token show | tr -d " \n\r" |
-      sed -n "s/.*\"path\":\"\([^\"]*\)\".*/\1/p")"
-    [ -n "$token" ] || {
-      echo "the helper did not say where it reads an account token, so its runtime root is not known" >&2
-      exit 1
-    }
-    # This has no daemon to reach and fails once it has allocated the identity, which is the part
-    # being read here.
-    "$helper" list >/dev/null 2>&1 || true
-    marker="$(find "$probe" -type f -printf "%d %p\n" | sort -n | head -n 1 | cut -d" " -f2-)"
-    [ -n "$marker" ] || {
-      echo "the helper published no identity of its own, so its state root is not known" >&2
-      exit 1
-    }
-    image_device="$(stat -c %d /)"
-    for named in "$(dirname "$token")" "$(dirname "$marker")"; do
-      real="$named"
-      mapped=0
-      while [ "$mapped" -lt "$index" ]; do
-        mapped=$((mapped + 1))
-        mirror="$probe/$mapped"
-        case "$named" in
-          "$mirror" | "$mirror"/*)
-            eval "value=\$configured_$mapped"
-            real="$value${named#"$mirror"}"
-            ;;
-        esac
-      done
-      # What the path leads to, not what it says: a component of it may be a link somewhere else.
-      resolved="$(readlink -m "$real")"
-      if [ ! -e "$resolved" ]; then
-        echo "  nothing of the product at $real"
-        continue
-      fi
-      device="$(stat -c %d "$resolved")"
-      [ "$device" = "$image_device" ] || {
-        echo "$real leads to $resolved, which is on storage this image does not carry and may be \
-shared with the distribution this one was copied from" >&2
-        exit 1
-      }
-      # The whole tree, not only its top: a directory inside it can mount storage of its own, and
-      # a removal that walked into one would take something this image does not carry with it.
-      # Nothing is removed until the walk below has found none.
-      find "$resolved" -xdev -printf "%D %p\n" >"$probe/crossings"
-      crossing="$(grep -v "^$device " "$probe/crossings" | head -n 1 | cut -d" " -f2-)"
-      [ -z "$crossing" ] || {
-        echo "$real holds $crossing, which is on storage this image does not carry and may be \
-shared with the distribution this one was copied from" >&2
-        exit 1
-      }
-      # The same boundary again while removing, so this cannot leave the filesystem it measured
-      # even if something is mounted between the two walks.
-      find "$resolved" -xdev -depth -delete
-      echo "  removed the inherited $real"
-    done
-    rm -rf "${probe:?}"
-    # The leftovers this acceptance itself put in the distribution that was copied. The file it
-    # writes a daemon identifier into would otherwise name a process in that other distribution.
-    rm -f /tmp/kr-acc-controller.pid /tmp/kr-controller.log
-  ' sh "$helper_path" ||
+  # The image of a distribution is the whole of it, so the storage it carries is the filesystem its
+  # root is on.
+  wsl.exe -d "$distribution" -u "$linux_user" --exec /bin/sh -lc "$inherited_reset" \
+    sh "$helper_path" / ||
     fail "$distribution could not be given an installation of its own"
+  # The leftovers this acceptance itself put in the distribution that was copied. The file it
+  # writes a daemon identifier into would otherwise name a process in that other distribution.
+  wsl.exe -d "$distribution" -u "$linux_user" --exec /bin/rm -f \
+    /tmp/kr-acc-controller.pid /tmp/kr-controller.log ||
+    fail "$distribution kept what this acceptance left in the distribution it was copied from"
 }
 
 start_daemon_inside() {
