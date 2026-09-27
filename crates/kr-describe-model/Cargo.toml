@@ -28,6 +28,8 @@ vtparse.workspace = true
 
 [dev-dependencies]
 kr-crypto.workspace = true
+# Places the description process on the internal disk before a test starts it.
+kr-ipc = { workspace = true, features = ["testing"] }
 tempfile.workspace = true
 
 [lints.rust]

@@ -58,6 +58,11 @@ use kr_protocol::scalars::U64;
 /// How many tokens one decode batch carries.
 const BATCH_TOKENS: usize = 512;
 
+/// How many prompt tokens one decode call reads. The token is checked between calls, so this is
+/// what bounds how long a cancellation waits while the prompt is read: a few hundred milliseconds
+/// on a busy host rather than the whole prompt.
+const PROMPT_CHUNK_TOKENS: usize = 128;
+
 /// The buffer one token's bytes are read into. No tokenizer piece in either profile is near it.
 const PIECE_BYTES: usize = 64;
 
@@ -355,13 +360,13 @@ impl LlamaRuntime {
             ));
         }
 
-        // The prompt is decoded in batches of at most the context's own batch size. A single
-        // decode of more tokens than that is not a slow path, it is one the library refuses
-        // outright, and a prompt long enough to reach it is an ordinary long prompt.
+        // The prompt is decoded in chunks smaller than the context's own batch size, which the
+        // library refuses a single decode past, and small enough that the token checked between
+        // them stops a job soon after it is cancelled.
         let prompt_started = Instant::now();
         let mut batch = LlamaBatch::new(BATCH_TOKENS, 1);
         let last = tokens.len().saturating_sub(1);
-        for chunk in tokens.chunks(BATCH_TOKENS) {
+        for chunk in tokens.chunks(PROMPT_CHUNK_TOKENS) {
             if token.is_cancelled() {
                 return Ok(stopped(JobEnd::Cancelled));
             }
