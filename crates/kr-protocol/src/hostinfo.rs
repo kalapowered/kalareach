@@ -4610,7 +4610,7 @@ pub mod export {
         field("CapabilityRecord", "evidence_source", ContentClass::Term),
         field("CapabilityRecord", "identity", ContentClass::Structure),
         field("CapabilityRecord", "invalidation", ContentClass::Term),
-        field("CapabilityRecord", "disabled_reason", ContentClass::Message),
+        field("CapabilityRecord", "disabled_reason", ContentClass::Stated),
         field("CapabilityRecord", "observed_at_ms", ContentClass::Number),
         field(
             "CapabilitySubject",
@@ -4626,7 +4626,7 @@ pub mod export {
         field("CapabilitySubject", "application", ContentClass::Name),
         field("CapabilitySubject", "terminal", ContentClass::Name),
         field("CapabilityIdentity", "binary", ContentClass::Path),
-        field("CapabilityIdentity", "version", ContentClass::Name),
+        field("CapabilityIdentity", "version", ContentClass::Stated),
         field("CapabilityIdentity", "package", ContentClass::Name),
         field("CapabilityIdentity", "schema", ContentClass::Name),
         field("CapabilityIdentity", "profile", ContentClass::Term),
@@ -5329,6 +5329,15 @@ pub mod export {
             self
         }
 
+        /// Appends a number in sixteen hexadecimal digits, as a digest this host computed is
+        /// written.
+        #[must_use]
+        pub fn hexadecimal(mut self, value: u64) -> Self {
+            use std::fmt::Write as _;
+            let _ = write!(&mut self.text, "{value:016x}");
+            self
+        }
+
         /// Appends a number.
         #[must_use]
         pub fn number(mut self, value: u64) -> Self {
@@ -5680,10 +5689,7 @@ pub mod export {
         {
             crate::desktop::CapabilityRecord {
                 capability: withheld_capability_name(&record.capability),
-                disabled_reason: carry_null(
-                    class("CapabilityRecord", "disabled_reason"),
-                    &record.disabled_reason,
-                ),
+                disabled_reason: exported_null(&record.disabled_reason),
                 subject: crate::desktop::CapabilitySubject {
                     // The same derived desktop identity the context carries, through the same
                     // boundary: one copy of it exported and the other not would be no boundary.
@@ -5710,10 +5716,7 @@ pub mod export {
                         class("CapabilityIdentity", "binary"),
                         &record.identity.binary,
                     ),
-                    version: carry_null(
-                        class("CapabilityIdentity", "version"),
-                        &record.identity.version,
-                    ),
+                    version: exported_null(&record.identity.version),
                     // Every string in the identity, so the boundary does not have to be revisited
                     // the first time a catalogue fills a field this host leaves empty today.
                     package: carry_null(
@@ -5840,8 +5843,12 @@ mod tests {
                 .field("CeilingValue", "origin", secret),
             Some("Fix the document and run this again."),
         );
+        // A sentence that arrived in a reply, which is the only way one can hold text like this.
+        let arrived = |text: &str| -> export::Sentence {
+            serde_json::from_value(serde_json::json!(text)).expect("a sentence on the wire")
+        };
         let record = crate::desktop::CapabilityRecord {
-            disabled_reason: Nullable(Some(secret.to_owned())),
+            disabled_reason: Nullable(Some(arrived(secret))),
             subject: crate::desktop::CapabilitySubject {
                 desktop_session_id: Nullable(
                     crate::ids::DesktopSessionId::new(format!("kr-{secret}")).ok(),
@@ -5853,7 +5860,7 @@ mod tests {
             },
             identity: crate::desktop::CapabilityIdentity {
                 binary: Nullable(Some(secret.to_owned())),
-                version: Nullable(Some(secret.to_owned())),
+                version: Nullable(Some(arrived(secret))),
                 package: Nullable(Some(secret.to_owned())),
                 schema: Nullable(Some(secret.to_owned())),
                 profile: Nullable(Some(WorkerProfile::HeadlessUser)),
@@ -6406,7 +6413,7 @@ mod tests {
     /// One capability record, populated the way a worker process reports one.
     fn capability_record() -> crate::desktop::CapabilityRecord {
         crate::desktop::CapabilityRecord {
-            disabled_reason: Nullable::some("the platform refused".to_owned()),
+            disabled_reason: Nullable::some(export::Sentence::new().stated("the platform refused")),
             subject: crate::desktop::CapabilitySubject {
                 desktop_session_id: Nullable(crate::ids::DesktopSessionId::new("kr-someone").ok()),
                 application: Nullable::some("Terminal".to_owned()),
@@ -6416,7 +6423,7 @@ mod tests {
             },
             identity: crate::desktop::CapabilityIdentity {
                 binary: Nullable::some("/usr/local/bin/kr-worker".to_owned()),
-                version: Nullable::some("0.1.0".to_owned()),
+                version: Nullable::some(export::Sentence::new().stated("0.1.0")),
                 package: Nullable::some("kalareach".to_owned()),
                 schema: Nullable::some("1".to_owned()),
                 profile: Nullable::some(WorkerProfile::HeadlessUser),

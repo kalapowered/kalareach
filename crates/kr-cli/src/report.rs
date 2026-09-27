@@ -420,7 +420,7 @@ pub fn capability(record: &CapabilityRecord) -> Document {
                 .identity
                 .version
                 .as_ref()
-                .map(|version| crate::shown::exported("CapabilityIdentity", "version", version)),
+                .map(crate::shown::host_text),
         )
         .with(
             "profile",
@@ -440,9 +440,7 @@ pub fn capability(record: &CapabilityRecord) -> Document {
         )
         .with(
             "disabled_reason",
-            record.disabled_reason.as_ref().map(|reason| {
-                crate::shown::exported("CapabilityRecord", "disabled_reason", reason)
-            }),
+            record.disabled_reason.as_ref().map(crate::shown::host_text),
         )
         .with("observed_at_ms", record.observed_at_ms.get())
 }
@@ -564,7 +562,7 @@ pub fn capability_lines(report: &DesktopCapabilityReport) -> Vec<Line> {
                     "  {} {} {}",
                     left(26, &capability),
                     left(24, &record.state.as_str()),
-                    crate::shown::exported("CapabilityRecord", "disabled_reason", reason)
+                    crate::shown::host_text(reason)
                 ),
                 (None, Some(binary)) => stdout_line!(
                     "  {} {} {}",
@@ -978,9 +976,9 @@ mod tests {
     /// KR-REQ-23.25: the host's power, its build and its desktop show planted text only where the
     /// person asked for it (the desktop's identifier, its account and a capability's binary) and
     /// where the host's own export text is said through its door (what a logout does to each
-    /// profile). The assertion's name, why none is held, the platform's session name and the
-    /// compositor's are the host's text, said as their class and length, and so are a
-    /// capability's identity and reason.
+    /// profile, and a capability's identity and reason). The assertion's name, why none is held,
+    /// the platform's session name and the compositor's are the host's text, said as their class
+    /// and length.
     #[test]
     fn planted_text_in_the_host_shows_only_where_it_was_asked_for() {
         for info in planted::<HostInfoResult>() {
@@ -1001,11 +999,26 @@ mod tests {
             shown.extend(only_asked_or_host_text(
                 "kr doctor",
                 &environment_capabilities(&result),
-                &["persistence[].mechanism", "persistence[].detail"],
+                &[
+                    "persistence[].mechanism",
+                    "persistence[].detail",
+                    "desktop.capabilities[].facility_identity",
+                    "desktop.capabilities[].disabled_reason",
+                ],
             ));
-            let mut lines = vec![desktop_summary_line(&result.desktop)];
-            lines.extend(capability_lines(&result.desktop));
-            only_asked_lines("kr doctor", &lines);
+            only_asked_lines("kr doctor", &[desktop_summary_line(&result.desktop)]);
+            // A capability's line says its reason through the door, and nothing else it holds
+            // shows unasked.
+            for (line, record) in capability_lines(&result.desktop)
+                .iter()
+                .zip(&result.desktop.records)
+            {
+                let door = record
+                    .disabled_reason
+                    .as_ref()
+                    .map_or(0, |reason| reason.as_str().matches(MARKER).count());
+                assert_eq!(line.unasked(MARKER), door, "{:?}", line.text());
+            }
             for (line, entry) in persistence_lines(&result.persistence)
                 .iter()
                 .zip(&result.persistence)
@@ -1021,7 +1034,12 @@ mod tests {
                 );
             }
         }
-        for asked in ["desktop.desktop.os_user", "desktop.capabilities[].binary"] {
+        for asked in [
+            "desktop.desktop.os_user",
+            "desktop.capabilities[].binary",
+            "desktop.capabilities[].facility_identity",
+            "desktop.capabilities[].disabled_reason",
+        ] {
             assert!(shown.contains(asked), "{asked} shows what was asked for");
         }
     }

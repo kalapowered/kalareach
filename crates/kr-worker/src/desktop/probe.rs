@@ -48,6 +48,7 @@ use kr_protocol::desktop::{
     CapabilityEvidenceSource, CapabilityIdentity, CapabilityInvalidation, CapabilityRecord,
     CapabilityState, CapabilitySubject, DesktopContext, capabilities,
 };
+use kr_protocol::hostinfo::export::{ContentClass, Sentence};
 use kr_protocol::identity::WorkerProfile;
 use kr_protocol::ids::{CapabilityId, CapabilityRevision};
 use kr_protocol::scalars::{Nullable, U64};
@@ -246,15 +247,17 @@ impl Plan {
 pub enum Outcome {
     /// The operation was performed and it worked, with what it established.
     Performed {
-        /// What the check saw, in plain words: a byte count, an element's name, a process.
-        detail: String,
+        /// What the check saw, in this host's words: a byte count, a number of elements, a
+        /// process. A path or a message in it is said as its class and its length.
+        detail: Sentence,
     },
     /// The operating system refused it for want of a permission, and named which.
     PermissionRefused {
         /// The permission category a person grants, in the platform's own words.
-        permission: String,
-        /// What the platform said.
-        detail: String,
+        permission: &'static str,
+        /// What the platform said, as this check read it: what the platform printed is said as
+        /// its class and its length.
+        detail: Sentence,
     },
     /// The facility this check performs the operation with is not installed.
     FacilityMissing,
@@ -271,7 +274,7 @@ pub enum Outcome {
     /// The check could not be attempted, for a reason that is not a permission.
     NotAttempted {
         /// What stopped it.
-        detail: String,
+        detail: Sentence,
     },
     /// The check was not run because its effects need a test context of its own.
     WithheldForIsolation,
@@ -308,63 +311,86 @@ pub trait Facilities {
 pub fn judge(
     check: Check,
     outcome: &Outcome,
-) -> (CapabilityState, CapabilityEvidenceSource, Option<String>) {
+) -> (CapabilityState, CapabilityEvidenceSource, Option<Sentence>) {
     match outcome {
         Outcome::Performed { detail } => (
             CapabilityState::QualifiedAvailable,
             CapabilityEvidenceSource::DisclosedProbe,
-            Some(format!(
-                "this context performed the operation: {detail}. That is what establishes it, and \
-                 it establishes it for this binary and this permission state only"
-            )),
+            Some(
+                Sentence::new()
+                    .stated("this context performed the operation: ")
+                    .sentence(detail)
+                    .stated(
+                        ". That is what establishes it, and it establishes it for this binary and \
+                         this permission state only",
+                    ),
+            ),
         ),
         Outcome::PermissionRefused { permission, detail } => (
             CapabilityState::PermissionRequired,
             CapabilityEvidenceSource::DisclosedProbe,
-            Some(format!(
-                "this context performed the operation and the operating system refused it: \
-                 {detail}. {permission} is granted per signed application, and this one does not \
-                 hold it"
-            )),
+            Some(
+                Sentence::new()
+                    .stated(
+                        "this context performed the operation and the operating system refused \
+                         it: ",
+                    )
+                    .sentence(detail)
+                    .stated(". ")
+                    .stated(permission)
+                    .stated(" is granted per signed application, and this one does not hold it"),
+            ),
         ),
         Outcome::FacilityMissing => (
             CapabilityState::MissingInstallation,
             CapabilityEvidenceSource::PlatformQuery,
-            Some(
+            Some(Sentence::new().stated(
                 "the platform facility this check performs the operation with is not installed, \
-                 so there was nothing to run and nothing to grant"
-                    .to_owned(),
-            ),
+                 so there was nothing to run and nothing to grant",
+            )),
         ),
         Outcome::NotAnswered { waited, stopped } => (
             CapabilityState::TemporarilyUnavailable,
             CapabilityEvidenceSource::DisclosedProbe,
-            Some(format!(
-                "the operation was started and had not answered after {} seconds, so it was asked \
-                 to stop{} and nothing is established either way. A permission the operating \
-                 system asks the person at the machine about looks exactly like this from here",
-                waited.as_secs(),
-                if *stopped {
-                    " and it did"
-                } else {
-                    ", which it had not done when this check answered"
-                }
-            )),
+            Some(
+                Sentence::new()
+                    .stated("the operation was started and had not answered after ")
+                    .number(waited.as_secs())
+                    .stated(" seconds, so it was asked to stop")
+                    .stated(if *stopped {
+                        " and it did"
+                    } else {
+                        ", which it had not done when this check answered"
+                    })
+                    .stated(
+                        " and nothing is established either way. A permission the operating \
+                         system asks the person at the machine about looks exactly like this from \
+                         here",
+                    ),
+            ),
         ),
         Outcome::NotAttempted { detail } => (
             CapabilityState::TemporarilyUnavailable,
             CapabilityEvidenceSource::DisclosedProbe,
             // Not "could not be attempted": some of these started and did not get to the end.
-            Some(format!("this check established nothing: {detail}")),
+            Some(
+                Sentence::new()
+                    .stated("this check established nothing: ")
+                    .sentence(detail),
+            ),
         ),
         Outcome::WithheldForIsolation => (
             CapabilityState::NotTested,
             CapabilityEvidenceSource::NotProbed,
-            Some(format!(
-                "this check {}, so it runs only inside a test context that owns the application \
-                 the keystroke lands in. It was not run and nothing is established either way",
-                check.effects().performs
-            )),
+            Some(
+                Sentence::new()
+                    .stated("this check ")
+                    .stated(check.effects().performs)
+                    .stated(
+                        ", so it runs only inside a test context that owns the application the \
+                         keystroke lands in. It was not run and nothing is established either way",
+                    ),
+            ),
         ),
     }
 }
@@ -630,9 +656,10 @@ fn read_authorised_file(plan: &Plan) -> Ran {
             check,
             facility: None,
             outcome: Outcome::NotAttempted {
-                detail: "no file was nominated for this check, and there is no default: a file \
-                         the person did not choose would establish something about the wrong file"
-                    .to_owned(),
+                detail: Sentence::new().stated(
+                    "no file was nominated for this check, and there is no default: a file the \
+                     person did not choose would establish something about the wrong file",
+                ),
             },
         };
     };
@@ -649,12 +676,11 @@ fn read_authorised_file(plan: &Plan) -> Ran {
             check,
             facility,
             outcome: Outcome::NotAttempted {
-                detail: format!(
-                    "{} had not been looked at after {} seconds, so this check stopped waiting \
-                     for it",
-                    path.display(),
-                    check.effects().bound.as_secs()
-                ),
+                detail: Sentence::new()
+                    .path(path)
+                    .stated(" had not been looked at after ")
+                    .number(check.effects().bound.as_secs())
+                    .stated(" seconds, so this check stopped waiting for it"),
             },
         };
     };
@@ -664,10 +690,9 @@ fn read_authorised_file(plan: &Plan) -> Ran {
                 check,
                 facility,
                 outcome: Outcome::NotAttempted {
-                    detail: format!(
-                        "{} is not a regular file, and this check reads only a file",
-                        path.display()
-                    ),
+                    detail: Sentence::new()
+                        .path(path)
+                        .stated(" is not a regular file, and this check reads only a file"),
                 },
             };
         }
@@ -677,11 +702,12 @@ fn read_authorised_file(plan: &Plan) -> Ran {
                 check,
                 facility,
                 outcome: Outcome::PermissionRefused {
-                    permission: permission_for_path(path).to_owned(),
-                    detail: format!(
-                        "the platform refused to look at {}: {error}",
-                        path.display()
-                    ),
+                    permission: permission_for_path(path),
+                    detail: Sentence::new()
+                        .stated("the platform refused to look at ")
+                        .path(path)
+                        .stated(": ")
+                        .withheld(ContentClass::Message, &error.to_string()),
                 },
             };
         }
@@ -690,7 +716,10 @@ fn read_authorised_file(plan: &Plan) -> Ran {
                 check,
                 facility,
                 outcome: Outcome::NotAttempted {
-                    detail: format!("{} could not be looked at: {error}", path.display()),
+                    detail: Sentence::new()
+                        .path(path)
+                        .stated(" could not be looked at: ")
+                        .withheld(ContentClass::Message, &error.to_string()),
                 },
             };
         }
@@ -698,27 +727,40 @@ fn read_authorised_file(plan: &Plan) -> Ran {
     let outcome = match bounded_read(path, remaining(deadline)) {
         // Nothing to ask to stop: the read is in the kernel and the check stops waiting for it.
         None => Outcome::NotAttempted {
-            detail: format!(
-                "{} had not been read after {} seconds, so this check stopped waiting for it; the \
-                 read itself is the filesystem's to finish",
-                path.display(),
-                check.effects().bound.as_secs()
-            ),
+            detail: Sentence::new()
+                .path(path)
+                .stated(" had not been read after ")
+                .number(check.effects().bound.as_secs())
+                .stated(
+                    " seconds, so this check stopped waiting for it; the read itself is the \
+                     filesystem's to finish",
+                ),
         },
         Some(Ok(count)) => Outcome::Performed {
-            detail: format!("it read {count} bytes of {}", path.display()),
+            detail: Sentence::new()
+                .stated("it read ")
+                .number(count as u64)
+                .stated(" bytes of ")
+                .path(path),
         },
         Some(Err(error)) if error.kind() == std::io::ErrorKind::PermissionDenied => {
             Outcome::PermissionRefused {
-                permission: permission_for_path(path).to_owned(),
-                detail: format!("the platform refused to open {}: {error}", path.display()),
+                permission: permission_for_path(path),
+                detail: Sentence::new()
+                    .stated("the platform refused to open ")
+                    .path(path)
+                    .stated(": ")
+                    .withheld(ContentClass::Message, &error.to_string()),
             }
         }
         Some(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => Outcome::NotAttempted {
-            detail: format!("{} is not there", path.display()),
+            detail: Sentence::new().path(path).stated(" is not there"),
         },
         Some(Err(error)) => Outcome::NotAttempted {
-            detail: format!("{} could not be read: {error}", path.display()),
+            detail: Sentence::new()
+                .path(path)
+                .stated(" could not be read: ")
+                .withheld(ContentClass::Message, &error.to_string()),
         },
     };
     Ran {
@@ -834,9 +876,9 @@ mod platform {
     //! asked, and a refusal names which. An application is started in the background as a new
     //! instance, and the instance this check started is the only process it ends.
 
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
-    use super::{Check, Outcome, Plan, Ran, bounded};
+    use super::{Check, ContentClass, Exit, Outcome, Plan, Ran, Sentence, bounded};
 
     /// The platform's screen capture tool.
     const CAPTURE: &str = "/usr/sbin/screencapture";
@@ -905,58 +947,75 @@ mod platform {
         let left_behind = match removal {
             Ok(()) => None,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => Some(format!(
-                ", and it could not remove {}: {error}",
-                image.display()
-            )),
+            Err(error) => Some(error.to_string()),
         };
-        let outcome = match (&ran.outcome, measured) {
+        let outcome = match (ran.exit, measured) {
             // The tool exits successfully whether or not the platform let it see the screen, so
             // an image it did not write is the refusal rather than the exit status.
-            (Outcome::Performed { .. }, Some((bytes, png))) if bytes > 0 && png => {
-                Outcome::Performed {
-                    detail: format!(
-                        "it read a {bytes}-byte image of the main display into memory and kept \
-                         none of it"
-                    ),
-                }
-            }
-            (Outcome::Performed { .. }, _) => refused_recording(
+            (Exit::Succeeded(_), Some((bytes, png))) if bytes > 0 && png => Outcome::Performed {
+                detail: Sentence::new()
+                    .stated("it read a ")
+                    .number(bytes)
+                    .stated("-byte image of the main display into memory and kept none of it"),
+            },
+            (Exit::Succeeded(_), _) => refused_recording(Sentence::new().stated(
                 "the capture tool ran and produced no image, which is what this platform does \
                  when the application asking has no recording grant",
-            ),
+            )),
             // What the tool prints when the platform will not give it the display. A context with
             // no desktop at all was refused before this ran, so what is left is the grant.
-            (Outcome::NotAttempted { detail }, _)
-                if detail
-                    .to_ascii_lowercase()
-                    .contains("could not create image") =>
+            (Exit::Failed(said), _)
+                if said.to_ascii_lowercase().contains("could not create image") =>
             {
-                refused_recording(detail)
+                refused_recording(
+                    Sentence::new()
+                        .stated("the capture tool could not create an image: ")
+                        .withheld(ContentClass::Message, &said),
+                )
             }
-            _ => ran.outcome,
+            (Exit::Failed(said), _) => Outcome::NotAttempted {
+                detail: super::failed(&said),
+            },
+            (Exit::Unfinished(outcome), _) => outcome,
         };
         Ran {
             check,
             facility: ran.facility,
             // Whatever the answer, an image this check could not remove is part of it.
-            outcome: match (outcome, left_behind) {
-                (outcome, None) => outcome,
-                (Outcome::Performed { detail }, Some(said)) => Outcome::Performed {
-                    detail: format!("{detail}{said}"),
-                },
-                (Outcome::PermissionRefused { permission, detail }, Some(said)) => {
-                    Outcome::PermissionRefused {
-                        permission,
-                        detail: format!("{detail}{said}"),
-                    }
-                }
-                (Outcome::NotAttempted { detail }, Some(said)) => Outcome::NotAttempted {
-                    detail: format!("{detail}{said}"),
-                },
-                (other, Some(said)) => Outcome::NotAttempted {
-                    detail: format!("{other:?}{said}"),
-                },
+            outcome: match left_behind {
+                None => outcome,
+                Some(error) => left(outcome, &image, &error),
+            },
+        }
+    }
+
+    /// An outcome with the image the screen check could not remove said as part of it.
+    fn left(outcome: Outcome, image: &Path, error: &str) -> Outcome {
+        let behind = |detail: Sentence| {
+            detail
+                .stated(", and it could not remove ")
+                .path(image)
+                .stated(": ")
+                .withheld(ContentClass::Message, error)
+        };
+        match outcome {
+            Outcome::Performed { detail } => Outcome::Performed {
+                detail: behind(detail),
+            },
+            Outcome::PermissionRefused { permission, detail } => Outcome::PermissionRefused {
+                permission,
+                detail: behind(detail),
+            },
+            Outcome::NotAttempted { detail } => Outcome::NotAttempted {
+                detail: behind(detail),
+            },
+            // An outcome with no words of its own is said in the words its judgement gives it.
+            other => Outcome::NotAttempted {
+                detail: behind(
+                    super::judge(Check::ScreenImage, &other)
+                        .2
+                        .unwrap_or_default(),
+                ),
             },
         }
     }
@@ -988,30 +1047,35 @@ mod platform {
             ],
             plan,
         );
-        let outcome = match ran.outcome {
-            Outcome::Performed { detail } => match detail.trim().parse::<u64>() {
+        let outcome = match ran.exit {
+            Exit::Succeeded(said) => match said.trim().parse::<u64>() {
                 // An element, not a number. A tree that answered with nothing in it is a tree
                 // this check found no element in, and the capability is finding one.
                 Ok(0) => Outcome::NotAttempted {
-                    detail: "the frontmost application offered no element to read, so nothing \
-                             about the accessibility tree is established"
-                        .to_owned(),
+                    detail: Sentence::new().stated(
+                        "the frontmost application offered no element to read, so nothing about \
+                         the accessibility tree is established",
+                    ),
                 },
                 Ok(count) => Outcome::Performed {
-                    detail: format!(
-                        "it read the accessibility tree of the frontmost application and found \
-                         {count} elements in it"
-                    ),
+                    detail: Sentence::new()
+                        .stated(
+                            "it read the accessibility tree of the frontmost application and \
+                             found ",
+                        )
+                        .number(count)
+                        .stated(" elements in it"),
                 },
                 Err(_) => Outcome::NotAttempted {
-                    detail: format!(
-                        "the accessibility tree answered with something that is not a count: {}",
-                        detail.trim()
-                    ),
+                    detail: Sentence::new()
+                        .stated(
+                            "the accessibility tree answered with something that is not a count: ",
+                        )
+                        .withheld(ContentClass::Message, said.trim()),
                 },
             },
-            Outcome::NotAttempted { detail } => refusal(&detail),
-            other => other,
+            Exit::Failed(said) => refusal(&said),
+            Exit::Unfinished(outcome) => outcome,
         };
         Ran {
             check,
@@ -1021,26 +1085,33 @@ mod platform {
     }
 
     /// The refusal for a screen image this platform would not produce.
-    fn refused_recording(said: &str) -> Outcome {
+    const fn refused_recording(detail: Sentence) -> Outcome {
         Outcome::PermissionRefused {
-            permission: "Screen & System Audio Recording".to_owned(),
-            detail: said.trim().to_owned(),
+            permission: "Screen & System Audio Recording",
+            detail,
         }
     }
 
     /// Reads a refusal out of what the automation facility said.
     ///
     /// The two grants fail with different words, and a person sent to the wrong settings pane has
-    /// been told nothing useful. Anything else is carried as it came.
-    fn refusal(said: &str) -> Outcome {
+    /// been told nothing useful. The words decide which grant this is; the answer says which in
+    /// this host's words and says the facility's own as their class and their length. Anything
+    /// else is a failure of the facility's own.
+    pub(super) fn refusal(said: &str) -> Outcome {
         let lowered = said.to_ascii_lowercase();
         if lowered.contains("not authorized to send apple events")
             || lowered.contains("not authorised to send apple events")
             || lowered.contains("-1743")
         {
             return Outcome::PermissionRefused {
-                permission: "Automation, for the platform's user-interface service".to_owned(),
-                detail: said.trim().to_owned(),
+                permission: "Automation, for the platform's user-interface service",
+                detail: Sentence::new()
+                    .stated(
+                        "the platform would not let this application send Apple events to its \
+                         user-interface service: ",
+                    )
+                    .withheld(ContentClass::Message, said),
             };
         }
         if lowered.contains("assistive")
@@ -1048,8 +1119,13 @@ mod platform {
             || lowered.contains("-25211")
         {
             return Outcome::PermissionRefused {
-                permission: "Accessibility".to_owned(),
-                detail: said.trim().to_owned(),
+                permission: "Accessibility",
+                detail: Sentence::new()
+                    .stated(
+                        "the platform would not let this application read the accessibility \
+                         tree: ",
+                    )
+                    .withheld(ContentClass::Message, said),
             };
         }
         if lowered.contains("connection is invalid")
@@ -1060,16 +1136,20 @@ mod platform {
             // was put to. Saying which is the difference between sending somebody to a settings
             // pane that will not help and telling them what actually happened.
             return Outcome::NotAttempted {
-                detail: format!(
-                    "the desktop's user-interface service could not be reached from this \
-                     execution context: {}. That is the service being unreachable rather than a \
-                     permission being refused",
-                    said.trim()
-                ),
+                detail: Sentence::new()
+                    .stated(
+                        "the desktop's user-interface service could not be reached from this \
+                         execution context: ",
+                    )
+                    .withheld(ContentClass::Message, said)
+                    .stated(
+                        ". That is the service being unreachable rather than a permission being \
+                         refused",
+                    ),
             };
         }
         Outcome::NotAttempted {
-            detail: said.trim().to_owned(),
+            detail: super::failed(said),
         }
     }
 
@@ -1110,33 +1190,46 @@ mod platform {
             &["-g", "-j", "-n", "-a", application, "--args", &mark],
             plan,
         );
-        let outcome = match ran.outcome {
+        let outcome = match ran.exit {
             // The launcher accepting the request is not the application having started, so the
             // answer waits for the process and says what became of it.
-            Outcome::Performed { .. } => match end_marked(&mark, plan) {
+            Exit::Succeeded(_) => match end_marked(&mark, plan) {
                 Ended::Gone(named) => Outcome::Performed {
-                    detail: format!(
-                        "it started a new hidden instance of {application} and ended {named}"
-                    ),
+                    detail: Sentence::new()
+                        .stated("it started a new hidden instance of ")
+                        .stated(application)
+                        .stated(" and ended ")
+                        .sentence(&named),
                 },
                 Ended::Lingering(named) => Outcome::Performed {
-                    detail: format!(
-                        "it started a new hidden instance of {application} and asked {named} to \
-                         end, which has not happened yet"
-                    ),
+                    detail: Sentence::new()
+                        .stated("it started a new hidden instance of ")
+                        .stated(application)
+                        .stated(" and asked ")
+                        .sentence(&named)
+                        .stated(" to end, which has not happened yet"),
                 },
                 Ended::NeverAppeared => Outcome::NotAttempted {
-                    detail: format!(
-                        "the launcher accepted a request to start {application} and no process of \
-                         it appeared, so whether it starts here is not established"
-                    ),
+                    detail: Sentence::new()
+                        .stated("the launcher accepted a request to start ")
+                        .stated(application)
+                        .stated(
+                            " and no process of it appeared, so whether it starts here is not \
+                             established",
+                        ),
                 },
             },
             // A launcher that did not answer may still have started something, so the instance is
             // looked for and ended on this path too.
-            other => {
+            Exit::Failed(said) => {
                 let _ = end_marked(&mark, plan);
-                other
+                Outcome::NotAttempted {
+                    detail: super::failed(&said),
+                }
+            }
+            Exit::Unfinished(outcome) => {
+                let _ = end_marked(&mark, plan);
+                outcome
             }
         };
         Ran {
@@ -1146,12 +1239,12 @@ mod platform {
         }
     }
 
-    /// What became of the instance the launch check started.
+    /// What became of the instance the launch check started, with how many there were.
     enum Ended {
         /// It appeared, it was asked to end, and it has.
-        Gone(String),
+        Gone(Sentence),
         /// It appeared and it was still there when the check stopped waiting.
-        Lingering(String),
+        Lingering(Sentence),
         /// No process carrying this check's mark ever appeared.
         NeverAppeared,
     }
@@ -1169,9 +1262,12 @@ mod platform {
                 let arguments: Vec<&str> = pids.iter().map(String::as_str).collect();
                 let _ = bounded(Check::ApplicationLaunch, "/bin/kill", &arguments, plan);
                 let named = if pids.len() == 1 {
-                    "the one instance it started".to_owned()
+                    Sentence::new().stated("the one instance it started")
                 } else {
-                    format!("the {} instances it started", pids.len())
+                    Sentence::new()
+                        .stated("the ")
+                        .number(pids.len() as u64)
+                        .stated(" instances it started")
                 };
                 // Asked to end is not ended, and a listing this check could not take is not a
                 // listing that came back empty. Only an answer settles it.
@@ -1199,16 +1295,15 @@ mod platform {
             &["-f", mark],
             plan,
         );
-        match listed.outcome {
-            Outcome::Performed { detail } => Some(
-                detail
-                    .split_whitespace()
+        match listed.exit {
+            Exit::Succeeded(said) => Some(
+                said.split_whitespace()
                     .filter(|word| word.chars().all(|character| character.is_ascii_digit()))
                     .map(std::borrow::ToOwned::to_owned)
                     .collect(),
             ),
             // The lister exits with a failure when it matched nothing, which is an answer.
-            Outcome::NotAttempted { detail } if detail.trim().is_empty() => Some(Vec::new()),
+            Exit::Failed(said) if said.is_empty() => Some(Vec::new()),
             _ => None,
         }
     }
@@ -1226,17 +1321,18 @@ mod platform {
     //! the accessibility tree is a bus rather than an automation facility. Saying so is the honest
     //! answer; performing the wrong operation and reporting its result would not be.
 
-    use super::{Check, Outcome, Plan, Ran};
+    use super::{Check, Outcome, Plan, Ran, Sentence};
 
     pub(super) fn perform(check: Check, _plan: &Plan) -> Ran {
         Ran {
             check,
             facility: None,
             outcome: Outcome::NotAttempted {
-                detail: "this build performs the disclosed checks on macOS; on this platform the \
-                         capability records carry what the platform itself answers and nothing \
-                         here has performed the operation"
-                    .to_owned(),
+                detail: Sentence::new().stated(
+                    "this build performs the disclosed checks on macOS; on this platform the \
+                     capability records carry what the platform itself answers and nothing here \
+                     has performed the operation",
+                ),
             },
         }
     }
@@ -1248,6 +1344,42 @@ fn installed(path: &str) -> Option<String> {
     metadata.is_file().then(|| path.to_owned())
 }
 
+/// What a facility a check ran came to.
+///
+/// What a facility prints is its own words rather than this build's. The check that ran it reads
+/// them to decide what happened and says what it decided, so they reach an answer as their class
+/// and their length and never as themselves.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+enum Exit {
+    /// It exited successfully, having printed this.
+    Succeeded(String),
+    /// It exited with a failure, having said this: what it printed on its error output, or on its
+    /// output where that was empty, without the space around it.
+    Failed(String),
+    /// It did not get as far as an exit this check could read, and the outcome says why.
+    Unfinished(Outcome),
+}
+
+/// One facility, run to an end.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+struct Run {
+    /// The facility, by absolute path, where it was there to run.
+    facility: Option<String>,
+    /// What came of it.
+    exit: Exit,
+}
+
+/// What a facility that exited with a failure said, as an answer carries it.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn failed(said: &str) -> Sentence {
+    let failure = Sentence::new().stated("the facility exited with a failure");
+    if said.is_empty() {
+        failure.stated(" and printed nothing")
+    } else {
+        failure.stated(": ").withheld(ContentClass::Message, said)
+    }
+}
+
 /// Runs one facility with its own allowance and says what came of it.
 ///
 /// The output goes to files in the check's own directory rather than to pipes, so a facility that
@@ -1256,25 +1388,24 @@ fn installed(path: &str) -> Option<String> {
 /// answers [`Outcome::NotAnswered`], which is what a permission prompt the person has not answered
 /// looks like from here.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn bounded(check: Check, program: &str, arguments: &[&str], plan: &Plan) -> Ran {
+fn bounded(check: Check, program: &'static str, arguments: &[&str], plan: &Plan) -> Run {
     let facility = installed(program);
     if facility.is_none() {
-        return Ran {
-            check,
+        return Run {
             facility,
-            outcome: Outcome::FacilityMissing,
+            exit: Exit::Unfinished(Outcome::FacilityMissing),
         };
     }
     if let Err(error) = std::fs::create_dir_all(&plan.scratch) {
-        return Ran {
-            check,
+        return Run {
             facility,
-            outcome: Outcome::NotAttempted {
-                detail: format!(
-                    "this check's own directory {} could not be made: {error}",
-                    plan.scratch.display()
-                ),
-            },
+            exit: Exit::Unfinished(Outcome::NotAttempted {
+                detail: Sentence::new()
+                    .stated("this check's own directory ")
+                    .path(&plan.scratch)
+                    .stated(" could not be made: ")
+                    .withheld(ContentClass::Message, &error.to_string()),
+            }),
         };
     }
     let out_path = plan.scratch.join(format!("{}-out.txt", name(check)));
@@ -1283,14 +1414,14 @@ fn bounded(check: Check, program: &str, arguments: &[&str], plan: &Plan) -> Ran 
         std::fs::File::create(&out_path),
         std::fs::File::create(&err_path),
     ) else {
-        return Ran {
-            check,
+        return Run {
             facility,
-            outcome: Outcome::NotAttempted {
-                detail: "this check could not open a file of its own to collect what the facility \
-                         printed"
-                    .to_owned(),
-            },
+            exit: Exit::Unfinished(Outcome::NotAttempted {
+                detail: Sentence::new().stated(
+                    "this check could not open a file of its own to collect what the facility \
+                     printed",
+                ),
+            }),
         };
     };
     let started = std::time::Instant::now();
@@ -1302,12 +1433,13 @@ fn bounded(check: Check, program: &str, arguments: &[&str], plan: &Plan) -> Ran 
         .stderr(err)
         .spawn();
     let Ok(mut child) = spawned else {
-        return Ran {
-            check,
+        return Run {
             facility,
-            outcome: Outcome::NotAttempted {
-                detail: format!("{program} could not be started"),
-            },
+            exit: Exit::Unfinished(Outcome::NotAttempted {
+                detail: Sentence::new()
+                    .stated(program)
+                    .stated(" could not be started"),
+            }),
         };
     };
     let bound = check.effects().bound;
@@ -1323,18 +1455,16 @@ fn bounded(check: Check, program: &str, arguments: &[&str], plan: &Plan) -> Ran 
             Err(_) => break None,
         }
     };
-    let outcome = match status {
-        Some(status) if status.success() => Outcome::Performed {
-            detail: std::fs::read_to_string(&out_path).unwrap_or_default(),
-        },
+    let exit = match status {
+        Some(status) if status.success() => {
+            Exit::Succeeded(std::fs::read_to_string(&out_path).unwrap_or_default())
+        }
         Some(_) => {
             let mut said = std::fs::read_to_string(&err_path).unwrap_or_default();
             if said.trim().is_empty() {
                 said = std::fs::read_to_string(&out_path).unwrap_or_default();
             }
-            Outcome::NotAttempted {
-                detail: said.trim().to_owned(),
-            }
+            Exit::Failed(said.trim().to_owned())
         }
         None => {
             // Only this check's own child, by the handle it holds: nothing here looks a process up
@@ -1350,19 +1480,15 @@ fn bounded(check: Check, program: &str, arguments: &[&str], plan: &Plan) -> Ran 
                     Ok(None) => std::thread::sleep(POLL),
                 }
             };
-            Outcome::NotAnswered {
+            Exit::Unfinished(Outcome::NotAnswered {
                 waited: started.elapsed(),
                 stopped,
-            }
+            })
         }
     };
     let _ = std::fs::remove_file(&out_path);
     let _ = std::fs::remove_file(&err_path);
-    Ran {
-        check,
-        facility,
-        outcome,
-    }
+    Run { facility, exit }
 }
 
 /// How often a running facility is asked whether it has finished.
@@ -1497,7 +1623,7 @@ mod tests {
         let (state, evidence, reason) = judge(
             Check::ScreenImage,
             &Outcome::Performed {
-                detail: "it obtained a 1-byte image".to_owned(),
+                detail: Sentence::new().stated("it obtained a 1-byte image"),
             },
         );
         assert_eq!(state, CapabilityState::QualifiedAvailable);
@@ -1505,6 +1631,7 @@ mod tests {
         assert!(
             reason
                 .expect("a reason")
+                .as_str()
                 .contains("performed the operation")
         );
     }
@@ -1514,8 +1641,8 @@ mod tests {
         let (state, evidence, reason) = judge(
             Check::ScreenImage,
             &Outcome::PermissionRefused {
-                permission: "Screen & System Audio Recording".to_owned(),
-                detail: "it produced no image".to_owned(),
+                permission: "Screen & System Audio Recording",
+                detail: Sentence::new().stated("it produced no image"),
             },
         );
         assert_eq!(state, CapabilityState::PermissionRequired);
@@ -1523,6 +1650,7 @@ mod tests {
         assert!(
             reason
                 .expect("a reason")
+                .as_str()
                 .contains("Screen & System Audio Recording")
         );
     }
@@ -1536,6 +1664,7 @@ mod tests {
         assert!(
             reason
                 .expect("a reason")
+                .as_str()
                 .contains("test context of its own")
         );
     }
@@ -1558,7 +1687,7 @@ mod tests {
         );
         assert_eq!(state, CapabilityState::TemporarilyUnavailable);
         assert_eq!(evidence, CapabilityEvidenceSource::DisclosedProbe);
-        assert!(reason.expect("a reason").contains("20 seconds"));
+        assert!(reason.expect("a reason").as_str().contains("20 seconds"));
     }
 
     #[test]
@@ -1567,26 +1696,26 @@ mod tests {
             ran(
                 Check::AccessibleElement,
                 Outcome::Performed {
-                    detail: "Finder".to_owned(),
+                    detail: Sentence::new().stated("Finder"),
                 },
             ),
             ran(
                 Check::ScreenImage,
                 Outcome::PermissionRefused {
-                    permission: "Screen & System Audio Recording".to_owned(),
-                    detail: "no image".to_owned(),
+                    permission: "Screen & System Audio Recording",
+                    detail: Sentence::new().stated("no image"),
                 },
             ),
             ran(
                 Check::ApplicationLaunch,
                 Outcome::Performed {
-                    detail: "started".to_owned(),
+                    detail: Sentence::new().stated("started"),
                 },
             ),
             ran(
                 Check::AuthorisedFileRead,
                 Outcome::Performed {
-                    detail: "4096 bytes".to_owned(),
+                    detail: Sentence::new().stated("4096 bytes"),
                 },
             ),
             ran(Check::SyntheticInput, Outcome::WithheldForIsolation),
@@ -1735,7 +1864,7 @@ mod tests {
         let facilities = Scripted(vec![ran(
             Check::ScreenImage,
             Outcome::Performed {
-                detail: "an image".to_owned(),
+                detail: Sentence::new().stated("an image"),
             },
         )]);
         let desktop = desktop();
@@ -1805,7 +1934,7 @@ mod tests {
         let facilities = Scripted(vec![ran(
             Check::ScreenImage,
             Outcome::Performed {
-                detail: "an image".to_owned(),
+                detail: Sentence::new().stated("an image"),
             },
         )]);
         let desktop = desktop();
@@ -1858,11 +1987,85 @@ mod tests {
             ..Plan::in_directory(&directory)
         };
         let ran = Platform.perform(Check::AuthorisedFileRead, &plan);
-        match ran.outcome {
-            Outcome::Performed { detail } => assert!(detail.contains("25 bytes")),
+        match &ran.outcome {
+            Outcome::Performed { detail } => {
+                assert!(detail.as_str().contains("25 bytes"), "{detail}");
+                // The path is what this host found rather than words of its own, so the detail
+                // says its class and its length.
+                let path = kr_protocol::hostinfo::export::withheld(
+                    ContentClass::Path,
+                    &file.display().to_string(),
+                );
+                assert!(detail.as_str().ends_with(&path), "{detail}");
+            }
             other => panic!("the read was performed: {other:?}"),
         }
+        // And the reason a person reads never repeats it.
+        let (_, _, reason) = judge(ran.check, &ran.outcome);
+        let reason = reason.expect("a reason");
+        assert!(!reason.as_str().contains("authorised.txt"), "{reason}");
         std::fs::remove_dir_all(&directory).expect("this test's own directory");
+    }
+
+    #[test]
+    fn a_facility_that_failed_is_said_as_the_failure_and_the_measure_of_what_it_printed() {
+        let said = "kr-marker-7c1e: no such thing";
+        let failure = failed(said);
+        assert_eq!(
+            failure.as_str(),
+            format!(
+                "the facility exited with a failure: {}",
+                kr_protocol::hostinfo::export::withheld(ContentClass::Message, said)
+            )
+        );
+        assert_eq!(
+            failed("").as_str(),
+            "the facility exited with a failure and printed nothing"
+        );
+    }
+
+    /// What the automation facility printed decides which grant a refusal is about, and the answer
+    /// names that grant in this host's words and says what was printed as its class and length.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_refusal_is_read_out_of_what_the_facility_printed_and_never_repeats_it() {
+        let marker = "kr-marker-7c1e";
+        let measured =
+            |said: &str| kr_protocol::hostinfo::export::withheld(ContentClass::Message, said);
+        for (said, permission) in [
+            (
+                format!("{marker}: Not authorized to send Apple events to System Events. (-1743)"),
+                "Automation, for the platform's user-interface service",
+            ),
+            (
+                format!("{marker}: osascript is not allowed assistive access. (-25211)"),
+                "Accessibility",
+            ),
+        ] {
+            match platform::refusal(&said) {
+                Outcome::PermissionRefused {
+                    permission: named,
+                    detail,
+                } => {
+                    assert_eq!(named, permission);
+                    assert!(detail.as_str().ends_with(&measured(&said)), "{detail}");
+                    assert!(!detail.as_str().contains(marker), "{detail}");
+                }
+                other => panic!("{said} is a refusal: {other:?}"),
+            }
+        }
+        for said in [
+            format!("{marker}: Connection is invalid. (-609)"),
+            format!("{marker}: something else went wrong"),
+        ] {
+            match platform::refusal(&said) {
+                Outcome::NotAttempted { detail } => {
+                    assert!(detail.as_str().contains(&measured(&said)), "{detail}");
+                    assert!(!detail.as_str().contains(marker), "{detail}");
+                }
+                other => panic!("{said} is not a refusal: {other:?}"),
+            }
+        }
     }
 
     #[test]

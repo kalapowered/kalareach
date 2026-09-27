@@ -7601,7 +7601,8 @@ export interface CapabilityRecord {
    */
   capability: string
   /**
-   * What a person is told when the capability is not available.
+   * What a person is told when the capability is not available, composed by the host from its
+   * own words, the closed terms it knows and the class and length of anything else.
    */
   disabled_reason: string | null
   /**
@@ -7659,7 +7660,8 @@ export interface CapabilityIdentity {
    */
   schema: string | null
   /**
-   * That binary's version, as it reported it.
+   * That binary's identity as the host composed it: its size and its digest, never what the
+   * binary printed.
    */
   version: string | null
 }

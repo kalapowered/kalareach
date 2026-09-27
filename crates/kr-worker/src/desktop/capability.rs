@@ -40,8 +40,10 @@ use kr_protocol::desktop::{
     CapabilityState, CapabilitySubject, DesktopAvailability, DesktopCapabilityReport,
     DesktopContext, DisplayServer, capabilities,
 };
+use kr_protocol::hostinfo::export::{ContentClass, Sentence};
 use kr_protocol::ids::{CapabilityId, CapabilityRevision, EnvironmentId, SessionId};
 use kr_protocol::scalars::{Nullable, U64};
+use std::path::Path;
 
 /// The version of the capability contracts this host writes records against.
 pub const CAPABILITY_VERSION: u64 = 1;
@@ -53,23 +55,33 @@ pub struct Answer {
     pub state: CapabilityState,
     /// What produced it.
     pub evidence: CapabilityEvidenceSource,
-    /// What a person is told, when the capability is not available.
-    pub reason: Option<String>,
+    /// What a person is told, when the capability is not available: this host's words, with a
+    /// facility's path and a compositor's name said as their class and length.
+    pub reason: Option<Sentence>,
     /// The facility the answer is about, where one was found.
     pub tool: Option<String>,
 }
 
 impl Answer {
-    /// An answer that refuses a capability, for a stated reason.
+    /// An answer that refuses a capability, for a reason in this host's words.
     fn refused(
         state: CapabilityState,
         evidence: CapabilityEvidenceSource,
-        reason: impl Into<String>,
+        reason: &'static str,
+    ) -> Self {
+        Self::refused_because(state, evidence, Sentence::new().stated(reason))
+    }
+
+    /// An answer that refuses a capability, for a reason composed here.
+    const fn refused_because(
+        state: CapabilityState,
+        evidence: CapabilityEvidenceSource,
+        reason: Sentence,
     ) -> Self {
         Self {
             state,
             evidence,
-            reason: Some(reason.into()),
+            reason: Some(reason),
             tool: None,
         }
     }
@@ -155,7 +167,7 @@ pub fn report(
 /// A capability whose evidence does not turn on a binary identity has no file in it. The display
 /// server is the one of those: the answer is about the server itself, which the platform names,
 /// and there is no installed thing whose replacement could invalidate it.
-fn identified(capability: &str, answer: Answer) -> (Answer, Option<String>) {
+fn identified(capability: &str, answer: Answer) -> (Answer, Option<Sentence>) {
     if !invalidation(capability).contains(&CapabilityInvalidation::BinaryIdentity) {
         return (answer, None);
     }
@@ -165,10 +177,13 @@ fn identified(capability: &str, answer: Answer) -> (Answer, Option<String>) {
     match facility_identity(tool) {
         Some(identity) => (answer, Some(identity)),
         None => {
-            let reason = format!(
-                "this host could not identify {tool} within the work a diagnostic may do, so \
-                 nothing about this capability is established"
-            );
+            let reason = Sentence::new()
+                .stated("this host could not identify ")
+                .path(Path::new(tool))
+                .stated(
+                    " within the work a diagnostic may do, so nothing about this capability is \
+                     established",
+                );
             (
                 Answer {
                     state: CapabilityState::TemporarilyUnavailable,
@@ -253,14 +268,16 @@ pub fn answer(capability: &str, desktop: &DesktopContext) -> Answer {
 /// Returns the refusal the execution context itself produces, where there is one.
 fn context_refusal(capability: &str, desktop: &DesktopContext) -> Option<Answer> {
     if !desktop.container.reaches_parent_desktop() {
-        return Some(Answer::refused(
+        return Some(Answer::refused_because(
             CapabilityState::Incompatible,
             CapabilityEvidenceSource::PlatformQuery,
-            format!(
-                "this session runs in a {} with its own process namespace and its own display; it \
-                 does not reach the desktop of the machine hosting it",
-                desktop.container.as_str()
-            ),
+            Sentence::new()
+                .stated("this session runs in a ")
+                .stated(desktop.container.as_str())
+                .stated(
+                    " with its own process namespace and its own display; it does not reach the \
+                     desktop of the machine hosting it",
+                ),
         ));
     }
     if !desktop.is_desktop() || !desktop.graphic_access {
@@ -338,11 +355,16 @@ fn decide_macos(capability: &str, tool: Option<String>) -> Answer {
     Answer {
         state: CapabilityState::NotTested,
         evidence: CapabilityEvidenceSource::NotProbed,
-        reason: Some(format!(
-            "macOS grants {permission} per signed application. Nothing here has performed the \
-             operation this capability is, and nothing here reads the permission itself, so this \
-             is not established either way"
-        )),
+        reason: Some(
+            Sentence::new()
+                .stated("macOS grants ")
+                .stated(permission)
+                .stated(
+                    " per signed application. Nothing here has performed the operation this \
+                     capability is, and nothing here reads the permission itself, so this is not \
+                     established either way",
+                ),
+        ),
         tool: Some(tool),
     }
 }
@@ -371,12 +393,11 @@ fn decide_windows(capability: &str, tool: Option<String>) -> Answer {
     Answer {
         state: CapabilityState::NotTested,
         evidence: CapabilityEvidenceSource::NotProbed,
-        reason: Some(
+        reason: Some(Sentence::new().stated(
             "nothing here has taken an image of this session's screen or sent it input, and \
              neither is something to try on a screen somebody may be looking at, so this is not \
-             established either way"
-                .to_owned(),
-        ),
+             established either way",
+        )),
         tool: Some(tool),
     }
 }
@@ -387,40 +408,48 @@ fn decide_windows(capability: &str, tool: Option<String>) -> Answer {
 /// unestablished there is only whether the display opens: the record says so and names the tool.
 /// Wayland hands it nothing. Capture goes through the compositor's own portal, injection through a
 /// compositor-specific facility, and a tool built for one compositor family does not work on
-/// another, so the compositor is named beside the tool. A compositor that asks the user for the
-/// operation each time is the one case the platform itself settles, and it settles it as a
-/// permission the user grants rather than one a tool holds.
+/// another, so the answer turns on the compositor as well as the tool. A compositor that asks the
+/// user for the operation each time is the one case the platform itself settles, and it settles it
+/// as a permission the user grants rather than one a tool holds.
+///
+/// The tool's path and the compositor's name are what this host found rather than words of its
+/// own, so a reason says each as its class and its length; the record's own `binary` names the
+/// tool.
 #[must_use]
 pub fn decide_unix(capability: &str, desktop: &DesktopContext, tool: Option<String>) -> Answer {
     let compositor = desktop
         .compositor
         .as_ref()
         .map_or_else(String::new, |value| value.to_ascii_lowercase());
+    // The compositor's name is what the platform supplied, so a reason says its class and length.
     let named_compositor = if compositor.is_empty() {
-        "this compositor".to_owned()
+        Sentence::new().stated("this compositor")
     } else {
-        compositor.clone()
+        Sentence::new().withheld(ContentClass::Name, &compositor)
     };
     match desktop.display_server {
         DisplayServer::X11 => match tool {
             Some(tool) if display_reachable() => Answer {
                 state: CapabilityState::NotTested,
                 evidence: CapabilityEvidenceSource::NotProbed,
-                reason: Some(format!(
-                    "X11 grants this to a client that holds the display and its authority, and \
-                     this context holds both. Nothing here has opened the display with {tool}, so \
-                     whether it opens is not established"
-                )),
+                reason: Some(
+                    Sentence::new()
+                        .stated(
+                            "X11 grants this to a client that holds the display and its authority, \
+                             and this context holds both. Nothing here has opened the display with ",
+                        )
+                        .path(Path::new(&tool))
+                        .stated(", so whether it opens is not established"),
+                ),
                 tool: Some(tool),
             },
             Some(tool) => Answer {
                 state: CapabilityState::PermissionRequired,
                 evidence: CapabilityEvidenceSource::PlatformQuery,
-                reason: Some(
+                reason: Some(Sentence::new().stated(
                     "this context has no X11 display and authority, so it cannot reach the X \
-                     server"
-                        .to_owned(),
-                ),
+                     server",
+                )),
                 tool: Some(tool),
             },
             None => Answer::refused(
@@ -435,22 +464,36 @@ pub fn decide_unix(capability: &str, desktop: &DesktopContext, tool: Option<Stri
                 let reason = match wayland_path(capability, &tool, &compositor) {
                     // The compositor implements the protocol this tool uses, so nothing stands in
                     // the way that a permission could remove. What is left is whether it works.
-                    WaylandPath::Protocol => format!(
-                        "{named_compositor} implements the protocol {tool} uses for {route}, so no \
-                         per-use permission stands in the way. Nothing here has run it"
-                    ),
+                    WaylandPath::Protocol => Sentence::new()
+                        .sentence(&named_compositor)
+                        .stated(" implements the protocol ")
+                        .path(Path::new(&tool))
+                        .stated(" uses for ")
+                        .stated(route)
+                        .stated(
+                            ", so no per-use permission stands in the way. Nothing here has run it",
+                        ),
                     // The tool does not go through the compositor at all.
-                    WaylandPath::Device => format!(
-                        "{tool} does not ask the compositor for {route}: it goes through its own \
-                         service and the input devices, which need their own permission. Nothing \
-                         here has run it"
-                    ),
+                    WaylandPath::Device => Sentence::new()
+                        .path(Path::new(&tool))
+                        .stated(" does not ask the compositor for ")
+                        .stated(route)
+                        .stated(
+                            ": it goes through its own service and the input devices, which need \
+                             their own permission. Nothing here has run it",
+                        ),
                     // Which route the pair takes is not something a name settles.
-                    WaylandPath::Unqualified => format!(
-                        "on Wayland {route} goes through the compositor rather than the display \
-                         server, and whether {named_compositor} grants it to {tool} or asks the \
-                         user for it each time is not established here"
-                    ),
+                    WaylandPath::Unqualified => Sentence::new()
+                        .stated("on Wayland ")
+                        .stated(route)
+                        .stated(
+                            " goes through the compositor rather than the display server, and \
+                             whether ",
+                        )
+                        .sentence(&named_compositor)
+                        .stated(" grants it to ")
+                        .path(Path::new(&tool))
+                        .stated(" or asks the user for it each time is not established here"),
                 };
                 Answer {
                     state: CapabilityState::NotTested,
@@ -459,17 +502,17 @@ pub fn decide_unix(capability: &str, desktop: &DesktopContext, tool: Option<Stri
                     tool: Some(tool),
                 }
             }
-            None => Answer::refused(
+            None => Answer::refused_because(
                 CapabilityState::MissingInstallation,
                 CapabilityEvidenceSource::PlatformQuery,
-                format!(
-                    "no installed tool on this host serves this capability on {}",
-                    if compositor.is_empty() {
-                        "Wayland".to_owned()
-                    } else {
-                        compositor
-                    }
-                ),
+                if compositor.is_empty() {
+                    Sentence::new()
+                        .stated("no installed tool on this host serves this capability on Wayland")
+                } else {
+                    Sentence::new()
+                        .stated("no installed tool on this host serves this capability on ")
+                        .withheld(ContentClass::Name, &compositor)
+                },
             ),
         },
         _ => Answer::refused(
@@ -666,7 +709,7 @@ fn runnable(path: &std::path::Path) -> bool {
 ///
 /// The digest is for noticing a change rather than for proving one: a capability record is
 /// evidence about what is feasible, never authority, and nothing here signs it.
-pub fn facility_identity(tool: &str) -> Option<String> {
+pub fn facility_identity(tool: &str) -> Option<Sentence> {
     use std::io::Read as _;
 
     let mut file = std::fs::File::open(tool).ok()?;
@@ -687,10 +730,12 @@ pub fn facility_identity(tool: &str) -> Option<String> {
             Err(_) => return None,
         }
     }
-    Some(format!(
-        "{digested} bytes, digest {:016x}",
-        std::hash::Hasher::finish(&hasher)
-    ))
+    Some(
+        Sentence::new()
+            .number(digested)
+            .stated(" bytes, digest ")
+            .hexadecimal(std::hash::Hasher::finish(&hasher)),
+    )
 }
 
 /// How much of a facility is held in memory while it is being digested.
@@ -842,8 +887,8 @@ mod tests {
         let _ = std::fs::remove_file(&small);
         assert_eq!(answer.state, CapabilityState::NotTested);
         let identity = identity.expect("a facility this host read has an identity");
-        assert!(identity.contains("digest"), "{identity}");
-        assert!(identity.contains("10 bytes"), "{identity}");
+        assert!(identity.as_str().contains("digest"), "{identity}");
+        assert!(identity.as_str().contains("10 bytes"), "{identity}");
 
         // One it cannot read has no identity, and an answer about a facility with no identity
         // would be an answer about whatever is at that path later.
@@ -854,7 +899,7 @@ mod tests {
             answer
                 .reason
                 .as_ref()
-                .is_some_and(|reason| reason.contains("could not identify")),
+                .is_some_and(|reason| reason.as_str().contains("could not identify")),
             "{answer:?}"
         );
 
@@ -892,7 +937,9 @@ mod tests {
                     .expect("a refusal says why")
                     .clone();
                 assert!(
-                    reason.contains("does not reach the desktop of the machine hosting it"),
+                    reason
+                        .as_str()
+                        .contains("does not reach the desktop of the machine hosting it"),
                     "{reason}"
                 );
             }
@@ -938,7 +985,7 @@ mod tests {
             capture
                 .disabled_reason
                 .as_ref()
-                .is_some_and(|reason| reason.contains("processes it owns are unaffected")),
+                .is_some_and(|reason| reason.as_str().contains("processes it owns are unaffected")),
             "a locked desktop is a separate fact from process life"
         );
         assert!(
@@ -985,34 +1032,44 @@ mod tests {
             );
             assert!(answer.reason.is_some(), "{answer:?}");
         }
-        // And each of the four says something different about why.
-        assert_eq!(portal.state, CapabilityState::NotTested);
-        assert!(
-            portal
-                .reason
+        // And each of the four says something different about why. The compositor's name and the
+        // tool's path are what this host found, so a reason says each as its class and its length
+        // and never as itself.
+        let said = |reason: &Option<Sentence>| {
+            reason
                 .as_ref()
-                .is_some_and(|reason| reason.contains("gnome")
-                    && reason.contains("screen image")
-                    && reason.contains("not established")),
-            "an answer a tool's name cannot settle names the compositor, the tool and the \
-             operation, and says it is not established: {portal:?}"
+                .map(|reason| reason.as_str().to_owned())
+                .unwrap_or_default()
+        };
+        let name = |value: &str| kr_protocol::hostinfo::export::withheld(ContentClass::Name, value);
+        let path = |value: &str| kr_protocol::hostinfo::export::withheld(ContentClass::Path, value);
+        assert_eq!(portal.state, CapabilityState::NotTested);
+        let reason = said(&portal.reason);
+        assert!(
+            reason.contains(&name("gnome"))
+                && reason.contains(&path("/usr/bin/gnome-screenshot"))
+                && reason.contains("screen image")
+                && reason.contains("not established"),
+            "an answer a tool's name cannot settle says the compositor, the tool and the \
+             operation, and says it is not established: {reason}"
         );
         assert_eq!(bare.state, CapabilityState::MissingInstallation);
-        assert!(
-            bare.reason
-                .as_ref()
-                .is_some_and(|reason| reason.contains("kde")),
-            "{bare:?}"
-        );
+        let reason = said(&bare.reason);
+        assert!(reason.contains(&name("kde")), "{reason}");
         assert_eq!(wlroots.state, CapabilityState::NotTested);
+        let reason = said(&wlroots.reason);
         assert!(
-            wlroots
-                .reason
-                .as_ref()
-                .is_some_and(|reason| reason.contains("sway")
-                    && reason.contains("synthetic input")),
-            "a wlroots answer names the compositor, the tool and the operation: {wlroots:?}"
+            reason.contains(&name("sway"))
+                && reason.contains(&path("/usr/bin/wtype"))
+                && reason.contains("synthetic input"),
+            "a wlroots answer says the compositor, the tool and the operation: {reason}"
         );
+        for reason in [&portal.reason, &bare.reason, &wlroots.reason, &x11.reason] {
+            let reason = said(reason);
+            for found in ["gnome", "kde", "sway", "/usr/bin/"] {
+                assert!(!reason.contains(found), "{found} in {reason}");
+            }
+        }
         // The X11 answer depends on whether this context holds a display, which a test host may
         // not. Both answers are about X11 and neither is the Wayland one.
         assert!(
@@ -1025,7 +1082,8 @@ mod tests {
         assert!(
             x11.reason
                 .as_ref()
-                .is_some_and(|reason| reason.contains("X11") || reason.contains("X server")),
+                .is_some_and(|reason| reason.as_str().contains("X11")
+                    || reason.as_str().contains("X server")),
             "an X11 answer says it is about X11: {x11:?}"
         );
     }

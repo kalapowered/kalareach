@@ -875,10 +875,9 @@ fn a_locked_or_unavailable_desktop_is_reported_separately_from_process_life() {
                 "a locked desktop refuses the screen"
             );
             assert!(
-                capture
-                    .disabled_reason
-                    .as_ref()
-                    .is_some_and(|reason| reason.contains("processes it owns are unaffected")),
+                capture.disabled_reason.as_ref().is_some_and(|reason| reason
+                    .as_str()
+                    .contains("processes it owns are unaffected")),
                 "and says the session is unaffected"
             );
         }
@@ -1570,7 +1569,7 @@ fn a_capability_record_per_desktop_says_what_produced_it_and_refuses_a_container
                 record
                     .disabled_reason
                     .as_ref()
-                    .is_some_and(|reason| reason.contains("machine hosting it")),
+                    .is_some_and(|reason| reason.as_str().contains("machine hosting it")),
                 "the answer says a container does not reach the parent desktop"
             );
         }

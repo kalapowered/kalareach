@@ -4796,7 +4796,7 @@
               "type": "null"
             }
           ],
-          "description": "That binary's version, as it reported it."
+          "description": "That binary's identity as the host composed it: its size and its digest, never what the\nbinary printed."
         }
       },
       "required": [
@@ -4877,7 +4877,7 @@
               "type": "null"
             }
           ],
-          "description": "What a person is told when the capability is not available."
+          "description": "What a person is told when the capability is not available, composed by the host from its\nown words, the closed terms it knows and the class and length of anything else."
         },
         "evidence_source": {
           "$ref": "#/$defs/CapabilityEvidenceSource",

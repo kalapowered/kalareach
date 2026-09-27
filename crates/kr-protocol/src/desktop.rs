@@ -445,8 +445,9 @@ pub struct CapabilitySubject {
 pub struct CapabilityIdentity {
     /// The binary that was probed, by absolute path.
     pub binary: Nullable<String>,
-    /// That binary's version, as it reported it.
-    pub version: Nullable<String>,
+    /// That binary's identity as the host composed it: its size and its digest, never what the
+    /// binary printed.
+    pub version: Nullable<crate::hostinfo::export::Sentence>,
     /// The package the capability belongs to.
     pub package: Nullable<String>,
     /// The schema the binding speaks.
@@ -493,8 +494,9 @@ pub struct CapabilityRecord {
     pub identity: CapabilityIdentity,
     /// What makes this record stale, in the order it is written.
     pub invalidation: Vec<CapabilityInvalidation>,
-    /// What a person is told when the capability is not available.
-    pub disabled_reason: Nullable<String>,
+    /// What a person is told when the capability is not available, composed by the host from its
+    /// own words, the closed terms it knows and the class and length of anything else.
+    pub disabled_reason: Nullable<crate::hostinfo::export::Sentence>,
     /// When the answer was established.
     pub observed_at_ms: TimestampMs,
 }
@@ -1101,14 +1103,19 @@ mod tests {
                     CapabilityInvalidation::OsPermission,
                     CapabilityInvalidation::DesktopGeneration,
                 ],
-                disabled_reason: Nullable::some("Screen Recording is not granted".to_owned()),
+                disabled_reason: Nullable::some(
+                    crate::hostinfo::export::Sentence::new()
+                        .stated("Screen Recording is not granted"),
+                ),
                 observed_at_ms: TimestampMs::new(12),
             }],
         };
         let bytes = kr_cbor::to_canonical_vec(&report).expect("encodes");
         let decoded: DesktopCapabilityReport =
             kr_cbor::from_canonical_slice(&bytes, &kr_cbor::Limits::DEFAULT).expect("decodes");
-        assert_eq!(decoded, report);
+        // A reason read back is text that arrived rather than words this process composed, so the
+        // two halves are compared as the one encoding they are.
+        assert_eq!(kr_cbor::to_canonical_vec(&decoded).expect("encodes"), bytes);
         assert!(
             decoded
                 .record(capabilities::SCREEN_CAPTURE)
