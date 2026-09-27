@@ -103,6 +103,18 @@ describe('the window over retained output (KR-REQ-13.15)', () => {
     expect(window.end).toBe('101')
   })
 
+  it('starts again where the host now begins when it let go of what came after the window', () => {
+    let window = withNewer(emptyOutput(), page(100, 'a'.repeat(100)), answer)
+    window = placed(window, false, { from: '100', offset: 4 })
+    const gap = { from_cursor: '200', to_cursor: '260', cause: 'retention' as const }
+    const again = withNewer(window, page(260, 'c'.repeat(40)), { oldest: '260', end: '300', gap })
+    expect(again.pages.map((each) => each.from)).toEqual(['260'])
+    expect(again.gap).toEqual(gap)
+    expect(again.anchor).toBeNull()
+    // Without the host saying why, a page from elsewhere is not the next one along.
+    expect(withNewer(window, page(260, 'c'), { oldest: '100', end: '300', gap: null })).toBe(window)
+  })
+
   it('records where the reader is, and nothing at the live end', () => {
     const window = withNewer(emptyOutput(), page(100, 'a'), answer)
     expect(placed(window, false, { from: '100', offset: 12 }).anchor).toEqual({ from: '100', offset: 12 })

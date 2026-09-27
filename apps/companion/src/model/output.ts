@@ -114,8 +114,11 @@ export function withOlder(
 
 /**
  * The window after a page newer than its last, or its first page. A page that does not begin where
- * the last ends is not the next one along, and changes nothing. Pages go from the oldest end while
- * the window holds more than `bound` bytes.
+ * the last ends is not the next one along, and changes nothing, unless the host said why: it no
+ * longer keeps what came after the window's last page, and answered from where its output now
+ * begins. Everything the window holds is older than that, and the host keeps none of it, so the
+ * window starts again at the page, with what the host said it let go. Pages go from the oldest end
+ * while the window holds more than `bound` bytes.
  */
 export function withNewer(
   window: OutputWindow,
@@ -124,7 +127,11 @@ export function withNewer(
   bound: number = OUTPUT_WINDOW_BYTES
 ): OutputWindow {
   const last = window.pages.at(-1)
-  if (last !== undefined && page.from !== last.next) return window
+  if (last !== undefined && page.from !== last.next) {
+    if (answer.gap === null || BigInt(page.from) <= BigInt(last.next)) return window
+    const again = heard({ ...window, pages: [], anchor: null }, answer)
+    return page.bytes.length === 0 ? again : { ...again, pages: [page] }
+  }
   if (page.bytes.length === 0) return heard(window, answer)
   let pages = [...window.pages, page]
   while (pages.length > 1 && held(pages) > bound) pages = pages.slice(1)

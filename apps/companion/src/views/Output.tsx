@@ -61,6 +61,23 @@ function pageOf(result: HistoryPageResult): OutputPage {
 /** The larger of two cursors. */
 const max = (a: bigint, b: bigint) => (a > b ? a : b)
 
+/**
+ * The most answers one span is read in. A host answers short where its memory begins or a segment
+ * ends, a few times in one page at most; a host that went on answering short for ever still ends
+ * the read.
+ */
+const MAX_SPAN_ANSWERS = 16
+
+/** A run of output read in one or more answers, and what the host said about the output. */
+interface Span {
+  readonly page: OutputPage
+  readonly oldest: string
+  readonly end: string
+  readonly gap: HistoryGapResult
+}
+
+type HistoryGapResult = HistoryPageResult['gap']
+
 /** One session's retained output. */
 export function RetainedOutput({
   sessionId,
@@ -114,6 +131,42 @@ export function RetainedOutput({
     [port, sessionId]
   )
 
+  /**
+   * Reads the output from `from` up to `upTo`. A host stops an answer short where its memory
+   * begins, so the read goes on from where each answer ended until it reaches `upTo`, the host has
+   * nothing more, or the host answers from somewhere else. The first answer may begin later than
+   * asked, where the host's output now begins, with what it let go.
+   */
+  const span = useCallback(
+    async (from: bigint, upTo: bigint): Promise<Span> => {
+      const first = await page(String(from), upTo - from)
+      const parts = [base64UrlToBytes(first.bytes)]
+      let at = BigInt(first.next_cursor)
+      let last = first
+      for (let answers = 1; at < upTo && answers < MAX_SPAN_ANSWERS; answers += 1) {
+        const more = await page(String(at), upTo - at)
+        const bytes = base64UrlToBytes(more.bytes)
+        if (BigInt(more.from_cursor) !== at || bytes.length === 0) break
+        parts.push(bytes)
+        at = BigInt(more.next_cursor)
+        last = more
+      }
+      const joined = new Uint8Array(parts.reduce((total, each) => total + each.length, 0))
+      let offset = 0
+      for (const each of parts) {
+        joined.set(each, offset)
+        offset += each.length
+      }
+      return {
+        page: { from: first.from_cursor, next: String(at), bytes: joined },
+        oldest: last.oldest_retained_cursor,
+        end: last.next_cursor,
+        gap: first.gap ?? last.gap
+      }
+    },
+    [page]
+  )
+
   /** Runs one read, unless one is on its way, and says what the host refused. */
   const run = useCallback((read: () => Promise<void>): Promise<void> => {
     if (reading.current) return Promise.resolve()
@@ -138,19 +191,19 @@ export function RetainedOutput({
         const end = BigInt(probe.from_cursor)
         const oldest = BigInt(probe.oldest_retained_cursor)
         const from = max(oldest, end - BigInt(pageBytes))
-        const last = await page(String(from), end - from)
+        const last = await span(from, end)
         change((window) =>
           window.pages.length > 0
             ? window
             : withNewer(
                 { ...emptyOutput(), end: String(end) },
-                pageOf(last),
-                { oldest: last.oldest_retained_cursor, end: last.next_cursor, gap: last.gap },
+                last.page,
+                { oldest: last.oldest, end: last.page.next, gap: last.gap },
                 windowBytes
               )
         )
       }),
-    [run, page, change, pageBytes, windowBytes]
+    [run, page, span, change, pageBytes, windowBytes]
   )
 
   /** Reads the page before the window's first. */
@@ -161,35 +214,30 @@ export function RetainedOutput({
         const first = window.pages[0]
         if (first === undefined || reachedStart(window)) return
         const upTo = BigInt(first.from)
-        // Asked from before what the host keeps, the host says what it let go and why.
+        // Asked from before what the host keeps, the host answers from where its output now
+        // begins and says what it let go and why; the span reads on from there to the window.
         const from = max(0n, upTo - BigInt(pageBytes))
-        let answer = await page(String(from), upTo - from)
-        // The host let more go since it last answered: read again from where its output now
-        // begins, and keep what it said is gone.
-        if (answer.gap !== null && BigInt(answer.from_cursor) < upTo) {
-          const kept = BigInt(answer.from_cursor)
-          answer = await page(String(kept), upTo - kept)
-        }
+        const answer = await span(from, upTo)
         const scroll = scroller.current
         const anchor = scroll === null ? null : anchorOf(scroll)
         if (anchor !== null) keep.current = anchor
-        const older = pageOf(answer)
         change((held) =>
-          BigInt(older.next) === upTo
-            ? withOlder(held, older, { oldest: answer.oldest_retained_cursor, gap: answer.gap }, windowBytes)
-            : { ...held, oldest: answer.oldest_retained_cursor, gap: answer.gap ?? held.gap }
+          BigInt(answer.page.next) === upTo
+            ? withOlder(held, answer.page, { oldest: answer.oldest, gap: answer.gap }, windowBytes)
+            : { ...held, oldest: answer.oldest, gap: answer.gap ?? held.gap }
         )
       }),
-    [run, page, change, now, pageBytes, windowBytes]
+    [run, span, change, now, pageBytes, windowBytes]
   )
 
-  /** Reads the page after the window's last. */
+  /** Reads the page after the window's last, or from where the output ended when it holds none. */
   const readNewer = useCallback(
     () =>
       run(async () => {
-        const last = now().pages.at(-1)
-        if (last === undefined) return
-        const answer = await page(last.next, BigInt(pageBytes))
+        const window = now()
+        const from = window.pages.at(-1)?.next ?? window.end
+        if (from === null) return
+        const answer = await page(from, BigInt(pageBytes))
         const scroll = scroller.current
         const anchor = scroll === null ? null : anchorOf(scroll)
         if (anchor !== null && !now().following) keep.current = anchor
@@ -214,11 +262,12 @@ export function RetainedOutput({
     if (now().pages.length === 0) void openAtEnd()
   }, [openAtEnd, now])
 
-  // At the live end, new output is read as it comes.
+  // At the live end, new output is read as it comes, a session that has written nothing yet
+  // included.
   useEffect(() => {
     const cadence = readOnCadence(async () => {
       const window = now()
-      if (window.pages.length === 0 || !window.following) return
+      if (window.end === null || !window.following) return
       await readNewer()
     }, cadenceMs)
     cadence.now()

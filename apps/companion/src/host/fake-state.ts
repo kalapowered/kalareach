@@ -305,13 +305,26 @@ function mainOutput(): Uint8Array {
 /** Where a session's retained output starts: the host let everything before this cursor go. */
 const OUTPUT_OLDEST = 2048n
 
+/**
+ * How much of a session's newest output the host keeps in memory. A worker reads older output from
+ * its spool, and a read from there stops where the memory begins, so a reader gets fewer bytes than
+ * it asked for and reads on from where the answer ended.
+ */
+const OUTPUT_RESIDENT_BYTES = 8192n
+
+/** A session's retained output: the cursor of its first byte, and the bytes from there. */
+interface RetainedOutput {
+  readonly oldest: bigint
+  readonly bytes: Uint8Array
+}
+
 /** The scripted host's records, and the host methods that read and change them. */
 export class ScriptedRecords {
   readonly #ids: ScriptedIds
   readonly #agents = new Map<string, ScriptedAgent>()
   /** The sessions created here, each running a shell with no agent in it yet. */
   readonly #shells = new Set<string>()
-  readonly #output = new Map<string, Uint8Array>()
+  readonly #output = new Map<string, RetainedOutput>()
   #attention: AttentionItem[]
   #revision = 10
   #reviews: ReviewState[]
@@ -332,7 +345,7 @@ export class ScriptedRecords {
     for (const capability of ['agent.prompt.queue', 'agent.steer'] as const) {
       this.setCapability(ids.sessions.build, capability, 'incompatible')
     }
-    this.#output.set(ids.sessions.main, mainOutput())
+    this.#output.set(ids.sessions.main, { oldest: OUTPUT_OLDEST, bytes: mainOutput() })
     this.#attention = this.#startingAttention()
     this.#reviews = [
       {
@@ -867,15 +880,18 @@ export class ScriptedRecords {
   history(params: unknown): HistoryPageResult {
     const read = decodeParams<HistoryPageParams>(params, HISTORY_PAGE_PARAMS)
     this.#agentOf(read.session_id)
-    const retained = this.#output.get(read.session_id) ?? new Uint8Array()
-    const oldest = retained.length === 0 ? 0n : OUTPUT_OLDEST
-    const end = oldest + BigInt(retained.length)
+    const retained = this.#output.get(read.session_id) ?? { oldest: 0n, bytes: new Uint8Array() }
+    const oldest = retained.oldest
+    const end = oldest + BigInt(retained.bytes.length)
+    const resident = end - OUTPUT_RESIDENT_BYTES > oldest ? end - OUTPUT_RESIDENT_BYTES : oldest
     const asked = BigInt(read.from_cursor)
     const limit = BigInt(read.max_bytes)
     const bound = limit < 1n ? 1n : limit > BigInt(MAX_HISTORY_PAGE_BYTES) ? BigInt(MAX_HISTORY_PAGE_BYTES) : limit
     const start = asked < oldest ? oldest : asked > end ? end : asked
-    const stop = start + bound > end ? end : start + bound
-    const bytes = retained.slice(Number(start - oldest), Number(stop - oldest))
+    const wanted = start + bound > end ? end : start + bound
+    // A read from the spool stops where the memory begins.
+    const stop = start < resident && wanted > resident ? resident : wanted
+    const bytes = retained.bytes.slice(Number(start - oldest), Number(stop - oldest))
     return {
       from_cursor: String(start),
       next_cursor: String(stop),
@@ -1378,12 +1394,30 @@ export class ScriptedRecords {
 
   /** Records output a session wrote, after what it wrote before. */
   appendOutput(sessionId: string, text: string): void {
-    const held = this.#output.get(sessionId) ?? new Uint8Array()
+    const held = this.#output.get(sessionId) ?? { oldest: 0n, bytes: new Uint8Array() }
     const added = new TextEncoder().encode(text)
-    const next = new Uint8Array(held.length + added.length)
-    next.set(held)
-    next.set(added, held.length)
-    this.#output.set(sessionId, next)
+    const next = new Uint8Array(held.bytes.length + added.length)
+    next.set(held.bytes)
+    next.set(added, held.bytes.length)
+    this.#output.set(sessionId, { oldest: held.oldest, bytes: next })
+  }
+
+  /**
+   * Lets a session's output before `cursor` go, as a host's retention does: a read from before it
+   * is answered from where the output now begins, with what went and why.
+   */
+  forgetOutput(sessionId: string, cursor: bigint): void {
+    const held = this.#output.get(sessionId)
+    if (held === undefined || cursor <= held.oldest) return
+    const end = held.oldest + BigInt(held.bytes.length)
+    const kept = cursor > end ? end : cursor
+    this.#output.set(sessionId, { oldest: kept, bytes: held.bytes.slice(Number(kept - held.oldest)) })
+  }
+
+  /** Where a session's output ends now. */
+  outputEnd(sessionId: string): bigint {
+    const held = this.#output.get(sessionId)
+    return held === undefined ? 0n : held.oldest + BigInt(held.bytes.length)
   }
 
   /** Lets the oldest `count` of a session's entries go, as a host's retention does. */

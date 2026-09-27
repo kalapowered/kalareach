@@ -176,6 +176,74 @@ describe('the retained output (KR-REQ-13.15)', () => {
     })
   })
 
+  it('reads on from where an answer the host cut short ended, until the page it asked for is whole', async () => {
+    const { port, asked, controls } = recording()
+    // Pages that do not line up with where the host's memory begins, so reading back crosses it.
+    openOutput(port, 3000, 9000)
+    await waitFor(() => {
+      expect(held()).toHaveLength(1)
+    })
+    for (const count of [2, 3]) {
+      act(() => {
+        scrollTo(10)
+      })
+      await waitFor(() => {
+        expect(held()).toHaveLength(count)
+      })
+    }
+    const end = controls.records.outputEnd(SESSION_MAIN)
+    // Three whole pages back from the end, each where the one after it begins.
+    expect(held()).toEqual([String(end - 9000n), String(end - 6000n), String(end - 3000n)])
+    // The last of them was read in two answers: the host stopped at its memory's edge.
+    const cut = asked.filter((each) => BigInt(each.from_cursor) === end - 8192n)
+    expect(cut).toHaveLength(1)
+    expect(screen.getByTestId('output-scroll').textContent).not.toContain('\u001b')
+  })
+
+  it('starts again where the host’s output now begins when it let go of what came after the window, and says so', async () => {
+    const { port, controls } = recording()
+    render(
+      <AppProvider port={port}>
+        <RetainedOutput sessionId={SESSION_MAIN} pageBytes={65_536} cadenceMs={20} />
+      </AppProvider>
+    )
+    await waitFor(() => {
+      expect(held()).toHaveLength(1)
+    })
+    // More output than the host keeps arrives before the next read: what came straight after the
+    // window has gone too.
+    const before = controls.records.outputEnd(SESSION_MAIN)
+    controls.records.appendOutput(SESSION_MAIN, `${'x'.repeat(200)}\r\nafter the gap\r\n`)
+    controls.records.forgetOutput(SESSION_MAIN, before + 100n)
+    await waitFor(() => {
+      expect(held()).toEqual([String(before + 100n)])
+    })
+    expect(screen.getByTestId('output-scroll').textContent).toContain('after the gap')
+    expect(screen.getByTestId('output-gap')).toHaveTextContent(
+      'Output before this is not kept: it was older than the host keeps output for.'
+    )
+    // And it keeps up from there.
+    controls.records.appendOutput(SESSION_MAIN, 'and after that\r\n')
+    await waitFor(() => {
+      expect(screen.getByTestId('output-scroll').textContent).toContain('and after that')
+    })
+  })
+
+  it('keeps reading at the live end of a session that had written nothing, and shows what it writes', async () => {
+    const { port, controls } = fakeHost()
+    render(
+      <AppProvider port={port}>
+        <RetainedOutput sessionId={SESSION_BUILD} cadenceMs={20} />
+      </AppProvider>
+    )
+    expect(await screen.findByTestId('output-empty')).toBeInTheDocument()
+    controls.records.appendOutput(SESSION_BUILD, '$ echo first\r\nfirst\r\n')
+    await waitFor(() => {
+      expect(screen.getByTestId('output-scroll').textContent).toContain('first')
+    })
+    expect(screen.queryByTestId('output-empty')).toBeNull()
+  })
+
   it('says the host keeps nothing when a session wrote nothing it kept', async () => {
     const { port } = fakeHost()
     render(
