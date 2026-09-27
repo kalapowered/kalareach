@@ -58,6 +58,9 @@ pub struct Run {
     leg: String,
     root: PathBuf,
     owned: Mutex<Vec<Owned>>,
+    /// The system's own programs seen running as another user beneath the run's processes, by
+    /// number and the file each runs: not the run's to end, and checked ended at the close.
+    system_programs: Mutex<Vec<(u32, PathBuf)>>,
     /// Why a search for the processes a leg's host started did not finish, once for each reason.
     ///
     /// A closing check that did not look for everything has not shown that nothing is left, so
@@ -102,6 +105,7 @@ impl Run {
             leg: leg.to_owned(),
             root,
             owned: Mutex::new(Vec::new()),
+            system_programs: Mutex::new(Vec::new()),
             undiscovered: Mutex::new(Vec::new()),
             passed: Mutex::new(false),
         };
@@ -158,6 +162,18 @@ impl Run {
             identity,
             what: what.to_owned(),
         });
+    }
+
+    /// Notes one of the system's own programs running as another user beneath the run's processes
+    /// ([`system_program_of_another_user`]), which the closing check requires to have ended.
+    pub fn note_system_program(&self, pid: u32, path: &Path) {
+        let mut noted = self
+            .system_programs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if !noted.iter().any(|(number, _)| *number == pid) {
+            noted.push((pid, path.to_path_buf()));
+        }
     }
 
     /// Records a child this process started, by the number its spawn returned.
@@ -252,8 +268,18 @@ impl Run {
     /// Returns what is still running, as [`Run::closing_check`] does.
     pub fn nothing_running(&self) -> Result<String, String> {
         let owned = self.owned();
+        let programs = self
+            .system_programs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
         let started = Instant::now();
-        while started.elapsed() < CLOSING_WAIT && owned.iter().any(|o| running(&o.identity)) {
+        while started.elapsed() < CLOSING_WAIT
+            && (owned.iter().any(|o| running(&o.identity))
+                || programs
+                    .iter()
+                    .any(|(pid, path)| system_program_runs(*pid, path)))
+        {
             std::thread::sleep(Duration::from_millis(100));
         }
         let mut left: Vec<String> = owned
@@ -261,6 +287,14 @@ impl Run {
             .filter(|owned| running(&owned.identity))
             .map(|owned| format!("{} (process {})", owned.what, owned.identity.pid.get()))
             .collect();
+        left.extend(
+            programs
+                .iter()
+                .filter(|(pid, path)| system_program_runs(*pid, path))
+                .map(|(pid, path)| {
+                    format!("the system program {} (process {pid})", path.display())
+                }),
+        );
         match processes_under(&self.root) {
             Ok(found) => left.extend(
                 found
@@ -395,11 +429,24 @@ impl Run {
                     // It has ended since the table was read.
                     ProcessQuery::Gone => continue,
                     // One of the system's own programs running as another user is not this run's
-                    // to end, and ends by itself.
+                    // to end: it is noted, so the close finds it ended, and it may start nothing,
+                    // since what it started could not be followed back to it.
                     ProcessQuery::CannotEstablish(error)
                         if system_program_of_another_user(entry.pid, &error.to_string())
                             .is_some() =>
                     {
+                        let path = system_program_of_another_user(entry.pid, &error.to_string())
+                            .unwrap_or_default();
+                        if let Some(child) = table.iter().find(|child| child.parent == entry.pid) {
+                            return Err(format!(
+                                "the system program {} (process {}) beneath {what} started \
+                                 process {}, which cannot be followed back to it",
+                                path.display(),
+                                entry.pid,
+                                child.pid
+                            ));
+                        }
+                        self.note_system_program(entry.pid, &path);
                         continue;
                     }
                     ProcessQuery::CannotEstablish(error) => {
@@ -508,9 +555,11 @@ impl Drop for Run {
 /// The file `pid` runs, where it is one of the system's own programs running as another user: a
 /// set-user-ID program a person's tools start, such as `/bin/ps` or `/usr/bin/top`. The kernel
 /// will not describe such a process to this user (`error`, from reading its identity, says
-/// "Operation not permitted"), and it still says which file the process runs; that file lies in a
-/// directory the system's integrity protection covers. Such a process is neither a build under
-/// test nor anything a run started or can end: it ends by itself.
+/// "Operation not permitted"), and it still says which file the process runs; that file lies in
+/// one of the system's own directories on the volume mounted read-only at `/`, the sealed system
+/// volume, and not under `/System/Volumes`, where the writable data volume is. Such a process is
+/// neither a build under test nor anything a run started or can signal: it ends by itself, and a
+/// caller still follows what it starts and checks that it has ended.
 #[must_use]
 pub fn system_program_of_another_user(pid: u32, error: &str) -> Option<PathBuf> {
     const SYSTEM: [&str; 6] = [
@@ -528,15 +577,43 @@ pub fn system_program_of_another_user(pid: u32, error: &str) -> Option<PathBuf> 
     {
         let path = PathBuf::from(libproc::proc_pid::pidpath(i32::try_from(pid).ok()?).ok()?);
         let text = path.display().to_string();
-        SYSTEM
+        let stat = rustix::fs::statfs(&path).ok()?;
+        let mounted_on: Vec<u8> = stat
+            .f_mntonname
             .iter()
-            .any(|prefix| text.starts_with(prefix))
+            .take_while(|character| **character != 0)
+            .map(|character| character.to_ne_bytes()[0])
+            .collect();
+        // MNT_RDONLY.
+        let read_only = stat.f_flags & 1 != 0;
+        (SYSTEM.iter().any(|prefix| text.starts_with(prefix))
+            && !text.starts_with("/System/Volumes/")
+            && mounted_on == b"/"
+            && read_only)
             .then_some(path)
     }
     #[cfg(not(target_os = "macos"))]
     {
         let _ = (pid, SYSTEM);
         None
+    }
+}
+
+/// Whether the process `pid`, a system program noted under [`Run::note_system_program`], still
+/// runs that file: the kernel still says it runs `path`.
+#[must_use]
+pub fn system_program_runs(pid: u32, path: &Path) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        i32::try_from(pid)
+            .ok()
+            .and_then(|pid| libproc::proc_pid::pidpath(pid).ok())
+            .is_some_and(|running| Path::new(&running) == path)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (pid, path);
+        false
     }
 }
 
