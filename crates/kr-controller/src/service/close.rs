@@ -17,8 +17,9 @@ use kr_transport::window::AcceptedDeadline;
 use crate::error::{ControllerError, Result};
 use crate::supervision::JobRetirement;
 
+use super::admission::remaining_deadline;
 use super::workers::UNACCOUNTED_WORKER;
-use super::{Controller, encode, parse, remaining_deadline};
+use super::{Controller, encode, parse};
 
 /// How long a closing worker is watched before the controller stops waiting for it to end.
 pub const CLOSURE_WATCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);

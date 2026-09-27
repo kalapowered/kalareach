@@ -46,7 +46,7 @@ pub(super) async fn daemon_passing_by_hand(
     let controller = Controller::start_passing(
         setup(temp),
         crate::service::Clocks::system(),
-        crate::service::PassSchedule::ByHand(schedule),
+        crate::service::barrier::PassSchedule::ByHand(schedule),
     )
     .await
     .expect("the daemon starts");
