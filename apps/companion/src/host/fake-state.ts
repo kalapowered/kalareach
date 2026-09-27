@@ -1369,6 +1369,16 @@ export class ScriptedRecords {
     return instance
   }
 
+  /** Records output a session wrote, after what it wrote before. */
+  appendOutput(sessionId: string, text: string): void {
+    const held = this.#output.get(sessionId) ?? new Uint8Array()
+    const added = new TextEncoder().encode(text)
+    const next = new Uint8Array(held.length + added.length)
+    next.set(held)
+    next.set(added, held.length)
+    this.#output.set(sessionId, next)
+  }
+
   /** Lets the oldest `count` of a session's entries go, as a host's retention does. */
   forget(sessionId: string, count: number): void {
     const agent = this.#agentOf(sessionId)

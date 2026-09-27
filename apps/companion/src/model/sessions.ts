@@ -20,6 +20,7 @@ import type {
 
 import type { WithheldCount } from './agent'
 import { emptyConversation, type ConversationState } from './conversation'
+import { emptyOutput, type OutputWindow } from './output'
 import { startDraft, type Draft } from './drafts'
 import type { Submission } from './receipts'
 
@@ -82,6 +83,8 @@ export interface SessionState {
   readonly conversation: ConversationState
   /** What the session's worker last said about its agent. */
   readonly agent: AgentReading
+  /** The window over the session's retained output, and where the reader is in it. */
+  readonly output: OutputWindow
   /** What this device has sent, and what became of it. */
   readonly submissions: readonly Submission[]
   /** The draft for this session. */
@@ -97,6 +100,7 @@ export function emptySessionState(sessionId: string, now: number): SessionState 
   return {
     conversation: emptyConversation(),
     agent: unreadAgent(),
+    output: emptyOutput(),
     submissions: [],
     draft: startDraft(
       `draft-${sessionId}`,

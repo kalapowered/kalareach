@@ -18,6 +18,7 @@ import type { LaunchSurface } from '../model/pending'
 import { answeredState, outcomeMessage, outcomeTone } from '../model/receipts'
 import { readSemanticArchive } from '../model/exports'
 import { Conversation } from './Conversation'
+import { RetainedOutput } from './Output'
 import { Sharing } from './Sharing'
 import { RawTerminal } from '../terminal/RawTerminal'
 import { ask } from '../mobile/model/call'
@@ -57,7 +58,7 @@ export function Session({
   pane
 }: {
   readonly sessionId: string
-  readonly pane: 'semantic' | 'terminal'
+  readonly pane: 'semantic' | 'terminal' | 'output'
 }): ReactNode {
   const { port, go, say, tabs, closeTab } = useApp()
   const [reading, setReading] = useState<SessionReading | null>(null)
@@ -229,7 +230,8 @@ export function Session({
             value={pane}
             options={[
               { value: 'semantic', label: 'Conversation' },
-              { value: 'terminal', label: 'Terminal' }
+              { value: 'terminal', label: 'Terminal' },
+              { value: 'output', label: 'Output' }
             ]}
             onChange={(next) => {
               go({ view: 'session', sessionId, pane: next })
@@ -289,6 +291,10 @@ export function Session({
           }
           onLaunched={readAgain}
         />
+      ) : pane === 'output' ? (
+        // What the session wrote, as the host keeps it: one view per session, opening where the
+        // person left it.
+        <RetainedOutput key={sessionId} sessionId={sessionId} />
       ) : (
         <RawTerminal
           sessionId={sessionId}

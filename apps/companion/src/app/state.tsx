@@ -31,7 +31,11 @@ export type Place =
   | { readonly view: 'plugins' }
   | { readonly view: 'pairing' }
   | { readonly view: 'setup' }
-  | { readonly view: 'session'; readonly sessionId: string; readonly pane: 'semantic' | 'terminal' }
+  | {
+      readonly view: 'session'
+      readonly sessionId: string
+      readonly pane: 'semantic' | 'terminal' | 'output'
+    }
 
 
 interface AppValue {

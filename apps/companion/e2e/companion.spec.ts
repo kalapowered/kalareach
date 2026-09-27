@@ -283,6 +283,95 @@ test.describe('the conversation keeps its place', () => {
   })
 })
 
+// KR-REQ-13.15: the retained output is read a page at a time with its cursor and byte bound, the
+// window moves towards older and newer output with the reader's page kept where it is, and a change
+// of view and back returns the reader to the same place.
+test.describe("a session's retained output", () => {
+  const MAIN = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
+
+  /** The page the reader is looking at and how far its top is from the top of the view. */
+  const reading = (scroll: Locator) =>
+    scroll.evaluate((element) => {
+      for (const block of element.querySelectorAll<HTMLElement>('[data-from]')) {
+        if (block.offsetTop + block.offsetHeight > element.scrollTop) {
+          return {
+            from: block.dataset.from ?? '',
+            offset: Math.round(block.offsetTop - element.scrollTop)
+          }
+        }
+      }
+      return null
+    })
+
+  test('moves both ways with the reader kept in place, and returns them after a change of view', async ({
+    page
+  }) => {
+    // More output than one page carries.
+    await page.goto('/harness.html')
+    await page.waitForSelector('.app-shell')
+    await page.evaluate((session) => {
+      const lines: string[] = []
+      for (let index = 0; index < 4000; index += 1) {
+        lines.push(`line ${String(index).padStart(4, '0')} \u001b[2m${'of retained output '.repeat(2)}\u001b[0m`)
+      }
+      window.krTestHost?.records.appendOutput(session, `\r\n${lines.join('\r\n')}\r\n`)
+    }, MAIN)
+    await page.getByRole('button', { name: 'Sessions' }).click()
+    await page.getByTestId('session-row-1').click()
+    await page.getByRole('tab', { name: 'Output' }).click()
+    const scroll = page.getByTestId('output-scroll')
+    await expect(scroll).toContainText('line 3999')
+    await expect(scroll).toHaveAttribute('data-following', 'true')
+    await expect(scroll).not.toContainText('\u001b')
+
+    // Up to the top of the window: the page before is read, and the reader's page stays put.
+    const pages = () => scroll.locator('[data-from]').count()
+    const before = await pages()
+    const first = (await scroll.locator('[data-from]').first().getAttribute('data-from')) ?? ''
+    /** How far the top of the page that begins at `from` is from the top of the view. */
+    const placeOf = (from: string) =>
+      scroll.evaluate((element, cursor) => {
+        const block = element.querySelector<HTMLElement>(`[data-from="${cursor}"]`)
+        return block === null ? null : Math.round(block.offsetTop - element.scrollTop)
+      }, from)
+    // The read the scroll asks for is held until the page's place has been measured.
+    await page.evaluate(() => {
+      const held = window.krTestHost?.hold('historyPage')
+      ;(window as unknown as { heldPages?: typeof held }).heldPages = held
+    })
+    await scroll.evaluate((element) => {
+      element.scrollTop = 0
+    })
+    const top = await placeOf(first)
+    await page.evaluate(() => {
+      ;(window as unknown as { heldPages?: { release: () => void } }).heldPages?.release()
+    })
+    await expect.poll(pages).toBeGreaterThan(before)
+    await expect(scroll).toHaveAttribute('data-following', 'false')
+    // The page that was at the top is where it was: the older one arrived above it, unseen.
+    await expect.poll(() => placeOf(first)).toBe(top)
+    const kept = await reading(scroll)
+
+    // To the conversation and back: the same page, the same distance from the top.
+    await page.getByRole('tab', { name: 'Conversation' }).click()
+    await page.getByTestId('conversation').waitFor()
+    await page.getByRole('tab', { name: 'Output' }).click()
+    await expect.poll(() => reading(scroll)).toEqual(kept)
+    await page.screenshot({ path: shot(`output-13.15-${test.info().project.name}`) })
+
+    // Back down to the live end: newer pages are read and the view keeps up again.
+    for (let step = 0; step < 20; step += 1) {
+      await scroll.evaluate((element) => {
+        element.scrollTop = element.scrollHeight
+      })
+      if ((await scroll.getAttribute('data-following')) === 'true') break
+      await page.waitForTimeout(100)
+    }
+    await expect(scroll).toHaveAttribute('data-following', 'true')
+    await expect(scroll).toContainText('line 3999')
+  })
+})
+
 test.describe('sessions', () => {
   test('a row carries the number, the directory, the attachments and the state', async ({
     page
