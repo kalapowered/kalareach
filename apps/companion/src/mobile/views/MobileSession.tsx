@@ -89,7 +89,7 @@ import { AccessoryRow } from '../components/keys'
 import { AttachmentPicker } from '../components/picker'
 import { afterKey, held as holds, NO_LATCH, pressModifier, rowKey, type Latch } from '../model/accessory'
 import { ask } from '../model/call'
-import { describeMode, routeGesture, type TouchGesture } from '../model/gestures'
+import { describeMode } from '../model/gestures'
 import { admit, describeBytes, type Picked } from '../model/media'
 import type { Lifecycle } from '../useLifecycle'
 import { minimumTarget, type Surface } from '../platform'
@@ -1285,21 +1285,6 @@ function RawTerminal({
     }
   }
 
-  const gestureFrom = (event: React.PointerEvent): TouchGesture => {
-    const origin = start.current
-    const points = [...pointers.current.values()]
-    const spread =
-      points.length >= 2 && points[0] && points[1]
-        ? Math.hypot(points[0].x - points[1].x, points[0].y - points[1].y)
-        : 0
-    return {
-      pointers: pointers.current.size,
-      deltaX: origin ? event.clientX - origin.x : 0,
-      deltaY: origin ? event.clientY - origin.y : 0,
-      scale: origin && origin.spread > 0 && spread > 0 ? spread / origin.spread : 1
-    }
-  }
-
   const palette = screen?.palette
   const gridName = useId()
   return (
@@ -1389,7 +1374,6 @@ function RawTerminal({
       }}
       onPointerUp={(event) => {
         if (!pointers.current.has(event.pointerId)) return
-        const outcome = routeGesture(mode, gestureFrom(event))
         const pinch = pinching.current
         // A pinch ends on the zoom step nearest where the fingers left the text.
         const target = pinch === null ? null : nearestZoom((ZOOM_STEPS[pinch.zoom] ?? 1) * pinchFactor(pinch))
@@ -1413,8 +1397,9 @@ function RawTerminal({
         if (pinch !== null) {
           pinching.current = null
           drawPinch(1, null)
-          // A pinch too small to be one changes nothing, as an unsteady two-finger touch should not.
-          if (outcome.kind === 'zoom' && target !== null) onZoom(target - pinch.zoom)
+          // The nearest step decides, which is also what keeps an unsteady two-finger touch from
+          // changing anything: it ends nearer the step it began at than any other.
+          if (target !== null && target !== pinch.zoom) onZoom(target - pinch.zoom)
         }
       }}
       onPointerCancel={(event) => {

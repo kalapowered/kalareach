@@ -15,7 +15,7 @@
  */
 
 import type { TerminalControl, TerminalWheel } from '../../host/port'
-import { ASKING, type ViewMode, type WheelOutcome } from '../../terminal/modes'
+import { ASKING, type ViewMode } from '../../terminal/modes'
 
 /** One touch gesture, in the terms both modes understand. */
 export interface TouchGesture {
@@ -26,33 +26,6 @@ export interface TouchGesture {
   readonly deltaY: number
   /** The pinch factor, where 1 is unchanged. Only meaningful with two fingers. */
   readonly scale: number
-}
-
-/** How much a pinch must change before it is a zoom rather than an unsteady two-finger drag. */
-export const PINCH_THRESHOLD = 0.08
-
-/**
- * Decides what a touch gesture does.
- *
- * A one-finger drag in control mode produces the same outcome a wheel would, so the program
- * receives one kind of scroll however the person produced it.
- */
-export function routeGesture(mode: ViewMode, gesture: TouchGesture): WheelOutcome {
-  const pinching = gesture.pointers >= 2 && Math.abs(gesture.scale - 1) >= PINCH_THRESHOLD
-  if (pinching) {
-    return { kind: 'zoom', steps: gesture.scale > 1 ? 1 : -1 }
-  }
-  if (mode === 'control') {
-    return { kind: 'application' }
-  }
-  // The screen follows the finger, so the window moves the other way: a finger dragged up moves the
-  // window down, as a wheel turned down does.
-  return { kind: 'pan', across: zeroed(-gesture.deltaX), down: zeroed(-gesture.deltaY) }
-}
-
-/** A number with no negative zero, which reads as a movement where there is none. */
-function zeroed(value: number): number {
-  return value === 0 ? 0 : value
 }
 
 /**

@@ -797,6 +797,56 @@ describe("the phone's raw terminal view (KR-REQ-08.02, 13.18)", () => {
     }
   })
 
+  // The nearest step decides, however small the pinch: a pinch to 107% is nearer 112.5% than 100%,
+  // and one to 104% is nearer 100%, so it changes nothing.
+  it('settles a small pinch on the step nearest where the fingers ended', async () => {
+    const restore = measured()
+    try {
+      const { port } = fakeHost()
+      await onTerminal(port)
+      await waitFor(() => {
+        expect(screen.getAllByTestId('mobile-terminal-line').length).toBeGreaterThan(0)
+      })
+      finger('pointerdown', 1, 100, 100)
+      finger('pointerdown', 2, 200, 100)
+      finger('pointermove', 2, 204, 100)
+      finger('pointerup', 2, 204, 100)
+      finger('pointerup', 1, 100, 100)
+      expect(screen.getByText('Zoom 100%')).toBeInTheDocument()
+      finger('pointerdown', 1, 100, 100)
+      finger('pointerdown', 2, 200, 100)
+      finger('pointermove', 2, 207, 100)
+      finger('pointerup', 2, 207, 100)
+      finger('pointerup', 1, 100, 100)
+      expect(screen.getByText('Zoom 113%')).toBeInTheDocument()
+    } finally {
+      restore()
+    }
+  })
+
+  // Nothing on the wire carries a pinch, so a pinch takes nothing from the program: it zooms in
+  // control mode as it does in view mode.
+  it('zooms with a pinch in control mode too', async () => {
+    const restore = measured()
+    try {
+      const { port } = fakeHost()
+      const person = await onTerminal(port)
+      await waitFor(() => {
+        expect(screen.getAllByTestId('mobile-terminal-line').length).toBeGreaterThan(0)
+      })
+      await person.click(screen.getByRole('button', { name: 'Take control' }))
+      await screen.findByRole('button', { name: 'Look around' })
+      finger('pointerdown', 1, 100, 100)
+      finger('pointerdown', 2, 200, 100)
+      finger('pointermove', 2, 160, 100)
+      finger('pointerup', 2, 160, 100)
+      finger('pointerup', 1, 100, 100)
+      expect(screen.getByText('Zoom 75%')).toBeInTheDocument()
+    } finally {
+      restore()
+    }
+  })
+
   it('sends nothing for a drag whose view has changed under it: control taken, or the view ended', async () => {
     const restore = measured()
     try {

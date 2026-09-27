@@ -37,7 +37,7 @@ import {
   attributesFor,
   describeBytes
 } from '../../src/mobile/model/media'
-import { routeGesture, consumesGesture, describeMode } from '../../src/mobile/model/gestures'
+import { consumesGesture, describeMode } from '../../src/mobile/model/gestures'
 import {
   EMPTY_DURABLE_STATE,
   onResume,
@@ -372,33 +372,6 @@ describe('camera, library and file input (KR-REQ-13.17)', () => {
 })
 
 describe('the raw terminal on a touch screen (KR-REQ-13.18, 13.17)', () => {
-  it('gives a one-finger drag to the program while control mode is active', () => {
-    // The view turns the program's wheel as the finger crosses each row, and takes nothing of it.
-    const outcome = routeGesture('control', { pointers: 1, deltaX: 0, deltaY: -64, scale: 1 })
-    expect(outcome).toEqual({ kind: 'application' })
-  })
-
-  it('never pans the view in control mode, however far the finger travels', () => {
-    for (const deltaY of [-500, -16, 16, 500]) {
-      const outcome = routeGesture('control', { pointers: 1, deltaX: 30, deltaY, scale: 1 })
-      expect(outcome.kind).toBe('application')
-    }
-  })
-
-  it('moves the window with a one-finger drag in view mode, and zooms with a pinch', () => {
-    // The frame follows the finger, so a finger dragged up and to the left moves the window down
-    // and to the right.
-    expect(routeGesture('view', { pointers: 1, deltaX: -12, deltaY: -32, scale: 1 })).toEqual({
-      kind: 'pan',
-      across: 12,
-      down: 32
-    })
-    expect(routeGesture('view', { pointers: 2, deltaX: 0, deltaY: 0, scale: 1.4 })).toEqual({
-      kind: 'zoom',
-      steps: 1
-    })
-  })
-
   it('says what each state of control does, and why control ended when it did', () => {
     const watching = { number: 0, state: 'watching', ended: null } as const
     const taking = { number: 1, state: 'taking', ended: null } as const
@@ -419,13 +392,6 @@ describe('the raw terminal on a touch screen (KR-REQ-13.18, 13.17)', () => {
     expect(describeMode(controlling, null)).toBe('Control: your keys go to the program in this terminal.')
     const lost = 'Control ended: another view took it, or the program changed how it reads keys.'
     expect(describeMode({ number: 1, state: 'watching', ended: lost }, 'reaches')).toBe(lost)
-  })
-
-  it('zooms in either mode, because nothing on the wire carries a pinch', () => {
-    expect(routeGesture('control', { pointers: 2, deltaX: 0, deltaY: 0, scale: 0.6 })).toEqual({
-      kind: 'zoom',
-      steps: -1
-    })
   })
 
   it('takes the gesture from the page only where it is used', () => {
