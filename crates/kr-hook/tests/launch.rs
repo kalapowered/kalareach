@@ -356,6 +356,8 @@ impl Shell {
 
     fn integration() -> CommandIntegration {
         CommandIntegration {
+            plugin_id: kr_protocol::ids::PluginId::new("kalareach/claude-code")
+                .expect("a plugin identifier"),
             command: fixture::COMMAND.to_owned(),
             flags: words(&fixture::FLAGS),
             enabled: true,
@@ -949,6 +951,8 @@ fn kr_req_12_07_a_backend_that_does_not_answer_leaves_the_invocation_as_typed() 
 /// Gemini CLI's integration as a session carries it: the command, and no flag.
 fn gemini_integration() -> CommandIntegration {
     CommandIntegration {
+        plugin_id: kr_protocol::ids::PluginId::new("kalareach/gemini-cli")
+            .expect("a plugin identifier"),
         command: "gemini".to_owned(),
         flags: Vec::new(),
         enabled: true,

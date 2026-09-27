@@ -222,14 +222,20 @@ fn uses_flag(element: &str, flag: &str) -> bool {
 mod tests {
     use super::*;
 
+    fn plugin(name: &str) -> kr_protocol::ids::PluginId {
+        kr_protocol::ids::PluginId::new(format!("kalareach/{name}")).expect("a plugin identifier")
+    }
+
     fn integrations() -> Vec<CommandIntegration> {
         vec![
             CommandIntegration {
+                plugin_id: plugin("codex"),
                 command: "codex".to_owned(),
                 flags: vec!["--kr-gateway".to_owned()],
                 enabled: true,
             },
             CommandIntegration {
+                plugin_id: plugin("opencode"),
                 command: "opencode".to_owned(),
                 flags: vec!["--kr-gateway".to_owned()],
                 enabled: false,
@@ -375,6 +381,7 @@ mod tests {
     /// no flag at all, and Qoder CLI's `--settings` with its inline value.
     fn released() -> Vec<CommandIntegration> {
         let integration = |command: &str, flags: &[&str]| CommandIntegration {
+            plugin_id: plugin(command),
             command: command.to_owned(),
             flags: argv(flags),
             enabled: true,

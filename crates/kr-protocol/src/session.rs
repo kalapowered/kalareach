@@ -228,9 +228,16 @@ impl ShellStartup {
 /// Section 12: where an agent needs integration flags, an explicitly enabled integration adds them
 /// to interactive invocations inside a managed root shell. The command name and the argument
 /// vector the person typed are preserved; the flags are added and nothing is removed or reordered.
+///
+/// The host writes each entry when the session is launched, from the environment's configuration
+/// and the release installed then: the package, the command and the flags its verified manifest
+/// declares. A launch establishes a backend only while the package that integrates the command is
+/// still that package and declares those flags.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CommandIntegration {
+    /// The installed package whose integration this is.
+    pub plugin_id: crate::ids::PluginId,
     /// The command name this integration applies to, as typed.
     pub command: String,
     /// The flags the agent needs, added to an interactive invocation.
@@ -258,6 +265,9 @@ pub struct LaunchProfile {
     /// operation that puts text a person did not type into their editor.
     pub fenced_launch: bool,
     /// The opt-in command integrations this session applies to interactive invocations.
+    ///
+    /// A create request names none: the host fills them from the environment's configuration
+    /// when the session is launched, and refuses a request that names one.
     pub command_integrations: Vec<CommandIntegration>,
 }
 

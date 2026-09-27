@@ -1066,6 +1066,7 @@ fn launch_profile_document(profile: &kr_protocol::session::LaunchProfile) -> ser
             .command_integrations
             .iter()
             .map(|integration| serde_json::json!({
+                "plugin_id": integration.plugin_id.as_str(),
                 "command": integration.command,
                 "flags": integration.flags,
                 "enabled": integration.enabled,

@@ -122,6 +122,8 @@ impl Setup {
 
     fn integration() -> CommandIntegration {
         CommandIntegration {
+            plugin_id: kr_protocol::ids::PluginId::new("kalareach/claude-code")
+                .expect("a plugin identifier"),
             command: fixture::COMMAND.to_owned(),
             flags: fixture::FLAGS
                 .iter()
@@ -184,6 +186,8 @@ fn invocation_adding(typed: &[&str], added: &[&str]) -> Invocation {
 
 fn gemini(flags: &[&str]) -> CommandIntegration {
     CommandIntegration {
+        plugin_id: kr_protocol::ids::PluginId::new("kalareach/gemini-cli")
+            .expect("a plugin identifier"),
         command: "gemini".to_owned(),
         flags: words(flags),
         enabled: true,
@@ -278,6 +282,30 @@ async fn kr_req_12_07_an_integrated_invocation_gets_a_backend_that_exists_before
         PathBuf::from(record["credential"].as_str().expect("a credential path")),
         directory.join("credential")
     );
+}
+
+/// KR-REQ-12.07: a session's entry names the package it was created with. Where another package
+/// integrates the command here, even one that declares the same flags, the entry establishes
+/// nothing, so a package whose integration the configuration never turned on is never taken for
+/// the one it did. Control: the entry for the package itself establishes.
+#[tokio::test]
+async fn kr_req_12_07_an_entry_for_another_package_establishes_nothing() {
+    let setup = Setup::new();
+    let claude = invocation(&["claude"]);
+    let another = CommandIntegration {
+        plugin_id: kr_protocol::ids::PluginId::new("someone/claude-code")
+            .expect("a plugin identifier"),
+        ..Setup::integration()
+    };
+    setup
+        .backends
+        .establish(&request(&setup, &claude, &another, 1))
+        .expect_err("another package integrates claude here");
+    assert!(setup.backends.root().is_none(), "nothing was created");
+    setup
+        .backends
+        .establish(&request(&setup, &claude, &Setup::integration(), 2))
+        .expect("the package the session was created with");
 }
 
 /// KR-REQ-12.07: every bypass is decided before anything is created.

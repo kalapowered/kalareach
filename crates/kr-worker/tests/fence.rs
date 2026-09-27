@@ -2568,6 +2568,8 @@ async fn asks_the_real_worker_before_each_command(
         (Vec::new(), "bypass not_integrated"),
         (
             vec![kr_protocol::session::CommandIntegration {
+                plugin_id: kr_protocol::ids::PluginId::new("kalareach/probe")
+                    .expect("a plugin identifier"),
                 command: "kr-probe".to_owned(),
                 flags: vec!["--kr-integrated".to_owned()],
                 enabled: true,
@@ -2953,6 +2955,8 @@ async fn an_integration_with_no_backend_behind_it_runs_the_invocation_as_typed()
         true,
         kr_protocol::session::LaunchProfile {
             command_integrations: vec![kr_protocol::session::CommandIntegration {
+                plugin_id: kr_protocol::ids::PluginId::new("kalareach/codex")
+                    .expect("a plugin identifier"),
                 command: "codex".to_owned(),
                 flags: vec!["--kr-gateway".to_owned()],
                 enabled: true,
@@ -3001,11 +3005,15 @@ async fn a_bypassed_invocation_runs_as_typed_and_is_given_no_backend() {
         kr_protocol::session::LaunchProfile {
             command_integrations: vec![
                 kr_protocol::session::CommandIntegration {
+                    plugin_id: kr_protocol::ids::PluginId::new("kalareach/codex")
+                        .expect("a plugin identifier"),
                     command: "codex".to_owned(),
                     flags: vec!["--kr-gateway".to_owned()],
                     enabled: true,
                 },
                 kr_protocol::session::CommandIntegration {
+                    plugin_id: kr_protocol::ids::PluginId::new("kalareach/opencode")
+                        .expect("a plugin identifier"),
                     command: "opencode".to_owned(),
                     flags: vec!["--kr-gateway".to_owned()],
                     enabled: false,
@@ -3061,6 +3069,8 @@ async fn an_unmanaged_shell_is_never_intercepted() {
         false,
         kr_protocol::session::LaunchProfile {
             command_integrations: vec![kr_protocol::session::CommandIntegration {
+                plugin_id: kr_protocol::ids::PluginId::new("kalareach/codex")
+                    .expect("a plugin identifier"),
                 command: "codex".to_owned(),
                 flags: vec!["--kr-gateway".to_owned()],
                 enabled: true,

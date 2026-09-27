@@ -387,6 +387,7 @@ pub fn an_interactive_command_asks_once_and_runs_as_typed(kind: ShellKind) {
     // A session created with an integration for the name, and no backend behind it, is answered
     // as the worker answers it, and the command still runs as it was typed: no flag, no variable.
     session.commands.policy = ResolvePolicy::Decide(vec![CommandIntegration {
+        plugin_id: kr_protocol::ids::PluginId::new("kalareach/probe").expect("a plugin identifier"),
         command: "kr-probe".to_owned(),
         flags: vec!["--kr-integrated".to_owned()],
         enabled: true,
