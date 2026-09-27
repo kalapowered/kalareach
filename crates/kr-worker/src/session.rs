@@ -3981,9 +3981,9 @@ impl Session {
     /// content here rather than waiting for the next maintenance pass narrows the window in which
     /// it is on the disk. It does not close it: this is a second transaction after the one that
     /// wrote the outcome, so a crash between the two leaves the content for the archive to serve,
-    /// and the asynchronous launch settlement and the early rejection path do not reach here at
-    /// all. Closing that needs the content policy inside the journal transition itself. A failure
-    /// becomes cleanup this session still owes.
+    /// and the early rejection path does not reach here at all. Closing that needs the content
+    /// policy inside the journal transition itself. A failure becomes cleanup this session still
+    /// owes.
     pub fn redact_settled_action(
         &mut self,
         actor_id: &kr_protocol::ids::ActorId,

@@ -3263,6 +3263,10 @@ impl WorkerService {
         if let Err(failure) = settled {
             session.note_journal_failure(&failure);
         }
+        // Privacy mode is prospective: the content this receipt carries goes where it settles.
+        if session.privacy().is_enabled() {
+            session.redact_settled_action(actor_id, action_id);
+        }
     }
 
     /// Records the outcome of a mutation that was settled outside the session boundary.
@@ -3308,6 +3312,10 @@ impl WorkerService {
         };
         if let Err(failure) = settled {
             session.note_journal_failure(&failure);
+        }
+        // Privacy mode is prospective: the content this receipt carries goes where it settles.
+        if session.privacy().is_enabled() {
+            session.redact_settled_action(actor_id, action_id);
         }
     }
 
@@ -3743,10 +3751,10 @@ impl WorkerService {
         // content its receipt carries goes here rather than on the next maintenance pass, which
         // narrows the window in which it is on the disk. It does not close it: this is a second
         // transaction after the one that wrote the outcome, so a crash between the two leaves the
-        // content for the archive to serve, and the asynchronous launch settlement and the early
-        // rejection path do not reach here at all. Closing it needs the content policy inside the
-        // journal transition itself. A failure is recorded as cleanup this host still owes rather
-        // than turned into a refusal of an effect that has already happened.
+        // content for the archive to serve, and the early rejection path does not reach here at
+        // all. Closing it needs the content policy inside the journal transition itself. A failure
+        // is recorded as cleanup this host still owes rather than turned into a refusal of an
+        // effect that has already happened.
         if session.privacy().is_enabled() {
             session.redact_settled_action(&caller.actor_id, mutation.action_id);
         }
