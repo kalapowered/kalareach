@@ -4019,6 +4019,17 @@ as it was. A method that makes several of those changes in turn — answering an
 admits and resolves — holds the lock for each of them rather than for all three, and what carries
 the rule across them is the durable dispatch marker rather than the lock.
 
+A resource snapshot, the state a view installs when it starts or resynchronises, carries every
+resource that can still happen and every settled one whose connection is still open. A settled
+resource stays while its connection is open because frames on that connection can still name it:
+a second answer, the upstream's own response and a request that reuses its identifier are each
+refused from the live record without reading the store, and a view that missed the settlement
+installs how it ended. Once the connection has closed and the settlement is written, nothing can
+name it and it is forgotten; a settlement made while the journal is faulted is kept until the
+recovery writes the gap. The ledger's record then answers for it: a late answer is told the resource
+ended, as it was told before. So a session's snapshot grows with what its open connections settled,
+not with everything it ever settled.
+
 The durable records live in the worker's own journal file, beside the receipts and the questions,
 with their own `broker_schema` version row. A plugin-host crash cannot touch them, because none of
 them is in the plugin process.
