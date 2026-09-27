@@ -92,9 +92,9 @@ impl Setup {
         }
     }
 
-    /// Runs `kr` with this setup's home, package root and installation directories, with
-    /// `zdotdir` as `ZDOTDIR` where one is given, and requires it to succeed.
-    fn kr(&self, arguments: &[&str], zdotdir: Option<&Path>) -> String {
+    /// A `kr` with this setup's home, package root and installation directories, and `zdotdir` as
+    /// `ZDOTDIR` where one is given.
+    fn command(&self, arguments: &[&str], zdotdir: Option<&Path>) -> std::process::Command {
         let mut command = std::process::Command::new(kr());
         command
             .args(arguments)
@@ -109,15 +109,25 @@ impl Setup {
         if let Some(zdotdir) = zdotdir {
             command.env("ZDOTDIR", zdotdir);
         }
-        let output = command.output().expect("kr runs");
-        let said = format!(
-            "{}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(output.status.success(), "kr {arguments:?}: {said}");
-        said
+        command
     }
+
+    /// Runs `kr` as [`Self::command`] makes it, and requires it to succeed.
+    fn kr(&self, arguments: &[&str], zdotdir: Option<&Path>) -> String {
+        let output = self.command(arguments, zdotdir).output().expect("kr runs");
+        said(arguments, &output)
+    }
+}
+
+/// What a `kr` that had to succeed printed, or a failure saying what it printed instead.
+fn said(arguments: &[&str], output: &std::process::Output) -> String {
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "kr {arguments:?}: {said}");
+    said
 }
 
 /// A marked entry of the person's own making, which no install wrote.
@@ -215,4 +225,62 @@ fn a_home_whose_name_has_a_space_and_a_quote_is_removed_from() {
     assert!(holds_an_entry(&zshrc));
     setup.kr(&["shell", "remove", "--shell", "zsh"], None);
     assert_eq!(std::fs::read_to_string(&zshrc).expect("reads"), THEIRS);
+}
+
+/// An install and a removal that run at once, as two `kr` processes, leave the record and the
+/// startup file agreeing: an entry in the file is one the record names, whichever of the two ran
+/// first. A removal that read the record between an install's recording the file and its writing
+/// the entry, found no entry and forgot the file, would leave an entry that no later removal takes
+/// out.
+///
+/// The removal starts a little later in each round, a millisecond more each time for thirty, and
+/// then again, so its reading of the record falls at every point of an install.
+#[test]
+fn an_install_and_a_removal_at_once_leave_no_entry_the_record_does_not_name() {
+    const ROUNDS: usize = 90;
+    const INSTALL: &[&str] = &["shell", "install", "--shell", "zsh"];
+    const REMOVE: &[&str] = &["shell", "remove", "--shell", "zsh"];
+    let mut unrecorded = Vec::new();
+    for round in 0..ROUNDS {
+        let setup = Setup::new(OsStr::new("home"));
+        let zshrc = setup.home.join(".zshrc");
+        std::fs::write(&zshrc, THEIRS).expect("the person's own startup file");
+        let installing = setup.command(INSTALL, None).output_in_the_background();
+        std::thread::sleep(std::time::Duration::from_millis(
+            u64::try_from(round % 30).expect("a small number"),
+        ));
+        let removing = setup.command(REMOVE, None).output_in_the_background();
+        said(INSTALL, &installing.join().expect("the install ran"));
+        said(REMOVE, &removing.join().expect("the removal ran"));
+        let recorded =
+            kr_shell_integration::host::startup::EntryRecord::in_state_directory(&setup.state)
+                .files(ShellKind::Zsh)
+                .expect("the record reads");
+        if holds_an_entry(&zshrc) && !recorded.contains(&zshrc) {
+            unrecorded.push(round);
+        }
+    }
+    assert!(
+        unrecorded.is_empty(),
+        "in {} of {ROUNDS} rounds the install's entry was left in the file with no record of it: \
+         {unrecorded:?}",
+        unrecorded.len()
+    );
+}
+
+/// Starting a command and collecting what it printed on a thread of its own.
+trait InTheBackground {
+    /// Starts the command now, and returns the thread that collects its output.
+    fn output_in_the_background(self) -> std::thread::JoinHandle<std::process::Output>;
+}
+
+impl InTheBackground for std::process::Command {
+    fn output_in_the_background(mut self) -> std::thread::JoinHandle<std::process::Output> {
+        let child = self
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("kr starts");
+        std::thread::spawn(move || child.wait_with_output().expect("kr is waited for"))
+    }
 }
