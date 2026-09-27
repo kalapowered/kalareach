@@ -24,7 +24,9 @@ pub fn call_id_of(line: &str) -> Option<String> {
 
 /// How many lines of `text` after the line `after` hold `marker`, an answer to a tool approval.
 /// Where `calls` names what marks a call that asks for approval, only the answers to such calls
-/// after `after` count, each tied to its call by the call's identifier.
+/// after `after` count, each tied to its call by the call's identifier; a call is a line that holds
+/// one of `calls` and is not itself an answer, so an answer that only quotes such a text, an error
+/// that names it, ties to nothing.
 #[must_use]
 pub fn answers(text: &str, after: Option<usize>, marker: &str, calls: &[String]) -> usize {
     let lines: Vec<&str> = text
@@ -33,6 +35,7 @@ pub fn answers(text: &str, after: Option<usize>, marker: &str, calls: &[String])
         .collect();
     let asked: std::collections::BTreeSet<String> = lines
         .iter()
+        .filter(|line| !line.contains(marker))
         .filter(|line| calls.iter().any(|call| line.contains(call.as_str())))
         .filter_map(|line| call_id_of(line))
         .collect();
@@ -106,6 +109,14 @@ mod tests {
             "an answer whose call came before `after` is not tied to one after it"
         );
         assert_eq!(call_id_of("not json"), None);
+        let quoting = r#"{"type":"response_item","payload":{"type":"function_call","call_id":"c","arguments":"{\"cmd\":\"echo\",\"justification\":\"x\"}"}}
+{"type":"response_item","payload":{"type":"function_call_output","call_id":"c","output":"`justification` requires an explicit `sandbox_permissions`; use `sandbox_permissions: \"require_escalated\"`"}}
+"#;
+        assert_eq!(
+            answers(quoting, None, marker, &["require_escalated".to_owned()]),
+            0,
+            "an answer that only names the text ties to no call that asked"
+        );
     }
 
     #[test]

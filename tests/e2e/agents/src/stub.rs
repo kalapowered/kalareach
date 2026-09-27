@@ -2,9 +2,12 @@
 //! agent would offer its model without calling one.
 //!
 //! An agent pointed at the stub sends it the request that would start a turn. The stub keeps only
-//! the kind and name of each tool that request offers, answers it with an error so the agent stops
-//! there, and answers anything else with "not found". The request's instructions and every header,
-//! an authorisation among them, are read only as far as the protocol needs and never kept.
+//! the kind and name of each tool that request offers, with the tools a tool's description offers
+//! in turn by a heading of their own (`### \`name\``, as a tool that runs code lists what the code
+//! may call) and whether that description says some such tools are left out of it; it answers the
+//! request with an error so the agent stops there, and anything else with "not found". The
+//! request's instructions and every header, an authorisation among them, are read only as far as
+//! the protocol needs and never kept.
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
@@ -253,7 +256,9 @@ fn read_chunks(reader: &mut impl BufRead) -> Result<Vec<u8>, String> {
 
 /// The tools a request body offers, one line each, `<kind> <name>`, with a tool a namespace groups
 /// named `<namespace>/<name>`: every list named `tools` in it, at the top or in an input item that
-/// carries tools; `None` where the body is not JSON or offers none.
+/// carries tools. A tool whose description lists further tools by headings of their own adds
+/// `nested <tool>/<name>` for each, and `deferred <tool>` where the description says some are left
+/// out of it. `None` where the body is not JSON or offers none.
 fn tools_of(body: &[u8]) -> Option<Vec<String>> {
     let value: serde_json::Value = serde_json::from_slice(body).ok()?;
     let mut lists = Vec::new();
@@ -293,6 +298,16 @@ fn tools_of(body: &[u8]) -> Option<Vec<String>> {
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or_default();
             lines.push(format!("{kind} {prefix}{name}").trim_end().to_owned());
+            if let Some(description) = tool.get("description").and_then(serde_json::Value::as_str) {
+                lines.extend(
+                    offered_in(description)
+                        .into_iter()
+                        .map(|nested| format!("nested {prefix}{name}/{nested}")),
+                );
+                if description.to_lowercase().contains("deferred nested tools") {
+                    lines.push(format!("deferred {prefix}{name}"));
+                }
+            }
             if let Some(nested) = tool.get("tools").and_then(serde_json::Value::as_array) {
                 let prefix = format!("{prefix}{name}/");
                 pending.extend(nested.iter().rev().map(|tool| (prefix.clone(), tool)));
@@ -300,6 +315,24 @@ fn tools_of(body: &[u8]) -> Option<Vec<String>> {
         }
     }
     Some(lines)
+}
+
+/// The tools a description offers by headings of their own, `### \`name\`` or `### \`name\`
+/// (\`raw name\`)`: each by the raw name where it gives one.
+fn offered_in(description: &str) -> Vec<String> {
+    description
+        .lines()
+        .filter_map(|line| line.trim_start().strip_prefix("### `"))
+        .filter_map(|rest| {
+            let (name, after) = rest.split_once('`')?;
+            let raw = after
+                .trim_start()
+                .strip_prefix("(`")
+                .and_then(|raw| raw.split_once('`'))
+                .map(|(raw, _)| raw);
+            Some(raw.unwrap_or(name).to_owned())
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -386,6 +419,26 @@ mod tests {
         );
         assert_eq!(tools_of(br#"{"input":[]}"#), None);
         assert_eq!(tools_of(b"not json"), None);
+    }
+
+    #[test]
+    fn tools_a_code_tool_lists_by_heading_are_found_and_a_left_out_list_is_said() {
+        let body = serde_json::json!({ "input": [{ "type": "additional_tools", "tools": [{
+            "type": "namespace", "name": "functions", "tools": [{
+                "type": "custom", "name": "exec",
+                "description": "Run code.\n\n### `exec_command`\nRuns a command.\n\n### `skills_read` (`skills.read`)\nReads a skill.\n\nSome deferred nested tools may be omitted from this description."
+            }]
+        }]}]});
+        assert_eq!(
+            tools_of(body.to_string().as_bytes()),
+            Some(vec![
+                "namespace functions".to_owned(),
+                "custom functions/exec".to_owned(),
+                "nested functions/exec/exec_command".to_owned(),
+                "nested functions/exec/skills.read".to_owned(),
+                "deferred functions/exec".to_owned(),
+            ])
+        );
     }
 
     #[test]

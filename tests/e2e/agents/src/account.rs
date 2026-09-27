@@ -771,29 +771,36 @@ pub fn changes(before: &Snapshot, after: &Snapshot) -> Changes {
     changes
 }
 
-/// Removes each file the part created, inside the snapshot's roots, that holds one of `marks`
-/// (the part's own marker, or the run's own directory, which the agent writes as the working
-/// directory), and then each directory the part created there that is left empty; returns what it
-/// removed and what it left. Nothing that existed before the part, a file or a directory, is
-/// touched, and nothing at all when `before` is not whole, since what it missed may have existed.
-/// A directory is removed only inside a root that was read whole: in one read for its own files
-/// alone, a directory's earlier contents were not seen.
+/// Removes each file the part created inside one of `removable`, the directories whose files
+/// belong to one conversation or run each, that holds one of `marks` (the part's own marker, or the
+/// run's own directory, which the agent writes as the working directory), and then each directory
+/// the part created there that is left empty; returns what it removed and what it left. A file the
+/// part created anywhere else is left and reported, since a file there, such as a database, can
+/// hold the part's text beside the person's own. Nothing that existed before the part, a file or a
+/// directory, is touched, and nothing at all when `before` is not whole, since what it missed may
+/// have existed. A directory is removed only inside a root that was read whole: in one read for its
+/// own files alone, a directory's earlier contents were not seen.
 #[must_use]
 pub fn remove_created(
     before: &Snapshot,
     changes: &Changes,
     marks: &[&str],
+    removable: &[PathBuf],
 ) -> (Vec<PathBuf>, Vec<PathBuf>) {
     if !before.whole() {
         return (Vec::new(), changes.created.clone());
     }
-    let inside = |path: &Path| before.roots.iter().any(|root| path.starts_with(root));
+    let inside = |path: &Path| {
+        before.roots.iter().any(|root| path.starts_with(root))
+            && removable.iter().any(|root| path.starts_with(root))
+    };
     let inside_a_whole_root = |path: &Path| {
         before
             .roots
             .iter()
             .filter(|root| !before.shallow.contains(root))
             .any(|root| path.starts_with(root))
+            && removable.iter().any(|root| path.starts_with(root))
     };
     let mut removed = Vec::new();
     let mut left = Vec::new();
@@ -801,13 +808,9 @@ pub fn remove_created(
         let new =
             inside(path) && !before.files.contains_key(path) && !before.directories.contains(path);
         let ours = new
-            && std::fs::read(path).is_ok_and(|bytes| {
-                marks.iter().any(|mark| {
-                    bytes
-                        .windows(mark.len())
-                        .any(|window| window == mark.as_bytes())
-                })
-            });
+            && which_hold(std::slice::from_ref(path), marks)
+                .0
+                .contains(path);
         if ours && std::fs::remove_file(path).is_ok() {
             removed.push(path.clone());
         } else {
@@ -1029,7 +1032,8 @@ mod tests {
         std::fs::write(agent.join("kept").join("theirs"), "someone else's").expect("another file");
         let after = snapshot(home, &directories, 1 << 20);
         let found = changes(&before, &after);
-        let (removed, left) = remove_created(&before, &found, &["kr0123"]);
+        let (removed, left) =
+            remove_created(&before, &found, &["kr0123"], std::slice::from_ref(&agent));
         assert!(
             !ours.join("ours.jsonl").exists(),
             "the marked file is removed"
@@ -1089,7 +1093,8 @@ mod tests {
             "a root that does not exist is not an unread entry"
         );
         let found = changes(&before, &after);
-        let (removed, left) = remove_created(&before, &found, &["kr0123"]);
+        let (removed, left) =
+            remove_created(&before, &found, &["kr0123"], std::slice::from_ref(&agent));
         assert!(
             removed.is_empty(),
             "nothing is removed after a snapshot that is not whole"
@@ -1136,7 +1141,8 @@ mod tests {
         let after = snapshot(home, &directories, 1 << 20);
         let found = changes(&before, &after);
         assert_eq!(found.appended, vec![agent.join("history.jsonl")]);
-        let (removed, left) = remove_created(&before, &found, &["kr0123"]);
+        let (removed, left) =
+            remove_created(&before, &found, &["kr0123"], &[day.clone(), next.clone()]);
         assert!(!day.join("ours.jsonl").exists() && day.join("old.jsonl").exists());
         assert!(
             !next.exists(),
@@ -1147,10 +1153,11 @@ mod tests {
             "a directory beneath the one read for its own files stays"
         );
         assert!(
-            removed.contains(&agent.join("state.sqlite")),
-            "a file the part made directly in it goes when it holds the mark"
+            agent.join("state.sqlite").exists() && !removed.contains(&agent.join("state.sqlite")),
+            "a file the part made outside the directories whose files are its own stays, marked \
+             or not, since it can hold the person's own data beside the part's"
         );
-        assert!(left.is_empty(), "{left:?}");
+        assert_eq!(left, vec![agent.join("state.sqlite")]);
         assert!(
             beneath.join("x").exists(),
             "what the listing did not see is not touched"

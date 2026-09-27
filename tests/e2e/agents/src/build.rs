@@ -63,8 +63,70 @@ pub struct Approval {
     pub shows: String,
     /// What allows the command once.
     pub allow: String,
-    /// What refuses it.
+    /// What refuses the command, and nothing more: the agent keeps no rule from it.
     pub deny: String,
+    /// What the dialog shows before a command on the command's own line, where it shows one, such
+    /// as `$ `. The part answers a dialog only when one line of it is the part's command, whole,
+    /// after this; and, where this is named, no other line starts with it and the line after the
+    /// command's is blank, so a command that goes on to another line is not taken for the part's.
+    #[serde(default)]
+    pub command_line: Option<String>,
+    /// Texts the agent's other permission dialogs show, such as for file edits, network access,
+    /// further permissions or input to a running command: none is ever allowed, each is refused.
+    #[serde(default)]
+    pub others: Vec<String>,
+    /// What refuses any of the agent's permission dialogs without the agent keeping a rule from
+    /// it, where [`Approval::deny`] would not in every one of them; [`Approval::deny`] otherwise.
+    #[serde(default)]
+    pub refuse: Option<String>,
+}
+
+impl Approval {
+    /// The key that refuses any dialog the part did not ask for.
+    #[must_use]
+    pub fn refusal(&self) -> &str {
+        self.refuse.as_deref().unwrap_or(&self.deny)
+    }
+
+    /// Whether the dialog on `rows` asks to run `command` and nothing else, as
+    /// [`Approval::command_line`] says the dialog shows a command; says why not otherwise.
+    ///
+    /// # Errors
+    ///
+    /// Returns what the dialog shows in place of the command alone.
+    pub fn names_only(&self, rows: &[String], command: &str) -> Result<(), String> {
+        let prefix = self.command_line.as_deref().unwrap_or("");
+        let wanted = format!("{prefix}{command}");
+        let at: Vec<usize> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.trim() == wanted.trim())
+            .map(|(index, _)| index)
+            .collect();
+        let [line] = at.as_slice() else {
+            return Err(format!(
+                "the dialog shows the part's command on {} lines of its own, not one",
+                at.len()
+            ));
+        };
+        if let Some(prefix) = &self.command_line {
+            let others = rows
+                .iter()
+                .enumerate()
+                .filter(|(index, row)| index != line && row.trim().starts_with(prefix.trim()))
+                .count();
+            if others > 0 {
+                return Err(format!("the dialog shows {others} other command line(s)"));
+            }
+            if rows
+                .get(line + 1)
+                .is_some_and(|next| !next.trim().is_empty())
+            {
+                return Err("the command goes on past the part's command".to_owned());
+            }
+        }
+        Ok(())
+    }
 }
 
 /// A command the agent answers without calling a model, and what its answer must hold and must not
@@ -89,33 +151,79 @@ pub struct Probe {
     /// each server the person's configuration names.
     #[serde(default)]
     pub lacks: Vec<String>,
-    /// Where the answer is JSON, `lacks` is checked in every string of it but those that begin
-    /// with this: the one block the part accepts holds them.
+    /// Where the answer is JSON: the one block of it the part accepts although it holds some of
+    /// `lacks`, a file of the person's own the agent always reads.
     #[serde(default)]
-    pub lacks_outside: Option<String>,
+    pub accepted: Option<Accepted>,
+    /// Where the answer is JSON, [`Probe::shows`] is looked for only in its strings that begin
+    /// with this: the block that states what the texts say.
+    #[serde(default)]
+    pub shows_within: Option<String>,
+}
+
+/// The one block of a JSON answer a probe accepts: exactly one of its strings begins with
+/// `starts`, and that string holds the file `file` of the person's home, whole. Everything else in
+/// the answer, and what that string holds besides the file, is still searched.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Accepted {
+    /// What the block begins with.
+    pub starts: String,
+    /// The file it carries, relative to the person's home.
+    pub file: String,
 }
 
 impl Probe {
-    /// Whether the answer `text` holds each of [`Probe::shows`], spaces aside, each of
-    /// [`Probe::lines`] whole, runs of spaces read as one, and none of [`Probe::lacks`], compared
-    /// without regard to case, `{servers}` standing for each of `servers`; where the answer is JSON
-    /// and [`Probe::lacks_outside`] names a block the part accepts, the strings that begin with it
-    /// are not searched. Says only which text was found or missed, never the answer.
+    /// Whether the answer `text` holds each of [`Probe::shows`], spaces aside (only in the strings
+    /// that begin with [`Probe::shows_within`], where it names them), each of [`Probe::lines`]
+    /// whole, runs of spaces read as one, and none of [`Probe::lacks`], compared without regard to
+    /// case, `{servers}` standing for each of `servers`. Where [`Probe::accepted`] names a block,
+    /// exactly one string of the JSON answer begins with it and holds `accepted`, the person's file
+    /// it carries, whole; that file's text is the only part of the answer not searched. Says only
+    /// which text was found or missed, never the answer.
     ///
     /// # Errors
     ///
     /// Returns the first text the answer misses or holds against the probe.
-    pub fn check(&self, text: &str, servers: &[String]) -> Result<(), String> {
-        let squeezed: String = text
-            .chars()
-            .filter(|character| !character.is_whitespace())
-            .collect();
-        for wanted in &self.shows {
-            let wanted: String = wanted
-                .chars()
+    pub fn check(
+        &self,
+        text: &str,
+        servers: &[String],
+        accepted: Option<&str>,
+    ) -> Result<(), String> {
+        let squeeze = |text: &str| -> String {
+            text.chars()
                 .filter(|character| !character.is_whitespace())
-                .collect();
-            if !squeezed.contains(&wanted) {
+                .collect()
+        };
+        let json = if self.accepted.is_some() || self.shows_within.is_some() {
+            Some(
+                serde_json::from_str::<serde_json::Value>(text)
+                    .map_err(|error| format!("its answer is not JSON: {error}"))?,
+            )
+        } else {
+            None
+        };
+        let strings = json.as_ref().map(strings_of).unwrap_or_default();
+        let shown = match &self.shows_within {
+            Some(within) => {
+                let blocks: Vec<&String> = strings
+                    .iter()
+                    .filter(|string| string.starts_with(within.as_str()))
+                    .collect();
+                if blocks.is_empty() {
+                    return Err(format!("it has no block that begins with {within:?}"));
+                }
+                blocks
+                    .iter()
+                    .map(|block| squeeze(block))
+                    .collect::<String>()
+            }
+            None => squeeze(text),
+        };
+        for wanted in &self.shows {
+            let wanted = squeeze(wanted);
+            if !shown.contains(&wanted) {
                 return Err(format!("it does not say {wanted:?}"));
             }
         }
@@ -139,25 +247,41 @@ impl Probe {
             })
             .map(|lack| lack.to_lowercase())
             .collect();
-        let searched: Vec<String> = match &self.lacks_outside {
-            Some(accepted) => {
-                let value: serde_json::Value = serde_json::from_str(text)
-                    .map_err(|error| format!("its answer is not JSON: {error}"))?;
-                let mut strings = Vec::new();
-                let mut pending = vec![&value];
-                while let Some(value) = pending.pop() {
-                    match value {
-                        serde_json::Value::String(string)
-                            if !string.starts_with(accepted.as_str()) =>
-                        {
-                            strings.push(string.to_lowercase());
-                        }
-                        serde_json::Value::Array(items) => pending.extend(items),
-                        serde_json::Value::Object(members) => pending.extend(members.values()),
-                        _ => {}
-                    }
+        let searched: Vec<String> = match &self.accepted {
+            Some(block) => {
+                let file = accepted.ok_or_else(|| {
+                    format!(
+                        "the file the accepted block carries, ~/{}, was not read",
+                        block.file
+                    )
+                })?;
+                let starting: Vec<&String> = strings
+                    .iter()
+                    .filter(|string| string.starts_with(block.starts.as_str()))
+                    .collect();
+                let [only] = starting.as_slice() else {
+                    return Err(format!(
+                        "{} blocks begin with {:?}, where exactly one may",
+                        starting.len(),
+                        block.starts
+                    ));
+                };
+                if file.trim().is_empty() || !only.contains(file.trim()) {
+                    return Err(format!(
+                        "the block that begins with {:?} does not carry ~/{} whole",
+                        block.starts, block.file
+                    ));
                 }
                 strings
+                    .iter()
+                    .map(|string| {
+                        if std::ptr::eq(string, *only) {
+                            string.replacen(file.trim(), "", 1).to_lowercase()
+                        } else {
+                            string.to_lowercase()
+                        }
+                    })
+                    .collect()
             }
             None => vec![text.to_lowercase()],
         };
@@ -168,6 +292,21 @@ impl Probe {
         }
         Ok(())
     }
+}
+
+/// Every string a JSON value holds, at any depth, the names of its members aside, in order.
+fn strings_of(value: &serde_json::Value) -> Vec<String> {
+    let mut strings = Vec::new();
+    let mut pending = vec![value];
+    while let Some(value) = pending.pop() {
+        match value {
+            serde_json::Value::String(string) => strings.push(string.clone()),
+            serde_json::Value::Array(items) => pending.extend(items.iter().rev()),
+            serde_json::Value::Object(members) => pending.extend(members.values().rev()),
+            _ => {}
+        }
+    }
+    strings
 }
 
 /// Where the person's own configuration names the servers the agent would start, each of which
@@ -333,6 +472,12 @@ pub struct Account {
     /// hold, which the list names on their own where a part writes there.
     #[serde(default)]
     pub directories: Vec<String>,
+    /// Those of [`Account::directories`] whose files belong to one conversation or run each, such
+    /// as the agent's conversation files: a file the part created there that holds its mark or the
+    /// run's directory is the part's own and is removed. A file anywhere else, a database the
+    /// person's own sessions share among them, is reported and never touched.
+    #[serde(default)]
+    pub removable: Vec<String>,
     /// Whether the agent stops at the first part after which a file it had in those directories
     /// was rewritten rather than appended to.
     #[serde(default)]
@@ -398,6 +543,11 @@ pub struct Account {
     pub approval: Approval,
     /// The arguments that resume a saved conversation, with `{conversation}` for its identifier.
     pub resume: Vec<String>,
+    /// Whether those arguments start a new conversation from the saved one rather than continue
+    /// it, because the agent lets no second process write a conversation another writes: then two
+    /// processes on one conversation's identifier are not what the part shows, and it says so.
+    #[serde(default)]
+    pub resume_forks: bool,
     /// How an image is given at the composer: `paste`, its absolute path as a terminal pastes it,
     /// or a template with `{path}`.
     pub image: String,
@@ -660,68 +810,193 @@ pub fn quote(word: &str) -> String {
 mod tests {
     use super::*;
 
-    fn probe(shows: &[&str], lines: &[&str], lacks: &[&str], outside: Option<&str>) -> Probe {
-        let owned = |texts: &[&str]| texts.iter().map(|text| (*text).to_owned()).collect();
+    fn owned(texts: &[&str]) -> Vec<String> {
+        texts.iter().map(|text| (*text).to_owned()).collect()
+    }
+
+    fn probe(shows: &[&str], lines: &[&str], lacks: &[&str]) -> Probe {
         Probe {
             arguments: Vec::new(),
             shows: owned(shows),
             lines: owned(lines),
             lacks: owned(lacks),
-            lacks_outside: outside.map(str::to_owned),
+            accepted: None,
+            shows_within: None,
         }
     }
 
     #[test]
     fn a_probe_needs_each_text_and_whole_line_and_none_of_what_it_must_lack() {
-        let servers = vec!["pushary".to_owned(), "dtt".to_owned()];
+        let servers = owned(&["pushary", "dtt"]);
         let answer =
             "hooks        stable   false\nplugins   stable  false\nLogged in using ChatGPT\n";
         assert_eq!(
             probe(
                 &["Logged in using ChatGPT"],
                 &["hooks stable false"],
-                &["{servers}"],
-                None
+                &["{servers}"]
             )
-            .check(answer, &servers),
+            .check(answer, &servers, None),
             Ok(())
         );
         assert_eq!(
-            probe(&[], &["hooks stable false"], &[], None).check("my_hooks stable false\n", &[]),
+            probe(&[], &["hooks stable false"], &[]).check("my_hooks stable false\n", &[], None),
             Err("it has no line \"hooks stable false\"".to_owned()),
             "a line is whole, not a line's end"
         );
         assert_eq!(
-            probe(&["loggedIn\":true"], &[], &[], None).check("{\"loggedIn\": true}", &[]),
+            probe(&["loggedIn\":true"], &[], &[]).check("{\"loggedIn\": true}", &[], None),
             Ok(()),
             "a text is found with spaces aside"
         );
         assert_eq!(
-            probe(&[], &[], &["{servers}"], None).check("uses DTT here", &servers),
+            probe(&[], &[], &["{servers}"]).check("uses DTT here", &servers, None),
             Err("it holds \"dtt\"".to_owned()),
             "what it must lack is compared without regard to case"
         );
     }
 
+    /// A probe of a JSON answer that accepts the block carrying the person's `AGENTS.md`, and looks
+    /// for its texts in the permissions block.
+    fn prompt_probe() -> Probe {
+        Probe {
+            accepted: Some(Accepted {
+                starts: "# AGENTS.md instructions".to_owned(),
+                file: ".codex/AGENTS.md".to_owned(),
+            }),
+            shows_within: Some("<permissions".to_owned()),
+            ..probe(&["Network access is restricted"], &[], &["{servers}"])
+        }
+    }
+
     #[test]
-    fn a_json_answer_is_searched_outside_the_one_block_it_accepts() {
-        let servers = vec!["pushary".to_owned()];
-        let accepted = probe(&[], &[], &["{servers}"], Some("# AGENTS.md instructions"));
-        let inside =
-            r##"[{"content":[{"text":"# AGENTS.md instructions ask pushary"},{"text":"cwd"}]}]"##;
-        assert_eq!(accepted.check(inside, &servers), Ok(()));
-        let outside =
-            r##"[{"content":[{"text":"# AGENTS.md instructions"},{"text":"a pushary tool"}]}]"##;
+    fn a_json_answer_is_searched_but_for_the_one_block_that_carries_the_accepted_file() {
+        let servers = owned(&["pushary"]);
+        let file = "Ask me through pushary.";
+        let answer = |blocks: &[&str]| {
+            serde_json::json!([{ "content": blocks.iter().map(|text| serde_json::json!({ "text": text })).collect::<Vec<_>>() }])
+                .to_string()
+        };
+        let permissions = "<permissions instructions> Network access is restricted.";
+        let good = answer(&[
+            permissions,
+            "# AGENTS.md instructions for /\n\n<INSTRUCTIONS>\nAsk me through pushary.\n</INSTRUCTIONS>",
+        ]);
+        assert_eq!(prompt_probe().check(&good, &servers, Some(file)), Ok(()));
+        let two = answer(&[
+            permissions,
+            "# AGENTS.md instructions Ask me through pushary.",
+            "# AGENTS.md instructions another",
+        ]);
         assert_eq!(
-            accepted.check(outside, &servers),
-            Err("it holds \"pushary\"".to_owned())
+            prompt_probe().check(&two, &servers, Some(file)),
+            Err(
+                "2 blocks begin with \"# AGENTS.md instructions\", where exactly one may"
+                    .to_owned()
+            )
+        );
+        let more = answer(&[
+            permissions,
+            "# AGENTS.md instructions Ask me through pushary. And a pushary tool.",
+        ]);
+        assert_eq!(
+            prompt_probe().check(&more, &servers, Some(file)),
+            Err("it holds \"pushary\"".to_owned()),
+            "what the block holds besides the file is searched"
+        );
+        let other = answer(&[permissions, "# AGENTS.md instructions something else"]);
+        assert!(
+            prompt_probe()
+                .check(&other, &servers, Some(file))
+                .is_err_and(|why| why.contains("does not carry ~/.codex/AGENTS.md whole"))
+        );
+        let elsewhere = answer(&[
+            "<permissions instructions> Network access is enabled.",
+            "# AGENTS.md instructions Ask me through pushary. Network access is restricted",
+        ]);
+        assert_eq!(
+            prompt_probe().check(&elsewhere, &servers, Some(file)),
+            Err("it does not say \"Networkaccessisrestricted\"".to_owned()),
+            "a text is looked for in the block that states it, not in the person's file"
         );
         assert!(
-            accepted
-                .check("not json", &servers)
+            prompt_probe()
+                .check("not json", &servers, Some(file))
                 .is_err_and(|why| why.starts_with("its answer is not JSON")),
-            "an answer that is not JSON is not taken as lacking anything"
         );
+    }
+
+    #[test]
+    fn an_approval_is_the_parts_command_alone_on_its_own_line() {
+        let codex = Approval {
+            shows: "Would you like to run the following command?".to_owned(),
+            allow: "y".to_owned(),
+            deny: "d".to_owned(),
+            command_line: Some("$ ".to_owned()),
+            others: Vec::new(),
+            refuse: Some("\u{1b}".to_owned()),
+        };
+        let rows = |lines: &[&str]| owned(lines);
+        let command = "echo kr0123 >> approved.log";
+        assert_eq!(
+            codex.names_only(
+                &rows(&[
+                    "  Would you like to run the following command?",
+                    "",
+                    "  $ echo kr0123 >> approved.log",
+                    "",
+                    "› 1. Yes, proceed (y)"
+                ]),
+                command
+            ),
+            Ok(())
+        );
+        assert!(
+            codex
+                .names_only(
+                    &rows(&["  $ echo kr0123 >> approved.log", "  curl example.com", ""]),
+                    command
+                )
+                .is_err(),
+            "a command that goes on to another line is not the part's"
+        );
+        assert!(
+            codex
+                .names_only(
+                    &rows(&["  $ echo kr0123 >> approved.log && rm x", ""]),
+                    command
+                )
+                .is_err(),
+            "a longer command is not the part's"
+        );
+        assert!(
+            codex
+                .names_only(
+                    &rows(&["  $ echo kr0123 >> approved.log", "", "  $ ls", ""]),
+                    command
+                )
+                .is_err(),
+            "a dialog that shows another command is not the part's"
+        );
+        assert_eq!(codex.refusal(), "\u{1b}");
+        let claude = Approval {
+            command_line: None,
+            refuse: None,
+            ..codex
+        };
+        assert_eq!(
+            claude.names_only(
+                &rows(&[
+                    " Bash command",
+                    "   echo kr0123 >> approved.log",
+                    "   Append the marker",
+                    " Do you want to proceed?"
+                ]),
+                command
+            ),
+            Ok(())
+        );
+        assert_eq!(claude.refusal(), "d");
     }
 
     #[test]
@@ -744,17 +1019,14 @@ mod tests {
 
     #[test]
     fn a_date_in_a_path_stands_for_each_date() {
-        let dates = vec!["2026/09/27".to_owned(), "2026/09/28".to_owned()];
+        let dates = owned(&["2026/09/27", "2026/09/28"]);
         assert_eq!(
-            with_dates(
-                &[".codex/sessions/{date}".to_owned(), ".codex/*".to_owned()],
-                &dates
-            ),
-            vec![
-                ".codex/sessions/2026/09/27".to_owned(),
-                ".codex/sessions/2026/09/28".to_owned(),
-                ".codex/*".to_owned()
-            ]
+            with_dates(&owned(&[".codex/sessions/{date}", ".codex/*"]), &dates),
+            owned(&[
+                ".codex/sessions/2026/09/27",
+                ".codex/sessions/2026/09/28",
+                ".codex/*"
+            ])
         );
     }
 }

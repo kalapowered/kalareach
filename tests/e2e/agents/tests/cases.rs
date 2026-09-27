@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use kr_client::cursors::StreamCursors;
 use kr_e2e_agents::account::{
-    Ledger, borrow_login_keychain, changes, conversation_id, files_holding, guarded_files,
+    Guarded, Ledger, borrow_login_keychain, changes, conversation_id, files_holding, guarded_files,
     key_from_descriptor, keychain_item_modified, now_ms, record_guarded, record_key_scan,
     remove_created, remove_marked_lines, snapshot, which_hold,
 };
@@ -84,6 +84,10 @@ const LOGIN_UNPROVEN: &str = "the agent's login is not established:";
 const ISOLATION_UNPROVEN: &str =
     "the agent's isolation from the person's own servers is not established:";
 
+/// How a part says a file of the person's that no part may change changed while it ran. A part
+/// that says so does nothing more, and its agent stops.
+const GUARD_CHANGED: &str = "a file of the person's that no part may change changed:";
+
 /// The directory of the run's own an agent keeps its configuration in, where its build list entry
 /// names one, in the run's directory.
 const CONFIG_DIRECTORY: &str = "agent-config";
@@ -116,14 +120,68 @@ struct Stage<'a, 'r> {
     /// model could have written: cleared by each charged request, set by its answer. A part that
     /// ends without passing while it is clear has no proof its login still holds.
     held: &'a std::sync::atomic::AtomicBool,
-    /// How many approvals the agent asked for that the part did not, each declined.
-    declined: &'a std::sync::atomic::AtomicU64,
+    /// Each request for approval the part refused, by what the agent asked: every one but the one
+    /// command part 3 names.
+    declined: &'a std::sync::Mutex<Vec<String>>,
+    /// The person's files no part may change, and those their own programs also write, as the
+    /// part found them before it started: checked again after the probes, once the agent is up,
+    /// before each prompt and approval, and after each wait.
+    guards: Option<&'a Guards>,
     /// The local dates `{date}` stands for in the build list's paths: the day the part started and
     /// the next.
     dates: &'a [String],
     /// What each probe that stands in for the vendor's model service found the agent offer its
     /// model: the tools' kinds and names, which say what of the person's own it loaded.
     offered: &'a std::sync::Mutex<Vec<serde_json::Value>>,
+}
+
+/// What a part's stage shares with the step that runs it, which reads each once the part is over:
+/// whether the closing check found nothing left, whether the login held, each request the part
+/// refused, the part's dates and the tools a probe found the agent offer its model.
+struct Shared<'a> {
+    closed: &'a std::sync::atomic::AtomicBool,
+    held: &'a std::sync::atomic::AtomicBool,
+    declined: &'a std::sync::Mutex<Vec<String>>,
+    dates: &'a [String],
+    offered: &'a std::sync::Mutex<Vec<serde_json::Value>>,
+}
+
+/// The person's files a part watches while it runs, as it found them before it started.
+struct Guards {
+    home: PathBuf,
+    /// Every file watched, relative to the home: those no part may change, those the person's
+    /// own programs also write, and those whose change is only recorded.
+    files: Vec<String>,
+    before: Vec<Guarded>,
+    guarded: Vec<String>,
+    shared: Vec<String>,
+}
+
+/// Stops the part at once when a file of the person's that no part may change has changed since the
+/// part started, or one the person's own programs also write has changed to hold the part's mark or
+/// the run's directory; or when either cannot be read.
+fn guards_hold(stage: &Stage<'_, '_>) {
+    let Some(guards) = stage.guards else {
+        return;
+    };
+    let root = stage.run.root().display().to_string();
+    let now = guarded_files(&guards.home, &guards.files, &[stage.mark, root.as_str()])
+        .unwrap_or_else(|why| panic!("{GUARD_CHANGED} {why}"));
+    for (first, second) in guards.before.iter().zip(&now) {
+        let changed = first.sha256 != second.sha256;
+        if changed && guards.guarded.contains(&first.relative) {
+            panic!(
+                "{GUARD_CHANGED} ~/{} changed while the part ran",
+                first.relative
+            );
+        }
+        if changed && second.holds && guards.shared.contains(&first.relative) {
+            panic!(
+                "{GUARD_CHANGED} ~/{} changed to hold the part's mark or the run's directory",
+                first.relative
+            );
+        }
+    }
 }
 
 /// The person's login as a part that needs it holds it: how the agent runs with it, the budget its
@@ -280,12 +338,22 @@ fn staged(
             .map(|service| keychain_item_modified(&login.person_home, service));
         (files, before, item)
     });
+    let guards = login
+        .as_ref()
+        .zip(watched.as_ref())
+        .map(|(login, (files, before, _))| Guards {
+            home: login.person_home.clone(),
+            files: files.clone(),
+            before: before.clone(),
+            guarded: login.account.guarded.clone(),
+            shared: login.account.shared.clone(),
+        });
     let run = Run::start(&format!("part {part}"));
     let root = run.root().to_path_buf();
     let provenance = Provenance::new(&inputs.build, &run, &shell, part);
     let closed = std::sync::atomic::AtomicBool::new(false);
     let held = std::sync::atomic::AtomicBool::new(false);
-    let declined = std::sync::atomic::AtomicU64::new(0);
+    let declined = std::sync::Mutex::new(Vec::new());
     let offered = std::sync::Mutex::new(Vec::new());
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         run_part(
@@ -297,7 +365,14 @@ fn staged(
             &runtime,
             &run,
             &provenance,
-            (&closed, &held, &declined, &dates, &offered),
+            Shared {
+                closed: &closed,
+                held: &held,
+                declined: &declined,
+                dates: &dates,
+                offered: &offered,
+            },
+            guards.as_ref(),
             body,
         )
     }));
@@ -320,8 +395,24 @@ fn staged(
     } else {
         Ok(())
     };
+    let removable: Vec<PathBuf> = login
+        .as_ref()
+        .map(|login| {
+            with_dates(&login.account.removable, &dates)
+                .iter()
+                .map(|relative| login.person_home.join(relative))
+                .collect()
+        })
+        .unwrap_or_default();
     let home = login.as_ref().zip(person.as_ref()).map(|(login, before)| {
-        person_home_report(login, before, &directories, &mark, &root, writers.is_ok())
+        person_home_report(
+            login,
+            before,
+            (&directories, &removable),
+            &mark,
+            &root,
+            writers.is_ok(),
+        )
     });
     let scan = login
         .as_ref()
@@ -474,12 +565,33 @@ fn staged(
             // numbers its sessions ran, and whether its agent stops, before its failure goes on.
             if needs_login {
                 let said = panic_text(&*panic);
-                if said.starts_with(LOGIN_UNPROVEN) || said.starts_with(ISOLATION_UNPROVEN) {
+                if said.starts_with(LOGIN_UNPROVEN)
+                    || said.starts_with(ISOLATION_UNPROVEN)
+                    || said.starts_with(GUARD_CHANGED)
+                {
                     stop.push(said.clone());
                 }
                 let mut evidence = serde_json::Map::new();
                 evidence.insert("provenance".to_owned(), provenance.evidence());
                 evidence.insert("login_held".to_owned(), json!(login_held));
+                evidence.insert(
+                    "declined_requests".to_owned(),
+                    json!(
+                        declined
+                            .lock()
+                            .map(|declined| declined.clone())
+                            .unwrap_or_default()
+                    ),
+                );
+                evidence.insert(
+                    "tools_offered".to_owned(),
+                    json!(
+                        offered
+                            .lock()
+                            .map(|offered| offered.clone())
+                            .unwrap_or_default()
+                    ),
+                );
                 if let Some(watched) = &watched_evidence {
                     evidence.insert("person_files".to_owned(), watched.clone());
                 }
@@ -575,7 +687,7 @@ fn hand_over(provenance: &Provenance, run: &Run) {
 fn person_home_report(
     login: &Login,
     before: &kr_e2e_agents::account::Snapshot,
-    directories: &[String],
+    (directories, removable): (&[String], &[PathBuf]),
     mark: &str,
     root: &Path,
     settled: bool,
@@ -584,7 +696,7 @@ fn person_home_report(
     let found = changes(before, &after);
     let root = root.display().to_string();
     let (removed, left) = if after.whole() && settled {
-        remove_created(before, &found, &[mark, &root])
+        remove_created(before, &found, &[mark, &root], removable)
     } else {
         (Vec::new(), found.created.clone())
     };
@@ -647,13 +759,14 @@ fn run_part(
     runtime: &tokio::runtime::Runtime,
     run: &Run,
     provenance: &Provenance,
-    (closed, held, declined, dates, offered): (
-        &std::sync::atomic::AtomicBool,
-        &std::sync::atomic::AtomicBool,
-        &std::sync::atomic::AtomicU64,
-        &[String],
-        &std::sync::Mutex<Vec<serde_json::Value>>,
-    ),
+    Shared {
+        closed,
+        held,
+        declined,
+        dates,
+        offered,
+    }: Shared<'_>,
+    guards: Option<&Guards>,
     body: impl FnOnce(&mut Stage<'_, '_>) -> Ending,
 ) -> Outcome {
     // Before anything starts in the run's home: a keychain of its own, its default there, or, for
@@ -707,6 +820,7 @@ fn run_part(
                 declined,
                 dates,
                 offered,
+                guards,
             };
             body(&mut stage)
         };
@@ -1202,6 +1316,7 @@ impl Logged {
                 rows.join("\n")
             );
         }
+        guards_hold(stage);
         logged
     }
 
@@ -1273,6 +1388,7 @@ impl Logged {
     /// [`Logged::submit`] with `key` in place of the submit key: the key that queues a prompt
     /// behind a running turn, where the agent has one of its own.
     fn submit_with(&mut self, stage: &Stage<'_, '_>, text: &str, what: &str, key: &str) {
+        guards_hold(stage);
         let login = stage.login.expect("a part with a login");
         let _ = login
             .ledger
@@ -1293,6 +1409,80 @@ impl Logged {
         let rows = self.wait_for(stage, needle, why);
         stage.held.store(true, std::sync::atomic::Ordering::SeqCst);
         rows
+    }
+
+    /// The texts of every permission dialog the agent raises: its command dialog first.
+    fn dialogs(account: &Account) -> Vec<&str> {
+        std::iter::once(account.approval.shows.as_str())
+            .chain(account.approval.others.iter().map(String::as_str))
+            .collect()
+    }
+
+    /// Refuses the dialog showing `shown`, which asks for something the part does not allow, and
+    /// records it: a command with the agent's own key that declines a command, anything else with
+    /// the key that refuses any request without the agent keeping a rule from it; then waits the
+    /// dialog out, before the part goes on.
+    fn refuse(&mut self, stage: &Stage<'_, '_>, shown: &str, why: &str) {
+        let account = stage.login.expect("a part with a login").account();
+        let key = if shown == account.approval.shows {
+            account.approval.deny.clone()
+        } else {
+            account.approval.refusal().to_owned()
+        };
+        self.type_text(stage, &key);
+        if let Ok(mut declined) = stage.declined.lock() {
+            declined.push(format!(
+                "{why}: a dialog showing {shown:?}, refused with {key:?}"
+            ));
+        }
+        let started = std::time::Instant::now();
+        while started.elapsed() < Duration::from_secs(10)
+            && self
+                .screen
+                .view
+                .rows()
+                .iter()
+                .any(|row| row.contains(shown))
+        {
+            self.screen.pump(stage, Duration::from_millis(200));
+        }
+    }
+
+    /// Waits for the agent's command dialog asking to run `command` and nothing else, and returns
+    /// its screen, taking the dialog as the vendor having answered, since only the model asks for
+    /// a tool. Every other request is refused and recorded as it comes; a part that has refused
+    /// three stops there.
+    fn approval_for(&mut self, stage: &Stage<'_, '_>, command: &str, why: &str) -> Vec<String> {
+        let account = stage.login.expect("a part with a login").account();
+        let dialogs = Self::dialogs(account);
+        let mut refused = 0;
+        loop {
+            let (index, rows) = self
+                .screen
+                .wait_for_any(stage, &self.agent.session, &dialogs, why);
+            if index == 0 {
+                match account.approval.names_only(&rows, command) {
+                    Ok(()) => {
+                        stage.held.store(true, std::sync::atomic::Ordering::SeqCst);
+                        guards_hold(stage);
+                        return rows;
+                    }
+                    Err(what) => self.refuse(
+                        stage,
+                        dialogs[index],
+                        &format!("a command other than the part's: {what}"),
+                    ),
+                }
+            } else {
+                self.refuse(stage, dialogs[index], "a request the part did not make");
+            }
+            refused += 1;
+            assert!(
+                refused < 3,
+                "{why}: the agent asked for {refused} things other than the part's command, each \
+                 refused"
+            );
+        }
     }
 
     /// Waits until the composer waits for a prompt: the device's view shows the composer and not
@@ -1325,33 +1515,17 @@ impl Logged {
     fn wait_for(&mut self, stage: &Stage<'_, '_>, needle: &str, why: &str) -> Vec<String> {
         let waited = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let account = stage.login.expect("a part with a login").account();
-            let approval = account.approval.shows.clone();
+            let mut needles = vec![needle];
+            needles.extend(Self::dialogs(account));
             loop {
-                let (index, rows) = self.screen.wait_for_any(
-                    stage,
-                    &self.agent.session,
-                    &[needle, approval.as_str()],
-                    why,
-                );
+                let (index, rows) =
+                    self.screen
+                        .wait_for_any(stage, &self.agent.session, &needles, why);
                 if index == 0 {
+                    guards_hold(stage);
                     return rows;
                 }
-                // Declined, and the dialog waited out, before the wait goes on.
-                self.type_text(stage, &account.approval.deny);
-                stage
-                    .declined
-                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                let started = std::time::Instant::now();
-                while started.elapsed() < Duration::from_secs(10)
-                    && self
-                        .screen
-                        .view
-                        .rows()
-                        .iter()
-                        .any(|row| row.contains(approval.as_str()))
-                {
-                    self.screen.pump(stage, Duration::from_millis(200));
-                }
+                self.refuse(stage, needles[index], "a request the part did not make");
             }
         }));
         waited.unwrap_or_else(|panic| {
@@ -1447,7 +1621,8 @@ fn keychain_readable_in_a_session(stage: &Stage<'_, '_>, variables: &[(String, S
 /// but for the tools a probe that stands in for the vendor's model service found offered, which
 /// the part records.
 fn login_holds(stage: &Stage<'_, '_>, variables: &[(String, String)]) {
-    let account = stage.login.expect("a part with a login").account();
+    let login = stage.login.expect("a part with a login");
+    let account = login.account();
     let switches = switches_of(stage);
     let servers = server_names(stage);
     let answered = |probe: &kr_e2e_agents::build::Probe| -> Result<(), String> {
@@ -1481,27 +1656,59 @@ fn login_holds(stage: &Stage<'_, '_>, variables: &[(String, String)]) {
             .current_dir(stage.run.work())
             .stdin(std::process::Stdio::null());
         let output = output_within(command, LIVENESS)?;
-        let text = match stub {
+        let accepted = match &probe.accepted {
+            Some(block) => Some(
+                std::fs::read_to_string(login.person_home.join(&block.file))
+                    .map_err(|error| format!("~/{}: {error}", block.file))?,
+            ),
+            None => None,
+        };
+        match stub {
             // The stub refused the request on purpose, so how the command ended says nothing; what
-            // the request offered is the answer.
+            // the request offered is the answer. The same check is shown one more tool, named for
+            // the first text the answer must lack, and must refuse it.
             Some(stub) => {
                 let tools = stub.finish()?;
+                let text = tools.join("\n");
+                probe.check(&text, &servers, accepted.as_deref())?;
+                let lacking = probe
+                    .lacks
+                    .iter()
+                    .find_map(|lack| {
+                        if lack == "{servers}" {
+                            servers.first().cloned()
+                        } else {
+                            Some(lack.clone())
+                        }
+                    })
+                    .unwrap_or_default();
+                let control = format!("{text}\nnested control/{lacking}");
+                let rejected = !lacking.is_empty()
+                    && probe
+                        .check(&control, &servers, accepted.as_deref())
+                        .is_err();
                 stage
                     .offered
                     .lock()
                     .map_err(|_| "the offered tools' record is poisoned".to_owned())?
-                    .push(json!({ "probe": probe.arguments, "tools": tools }));
-                tools.join("\n")
+                    .push(json!({ "probe": probe.arguments, "tools": tools, "control": { "added": format!("nested control/{lacking}"), "rejected": rejected } }));
+                if rejected {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "its check did not refuse a tool named for {lacking:?}, added on purpose"
+                    ))
+                }
             }
             None => {
                 if !output.status.success() {
                     return Err(format!("it exited {}", output.status));
                 }
-                String::from_utf8_lossy(&output.stdout).into_owned()
-                    + &String::from_utf8_lossy(&output.stderr)
+                let text = String::from_utf8_lossy(&output.stdout).into_owned()
+                    + &String::from_utf8_lossy(&output.stderr);
+                probe.check(&text, &servers, accepted.as_deref())
             }
-        };
-        probe.check(&text, &servers)
+        }
     };
     if let Some(status) = &account.status {
         answered(status).unwrap_or_else(|why| {
@@ -1525,10 +1732,12 @@ fn login_holds(stage: &Stage<'_, '_>, variables: &[(String, String)]) {
         assert!(
             !path.exists(),
             "{ISOLATION_UNPROVEN} {} exists, which would load the person's own settings, hooks or \
-             servers into the agent",
+             servers into the agent, or which it would remove",
             path.display()
         );
     }
+    // The probes may not have changed anything of the person's either.
+    guards_hold(stage);
 }
 
 /// The servers the person's configuration names, where the build list says where: each section
@@ -1588,10 +1797,11 @@ fn switches_of(stage: &Stage<'_, '_>) -> Vec<String> {
 }
 
 /// The files the build list says must not exist before the agent starts, with `{config}` and
-/// `{work}` made the run's configuration and working directories and `{user}` the account name the
-/// system has for the person, as `id -un` says it.
+/// `{work}` made the run's configuration and working directories, `{home}` the home the agent runs
+/// with, and `{user}` the account name the system has for the person, as `id -un` says it.
 fn absent_paths(stage: &Stage<'_, '_>) -> Vec<PathBuf> {
     let account = stage.login.expect("a part with a login").account();
+    let home = login_home(stage).display().to_string();
     let config = stage
         .run
         .root()
@@ -1617,6 +1827,7 @@ fn absent_paths(stage: &Stage<'_, '_>) -> Vec<PathBuf> {
             PathBuf::from(
                 path.replace("{config}", &config)
                     .replace("{work}", &work)
+                    .replace("{home}", &home)
                     .replace("{user}", &user),
             )
         })
@@ -1732,11 +1943,11 @@ fn account_evidence(stage: &Stage<'_, '_>, turns: u64) -> serde_json::Value {
         "variable": login.account.variable,
         "arguments": login.account.arguments,
         "turns": turns,
-        "declined_requests": stage.declined.load(std::sync::atomic::Ordering::SeqCst),
+        "declined_requests": stage.declined.lock().map(|declined| declined.clone()).unwrap_or_default(),
         "budget_spent": login.ledger.spent().ok(),
         "budget_limit": login.ledger.limit(),
         "isolation": {
-            "probes": login.account.isolated.iter().map(|probe| json!({ "command": probe.arguments, "shows": probe.shows, "lines": probe.lines, "lacks": probe.lacks, "outside": probe.lacks_outside })).collect::<Vec<_>>(),
+            "probes": login.account.isolated.iter().map(|probe| json!({ "command": probe.arguments, "shows": probe.shows, "lines": probe.lines, "lacks": probe.lacks, "accepted": probe.accepted.as_ref().map(|block| json!({ "starts": block.starts, "file": block.file })), "shows_within": probe.shows_within })).collect::<Vec<_>>(),
             "tools_offered": stage.offered.lock().map(|offered| offered.clone()).unwrap_or_default(),
             "switches": switches_of(stage),
             "servers_switched_off": server_names(stage),
@@ -3965,17 +4176,15 @@ fn a_local_and_a_remote_answer_raced_to_one_approval_resolve_it_once() {
         let detected = check_detected(&launched(stage, &logged.agent), &shown);
         let mark = stage.mark.to_owned();
         let log = stage.run.work().join("approved.log");
+        let command = format!("echo {mark} >> approved.log");
         logged.submit(
             stage,
-            &format!("Use your shell tool to run exactly this command and nothing else: echo {mark} >> approved.log"),
+            &format!("Use your shell tool to run exactly this command and nothing else: {command}"),
             "an approval-gated command",
         );
-        // Only the model asks for a tool, so the dialog says the vendor answered.
-        let _ = logged.answered(
-            stage,
-            &account.approval.shows,
-            "the agent asks for approval",
-        );
+        // Only the model asks for a tool, so the dialog says the vendor answered; it is answered
+        // only when it asks to run the part's command and nothing else.
+        let _ = logged.approval_for(stage, &command, "the agent asks for approval");
         // The race: the local terminal denies and, at once, the device, which holds the lease,
         // allows. The local key is written to its terminal first; the lease decides.
         logged
@@ -4549,25 +4758,36 @@ fn a_second_process_on_the_same_saved_conversation_is_another_execution_not_merg
             "account": account_evidence(stage, first.turns + second.turns),
             "conversation": conversation,
             "session_a": { "detection": shown_first.detection.evidence(), "detected": detected_evidence(&detected_first), "owners": owners(&first) },
-            "session_b": { "detection": shown_second.detection.evidence(), "detected": detected_evidence(&detected_second), "owners": owners(&second), "resumed_with": resume },
+            "session_b": { "detection": shown_second.detection.evidence(), "detected": detected_evidence(&detected_second), "owners": owners(&second), "resumed_with": resume, "same_conversation": !account.resume_forks },
             "control": { "what": "session B's marker typed into session A", "breaks_property": true, "isolated": control },
         });
-        let outcome = match (&detected_first, &detected_second) {
-            (Ok(_), Ok(_)) => Outcome::passed("7", TEST, evidence),
-            (first_result, second_result) => Outcome::failed(
-                "7",
-                TEST,
-                &format!(
-                    "the host did not detect each launch as section 12 requires: A {}, B {}",
-                    first_result
-                        .as_ref()
-                        .map_or_else(Clone::clone, |_| "detected".to_owned()),
-                    second_result
-                        .as_ref()
-                        .map_or_else(Clone::clone, |_| "detected".to_owned())
-                ),
-                evidence,
-            ),
+        // Where the agent forks a saved conversation for a second process, the part shows two
+        // executions from one saved history, not two on one conversation's identifier.
+        let mut failures = Vec::new();
+        if let (Ok(_), Ok(_)) = (&detected_first, &detected_second) {
+        } else {
+            failures.push(format!(
+                "the host did not detect each launch as section 12 requires: A {}, B {}",
+                detected_first
+                    .as_ref()
+                    .map_or_else(Clone::clone, |_| "detected".to_owned()),
+                detected_second
+                    .as_ref()
+                    .map_or_else(Clone::clone, |_| "detected".to_owned())
+            ));
+        }
+        if account.resume_forks {
+            failures.push(
+                "the agent lets no second process write a conversation another process writes, so \
+                 session B forked the saved conversation under a new identifier: two executions on \
+                 one conversation's identifier were not shown"
+                    .to_owned(),
+            );
+        }
+        let outcome = if failures.is_empty() {
+            Outcome::passed("7", TEST, evidence)
+        } else {
+            Outcome::failed("7", TEST, &failures.join("; "), evidence)
         };
         let mut sessions = first.agent.sessions();
         sessions.extend(second.agent.sessions());
