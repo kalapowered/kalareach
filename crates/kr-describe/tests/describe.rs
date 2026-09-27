@@ -687,10 +687,10 @@ fn privacy_mode_fences_cancels_and_removes_generated_text_and_keeps_pins() {
     let enabling = {
         let mut hook = service.privacy(session(3));
         let enabling = mode.apply(&mut [&mut hook], TimestampMs::new(1));
+        assert!(enabling.is_finished());
         assert!(hook.failure().is_none());
-        assert_eq!(hook.pins_kept(), 1);
-        assert_eq!(hook.kept().len(), 1);
-        assert!(hook.exported().is_empty());
+        assert_eq!(hook.kept().len(), 1, "the pin is named as kept");
+        assert!(hook.exported().expect("a list").is_empty());
         enabling
     };
     assert_eq!(enabling.fenced[0].1.queues, 1);
@@ -808,12 +808,14 @@ fn in_flight_work_keeps_reconciliation_outstanding() {
             &running,
             &debt,
         );
-        let cancelled = hook.cancel_undispatched(PrivacyGeneration::new(1));
+        let cancelled = hook
+            .cancel_undispatched(PrivacyGeneration::new(1))
+            .expect("nothing refuses a cancellation here");
         assert_eq!(
             cancelled.in_flight, 2,
             "one session's in-flight work is not another's"
         );
-        assert_eq!(hook.outstanding(), 2);
+        assert_eq!(hook.outstanding(), Ok(2));
         assert!(matches!(
             PrivacyMode::reconcile(&[&hook]),
             PrivacyCompletion::Reconciling { .. }
@@ -833,7 +835,7 @@ fn in_flight_work_keeps_reconciliation_outstanding() {
             &running,
             &debt,
         );
-        assert_eq!(hook.outstanding(), 0);
+        assert_eq!(hook.outstanding(), Ok(0));
         assert_eq!(
             PrivacyMode::reconcile(&[&hook]),
             PrivacyCompletion::Complete
@@ -845,7 +847,7 @@ fn in_flight_work_keeps_reconciliation_outstanding() {
     assert_eq!(in_flight.get(&session(1)), 0);
 }
 
-/// KR-REQ-22.17: cleanup this host could not finish stays outstanding however often it is asked.
+/// KR-REQ-22.17: cleanup this host could not finish stays unavailable however often it is asked.
 ///
 /// The debt belongs to the service rather than to the hook. A debt that lived on the hook would
 /// disappear the moment privacy mode built another one, and the next reconciliation would report
@@ -872,10 +874,13 @@ fn a_cleanup_that_could_not_finish_stays_outstanding_across_hooks() {
             &running,
             &debt,
         );
-        assert_eq!(hook.outstanding(), 1);
+        assert!(
+            hook.outstanding().is_err(),
+            "an unfinished removal is in the way"
+        );
         assert!(matches!(
             PrivacyMode::reconcile(&[&hook]),
-            PrivacyCompletion::Reconciling { .. }
+            PrivacyCompletion::Unavailable { .. }
         ));
     }
 
@@ -891,10 +896,130 @@ fn a_cleanup_that_could_not_finish_stays_outstanding_across_hooks() {
         &running,
         &debt,
     );
-    assert_eq!(hook.outstanding(), 1);
-    hook.remove_retained(PrivacyGeneration::new(1));
-    assert_eq!(hook.outstanding(), 0);
+    assert!(hook.outstanding().is_err());
+    hook.remove_retained(PrivacyGeneration::new(1))
+        .expect("the store accepts the removal");
+    assert_eq!(hook.outstanding(), Ok(0));
     assert!(debt.is_empty());
+}
+
+/// KR-REQ-22.17: a removal the store refuses answers with the store's reason and leaves a debt on
+/// the service, so a hook built afterwards still reports it; a later removal at the same
+/// generation that succeeds is the only thing that clears it.
+#[test]
+fn a_refused_removal_is_retried_by_a_new_hook_at_the_same_generation() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let store = DescriptionStore::open(directory.path()).expect("a store");
+    // A generated description to remove, since the store's refusal is one per row it would delete.
+    store
+        .publish(
+            &session(1),
+            &kr_describe::output::GeneratedDescription {
+                title: Title::new("kalareach").expect("a title"),
+                activity: kr_describe::metadata::ActivityText::new("Builds the host")
+                    .expect("an activity"),
+                cursor: CursorInterval::new(0, 10),
+                revision: ContextRevision::new(1),
+                produced_under: ProducedUnder {
+                    session_epoch: SessionEpoch::V1,
+                    binding: kr_describe::context::ContextBinding::new(
+                        "desktop-1/terminal/epoch-1",
+                    ),
+                    context_revision: ContextRevision::new(1),
+                    cursor: CursorInterval::new(0, 10),
+                    profile_id: "test-profile".to_owned(),
+                    profile_revision: ProfileRevision::new(1),
+                    generation: PrivacyGeneration::INITIAL,
+                },
+            },
+            1_000,
+        )
+        .expect("a generated description");
+    let other = rusqlite::Connection::open(directory.path().join("descriptions.sqlite3"))
+        .expect("the same store");
+    other
+        .execute_batch(
+            "CREATE TRIGGER refuse_the_removal BEFORE DELETE ON describe_generated
+             BEGIN SELECT RAISE(ABORT, 'this store refused the removal'); END;",
+        )
+        .expect("the store will refuse the removal");
+    let fence = DescriptionFence::new();
+    let in_flight = InFlight::new();
+    let running = RunningJob::new();
+    let debt = CleanupDebt::new();
+    let mut scheduler = Scheduler::new(Budgets::DEFAULTS);
+    let mut mode = PrivacyMode::new();
+    mode.open_generation(TimestampMs::new(1));
+
+    let enabling = {
+        let mut hook = DescriptionPrivacy::over(
+            session(1),
+            &fence,
+            &mut scheduler,
+            None,
+            None,
+            &store,
+            &in_flight,
+            &running,
+            &debt,
+        );
+        mode.apply(&mut [&mut hook], TimestampMs::new(1))
+    };
+    let unfinished = enabling
+        .unfinished("descriptions")
+        .expect("the removal was refused");
+    assert!(
+        unfinished
+            .unavailable
+            .reason()
+            .contains("refused the removal"),
+        "{}",
+        unfinished.unavailable
+    );
+    assert!(
+        debt.owed(&session(1)).is_some(),
+        "the service keeps the debt"
+    );
+
+    // A new hook still reports it, for as long as the store refuses.
+    {
+        let hook = DescriptionPrivacy::over(
+            session(1),
+            &fence,
+            &mut scheduler,
+            None,
+            None,
+            &store,
+            &in_flight,
+            &running,
+            &debt,
+        );
+        assert!(matches!(
+            PrivacyMode::reconcile(&[&hook]),
+            PrivacyCompletion::Unavailable { .. }
+        ));
+    }
+
+    other
+        .execute_batch("DROP TRIGGER refuse_the_removal")
+        .expect("the store accepts the removal");
+    let enabling = {
+        let mut hook = DescriptionPrivacy::over(
+            session(1),
+            &fence,
+            &mut scheduler,
+            None,
+            None,
+            &store,
+            &in_flight,
+            &running,
+            &debt,
+        );
+        mode.apply(&mut [&mut hook], TimestampMs::new(1))
+    };
+    assert!(enabling.is_finished());
+    assert!(debt.is_empty());
+    assert!(store.generated(&session(1)).expect("a read").is_none());
 }
 
 /// KR-REQ-22.17: a session made private while its job is running has its result refused.
@@ -985,7 +1110,8 @@ fn a_private_session_captures_no_context_at_all() {
 
     // The cleanup forgets what was captured before the fence, so nothing crosses the boundary.
     let mut hook = service.privacy(session(1));
-    hook.remove_retained(PrivacyGeneration::new(1));
+    hook.remove_retained(PrivacyGeneration::new(1))
+        .expect("the store accepts the removal");
     service.fence().lower(&session(1));
     service.observe(
         &session(1),

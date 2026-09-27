@@ -27,6 +27,7 @@
 
 use kr_worker::privacy::{
     Cancelled, Exported, Fenced, KeptExplicitly, PrivacyGeneration, PrivacySubsystem, Removed,
+    Unavailable,
 };
 
 use crate::journal::DeliveryJournal;
@@ -35,12 +36,12 @@ use crate::journal::DeliveryJournal;
 ///
 /// It borrows the journal rather than owning it, which is the privacy contract's own shape: the
 /// caller holds the subsystems and drives them, so the one that reports its own cleanup is still
-/// reachable after the enabling that started it.
+/// reachable after the enabling that started it. It keeps no memory of a failed step: each step
+/// answers with the journal's reason, and the caller keeps it until the step succeeds.
 #[derive(Debug)]
 pub struct DeliveryOutbox<'a> {
     journal: &'a mut DeliveryJournal,
     now_ms: u64,
-    failure: Option<String>,
 }
 
 impl<'a> DeliveryOutbox<'a> {
@@ -50,25 +51,13 @@ impl<'a> DeliveryOutbox<'a> {
     /// receipt stamped with one would say a cancellation happened in 1970.
     #[must_use]
     pub fn over(journal: &'a mut DeliveryJournal, now_ms: u64) -> Self {
-        Self {
-            journal,
-            now_ms,
-            failure: None,
-        }
+        Self { journal, now_ms }
     }
+}
 
-    /// Returns why a step could not finish, when one could not.
-    ///
-    /// A failure here keeps [`PrivacySubsystem::outstanding`] above nought, so cleanup does not
-    /// report complete over content it did not manage to remove.
-    #[must_use]
-    pub fn failure(&self) -> Option<&str> {
-        self.failure.as_deref()
-    }
-
-    fn record(&mut self, what: &str, error: &crate::DeliveryError) {
-        self.failure = Some(format!("{what}: {error}"));
-    }
+/// Says what a step could not do, with the journal's own reason.
+fn unavailable(what: &str, error: &crate::DeliveryError) -> Unavailable {
+    Unavailable::new(format!("{what}: {error}"))
 }
 
 impl PrivacySubsystem for DeliveryOutbox<'_> {
@@ -76,44 +65,42 @@ impl PrivacySubsystem for DeliveryOutbox<'_> {
         "delivery"
     }
 
-    fn fence(&mut self, generation: PrivacyGeneration) -> Fenced {
-        match self.journal.fence(generation.get()) {
-            Ok((queues, items)) => Fenced { queues, items },
-            Err(error) => {
-                // A fence this host could not record is a fence it is not in. Saying so is what
-                // stops privacy mode reporting that the queue was stopped.
-                self.record("the delivery outbox could not be fenced", &error);
-                Fenced::default()
-            }
-        }
+    fn fence(&mut self, generation: PrivacyGeneration) -> Result<Fenced, Unavailable> {
+        // A fence this host could not record is a fence it is not in, and the answer says so
+        // rather than reporting that the queue was stopped.
+        self.journal
+            .fence(generation.get())
+            .map(|(queues, items)| Fenced { queues, items })
+            .map_err(|error| unavailable("the delivery outbox could not be fenced", &error))
     }
 
-    fn cancel_undispatched(&mut self, _generation: PrivacyGeneration) -> Cancelled {
-        match self.journal.cancel_undispatched(self.now_ms) {
-            Ok((undispatched, in_flight)) => Cancelled {
+    fn cancel_undispatched(
+        &mut self,
+        _generation: PrivacyGeneration,
+    ) -> Result<Cancelled, Unavailable> {
+        self.journal
+            .cancel_undispatched(self.now_ms)
+            .map(|(undispatched, in_flight)| Cancelled {
                 undispatched,
                 in_flight,
-            },
-            Err(error) => {
-                self.record("admitted deliveries could not be taken back", &error);
-                Cancelled::default()
-            }
-        }
+            })
+            .map_err(|error| unavailable("admitted deliveries could not be taken back", &error))
     }
 
-    fn remove_retained(&mut self, _generation: PrivacyGeneration) -> Removed {
-        match self.journal.remove_retained() {
-            Ok((bytes, records)) => Removed { bytes, records },
-            Err(error) => {
-                self.record("queued content could not be removed", &error);
-                Removed::default()
-            }
-        }
+    fn remove_retained(&mut self, _generation: PrivacyGeneration) -> Result<Removed, Unavailable> {
+        self.journal
+            .remove_retained()
+            .map(|(bytes, records)| Removed { bytes, records })
+            .map_err(|error| unavailable("queued content could not be removed", &error))
     }
 
-    fn outstanding(&self) -> u64 {
-        let queued = self.journal.outstanding().unwrap_or(1);
-        queued.saturating_add(u64::from(self.failure.is_some()))
+    fn outstanding(&self) -> Result<u64, Unavailable> {
+        self.journal.outstanding().map_err(|error| {
+            unavailable(
+                "the delivery journal cannot say what is outstanding",
+                &error,
+            )
+        })
     }
 
     fn kept(&self) -> Vec<KeptExplicitly> {
@@ -133,10 +120,14 @@ impl PrivacySubsystem for DeliveryOutbox<'_> {
         ]
     }
 
-    fn exported(&self) -> Vec<Exported> {
-        self.journal
-            .exported()
-            .unwrap_or_default()
+    fn exported(&self) -> Result<Vec<Exported>, Unavailable> {
+        let copies = self.journal.exported().map_err(|error| {
+            unavailable(
+                "the delivery journal cannot list what has left this host",
+                &error,
+            )
+        })?;
+        Ok(copies
             .into_iter()
             .map(|exported| Exported {
                 kind: exported.kind,
@@ -144,7 +135,7 @@ impl PrivacySubsystem for DeliveryOutbox<'_> {
                 left_at_ms: exported.left_at_ms,
                 deletable: exported.deletable,
             })
-            .collect()
+            .collect())
     }
 }
 
@@ -227,6 +218,22 @@ mod tests {
 
     fn journal_with_work() -> DeliveryJournal {
         let mut journal = DeliveryJournal::in_memory().expect("a journal");
+        fill(&mut journal);
+        journal
+    }
+
+    /// A journal on the internal disk, so a second connection can reach its store.
+    fn journal_on_disk_with_work(
+        directory: &tempfile::TempDir,
+    ) -> (DeliveryJournal, std::path::PathBuf) {
+        let path = directory.path().join("delivery.sqlite3");
+        let mut journal = DeliveryJournal::open(&path).expect("a journal");
+        fill(&mut journal);
+        (journal, path)
+    }
+
+    /// Three deliveries admitted to the webhook and never dispatched.
+    fn fill(journal: &mut DeliveryJournal) {
         journal
             .register_consumer(&consumer(), 1)
             .expect("registration");
@@ -267,7 +274,6 @@ mod tests {
                 })
                 .expect("admitted");
         }
-        journal
     }
 
     #[test]
@@ -292,7 +298,7 @@ mod tests {
             .expect("it reported its cancellation");
         assert_eq!(cancelled.1.undispatched, 3);
         assert_eq!(cancelled.1.in_flight, 0);
-        assert!(outbox.failure().is_none());
+        assert!(enabling.is_finished());
         assert!(
             journal.due(50_000, 10).expect("a read").is_empty(),
             "nothing is offered to a sender after the fence"
@@ -355,7 +361,9 @@ mod tests {
             DeliveryState::DuplicateUncertain,
             "it is marked as having left rather than taken back"
         );
-        let exported = DeliveryOutbox::over(&mut journal, 2_000).exported();
+        let exported = DeliveryOutbox::over(&mut journal, 2_000)
+            .exported()
+            .expect("a list");
         assert_eq!(exported.len(), 1, "it is shown as a retained artifact");
     }
 
@@ -478,7 +486,7 @@ mod tests {
             })
             .expect("a transition");
         let outbox = DeliveryOutbox::over(&mut journal, 2_000);
-        let exported = outbox.exported();
+        let exported = outbox.exported().expect("a list");
         assert_eq!(exported.len(), 1);
         assert!(exported[0].kind.contains("webhook"));
         assert!(
@@ -507,7 +515,7 @@ mod tests {
             })
             .expect("a transition");
         let outbox = DeliveryOutbox::over(&mut journal, 2_000);
-        let exported = outbox.exported();
+        let exported = outbox.exported().expect("a list");
         assert_eq!(exported.len(), 1);
         assert!(exported[0].kind.contains("webhook"));
         assert!(exported[0].reference.contains("duplicate"));
@@ -533,16 +541,100 @@ mod tests {
     }
 
     #[test]
-    fn a_journal_that_cannot_answer_is_outstanding_rather_than_finished() {
-        // A closed store cannot be asked, and the honest answer to "is your cleanup finished" from
-        // something that cannot look is no.
-        let mut journal = journal_with_work();
-        let mut outbox = DeliveryOutbox::over(&mut journal, 2_000);
-        outbox.failure = Some("the store could not be written".to_owned());
-        assert!(outbox.outstanding() > 0);
-        assert!(matches!(
-            PrivacyMode::reconcile(&[&outbox]),
-            Completion::Reconciling { .. }
-        ));
+    fn a_journal_that_cannot_answer_is_unavailable_rather_than_finished() {
+        // A store that cannot be read cannot say whether a send is still on the wire, and the
+        // honest answer to "is your cleanup finished" from something that cannot look is neither
+        // yes nor a count: it is that this subsystem cannot say, and why.
+        let directory = tempfile::tempdir().expect("a directory");
+        let (mut journal, path) = journal_on_disk_with_work(&directory);
+        let other = rusqlite::Connection::open(&path).expect("the same store");
+        other
+            .execute_batch("ALTER TABLE delivery_notifications RENAME TO delivery_hidden")
+            .expect("the records go out of reach");
+
+        let outbox = DeliveryOutbox::over(&mut journal, 2_000);
+        let reason = outbox
+            .outstanding()
+            .expect_err("a journal that cannot be read cannot say what is outstanding");
+        assert!(reason.reason().contains("cannot say"), "{reason}");
+        assert!(
+            outbox.exported().is_err(),
+            "nor can it list what has left, and it does not answer with an empty list"
+        );
+        let Completion::Unavailable { unavailable, .. } = PrivacyMode::reconcile(&[&outbox]) else {
+            panic!("a subsystem that cannot answer is not reconciling and not complete");
+        };
+        assert_eq!(unavailable.len(), 1);
+        assert_eq!(unavailable[0].0, "delivery");
+
+        // Once the store can be read again, the same question has an answer.
+        other
+            .execute_batch("ALTER TABLE delivery_hidden RENAME TO delivery_notifications")
+            .expect("the records come back");
+        let outbox = DeliveryOutbox::over(&mut journal, 2_000);
+        assert_eq!(PrivacyMode::reconcile(&[&outbox]), Completion::Complete);
+    }
+
+    /// A fence the store refused stops this subsystem at that step, with the store's reason, and
+    /// nothing behind it runs. A new hook over the same journal then takes it through every step,
+    /// which is how a caller that kept the failure retries it.
+    #[test]
+    fn a_refused_fence_is_retried_by_a_new_hook_at_the_same_generation() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let (mut journal, path) = journal_on_disk_with_work(&directory);
+        let other = rusqlite::Connection::open(&path).expect("the same store");
+        other
+            .execute_batch(
+                "CREATE TRIGGER refuse_the_fence BEFORE UPDATE ON delivery_privacy
+                 BEGIN SELECT RAISE(ABORT, 'this store refused the fence'); END;",
+            )
+            .expect("the store will refuse the fence");
+        let mut mode = PrivacyMode::new();
+        mode.open_generation(TimestampMs::new(2_000));
+
+        let enabling = {
+            let mut outbox = DeliveryOutbox::over(&mut journal, 2_000);
+            mode.apply(&mut [&mut outbox], TimestampMs::new(2_000))
+        };
+        let unfinished = enabling
+            .unfinished("delivery")
+            .expect("the fence was refused");
+        assert_eq!(unfinished.step, kr_worker::privacy::Step::Fence);
+        assert!(
+            unfinished
+                .unavailable
+                .reason()
+                .contains("refused the fence"),
+            "{}",
+            unfinished.unavailable
+        );
+        assert!(
+            enabling.cancelled.is_empty(),
+            "nothing is cancelled behind a fence that failed"
+        );
+        assert!(!journal.is_fenced().expect("a read"));
+        assert!(
+            journal
+                .deliveries()
+                .expect("a read")
+                .iter()
+                .all(|record| record.state == DeliveryState::Admitted),
+            "the admitted work was not taken back behind a fence that did not go up"
+        );
+
+        // The store accepts writes again, and a fresh hook takes it through every step.
+        other
+            .execute_batch("DROP TRIGGER refuse_the_fence")
+            .expect("the store accepts the fence");
+        let enabling = {
+            let mut outbox = DeliveryOutbox::over(&mut journal, 2_000);
+            mode.apply(&mut [&mut outbox], TimestampMs::new(2_000))
+        };
+        assert!(enabling.is_finished());
+        assert!(journal.is_fenced().expect("a read"));
+        for record in journal.deliveries().expect("a read") {
+            assert_eq!(record.state, DeliveryState::Cancelled);
+            assert_eq!(record.content, None);
+        }
     }
 }

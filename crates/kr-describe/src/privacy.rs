@@ -11,20 +11,20 @@
 //!
 //! # Why every one of these is per session
 //!
-//! Privacy mode is a session's state in this product: `Session::enable_privacy` records a
-//! generation for one session, and one private session sits beside another that is not. The model
-//! is shared and the queue is shared, but what privacy mode reaches is not, so every type here is
-//! keyed by [`SessionId`] and [`crate::service::DescriptionService::privacy`] hands out a hook for
-//! one session. A hook that emptied the whole queue would be cancelling work for sessions nobody
-//! asked about.
+//! Privacy mode's generation is the environment's, and every session applies it, but a session
+//! applies it at its own moment: `Session::enable_privacy` records it in that session's journal
+//! when the session is told. The model is shared and the queue is shared, but what privacy mode
+//! reaches is each session's, so every type here is keyed by [`SessionId`] and
+//! [`crate::service::DescriptionService::privacy`] hands out a hook for one session. A hook that
+//! emptied the whole queue would be cancelling work for sessions not yet told.
 //!
 //! | Call | What it does here |
 //! | --- | --- |
 //! | `fence` | Raises the fence for this session and cancels its job if one is running |
 //! | `cancel_undispatched` | Drops this session's queued job, and counts a running one as in flight |
 //! | `remove_retained` | Deletes this session's generated description and forgets its context and events |
-//! | `outstanding` | Its running job, plus a removal that did not finish |
-//! | `kept` | Its pin, named, with why it stays |
+//! | `outstanding` | Its running job; a removal that did not finish is unavailable, with its reason |
+//! | `kept` | Pins, named, with why they stay |
 //! | `exported` | Nothing. A description is never sent anywhere |
 //!
 //! # The late-result rule is not restated here
@@ -48,6 +48,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use kr_protocol::ids::SessionId;
 use kr_worker::privacy::{
     Cancelled, Exported, Fenced, KeptExplicitly, PrivacyGeneration, PrivacySubsystem, Removed,
+    Unavailable,
 };
 
 use crate::context::{ContextTracker, SemanticEvent};
@@ -327,7 +328,9 @@ impl RunningJob {
 ///
 /// It belongs to the service rather than to the hook, because a hook is built for one call and
 /// dropped. A debt that lived on the hook would disappear the moment privacy mode asked again, and
-/// the next reconciliation would report complete over content that is still there.
+/// the next reconciliation would report complete over content that is still there. A failed
+/// removal is the only thing that sets it, and a removal that succeeds is the only thing that
+/// clears it.
 #[derive(Clone, Debug, Default)]
 pub struct CleanupDebt {
     owed: Arc<Mutex<BTreeMap<SessionId, String>>>,
@@ -388,7 +391,6 @@ pub struct DescriptionPrivacy<'a> {
     in_flight: &'a InFlight,
     running: &'a RunningJob,
     debt: &'a CleanupDebt,
-    pins_kept: u64,
 }
 
 impl<'a> DescriptionPrivacy<'a> {
@@ -416,20 +418,16 @@ impl<'a> DescriptionPrivacy<'a> {
             in_flight,
             running,
             debt,
-            pins_kept: 0,
         }
     }
 
-    /// Returns why the removal could not finish, when it could not.
+    /// Returns why this session's removal could not finish, when it could not.
+    ///
+    /// It is the service's record rather than this hook's, so it outlives the hook that saw the
+    /// failure.
     #[must_use]
     pub fn failure(&self) -> Option<String> {
         self.debt.owed(&self.session_id)
-    }
-
-    /// Returns how many pins were kept, as the last removal counted them.
-    #[must_use]
-    pub const fn pins_kept(&self) -> u64 {
-        self.pins_kept
     }
 }
 
@@ -438,27 +436,30 @@ impl PrivacySubsystem for DescriptionPrivacy<'_> {
         "descriptions"
     }
 
-    fn fence(&mut self, generation: PrivacyGeneration) -> Fenced {
+    fn fence(&mut self, generation: PrivacyGeneration) -> Result<Fenced, Unavailable> {
         // The fence goes up before anything is counted, so nothing is admitted between the count
         // and the stop. The running job is then cancelled through the token its dispatcher left
         // behind, which is the only way to reach work that is already inside the runtime.
         self.fence.raise(self.session_id, generation);
         let cancelled_running = self.running.cancel(&self.session_id);
-        Fenced {
+        Ok(Fenced {
             queues: 1,
             items: u64::from(self.scheduler.has_queued(&self.session_id))
                 + u64::from(cancelled_running),
-        }
+        })
     }
 
-    fn cancel_undispatched(&mut self, _generation: PrivacyGeneration) -> Cancelled {
-        Cancelled {
+    fn cancel_undispatched(
+        &mut self,
+        _generation: PrivacyGeneration,
+    ) -> Result<Cancelled, Unavailable> {
+        Ok(Cancelled {
             undispatched: u64::from(self.scheduler.cancel(&self.session_id)),
             in_flight: self.in_flight.get(&self.session_id),
-        }
+        })
     }
 
-    fn remove_retained(&mut self, _generation: PrivacyGeneration) -> Removed {
+    fn remove_retained(&mut self, _generation: PrivacyGeneration) -> Result<Removed, Unavailable> {
         // The retained context goes first. It is not in a store, it is in this host's memory, and
         // leaving it would let a change captured while private reach a job after privacy ended.
         if let Some(tracker) = self.tracker.as_deref_mut() {
@@ -470,40 +471,33 @@ impl PrivacySubsystem for DescriptionPrivacy<'_> {
         if let Some(events) = self.events.as_deref_mut() {
             events.clear();
         }
-        // Pins are counted before the removal so the figure reported as kept is of rows that are
-        // still there afterwards rather than of rows that were there before.
-        match self.store.pin_count_for(&self.session_id) {
-            Ok(pins) => self.pins_kept = pins,
-            Err(error) => self.debt.owe(self.session_id, error.to_string()),
-        }
         match self.store.remove_generated_for(&self.session_id) {
             Ok(removed) => {
                 self.debt.settle(&self.session_id);
-                Removed {
+                Ok(Removed {
                     bytes: removed.bytes,
                     records: removed.records,
-                }
+                })
             }
             Err(error) => {
                 // Nothing is claimed. A removal this host could not make is a removal it does not
-                // report, and the debt keeps the cleanup from reporting complete however many
-                // times privacy mode asks again.
-                self.debt.owe(self.session_id, error.to_string());
-                Removed::default()
+                // report, and the debt keeps the cleanup unavailable however many times privacy
+                // mode asks again.
+                let reason = error.to_string();
+                self.debt.owe(self.session_id, reason.clone());
+                Err(Unavailable::new(reason))
             }
         }
     }
 
-    fn outstanding(&self) -> u64 {
-        self.in_flight
-            .get(&self.session_id)
-            .saturating_add(u64::from(self.debt.owed(&self.session_id).is_some()))
+    fn outstanding(&self) -> Result<u64, Unavailable> {
+        if let Some(owed) = self.debt.owed(&self.session_id) {
+            return Err(Unavailable::new(owed));
+        }
+        Ok(self.in_flight.get(&self.session_id))
     }
 
     fn kept(&self) -> Vec<KeptExplicitly> {
-        if self.pins_kept == 0 {
-            return Vec::new();
-        }
         vec![KeptExplicitly {
             what: "a session name a person pinned",
             why: "a name somebody chose is theirs, and section 24 keeps it until they clear it; it \
@@ -511,10 +505,10 @@ impl PrivacySubsystem for DescriptionPrivacy<'_> {
         }]
     }
 
-    fn exported(&self) -> Vec<Exported> {
+    fn exported(&self) -> Result<Vec<Exported>, Unavailable> {
         // A description is produced on this host, stored on this host and shown on this host. It is
         // never uploaded, so there is no copy elsewhere to offer a separate deletion of.
-        Vec::new()
+        Ok(Vec::new())
     }
 }
 

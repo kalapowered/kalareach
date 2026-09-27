@@ -45,6 +45,11 @@ use kr_worker::privacy::{PrivacyGeneration, PrivacyMode, PrivacySubsystem};
 /// Who these tests hand a dispatch attempt to. A real one names the transport that carries it.
 const EXECUTOR: &str = "the test transport";
 
+/// Privacy mode's hook over one backup service, for one pass at the current time.
+fn privacy(service: &BackupService) -> kr_controller::backup::BackupPrivacy<'_> {
+    service.privacy(kr_ipc::now_ms())
+}
+
 fn archive_id() -> ArchiveId {
     ArchiveId::new(Uuid::from_bytes([0x11; 16]))
 }
@@ -673,7 +678,7 @@ fn a_fence_stops_admission_and_dispatch_and_survives_a_restart() {
     let second = producer.seal(2, &objects);
     let admitted;
     {
-        let mut service = BackupService::open(&state).expect("a backup service");
+        let service = BackupService::open(&state).expect("a backup service");
         service
             .reconcile(TimestampMs::new(4_000))
             .expect("the startup reconciliation a service opens unready without");
@@ -689,7 +694,9 @@ fn a_fence_stops_admission_and_dispatch_and_survives_a_restart() {
             )
             .expect("the generation is admitted");
 
-        service.fence(PrivacyGeneration::new(4));
+        privacy(&service)
+            .fence(PrivacyGeneration::new(4))
+            .expect("the fence goes up");
         assert_eq!(service.fenced_at().expect("a read"), Some(4));
 
         // A fence that recorded a number and let the queue go would be a fence in name only.
@@ -833,11 +840,12 @@ fn releasing_the_fence_admits_backup_production_again_under_the_new_generation()
         .expect("the writer is enrolled");
     let objects = [stage(1, "a.cbor", b"one")];
 
-    let mut environment = environment;
+    let environment = environment;
     let mut mode = PrivacyMode::new();
     mode.open_generation(TimestampMs::new(6_000));
     {
-        let mut subsystems: Vec<&mut dyn PrivacySubsystem> = vec![&mut environment.service];
+        let mut backup = privacy(&environment.service);
+        let mut subsystems: Vec<&mut dyn PrivacySubsystem> = vec![&mut backup];
         mode.apply(&mut subsystems, TimestampMs::new(6_000));
     }
     assert!(
@@ -1119,7 +1127,7 @@ fn a_restore_classifies_a_reusable_host_control_key_as_material_it_refuses() {
 
 #[test]
 fn privacy_mode_fences_cancels_and_removes_what_this_host_still_holds() {
-    let mut environment = Environment::open();
+    let environment = Environment::open();
     let producer = Producer::generate();
     environment
         .service()
@@ -1184,7 +1192,8 @@ fn privacy_mode_fences_cancels_and_removes_what_this_host_still_holds() {
         .collect();
 
     let enabling = {
-        let mut subsystems: Vec<&mut dyn PrivacySubsystem> = vec![&mut environment.service];
+        let mut backup = privacy(&environment.service);
+        let mut subsystems: Vec<&mut dyn PrivacySubsystem> = vec![&mut backup];
         mode.apply(&mut subsystems, TimestampMs::new(6_000))
     };
     assert_eq!(enabling.generation, generation);
@@ -1265,13 +1274,14 @@ fn privacy_mode_fences_cancels_and_removes_what_this_host_still_holds() {
             .expect("a read")
             .is_empty()
     );
-    let subsystems: Vec<&dyn PrivacySubsystem> = vec![&environment.service];
+    let backup = privacy(&environment.service);
+    let subsystems: Vec<&dyn PrivacySubsystem> = vec![&backup];
     assert!(PrivacyMode::reconcile(&subsystems).is_complete());
 }
 
 #[test]
 fn dispatched_backup_work_keeps_reconciliation_open_until_it_is_settled() {
-    let mut environment = Environment::open();
+    let environment = Environment::open();
     let producer = Producer::generate();
     environment
         .service()
@@ -1296,7 +1306,8 @@ fn dispatched_backup_work_keeps_reconciliation_open_until_it_is_settled() {
     let mut mode = PrivacyMode::new();
     mode.open_generation(TimestampMs::new(6_000));
     let enabling = {
-        let mut subsystems: Vec<&mut dyn PrivacySubsystem> = vec![&mut environment.service];
+        let mut backup = privacy(&environment.service);
+        let mut subsystems: Vec<&mut dyn PrivacySubsystem> = vec![&mut backup];
         mode.apply(&mut subsystems, TimestampMs::new(6_000))
     };
     let (_, cancelled) = enabling.cancelled[0];
@@ -1305,7 +1316,8 @@ fn dispatched_backup_work_keeps_reconciliation_open_until_it_is_settled() {
     assert_eq!(enabling.in_flight(), 1);
 
     {
-        let subsystems: Vec<&dyn PrivacySubsystem> = vec![&environment.service];
+        let backup = privacy(&environment.service);
+        let subsystems: Vec<&dyn PrivacySubsystem> = vec![&backup];
         assert!(
             !PrivacyMode::reconcile(&subsystems).is_complete(),
             "cleanup is not complete while a backup is still in flight"
@@ -1318,13 +1330,14 @@ fn dispatched_backup_work_keeps_reconciliation_open_until_it_is_settled() {
         .service()
         .note_attempt_stopped(admitted.sequence, TimestampMs::new(7_000))
         .expect("the outcome is recorded");
-    let subsystems: Vec<&dyn PrivacySubsystem> = vec![&environment.service];
+    let backup = privacy(&environment.service);
+    let subsystems: Vec<&dyn PrivacySubsystem> = vec![&backup];
     assert!(PrivacyMode::reconcile(&subsystems).is_complete());
 }
 
 #[test]
 fn a_result_is_published_only_under_the_generation_this_host_admitted_the_work_under() {
-    let mut environment = Environment::open();
+    let environment = Environment::open();
     let producer = Producer::generate();
     environment
         .service()
@@ -1354,7 +1367,9 @@ fn a_result_is_published_only_under_the_generation_this_host_admitted_the_work_u
 
     // Privacy mode is enabled. The boundary is the store's own: raising the fence is what moves
     // the generation in force, so nothing a caller says can put the line somewhere else.
-    environment.service.fence(PrivacyGeneration::new(1));
+    privacy(&environment.service)
+        .fence(PrivacyGeneration::new(1))
+        .expect("the fence goes up");
 
     // The answer to work admitted before privacy mode was enabled comes back afterwards. It is an
     // answer, so it is recorded as one: the service holds that archive. It is not a publication of
@@ -1407,12 +1422,12 @@ fn a_result_is_published_only_under_the_generation_this_host_admitted_the_work_u
     // Work admitted under the generation in force publishes. Privacy mode is off again here,
     // because a host in privacy mode admits no content-bearing backup work at all, and the fence
     // comes down only once the cleanup it wrote down is finished.
-    environment
-        .service
-        .cancel_undispatched(PrivacyGeneration::new(1));
-    environment
-        .service
-        .remove_retained(PrivacyGeneration::new(1));
+    privacy(&environment.service)
+        .cancel_undispatched(PrivacyGeneration::new(1))
+        .expect("the undispatched work is taken back");
+    privacy(&environment.service)
+        .remove_retained(PrivacyGeneration::new(1))
+        .expect("the cleanup pass runs");
     assert_eq!(
         environment
             .service()
@@ -1565,12 +1580,14 @@ fn a_fence_is_recorded_durably_and_a_restart_comes_back_fenced() {
     let state = root.path().join("state");
     std::fs::create_dir_all(&state).expect("the state directory");
     {
-        let mut service = BackupService::open(&state).expect("a backup service");
+        let service = BackupService::open(&state).expect("a backup service");
         service
             .reconcile(TimestampMs::new(4_000))
             .expect("the startup reconciliation a service opens unready without");
         assert_eq!(service.fenced_at().expect("a read"), None);
-        let fenced = service.fence(PrivacyGeneration::new(4));
+        let fenced = privacy(&service)
+            .fence(PrivacyGeneration::new(4))
+            .expect("the fence goes up");
         assert_eq!(fenced.queues, 1);
         // The fence writes its own scope down. There is nothing staged here, so the only thing it
         // owes is the walk of the staging directory, which is how ciphertext no row names is found.
@@ -1593,7 +1610,7 @@ fn a_store_that_will_not_take_the_request_reports_work_outstanding_rather_than_c
     let root = tempfile::tempdir().expect("a disposable directory on the internal disk");
     let state = root.path().join("state");
     std::fs::create_dir_all(&state).expect("the state directory");
-    let mut service = BackupService::open(&state).expect("a backup service");
+    let service = BackupService::open(&state).expect("a backup service");
     service
         .reconcile(TimestampMs::new(4_000))
         .expect("the startup reconciliation a service opens unready without");
@@ -1613,14 +1630,19 @@ fn a_store_that_will_not_take_the_request_reports_work_outstanding_rather_than_c
         ),
         "the reason is the answer: {error}"
     );
-    let fenced = service.fence(PrivacyGeneration::new(1));
-    assert_eq!(fenced.queues, 0);
+    let refused = privacy(&service)
+        .fence(PrivacyGeneration::new(1))
+        .expect_err("a store that will not take the request raises no fence");
+    assert!(
+        refused.reason().contains("could not be raised"),
+        "{refused}"
+    );
     assert!(service.privacy_request(1).expect("a read").is_none());
     assert!(service.obligations().expect("a read").is_empty());
 
-    // And the subsystem still reports work outstanding. A host that cannot say what it owes does
-    // not owe nothing, and privacy mode must never read the first as the second.
-    assert!(service.outstanding() > 0);
+    // And the subsystem says it cannot say. A host that cannot say what it owes does not owe
+    // nothing, and privacy mode must never read the first as the second.
+    assert!(privacy(&service).outstanding().is_err());
     let work = service.outstanding_work().expect("reads still work");
     assert!(!work.is_complete());
     assert_eq!(
@@ -1660,7 +1682,9 @@ fn a_store_that_will_not_take_the_request_reports_work_outstanding_rather_than_c
     );
 
     // That step, for its own request, is what ends it.
-    let fenced = service.fence(PrivacyGeneration::new(1));
+    let fenced = privacy(&service)
+        .fence(PrivacyGeneration::new(1))
+        .expect("the fence goes up");
     assert_eq!(fenced.queues, 1, "the backup outbox is fenced");
     assert_eq!(fenced.items, 0, "nothing was admitted to cancel");
     assert!(
@@ -1761,7 +1785,7 @@ fn an_activation_that_fails_leaves_the_request_and_its_obligation_behind() {
     let state = root.path().join("state");
     std::fs::create_dir_all(&state).expect("the state directory");
     {
-        let mut service = BackupService::open(&state).expect("a backup service");
+        let service = BackupService::open(&state).expect("a backup service");
         service
             .reconcile(TimestampMs::new(4_000))
             .expect("the startup reconciliation a service opens unready without");
@@ -1771,9 +1795,11 @@ fn an_activation_that_fails_leaves_the_request_and_its_obligation_behind() {
         // Everything after the request fails. The request stands, because it was committed on its
         // own before anything was attempted over it.
         service.set_query_only(true).expect("query_only pragma");
-        let fenced = service.fence(PrivacyGeneration::new(4));
-        assert_eq!(fenced.queues, 0, "no fence is reported that did not go up");
-        assert!(service.outstanding() > 0);
+        assert!(
+            privacy(&service).fence(PrivacyGeneration::new(4)).is_err(),
+            "no fence is reported that did not go up"
+        );
+        assert!(privacy(&service).outstanding().is_err());
     }
 
     // A restart reads the request and its obligation back. Neither an empty list nor another
@@ -1791,7 +1817,7 @@ fn an_activation_that_fails_leaves_the_request_and_its_obligation_behind() {
     assert_eq!(owed.len(), 1);
     assert_eq!(owed[0].kind, ObligationKind::ActivateFence);
     assert_eq!(owed[0].target_key, "request:4");
-    assert!(reopened.outstanding() > 0);
+    assert!(privacy(&reopened).outstanding().expect("a count") > 0);
     assert_eq!(
         reopened.fenced_at().expect("a read"),
         Some(4),
@@ -1799,8 +1825,9 @@ fn an_activation_that_fails_leaves_the_request_and_its_obligation_behind() {
     );
 
     // Its own retry is what ends it.
-    let mut reopened = reopened;
-    let fenced = reopened.fence(PrivacyGeneration::new(4));
+    let fenced = privacy(&reopened)
+        .fence(PrivacyGeneration::new(4))
+        .expect("its own retry raises it");
     assert_eq!(fenced.queues, 1);
     let owed = reopened.obligations().expect("a read");
     assert!(
@@ -1822,7 +1849,7 @@ fn a_fence_is_released_only_when_nothing_is_owed_under_it_and_never_by_hand() {
     let root = tempfile::tempdir().expect("a disposable directory on the internal disk");
     let state = root.path().join("state");
     std::fs::create_dir_all(&state).expect("the state directory");
-    let mut service = BackupService::open(&state).expect("a backup service");
+    let service = BackupService::open(&state).expect("a backup service");
     service
         .reconcile(TimestampMs::new(4_000))
         .expect("the startup reconciliation a service opens unready without");
@@ -1842,7 +1869,9 @@ fn a_fence_is_released_only_when_nothing_is_owed_under_it_and_never_by_hand() {
         FenceRelease::NotHeld,
         "there is no raised fence yet, only the obligation to raise one"
     );
-    let fenced = service.fence(PrivacyGeneration::new(2));
+    let fenced = privacy(&service)
+        .fence(PrivacyGeneration::new(2))
+        .expect("the fence goes up");
     assert_eq!(fenced.queues, 1);
 
     // A release under a generation that is not newer is refused outright.
@@ -1906,7 +1935,7 @@ fn a_fence_is_released_only_when_nothing_is_owed_under_it_and_never_by_hand() {
 
 #[test]
 fn a_late_upload_acknowledgement_while_fenced_does_not_enqueue_publication() {
-    let mut environment = Environment::open();
+    let environment = Environment::open();
     let producer = Producer::generate();
     environment
         .service()
@@ -1931,11 +1960,13 @@ fn a_late_upload_acknowledgement_while_fenced_does_not_enqueue_publication() {
         .expect("dispatched");
 
     // Privacy mode is enabled: fence is recorded.
-    let fenced = environment.service.fence(PrivacyGeneration::new(1));
+    let fenced = privacy(&environment.service)
+        .fence(PrivacyGeneration::new(1))
+        .expect("the fence goes up");
     assert_eq!(fenced.queues, 1);
-    let cancelled = environment
-        .service
-        .cancel_undispatched(PrivacyGeneration::new(1));
+    let cancelled = privacy(&environment.service)
+        .cancel_undispatched(PrivacyGeneration::new(1))
+        .expect("the undispatched work is taken back");
     assert_eq!(cancelled.in_flight, 1);
 
     // Now the in-flight uploads complete while fenced.
@@ -2005,7 +2036,7 @@ fn a_late_upload_acknowledgement_while_fenced_does_not_enqueue_publication() {
 #[test]
 fn an_upload_finishing_after_privacy_mode_stops_does_not_enqueue_publication_and_completes_reconciliation()
  {
-    let mut environment = Environment::open();
+    let environment = Environment::open();
     let producer = Producer::generate();
     environment
         .service()
@@ -2030,24 +2061,27 @@ fn an_upload_finishing_after_privacy_mode_stops_does_not_enqueue_publication_and
         .expect("dispatched");
 
     // Privacy mode is enabled: fence is recorded and undispatched work cancelled.
-    let _fenced = environment.service.fence(PrivacyGeneration::new(1));
-    let cancelled = environment
-        .service
-        .cancel_undispatched(PrivacyGeneration::new(1));
+    privacy(&environment.service)
+        .fence(PrivacyGeneration::new(1))
+        .expect("the fence goes up");
+    let cancelled = privacy(&environment.service)
+        .cancel_undispatched(PrivacyGeneration::new(1))
+        .expect("the undispatched work is taken back");
     assert_eq!(cancelled.in_flight, 1);
 
     // Privacy mode is reconciling because work is in flight.
     {
-        let subsystems: Vec<&dyn PrivacySubsystem> = vec![&environment.service];
+        let backup = privacy(&environment.service);
+        let subsystems: Vec<&dyn PrivacySubsystem> = vec![&backup];
         assert!(!PrivacyMode::reconcile(&subsystems).is_complete());
     }
 
     // Privacy mode is turned off before the in-flight upload completes, and the fence does not
     // come down: backup production does not resume into a scope this host has not finished
     // clearing, and the upload that left is still unanswered.
-    environment
-        .service
-        .remove_retained(PrivacyGeneration::new(1));
+    privacy(&environment.service)
+        .remove_retained(PrivacyGeneration::new(1))
+        .expect("the cleanup pass runs");
     assert!(matches!(
         environment
             .service()
@@ -2105,7 +2139,8 @@ fn an_upload_finishing_after_privacy_mode_stops_does_not_enqueue_publication_and
         "the attempt that left is still owed an answer"
     );
     {
-        let subsystems: Vec<&dyn PrivacySubsystem> = vec![&environment.service];
+        let backup = privacy(&environment.service);
+        let subsystems: Vec<&dyn PrivacySubsystem> = vec![&backup];
         assert!(!PrivacyMode::reconcile(&subsystems).is_complete());
     }
 
@@ -2124,7 +2159,8 @@ fn an_upload_finishing_after_privacy_mode_stops_does_not_enqueue_publication_and
             .is_empty()
     );
     {
-        let subsystems: Vec<&dyn PrivacySubsystem> = vec![&environment.service];
+        let backup = privacy(&environment.service);
+        let subsystems: Vec<&dyn PrivacySubsystem> = vec![&backup];
         assert!(PrivacyMode::reconcile(&subsystems).is_complete());
     }
     assert_eq!(
@@ -2163,9 +2199,9 @@ fn an_upload_finishing_after_privacy_mode_stops_does_not_enqueue_publication_and
         assert!(!row.staged_path.exists());
     }
     assert!(
-        environment
-            .service()
+        privacy(environment.service())
             .exported()
+            .expect("a list")
             .iter()
             .any(|artifact| artifact.kind == "backup object ciphertext"),
         "privacy mode shows what the service holds rather than deleting the evidence of it"
@@ -2174,7 +2210,7 @@ fn an_upload_finishing_after_privacy_mode_stops_does_not_enqueue_publication_and
 
 #[test]
 fn a_publication_that_left_before_the_cancellation_survives_a_repeated_upload_acknowledgement() {
-    let mut environment = Environment::open();
+    let environment = Environment::open();
     let producer = Producer::generate();
     environment
         .service()
@@ -2233,10 +2269,12 @@ fn a_publication_that_left_before_the_cancellation_survives_a_repeated_upload_ac
         .expect("the publication is in flight");
 
     // Privacy mode draws its line while the publication is out there.
-    let _fenced = environment.service.fence(PrivacyGeneration::new(1));
-    let cancelled = environment
-        .service
-        .cancel_undispatched(PrivacyGeneration::new(1));
+    privacy(&environment.service)
+        .fence(PrivacyGeneration::new(1))
+        .expect("the fence goes up");
+    let cancelled = privacy(&environment.service)
+        .cancel_undispatched(PrivacyGeneration::new(1))
+        .expect("the undispatched work is taken back");
     assert_eq!(cancelled.in_flight, 1, "the publication had already left");
 
     // The service acknowledges an object a second time. That says nothing about the publication,
@@ -2263,7 +2301,8 @@ fn a_publication_that_left_before_the_cancellation_survives_a_repeated_upload_ac
     assert_eq!(outbox[0].status, AttemptStatus::Dispatched);
 
     // And cleanup is not reported complete over it.
-    let subsystems: Vec<&dyn PrivacySubsystem> = vec![&environment.service];
+    let backup = privacy(&environment.service);
+    let subsystems: Vec<&dyn PrivacySubsystem> = vec![&backup];
     assert!(
         !PrivacyMode::reconcile(&subsystems).is_complete(),
         "a publication whose answer is still owed keeps cleanup open"
@@ -2279,7 +2318,7 @@ fn a_restart_does_not_end_the_wait_over_an_upload_that_left_this_host() {
     let objects = [stage(1, "a.cbor", b"one")];
     let sealed = producer.seal(1, &objects);
     {
-        let mut service = BackupService::open(&state).expect("a backup service");
+        let service = BackupService::open(&state).expect("a backup service");
         service
             .reconcile(TimestampMs::new(4_000))
             .expect("the startup reconciliation a service opens unready without");
@@ -2297,9 +2336,15 @@ fn a_restart_does_not_end_the_wait_over_an_upload_that_left_this_host() {
         service
             .note_dispatched(admitted.sequence, EXECUTOR, TimestampMs::new(6_500))
             .expect("the upload is in flight");
-        let _fenced = service.fence(PrivacyGeneration::new(1));
-        service.cancel_undispatched(PrivacyGeneration::new(1));
-        service.remove_retained(PrivacyGeneration::new(1));
+        privacy(&service)
+            .fence(PrivacyGeneration::new(1))
+            .expect("the fence goes up");
+        privacy(&service)
+            .cancel_undispatched(PrivacyGeneration::new(1))
+            .expect("the undispatched work is taken back");
+        privacy(&service)
+            .remove_retained(PrivacyGeneration::new(1))
+            .expect("the cleanup pass runs");
 
         // The fence cannot be released while the attempt that left this host is unanswered: the
         // obligation that names it is still there, and the guarded statement finds it.
@@ -2342,7 +2387,8 @@ fn a_restart_does_not_end_the_wait_over_an_upload_that_left_this_host() {
         .expect("the record");
     assert_eq!(record.production, Production::Cancelled);
     {
-        let subsystems: Vec<&dyn PrivacySubsystem> = vec![&service];
+        let backup = privacy(&service);
+        let subsystems: Vec<&dyn PrivacySubsystem> = vec![&backup];
         assert!(!PrivacyMode::reconcile(&subsystems).is_complete());
     }
 
@@ -2355,7 +2401,8 @@ fn a_restart_does_not_end_the_wait_over_an_upload_that_left_this_host() {
         .expect("the outcome is recorded");
     assert!(service.outbox().expect("a read").is_empty());
     assert!(service.obligations().expect("a read").is_empty());
-    let subsystems: Vec<&dyn PrivacySubsystem> = vec![&service];
+    let backup = privacy(&service);
+    let subsystems: Vec<&dyn PrivacySubsystem> = vec![&backup];
     assert!(PrivacyMode::reconcile(&subsystems).is_complete());
 }
 
@@ -2368,7 +2415,7 @@ fn a_cancelled_generation_whose_publication_left_keeps_its_unanswered_attempt() 
     let objects = [stage(1, "a.cbor", b"one")];
     let sealed = producer.seal(1, &objects);
     {
-        let mut service = BackupService::open(&state).expect("a backup service");
+        let service = BackupService::open(&state).expect("a backup service");
         service
             .reconcile(TimestampMs::new(4_000))
             .expect("the startup reconciliation a service opens unready without");
@@ -2392,8 +2439,12 @@ fn a_cancelled_generation_whose_publication_left_keeps_its_unanswered_attempt() 
             BackupGeneration::new(1),
             TimestampMs::new(6_500),
         );
-        let _fenced = service.fence(PrivacyGeneration::new(1));
-        service.cancel_undispatched(PrivacyGeneration::new(1));
+        privacy(&service)
+            .fence(PrivacyGeneration::new(1))
+            .expect("the fence goes up");
+        privacy(&service)
+            .cancel_undispatched(PrivacyGeneration::new(1))
+            .expect("the undispatched work is taken back");
     }
 
     // A publication left this host and was never answered. Whether the service holds it is not
@@ -2427,8 +2478,9 @@ fn a_cancelled_generation_whose_publication_left_keeps_its_unanswered_attempt() 
     assert_eq!(record.production, Production::Cancelled);
     assert_eq!(record.remote, Remote::Objects);
     assert!(
-        service
+        privacy(&service)
             .exported()
+            .expect("a list")
             .iter()
             .any(|artifact| artifact.kind == "backup archive, outcome unknown"),
         "a copy this host cannot account for is shown rather than pretended away"
@@ -2437,7 +2489,7 @@ fn a_cancelled_generation_whose_publication_left_keeps_its_unanswered_attempt() 
 
 #[test]
 fn an_object_acknowledged_after_its_staged_copy_went_arrives_without_ending_its_transfer() {
-    let mut environment = Environment::open();
+    let environment = Environment::open();
     let producer = Producer::generate();
     environment
         .service()
@@ -2473,7 +2525,8 @@ fn an_object_acknowledged_after_its_staged_copy_went_arrives_without_ending_its_
     let mut mode = PrivacyMode::new();
     mode.open_generation(TimestampMs::new(6_500));
     let enabling = {
-        let mut subsystems: Vec<&mut dyn PrivacySubsystem> = vec![&mut environment.service];
+        let mut backup = privacy(&environment.service);
+        let mut subsystems: Vec<&mut dyn PrivacySubsystem> = vec![&mut backup];
         mode.apply(&mut subsystems, TimestampMs::new(6_500))
     };
     assert_eq!(enabling.in_flight(), 1);
@@ -2507,7 +2560,8 @@ fn an_object_acknowledged_after_its_staged_copy_went_arrives_without_ending_its_
         "nothing is published in place of a cancelled generation's upload: {outbox:?}"
     );
     {
-        let subsystems: Vec<&dyn PrivacySubsystem> = vec![&environment.service];
+        let backup = privacy(&environment.service);
+        let subsystems: Vec<&dyn PrivacySubsystem> = vec![&backup];
         assert!(
             !PrivacyMode::reconcile(&subsystems).is_complete(),
             "a complete set of objects is not evidence that the transfer ended"
@@ -2521,7 +2575,8 @@ fn an_object_acknowledged_after_its_staged_copy_went_arrives_without_ending_its_
         .note_attempt_accepted(admitted.sequence, TimestampMs::new(7_100))
         .expect("the executor reports its upload finished");
     assert!(environment.service().outbox().expect("a read").is_empty());
-    let subsystems: Vec<&dyn PrivacySubsystem> = vec![&environment.service];
+    let backup = privacy(&environment.service);
+    let subsystems: Vec<&dyn PrivacySubsystem> = vec![&backup];
     assert!(
         PrivacyMode::reconcile(&subsystems).is_complete(),
         "every transfer has ended, so the cleanup has too"
@@ -2538,7 +2593,7 @@ fn a_restart_over_an_unanswered_attempt_still_owes_the_ciphertext_this_host_hold
     let sealed = producer.seal(1, &objects);
     let staged_paths: Vec<std::path::PathBuf>;
     {
-        let mut service = BackupService::open(&state).expect("a backup service");
+        let service = BackupService::open(&state).expect("a backup service");
         service
             .reconcile(TimestampMs::new(4_000))
             .expect("the startup reconciliation a service opens unready without");
@@ -2564,13 +2619,17 @@ fn a_restart_over_an_unanswered_attempt_still_owes_the_ciphertext_this_host_hold
             .collect();
 
         // Privacy mode fences and cancels, and this host stops before it removes anything.
-        let _fenced = service.fence(PrivacyGeneration::new(1));
-        service.cancel_undispatched(PrivacyGeneration::new(1));
+        privacy(&service)
+            .fence(PrivacyGeneration::new(1))
+            .expect("the fence goes up");
+        privacy(&service)
+            .cancel_undispatched(PrivacyGeneration::new(1))
+            .expect("the undispatched work is taken back");
     }
 
     // The restart reads back what the fence wrote down: the staged ciphertext is still here, and
     // the removal obligations say so. The attempt that left this host is still unanswered too.
-    let mut service = BackupService::open(&state).expect("the service opens again");
+    let service = BackupService::open(&state).expect("the service opens again");
     let outcome = service
         .reconcile(TimestampMs::new(7_000))
         .expect("reconciliation");
@@ -2584,7 +2643,8 @@ fn a_restart_over_an_unanswered_attempt_still_owes_the_ciphertext_this_host_hold
     }
     assert!(!service.obligations().expect("a read").is_empty());
     {
-        let subsystems: Vec<&dyn PrivacySubsystem> = vec![&service];
+        let backup = privacy(&service);
+        let subsystems: Vec<&dyn PrivacySubsystem> = vec![&backup];
         assert!(
             !PrivacyMode::reconcile(&subsystems).is_complete(),
             "cleanup is not complete while this host still holds the ciphertext"
@@ -2593,7 +2653,9 @@ fn a_restart_over_an_unanswered_attempt_still_owes_the_ciphertext_this_host_hold
 
     // The removal it owed clears those obligations, and the attempt that left this host keeps its
     // own: removing the local copy says nothing about what the service did with the bytes.
-    let removed = service.remove_retained(PrivacyGeneration::new(1));
+    let removed = privacy(&service)
+        .remove_retained(PrivacyGeneration::new(1))
+        .expect("the cleanup pass runs");
     assert!(removed.bytes > 0);
     for path in &staged_paths {
         assert!(!path.exists(), "the ciphertext left this host");
@@ -2605,7 +2667,8 @@ fn a_restart_over_an_unanswered_attempt_still_owes_the_ciphertext_this_host_hold
                 .any(|obligation| obligation.kind == ObligationKind::ResolveUpload),
             "removing the local copy is not evidence about the transfer: {owed:?}"
         );
-        let subsystems: Vec<&dyn PrivacySubsystem> = vec![&service];
+        let backup = privacy(&service);
+        let subsystems: Vec<&dyn PrivacySubsystem> = vec![&backup];
         assert!(!PrivacyMode::reconcile(&subsystems).is_complete());
     }
 
@@ -2616,7 +2679,8 @@ fn a_restart_over_an_unanswered_attempt_still_owes_the_ciphertext_this_host_hold
         .note_attempt_stopped(unanswered[0].sequence, TimestampMs::new(8_000))
         .expect("the outcome is recorded");
     assert!(service.obligations().expect("a read").is_empty());
-    let subsystems: Vec<&dyn PrivacySubsystem> = vec![&service];
+    let backup = privacy(&service);
+    let subsystems: Vec<&dyn PrivacySubsystem> = vec![&backup];
     assert!(PrivacyMode::reconcile(&subsystems).is_complete());
 }
 
@@ -2724,7 +2788,7 @@ fn a_restart_owes_the_ciphertext_of_cancelled_work_that_never_left_this_host() {
     let sealed = producer.seal(1, &objects);
     let staged_paths: Vec<std::path::PathBuf>;
     {
-        let mut service = BackupService::open(&state).expect("a backup service");
+        let service = BackupService::open(&state).expect("a backup service");
         service
             .reconcile(TimestampMs::new(4_000))
             .expect("the startup reconciliation a service opens unready without");
@@ -2748,8 +2812,12 @@ fn a_restart_owes_the_ciphertext_of_cancelled_work_that_never_left_this_host() {
 
         // Nothing was dispatched, so the cancellation empties the outbox outright. This host then
         // stops before it removes anything.
-        let _fenced = service.fence(PrivacyGeneration::new(1));
-        let cancelled = service.cancel_undispatched(PrivacyGeneration::new(1));
+        privacy(&service)
+            .fence(PrivacyGeneration::new(1))
+            .expect("the fence goes up");
+        let cancelled = privacy(&service)
+            .cancel_undispatched(PrivacyGeneration::new(1))
+            .expect("the undispatched work is taken back");
         assert_eq!(cancelled.in_flight, 0);
         assert!(service.outbox().expect("a read").is_empty());
     }
@@ -2765,21 +2833,25 @@ fn a_restart_owes_the_ciphertext_of_cancelled_work_that_never_left_this_host() {
     }
     assert!(!service.obligations().expect("a read").is_empty());
     {
-        let subsystems: Vec<&dyn PrivacySubsystem> = vec![&service];
+        let backup = privacy(&service);
+        let subsystems: Vec<&dyn PrivacySubsystem> = vec![&backup];
         assert!(!PrivacyMode::reconcile(&subsystems).is_complete());
     }
 
     // A second restart before the removal still owes it: the obligation is durable, not something
     // the first reconciliation spent.
     drop(service);
-    let mut service = BackupService::open(&state).expect("the service opens a third time");
+    let service = BackupService::open(&state).expect("the service opens a third time");
     service
         .reconcile(TimestampMs::new(8_000))
         .expect("reconciliation");
     assert!(!service.obligations().expect("a read").is_empty());
-    let removed = service.remove_retained(PrivacyGeneration::new(1));
+    let removed = privacy(&service)
+        .remove_retained(PrivacyGeneration::new(1))
+        .expect("the cleanup pass runs");
     assert!(removed.bytes > 0);
-    let subsystems: Vec<&dyn PrivacySubsystem> = vec![&service];
+    let backup = privacy(&service);
+    let subsystems: Vec<&dyn PrivacySubsystem> = vec![&backup];
     assert!(PrivacyMode::reconcile(&subsystems).is_complete());
 }
 
@@ -2792,7 +2864,7 @@ fn a_late_acknowledgement_does_not_bring_back_a_cleanup_that_is_finished() {
     let objects = [stage(1, "a.cbor", b"one")];
     let sealed = producer.seal(1, &objects);
     {
-        let mut service = BackupService::open(&state).expect("a backup service");
+        let service = BackupService::open(&state).expect("a backup service");
         service
             .reconcile(TimestampMs::new(4_000))
             .expect("the startup reconciliation a service opens unready without");
@@ -2824,7 +2896,8 @@ fn a_late_acknowledgement_does_not_bring_back_a_cleanup_that_is_finished() {
         let mut mode = PrivacyMode::new();
         mode.open_generation(TimestampMs::new(6_500));
         {
-            let mut subsystems: Vec<&mut dyn PrivacySubsystem> = vec![&mut service];
+            let mut backup = privacy(&service);
+            let mut subsystems: Vec<&mut dyn PrivacySubsystem> = vec![&mut backup];
             mode.apply(&mut subsystems, TimestampMs::new(6_500));
         }
 
@@ -2854,7 +2927,8 @@ fn a_late_acknowledgement_does_not_bring_back_a_cleanup_that_is_finished() {
         service
             .note_attempt_accepted(admitted.sequence, TimestampMs::new(7_100))
             .expect("the executor reports its upload finished");
-        let subsystems: Vec<&dyn PrivacySubsystem> = vec![&service];
+        let backup = privacy(&service);
+        let subsystems: Vec<&dyn PrivacySubsystem> = vec![&backup];
         assert!(PrivacyMode::reconcile(&subsystems).is_complete());
     }
 
@@ -2867,7 +2941,8 @@ fn a_late_acknowledgement_does_not_bring_back_a_cleanup_that_is_finished() {
         service.obligations().expect("a read").is_empty(),
         "the cleanup is finished and stays finished"
     );
-    let subsystems: Vec<&dyn PrivacySubsystem> = vec![&service];
+    let backup = privacy(&service);
+    let subsystems: Vec<&dyn PrivacySubsystem> = vec![&backup];
     assert!(PrivacyMode::reconcile(&subsystems).is_complete());
 }
 
@@ -2881,7 +2956,7 @@ fn a_restart_owes_the_ciphertext_of_a_published_archive_the_fence_had_not_reache
     let sealed = producer.seal(1, &objects);
     let staged_paths: Vec<std::path::PathBuf>;
     {
-        let mut service = BackupService::open(&state).expect("a backup service");
+        let service = BackupService::open(&state).expect("a backup service");
         service
             .reconcile(TimestampMs::new(4_000))
             .expect("the startup reconciliation a service opens unready without");
@@ -2922,13 +2997,17 @@ fn a_restart_owes_the_ciphertext_of_a_published_archive_the_fence_had_not_reache
         // Privacy mode fences and cancels, and this host stops before it removes anything. The
         // published generation has nothing left in its outbox, so nothing there says its staged
         // copies are still here.
-        let _fenced = service.fence(PrivacyGeneration::new(1));
-        service.cancel_undispatched(PrivacyGeneration::new(1));
+        privacy(&service)
+            .fence(PrivacyGeneration::new(1))
+            .expect("the fence goes up");
+        privacy(&service)
+            .cancel_undispatched(PrivacyGeneration::new(1))
+            .expect("the undispatched work is taken back");
     }
 
     // While the fence is recorded, every staged copy is a removal privacy mode asked for. A
     // published archive's ciphertext is as much on this host as a cancelled one's.
-    let mut service = BackupService::open(&state).expect("the service opens again");
+    let service = BackupService::open(&state).expect("the service opens again");
     service
         .reconcile(TimestampMs::new(7_000))
         .expect("reconciliation");
@@ -2937,11 +3016,14 @@ fn a_restart_owes_the_ciphertext_of_a_published_archive_the_fence_had_not_reache
     }
     assert!(!service.obligations().expect("a read").is_empty());
     {
-        let subsystems: Vec<&dyn PrivacySubsystem> = vec![&service];
+        let backup = privacy(&service);
+        let subsystems: Vec<&dyn PrivacySubsystem> = vec![&backup];
         assert!(!PrivacyMode::reconcile(&subsystems).is_complete());
     }
 
-    let removed = service.remove_retained(PrivacyGeneration::new(1));
+    let removed = privacy(&service)
+        .remove_retained(PrivacyGeneration::new(1))
+        .expect("the cleanup pass runs");
     assert!(removed.bytes > 0);
     assert_eq!(
         removed.records, 0,
@@ -2951,12 +3033,15 @@ fn a_restart_owes_the_ciphertext_of_a_published_archive_the_fence_had_not_reache
         assert!(!path.exists(), "the ciphertext left this host");
     }
     {
-        let subsystems: Vec<&dyn PrivacySubsystem> = vec![&service];
+        let backup = privacy(&service);
+        let subsystems: Vec<&dyn PrivacySubsystem> = vec![&backup];
         assert!(PrivacyMode::reconcile(&subsystems).is_complete());
     }
 
     // A second pass has nothing to remove and says so, and the record of what left this host stays.
-    let again = service.remove_retained(PrivacyGeneration::new(1));
+    let again = privacy(&service)
+        .remove_retained(PrivacyGeneration::new(1))
+        .expect("the cleanup pass runs");
     assert_eq!(again.bytes, 0);
     assert_eq!(again.records, 0);
     let kept = service
@@ -2972,7 +3057,7 @@ fn a_restart_owes_the_ciphertext_of_a_published_archive_the_fence_had_not_reache
 
 #[test]
 fn a_fence_writes_down_every_target_it_implies_and_a_repeat_adds_nothing() {
-    let mut environment = Environment::open();
+    let environment = Environment::open();
     let producer = Producer::generate();
     environment
         .service()
@@ -2990,7 +3075,9 @@ fn a_fence_writes_down_every_target_it_implies_and_a_repeat_adds_nothing() {
         )
         .expect("the generation is admitted");
 
-    let fenced = environment.service.fence(PrivacyGeneration::new(1));
+    let fenced = privacy(&environment.service)
+        .fence(PrivacyGeneration::new(1))
+        .expect("the fence goes up");
     assert_eq!(fenced.queues, 1);
     let owed = environment.service().obligations().expect("a read");
     // Three staged copies, one queued entry, one generation's bookkeeping, one staging walk.
@@ -3035,14 +3122,16 @@ fn a_fence_writes_down_every_target_it_implies_and_a_repeat_adds_nothing() {
 
     // Asking for the same generation again reads the request back. It does not write a second
     // scope, and it does not recreate cleanup that has already been done.
-    let again = environment.service.fence(PrivacyGeneration::new(1));
+    let again = privacy(&environment.service)
+        .fence(PrivacyGeneration::new(1))
+        .expect("the fence goes up");
     assert_eq!(again.queues, 1);
     assert_eq!(environment.service().obligations().expect("a read"), owed);
 }
 
 #[test]
 fn a_repeated_request_after_cleanup_finished_does_not_recreate_it() {
-    let mut environment = Environment::open();
+    let environment = Environment::open();
     let producer = Producer::generate();
     environment
         .service()
@@ -3062,7 +3151,8 @@ fn a_repeated_request_after_cleanup_finished_does_not_recreate_it() {
     let mut mode = PrivacyMode::new();
     mode.open_generation(TimestampMs::new(6_000));
     {
-        let mut subsystems: Vec<&mut dyn PrivacySubsystem> = vec![&mut environment.service];
+        let mut backup = privacy(&environment.service);
+        let mut subsystems: Vec<&mut dyn PrivacySubsystem> = vec![&mut backup];
         mode.apply(&mut subsystems, TimestampMs::new(6_000));
     }
     assert!(
@@ -3075,7 +3165,9 @@ fn a_repeated_request_after_cleanup_finished_does_not_recreate_it() {
 
     // The same request arriving again finds its record applied. Recreating the scope would put
     // back removals whose targets are already gone, which no retry could ever discharge.
-    let repeated = environment.service.fence(mode.generation());
+    let repeated = privacy(&environment.service)
+        .fence(mode.generation())
+        .expect("the fence goes up");
     assert_eq!(repeated.queues, 1);
     assert!(
         environment
@@ -3094,7 +3186,7 @@ fn a_staged_copy_this_host_cannot_remove_keeps_its_own_obligation_until_it_can()
     std::fs::create_dir_all(&state).expect("the state directory");
     let producer = Producer::generate();
     let objects = [stage(1, "a.cbor", b"one")];
-    let mut service = BackupService::open(&state).expect("a backup service");
+    let service = BackupService::open(&state).expect("a backup service");
     service
         .reconcile(TimestampMs::new(4_000))
         .expect("the startup reconciliation a service opens unready without");
@@ -3115,8 +3207,12 @@ fn a_staged_copy_this_host_cannot_remove_keeps_its_own_obligation_until_it_can()
         .into_iter()
         .map(|row| row.staged_path)
         .collect();
-    service.fence(PrivacyGeneration::new(1));
-    service.cancel_undispatched(PrivacyGeneration::new(1));
+    privacy(&service)
+        .fence(PrivacyGeneration::new(1))
+        .expect("the fence goes up");
+    privacy(&service)
+        .cancel_undispatched(PrivacyGeneration::new(1))
+        .expect("the undispatched work is taken back");
 
     // The directory that holds the ciphertext is made unwritable, so every unlink fails.
     let directory = staged[0]
@@ -3124,7 +3220,9 @@ fn a_staged_copy_this_host_cannot_remove_keeps_its_own_obligation_until_it_can()
         .expect("a staging directory")
         .to_path_buf();
     set_directory_writable(&directory, false);
-    let removed = service.remove_retained(PrivacyGeneration::new(1));
+    let removed = privacy(&service)
+        .remove_retained(PrivacyGeneration::new(1))
+        .expect("the cleanup pass runs");
     assert_eq!(removed.bytes, 0);
     let owed = service.obligations().expect("a read");
     let failed: Vec<&_> = owed
@@ -3139,7 +3237,7 @@ fn a_staged_copy_this_host_cannot_remove_keeps_its_own_obligation_until_it_can()
             "the reason is recorded beside the obligation, never instead of it"
         );
     }
-    assert!(!PrivacyMode::reconcile(&[&service as &dyn PrivacySubsystem]).is_complete());
+    assert!(!PrivacyMode::reconcile(&[&privacy(&service) as &dyn PrivacySubsystem]).is_complete());
     assert_eq!(
         service
             .release_fence(
@@ -3154,7 +3252,9 @@ fn a_staged_copy_this_host_cannot_remove_keeps_its_own_obligation_until_it_can()
     );
 
     // A second attempt while the fault holds finds the same targets, not new ones.
-    service.remove_retained(PrivacyGeneration::new(1));
+    privacy(&service)
+        .remove_retained(PrivacyGeneration::new(1))
+        .expect("the cleanup pass runs");
     let again = service.obligations().expect("a read");
     assert_eq!(again.len(), owed.len());
     for obligation in &failed {
@@ -3169,7 +3269,7 @@ fn a_staged_copy_this_host_cannot_remove_keeps_its_own_obligation_until_it_can()
 
     // A restart does not recreate them either: the rows are the account, not the process.
     drop(service);
-    let mut service = BackupService::open(&state).expect("the service opens again");
+    let service = BackupService::open(&state).expect("the service opens again");
     service
         .reconcile(TimestampMs::new(4_000))
         .expect("the startup reconciliation a service opens unready without");
@@ -3177,13 +3277,15 @@ fn a_staged_copy_this_host_cannot_remove_keeps_its_own_obligation_until_it_can()
 
     // Access comes back, and their own success is what ends them.
     set_directory_writable(&directory, true);
-    let removed = service.remove_retained(PrivacyGeneration::new(1));
+    let removed = privacy(&service)
+        .remove_retained(PrivacyGeneration::new(1))
+        .expect("the cleanup pass runs");
     assert!(removed.bytes > 0);
     for path in &staged {
         assert!(!path.exists());
     }
     assert!(service.obligations().expect("a read").is_empty());
-    assert!(PrivacyMode::reconcile(&[&service as &dyn PrivacySubsystem]).is_complete());
+    assert!(PrivacyMode::reconcile(&[&privacy(&service) as &dyn PrivacySubsystem]).is_complete());
     assert_eq!(
         service
             .release_fence(
@@ -3204,7 +3306,7 @@ fn a_store_that_stops_accepting_writes_mid_cleanup_keeps_the_obligation_for_the_
     std::fs::create_dir_all(&state).expect("the state directory");
     let producer = Producer::generate();
     let objects = [stage(1, "a.cbor", b"one")];
-    let mut service = BackupService::open(&state).expect("a backup service");
+    let service = BackupService::open(&state).expect("a backup service");
     service
         .reconcile(TimestampMs::new(4_000))
         .expect("the startup reconciliation a service opens unready without");
@@ -3225,8 +3327,12 @@ fn a_store_that_stops_accepting_writes_mid_cleanup_keeps_the_obligation_for_the_
         .into_iter()
         .map(|row| row.staged_path)
         .collect();
-    service.fence(PrivacyGeneration::new(1));
-    service.cancel_undispatched(PrivacyGeneration::new(1));
+    privacy(&service)
+        .fence(PrivacyGeneration::new(1))
+        .expect("the fence goes up");
+    privacy(&service)
+        .cancel_undispatched(PrivacyGeneration::new(1))
+        .expect("the undispatched work is taken back");
 
     // The first pass gets past the staging walk and fails at the removals, so what is left owed
     // is a removal rather than the walk in front of it.
@@ -3235,7 +3341,9 @@ fn a_store_that_stops_accepting_writes_mid_cleanup_keeps_the_obligation_for_the_
         .expect("a staging directory")
         .to_path_buf();
     set_directory_writable(&directory, false);
-    service.remove_retained(PrivacyGeneration::new(1));
+    privacy(&service)
+        .remove_retained(PrivacyGeneration::new(1))
+        .expect("the cleanup pass runs");
     set_directory_writable(&directory, true);
     let owed = service.obligations().expect("a read");
     assert!(
@@ -3254,24 +3362,31 @@ fn a_store_that_stops_accepting_writes_mid_cleanup_keeps_the_obligation_for_the_
         std::fs::remove_file(path).expect("the file goes before the store is asked");
     }
     service.set_query_only(true).expect("query_only pragma");
-    let removed = service.remove_retained(PrivacyGeneration::new(1));
-    assert_eq!(removed.records, 0);
+    let refused = privacy(&service)
+        .remove_retained(PrivacyGeneration::new(1))
+        .expect_err("a store that refuses writes refuses the pass");
+    assert!(
+        refused.reason().contains("could not be removed"),
+        "{refused}"
+    );
     let owed = service.obligations().expect("a read");
     assert!(
         owed.iter()
             .any(|obligation| obligation.kind == ObligationKind::UnlinkObject),
         "the removal is still owed although the file has gone: {owed:?}"
     );
-    assert!(!PrivacyMode::reconcile(&[&service as &dyn PrivacySubsystem]).is_complete());
+    assert!(!PrivacyMode::reconcile(&[&privacy(&service) as &dyn PrivacySubsystem]).is_complete());
 
     // With write access back, a file that is already gone is exactly what the retry expects.
     service.set_query_only(false).expect("query_only pragma");
-    service.remove_retained(PrivacyGeneration::new(1));
+    privacy(&service)
+        .remove_retained(PrivacyGeneration::new(1))
+        .expect("the cleanup pass runs");
     for path in &staged {
         assert!(!path.exists());
     }
     assert!(service.obligations().expect("a read").is_empty());
-    assert!(PrivacyMode::reconcile(&[&service as &dyn PrivacySubsystem]).is_complete());
+    assert!(PrivacyMode::reconcile(&[&privacy(&service) as &dyn PrivacySubsystem]).is_complete());
 }
 
 /// Section 24: a staged copy's removal is reported only once the directory that named it is
@@ -3307,15 +3422,21 @@ fn a_removal_whose_directory_cannot_be_flushed_keeps_its_obligation_until_it_can
         .into_iter()
         .map(|row| row.staged_path)
         .collect();
-    service.fence(PrivacyGeneration::new(1));
-    service.cancel_undispatched(PrivacyGeneration::new(1));
+    privacy(&service)
+        .fence(PrivacyGeneration::new(1))
+        .expect("the fence goes up");
+    privacy(&service)
+        .cancel_undispatched(PrivacyGeneration::new(1))
+        .expect("the undispatched work is taken back");
 
     let directory = staged[0]
         .parent()
         .expect("a staging directory")
         .to_path_buf();
     let held = hold_without_shared_writing(&directory);
-    let removed = service.remove_retained(PrivacyGeneration::new(1));
+    let removed = privacy(&service)
+        .remove_retained(PrivacyGeneration::new(1))
+        .expect("the cleanup pass runs");
     assert_eq!(
         removed.bytes, 0,
         "no removal is reported while its flush is refused"
@@ -3339,14 +3460,16 @@ fn a_removal_whose_directory_cannot_be_flushed_keeps_its_obligation_until_it_can
             "the reason is recorded beside the obligation, never instead of it"
         );
     }
-    assert!(!PrivacyMode::reconcile(&[&service as &dyn PrivacySubsystem]).is_complete());
+    assert!(!PrivacyMode::reconcile(&[&privacy(&service) as &dyn PrivacySubsystem]).is_complete());
 
     // With the directory free again, a name that is already gone is what the retry expects, and
     // the flush it makes is what ends each obligation.
     drop(held);
-    service.remove_retained(PrivacyGeneration::new(1));
+    privacy(&service)
+        .remove_retained(PrivacyGeneration::new(1))
+        .expect("the cleanup pass runs");
     assert!(service.obligations().expect("a read").is_empty());
-    assert!(PrivacyMode::reconcile(&[&service as &dyn PrivacySubsystem]).is_complete());
+    assert!(PrivacyMode::reconcile(&[&privacy(&service) as &dyn PrivacySubsystem]).is_complete());
 }
 
 /// Section 24: staged ciphertext is flushed into its directory, and each directory up to the
@@ -3411,7 +3534,7 @@ fn a_staged_write_whose_directory_cannot_be_flushed_is_not_admitted() {
 #[test]
 fn ciphertext_no_row_names_keeps_cleanup_pending_until_the_walk_finds_and_removes_it() {
     let environment = Environment::open();
-    let mut environment = environment;
+    let environment = environment;
     let stray = environment
         .service()
         .staging_root()
@@ -3420,7 +3543,9 @@ fn ciphertext_no_row_names_keeps_cleanup_pending_until_the_walk_finds_and_remove
     std::fs::create_dir_all(stray.parent().expect("a directory")).expect("the directory");
     std::fs::write(&stray, b"ciphertext a stop left behind").expect("the stray file");
 
-    environment.service.fence(PrivacyGeneration::new(1));
+    privacy(&environment.service)
+        .fence(PrivacyGeneration::new(1))
+        .expect("the fence goes up");
     // Nothing is registered, so nothing but the walk is owed until the walk has run.
     let owed = environment.service().obligations().expect("a read");
     assert_eq!(owed.len(), 1);
@@ -3438,12 +3563,15 @@ fn ciphertext_no_row_names_keeps_cleanup_pending_until_the_walk_finds_and_remove
             .expect("a read")
             .is_empty()
     );
-    assert!(PrivacyMode::reconcile(&[&environment.service as &dyn PrivacySubsystem]).is_complete());
+    assert!(
+        PrivacyMode::reconcile(&[&privacy(&environment.service) as &dyn PrivacySubsystem])
+            .is_complete()
+    );
 }
 
 #[test]
 fn a_late_acknowledgement_ends_only_its_own_attempt_and_puts_no_file_back() {
-    let mut environment = Environment::open();
+    let environment = Environment::open();
     let producer = Producer::generate();
     environment
         .service()
@@ -3476,13 +3604,15 @@ fn a_late_acknowledgement_ends_only_its_own_attempt_and_puts_no_file_back() {
         )
         .expect("the member is acknowledged");
 
-    environment.service.fence(PrivacyGeneration::new(1));
-    environment
-        .service
-        .cancel_undispatched(PrivacyGeneration::new(1));
-    let removed = environment
-        .service
-        .remove_retained(PrivacyGeneration::new(1));
+    privacy(&environment.service)
+        .fence(PrivacyGeneration::new(1))
+        .expect("the fence goes up");
+    privacy(&environment.service)
+        .cancel_undispatched(PrivacyGeneration::new(1))
+        .expect("the undispatched work is taken back");
+    let removed = privacy(&environment.service)
+        .remove_retained(PrivacyGeneration::new(1))
+        .expect("the cleanup pass runs");
     assert!(removed.bytes > 0);
     for row in environment
         .service()
@@ -3511,7 +3641,8 @@ fn a_late_acknowledgement_ends_only_its_own_attempt_and_puts_no_file_back() {
                 && attempt.status == AttemptStatus::Dispatched)
     );
     assert!(
-        !PrivacyMode::reconcile(&[&environment.service as &dyn PrivacySubsystem]).is_complete()
+        !PrivacyMode::reconcile(&[&privacy(&environment.service) as &dyn PrivacySubsystem])
+            .is_complete()
     );
     environment
         .service()
@@ -3536,7 +3667,10 @@ fn a_late_acknowledgement_ends_only_its_own_attempt_and_puts_no_file_back() {
             .expect("a read")
             .is_empty()
     );
-    assert!(PrivacyMode::reconcile(&[&environment.service as &dyn PrivacySubsystem]).is_complete());
+    assert!(
+        PrivacyMode::reconcile(&[&privacy(&environment.service) as &dyn PrivacySubsystem])
+            .is_complete()
+    );
 }
 
 #[cfg(unix)]
@@ -3547,7 +3681,7 @@ fn a_second_fence_is_not_released_by_the_first_ones_cleanup() {
     std::fs::create_dir_all(&state).expect("the state directory");
     let producer = Producer::generate();
     let objects = [stage(1, "a.cbor", b"one")];
-    let mut service = BackupService::open(&state).expect("a backup service");
+    let service = BackupService::open(&state).expect("a backup service");
     service
         .reconcile(TimestampMs::new(4_000))
         .expect("the startup reconciliation a service opens unready without");
@@ -3574,14 +3708,22 @@ fn a_second_fence_is_not_released_by_the_first_ones_cleanup() {
         .to_path_buf();
 
     // The first fence leaves work behind, because nothing can be removed.
-    service.fence(PrivacyGeneration::new(1));
-    service.cancel_undispatched(PrivacyGeneration::new(1));
+    privacy(&service)
+        .fence(PrivacyGeneration::new(1))
+        .expect("the fence goes up");
+    privacy(&service)
+        .cancel_undispatched(PrivacyGeneration::new(1))
+        .expect("the undispatched work is taken back");
     set_directory_writable(&directory, false);
-    service.remove_retained(PrivacyGeneration::new(1));
+    privacy(&service)
+        .remove_retained(PrivacyGeneration::new(1))
+        .expect("the cleanup pass runs");
     assert!(!service.obligations().expect("a read").is_empty());
 
     // A second request arrives over the top of it.
-    service.fence(PrivacyGeneration::new(5));
+    privacy(&service)
+        .fence(PrivacyGeneration::new(5))
+        .expect("the fence goes up");
     let status = service.privacy_status().expect("a read");
     assert_eq!(status.current_generation, 5);
     assert_eq!(status.unreleased_fence, Some(1), "the older fence stands");
@@ -3589,7 +3731,9 @@ fn a_second_fence_is_not_released_by_the_first_ones_cleanup() {
     // Cleanup of the older fence cannot release the newer one, and a release aimed at the older
     // one does not move the generation in force backwards.
     set_directory_writable(&directory, true);
-    service.remove_retained(PrivacyGeneration::new(5));
+    privacy(&service)
+        .remove_retained(PrivacyGeneration::new(5))
+        .expect("the cleanup pass runs");
     assert_eq!(
         service
             .release_fence(
@@ -3626,11 +3770,13 @@ fn direct_sql_cannot_release_a_fence_that_still_has_cleanup_outstanding() {
     let state = root.path().join("state");
     std::fs::create_dir_all(&state).expect("the state directory");
     {
-        let mut service = BackupService::open(&state).expect("a backup service");
+        let service = BackupService::open(&state).expect("a backup service");
         service
             .reconcile(TimestampMs::new(4_000))
             .expect("the startup reconciliation a service opens unready without");
-        service.fence(PrivacyGeneration::new(1));
+        privacy(&service)
+            .fence(PrivacyGeneration::new(1))
+            .expect("the fence goes up");
         assert!(!service.obligations().expect("a read").is_empty());
     }
 
@@ -3937,7 +4083,7 @@ fn direct_sql_cannot_end_a_transfer_by_stopping_forgetting_or_discharging_it() {
     let producer = Producer::generate();
     let objects = [stage(1, "a.cbor", b"one")];
     let admitted = {
-        let mut service = BackupService::open(&state).expect("a backup service");
+        let service = BackupService::open(&state).expect("a backup service");
         service
             .reconcile(TimestampMs::new(4_000))
             .expect("the startup reconciliation a service opens unready without");
@@ -3957,9 +4103,15 @@ fn direct_sql_cannot_end_a_transfer_by_stopping_forgetting_or_discharging_it() {
             .expect("the upload is in flight");
         // The fence writes down one resolution for that exact attempt, which is what a cleanup
         // has to discharge before it can report itself finished.
-        service.fence(PrivacyGeneration::new(1));
-        service.cancel_undispatched(PrivacyGeneration::new(1));
-        service.remove_retained(PrivacyGeneration::new(1));
+        privacy(&service)
+            .fence(PrivacyGeneration::new(1))
+            .expect("the fence goes up");
+        privacy(&service)
+            .cancel_undispatched(PrivacyGeneration::new(1))
+            .expect("the undispatched work is taken back");
+        privacy(&service)
+            .remove_retained(PrivacyGeneration::new(1))
+            .expect("the cleanup pass runs");
         assert!(
             service
                 .obligations()
@@ -4535,7 +4687,8 @@ fn an_acknowledgement_ends_no_transfer_and_a_finished_one_ends_only_itself() {
         "the second attempt keeps its own obligation: {owed:?}"
     );
     {
-        let subsystems: Vec<&dyn PrivacySubsystem> = vec![&environment.service];
+        let backup = privacy(&environment.service);
+        let subsystems: Vec<&dyn PrivacySubsystem> = vec![&backup];
         assert!(!PrivacyMode::reconcile(&subsystems).is_complete());
     }
     assert!(matches!(
@@ -4684,9 +4837,9 @@ fn a_publication_this_host_cannot_account_for_ends_production_rather_than_being_
         "no replacement descriptor is enqueued"
     );
     assert!(
-        environment
-            .service()
+        privacy(environment.service())
             .exported()
+            .expect("a list")
             .iter()
             .any(|artifact| artifact.kind == "backup archive, outcome unknown"),
         "a copy this host cannot account for is shown rather than pretended away"
@@ -8197,7 +8350,8 @@ async fn a_privacy_fence_raised_mid_upload_stops_everything_not_yet_sent() {
         .run_cleanup(PrivacyGeneration::new(1), TimestampMs::new(13_000))
         .expect("the cleanup runs");
     assert!(host.service.obligations().expect("a read").is_empty());
-    let subsystems: Vec<&dyn PrivacySubsystem> = vec![&*host.service];
+    let backup = privacy(&*host.service);
+    let subsystems: Vec<&dyn PrivacySubsystem> = vec![&backup];
     assert!(PrivacyMode::reconcile(&subsystems).is_complete());
 }
 

@@ -17,7 +17,14 @@
 //!
 //! The generation is what ties the four together. It is recorded when privacy mode is enabled, it
 //! travels with every piece of work, and it is what makes "late" decidable: a result carries the
-//! generation it was produced under, and this host compares rather than guesses.
+//! generation it was produced under, and this host compares rather than guesses. One generation is
+//! in force for a whole environment: the environment's record advances it, and each session applies
+//! the one it is given, so every part of the host draws its boundary in the same place.
+//!
+//! Every step answers whether it was taken. A store that refused a step, or cannot say what is
+//! still outstanding, answers [`Unavailable`] with its own reason, and reconciliation reports that
+//! as [`Completion::Unavailable`]: not complete, and not merely waiting either. "This host cannot
+//! say what it owes" is never read as "this host owes nothing".
 //!
 //! What privacy mode does **not** do is equally fixed. It does not erase what has already left
 //! the host, and it does not pretend to: [`Exported`] is what a person is shown instead, with the
@@ -162,30 +169,116 @@ pub struct Removed {
     pub records: u64,
 }
 
+/// Why a subsystem could not take a step, or could not say where its cleanup stands.
+///
+/// It carries the reason the subsystem's own store gave, because a person told that privacy mode's
+/// cleanup is unfinished needs to know what is in the way. A subsystem that cannot answer is not a
+/// subsystem with nothing outstanding, and privacy mode never reads the first as the second.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("{reason}")]
+pub struct Unavailable {
+    reason: String,
+}
+
+impl Unavailable {
+    /// Builds one from the reason a store gave.
+    #[must_use]
+    pub fn new(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+        }
+    }
+
+    /// Returns the reason.
+    #[must_use]
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+}
+
+/// One of the three steps privacy mode takes on every subsystem, in the order it takes them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Step {
+    /// [`PrivacySubsystem::fence`].
+    Fence,
+    /// [`PrivacySubsystem::cancel_undispatched`].
+    Cancel,
+    /// [`PrivacySubsystem::remove_retained`].
+    Remove,
+}
+
+impl Step {
+    /// Returns the stable name this step is reported under.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Fence => "fence",
+            Self::Cancel => "cancel",
+            Self::Remove => "remove",
+        }
+    }
+}
+
+/// A subsystem privacy mode could not take through all three steps.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Unfinished {
+    /// The subsystem's name.
+    pub subsystem: &'static str,
+    /// The step it could not take. The steps after it were not taken either.
+    pub step: Step,
+    /// Why, as the subsystem's store said.
+    pub unavailable: Unavailable,
+}
+
 /// What every subsystem privacy mode reaches has to implement.
 ///
 /// One trait rather than four hooks, because the four steps are one contract: a subsystem that
 /// fenced and did not reconcile would let privacy mode report complete while its own work was
 /// still in flight, and one that cancelled without rejecting a late result would publish the
 /// answer to work it had cancelled.
+///
+/// Every step is idempotent at one generation. Taken again after it succeeded it changes nothing;
+/// taken again after it failed it is taken as though for the first time. That is what lets a
+/// caller that could not finish retry by taking the subsystem through all three steps again, and
+/// it is why a subsystem keeps no memory of its own failures: the caller that saw one keeps it,
+/// and clears it only when that step succeeds.
 pub trait PrivacySubsystem: std::fmt::Debug {
     /// The subsystem's stable name, which is what a report names.
     fn name(&self) -> &'static str;
 
     /// Stops every content-bearing queue and capture, at once.
-    fn fence(&mut self, generation: PrivacyGeneration) -> Fenced;
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Unavailable`], with the store's reason, when the fence could not be raised.
+    fn fence(&mut self, generation: PrivacyGeneration) -> Result<Fenced, Unavailable>;
 
     /// Takes back the work that was admitted and never dispatched.
-    fn cancel_undispatched(&mut self, generation: PrivacyGeneration) -> Cancelled;
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Unavailable`], with the store's reason, when the work could not be taken back.
+    fn cancel_undispatched(
+        &mut self,
+        generation: PrivacyGeneration,
+    ) -> Result<Cancelled, Unavailable>;
 
     /// Removes the retained local content this subsystem holds.
-    fn remove_retained(&mut self, generation: PrivacyGeneration) -> Removed;
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Unavailable`], with the store's reason, when any of that content is still there.
+    fn remove_retained(&mut self, generation: PrivacyGeneration) -> Result<Removed, Unavailable>;
 
     /// Returns how much of this subsystem's in-flight work is still being cleaned up.
     ///
     /// Reconciliation is this answer reaching nought. A subsystem that returned nought while work
     /// was outstanding would make privacy mode report complete before it was.
-    fn outstanding(&self) -> u64;
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Unavailable`], with the store's reason, when the subsystem cannot say.
+    fn outstanding(&self) -> Result<u64, Unavailable>;
 
     /// Returns what this subsystem keeps, explicitly, whatever privacy mode is doing.
     fn kept(&self) -> Vec<KeptExplicitly> {
@@ -193,8 +286,14 @@ pub trait PrivacySubsystem: std::fmt::Debug {
     }
 
     /// Returns what has already left this host, which privacy mode does not erase.
-    fn exported(&self) -> Vec<Exported> {
-        Vec::new()
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Unavailable`], with the store's reason, when the subsystem cannot list it. An
+    /// empty list is a statement that nothing has left, so a store that cannot be read never
+    /// answers with one.
+    fn exported(&self) -> Result<Vec<Exported>, Unavailable> {
+        Ok(Vec::new())
     }
 }
 
@@ -213,10 +312,14 @@ pub struct Enabling {
     pub cancelled: Vec<(&'static str, Cancelled)>,
     /// What each subsystem's local cleanup removed, by name.
     pub removed: Vec<(&'static str, Removed)>,
+    /// Each subsystem that could not be taken through all three steps, and the step it stopped at.
+    pub unfinished: Vec<Unfinished>,
     /// What is kept, explicitly.
     pub kept: Vec<KeptExplicitly>,
     /// What had already left this host, which is shown rather than erased.
     pub exported: Vec<Exported>,
+    /// Each subsystem that could not list what had already left, and why.
+    pub unlisted: Vec<(&'static str, Unavailable)>,
 }
 
 impl Enabling {
@@ -227,6 +330,20 @@ impl Enabling {
             .iter()
             .map(|(_, cancelled)| cancelled.in_flight)
             .sum()
+    }
+
+    /// Returns true when every subsystem was taken through all three steps.
+    #[must_use]
+    pub fn is_finished(&self) -> bool {
+        self.unfinished.is_empty()
+    }
+
+    /// Returns why one subsystem could not be taken through all three steps, when it could not.
+    #[must_use]
+    pub fn unfinished(&self, subsystem: &str) -> Option<&Unfinished> {
+        self.unfinished
+            .iter()
+            .find(|unfinished| unfinished.subsystem == subsystem)
     }
 }
 
@@ -240,9 +357,48 @@ pub enum Completion {
         /// Each subsystem with work outstanding, and how much.
         outstanding: Vec<(&'static str, u64)>,
     },
+    /// Something is in the way: a subsystem could not take a step, or cannot say where its cleanup
+    /// stands. Cleanup is not complete, and it is not merely waiting for work to settle.
+    Unavailable {
+        /// Each subsystem that could not answer, with its store's reason.
+        unavailable: Vec<(&'static str, Unavailable)>,
+        /// Each subsystem with work outstanding, and how much.
+        outstanding: Vec<(&'static str, u64)>,
+    },
 }
 
 impl Completion {
+    /// Builds the answer from what is outstanding and what could not answer.
+    #[must_use]
+    pub fn from_parts(
+        outstanding: Vec<(&'static str, u64)>,
+        unavailable: Vec<(&'static str, Unavailable)>,
+    ) -> Self {
+        if !unavailable.is_empty() {
+            Self::Unavailable {
+                unavailable,
+                outstanding,
+            }
+        } else if !outstanding.is_empty() {
+            Self::Reconciling { outstanding }
+        } else {
+            Self::Complete
+        }
+    }
+
+    /// Returns what is outstanding and what could not answer, which is everything this says.
+    #[must_use]
+    pub fn into_parts(self) -> (Vec<(&'static str, u64)>, Vec<(&'static str, Unavailable)>) {
+        match self {
+            Self::Complete => (Vec::new(), Vec::new()),
+            Self::Reconciling { outstanding } => (outstanding, Vec::new()),
+            Self::Unavailable {
+                unavailable,
+                outstanding,
+            } => (outstanding, unavailable),
+        }
+    }
+
     /// Returns true when cleanup has finished.
     #[must_use]
     pub const fn is_complete(&self) -> bool {
@@ -250,9 +406,26 @@ impl Completion {
     }
 }
 
-/// Privacy mode for one session.
+/// Where a change another owner recorded stands against the generation in force.
 ///
-/// What it holds is the durable state: the generation and whether privacy mode is on. It does not
+/// The environment's record is what advances the generation, and a session applies the one it is
+/// given. So a session asks this first: a newer generation is a change to make, the one in force
+/// in the state already in force is the same change again, and anything else would move the
+/// boundary backwards or give one generation two meanings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Standing {
+    /// A newer generation: the change it names is made.
+    Newer,
+    /// The generation in force, in the state in force: nothing changes, and cleanup is retried.
+    Current,
+    /// An older generation, or the one in force in the other state: refused.
+    Refused,
+}
+
+/// Privacy mode's durable state: the generation, and whether privacy mode is on.
+///
+/// The environment's record advances it with [`Self::open_generation`] and [`Self::disable`]; a
+/// session applies the generation it is given with [`Self::enter`] and [`Self::leave`]. It does not
 /// own the subsystems, and that is deliberate. A subsystem worth having is an adapter over a live
 /// store - the session's retained output, its journal - which its owner already holds, and one
 /// that reports its own cleanup has to stay reachable after the enabling that started it. So the
@@ -323,12 +496,68 @@ impl PrivacyMode {
         self.generation
     }
 
+    /// Returns where a generation another owner recorded stands against the one in force.
+    #[must_use]
+    pub const fn standing(&self, generation: PrivacyGeneration, enabled: bool) -> Standing {
+        if generation.get() > self.generation.get() {
+            Standing::Newer
+        } else if generation.get() == self.generation.get() && enabled == self.enabled {
+            Standing::Current
+        } else {
+            Standing::Refused
+        }
+    }
+
+    /// Turns privacy mode on at a generation another owner recorded, when that is newer.
+    ///
+    /// It returns where the generation stood and changes nothing unless it was newer. As with
+    /// [`Self::open_generation`], the caller writes the change down before it drives anything.
+    pub const fn enter(&mut self, generation: PrivacyGeneration, now_ms: TimestampMs) -> Standing {
+        let standing = self.standing(generation, true);
+        if matches!(standing, Standing::Newer) {
+            self.generation = generation;
+            self.enabled = true;
+            self.enabled_at_ms = Some(now_ms);
+        }
+        standing
+    }
+
+    /// Turns privacy mode off from a generation another owner recorded, when that is newer.
+    ///
+    /// It returns where the generation stood, and what resumed when it was newer. Like
+    /// [`Self::disable`], it reconstructs nothing that was omitted while privacy mode was on.
+    pub const fn leave(
+        &mut self,
+        generation: PrivacyGeneration,
+        now_ms: TimestampMs,
+    ) -> (Standing, Option<Resumed>) {
+        let standing = self.standing(generation, false);
+        if !matches!(standing, Standing::Newer) {
+            return (standing, None);
+        }
+        self.generation = generation;
+        self.enabled = false;
+        self.enabled_at_ms = None;
+        (
+            standing,
+            Some(Resumed {
+                generation,
+                retention_resumes_at_ms: now_ms,
+            }),
+        )
+    }
+
     /// Drives every subsystem through the four things privacy mode asks of them.
     ///
     /// The order is the contract and it is the order section 24 states: fence what is
     /// content-bearing *immediately*, cancel what has not been dispatched, then remove the
     /// retained local content. Fencing first is what stops a queue emptying itself while the
     /// cancellation walks it.
+    ///
+    /// A subsystem whose step fails takes no further step: a cancellation or a removal behind a
+    /// fence that did not go up would be cleanup reported over a queue that is still filling. It
+    /// is listed in [`Enabling::unfinished`] with the step and its store's reason, and the other
+    /// subsystems are taken through every step. A caller retries it by applying it again.
     ///
     /// It does not report completion. In-flight work is reconciled by [`Self::reconcile`], and
     /// until that says so this is an enabling rather than a finished cleanup.
@@ -338,26 +567,65 @@ impl PrivacyMode {
         now_ms: TimestampMs,
     ) -> Enabling {
         let generation = self.generation;
+        let mut stopped = vec![false; subsystems.len()];
+        let mut unfinished = Vec::new();
         let mut fenced = Vec::new();
-        for subsystem in subsystems.iter_mut() {
-            fenced.push((subsystem.name(), subsystem.fence(generation)));
+        for (index, subsystem) in subsystems.iter_mut().enumerate() {
+            match subsystem.fence(generation) {
+                Ok(done) => fenced.push((subsystem.name(), done)),
+                Err(unavailable) => {
+                    stopped[index] = true;
+                    unfinished.push(Unfinished {
+                        subsystem: subsystem.name(),
+                        step: Step::Fence,
+                        unavailable,
+                    });
+                }
+            }
         }
         let mut cancelled = Vec::new();
-        for subsystem in subsystems.iter_mut() {
-            cancelled.push((subsystem.name(), subsystem.cancel_undispatched(generation)));
+        for (index, subsystem) in subsystems.iter_mut().enumerate() {
+            if stopped[index] {
+                continue;
+            }
+            match subsystem.cancel_undispatched(generation) {
+                Ok(done) => cancelled.push((subsystem.name(), done)),
+                Err(unavailable) => {
+                    stopped[index] = true;
+                    unfinished.push(Unfinished {
+                        subsystem: subsystem.name(),
+                        step: Step::Cancel,
+                        unavailable,
+                    });
+                }
+            }
         }
         let mut removed = Vec::new();
-        for subsystem in subsystems.iter_mut() {
-            removed.push((subsystem.name(), subsystem.remove_retained(generation)));
+        for (index, subsystem) in subsystems.iter_mut().enumerate() {
+            if stopped[index] {
+                continue;
+            }
+            match subsystem.remove_retained(generation) {
+                Ok(done) => removed.push((subsystem.name(), done)),
+                Err(unavailable) => unfinished.push(Unfinished {
+                    subsystem: subsystem.name(),
+                    step: Step::Remove,
+                    unavailable,
+                }),
+            }
         }
         let kept = subsystems
             .iter()
             .flat_map(|subsystem| subsystem.kept())
             .collect();
-        let exported = subsystems
-            .iter()
-            .flat_map(|subsystem| subsystem.exported())
-            .collect();
+        let mut exported = Vec::new();
+        let mut unlisted = Vec::new();
+        for subsystem in subsystems.iter() {
+            match subsystem.exported() {
+                Ok(copies) => exported.extend(copies),
+                Err(unavailable) => unlisted.push((subsystem.name(), unavailable)),
+            }
+        }
         Enabling {
             generation,
             at_ms: now_ms,
@@ -365,24 +633,29 @@ impl PrivacyMode {
             fenced,
             cancelled,
             removed,
+            unfinished,
             kept,
             exported,
+            unlisted,
         }
     }
 
     /// Asks every subsystem whether its in-flight cleanup has finished.
+    ///
+    /// A subsystem that cannot say makes the answer [`Completion::Unavailable`], whatever the
+    /// others say, and one with work outstanding makes it at least [`Completion::Reconciling`].
     #[must_use]
     pub fn reconcile(subsystems: &[&dyn PrivacySubsystem]) -> Completion {
-        let outstanding: Vec<(&'static str, u64)> = subsystems
-            .iter()
-            .map(|subsystem| (subsystem.name(), subsystem.outstanding()))
-            .filter(|(_, outstanding)| *outstanding > 0)
-            .collect();
-        if outstanding.is_empty() {
-            Completion::Complete
-        } else {
-            Completion::Reconciling { outstanding }
+        let mut outstanding = Vec::new();
+        let mut unavailable = Vec::new();
+        for subsystem in subsystems {
+            match subsystem.outstanding() {
+                Ok(0) => {}
+                Ok(count) => outstanding.push((subsystem.name(), count)),
+                Err(reason) => unavailable.push((subsystem.name(), reason)),
+            }
         }
+        Completion::from_parts(outstanding, unavailable)
     }
 
     /// Returns whether a result produced under an earlier generation may be published.
@@ -507,13 +780,111 @@ mod tests {
         drive(&mode, &mut quiet, &mut busy);
         match PrivacyMode::reconcile(&[&quiet, &busy]) {
             Completion::Reconciling { outstanding } => assert_eq!(outstanding, vec![("busy", 2)]),
-            Completion::Complete => panic!("cleanup had not finished"),
+            other => panic!("cleanup had not finished, and nothing was in the way: {other:?}"),
         }
         // The subsystem the caller still holds is the one that reports its own cleanup, which is
         // what makes completion reachable rather than a state nothing can leave.
         busy.note_reconciled();
         busy.note_reconciled();
         assert!(PrivacyMode::reconcile(&[&quiet, &busy]).is_complete());
+    }
+
+    /// A store that cannot say what is outstanding makes the whole answer unavailable, with its
+    /// reason, and never complete, whatever the other subsystems say; it does not hide their work.
+    #[test]
+    fn a_subsystem_that_cannot_answer_makes_completion_unavailable_and_never_complete() {
+        let mut mode = PrivacyMode::new();
+        mode.open_generation(TimestampMs::new(1_000));
+        let mut busy = Recording::with_in_flight("busy", 1);
+        let mut stuck = Recording::unanswerable("stuck");
+        drive(&mode, &mut busy, &mut stuck);
+        let Completion::Unavailable {
+            unavailable,
+            outstanding,
+        } = PrivacyMode::reconcile(&[&busy, &stuck])
+        else {
+            panic!("a subsystem that cannot answer is not reconciling and not complete");
+        };
+        assert_eq!(unavailable.len(), 1);
+        assert_eq!(unavailable[0].0, "stuck");
+        assert!(unavailable[0].1.reason().contains("cannot say"));
+        assert_eq!(outstanding, vec![("busy", 1)]);
+
+        // Its work settling elsewhere does not make it complete while it still cannot answer.
+        busy.note_reconciled();
+        assert!(!PrivacyMode::reconcile(&[&busy, &stuck]).is_complete());
+        stuck.recover();
+        assert!(PrivacyMode::reconcile(&[&busy, &stuck]).is_complete());
+    }
+
+    /// A refused step stops that subsystem, with its reason, and takes nothing behind it; the
+    /// others go through every step. Applying it again once the store answers finishes it.
+    #[test]
+    fn a_refused_step_stops_its_subsystem_and_the_others_go_on() {
+        let mut mode = PrivacyMode::new();
+        mode.open_generation(TimestampMs::new(1_000));
+        let mut refusing = Recording::refusing("refusing", Step::Fence);
+        let mut willing = Recording::new("willing");
+        let enabling = drive(&mode, &mut refusing, &mut willing);
+        assert!(!enabling.is_finished());
+        let unfinished = enabling.unfinished("refusing").expect("it stopped");
+        assert_eq!(unfinished.step, Step::Fence);
+        assert!(
+            unfinished
+                .unavailable
+                .reason()
+                .contains("refused the fence step")
+        );
+        assert!(!refusing.was_fenced() && !refusing.was_cancelled());
+        assert!(willing.was_fenced() && willing.was_cancelled());
+        assert_eq!(enabling.fenced.len(), 1);
+        assert_eq!(enabling.cancelled.len(), 1);
+        assert_eq!(enabling.removed.len(), 1);
+
+        refusing.recover();
+        let enabling = drive(&mode, &mut refusing, &mut willing);
+        assert!(enabling.is_finished());
+        assert!(refusing.was_fenced() && refusing.was_cancelled());
+    }
+
+    /// A generation another owner recorded is taken only when it is newer; the one in force in
+    /// the same state changes nothing, and anything else is refused.
+    #[test]
+    fn a_named_generation_is_taken_only_when_it_is_newer() {
+        let mut mode = PrivacyMode::new();
+        assert_eq!(
+            mode.enter(PrivacyGeneration::new(3), TimestampMs::new(1_000)),
+            Standing::Newer
+        );
+        assert!(mode.is_enabled());
+        assert_eq!(mode.generation(), PrivacyGeneration::new(3));
+        assert_eq!(
+            mode.enter(PrivacyGeneration::new(3), TimestampMs::new(2_000)),
+            Standing::Current
+        );
+        assert_eq!(mode.enabled_at_ms(), Some(TimestampMs::new(1_000)));
+        assert_eq!(
+            mode.enter(PrivacyGeneration::new(2), TimestampMs::new(2_000)),
+            Standing::Refused
+        );
+        let (standing, resumed) = mode.leave(PrivacyGeneration::new(3), TimestampMs::new(3_000));
+        assert_eq!((standing, resumed), (Standing::Refused, None));
+        assert!(
+            mode.is_enabled(),
+            "one generation does not mean both on and off"
+        );
+        let (standing, resumed) = mode.leave(PrivacyGeneration::new(4), TimestampMs::new(3_000));
+        assert_eq!(standing, Standing::Newer);
+        assert_eq!(
+            resumed.map(|resumed| resumed.generation),
+            Some(PrivacyGeneration::new(4))
+        );
+        assert!(!mode.is_enabled());
+        assert!(!mode.accepts_result(PrivacyGeneration::new(3)));
+        assert_eq!(
+            mode.leave(PrivacyGeneration::new(4), TimestampMs::new(4_000)),
+            (Standing::Current, None)
+        );
     }
 
     #[test]

@@ -6,11 +6,16 @@
 //! answered "nothing outstanding" without knowing would be worse than no stub at all, so a seam
 //! with no store behind it reports nothing to fence, nothing to cancel and nothing outstanding,
 //! and says in its own documentation what will be true when its store exists.
+//!
+//! None of them remembers a failure. A step that could not be taken says so in its answer, with
+//! its store's reason, and the caller that drives the step keeps it until the step succeeds: a
+//! hook is built for one call, so a failure kept on it would be forgotten with it.
 
 use kr_protocol::scalars::TimestampMs;
 
 use crate::privacy::{
     Cancelled, Exported, Fenced, KeptExplicitly, PrivacyGeneration, PrivacySubsystem, Removed,
+    Step, Unavailable,
 };
 
 /// Retained session output, over the session's own history.
@@ -26,7 +31,6 @@ use crate::privacy::{
 pub struct RetainedHistory<'a> {
     history: &'a mut crate::history::OutputHistory,
     fenced: bool,
-    failure: Option<String>,
 }
 
 impl<'a> RetainedHistory<'a> {
@@ -36,7 +40,6 @@ impl<'a> RetainedHistory<'a> {
         Self {
             history,
             fenced: false,
-            failure: None,
         }
     }
 
@@ -45,12 +48,6 @@ impl<'a> RetainedHistory<'a> {
     pub const fn is_fenced(&self) -> bool {
         self.fenced
     }
-
-    /// Returns why the removal could not finish, when it could not.
-    #[must_use]
-    pub fn failure(&self) -> Option<&str> {
-        self.failure.as_deref()
-    }
 }
 
 impl PrivacySubsystem for RetainedHistory<'_> {
@@ -58,37 +55,42 @@ impl PrivacySubsystem for RetainedHistory<'_> {
         "history"
     }
 
-    fn fence(&mut self, _generation: PrivacyGeneration) -> Fenced {
+    fn fence(&mut self, _generation: PrivacyGeneration) -> Result<Fenced, Unavailable> {
         // The capture stops before the removal, so nothing is written behind the cleanup.
         self.fenced = true;
         self.history.stop_retaining();
-        Fenced {
+        Ok(Fenced {
             queues: 1,
             items: 0,
-        }
+        })
     }
 
-    fn cancel_undispatched(&mut self, _generation: PrivacyGeneration) -> Cancelled {
+    fn cancel_undispatched(
+        &mut self,
+        _generation: PrivacyGeneration,
+    ) -> Result<Cancelled, Unavailable> {
         // Retained output is not dispatched anywhere. There is nothing to take back and nothing
         // in flight, and saying so is the honest answer rather than a count of nothing.
-        Cancelled::default()
+        Ok(Cancelled::default())
     }
 
-    fn remove_retained(&mut self, _generation: PrivacyGeneration) -> Removed {
+    fn remove_retained(&mut self, _generation: PrivacyGeneration) -> Result<Removed, Unavailable> {
         let discarded = self.history.discard_retained();
-        if let Some(left) = discarded.left_behind {
+        match discarded.left_behind {
             // Content privacy mode was asked to remove and has not. Saying so is what stops the
             // cleanup reporting complete over output a reader can still page.
-            self.failure = Some(left);
-        }
-        Removed {
-            bytes: discarded.bytes,
-            records: discarded.segments,
+            Some(left) => Err(Unavailable::new(left)),
+            None => Ok(Removed {
+                bytes: discarded.bytes,
+                records: discarded.segments,
+            }),
         }
     }
 
-    fn outstanding(&self) -> u64 {
-        u64::from(self.failure.is_some())
+    fn outstanding(&self) -> Result<u64, Unavailable> {
+        // The removal is synchronous: once it has answered there is nothing of this subsystem's
+        // still in flight. A removal that failed said so in its own answer.
+        Ok(0)
     }
 }
 
@@ -103,24 +105,13 @@ impl PrivacySubsystem for RetainedHistory<'_> {
 pub struct ReceiptMetadata<'a> {
     journal: Option<&'a mut crate::journal::Journal>,
     pending: u64,
-    failure: Option<String>,
 }
 
 impl<'a> ReceiptMetadata<'a> {
     /// Builds the hook over one session's journal and its live pending questions and approvals.
     #[must_use]
     pub fn over(journal: Option<&'a mut crate::journal::Journal>, pending: u64) -> Self {
-        Self {
-            journal,
-            pending,
-            failure: None,
-        }
-    }
-
-    /// Returns why the redaction could not finish, when it could not.
-    #[must_use]
-    pub fn failure(&self) -> Option<&str> {
-        self.failure.as_deref()
+        Self { journal, pending }
     }
 }
 
@@ -129,37 +120,38 @@ impl PrivacySubsystem for ReceiptMetadata<'_> {
         "receipts"
     }
 
-    fn fence(&mut self, _generation: PrivacyGeneration) -> Fenced {
+    fn fence(&mut self, _generation: PrivacyGeneration) -> Result<Fenced, Unavailable> {
         // A receipt does not travel anywhere on its own, so there is no queue here to stop. What
         // has to be taken out of it is taken by the removal below.
-        Fenced::default()
+        Ok(Fenced::default())
     }
 
-    fn cancel_undispatched(&mut self, _generation: PrivacyGeneration) -> Cancelled {
+    fn cancel_undispatched(
+        &mut self,
+        _generation: PrivacyGeneration,
+    ) -> Result<Cancelled, Unavailable> {
         // Cancelling an admitted action because privacy mode was enabled would be privacy mode
         // deciding what a caller's action does. It is not one of the four things section 24 asks
         // for, and the dispatch barrier is where an action is taken back.
-        Cancelled::default()
+        Ok(Cancelled::default())
     }
 
-    fn remove_retained(&mut self, _generation: PrivacyGeneration) -> Removed {
+    fn remove_retained(&mut self, _generation: PrivacyGeneration) -> Result<Removed, Unavailable> {
         let Some(journal) = self.journal.as_mut() else {
-            return Removed::default();
+            return Ok(Removed::default());
         };
-        match journal.redact_settled_content() {
-            Ok(records) => Removed { bytes: 0, records },
-            Err(error) => {
-                // A store that refused the redaction has not done it, and this says so rather
-                // than reporting a removal that did not happen. Reconciliation carries it.
-                self.failure = Some(error.to_string());
-                Removed::default()
-            }
-        }
+        // A store that refused the redaction has not done it, and this says so rather than
+        // reporting a removal that did not happen.
+        journal
+            .redact_settled_content()
+            .map(|records| Removed { bytes: 0, records })
+            .map_err(|error| Unavailable::new(error.to_string()))
     }
 
-    fn outstanding(&self) -> u64 {
-        // A redaction that failed is cleanup this host still owes.
-        u64::from(self.failure.is_some())
+    fn outstanding(&self) -> Result<u64, Unavailable> {
+        // Nothing of a receipt is in flight: the redaction is synchronous, and one that failed
+        // said so in its own answer.
+        Ok(0)
     }
 
     fn kept(&self) -> Vec<KeptExplicitly> {
@@ -230,30 +222,33 @@ impl PrivacySubsystem for TransferPreviews {
         "transfer_previews"
     }
 
-    fn fence(&mut self, _generation: PrivacyGeneration) -> Fenced {
+    fn fence(&mut self, _generation: PrivacyGeneration) -> Result<Fenced, Unavailable> {
         self.fenced = true;
-        Fenced {
+        Ok(Fenced {
             queues: u64::from(self.previews > 0),
             items: self.previews,
-        }
+        })
     }
 
-    fn cancel_undispatched(&mut self, _generation: PrivacyGeneration) -> Cancelled {
-        Cancelled {
+    fn cancel_undispatched(
+        &mut self,
+        _generation: PrivacyGeneration,
+    ) -> Result<Cancelled, Unavailable> {
+        Ok(Cancelled {
             undispatched: std::mem::take(&mut self.undispatched),
             in_flight: self.in_flight,
-        }
+        })
     }
 
-    fn remove_retained(&mut self, _generation: PrivacyGeneration) -> Removed {
-        Removed {
+    fn remove_retained(&mut self, _generation: PrivacyGeneration) -> Result<Removed, Unavailable> {
+        Ok(Removed {
             bytes: 0,
             records: std::mem::take(&mut self.previews),
-        }
+        })
     }
 
-    fn outstanding(&self) -> u64 {
-        self.in_flight
+    fn outstanding(&self) -> Result<u64, Unavailable> {
+        Ok(self.in_flight)
     }
 }
 
@@ -297,32 +292,35 @@ impl PrivacySubsystem for DescriptionInference {
         "description_inference"
     }
 
-    fn fence(&mut self, _generation: PrivacyGeneration) -> Fenced {
+    fn fence(&mut self, _generation: PrivacyGeneration) -> Result<Fenced, Unavailable> {
         self.fenced = true;
-        Fenced {
+        Ok(Fenced {
             queues: u64::from(self.queued > 0 || self.in_flight > 0),
             items: self.queued,
-        }
+        })
     }
 
-    fn cancel_undispatched(&mut self, _generation: PrivacyGeneration) -> Cancelled {
-        Cancelled {
+    fn cancel_undispatched(
+        &mut self,
+        _generation: PrivacyGeneration,
+    ) -> Result<Cancelled, Unavailable> {
+        Ok(Cancelled {
             undispatched: std::mem::take(&mut self.queued),
             in_flight: self.in_flight,
-        }
+        })
     }
 
-    fn remove_retained(&mut self, _generation: PrivacyGeneration) -> Removed {
+    fn remove_retained(&mut self, _generation: PrivacyGeneration) -> Result<Removed, Unavailable> {
         // Generated descriptions go with the rest of the content. A pinned label a person wrote
         // is not one of these: section 24 keeps it locally unless it is explicitly cleared.
-        Removed {
+        Ok(Removed {
             bytes: 0,
             records: std::mem::take(&mut self.generated),
-        }
+        })
     }
 
-    fn outstanding(&self) -> u64 {
-        self.in_flight
+    fn outstanding(&self) -> Result<u64, Unavailable> {
+        Ok(self.in_flight)
     }
 }
 
@@ -362,31 +360,34 @@ impl PrivacySubsystem for SyncOutbox {
         "sync"
     }
 
-    fn fence(&mut self, _generation: PrivacyGeneration) -> Fenced {
+    fn fence(&mut self, _generation: PrivacyGeneration) -> Result<Fenced, Unavailable> {
         self.fenced = true;
-        Fenced {
+        Ok(Fenced {
             queues: 1,
             items: self.queued,
-        }
+        })
     }
 
-    fn cancel_undispatched(&mut self, _generation: PrivacyGeneration) -> Cancelled {
-        Cancelled {
+    fn cancel_undispatched(
+        &mut self,
+        _generation: PrivacyGeneration,
+    ) -> Result<Cancelled, Unavailable> {
+        Ok(Cancelled {
             undispatched: std::mem::take(&mut self.queued),
             in_flight: self.in_flight,
-        }
+        })
     }
 
-    fn remove_retained(&mut self, _generation: PrivacyGeneration) -> Removed {
-        Removed::default()
+    fn remove_retained(&mut self, _generation: PrivacyGeneration) -> Result<Removed, Unavailable> {
+        Ok(Removed::default())
     }
 
-    fn outstanding(&self) -> u64 {
-        self.in_flight
+    fn outstanding(&self) -> Result<u64, Unavailable> {
+        Ok(self.in_flight)
     }
 
-    fn exported(&self) -> Vec<Exported> {
-        self.uploaded.clone()
+    fn exported(&self) -> Result<Vec<Exported>, Unavailable> {
+        Ok(self.uploaded.clone())
     }
 
     fn kept(&self) -> Vec<KeptExplicitly> {
@@ -432,53 +433,56 @@ impl PrivacySubsystem for BackupOutbox {
         "backup"
     }
 
-    fn fence(&mut self, _generation: PrivacyGeneration) -> Fenced {
+    fn fence(&mut self, _generation: PrivacyGeneration) -> Result<Fenced, Unavailable> {
         self.fenced = true;
-        Fenced {
+        Ok(Fenced {
             queues: 1,
             items: self.queued,
-        }
+        })
     }
 
-    fn cancel_undispatched(&mut self, _generation: PrivacyGeneration) -> Cancelled {
-        Cancelled {
+    fn cancel_undispatched(
+        &mut self,
+        _generation: PrivacyGeneration,
+    ) -> Result<Cancelled, Unavailable> {
+        Ok(Cancelled {
             undispatched: std::mem::take(&mut self.queued),
             in_flight: self.in_flight,
-        }
+        })
     }
 
-    fn remove_retained(&mut self, _generation: PrivacyGeneration) -> Removed {
-        Removed::default()
+    fn remove_retained(&mut self, _generation: PrivacyGeneration) -> Result<Removed, Unavailable> {
+        Ok(Removed::default())
     }
 
-    fn outstanding(&self) -> u64 {
-        self.in_flight
+    fn outstanding(&self) -> Result<u64, Unavailable> {
+        Ok(self.in_flight)
     }
 
-    fn exported(&self) -> Vec<Exported> {
-        self.archives.clone()
+    fn exported(&self) -> Result<Vec<Exported>, Unavailable> {
+        Ok(self.archives.clone())
     }
 }
 
 /// A subsystem that records what it was asked, for the tests of the contract itself.
+///
+/// It can be told to refuse one step, or to be unable to say what is outstanding, which is how a
+/// test stands in for a store that will not answer.
 #[derive(Debug)]
 pub struct Recording {
     name: &'static str,
     fenced: bool,
     cancelled: bool,
     in_flight: u64,
+    refuses: Option<Step>,
+    answers: bool,
 }
 
 impl Recording {
     /// Builds one with nothing in flight.
     #[must_use]
     pub const fn new(name: &'static str) -> Self {
-        Self {
-            name,
-            fenced: false,
-            cancelled: false,
-            in_flight: 0,
-        }
+        Self::with_in_flight(name, 0)
     }
 
     /// Builds one with work still in flight.
@@ -489,7 +493,31 @@ impl Recording {
             fenced: false,
             cancelled: false,
             in_flight,
+            refuses: None,
+            answers: true,
         }
+    }
+
+    /// Builds one whose store refuses `step`, until [`Self::recover`].
+    #[must_use]
+    pub const fn refusing(name: &'static str, step: Step) -> Self {
+        let mut recording = Self::new(name);
+        recording.refuses = Some(step);
+        recording
+    }
+
+    /// Builds one whose store cannot say what is outstanding, until [`Self::recover`].
+    #[must_use]
+    pub const fn unanswerable(name: &'static str) -> Self {
+        let mut recording = Self::new(name);
+        recording.answers = false;
+        recording
+    }
+
+    /// Makes the store answer again.
+    pub const fn recover(&mut self) {
+        self.refuses = None;
+        self.answers = true;
     }
 
     /// Records that one piece of in-flight work has been reconciled.
@@ -497,10 +525,27 @@ impl Recording {
         self.in_flight = self.in_flight.saturating_sub(1);
     }
 
+    /// Returns whether this subsystem was fenced.
+    #[must_use]
+    pub const fn was_fenced(&self) -> bool {
+        self.fenced
+    }
+
     /// Returns whether this subsystem was cancelled.
     #[must_use]
     pub const fn was_cancelled(&self) -> bool {
         self.cancelled
+    }
+
+    fn refusal(&self, step: Step) -> Result<(), Unavailable> {
+        if self.refuses == Some(step) {
+            return Err(Unavailable::new(format!(
+                "{}'s store refused the {} step",
+                self.name,
+                step.as_str()
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -509,33 +554,45 @@ impl PrivacySubsystem for Recording {
         self.name
     }
 
-    fn fence(&mut self, _generation: PrivacyGeneration) -> Fenced {
+    fn fence(&mut self, _generation: PrivacyGeneration) -> Result<Fenced, Unavailable> {
+        self.refusal(Step::Fence)?;
         self.fenced = true;
-        Fenced {
+        Ok(Fenced {
             queues: 1,
             items: 0,
-        }
+        })
     }
 
-    fn cancel_undispatched(&mut self, _generation: PrivacyGeneration) -> Cancelled {
+    fn cancel_undispatched(
+        &mut self,
+        _generation: PrivacyGeneration,
+    ) -> Result<Cancelled, Unavailable> {
+        self.refusal(Step::Cancel)?;
         // The order matters, so it is checked rather than assumed: a cancellation that ran before
         // this subsystem was fenced reports nothing taken back, and the test sees it.
         if !self.fenced {
-            return Cancelled::default();
+            return Ok(Cancelled::default());
         }
         self.cancelled = true;
-        Cancelled {
+        Ok(Cancelled {
             undispatched: 1,
             in_flight: self.in_flight,
+        })
+    }
+
+    fn remove_retained(&mut self, _generation: PrivacyGeneration) -> Result<Removed, Unavailable> {
+        self.refusal(Step::Remove)?;
+        Ok(Removed::default())
+    }
+
+    fn outstanding(&self) -> Result<u64, Unavailable> {
+        if !self.answers {
+            return Err(Unavailable::new(format!(
+                "{}'s store cannot say what is outstanding",
+                self.name
+            )));
         }
-    }
-
-    fn remove_retained(&mut self, _generation: PrivacyGeneration) -> Removed {
-        Removed::default()
-    }
-
-    fn outstanding(&self) -> u64 {
-        self.in_flight
+        Ok(self.in_flight)
     }
 }
 

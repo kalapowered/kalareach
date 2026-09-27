@@ -446,19 +446,23 @@ fn said(body: &str) -> String {
     format!("Normal: {body}")
 }
 
+/// Enables privacy mode at the generation after the one in force, as the environment's record
+/// would name it.
 fn enable_privacy(host: &Host) {
-    host.service
-        .runtime()
-        .session()
-        .enable_privacy(&mut [])
+    let mut session = host.service.runtime().session();
+    let next = session.privacy().generation().next();
+    session
+        .enable_privacy(next, &mut [])
         .expect("privacy mode is enabled");
 }
 
+/// Disables privacy mode at the generation after the one in force, as the environment's record
+/// would name it.
 fn disable_privacy(host: &Host) {
-    host.service
-        .runtime()
-        .session()
-        .disable_privacy()
+    let mut session = host.service.runtime().session();
+    let next = session.privacy().generation().next();
+    session
+        .disable_privacy(next)
         .expect("privacy mode is disabled");
 }
 
@@ -1527,10 +1531,10 @@ fn raise(host: &Host) -> tokio::task::JoinHandle<kr_worker::service::PrivacyTran
 
 /// Enables privacy mode with the worker's attention subsystem among those it drives.
 fn enable_with(host: &Host, attention: &mut kr_worker::attention_fence::AttentionPrivacy) {
-    host.service
-        .runtime()
-        .session()
-        .enable_privacy(&mut [attention])
+    let mut session = host.service.runtime().session();
+    let next = session.privacy().generation().next();
+    session
+        .enable_privacy(next, &mut [attention])
         .expect("privacy mode is enabled");
 }
 

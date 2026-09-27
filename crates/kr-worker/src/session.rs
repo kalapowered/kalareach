@@ -3778,13 +3778,18 @@ impl Session {
         self.privacy
     }
 
-    /// Enables privacy mode for this session.
+    /// Applies the environment's privacy generation to this session, turning privacy mode on.
     ///
-    /// The order is section 24's and it starts with the durable write: the generation is recorded
-    /// *before* any subsystem is touched, because a generation that was applied and not recorded
-    /// would be a boundary a restart could not see, and a late result from before it would then
-    /// be published. Then the content-bearing capture is fenced, the undispatched work is
-    /// cancelled, and the retained local content is removed.
+    /// The generation is the environment's, recorded there first; this session applies the one it
+    /// is given, so every session of an environment draws its boundary in the same place. A newer
+    /// generation is written to this session's journal *before* any subsystem is touched, because
+    /// a generation that was applied and not recorded would be a boundary a restart could not see,
+    /// and a late result from before it would then be published. Then the content-bearing capture
+    /// is fenced, the undispatched work is cancelled, and the retained local content is removed.
+    ///
+    /// The generation already in force, with privacy mode already on, is the same enabling again:
+    /// the journal's record is left exactly as it is, because the attention heads it holds are the
+    /// boundary, and the cleanup is taken again, so a step that failed is retried.
     ///
     /// It does not report completion. In-flight work is reconciled by
     /// [`Self::reconcile_privacy`], and until that says so this is an enabling rather than a
@@ -3792,24 +3797,46 @@ impl Session {
     ///
     /// # Errors
     ///
-    /// Returns [`WorkerError::JournalUnavailable`] when the generation cannot be recorded, and
-    /// then nothing has been fenced or removed: a privacy mode this host cannot write down is one
-    /// it must not claim to be in.
+    /// Returns [`WorkerError::PreconditionFailed`] for an older generation, or for the generation
+    /// in force while privacy mode is off, and [`WorkerError::JournalUnavailable`] when the
+    /// generation cannot be recorded. Either way nothing has been fenced or removed: a privacy
+    /// mode this host cannot write down is one it must not claim to be in.
     pub fn enable_privacy<'a>(
         &'a mut self,
+        generation: crate::privacy::PrivacyGeneration,
         extra: &mut [&'a mut dyn crate::privacy::PrivacySubsystem],
     ) -> Result<crate::privacy::Enabling> {
         let now = kr_ipc::now_ms();
         let mut privacy = self.privacy;
-        let generation = privacy.open_generation(now);
-        let Some(journal) = self.journal.as_mut() else {
-            return Err(WorkerError::JournalUnavailable {
-                detail: "this session has no journal, so a privacy generation cannot be recorded"
-                    .to_owned(),
-            });
-        };
-        journal.record_privacy(generation.get(), true, now)?;
-        self.privacy = privacy;
+        match privacy.enter(generation, now) {
+            crate::privacy::Standing::Refused => {
+                return Err(WorkerError::PreconditionFailed {
+                    detail: format!(
+                        "privacy generation {} does not follow the generation {} this session \
+                         holds {}",
+                        generation.get(),
+                        self.privacy.generation().get(),
+                        if self.privacy.is_enabled() {
+                            "with privacy mode on"
+                        } else {
+                            "with privacy mode off"
+                        }
+                    ),
+                });
+            }
+            crate::privacy::Standing::Current => {}
+            crate::privacy::Standing::Newer => {
+                let Some(journal) = self.journal.as_mut() else {
+                    return Err(WorkerError::JournalUnavailable {
+                        detail: "this session has no journal, so a privacy generation cannot be \
+                                 recorded"
+                            .to_owned(),
+                    });
+                };
+                journal.record_privacy(generation.get(), true, now)?;
+                self.privacy = privacy;
+            }
+        }
 
         // The question ledger is the service's rather than the session's, so the count of live
         // pending questions and approvals comes from the caller with its own subsystems. What is
@@ -3822,14 +3849,19 @@ impl Session {
         for subsystem in extra.iter_mut() {
             subsystems.push(&mut **subsystem);
         }
-        let enabling = privacy.apply(&mut subsystems, now);
+        let enabling = self.privacy.apply(&mut subsystems, now);
         // What each of this session's own two could not finish, kept apart so the retry of one
-        // never settles the other.
+        // never settles the other, and kept here because the hooks are gone after this call.
+        let owed = |name: &str| {
+            enabling
+                .unfinished(name)
+                .map(|unfinished| unfinished.unavailable.reason().to_owned())
+        };
         self.privacy_cleanup = PrivacyCleanup {
             // The state was written down before any of this ran, so it is not in doubt.
             unresolved: None,
-            history: history.failure().map(str::to_owned),
-            receipts: receipts.failure().map(str::to_owned),
+            history: owed("history"),
+            receipts: owed("receipts"),
         };
         Ok(enabling)
     }
@@ -3838,26 +3870,18 @@ impl Session {
     ///
     /// Two halves, and completion needs both. The session's own cleanup is local and synchronous,
     /// so it is finished when `enable_privacy` returns - unless it *failed*, and a failure is
-    /// cleanup this host still owes rather than something the return hid. The other half is the
-    /// caller's subsystems, whose work can still be in flight.
+    /// cleanup this host still owes, reported as unavailable with its store's reason rather than
+    /// something the return hid. The other half is the caller's subsystems, whose work can still be
+    /// in flight.
     #[must_use]
     pub fn reconcile_privacy(
         &self,
         extra: &[&dyn crate::privacy::PrivacySubsystem],
     ) -> crate::privacy::Completion {
-        let mut outstanding = match crate::privacy::PrivacyMode::reconcile(extra) {
-            crate::privacy::Completion::Complete => Vec::new(),
-            crate::privacy::Completion::Reconciling { outstanding } => outstanding,
-        };
-        let owed = self.privacy_cleanup.owed();
-        if owed > 0 {
-            outstanding.push(("session", owed));
-        }
-        if outstanding.is_empty() {
-            crate::privacy::Completion::Complete
-        } else {
-            crate::privacy::Completion::Reconciling { outstanding }
-        }
+        let (outstanding, mut unavailable) =
+            crate::privacy::PrivacyMode::reconcile(extra).into_parts();
+        unavailable.extend(self.privacy_cleanup.unavailable());
+        crate::privacy::Completion::from_parts(outstanding, unavailable)
     }
 
     /// Returns why this session's own privacy cleanup could not finish, when it could not.
@@ -3866,20 +3890,49 @@ impl Session {
         self.privacy_cleanup.describe()
     }
 
-    /// Turns privacy mode off, and starts retention again from this moment.
+    /// Applies the environment's privacy generation to this session, turning privacy mode off and
+    /// starting retention again from this moment.
     ///
-    /// Nothing omitted while it was on is reconstructed, and the generation stays where it is, so
-    /// a late result from the private interval is still refused.
+    /// Nothing omitted while it was on is reconstructed, and the generation is the new one the
+    /// environment recorded, so a late result from the private interval is still refused. The
+    /// generation already in force, with privacy mode already off, changes nothing and answers
+    /// `None`.
     ///
     /// # Errors
     ///
-    /// Returns [`WorkerError::JournalUnavailable`] when the change cannot be recorded.
-    pub fn disable_privacy(&mut self) -> Result<crate::privacy::Resumed> {
+    /// Returns [`WorkerError::PreconditionFailed`] for an older generation, or for the generation
+    /// in force while privacy mode is on, and [`WorkerError::JournalUnavailable`] while this
+    /// session's own cleanup is unfinished or when the change cannot be recorded.
+    pub fn disable_privacy(
+        &mut self,
+        generation: crate::privacy::PrivacyGeneration,
+    ) -> Result<Option<crate::privacy::Resumed>> {
         let now = kr_ipc::now_ms();
         // Everything admitted while privacy mode was on settles under it, and some of it settles
         // between the last maintenance tick and this call. Taking its content now is what stops
         // turning privacy mode off from being a way of keeping the private interval's content.
         self.retry_privacy_cleanup();
+        let mut privacy = self.privacy;
+        let (standing, resumed) = privacy.leave(generation, now);
+        match standing {
+            crate::privacy::Standing::Refused => {
+                return Err(WorkerError::PreconditionFailed {
+                    detail: format!(
+                        "privacy generation {} does not follow the generation {} this session \
+                         holds {}",
+                        generation.get(),
+                        self.privacy.generation().get(),
+                        if self.privacy.is_enabled() {
+                            "with privacy mode on"
+                        } else {
+                            "with privacy mode off"
+                        }
+                    ),
+                });
+            }
+            crate::privacy::Standing::Current => return Ok(None),
+            crate::privacy::Standing::Newer => {}
+        }
         // A cleanup this host still owes is content privacy mode was asked to remove and has not.
         // Turning privacy mode off over it would resume retention beside an unfinished purge:
         // output kept afterwards would join the history the purge is still owed, and a restart
@@ -3892,12 +3945,10 @@ impl Session {
                 ),
             });
         }
-        let mut privacy = self.privacy;
-        let resumed = privacy.disable(now);
         // Recorded before retention starts again, for the reason enabling records first: a
         // boundary this host could not write down is one a restart cannot see.
         if let Some(journal) = self.journal.as_mut() {
-            journal.record_privacy(resumed.generation.get(), false, now)?;
+            journal.record_privacy(generation.get(), false, now)?;
         }
         self.privacy = privacy;
         self.history.resume_retaining();
@@ -4656,6 +4707,21 @@ impl PrivacyCleanup {
         (self.unresolved.is_some() as u64)
             + (self.history.is_some() as u64)
             + (self.receipts.is_some() as u64)
+    }
+
+    /// Returns each obligation that is outstanding, as the subsystem it belongs to and why.
+    ///
+    /// Each is cleanup a store refused or a state this host could not read, so each is reported as
+    /// unavailable rather than as work still settling.
+    fn unavailable(&self) -> Vec<(&'static str, crate::privacy::Unavailable)> {
+        [
+            ("session", self.unresolved.as_deref()),
+            ("history", self.history.as_deref()),
+            ("receipts", self.receipts.as_deref()),
+        ]
+        .into_iter()
+        .filter_map(|(name, why)| why.map(|why| (name, crate::privacy::Unavailable::new(why))))
+        .collect()
     }
 
     /// Returns what is outstanding, for a person.

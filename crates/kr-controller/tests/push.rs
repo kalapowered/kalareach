@@ -2745,7 +2745,7 @@ fn privacy_mode_fences_the_outbox_with_work_in_flight() {
                 PrivacyMode::reconcile(&[&outbox]),
                 Completion::Reconciling { .. }
             ));
-            let exported = outbox.exported();
+            let exported = outbox.exported().expect("a list");
             assert!(
                 exported.iter().any(|exported| !exported.deletable),
                 "what has already left is shown, and this host claims no recall"

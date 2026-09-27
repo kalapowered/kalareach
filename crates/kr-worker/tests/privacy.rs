@@ -60,6 +60,38 @@ fn session_on_disk() -> (kr_ipc::testing::TempHost, Session) {
     (temp, session)
 }
 
+/// A session's configuration on the internal disk, with its journal at `journal`.
+fn config_at(
+    temp: &kr_ipc::testing::TempHost,
+    session_id: SessionId,
+    journal: std::path::PathBuf,
+) -> SessionConfig {
+    let environment = temp.environment();
+    SessionConfig {
+        session_id,
+        session_epoch: SessionEpoch::V1,
+        environment_id: environment.environment_id(),
+        display_number: DisplayNumber::new(1),
+        shell: ShellCommand {
+            program: "/bin/sh".to_owned(),
+            arguments: vec!["-c".to_owned(), "sleep 30".to_owned()],
+            cwd: "/".to_owned(),
+            environment: vec![("PATH".to_owned(), "/usr/bin:/bin".to_owned())],
+        },
+        shell_mode: ShellMode::NativeCompat,
+        worker_profile: WorkerProfile::HeadlessUser,
+        launch_profile: kr_protocol::session::LaunchProfile::default(),
+        worker_endpoint: None,
+        desktop: DesktopBinding::none(),
+        dimensions: Dimensions::new(80, 24),
+        journal_path: Some(journal),
+        spool_directory: Some(environment.session_spool(session_id)),
+        send_queue_bytes: 1024 * 1024,
+        resident_bytes: 64 * 1024,
+        time: kr_worker::action::time::TimeSources::system(),
+    }
+}
+
 fn actor() -> ActorId {
     ActorId::new("test:privacy").expect("an actor")
 }
@@ -122,7 +154,9 @@ fn enabling_privacy_records_a_generation_durably_before_anything_is_touched() {
     assert_eq!(session.privacy().generation(), PrivacyGeneration::INITIAL);
     assert!(!session.privacy().is_enabled());
 
-    let enabling = session.enable_privacy(&mut []).expect("enables");
+    let enabling = session
+        .enable_privacy(PrivacyGeneration::new(1), &mut [])
+        .expect("enables");
     assert_eq!(enabling.generation, PrivacyGeneration::new(1));
     assert!(session.privacy().is_enabled());
 
@@ -144,7 +178,9 @@ fn the_four_capabilities_are_disabled_together_and_prospectively() {
     for capability in Disabled::ALL {
         assert!(!session.privacy().disables(*capability));
     }
-    let enabling = session.enable_privacy(&mut []).expect("enables");
+    let enabling = session
+        .enable_privacy(PrivacyGeneration::new(1), &mut [])
+        .expect("enables");
     assert_eq!(
         enabling
             .disabled
@@ -172,7 +208,9 @@ fn retained_output_is_removed_and_nothing_is_retained_after_it() {
     let before = session.retained_output_bytes();
     assert!(before > 0, "this session has retained output");
 
-    let enabling = session.enable_privacy(&mut []).expect("enables");
+    let enabling = session
+        .enable_privacy(PrivacyGeneration::new(1), &mut [])
+        .expect("enables");
     let removed = enabling
         .removed
         .iter()
@@ -221,7 +259,9 @@ fn a_settled_receipts_content_is_removed_and_its_metadata_is_kept() {
         // And one that has not settled, whose envelope recovery still needs.
         journal.accept(&submission(2)).expect("a pending action");
     }
-    let enabling = session.enable_privacy(&mut []).expect("enables");
+    let enabling = session
+        .enable_privacy(PrivacyGeneration::new(1), &mut [])
+        .expect("enables");
     let removed = enabling
         .removed
         .iter()
@@ -280,7 +320,11 @@ fn a_privacy_generation_this_host_cannot_record_is_not_one_it_claims_to_be_in() 
         session.ingest_output(&[b'x'; 4096]);
     }
     let retained = session.retained_output_bytes();
-    assert!(session.enable_privacy(&mut []).is_err());
+    assert!(
+        session
+            .enable_privacy(PrivacyGeneration::new(1), &mut [])
+            .is_err()
+    );
     assert!(!session.privacy().is_enabled());
     assert_eq!(
         session.retained_output_bytes(),
@@ -303,7 +347,9 @@ fn privacy_is_enabled_with_upload_notification_and_inference_work_in_flight() {
     let enabling = {
         let mut seams: Vec<&mut dyn PrivacySubsystem> =
             vec![&mut previews, &mut descriptions, &mut sync, &mut backup];
-        session.enable_privacy(&mut seams).expect("enables")
+        session
+            .enable_privacy(PrivacyGeneration::new(1), &mut seams)
+            .expect("enables")
     };
     assert_eq!(
         enabling.in_flight(),
@@ -352,7 +398,9 @@ fn every_content_bearing_queue_and_capture_is_fenced_immediately() {
     let enabling = {
         let mut seams: Vec<&mut dyn PrivacySubsystem> =
             vec![&mut previews, &mut descriptions, &mut sync, &mut backup];
-        session.enable_privacy(&mut seams).expect("enables")
+        session
+            .enable_privacy(PrivacyGeneration::new(1), &mut seams)
+            .expect("enables")
     };
     let fenced: std::collections::BTreeMap<&str, u64> = enabling
         .fenced
@@ -372,13 +420,17 @@ fn every_content_bearing_queue_and_capture_is_fenced_immediately() {
 #[test]
 fn no_late_result_is_published_and_only_the_generation_in_force_is() {
     let (_temp, mut session) = session_on_disk();
-    session.enable_privacy(&mut []).expect("enables");
+    session
+        .enable_privacy(PrivacyGeneration::new(1), &mut [])
+        .expect("enables");
     let privacy = session.privacy();
     assert!(!privacy.accepts_result(PrivacyGeneration::INITIAL));
     assert!(privacy.accepts_result(PrivacyGeneration::new(1)));
     // A generation this host has never opened is not a licence either.
     assert!(!privacy.accepts_result(PrivacyGeneration::new(2)));
-    session.enable_privacy(&mut []).expect("enables again");
+    session
+        .enable_privacy(PrivacyGeneration::new(2), &mut [])
+        .expect("enables again");
     assert!(!session.privacy().accepts_result(PrivacyGeneration::new(1)));
 }
 
@@ -391,7 +443,9 @@ fn what_privacy_mode_keeps_is_named_rather_than_quietly_retained() {
     let enabling = {
         let mut seams: Vec<&mut dyn PrivacySubsystem> =
             vec![&mut previews, &mut descriptions, &mut sync, &mut backup];
-        session.enable_privacy(&mut seams).expect("enables")
+        session
+            .enable_privacy(PrivacyGeneration::new(1), &mut seams)
+            .expect("enables")
     };
     let kept: Vec<&str> = enabling.kept.iter().map(|kept| kept.what).collect();
     assert!(kept.contains(&"the receipt journal's operation metadata"));
@@ -414,7 +468,9 @@ fn what_already_left_this_host_is_shown_rather_than_claimed_to_be_erased() {
     let enabling = {
         let mut seams: Vec<&mut dyn PrivacySubsystem> =
             vec![&mut previews, &mut descriptions, &mut sync, &mut backup];
-        session.enable_privacy(&mut seams).expect("enables")
+        session
+            .enable_privacy(PrivacyGeneration::new(1), &mut seams)
+            .expect("enables")
     };
     assert_eq!(enabling.exported.len(), 2);
     let kinds: Vec<&str> = enabling
@@ -432,17 +488,25 @@ fn what_already_left_this_host_is_shown_rather_than_claimed_to_be_erased() {
         assert!(copy.left_at_ms.get() > 0);
     }
     // And they are still there afterwards: privacy mode does not erase them.
-    assert_eq!(sync.exported().len() + backup.exported().len(), 2);
+    assert_eq!(
+        sync.exported().expect("a list").len() + backup.exported().expect("a list").len(),
+        2
+    );
 }
 
 #[test]
 fn disabling_privacy_starts_retention_again_and_still_refuses_the_private_intervals_results() {
     let (_temp, mut session) = session_on_disk();
-    session.enable_privacy(&mut []).expect("enables");
+    session
+        .enable_privacy(PrivacyGeneration::new(1), &mut [])
+        .expect("enables");
     session.ingest_output(&[b'x'; 4096]);
     assert_eq!(session.retained_output_bytes(), 0);
 
-    let resumed = session.disable_privacy().expect("disables");
+    let resumed = session
+        .disable_privacy(PrivacyGeneration::new(2))
+        .expect("disables")
+        .expect("privacy mode was on");
     assert!(!session.privacy().is_enabled());
     for capability in Disabled::ALL {
         assert!(!session.privacy().disables(*capability));
@@ -475,7 +539,9 @@ fn disabling_privacy_starts_retention_again_and_still_refuses_the_private_interv
 fn a_restarted_session_reads_its_generation_back_and_keeps_refusing_what_it_refused() {
     let (temp, mut session) = session_on_disk();
     let session_id = session.summary().session_id;
-    session.enable_privacy(&mut []).expect("enables");
+    session
+        .enable_privacy(PrivacyGeneration::new(1), &mut [])
+        .expect("enables");
     let generation = session.privacy().generation();
     drop(session);
 
@@ -522,7 +588,9 @@ fn content_that_settles_while_privacy_is_on_is_taken_when_privacy_is_turned_off(
     // content its receipt carries is content this host was asked not to keep. Waiting for a
     // maintenance tick would leave it there for anybody who turned privacy mode off first.
     let (_temp, mut session) = session_on_disk();
-    session.enable_privacy(&mut []).expect("enables");
+    session
+        .enable_privacy(PrivacyGeneration::new(1), &mut [])
+        .expect("enables");
     {
         let journal = session.journal_mut().expect("a journal");
         journal.accept(&submission(3)).expect("an action");
@@ -551,7 +619,9 @@ fn content_that_settles_while_privacy_is_on_is_taken_when_privacy_is_turned_off(
             "it is there until something takes it"
         );
     }
-    session.disable_privacy().expect("disables");
+    session
+        .disable_privacy(PrivacyGeneration::new(2))
+        .expect("disables");
     let journal = session.journal_mut().expect("a journal");
     assert!(
         journal
@@ -582,7 +652,9 @@ fn a_cleanup_that_could_not_remove_the_output_is_not_settled_by_a_redaction_that
     let spool = temp.environment().session_spool(session_id);
     std::fs::create_dir(spool.join("boundary")).expect("blocks the boundary file");
 
-    session.enable_privacy(&mut []).expect("enables");
+    session
+        .enable_privacy(PrivacyGeneration::new(1), &mut [])
+        .expect("enables");
     assert!(
         session.privacy_cleanup_failure().is_some(),
         "the removal that could not finish is owed"
@@ -652,9 +724,143 @@ fn a_session_whose_privacy_state_cannot_be_read_retains_nothing_and_owes_its_cle
     assert!(!session.reconcile_privacy(&[]).is_complete());
     assert!(session.privacy_cleanup_failure().is_some());
     assert!(
-        session.disable_privacy().is_err(),
+        session.disable_privacy(PrivacyGeneration::new(1)).is_err(),
         "privacy mode this host cannot see is not privacy mode it may turn off"
     );
+}
+
+/// A session whose store cannot be read says so: its cleanup is unavailable, with the reason,
+/// rather than merely reconciling, and it is never reported complete while that holds.
+#[test]
+fn a_session_whose_store_cannot_be_read_reports_unavailable_and_never_complete() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let environment = temp.environment();
+    let session_id = SessionId::new(kr_ipc::new_uuid());
+    // A journal path that cannot be opened: a directory stands where the file belongs.
+    let journal = environment.journal_database(session_id);
+    std::fs::create_dir_all(&journal).expect("blocks the journal");
+    let mut session = Session::open(config_at(&temp, session_id, journal)).expect("opens");
+
+    for _ in 0..2 {
+        let Completion::Unavailable {
+            unavailable,
+            outstanding,
+        } = session.reconcile_privacy(&[])
+        else {
+            panic!("a session that cannot read its privacy state is not merely reconciling");
+        };
+        let names: Vec<&str> = unavailable.iter().map(|(name, _)| *name).collect();
+        assert!(names.contains(&"session"), "{names:?}");
+        assert!(
+            unavailable
+                .iter()
+                .all(|(_, reason)| !reason.reason().is_empty()),
+            "each carries the reason its store gave"
+        );
+        assert!(outstanding.is_empty());
+        // A maintenance pass cannot read it either, and settles nothing on the strength of work
+        // it could not do.
+        session.collect_expired();
+    }
+}
+
+/// A removal the store refused is owed by the session, and the same generation applied again
+/// retries it without writing the journal's record a second time: the attention heads that record
+/// holds are the boundary, and a second write would move it.
+#[test]
+fn a_refused_removal_is_retried_at_the_same_generation_without_rewriting_the_record() {
+    let (temp, mut session) = session_on_disk();
+    let session_id = session.summary().session_id;
+    for _ in 0..4 {
+        session.ingest_output(&[b'x'; 4096]);
+    }
+    let spool = temp.environment().session_spool(session_id);
+    std::fs::create_dir(spool.join("boundary")).expect("blocks the boundary file");
+    let recorded_at = || -> i64 {
+        rusqlite::Connection::open(temp.environment().journal_database(session_id))
+            .expect("the same database")
+            .query_row(
+                "SELECT recorded_at_ms FROM privacy WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("the record")
+    };
+
+    let enabling = session
+        .enable_privacy(PrivacyGeneration::new(1), &mut [])
+        .expect("enables");
+    let unfinished = enabling
+        .unfinished("history")
+        .expect("the removal was refused");
+    assert_eq!(unfinished.step, kr_worker::privacy::Step::Remove);
+    let Completion::Unavailable { unavailable, .. } = session.reconcile_privacy(&[]) else {
+        panic!("a refused removal is in the way, not merely reconciling");
+    };
+    assert_eq!(unavailable[0].0, "history");
+    let first = recorded_at();
+
+    // The same generation again, while the obstruction stands: still owed, record untouched.
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    session
+        .enable_privacy(PrivacyGeneration::new(1), &mut [])
+        .expect("the same enabling again");
+    assert!(!session.reconcile_privacy(&[]).is_complete());
+    assert_eq!(
+        recorded_at(),
+        first,
+        "the record is not written a second time"
+    );
+
+    // Once it is gone the same generation finishes the removal, and only then is it complete.
+    std::fs::remove_dir(spool.join("boundary")).expect("unblocks it");
+    session
+        .enable_privacy(PrivacyGeneration::new(1), &mut [])
+        .expect("the same enabling again");
+    assert!(session.reconcile_privacy(&[]).is_complete());
+    assert_eq!(session.retained_output_bytes(), 0);
+    assert_eq!(recorded_at(), first);
+}
+
+/// The environment's generation is taken only when it is newer. The one in force in the state in
+/// force changes nothing, and an older one, or the one in force in the other state, is refused:
+/// either would move the boundary backwards or give one generation two meanings.
+#[test]
+fn a_generation_the_environment_recorded_is_taken_only_when_it_is_newer() {
+    let (_temp, mut session) = session_on_disk();
+    session
+        .enable_privacy(PrivacyGeneration::new(3), &mut [])
+        .expect("a newer generation is taken");
+    assert_eq!(session.privacy().generation(), PrivacyGeneration::new(3));
+    assert!(
+        session
+            .enable_privacy(PrivacyGeneration::new(2), &mut [])
+            .is_err(),
+        "an older generation is refused"
+    );
+    assert!(
+        session.disable_privacy(PrivacyGeneration::new(3)).is_err(),
+        "one generation does not mean both on and off"
+    );
+    let resumed = session
+        .disable_privacy(PrivacyGeneration::new(4))
+        .expect("a newer generation is taken")
+        .expect("privacy mode was on");
+    assert_eq!(resumed.generation, PrivacyGeneration::new(4));
+    assert_eq!(
+        session
+            .disable_privacy(PrivacyGeneration::new(4))
+            .expect("the same change again"),
+        None,
+        "the same change again changes nothing"
+    );
+    assert!(
+        session
+            .enable_privacy(PrivacyGeneration::new(4), &mut [])
+            .is_err()
+    );
+    assert!(!session.privacy().is_enabled());
+    assert!(!session.privacy().accepts_result(PrivacyGeneration::new(3)));
 }
 
 #[test]
@@ -662,7 +868,9 @@ fn content_settled_under_privacy_is_taken_where_it_settles_rather_than_at_the_ne
     // A crash between a settlement and the next maintenance pass would leave the content for the
     // archive to serve, so it goes in the settlement's own wake rather than later.
     let (_temp, mut session) = session_on_disk();
-    session.enable_privacy(&mut []).expect("enables");
+    session
+        .enable_privacy(PrivacyGeneration::new(1), &mut [])
+        .expect("enables");
     let action = kr_worker::journal::action_id_from([9; 16]);
     {
         let journal = session.journal_mut().expect("a journal");
@@ -720,11 +928,13 @@ fn privacy_is_not_turned_off_while_its_own_cleanup_is_unfinished() {
     }
     let spool = temp.environment().session_spool(session_id);
     std::fs::create_dir(spool.join("boundary")).expect("blocks the boundary file");
-    session.enable_privacy(&mut []).expect("enables");
+    session
+        .enable_privacy(PrivacyGeneration::new(1), &mut [])
+        .expect("enables");
     assert!(session.privacy_cleanup_failure().is_some());
 
     let refused = session
-        .disable_privacy()
+        .disable_privacy(PrivacyGeneration::new(2))
         .expect_err("privacy mode is not turned off over an unfinished cleanup");
     assert!(refused.to_string().contains("unfinished"), "{refused}");
     assert!(session.privacy().is_enabled());
@@ -732,7 +942,9 @@ fn privacy_is_not_turned_off_while_its_own_cleanup_is_unfinished() {
     // Once the obstruction is gone, the retry finishes it and the change is allowed.
     std::fs::remove_dir(spool.join("boundary")).expect("unblocks it");
     session.collect_expired();
-    session.disable_privacy().expect("disables");
+    session
+        .disable_privacy(PrivacyGeneration::new(2))
+        .expect("disables");
     assert!(!session.privacy().is_enabled());
 }
 
@@ -774,7 +986,7 @@ fn a_shared_runtime_can_be_wrapped_once_and_driven_by_the_same_contract() {
         let enabling = mode.apply(&mut subsystems, TimestampMs::new(1_000));
         assert_eq!(enabling.in_flight(), 2);
     }
-    assert_eq!(sync.outstanding(), 2);
+    assert_eq!(sync.outstanding(), Ok(2));
     sync.note_reconciled();
     sync.note_reconciled();
     assert!(PrivacyMode::reconcile(&[&sync]).is_complete());

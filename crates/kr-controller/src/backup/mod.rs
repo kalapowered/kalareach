@@ -16,12 +16,13 @@
 //! * **Data only.** [`RestoreRequest::admit`] answers every material kind a caller asks for, and
 //!   refuses each one that would recreate authority rather than return data. The answer is
 //!   `kr_crypto::backup`'s, so a host and a device cannot disagree about it.
-//! * **The privacy hook.** [`BackupService`] implements `kr_worker::privacy::PrivacySubsystem`
-//!   directly: it fences the outbox at the generation, takes back what has not been dispatched,
-//!   removes the staged ciphertext it holds, reports what is still in flight, names what it keeps,
-//!   and shows already-uploaded archives as retained artifacts. It marks them **not** deletable,
-//!   because this host holds no route through which it could ask a service to remove one; the
-//!   separately authorised deletion action section 24 asks for is not built here.
+//! * **The privacy hook.** [`BackupService::privacy`] is the service's
+//!   `kr_worker::privacy::PrivacySubsystem`: it fences the outbox at the generation, takes back
+//!   what has not been dispatched, removes the staged ciphertext it holds, reports what is still in
+//!   flight, names what it keeps, and shows already-uploaded archives as retained artifacts. Each
+//!   step answers with the reason the store gave when it could not be taken. It marks the archives
+//!   **not** deletable, because this host holds no route through which it could ask a service to
+//!   remove one; the separately authorised deletion action section 24 asks for is not built here.
 //!
 //! # What this host never writes down
 //!
@@ -49,6 +50,7 @@ use kr_protocol::ids::{ArchiveId, BackupGeneration, BackupObjectId};
 use kr_protocol::scalars::{AuthorisationKey, KeyId, TimestampMs};
 use kr_worker::privacy::{
     Cancelled, Exported, Fenced, KeptExplicitly, PrivacyGeneration, PrivacySubsystem, Removed,
+    Unavailable,
 };
 
 use crate::backup::store::{
@@ -612,10 +614,10 @@ impl BackupService {
 
     /// Accepts privacy mode's request and raises the fence it asks for.
     ///
-    /// This is the step behind [`PrivacySubsystem::fence`], with its error kept. The trait's
-    /// method has nowhere to put one and must return a count, so it turns a failure into a guard
-    /// that keeps this subsystem reporting work outstanding; a caller that can act on the reason
-    /// calls this instead.
+    /// This is the step behind the privacy hook's fence ([`BackupPrivacy`]), which answers with
+    /// this error's reason. A failure also sets the readiness guard, on the service rather than on
+    /// the hook, so production stays withheld however many hooks are built until the step
+    /// succeeds.
     ///
     /// # Errors
     ///
@@ -1504,7 +1506,36 @@ fn authorisation_key_id(key: &AuthorisationKey) -> KeyId {
     )
 }
 
-impl PrivacySubsystem for BackupService {
+/// The backup service as privacy mode sees it, for one pass.
+///
+/// It borrows the service, which a daemon holds shared, and carries the time the pass reads, so
+/// every obligation a step writes down is stamped with the same instant. Each step is one of the
+/// service's own error-carrying calls, and the reason its store gave is the step's answer. The
+/// readiness guard a refused step sets lives on the service, so it withholds production however
+/// many hooks are built, and only that step's own success clears it.
+#[derive(Debug)]
+pub struct BackupPrivacy<'a> {
+    service: &'a BackupService,
+    now_ms: TimestampMs,
+}
+
+impl BackupService {
+    /// Returns privacy mode's hook over this service, for one pass at `now_ms`.
+    #[must_use]
+    pub const fn privacy(&self, now_ms: TimestampMs) -> BackupPrivacy<'_> {
+        BackupPrivacy {
+            service: self,
+            now_ms,
+        }
+    }
+}
+
+/// Says what a step could not do, with the store's own reason.
+fn unavailable(what: &str, error: &ControllerError) -> Unavailable {
+    Unavailable::new(format!("{what}: {error}"))
+}
+
+impl PrivacySubsystem for BackupPrivacy<'_> {
     fn name(&self) -> &'static str {
         SUBSYSTEM_NAME
     }
@@ -1515,31 +1546,41 @@ impl PrivacySubsystem for BackupService {
     /// and records the obligation to raise the fence; the second raises it. An activation that
     /// fails therefore leaves an accepted request and an outstanding obligation behind, so this
     /// host is inhibited, counts the work, and cannot report a fence it did not raise. A request
-    /// this host could not even accept leaves the caller holding it: the count is nought and
-    /// [`PrivacySubsystem::outstanding`] is not, because a store that will not answer is not a
-    /// store with nothing outstanding.
-    fn fence(&mut self, generation: PrivacyGeneration) -> Fenced {
-        self.raise_fence(generation, kr_ipc::now_ms())
-            .unwrap_or_default()
+    /// this host could not even accept leaves the caller holding it, with the store's reason.
+    fn fence(&mut self, generation: PrivacyGeneration) -> std::result::Result<Fenced, Unavailable> {
+        self.service
+            .raise_fence(generation, self.now_ms)
+            .map_err(|error| unavailable("the backup privacy fence could not be raised", &error))
     }
 
     /// Takes back every admitted, undispatched piece of backup work.
     ///
     /// What has been dispatched is counted rather than claimed: it has left this host and can only
     /// be followed, which is what reconciliation is for.
-    fn cancel_undispatched(&mut self, generation: PrivacyGeneration) -> Cancelled {
-        self.cancel_undispatched_work(generation, kr_ipc::now_ms())
-            .unwrap_or_default()
+    fn cancel_undispatched(
+        &mut self,
+        generation: PrivacyGeneration,
+    ) -> std::result::Result<Cancelled, Unavailable> {
+        self.service
+            .cancel_undispatched_work(generation, self.now_ms)
+            .map_err(|error| {
+                unavailable("undispatched backup work could not be taken back", &error)
+            })
     }
 
     /// Carries out the cleanup the fence wrote down, one obligation at a time.
     ///
     /// It reports only what it actually removed, and it ends only what it has evidence for. A file
     /// this host could not unlink keeps its obligation, with the reason written beside it, so the
-    /// next pass finds the same target rather than a fresh guess at what is left.
-    fn remove_retained(&mut self, generation: PrivacyGeneration) -> Removed {
-        self.run_cleanup(generation, kr_ipc::now_ms())
-            .unwrap_or_default()
+    /// next pass finds the same target rather than a fresh guess at what is left. That is work
+    /// outstanding rather than a refused step; a store that refused the pass itself is the latter.
+    fn remove_retained(
+        &mut self,
+        generation: PrivacyGeneration,
+    ) -> std::result::Result<Removed, Unavailable> {
+        self.service
+            .run_cleanup(generation, self.now_ms)
+            .map_err(|error| unavailable("staged backup ciphertext could not be removed", &error))
     }
 
     /// Returns how much backup work is still being cleaned up.
@@ -1549,42 +1590,49 @@ impl PrivacySubsystem for BackupService {
     /// work that has left this host and not been answered. Nothing is counted twice: an attempt
     /// that an obligation already names is that obligation.
     ///
-    /// A store that cannot be read answers one, not nought. "This host cannot say what it owes" is
-    /// not "this host owes nothing", and privacy mode must never read the first as the second.
-    fn outstanding(&self) -> u64 {
-        let store = self.store();
-        // A step this process could not carry out counts whatever the store says. It is the one
-        // case the store owns nothing for: a request it would not accept left no row behind.
-        let failed = self.failed_steps().len() as u64;
-        let Ok(status) = store.privacy_status() else {
-            return failed.max(1);
-        };
+    /// A privacy step this process could not take, and a store that cannot be read, are both
+    /// answered as unavailable with the reason, never as a count: "this host cannot say what it
+    /// owes" is not "this host owes nothing", and a refused step is in the way rather than
+    /// settling.
+    fn outstanding(&self) -> std::result::Result<u64, Unavailable> {
+        let store = self.service.store();
+        // A step this process could not carry out is in the way whatever the store says. It is the
+        // one case the store owns nothing for: a request it would not accept left no row behind.
+        if let Some(withheld) = self.service.withheld() {
+            return Err(Unavailable::new(withheld));
+        }
+        let status = store.privacy_status().map_err(|error| {
+            unavailable(
+                "the backup store cannot say what privacy mode is owed",
+                &error,
+            )
+        })?;
         if status.inhibited_at().is_some() {
             // Under a fence the obligations are the account, and nothing else is. A pending
             // activation has an obligation of its own, so a request whose fence never went up is
             // counted here; an attempt that has left this host is counted by the obligation that
             // names it, never a second time. A fence that is still up over finished cleanup is
             // not outstanding work: what is outstanding is what has not been done.
-            return status.obligations.saturating_add(failed);
+            return Ok(status.obligations);
         }
         // A generation whose outcome is *unknown* is not counted here, and that is deliberate.
         // `note_outcome_unknown` is the caller saying the transfer stopped and the answer never
         // came; the work is not still in flight, and counting it would leave privacy mode
         // reconciling for ever over something that will never become known. It is a copy that may
-        // have left, which section 24 answers by showing it: [`Self::exported`] lists it as a
+        // have left, which section 24 answers by showing it: the exported list shows it as a
         // retained artifact whose outcome this host cannot establish.
         let dispatched = store
             .outbox()
-            .map(|attempts| {
-                attempts
-                    .iter()
-                    .filter(|attempt| attempt.status == AttemptStatus::Dispatched)
-                    .count() as u64
-            })
-            .unwrap_or(1);
-        dispatched
-            .saturating_add(status.obligations)
-            .saturating_add(failed)
+            .map_err(|error| {
+                unavailable(
+                    "the backup store cannot say what has left this host",
+                    &error,
+                )
+            })?
+            .iter()
+            .filter(|attempt| attempt.status == AttemptStatus::Dispatched)
+            .count() as u64;
+        Ok(dispatched.saturating_add(status.obligations))
     }
 
     /// Names what this host keeps whatever privacy mode is doing.
@@ -1615,22 +1663,27 @@ impl PrivacySubsystem for BackupService {
     /// What a service holds is read from the generation's own record of it, which production being
     /// cancelled never changes. An archive whose ciphertext was acknowledged and whose production
     /// privacy mode then stopped is listed here, because the bytes are still there.
-    fn exported(&self) -> Vec<Exported> {
-        let store = self.store();
-        let Ok(generations) = store.generations() else {
-            return Vec::new();
-        };
+    fn exported(&self) -> std::result::Result<Vec<Exported>, Unavailable> {
+        let store = self.service.store();
+        let generations = store
+            .generations()
+            .map_err(|error| unavailable("the backup store cannot list its generations", &error))?;
         // An attempt that left this host and has not been answered is a copy that may be at a
         // service. It is shown on the same terms as one this host knows left: the alternative is
         // to say nothing about bytes that may well be there.
         let unanswered: Vec<(ArchiveId, BackupGeneration)> = store
             .outbox()
-            .unwrap_or_default()
+            .map_err(|error| {
+                unavailable(
+                    "the backup store cannot say what has left this host",
+                    &error,
+                )
+            })?
             .into_iter()
             .filter(|attempt| attempt.status == AttemptStatus::Dispatched)
             .map(|attempt| (attempt.archive_id, attempt.backup_generation))
             .collect();
-        generations
+        Ok(generations
             .into_iter()
             .filter_map(|record| {
                 let left = record.remote.is_artifact();
@@ -1666,6 +1719,6 @@ impl PrivacySubsystem for BackupService {
                     deletable: false,
                 })
             })
-            .collect()
+            .collect())
     }
 }

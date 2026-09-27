@@ -695,17 +695,9 @@ async fn a_store_rebuilt_from_the_journal_folds_notices_as_the_live_one_did() {
             !of_rule(items, AttentionRule::ApplicationNotice).is_empty()
         })
         .await;
-        one.service
-            .runtime()
-            .session()
-            .enable_privacy(&mut [])
-            .expect("privacy mode is enabled");
+        enable_privacy(&one);
         notify(&one, "the build finished");
-        one.service
-            .runtime()
-            .session()
-            .disable_privacy()
-            .expect("privacy mode is disabled");
+        disable_privacy(&one);
         notify(&one, "the build finished");
         let items = until(&module, &reach, |items| {
             of_rule(items, AttentionRule::ApplicationNotice)
@@ -1145,17 +1137,9 @@ async fn a_notice_keeps_its_key_across_privacy_mode() {
     let key = of_rule(&first, AttentionRule::ApplicationNotice)[0]
         .key
         .clone();
-    one.service
-        .runtime()
-        .session()
-        .enable_privacy(&mut [])
-        .expect("privacy mode is enabled");
+    enable_privacy(&one);
     notify(&one, "the build finished");
-    one.service
-        .runtime()
-        .session()
-        .disable_privacy()
-        .expect("privacy mode is disabled");
+    disable_privacy(&one);
     let items = until(&module, &reach, |items| {
         of_rule(items, AttentionRule::ApplicationNotice)
             .first()
@@ -2616,13 +2600,33 @@ fn summaries(read: &AttentionReadResult) -> Vec<Option<String>> {
 /// returns the subsystem, which reports whether the daemon has recorded the generation.
 fn enable(worker: &Worker) -> kr_worker::attention_fence::AttentionPrivacy {
     let mut attention = worker.service.attention_privacy();
-    worker
-        .service
-        .runtime()
-        .session()
-        .enable_privacy(&mut [&mut attention])
-        .expect("privacy mode is enabled");
+    {
+        let mut session = worker.service.runtime().session();
+        let next = session.privacy().generation().next();
+        session
+            .enable_privacy(next, &mut [&mut attention])
+            .expect("privacy mode is enabled");
+    }
     attention
+}
+
+/// Enables privacy mode in a worker's session at the generation after the one in force, as the
+/// environment's record would name it.
+fn enable_privacy(worker: &Worker) {
+    let mut session = worker.service.runtime().session();
+    let next = session.privacy().generation().next();
+    session
+        .enable_privacy(next, &mut [])
+        .expect("privacy mode is enabled");
+}
+
+/// Disables privacy mode in a worker's session at the generation after the one in force.
+fn disable_privacy(worker: &Worker) {
+    let mut session = worker.service.runtime().session();
+    let next = session.privacy().generation().next();
+    session
+        .disable_privacy(next)
+        .expect("privacy mode is disabled");
 }
 
 fn completed(worker: &Worker, attention: &kr_worker::attention_fence::AttentionPrivacy) -> bool {
@@ -2861,11 +2865,7 @@ async fn text_held_across_enable_disable_and_enable_is_withheld() {
     .expect("the daemon acknowledges the first raise");
     let _enabled = enable(&one);
     first.settle().await;
-    one.service
-        .runtime()
-        .session()
-        .disable_privacy()
-        .expect("privacy mode is turned off");
+    disable_privacy(&one);
     let second = tokio::time::timeout(
         Duration::from_secs(2),
         one.service.raise_privacy_transition(),

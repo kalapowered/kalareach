@@ -42,7 +42,9 @@ use kr_protocol::attention::{ATTENTION_TEXT_LEASE_MS, AttentionBarrier};
 use kr_protocol::ids::{ConnectionId, RequestId};
 use kr_protocol::scalars::{Nullable, U64};
 
-use crate::privacy::{Cancelled, Fenced, PrivacyGeneration, PrivacySubsystem, Removed};
+use crate::privacy::{
+    Cancelled, Fenced, PrivacyGeneration, PrivacySubsystem, Removed, Unavailable,
+};
 
 /// The longest a raised transition waits for the control daemon's acknowledgement, from the raise
 /// to the acknowledgement: the turn at the connection's writer, the write and the answer.
@@ -432,28 +434,39 @@ impl PrivacySubsystem for AttentionPrivacy {
         "attention"
     }
 
-    fn fence(&mut self, generation: PrivacyGeneration) -> Fenced {
+    fn fence(&mut self, generation: PrivacyGeneration) -> Result<Fenced, Unavailable> {
         self.target = Some(generation.get());
         // The release of this session's text at the daemon was stopped before the generation was
         // committed; it is the one content-bearing outbox this subsystem answers for.
-        Fenced {
+        Ok(Fenced {
             queues: 1,
             items: 0,
-        }
+        })
     }
 
-    fn cancel_undispatched(&mut self, _generation: PrivacyGeneration) -> Cancelled {
-        Cancelled {
+    fn cancel_undispatched(
+        &mut self,
+        _generation: PrivacyGeneration,
+    ) -> Result<Cancelled, Unavailable> {
+        Ok(Cancelled {
             undispatched: 0,
-            in_flight: self.outstanding(),
-        }
+            in_flight: self.awaiting_the_daemon(),
+        })
     }
 
-    fn remove_retained(&mut self, _generation: PrivacyGeneration) -> Removed {
-        Removed::default()
+    fn remove_retained(&mut self, _generation: PrivacyGeneration) -> Result<Removed, Unavailable> {
+        Ok(Removed::default())
     }
 
-    fn outstanding(&self) -> u64 {
+    fn outstanding(&self) -> Result<u64, Unavailable> {
+        Ok(self.awaiting_the_daemon())
+    }
+}
+
+impl AttentionPrivacy {
+    /// Returns one while the daemon has not yet named the generation this enabling committed, on
+    /// the current attention connection, and nought once it has.
+    fn awaiting_the_daemon(&self) -> u64 {
         match self.target {
             Some(target)
                 if self
@@ -617,17 +630,17 @@ mod tests {
         let link = connection();
         let _ = fence.began(link, 1, || JournalGeneration::Read(Some(0)));
         let mut subsystem = AttentionPrivacy::new(Arc::clone(&fence));
-        assert_eq!(subsystem.outstanding(), 0);
+        assert_eq!(subsystem.outstanding(), Ok(0));
         let _ = subsystem.fence(PrivacyGeneration::new(1));
-        assert_eq!(subsystem.outstanding(), 1);
+        assert_eq!(subsystem.outstanding(), Ok(1));
         fence.named(link, Some(0));
-        assert_eq!(subsystem.outstanding(), 1);
+        assert_eq!(subsystem.outstanding(), Ok(1));
         fence.named(link, Some(1));
-        assert_eq!(subsystem.outstanding(), 0);
+        assert_eq!(subsystem.outstanding(), Ok(0));
         let _ = fence.began(connection(), 1, || JournalGeneration::Read(Some(1)));
         assert_eq!(
             subsystem.outstanding(),
-            1,
+            Ok(1),
             "a new connection starts from none"
         );
     }
