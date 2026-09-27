@@ -647,8 +647,9 @@ async fn kr_req_23_40_the_five_mutations_carry_the_registrys_rights_and_check_th
     );
 }
 
-/// KR-REQ-12.04: what the broker observes of an agent is bound to the exact instance, the
-/// upstream execution that owns it, the session and the turn.
+/// KR-REQ-12.04: what the broker observes of an agent is read back only for its own instance and
+/// session, and every read and operation is bound to the upstream execution that owns the instance
+/// and to the turn it runs.
 ///
 /// * The instance: two instances in one session each read back only what was observed of them,
 ///   and an instance this worker does not hold is neither observed nor read.
@@ -659,6 +660,9 @@ async fn kr_req_23_40_the_five_mutations_carry_the_registrys_rights_and_check_th
 /// * The turn: the binding reports the turn the upstream said is running, an operation naming
 ///   another turn is refused, the one naming it carries it to the upstream, and a change of owner
 ///   leaves no turn running for a later operation to name.
+///
+/// Every snapshot names the binding it was read under: the owner's revision, its thread and its
+/// turn, each as it stood at the read, and one instance's change leaves the other's as it was.
 #[tokio::test]
 async fn kr_req_12_04_an_observation_is_bound_to_its_instance_owner_session_and_turn() {
     let upstream = std::sync::Arc::new(RecordingUpstream::default());
@@ -687,6 +691,17 @@ async fn kr_req_12_04_an_observation_is_bound_to_its_instance_owner_session_and_
             .map(|entry| entry.text)
             .collect()
     };
+    // The binding a snapshot of one instance names: the owner's revision, its thread and its turn.
+    let read_under = |application_instance_id: ApplicationInstanceId| {
+        let binding = snapshot(session(), application_instance_id)
+            .expect("the read succeeds")
+            .binding;
+        (
+            binding.binding_revision,
+            binding.thread_id.0,
+            binding.turn_id.0,
+        )
+    };
 
     // The instance.
     broker
@@ -702,6 +717,9 @@ async fn kr_req_12_04_an_observation_is_bound_to_its_instance_owner_session_and_
         .expect("observed");
     assert_eq!(texts(instance()), ["said by the first"]);
     assert_eq!(texts(other), ["said by the second"]);
+    for each in [instance(), other] {
+        assert_eq!(read_under(each), (AgentBindingRevision::new(1), None, None));
+    }
     let absent = ApplicationInstanceId::new(Uuid::from_bytes([6; 16]));
     assert!(matches!(
         broker.observe(
@@ -757,6 +775,16 @@ async fn kr_req_12_04_an_observation_is_bound_to_its_instance_owner_session_and_
         .expect("the read succeeds")
         .binding;
     assert_eq!(bound.turn_id, Nullable::some(running.clone()));
+    assert_eq!(
+        read_under(instance()),
+        (AgentBindingRevision::new(1), None, Some(running.clone())),
+        "a snapshot read in the turn names it"
+    );
+    assert_eq!(
+        read_under(other),
+        (AgentBindingRevision::new(1), None, None),
+        "and the other instance runs no turn"
+    );
     let steer = |turn_id: &AgentTurnId, revision: u64| AgentSteerParams {
         target: target(revision),
         turn_id: turn_id.clone(),
@@ -831,8 +859,18 @@ async fn kr_req_12_04_an_observation_is_bound_to_its_instance_owner_session_and_
         .expect("the read succeeds")
         .binding;
     assert_eq!(moved.binding_revision, AgentBindingRevision::new(2));
-    assert_eq!(moved.thread_id, Nullable::some(conversation));
+    assert_eq!(moved.thread_id, Nullable::some(conversation.clone()));
     assert_eq!(moved.turn_id, Nullable::null());
+    assert_eq!(
+        read_under(instance()),
+        (AgentBindingRevision::new(2), Some(conversation), None),
+        "a snapshot read after the owner changed names the new owner and no turn"
+    );
+    assert_eq!(
+        read_under(other),
+        (AgentBindingRevision::new(1), None, None),
+        "and the other instance's binding is as it was"
+    );
     let late = broker
         .agent_steer(&caller(), &steer(&running, 2), TimestampMs::new(13))
         .await
