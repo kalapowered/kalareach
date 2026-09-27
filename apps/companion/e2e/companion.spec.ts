@@ -1392,6 +1392,23 @@ test.describe("the phone's tab bar", () => {
               .toBe(true)
           }
         }
+        // The widest count a badge shows, 99+, stays clear of its own label.
+        const badge = page.locator('.m-tab-badge')
+        await expect(badge).toBeVisible()
+        const clear = await badge.evaluate((element) => {
+          element.textContent = '99+'
+          const label = element.closest('.m-tab')?.querySelector('.m-tab-label')
+          if (!label) return false
+          const count = element.getBoundingClientRect()
+          const text = label.getBoundingClientRect()
+          return (
+            count.right <= text.left + 0.5 ||
+            text.right <= count.left + 0.5 ||
+            count.bottom <= text.top + 0.5 ||
+            text.bottom <= count.top + 0.5
+          )
+        })
+        expect.soft(clear, 'the widest badge stays clear of its label').toBe(true)
         await still(page, `tabs-13.19-${surface}-${seen.width}x${seen.height}-${seen.scale.replace('%', '')}`)
       })
     }

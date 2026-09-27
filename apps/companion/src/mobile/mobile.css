@@ -238,6 +238,31 @@
   color: var(--bg);
 }
 
+/*
+ * Beside its label, a glyph's badge takes up room in the row: it sits over the glyph's top corner
+ * as it does in one row, and a wider count moves the label along rather than covering it.
+ */
+.m-tabbar[data-crowded] .m-tab-glyph {
+  grid-template-areas: 'glyph';
+  place-items: start;
+  inline-size: auto;
+  min-inline-size: 26px;
+}
+
+.m-tabbar[data-crowded] .m-tab-glyph > * {
+  grid-area: glyph;
+}
+
+.m-tabbar[data-crowded] .m-tab-glyph > svg {
+  margin: 2px;
+}
+
+.m-tabbar[data-crowded] .m-tab-badge {
+  position: static;
+  margin-block-start: -2px;
+  margin-inline-start: 14px;
+}
+
 /* ---- Rows and cards -------------------------------------------------------------------------- */
 
 .m-list {
