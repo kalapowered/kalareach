@@ -1648,56 +1648,8 @@ impl Broker {
         option_id: &str,
         now: TimestampMs,
     ) -> Result<()> {
-        // The ledger's record answers for a resource whose settlement is final, so it is refused
-        // as ended, as it was while the live arbitration held it.
-        let resource = self.state().resource(resource_id)?;
-        if resource.application_instance_id != target.subject.application_instance_id {
-            return Err(BrokerError::denied(format!(
-                "{resource_id} belongs to another application instance"
-            )));
-        }
-        // One resolution per pending resource. A resource that has already reached an answer,
-        // been cancelled or been left uncertain is not answerable again, and saying so here is
-        // what keeps the claim below from being the thing that discovers it.
-        if resource.state != PendingState::Pending {
-            return Err(BrokerError::Arbitration(
-                kr_protocol::gateway::ArbitrationError::AlreadyResolved {
-                    state: resource.state,
-                },
-            ));
-        }
-        // The same bound the claim uses: at the deadline the answer is already too late, so an
-        // answer admitted here would be refused a moment later, after the marker.
-        if let Some(deadline) = resource.deadline_ms.as_ref()
-            && deadline.get() <= now.get()
-        {
-            return Err(BrokerError::PreconditionFailed {
-                detail: format!(
-                    "{resource_id}'s upstream deadline passed at {}, so this answer would reach \
-                     nothing",
-                    deadline.get()
-                ),
-            });
-        }
-        let entry = self
-            .decoding(resource_id)?
-            .ok_or_else(|| BrokerError::PreconditionFailed {
-                detail: format!(
-                    "{resource_id} has no recorded interpretation, so there is nothing to answer"
-                ),
-            })?;
-        // The rest is exactly what the claim rechecks: the instance's rich work is not suspended,
-        // the request's generation is still the instance's own, and the decoder that interpreted
-        // it may still encode the answer. Sharing that check is what keeps this from admitting
-        // something the claim would refuse a moment later, after the marker.
-        self.state().recheck_answerable(resource_id)?;
-        if entry.offers(option_id) {
-            Ok(())
-        } else {
-            Err(BrokerError::PreconditionFailed {
-                detail: format!("{option_id} is not one of the decisions this request offered"),
-            })
-        }
+        self.state()
+            .check_answerable_in(target, resource_id, Some(option_id), now)
     }
 
     /// Checks that one pending resource can still be answered for the instance a call targets,
@@ -1719,40 +1671,8 @@ impl Broker {
         resource_id: kr_protocol::ids::PendingResourceId,
         now: TimestampMs,
     ) -> Result<()> {
-        // The ledger's record answers for a resource whose settlement is final, so it is refused
-        // as ended, as it was while the live arbitration held it.
-        let resource = self.state().resource(resource_id)?;
-        if resource.application_instance_id != target.subject.application_instance_id {
-            return Err(BrokerError::denied(format!(
-                "{resource_id} belongs to another application instance"
-            )));
-        }
-        if resource.state != PendingState::Pending {
-            return Err(BrokerError::Arbitration(
-                kr_protocol::gateway::ArbitrationError::AlreadyResolved {
-                    state: resource.state,
-                },
-            ));
-        }
-        if let Some(deadline) = resource.deadline_ms.as_ref()
-            && deadline.get() <= now.get()
-        {
-            return Err(BrokerError::PreconditionFailed {
-                detail: format!(
-                    "{resource_id}'s upstream deadline passed at {}, so this answer would reach \
-                     nothing",
-                    deadline.get()
-                ),
-            });
-        }
-        if self.decoding(resource_id)?.is_none() {
-            return Err(BrokerError::PreconditionFailed {
-                detail: format!(
-                    "{resource_id} has no recorded interpretation, so there is nothing to answer"
-                ),
-            });
-        }
-        self.state().recheck_answerable(resource_id)
+        self.state()
+            .check_answerable_in(target, resource_id, None, now)
     }
 
     /// Checks everything a plugin action call can be refused for before anything is marked.
@@ -2229,6 +2149,70 @@ impl crate::broker::BrokerState {
             });
         }
         Ok(())
+    }
+
+    /// Checks, under one hold of the broker's lock, that a resource can be answered for `target`,
+    /// with `option_id` when the answer's decision is known. See [`Broker::check_answerable`].
+    ///
+    /// One hold, because every step reads a resource that can change: a resource settled and
+    /// forgotten between two steps would be refused by the later one as unknown rather than as
+    /// ended.
+    fn check_answerable_in(
+        &self,
+        target: &AgentMutationTarget,
+        resource_id: kr_protocol::ids::PendingResourceId,
+        option_id: Option<&str>,
+        now: TimestampMs,
+    ) -> Result<()> {
+        // The ledger's record answers for a resource whose settlement is final, so it is refused
+        // as ended, as it was while the live arbitration held it.
+        let resource = self.resource(resource_id)?;
+        if resource.application_instance_id != target.subject.application_instance_id {
+            return Err(BrokerError::denied(format!(
+                "{resource_id} belongs to another application instance"
+            )));
+        }
+        // One resolution per pending resource. A resource that has already reached an answer,
+        // been cancelled or been left uncertain is not answerable again, and saying so here is
+        // what keeps the claim below from being the thing that discovers it.
+        if resource.state != PendingState::Pending {
+            return Err(BrokerError::Arbitration(
+                kr_protocol::gateway::ArbitrationError::AlreadyResolved {
+                    state: resource.state,
+                },
+            ));
+        }
+        // The same bound the claim uses: at the deadline the answer is already too late, so an
+        // answer admitted here would be refused a moment later, after the marker.
+        if let Some(deadline) = resource.deadline_ms.as_ref()
+            && deadline.get() <= now.get()
+        {
+            return Err(BrokerError::PreconditionFailed {
+                detail: format!(
+                    "{resource_id}'s upstream deadline passed at {}, so this answer would reach \
+                     nothing",
+                    deadline.get()
+                ),
+            });
+        }
+        let entry = self.ledger.decoding(resource_id)?.ok_or_else(|| {
+            BrokerError::PreconditionFailed {
+                detail: format!(
+                    "{resource_id} has no recorded interpretation, so there is nothing to answer"
+                ),
+            }
+        })?;
+        // The rest is exactly what the claim rechecks: the instance's rich work is not suspended,
+        // the request's generation is still the instance's own, and the decoder that interpreted
+        // it may still encode the answer. Sharing that check is what keeps this from admitting
+        // something the claim would refuse a moment later, after the marker.
+        self.recheck_answerable(resource_id)?;
+        match option_id {
+            Some(option_id) if !entry.offers(option_id) => Err(BrokerError::PreconditionFailed {
+                detail: format!("{option_id} is not one of the decisions this request offered"),
+            }),
+            _ => Ok(()),
+        }
     }
 
     /// The answer transaction, under the broker's lock: the resource, the mutation, the claim and
