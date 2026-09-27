@@ -1125,10 +1125,10 @@ mod windows {
             trusted.push(OwnedSid::parse(text)?);
         }
         // Two different rules, so they are two different predicates. The owner has to be an account
-        // this process could have created the directory as: its own user, or the owner new objects of
-        // this process receive. The machine's own accounts are trusted to *hold* the directory, which
-        // nothing can prevent, but a directory owned by one of them is not one this host created.
-        let is_owner = |sid: PSID| equal(sid, accounts.user()) || equal(sid, accounts.owner());
+        // this process could have created the directory as. The machine's own accounts are trusted
+        // to *hold* the directory, which nothing can prevent, but a directory owned by one of them is
+        // not one this host created.
+        let is_owner = |sid: PSID| could_have_created(sid, &accounts);
         let permitted = |sid: PSID| {
             is_owner(sid) || trusted.iter().any(|account| equal(sid, account.as_psid()))
         };
@@ -1690,6 +1690,12 @@ mod windows {
         }
     }
 
+    /// Whether an object owned by `owner` is one a process with `accounts` could have created: its
+    /// owner is the process's user, or the owner the process's new objects receive.
+    fn could_have_created(owner: PSID, accounts: &TokenAccounts) -> bool {
+        equal(owner, accounts.user()) || equal(owner, accounts.owner())
+    }
+
     /// The two accounts this process could have created a directory as.
     struct TokenAccounts {
         /// The buffer holding this process's user identifier.
@@ -1701,7 +1707,11 @@ mod windows {
     impl TokenAccounts {
         /// Reads both from this process's own token.
         fn read() -> std::result::Result<Self, AccessListRefusal> {
-            let token = TokenHandle::open()?;
+            Self::of(&TokenHandle::open()?)
+        }
+
+        /// Reads both from a token.
+        fn of(token: &TokenHandle) -> std::result::Result<Self, AccessListRefusal> {
             Ok(Self {
                 user: token.information(TokenUser, std::mem::size_of::<TOKEN_USER>())?,
                 owner: token.information(TokenOwner, std::mem::size_of::<TOKEN_OWNER>())?,
@@ -1954,6 +1964,97 @@ mod windows {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        /// This process's token again, as a primary token of its own this test may read and give
+        /// another default owner.
+        fn this_token_again() -> TokenHandle {
+            use windows_sys::Win32::Security::{
+                DuplicateTokenEx, SecurityImpersonation, TOKEN_ADJUST_DEFAULT, TOKEN_DUPLICATE,
+                TokenPrimary,
+            };
+
+            let mut original: HANDLE = std::ptr::null_mut();
+            // SAFETY: the process handle is a pseudo-handle that needs no release, and `original`
+            // is a live out parameter.
+            let opened = unsafe {
+                OpenProcessToken(
+                    GetCurrentProcess(),
+                    TOKEN_DUPLICATE | TOKEN_QUERY,
+                    &raw mut original,
+                )
+            };
+            assert!(opened != 0, "{}", std::io::Error::last_os_error());
+            let original = TokenHandle(original);
+            let mut copy: HANDLE = std::ptr::null_mut();
+            // SAFETY: `original` is open for the call and `copy` is a live out parameter; no
+            // attributes are given.
+            let duplicated = unsafe {
+                DuplicateTokenEx(
+                    original.0,
+                    TOKEN_QUERY | TOKEN_ADJUST_DEFAULT,
+                    std::ptr::null(),
+                    SecurityImpersonation,
+                    TokenPrimary,
+                    &raw mut copy,
+                )
+            };
+            assert!(duplicated != 0, "{}", std::io::Error::last_os_error());
+            TokenHandle(copy)
+        }
+
+        /// Whether a token is elevated: an administrator's that holds the Administrators group
+        /// enabled, rather than filtered down to what a standard user holds.
+        fn elevated(token: &TokenHandle) -> bool {
+            use windows_sys::Win32::Security::{TOKEN_ELEVATION, TokenElevation};
+
+            let buffer = token
+                .information(TokenElevation, std::mem::size_of::<TOKEN_ELEVATION>())
+                .expect("the token's elevation");
+            // SAFETY: the buffer holds a `TOKEN_ELEVATION` the kernel wrote, aligned for it.
+            unsafe { std::ptr::read(buffer.as_ptr().cast::<TOKEN_ELEVATION>()) }.TokenIsElevated
+                != 0
+        }
+
+        /// KR-REQ-24.01: a process whose new objects are owned by its user, as a shell of Git for
+        /// Windows gives them, could still have created a tree an elevated process made, owned by
+        /// the Administrators group, when its own token is elevated: that token may give what it
+        /// creates the group as owner. A token that is not elevated could not have, nor could any
+        /// token another account's tree, and the user's own is accepted either way.
+        #[test]
+        fn an_elevated_token_owning_new_objects_as_its_user_could_create_as_administrators() {
+            use windows_sys::Win32::Security::{SetTokenInformation, TOKEN_OWNER};
+
+            let token = this_token_again();
+            let accounts = TokenAccounts::of(&token).expect("reads the token");
+            let owner = TOKEN_OWNER {
+                Owner: accounts.user(),
+            };
+            // SAFETY: the token is open with the right to change its defaults, and the structure
+            // points at the user's identifier inside `accounts`, which outlives the call.
+            let set = unsafe {
+                SetTokenInformation(
+                    token.0,
+                    TokenOwner,
+                    std::ptr::from_ref(&owner).cast(),
+                    u32::try_from(std::mem::size_of::<TOKEN_OWNER>()).unwrap_or(0),
+                )
+            };
+            assert!(set != 0, "{}", std::io::Error::last_os_error());
+            let accounts = TokenAccounts::of(&token).expect("reads the token again");
+            assert!(
+                equal(accounts.owner(), accounts.user()),
+                "new objects are owned by the user"
+            );
+            let administrators = OwnedSid::parse("S-1-5-32-544").expect("the Administrators group");
+            let users = OwnedSid::parse("S-1-5-32-545").expect("the Users group");
+            assert!(could_have_created(accounts.user(), &accounts));
+            assert_eq!(
+                could_have_created(administrators.as_psid(), &accounts),
+                elevated(&token),
+                "the Administrators group exactly when the token is elevated"
+            );
+            assert!(!could_have_created(users.as_psid(), &accounts));
+        }
 
         /// An account the tests name: the local system.
         fn system() -> Account {
