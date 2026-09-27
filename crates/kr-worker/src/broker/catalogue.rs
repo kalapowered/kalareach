@@ -330,26 +330,12 @@ impl Admissions {
         if held.frame.is_some_and(|held| prepared.frame <= held) {
             return Applied::Older;
         }
-        let mut read = BTreeMap::new();
-        for package in &prepared.packages {
-            let outcome = match prepared.verified.get(&package.package_digest) {
-                Some(Ok(checked)) => derive(package, checked),
-                Some(Err(why)) => Err(why.clone()),
-                None => Err("the package was not read".to_owned()),
-            };
-            read.insert(package.package_digest, outcome);
-        }
-        let connectors: Vec<Arc<InstalledConnector>> = read
-            .values()
-            .filter_map(|outcome| match outcome {
-                Ok(ReadPackage::Connector(connector)) => Some(Arc::clone(connector)),
-                _ => None,
-            })
-            .collect();
-        // A refusal of this kind belongs to this snapshot alone: the next one reads again.
-        for (connector, refusal) in sources.replace_read(connectors, Some(prepared.frame)) {
-            read.insert(connector.package_digest(), Err(refusal.detail));
-        }
+        let read = read_packages(
+            &prepared.packages,
+            &prepared.verified,
+            sources,
+            Some(prepared.frame),
+        );
         held.frame = Some(prepared.frame);
         held.policy = Some(prepared.policy);
         held.packages = prepared.packages;
@@ -557,6 +543,110 @@ pub fn capabilities(names: &[String]) -> BTreeSet<PluginCapability> {
                 .find(|capability| capability.as_str() == name)
         })
         .collect()
+}
+
+/// What each admitted package reads as under the grants its admissions give it, from its verified
+/// files: a connector, a declarative package, or why it was refused. `sources` is replaced with the
+/// connectors, which leaves out any two that integrate one command, and those are refused too.
+fn read_packages(
+    packages: &[AdmittedPackage],
+    verified: &BTreeMap<Digest256, Verified>,
+    sources: &ConnectorSources,
+    frame: Option<FrameId>,
+) -> BTreeMap<Digest256, Result<ReadPackage, String>> {
+    let mut read = BTreeMap::new();
+    for package in packages {
+        let outcome = match verified.get(&package.package_digest) {
+            Some(Ok(checked)) => derive(package, checked),
+            Some(Err(why)) => Err(why.clone()),
+            None => Err("the package was not read".to_owned()),
+        };
+        read.insert(package.package_digest, outcome);
+    }
+    let connectors: Vec<Arc<InstalledConnector>> = read
+        .values()
+        .filter_map(|outcome| match outcome {
+            Ok(ReadPackage::Connector(connector)) => Some(Arc::clone(connector)),
+            _ => None,
+        })
+        .collect();
+    // A refusal of this kind belongs to these admissions alone: the next ones read again.
+    for (connector, refusal) in sources.replace_read(connectors, frame) {
+        read.insert(connector.package_digest(), Err(refusal.detail));
+    }
+    read
+}
+
+/// The checks of admitted packages, kept by hash, for a reader of admissions outside a worker.
+///
+/// A hash names the same verified files for good, so each package is checked once and kept. A
+/// check that failed is not kept: a package's copy can be put right under the same hash.
+#[derive(Debug, Default)]
+pub struct CheckedPackages {
+    checked: Mutex<BTreeMap<Digest256, Arc<kr_plugin_sdk::package::Package>>>,
+}
+
+/// One set of admitted packages, read the way a worker handed them in one snapshot reads them.
+#[derive(Debug)]
+pub struct Reading {
+    /// Each admitted package, with what it reads as or why it was refused.
+    pub packages: Vec<(AdmittedPackage, Result<ReadPackage, String>)>,
+    /// The connectors whose command integration applies, by the command each resolves.
+    pub sources: ConnectorSources,
+}
+
+impl CheckedPackages {
+    /// Nothing checked yet.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Reads `packages` by a worker's rules: each package checked (a hash checked before is not
+    /// checked again), each read under the grants these admissions give it, and one command
+    /// resolving to one connector. It reads files, so it belongs on a thread that may block.
+    #[must_use]
+    pub fn read(&self, packages: &[AdmittedPackage]) -> Reading {
+        let verified: BTreeMap<Digest256, Verified> = packages
+            .iter()
+            .map(|package| {
+                let known = self
+                    .checked
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(&package.package_digest)
+                    .cloned();
+                let checked = known.map_or_else(
+                    || {
+                        let checked = verify(package);
+                        if let Ok(checked) = &checked {
+                            self.checked
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .insert(package.package_digest, Arc::clone(checked));
+                        }
+                        checked
+                    },
+                    Ok,
+                );
+                (package.package_digest, checked)
+            })
+            .collect();
+        let sources = ConnectorSources::new();
+        let mut read = read_packages(packages, &verified, &sources, None);
+        Reading {
+            packages: packages
+                .iter()
+                .map(|package| {
+                    let outcome = read
+                        .remove(&package.package_digest)
+                        .unwrap_or_else(|| Err("the package was not read".to_owned()));
+                    (package.clone(), outcome)
+                })
+                .collect(),
+            sources,
+        }
+    }
 }
 
 /// What an installation hands the connector reader for one admitted package.
