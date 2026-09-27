@@ -583,12 +583,14 @@ pub fn versions() -> Result<Vec<Kept>> {
         .releases()
         .map_err(|error| CliError::Other(said(&error)))?
     {
-        let sequence =
-            kr_ipc::paths::read_owner_only_file(&store.manifest(&release), 4 * 1024 * 1024)
-                .ok()
-                .flatten()
-                .and_then(|bytes| kr_protocol::update::ReleaseManifest::read_document(&bytes).ok())
-                .map(|manifest| manifest.sequence.get());
+        // A release is read-only once it is in the store, so its manifest is read as a release's,
+        // not as a file of this user's own.
+        let sequence = release::manifest_document(&store.release_directory(&release))
+            .ok()
+            .and_then(|document| {
+                kr_protocol::update::ReleaseManifest::read_document(&document).ok()
+            })
+            .map(|manifest| manifest.sequence.get());
         kept.push(Kept {
             current: current.as_ref() == Some(&release),
             previous: record.previous.as_ref() == Some(&release),
