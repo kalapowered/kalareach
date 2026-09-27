@@ -48,8 +48,8 @@
 //! # When a request goes once more
 //!
 //! Section 23 lets a client send a request again without being asked only where the request is
-//! safe to repeat. [`Repeat`] is that judgement, made for each request from its method and the body
-//! its signature covers. When the service answers a request that is safe with `SERVICE_UNAVAILABLE`
+//! safe to repeat. This client judges that for each request, from its method and the body its
+//! signature covers. When the service answers a request that is safe with `SERVICE_UNAVAILABLE`
 //! and a delay no longer than [`crate::retry::MAX_AUTOMATIC_DELAY`], it has not carried the request
 //! out, or has not finished answering it, and either way it asks for the same request again. This
 //! client waits that delay and sends the request once more, signed afresh, and the second answer
