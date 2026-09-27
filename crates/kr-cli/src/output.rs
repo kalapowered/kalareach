@@ -355,8 +355,8 @@ fn asked_in(asked: &mut Vec<String>, piece: &Piece<'_>) {
 /// A value a document holds. Anything in this crate can make one; only this module reads it.
 pub struct Held {
     value: serde_json::Value,
-    /// Where in the value asked content is, for a test: `""` for the value itself, a key, or `[]`
-    /// for every element of a list, joined with dots.
+    /// Where in the value asked content is, for a test: `""` for the value itself, a key, or `[n]`
+    /// for the element of a list at `n`, joined with dots.
     #[cfg(test)]
     asked: std::collections::BTreeSet<String>,
 }
@@ -460,21 +460,22 @@ impl<T: Into<Held>> From<Option<T>> for Held {
 
 impl<T: Into<Held>> From<Vec<T>> for Held {
     fn from(values: Vec<T>) -> Self {
-        #[cfg(test)]
-        let mut asked = std::collections::BTreeSet::new();
-        let values = values
-            .into_iter()
-            .map(|value| {
-                let held = value.into();
-                #[cfg(test)]
-                asked.extend(held.asked.iter().map(|path| joined("[]", path)));
-                held.value
-            })
-            .collect();
+        let held: Vec<Self> = values.into_iter().map(Into::into).collect();
         Self {
-            value: serde_json::Value::Array(values),
             #[cfg(test)]
-            asked,
+            asked: held
+                .iter()
+                .enumerate()
+                .flat_map(|(index, element)| {
+                    element
+                        .asked
+                        .iter()
+                        .map(move |path| joined(&format!("[{index}]"), path))
+                })
+                .collect(),
+            value: serde_json::Value::Array(
+                held.into_iter().map(|element| element.value).collect(),
+            ),
         }
     }
 }
@@ -1052,6 +1053,72 @@ mod tests {
                 Asked::text(Request::Sessions, MARKER),
                 Shown::said(MARKER)
             )],
+        );
+    }
+
+    /// The negative control for lists: asked content in one element does not let the marker show
+    /// in the same field of another.
+    #[test]
+    #[should_panic(expected = "holds no asked content")]
+    fn the_marker_in_an_element_that_asked_for_nothing_fails_the_document_check() {
+        let document = Document::new().with(
+            "items",
+            vec![
+                Document::new().with("detail", Asked::text(Request::Sessions, MARKER)),
+                Document::new().with("detail", Shown::said(MARKER)),
+            ],
+        );
+        let _ = planted::only_asked("a planted leak in a list", &document);
+    }
+
+    /// The negative control for the encoding: a reducer's words stand only in place of a string, so
+    /// a value replaced whole by a bracketed string fails the check.
+    #[test]
+    #[should_panic(expected = "neither asked content")]
+    fn a_value_replaced_whole_fails_the_encoding_check() {
+        let encoded = serde_json::json!({ "nested": { "text": MARKER } });
+        let document = Document::new().with("nested", Shown::said("[withheld]"));
+        planted::differs_only_where_said("a value replaced whole", &document, &encoded, &[]);
+    }
+
+    /// A choice inside one alternative of another is built in each of its own alternatives, not
+    /// only in the one its parent's position would give it.
+    #[test]
+    fn a_choice_inside_an_alternative_is_built_in_each_of_its_own() {
+        #[derive(
+            Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize, schemars::JsonSchema,
+        )]
+        #[serde(rename_all = "snake_case")]
+        enum Reason {
+            First,
+            Second,
+            Third,
+            Fourth,
+        }
+        #[derive(serde::Deserialize, schemars::JsonSchema)]
+        #[serde(tag = "state", rename_all = "snake_case")]
+        enum Status {
+            Open { count: u64 },
+            Waiting { since: u64 },
+            Consumed { reason: Reason },
+        }
+        let mut reasons = std::collections::BTreeSet::new();
+        let mut states = 0_usize;
+        for status in planted::planted::<Status>() {
+            match status {
+                Status::Open { count } | Status::Waiting { since: count } => {
+                    states += usize::from(count > 0);
+                }
+                Status::Consumed { reason } => {
+                    reasons.insert(reason);
+                }
+            }
+        }
+        assert!(states >= 2, "each other state is built too");
+        assert_eq!(
+            reasons.len(),
+            4,
+            "every reason is built inside the one state that has one"
         );
     }
 
