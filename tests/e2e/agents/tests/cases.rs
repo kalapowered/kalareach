@@ -3441,10 +3441,16 @@ fn a_disconnection_after_the_agent_took_a_prompt_leaves_one_reply_and_no_duplica
             !needle.is_empty() && sent.windows(needle.len()).any(|window| window == needle)
         };
         code_seen |= holds(code_start.as_bytes());
+        // What the view that was cut off asked for afresh, read before a later view replaces it.
+        let fresh_screens = logged
+            .screen
+            .view
+            .fresh_screens()
+            .saturating_sub(fresh_before);
         reached |= code_seen
             || holds(account.reply_mark.as_bytes())
             || resyncs(&logged) > resyncs_before
-            || logged.screen.view.fresh_screens() > fresh_before;
+            || fresh_screens > 0;
         if code_seen {
             // Only the model writes the code in upper case: the vendor answered.
             stage.held.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -3477,6 +3483,7 @@ fn a_disconnection_after_the_agent_took_a_prompt_leaves_one_reply_and_no_duplica
                 "boundary": "an event or output byte the device was sent between the submission and the agent's record of the prompt showed the reply, the device was sent or asked for a fresh screen in that time, or its reader was not seen to stop once it disconnected",
                 "code_seen": code_seen,
                 "reader_stopped": reader_stopped,
+                "fresh_screens": fresh_screens,
             });
             return Ending::new(
                 Outcome::not_run(
@@ -3554,7 +3561,7 @@ fn a_disconnection_after_the_agent_took_a_prompt_leaves_one_reply_and_no_duplica
             "conversation": conversation_id(&conversation),
             "admission": "the agent's conversation held the prompt, and no screen the device was sent from the submission until it disconnected showed the reply mark or the code in upper case",
             "markers": { "reply_begins": begin, "reply_ends": end, "screen_reply_mark": account.reply_mark, "looked_for": code_start },
-            "cutoff": { "reader_stopped": reader_stopped, "fresh_screens": logged.screen.view.fresh_screens() - fresh_before },
+            "cutoff": { "reader_stopped": reader_stopped, "fresh_screens": fresh_screens },
             "reconciled": { "attachment": old.0.to_string(), "epoch": old.1.get(), "next_sequence": old.2, "stale_input": stale.err().map(|refusal| refusal.detail) },
             "after_reconnect": { "prompts": prompts, "finished_replies": replies, "rows": redrawn.iter().filter(|row| row.contains(&end)).collect::<Vec<_>>() },
             "control": { "what": "the same prompt sent again", "breaks_property": true, "prompts": prompts_twice, "finished_replies": replies_twice, "check": control.err() },
