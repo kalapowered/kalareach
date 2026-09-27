@@ -561,6 +561,8 @@ export interface HostPort {
    * Opens a raw terminal view of one session, `grid` in size. Native code attaches it to the
    * session and holds its screen; every state it is in reaches `listener`, and nothing else does.
    * Resolves with the view as soon as native code holds it, before the host has answered anything.
+   * A session identifier native code cannot parse, or a size outside a terminal's bounds, is
+   * refused with `INVALID_ARGUMENT`, and nothing opens.
    */
   openTerminalView(
     sessionId: string,
@@ -998,9 +1000,12 @@ export interface TerminalCursor {
 
 /** One open raw terminal view. */
 export interface TerminalView {
-  /** Tells the view the page's grid is now `grid`. */
+  /**
+   * Tells the view the page's grid is now `grid`. A size outside a terminal's bounds is refused
+   * with `INVALID_ARGUMENT`, and the grid stays as it was.
+   */
   resize(grid: TerminalGrid): Promise<void>
-  /** Moves the view's window. */
+  /** Moves the view's window. A move native code cannot read is refused, and nothing moves. */
   move(move: TerminalMove): Promise<void>
   /**
    * Hands the view the person's input. Resolves once native code has taken it; a wheel turn or keys

@@ -844,8 +844,13 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
       return Promise.resolve(settledAs('storage.object.delete', 'applied'))
     },
 
+    // Read as native code reads the command: a session identifier and a terminal's size, or nothing
+    // opens.
     openTerminalView: (sessionId, grid, listener) => {
-      const view = fakeTerminalView(sessionId, grid, listener, terminalPresentation, {
+      if (!isSessionId(sessionId)) return refused('INVALID_ARGUMENT', 'that is not a session identifier')
+      const size = readTerminalGrid(grid)
+      if (typeof size === 'string') return refused('INVALID_ARGUMENT', size)
+      const view = fakeTerminalView(sessionId, size, listener, terminalPresentation, {
         holdingMoves: holdingTerminalMoves,
         holdingControl: holdingTerminalControl,
         wheel: terminalWheel
@@ -2099,21 +2104,27 @@ function fakeTerminalView(
     publish,
     deliverInFlight: listener,
     handle: {
+      // A size is read as native code reads it, and one it refuses changes nothing.
       resize: (next) => {
-        grids.push(next)
+        const size = readTerminalGrid(next)
+        if (typeof size === 'string') return refused('INVALID_ARGUMENT', size)
+        grids.push(size)
         // The host holds the window inside what a window of the new size can reach.
-        place = heldInside(sessionId, next, place)
+        place = heldInside(sessionId, size, place)
         return Promise.resolve()
       },
+      // A move is read as native code reads it, and one it refuses is neither recorded nor applied.
       // Native code applies a move, has the host draw the window there, and says the move is
       // settled with that screen. A view whose moves are held records them and waits for the test;
       // a view that has ended, or a move not numbered after the last, takes nothing, and a screen
       // drawn for a view that ends before it is sent is never sent.
       move: (next) => {
-        moves.push(next)
-        if (!held.holdingMoves && !closed && !ended && next.number > applied) {
-          place = moved(sessionId, grids.at(-1) ?? grid, place, next)
-          applied = next.number
+        const asked = readTerminalMove(next)
+        if (typeof asked === 'string') return refused('INVALID_ARGUMENT', asked)
+        moves.push(asked)
+        if (!held.holdingMoves && !closed && !ended && asked.number > applied) {
+          place = moved(sessionId, grids.at(-1) ?? grid, place, asked)
+          applied = asked.number
           setTimeout(() => {
             if (ended) return
             publish({
@@ -2186,6 +2197,65 @@ function refused(code: string, message: string): Promise<never> {
     // eslint-disable-next-line @typescript-eslint/prefer-promise-reject-errors -- a refusal is the data native code rejects with, never an Error
     reject(new FakeHostError(code, message).toPayload())
   })
+}
+
+/** The most columns, rows and cells a terminal may have, all three at once (section 8). */
+const MAX_COLUMNS = 2048
+const MAX_ROWS = 1024
+const MAX_CELLS = 262_144
+
+/** A whole number the page can send exactly, from 0. */
+function isCount(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
+}
+
+/**
+ * Whether `value` is a session identifier as native code parses one: five groups of 8, 4, 4, 4 and
+ * 12 hexadecimal digits, joined by hyphens.
+ */
+export function isSessionId(value: unknown): value is string {
+  return (
+    typeof value === 'string' &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value)
+  )
+}
+
+/**
+ * A view's grid read as native code reads the size the page's port sends, or why native code
+ * refuses it, in its words: whole numbers of columns and rows, then a terminal's bounds of 1 to
+ * 2,048 columns, 1 to 1,024 rows and at most 262,144 cells.
+ */
+export function readTerminalGrid(value: unknown): TerminalGrid | string {
+  if (typeof value !== 'object' || value === null) return 'a size is a map'
+  const { columns, rows } = value as Record<string, unknown>
+  if (!isCount(columns)) return '`columns` is not a whole number in range'
+  if (!isCount(rows)) return '`rows` is not a whole number in range'
+  const refusal = "that is not a terminal's size:"
+  if (columns === 0 || columns > MAX_COLUMNS) {
+    return `${refusal} columns ${columns} must be between 1 and ${MAX_COLUMNS}`
+  }
+  if (rows === 0 || rows > MAX_ROWS) return `${refusal} rows ${rows} must be between 1 and ${MAX_ROWS}`
+  if (columns * rows > MAX_CELLS) return `${refusal} cells ${columns * rows} must not exceed ${MAX_CELLS}`
+  return { columns, rows }
+}
+
+/**
+ * A move read as native code reads the one the page's port sends, or why native code refuses it:
+ * the page's number for the move, a whole number from 0, and whole numbers of columns across and
+ * rows down, either way. A move that has `live` is sent as a return to the live screen, whatever
+ * else it holds, so it is read as one.
+ */
+export function readTerminalMove(value: unknown): TerminalMove | string {
+  if (typeof value !== 'object' || value === null) return 'a move is a map'
+  const fields = value as Record<string, unknown>
+  const number = fields['number']
+  if (!isCount(number)) return '`number` is not a whole number in range'
+  if ('live' in fields) return { number, live: true }
+  const across = fields['across']
+  const down = fields['down']
+  if (typeof across !== 'number' || !Number.isSafeInteger(across)) return '`across` is not a whole number'
+  if (typeof down !== 'number' || !Number.isSafeInteger(down)) return '`down` is not a whole number'
+  return { number, across, down }
 }
 
 /**

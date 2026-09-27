@@ -180,3 +180,84 @@ describe('the scripted host reads input as native code does (KR-REQ-10.01)', () 
     expect(controls.terminalViews[0]?.inputs).toEqual([{ kind: 'take', number: 1 }])
   })
 })
+
+describe("the scripted host reads a view's opening, size and moves as native code does", () => {
+  /** A view's grid and move as the page's port could be handed them, wrong in some way. */
+  const wrongGrids: unknown[] = [
+    { columns: 0, rows: 24 },
+    { columns: 2049, rows: 1 },
+    { columns: 80, rows: 0 },
+    { columns: 80, rows: 1025 },
+    // Within each bound on its own, and over the cells a terminal may have.
+    { columns: 1024, rows: 257 },
+    { columns: 80.5, rows: 24 },
+    { columns: -1, rows: 24 },
+    { columns: '80', rows: 24 },
+    { columns: 80 },
+    null
+  ]
+
+  it('refuses to open a view native code would not open, and opens none', async () => {
+    const { port, controls } = fakeHost()
+    for (const sessionId of [
+      'session-1',
+      '8a7b6c50-22bb-4c3d-8e4f-00000000010',
+      '8a7b6c50x22bb-4c3d-8e4f-000000000101',
+      'zzzzzzzz-22bb-4c3d-8e4f-000000000101'
+    ]) {
+      await expect(port.openTerminalView(sessionId, { columns: 80, rows: 8 }, () => {}), sessionId).rejects.toMatchObject({
+        code: 'INVALID_ARGUMENT',
+        message: 'that is not a session identifier'
+      })
+    }
+    for (const grid of wrongGrids) {
+      await expect(port.openTerminalView(SESSION_MAIN, grid as never, () => {}), JSON.stringify(grid)).rejects.toMatchObject({
+        code: 'INVALID_ARGUMENT'
+      })
+    }
+    expect(controls.terminalViews).toHaveLength(0)
+    // The largest a terminal may be, 262,144 cells, opens.
+    await port.openTerminalView(SESSION_MAIN, { columns: 2048, rows: 128 }, () => {})
+    expect(controls.terminalViews).toHaveLength(1)
+  })
+
+  it('refuses a size or a move native code would not take, and takes neither', async () => {
+    const { port, controls } = fakeHost()
+    const view: TerminalView = await port.openTerminalView(SESSION_MAIN, { columns: 80, rows: 8 }, () => {})
+    for (const grid of wrongGrids) {
+      await expect(view.resize(grid as never), JSON.stringify(grid)).rejects.toMatchObject({ code: 'INVALID_ARGUMENT' })
+    }
+    await expect(view.resize({ columns: 1024, rows: 257 })).rejects.toMatchObject({
+      message: "that is not a terminal's size: cells 263168 must not exceed 262144"
+    })
+    for (const move of [
+      { number: -1, across: 1, down: 0 },
+      { number: 1.5, across: 1, down: 0 },
+      { number: 1, across: 0.5, down: 0 },
+      { number: 1, across: Number.NaN, down: 0 },
+      { number: 1, across: 1 },
+      { number: 1, down: 1 },
+      { across: 1, down: 0 },
+      null
+    ]) {
+      await expect(view.move(move as never), JSON.stringify(move)).rejects.toMatchObject({ code: 'INVALID_ARGUMENT' })
+    }
+    await expect(view.move({ number: 1, across: 0.5, down: 0 })).rejects.toMatchObject({
+      message: expect.stringContaining('across') as string
+    })
+    expect(controls.terminalViews[0]?.grids).toEqual([{ columns: 80, rows: 8 }])
+    expect(controls.terminalViews[0]?.moves).toEqual([])
+    // What native code takes, the scripted host takes.
+    await view.resize({ columns: 40, rows: 6 })
+    await view.move({ number: 1, across: 0, down: -2 })
+    await view.move({ number: 2, live: true })
+    expect(controls.terminalViews[0]?.grids).toEqual([
+      { columns: 80, rows: 8 },
+      { columns: 40, rows: 6 }
+    ])
+    expect(controls.terminalViews[0]?.moves).toEqual([
+      { number: 1, across: 0, down: -2 },
+      { number: 2, live: true }
+    ])
+  })
+})
