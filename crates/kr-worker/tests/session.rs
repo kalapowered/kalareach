@@ -2101,3 +2101,86 @@ async fn a_silent_session_is_never_closed_for_its_silence() {
     gate.release();
     closure_record(&runtime, "the closure finishes").await;
 }
+
+/// KR-REQ-07.46: a new shell owns its terminal before it starts a child. The root shell leads a
+/// session of its own, its own group is the terminal's foreground group from the moment it is
+/// launched, and the first process it starts is already in that session and that group, on the
+/// same controlling terminal.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_shell_owns_its_terminal_before_it_starts_a_child() {
+    use rustix::process::{Pid, getpgid, getsid};
+
+    let host = kr_ipc::testing::TempHost::create();
+    let config = configuration(
+        &host,
+        "sleep 300 & printf 'kr-first-child:%s:kr-end\\n' \"$!\"; exec cat",
+    );
+    let mut session = Session::open(config).expect("opens");
+    session.launch().expect("launches");
+    let root = session.root_identity().expect("the root shell").pid.get();
+    let foreground = session.foreground_group();
+    let runtime = std::sync::Arc::new(
+        SessionRuntime::start(
+            session,
+            std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+        )
+        .expect("starts"),
+    );
+    produced(&runtime, b":kr-end\r\n").await;
+    let seen = String::from_utf8_lossy(&retained(&runtime)).into_owned();
+    let child: u64 = seen
+        .split("kr-first-child:")
+        .nth(1)
+        .and_then(|rest| rest.split(':').next())
+        .expect("the child's identifier was printed")
+        .trim()
+        .parse()
+        .expect("a process identifier");
+    let pid = |raw: u64| {
+        Pid::from_raw(i32::try_from(raw).expect("a process identifier")).expect("a process")
+    };
+
+    assert_eq!(
+        getsid(Some(pid(root))).expect("its session"),
+        pid(root),
+        "the root shell leads a session of its own"
+    );
+    assert_eq!(
+        getpgid(Some(pid(root))).expect("its group"),
+        pid(root),
+        "and a group of its own"
+    );
+    assert_eq!(
+        foreground,
+        Some(i32::try_from(root).expect("a process identifier")),
+        "its group is the terminal's foreground group from the moment it is launched"
+    );
+    assert_eq!(
+        getsid(Some(pid(child))).expect("its session"),
+        pid(root),
+        "the first child is in the root shell's session"
+    );
+    assert_eq!(
+        getpgid(Some(pid(child))).expect("its group"),
+        pid(root),
+        "and in the terminal's foreground group"
+    );
+    let terminal_of = |raw: u64| {
+        let listed = std::process::Command::new("ps")
+            .args(["-o", "tty=", "-p", &raw.to_string()])
+            .output()
+            .expect("ps runs");
+        String::from_utf8_lossy(&listed.stdout).trim().to_owned()
+    };
+    let terminal = terminal_of(root);
+    assert!(
+        !terminal.is_empty() && !terminal.starts_with('?'),
+        "the root shell has a controlling terminal: {terminal:?}"
+    );
+    assert_eq!(terminal_of(child), terminal, "the child holds the same one");
+
+    let (_, gate) = runtime.close(ClosureReason::CloseRequested);
+    gate.release();
+    closure_record(&runtime, "the closure finishes").await;
+}

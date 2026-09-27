@@ -4310,3 +4310,163 @@ async fn a_reconnect_opens_a_new_input_stream_and_replays_no_input() {
     close_session(&mut local, &host, session_id).await;
     daemon.stop().await;
 }
+
+/// How many times `needle` occurs in `haystack`.
+fn occurrences(haystack: &[u8], needle: &[u8]) -> usize {
+    haystack
+        .windows(needle.len())
+        .filter(|window| *window == needle)
+        .count()
+}
+
+// Ignored by default: this suite starts real processes, and the binary it launches is built by
+// `scripts/end-to-end.sh`, which runs it with `--include-ignored`. A suite that skipped itself
+// silently when that binary was absent would report a pass for something it never ran.
+/// KR-ACC-001: one query responder, with a local client and a remote device attached to the same
+/// session. The application asks the terminal what it is: the host answers it exactly once, the
+/// question reaches neither client, and the application goes on to its next line rather than
+/// waiting for an answer that never comes.
+#[ignore = "launches a worker process; run through scripts/end-to-end.sh"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_responder_answers_a_query_with_a_local_and_a_remote_client_attached() {
+    use kr_protocol::envelope::ControlFrame;
+
+    let host = Host::create();
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let daemon = host.start(loopback(), &owner).await;
+    let environment_id = host.environment_id;
+    let mut local = host.client().await;
+    let created = create(&mut local, &host).await;
+    let session_id = created.session.session_id;
+
+    // A local client on the worker's own endpoint, watching the session's output.
+    let mut watcher = LocalClient::connect(
+        &kr_ipc::paths::Endpoint::from_path(
+            created
+                .endpoint
+                .as_ref()
+                .cloned()
+                .expect("a live session names its worker"),
+        )
+        .expect("a worker endpoint"),
+        LocalClientKind::Cli,
+        build(),
+    )
+    .await
+    .expect("the local client reaches the worker");
+    let watching: SessionAttachResult = watcher
+        .mutate(
+            Method::SessionAttach,
+            ActionId::new(kr_ipc::new_uuid()),
+            on_session(environment_id, session_id),
+            &SessionAttachParams {
+                session_id,
+                mode: AttachMode::Semantic,
+                claim_geometry: false,
+                dimensions: Nullable::null(),
+                terminal_profile_id: Nullable::null(),
+                requested: [AttachmentCapability::ObserveTerminal]
+                    .into_iter()
+                    .collect(),
+            },
+        )
+        .await
+        .expect("the call reaches the worker")
+        .expect("the local attachment is admitted")
+        .to_typed()
+        .expect("an attachment");
+    watcher
+        .request(
+            Method::EventsSubscribe,
+            &kr_protocol::recovery::EventsSubscribeParams {
+                session_id,
+                attachment_id: watching.attachment.attachment_id,
+                streams: [EventStream::Output].into_iter().collect(),
+                from_cursor: Nullable::null(),
+            },
+        )
+        .await
+        .expect("the call reaches the worker")
+        .expect("the local subscription succeeds");
+
+    // A paired device, attached over the network, which types.
+    let device = Device::create(&loopback()).await;
+    let record = pair(&daemon, &device, &owner).await;
+    let session = connect(&daemon, &device, &record).await;
+    let attached = attach(&session, environment_id, session_id).await;
+    let lease = acquire(&session, environment_id, session_id, attached.typing).await;
+    let mut events = session.events();
+    // The shell asks the terminal what it is, waits for the answer's line to end, and says it went
+    // on. The answer the host writes into its input is echoed back out as ordinary text.
+    session
+        .write_input(&InputWriteParams {
+            session_id,
+            attachment_id: attached.typing,
+            epoch: lease.lease.epoch,
+            sequence: kr_protocol::ids::InputSequence::new(0),
+            bytes: kr_protocol::scalars::Bytes::new(
+                b"printf '\\033[c'; read -r _; printf 'kala%s-after\\n' reach\n".to_vec(),
+            ),
+        })
+        .await
+        .expect("the command is accepted");
+    let answered = observe(&session, &mut events, "[?62;22c").await;
+    session
+        .write_input(&InputWriteParams {
+            session_id,
+            attachment_id: attached.typing,
+            epoch: lease.lease.epoch,
+            sequence: kr_protocol::ids::InputSequence::new(1),
+            bytes: kr_protocol::scalars::Bytes::new(b"\n".to_vec()),
+        })
+        .await
+        .expect("the line ends");
+    let remote = format!(
+        "{answered}{}",
+        observe(&session, &mut events, "kalareach-after").await
+    );
+
+    // What the local client was sent, up to the line the application printed after its answer.
+    let deadline = tokio::time::Instant::now() + PATIENCE;
+    let mut seen = Vec::new();
+    while occurrences(&seen, b"kalareach-after") == 0 {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(remaining, watcher.recv()).await {
+            Ok(Ok(ControlFrame::Notification(notification)))
+                if notification.event_type.as_str() == "session.output" =>
+            {
+                if let Ok(event) = notification.payload.to_typed::<OutputEvent>() {
+                    seen.extend_from_slice(event.bytes.as_slice());
+                }
+            }
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => panic!("the local client's connection ended: {error}"),
+            Err(_) => panic!(
+                "the local client was never sent the line after the answer: {:?}",
+                String::from_utf8_lossy(&seen)
+            ),
+        }
+    }
+
+    // One answer, written by the host into the application's input and echoed once.
+    let history = retained_history(&created).await;
+    assert_eq!(
+        occurrences(history.as_bytes(), b"[?62;22c"),
+        1,
+        "the query was answered exactly once: {history:?}"
+    );
+    // The question itself reached neither client, so neither could answer it a second time.
+    assert_eq!(
+        occurrences(&seen, b"\x1b[c"),
+        0,
+        "{:?}",
+        String::from_utf8_lossy(&seen)
+    );
+    assert!(!remote.contains("\u{1b}[c"), "{remote:?}");
+    assert!(remote.contains("kalareach-after"));
+
+    session.close();
+    drop(watcher);
+    close_session(&mut local, &host, session_id).await;
+    daemon.stop().await;
+}
