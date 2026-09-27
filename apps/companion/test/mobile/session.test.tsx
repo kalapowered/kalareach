@@ -957,6 +957,8 @@ describe("the phone's raw terminal view (KR-REQ-08.02, 13.18)", () => {
     const reason = await screen.findByText(/no confirmed outcome yet/)
     expect(field).toHaveAttribute('aria-describedby', reason.id)
     expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled()
+    // The reason comes before the field's line, above it, where the composer yields first.
+    expect(reason.compareDocumentPosition(field) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
   })
 
   it('lets the bar yield while a keyboard covers part of the session, and not for what lies under it', async () => {
@@ -1093,5 +1095,71 @@ describe("the phone's raw terminal view (KR-REQ-08.02, 13.18)", () => {
     await waitFor(() => {
       expect(screen.queryByText('This view was detached from the session.')).toBeNull()
     })
+  })
+})
+
+describe("the phone's composer on a short session (KR-REQ-13.19)", () => {
+  it('folds to its line on a session too short for the whole of it and back, keeping the field, its focus and what was typed', async () => {
+    const { port } = fakeHost()
+    const person = userEvent.setup()
+    // jsdom lays nothing out: a session 40 lines of the root text size high, then 20, then 40.
+    const root = document.documentElement
+    root.style.fontSize = '16px'
+    let lines = 40
+    const heights = vi.spyOn(Element.prototype, 'clientHeight', 'get').mockImplementation(function (
+      this: Element
+    ) {
+      return this.classList.contains('m-session') ? lines * 16 : 0
+    })
+    const resized = (to: number) => {
+      lines = to
+      act(() => {
+        window.dispatchEvent(new Event('resize'))
+      })
+    }
+    try {
+      render(
+        <AppProvider port={port}>
+          <OnSession sessionId={SESSION_MAIN} />
+        </AppProvider>
+      )
+      const field = screen.getByLabelText('Message this session')
+      const send = () => screen.getByRole('button', { name: 'Send' })
+      const line = () => send().closest('.m-composer-line')
+      // The whole composer: Send under the pickers, and words for why an empty draft waits.
+      expect(line()).toBeNull()
+      expect(screen.getByText('Write something, or add an attachment.')).toBeInTheDocument()
+
+      await person.click(field)
+      await person.type(field, 'hel')
+      resized(20)
+      // Its line: Send beside the field, which needs no words while the draft is empty, the pickers
+      // still under it, and the same field, still focused, still holding what was typed.
+      await waitFor(() => {
+        expect(line()).not.toBeNull()
+      })
+      expect(document.querySelector('.m-session')).toHaveAttribute('data-composer', 'line')
+      expect(screen.getByLabelText('Message this session')).toBe(field)
+      expect(line()).toContainElement(field)
+      expect(field).toHaveFocus()
+      expect(screen.getByRole('group', { name: 'Add an attachment' })).toBeInTheDocument()
+      await person.type(field, 'lo')
+      expect(field).toHaveValue('hello')
+      await person.clear(field)
+      expect(screen.queryByText('Write something, or add an attachment.')).toBeNull()
+      expect(send()).toBeDisabled()
+
+      resized(40)
+      await waitFor(() => {
+        expect(line()).toBeNull()
+      })
+      expect(document.querySelector('.m-session')).toHaveAttribute('data-composer', 'whole')
+      expect(screen.getByLabelText('Message this session')).toBe(field)
+      expect(field).toHaveFocus()
+      expect(screen.getByText('Write something, or add an attachment.')).toBeInTheDocument()
+    } finally {
+      heights.mockRestore()
+      root.style.removeProperty('font-size')
+    }
   })
 })

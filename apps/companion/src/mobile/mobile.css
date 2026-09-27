@@ -36,6 +36,9 @@
    */
   --field-size: 1rem;
   --field-leading: 1.45;
+  /* The conversation's type, which the room kept for the conversation is counted in. */
+  --stream-size: 0.9375rem;
+  --stream-leading: 1.55;
 }
 
 .m-shell {
@@ -165,6 +168,37 @@
 .m-tab[aria-current='page'] {
   color: var(--text);
   font-weight: 620;
+}
+
+/*
+ * A label stays inside its own tab. Where even the bar's two-row form leaves a tab too narrow for
+ * it, it ends in an ellipsis rather than run into the next tab; its whole name stays for a screen
+ * reader.
+ */
+.m-tab-label {
+  max-inline-size: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/*
+ * With text too large for every label to sit in a quarter of the bar, the tabs take two rows of
+ * two, in the same order, each glyph beside its label as on a short landscape screen and with less
+ * space above and below: every label is whole at the person's own text size.
+ */
+.m-tabbar[data-crowded] {
+  grid-auto-flow: row;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.m-tabbar[data-crowded] .m-tab {
+  grid-auto-flow: column;
+  grid-template-columns: auto minmax(0, max-content);
+  justify-content: center;
+  align-items: center;
+  gap: var(--gap-2);
+  padding-block: var(--gap-1);
 }
 
 .m-tab:focus-visible {
@@ -405,6 +439,16 @@
   grid-template-rows: auto minmax(var(--terminal-floor), 1fr) auto;
 }
 
+/*
+ * The conversation never has less than three lines at its type's own size, whatever the composer
+ * holds. The composer takes what it needs of the rest and the conversation all that is left, which
+ * it scrolls within. Where the screen cannot hold both, the page scrolls rather than cut either.
+ */
+.m-session[data-pane='semantic'] {
+  --stream-floor: calc(3 * var(--stream-size) * var(--stream-leading));
+  grid-template-rows: auto minmax(var(--stream-floor), 1fr) auto;
+}
+
 /* The terminal fills its pane, under the words of a view that has ended. */
 .m-session[data-pane='terminal'] > .m-pane {
   display: flex;
@@ -421,8 +465,8 @@
 .m-node {
   padding-block: var(--gap-2);
   border-block-end: 1px solid var(--line);
-  font-size: 0.9375rem;
-  line-height: 1.55;
+  font-size: var(--stream-size);
+  line-height: var(--stream-leading);
 }
 
 .m-node:last-child {
@@ -533,14 +577,45 @@
 
 /*
  * Under the terminal the composer scrolls when it holds more than the room it has, and it scrolls
- * from its bottom: the field and the terminal keys stay in view above the keyboard, and the bar
- * above them is what goes out of view first. Its room is never less than the field's line: one line
- * of the field's type inside its padding and border, and the platform's target at least, as the
- * field is. The padding that lifts it over a keyboard is added to that room.
+ * from its bottom: the field's line stays in view above the keyboard, with the reason sending is
+ * held back and then the terminal keys above it, and the bar above them is what goes out of view
+ * first. Its room is never less than the field's line: one line of the field's type inside its
+ * padding and border, and the platform's target at least, as the field is. The padding that lifts
+ * it over a keyboard is added to that room. It comes to rest with the line at its bottom edge, so a
+ * change above it that takes some of its room, text growing or a banner arriving, leaves the line
+ * in view: an engine that keeps the top of what it shows would otherwise cut the line.
  */
 .m-session[data-pane='terminal'] > .m-composer {
   display: flex;
   flex-direction: column-reverse;
+  overflow-y: auto;
+  overscroll-behavior-y: contain;
+  scroll-snap-type: y proximity;
+  box-sizing: content-box;
+  min-block-size: max(
+    var(--target),
+    calc(var(--field-size) * var(--field-leading) + 2 * var(--gap-2) + 2px)
+  );
+}
+
+/*
+ * Under the terminal, what does not fit beside the field and Send on their line, the state of the
+ * last thing sent, goes on a row above them rather than under them, so the field and Send keep the
+ * composer's bottom.
+ */
+.m-session[data-pane='terminal'] .m-composer-line {
+  flex-wrap: wrap-reverse;
+  scroll-snap-align: end;
+}
+
+/*
+ * On a session too short for the whole composer under the conversation's three lines, the
+ * composer is its line, with the reason sending is held back and the pickers under it. It scrolls
+ * when it holds more than the room it has, from its top, so the line stays in view and what is under
+ * it goes out of view first. As under the terminal, its room is never less than the line, with the
+ * lift over a keyboard added, and the field is one line of its type.
+ */
+.m-session[data-pane='semantic'][data-composer='line'] > .m-composer {
   overflow-y: auto;
   overscroll-behavior-y: contain;
   box-sizing: content-box;
@@ -550,7 +625,16 @@
   );
 }
 
-/* While the terminal shows, the field is one line with Send beside it. */
+.m-session[data-pane='semantic'][data-composer='line'] .m-composer-line textarea {
+  block-size: calc(var(--field-size) * var(--field-leading) + 2 * var(--gap-2) + 2px);
+}
+
+/* The field in the whole composer: laid out as the composer's other rows are. */
+.m-composer-field {
+  display: grid;
+}
+
+/* The composer's line: the field one line with Send beside it. */
 .m-composer-line {
   display: flex;
   flex-wrap: wrap;
@@ -759,7 +843,10 @@
   }
 }
 
-/* A sentence that qualifies what a control will do, under the control it qualifies. */
+/*
+ * A sentence that qualifies what a control will do, next to the control it qualifies: under it, or
+ * above it where the composer keeps its bottom in view.
+ */
 .m-hint {
   margin: var(--gap-2) 0 0;
   font-size: 0.8125rem;

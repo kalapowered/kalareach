@@ -84,6 +84,14 @@ import { minimumTarget, type Surface } from '../platform'
 /** Which of the two views is showing. */
 type Pane = 'semantic' | 'terminal'
 
+/**
+ * The shortest session, in multiples of the root text size, that holds the view switch, the
+ * conversation's three lines and the whole composer under them. At the base text size these take
+ * about 22.4, with a reason of one line; 25 leaves room for a longer one. A shorter session, on a
+ * small screen or with a large text size, gets the composer as its line.
+ */
+const ROOMY_SESSION_REM = 25
+
 /** One node as the phone holds it. */
 interface ReadNode {
   readonly id: string
@@ -146,6 +154,8 @@ export function MobileSession({
   const modeButtonId = useId()
   // Whether a software keyboard hides part of the session.
   const [keyboardUp, setKeyboardUp] = useState(false)
+  // Whether the session is too short for the conversation's floor under the whole composer.
+  const [short, setShort] = useState(false)
   const sessionRef = useRef<HTMLDivElement | null>(null)
   // What the person picked, held here until there is a command that carries bytes to a host. It
   // is shown rather than dropped, because a file that vanishes after a success message is worse
@@ -281,16 +291,21 @@ export function MobileSession({
   // the session there is already the shell's padding and its tab bar, which keeps clear of the
   // home indicator, and a keyboard covers those first: the composer is lifted by what it covers
   // beyond them and no more, and while it covers any of the session the terminal's bar yields to
-  // the terminal, its keys and the field.
+  // the terminal, its keys and the field. The session's own height, in multiples of the root text
+  // size, decides whether the whole composer fits under the conversation; a session not laid out,
+  // with no height at all, is taken to be roomy.
   useLayoutEffect(() => {
     const element = sessionRef.current
     if (element === null) return
     const root = document.documentElement
     const cover = () => {
       const under = Math.max(0, window.innerHeight - element.getBoundingClientRect().bottom)
-      const covered = parseFloat(getComputedStyle(root).getPropertyValue('--keyboard')) || 0
+      const style = getComputedStyle(root)
+      const covered = parseFloat(style.getPropertyValue('--keyboard')) || 0
       element.style.setProperty('--under-session', `${under}px`)
       setKeyboardUp(covered > under)
+      const rem = parseFloat(style.fontSize)
+      setShort(element.clientHeight > 0 && rem > 0 && element.clientHeight < ROOMY_SESSION_REM * rem)
     }
     cover()
     const resized = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(cover)
@@ -415,9 +430,17 @@ export function MobileSession({
     waiting.length > 0
       ? `${waiting.length === 1 ? 'One action has' : `${waiting.length} actions have`} no confirmed outcome yet. Sending again could run it twice.`
       : notSubmittableBecause(draft)
-  // While the terminal shows, a draft that is only empty needs no words: Send stands disabled on
-  // the field's own line, and attachments are added in the conversation. Every other reason stays.
-  const hint = pane === 'terminal' && waiting.length === 0 && draft.state === 'bound' ? null : blocked
+  // The composer is its line, the field with Send beside it, while the terminal shows and on a
+  // session too short for the whole composer under the conversation's floor.
+  const asLine = pane === 'terminal' || short
+  // While the composer is its line, a draft that is only empty needs no words: Send stands disabled
+  // beside the field. Every other reason stays.
+  const hint = asLine && waiting.length === 0 && draft.state === 'bound' ? null : blocked
+  const reason = hint ? (
+    <p className="m-hint" id={`composer-why-${sessionId}`}>
+      {hint}
+    </p>
+  ) : null
   const terminalWarnings = frame === null ? [] : warningsOf(frame, leftBlankOnPhone(frame))
 
   const field = (
@@ -472,6 +495,7 @@ export function MobileSession({
       ref={sessionRef}
       data-pane={pane}
       data-keyboard={keyboardUp ? '' : undefined}
+      data-composer={asLine ? 'line' : 'whole'}
     >
       <div>
         {lifecycle.banner ? (
@@ -735,25 +759,30 @@ export function MobileSession({
           <label className="visually-hidden" htmlFor={`composer-${sessionId}`}>
             Message this session
           </label>
-          {pane === 'terminal' ? (
-            // While the terminal shows, the field is one line with Send beside it, as in a
-            // message thread: the rows it would take are the terminal's.
-            <div className="m-composer-line">
-              {field}
-              {sendButton}
-              {lastState}
-            </div>
-          ) : (
-            field
-          )}
-          {hint ? (
-            <p className="m-hint" id={`composer-why-${sessionId}`}>
-              {hint}
-            </p>
-          ) : null}
+          {/*
+           * Under the terminal the composer keeps its bottom in view, so the reason sits above the
+           * field's line: however long it runs, the line keeps the composer's floor.
+           */}
+          {pane === 'terminal' ? reason : null}
+          {/*
+           * The field keeps its place in every form the composer takes, so a change of form never
+           * takes it away from under the person typing in it. As the composer's line it is one line
+           * with Send beside it, as in a message thread: the rows it would take are the terminal's
+           * or the conversation's.
+           */}
+          <div className={asLine ? 'm-composer-line' : 'm-composer-field'}>
+            {field}
+            {asLine ? (
+              <>
+                {sendButton}
+                {lastState}
+              </>
+            ) : null}
+          </div>
 
           {pane === 'semantic' ? (
             <>
+              {reason}
               <AttachmentPicker
                 surface={surface}
                 onPicked={(files) => {
@@ -768,10 +797,12 @@ export function MobileSession({
                 }}
               />
 
-              <div className="m-composer-actions">
-                {sendButton}
-                {lastState}
-              </div>
+              {asLine ? null : (
+                <div className="m-composer-actions">
+                  {sendButton}
+                  {lastState}
+                </div>
+              )}
             </>
           ) : null}
         </div>

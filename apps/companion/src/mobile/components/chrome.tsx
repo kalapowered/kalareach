@@ -7,7 +7,7 @@
  * doing.
  */
 
-import type { ReactNode } from 'react'
+import { useLayoutEffect, useRef, useState, type ReactNode } from 'react'
 
 import { minimumTarget, showsBackControl, type Surface } from '../platform'
 
@@ -33,8 +33,41 @@ export function TabBar({
   readonly surface: Surface
 }): ReactNode {
   const target = minimumTarget(surface)
+  const bar = useRef<HTMLElement | null>(null)
+  // Whether a label is wider than its share of one row, as the text it is set in measures it. Each
+  // label is one word, so its width is the same whatever form the bar takes, and the bar's form
+  // never changes what decides it.
+  const [crowded, setCrowded] = useState(false)
+  useLayoutEffect(() => {
+    const element = bar.current
+    if (element === null) return
+    const measure = () => {
+      const tabs = Array.from(element.querySelectorAll<HTMLElement>('.m-tab'))
+      const style = getComputedStyle(element)
+      const share =
+        (element.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight)) /
+        Math.max(1, tabs.length)
+      setCrowded(
+        tabs.some((tab) => {
+          const label = tab.querySelector<HTMLElement>('.m-tab-label')
+          if (label === null || label.scrollWidth === 0) return false
+          const inside = getComputedStyle(tab)
+          return label.scrollWidth + parseFloat(inside.paddingLeft) + parseFloat(inside.paddingRight) > share + 0.5
+        })
+      )
+    }
+    measure()
+    if (typeof ResizeObserver === 'undefined') return
+    // The bar changes size with the screen and with the text, and each label with the text.
+    const observer = new ResizeObserver(measure)
+    observer.observe(element)
+    for (const label of element.querySelectorAll('.m-tab-label')) observer.observe(label)
+    return () => {
+      observer.disconnect()
+    }
+  }, [destinations])
   return (
-    <nav className="m-tabbar" aria-label="Sections">
+    <nav className="m-tabbar" aria-label="Sections" ref={bar} data-crowded={crowded ? '' : undefined}>
       {destinations.map((destination) => (
         <button
           key={destination.id}
@@ -52,7 +85,7 @@ export function TabBar({
               <span className="m-tab-badge">{destination.badge > 99 ? '99+' : destination.badge}</span>
             ) : null}
           </span>
-          <span>{destination.label}</span>
+          <span className="m-tab-label">{destination.label}</span>
           {destination.badge && destination.badge > 0 ? (
             <span className="visually-hidden">{`, ${destination.badge} waiting for you`}</span>
           ) : null}

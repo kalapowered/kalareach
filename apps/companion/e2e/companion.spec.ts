@@ -11,12 +11,25 @@
 
 import { expect, test, type Locator, type Page } from '@playwright/test'
 
+import { RECORD_VERSION, SUBMISSIONS_KEY } from '../src/mobile/model/store'
+import type { Submission } from '../src/model/receipts'
 
 import { PRESENTATION_DEADLINE } from './bounds'
 
 /** Where a screenshot for the evidence goes. */
 function shot(name: string): string {
   return `/tmp/kr-companion-${name}.png`
+}
+
+/**
+ * Takes a screenshot for this browser once every transition on the page has finished or been
+ * cancelled, so none is caught halfway. Each engine keeps its own.
+ */
+async function still(page: Page, name: string): Promise<void> {
+  await page.evaluate(() =>
+    Promise.all(document.getAnimations().map((animation) => animation.finished.catch(() => undefined)))
+  )
+  await page.screenshot({ path: shot(`${name}-${test.info().project.name}`) })
 }
 
 async function open(page: Page, hash = ''): Promise<void> {
@@ -50,6 +63,79 @@ async function programInputs(page: Page) {
       (input) => input.kind === 'wheel' || input.kind === 'keys'
     )
   )
+}
+
+/**
+ * Opens the phone with an action on `sessionId` whose outcome nobody has confirmed, as the device
+ * keeps one across a restart. Until a receipt settles it, that session sends nothing more.
+ */
+async function withUnconfirmedAction(page: Page, sessionId: string): Promise<void> {
+  const unconfirmed: Submission = {
+    localId: `local:${sessionId}:1`,
+    actionId: null,
+    label: 'cargo test',
+    text: 'cargo test',
+    state: 'unknown',
+    createdAtMs: 1,
+    error: null
+  }
+  await page.addInitScript(
+    ({ key, record }) => {
+      localStorage.setItem(key, JSON.stringify(record))
+    },
+    { key: SUBMISSIONS_KEY, record: { version: RECORD_VERSION, value: [unconfirmed] } }
+  )
+}
+
+/**
+ * How far `locator`'s element runs outside what a person sees of it: outside the screen, or
+ * outside any box around it that clips what it holds. Zero when it is whole in view.
+ */
+async function hiddenPart(locator: Locator): Promise<number> {
+  return locator.evaluate((element) => {
+    const box = element.getBoundingClientRect()
+    let top = 0
+    let bottom = window.innerHeight
+    for (let around = element.parentElement; around !== null; around = around.parentElement) {
+      const style = getComputedStyle(around)
+      if (style.overflowY === 'visible' && style.overflowX === 'visible') continue
+      const clip = around.getBoundingClientRect()
+      top = Math.max(top, clip.top)
+      bottom = Math.min(bottom, clip.bottom)
+    }
+    return Math.max(0, top - box.top) + Math.max(0, box.bottom - bottom)
+  })
+}
+
+/**
+ * How far the focus ring around `locator`'s element runs outside what a person sees of it, on its
+ * most hidden side: outside the screen, or outside any box around it that clips what it holds.
+ * Zero when the whole ring is in view, and endless when the element draws no ring at all.
+ */
+async function ringHidden(locator: Locator): Promise<number> {
+  return locator.evaluate((element) => {
+    const style = getComputedStyle(element)
+    if (style.outlineStyle === 'none' || !(parseFloat(style.outlineWidth) > 0)) return Infinity
+    const ring = Math.max(0, parseFloat(style.outlineWidth) + parseFloat(style.outlineOffset))
+    const box = element.getBoundingClientRect()
+    const seen = { top: 0, right: window.innerWidth, bottom: window.innerHeight, left: 0 }
+    for (let around = element.parentElement; around !== null; around = around.parentElement) {
+      const clipping = getComputedStyle(around)
+      if (clipping.overflowY === 'visible' && clipping.overflowX === 'visible') continue
+      const clip = around.getBoundingClientRect()
+      seen.top = Math.max(seen.top, clip.top)
+      seen.right = Math.min(seen.right, clip.right)
+      seen.bottom = Math.min(seen.bottom, clip.bottom)
+      seen.left = Math.max(seen.left, clip.left)
+    }
+    return Math.max(
+      0,
+      seen.top - (box.top - ring),
+      box.right + ring - seen.right,
+      box.bottom + ring - seen.bottom,
+      seen.left - (box.left - ring)
+    )
+  })
 }
 
 test.describe('the attention inbox', () => {
@@ -944,27 +1030,11 @@ test.describe("the phone's room for its terminal", () => {
     { width: 390, height: 844, keyboard: 336, rows: 14, typing: 10 }
   ] as const
 
-  /** Where a screenshot for this browser goes, so each engine keeps its own. */
-  const shotFor = (name: string): string => shot(`${name}-${test.info().project.name}`)
-
   /** Opens the harness in one colour mode, whatever the system's. */
   async function inTheme(page: Page, theme: 'light' | 'dark'): Promise<void> {
     await page.addInitScript((mode) => {
       localStorage.setItem('kalareach-theme', mode)
     }, theme)
-  }
-
-  /**
-   * Takes a screenshot once every transition on the page has finished or been cancelled, so none is
-   * caught halfway.
-   */
-  async function still(page: Page, name: string): Promise<void> {
-    await page.evaluate(() =>
-      Promise.all(
-        document.getAnimations().map((animation) => animation.finished.catch(() => undefined))
-      )
-    )
-    await page.screenshot({ path: shotFor(name) })
   }
 
   /** Covers the bottom `inset` pixels of the screen, as a software keyboard does. */
@@ -1006,57 +1076,6 @@ test.describe("the phone's room for its terminal", () => {
         (surface.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight)) / cell
       )
       return { shown: { columns, rows }, told: window.krTestHost?.terminalViews.at(-1)?.grids ?? [] }
-    })
-  }
-
-  /**
-   * How far `locator`'s element runs outside what a person sees of it: outside the screen, or
-   * outside any box around it that clips what it holds. Zero when it is whole in view.
-   */
-  async function hiddenPart(locator: Locator): Promise<number> {
-    return locator.evaluate((element) => {
-      const box = element.getBoundingClientRect()
-      let top = 0
-      let bottom = window.innerHeight
-      for (let around = element.parentElement; around !== null; around = around.parentElement) {
-        const style = getComputedStyle(around)
-        if (style.overflowY === 'visible' && style.overflowX === 'visible') continue
-        const clip = around.getBoundingClientRect()
-        top = Math.max(top, clip.top)
-        bottom = Math.min(bottom, clip.bottom)
-      }
-      return Math.max(0, top - box.top) + Math.max(0, box.bottom - bottom)
-    })
-  }
-
-  /**
-   * How far the focus ring around `locator`'s element runs outside what a person sees of it, on its
-   * most hidden side: outside the screen, or outside any box around it that clips what it holds.
-   * Zero when the whole ring is in view, and endless when the element draws no ring at all.
-   */
-  async function ringHidden(locator: Locator): Promise<number> {
-    return locator.evaluate((element) => {
-      const style = getComputedStyle(element)
-      if (style.outlineStyle === 'none' || !(parseFloat(style.outlineWidth) > 0)) return Infinity
-      const ring = Math.max(0, parseFloat(style.outlineWidth) + parseFloat(style.outlineOffset))
-      const box = element.getBoundingClientRect()
-      const seen = { top: 0, right: window.innerWidth, bottom: window.innerHeight, left: 0 }
-      for (let around = element.parentElement; around !== null; around = around.parentElement) {
-        const clipping = getComputedStyle(around)
-        if (clipping.overflowY === 'visible' && clipping.overflowX === 'visible') continue
-        const clip = around.getBoundingClientRect()
-        seen.top = Math.max(seen.top, clip.top)
-        seen.right = Math.min(seen.right, clip.right)
-        seen.bottom = Math.min(seen.bottom, clip.bottom)
-        seen.left = Math.max(seen.left, clip.left)
-      }
-      return Math.max(
-        0,
-        seen.top - (box.top - ring),
-        box.right + ring - seen.right,
-        box.bottom + ring - seen.bottom,
-        seen.left - (box.left - ring)
-      )
     })
   }
 
@@ -1203,6 +1222,51 @@ test.describe("the phone's room for its terminal", () => {
     }
   }
 
+  // While an action has no confirmed outcome, sending is held back and a sentence says why. The
+  // sentence sits above the field's line, so however long it runs the line keeps the composer's
+  // floor: once the page is scrolled to the composer, the field and Send are whole in view, with the
+  // sentence and the terminal's four rows above them.
+  for (const surface of ['ios', 'android'] as const) {
+    for (const [phone, scale] of [
+      [PHONES[0], '200%'],
+      [PHONES[1], '100%']
+    ] as const) {
+      test(`keeps the field whole under the reason sending is held back on ${surface} at ${phone.width}×${phone.height} with text at ${scale}`, async ({
+        page
+      }) => {
+        await withUnconfirmedAction(page, SESSION_MAIN)
+        await page.setViewportSize({ width: phone.width, height: phone.height })
+        await page.goto(`/harness.html?surface=${surface}&session=${SESSION_MAIN}`)
+        await page.evaluate((size) => {
+          document.documentElement.style.fontSize = size
+        }, scale)
+        await page.getByRole('tab', { name: 'Terminal' }).click()
+        await expect(page.getByTestId('mobile-terminal-line').first()).toContainText('$ cargo')
+        const field = page.getByLabel('Message this session')
+        const send = page.getByRole('button', { name: 'Send' })
+        const reason = page.locator('.m-composer .m-hint', { hasText: 'no confirmed outcome yet' })
+        await expect(send).toBeDisabled()
+        await expect(field).toHaveAttribute('aria-describedby', (await reason.getAttribute('id')) ?? 'no reason')
+        // Down to the composer, as a person scrolls: the composer's own scroll stays where it starts.
+        await page.locator('.m-main').evaluate((main) => {
+          main.scrollTop = main.scrollHeight
+        })
+        expect(await hiddenPart(field), 'the field is whole in view').toBeLessThanOrEqual(1)
+        expect(await hiddenPart(send), 'Send is whole in view').toBeLessThanOrEqual(1)
+        const reasonBox = await reason.boundingBox()
+        const fieldBox = await field.boundingBox()
+        expect(
+          (reasonBox?.y ?? Infinity) + (reasonBox?.height ?? 0),
+          'the reason ends above the field'
+        ).toBeLessThanOrEqual((fieldBox?.y ?? -Infinity) + 0.5)
+        await field.focus()
+        expect(await ringHidden(field), 'the focus ring is whole in view').toBeLessThanOrEqual(1)
+        await expectRoom(page, FLOOR, `sending held back, text at ${scale}`)
+        await still(page, `blocked-13.19-${surface}-${phone.width}x${phone.height}-${scale.replace('%', '')}`)
+      })
+    }
+  }
+
   for (const theme of ['light', 'dark'] as const) {
     for (const phone of PHONES) {
       test(`the terminal and its bar at ${phone.width}×${phone.height}, ${theme}`, async ({ page }) => {
@@ -1225,6 +1289,154 @@ test.describe("the phone's room for its terminal", () => {
         await keyboard(page, phone.keyboard)
         await expectRoom(page, phone.typing, 'the keyboard up')
         await still(page, `terminal-room-13.19-phone-${size}-keyboard-${theme}`)
+      })
+    }
+  }
+})
+
+/** A phone's screen and a person's own text size. */
+interface Seen {
+  readonly width: number
+  readonly height: number
+  readonly scale: string
+}
+
+/** Opens the phone's harness on `surface` at `seen`, at `address`'s place. */
+async function onPhone(page: Page, surface: 'ios' | 'android', seen: Seen, address = ''): Promise<void> {
+  await page.setViewportSize({ width: seen.width, height: seen.height })
+  await page.goto(`/harness.html?surface=${surface}${address}`)
+  await page.evaluate((size) => {
+    document.documentElement.style.fontSize = size
+  }, seen.scale)
+}
+
+// KR-REQ-13.19: the tab bar names each destination whole at a person's own text size. With text too
+// large for four labels side by side, the tabs take two rows of two, and no label runs into another
+// or out of its own tab. Each tab stays the platform's target, and the tabs read in their order.
+test.describe("the phone's tab bar", () => {
+  const SIZES: readonly Seen[] = [
+    { width: 320, height: 720, scale: '200%' },
+    { width: 320, height: 720, scale: '150%' },
+    { width: 390, height: 844, scale: '200%' },
+    { width: 390, height: 844, scale: '100%' }
+  ]
+
+  for (const surface of ['ios', 'android'] as const) {
+    for (const seen of SIZES) {
+      test(`names every destination whole and none over another on ${surface} at ${seen.width}×${seen.height} with text at ${seen.scale}`, async ({
+        page
+      }) => {
+        await onPhone(page, surface, seen)
+        const tabs = page.getByRole('navigation', { name: 'Sections' }).getByRole('button')
+        await expect(tabs).toHaveCount(4)
+        const placed = await tabs.evaluateAll((buttons) =>
+          buttons.map((button) => {
+            const label = Array.from(button.children).find(
+              (child): child is HTMLElement =>
+                child instanceof HTMLElement && !child.matches('.m-tab-glyph, .visually-hidden')
+            )
+            const tab = button.getBoundingClientRect()
+            const text = label?.getBoundingClientRect()
+            return {
+              name: label?.textContent ?? '',
+              tab: { left: tab.left, right: tab.right, top: tab.top, bottom: tab.bottom },
+              label: {
+                left: text?.left ?? 0,
+                right: text?.right ?? 0,
+                top: text?.top ?? 0,
+                bottom: text?.bottom ?? 0
+              },
+              cut: label === undefined ? Infinity : label.scrollWidth - label.clientWidth
+            }
+          })
+        )
+        const target = surface === 'ios' ? 44 : 48
+        for (const [index, each] of placed.entries()) {
+          expect.soft(each.cut, `${each.name} is whole`).toBeLessThanOrEqual(1)
+          expect.soft(each.label.left, `${each.name} starts inside its tab`).toBeGreaterThanOrEqual(each.tab.left - 0.5)
+          expect.soft(each.label.right, `${each.name} ends inside its tab`).toBeLessThanOrEqual(each.tab.right + 0.5)
+          expect.soft(each.tab.right - each.tab.left, `${each.name}'s width`).toBeGreaterThanOrEqual(target - 0.5)
+          expect.soft(each.tab.bottom - each.tab.top, `${each.name}'s height`).toBeGreaterThanOrEqual(target - 0.5)
+          expect.soft(each.tab.bottom, `${each.name} is on the screen`).toBeLessThanOrEqual(seen.height + 0.5)
+          for (const other of placed.slice(index + 1)) {
+            const apart =
+              each.label.right <= other.label.left + 0.5 ||
+              other.label.right <= each.label.left + 0.5 ||
+              each.label.bottom <= other.label.top + 0.5 ||
+              other.label.bottom <= each.label.top + 0.5
+            expect.soft(apart, `${each.name} and ${other.name} do not overlap`).toBe(true)
+          }
+          // Each tab follows the one before it: to its right on its row, or on a row below.
+          const before = placed[index - 1]
+          if (before !== undefined) {
+            const sameRow = each.tab.top < before.tab.bottom - 0.5 && before.tab.top < each.tab.bottom - 0.5
+            expect
+              .soft(sameRow ? each.tab.left >= before.tab.right - 0.5 : each.tab.top >= before.tab.bottom - 0.5, `${each.name} follows ${before.name}`)
+              .toBe(true)
+          }
+        }
+        await still(page, `tabs-13.19-${surface}-${seen.width}x${seen.height}-${seen.scale.replace('%', '')}`)
+      })
+    }
+  }
+})
+
+// KR-REQ-13.19: the conversation keeps a height it scrolls within at a person's own text size: at
+// least three lines of its own type, whatever the composer under it holds. The last of it can be
+// scrolled to, and the field and Send are whole on the screen as it opens, without scrolling the
+// page.
+test.describe("the phone's conversation", () => {
+  const SESSION_MAIN = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
+
+  /** The lines of its own type the conversation keeps at the least. */
+  const FLOOR = 3
+
+  const SIZES: readonly Seen[] = [
+    { width: 320, height: 720, scale: '200%' },
+    { width: 320, height: 720, scale: '150%' },
+    { width: 390, height: 844, scale: '100%' }
+  ]
+
+  for (const surface of ['ios', 'android'] as const) {
+    for (const seen of SIZES) {
+      test(`keeps a height it scrolls within and the composer on screen on ${surface} at ${seen.width}×${seen.height} with text at ${seen.scale}`, async ({
+        page
+      }) => {
+        await onPhone(page, surface, seen, `&session=${SESSION_MAIN}`)
+        const stream = page.getByTestId('mobile-conversation')
+        await expect(stream.locator('.m-node')).toHaveCount(6)
+        const pane = page.locator('.m-pane')
+        const room = await pane.evaluate((element) => {
+          const text = element.querySelector<HTMLElement>('.m-node p:last-child')
+          return {
+            height: element.getBoundingClientRect().height,
+            line: text === null ? Infinity : parseFloat(getComputedStyle(text).lineHeight)
+          }
+        })
+        expect(room.height, 'the conversation keeps its lines').toBeGreaterThanOrEqual(FLOOR * room.line - 0.5)
+        // The last thing said can be scrolled to: with the conversation at its end, the end of the
+        // last node is in view.
+        const end = await pane.evaluate((element) => {
+          element.scrollTop = element.scrollHeight
+          const last = Array.from(element.querySelectorAll<HTMLElement>('.m-node')).at(-1)
+          if (last === undefined) return null
+          let top = 0
+          let bottom = window.innerHeight
+          for (let around = last.parentElement; around !== null; around = around.parentElement) {
+            const style = getComputedStyle(around)
+            if (style.overflowY === 'visible' && style.overflowX === 'visible') continue
+            const clip = around.getBoundingClientRect()
+            top = Math.max(top, clip.top)
+            bottom = Math.min(bottom, clip.bottom)
+          }
+          const box = last.getBoundingClientRect()
+          return { endShown: box.bottom <= bottom + 1 && box.bottom > top, shown: Math.min(box.bottom, bottom) - Math.max(box.top, top) }
+        })
+        expect(end?.endShown, 'the end of the last node is in view').toBe(true)
+        expect(end?.shown ?? 0, 'some of the last node is in view').toBeGreaterThan(0)
+        expect(await hiddenPart(page.getByLabel('Message this session')), 'the field is whole in view').toBeLessThanOrEqual(1)
+        expect(await hiddenPart(page.getByRole('button', { name: 'Send' })), 'Send is whole in view').toBeLessThanOrEqual(1)
+        await still(page, `conversation-13.19-${surface}-${seen.width}x${seen.height}-${seen.scale.replace('%', '')}`)
       })
     }
   }
