@@ -56,10 +56,6 @@ pub const NAMED_COMMANDS: &[(&str, Option<Method>)] = &[
     ("terminal_view_move", None),
     ("terminal_view_input", None),
     ("terminal_view_close", None),
-    // Input.
-    ("input_acquire", Some(Method::InputAcquire)),
-    ("input_release", Some(Method::InputRelease)),
-    ("input_interrupt", Some(Method::InputInterrupt)),
     // The launch surface.
     ("shell_launch", Some(Method::ShellLaunch)),
     // Drafts and attachments.
@@ -195,9 +191,6 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static
         terminal_view_move,
         terminal_view_input,
         terminal_view_close,
-        input_acquire,
-        input_release,
-        input_interrupt,
         shell_launch,
         draft_create,
         draft_update,
@@ -413,18 +406,6 @@ mutate_command!(
 mutate_command!(
     /// Closes a session, after the interface has shown what closing does.
     session_close, Method::SessionClose, kr_protocol::session::SessionCloseParams
-);
-mutate_command!(
-    /// Takes the input lease.
-    input_acquire, Method::InputAcquire, kr_protocol::input::InputAcquireParams
-);
-mutate_command!(
-    /// Releases the input lease.
-    input_release, Method::InputRelease, kr_protocol::input::InputReleaseParams
-);
-mutate_command!(
-    /// Interrupts the foreground application.
-    input_interrupt, Method::InputInterrupt, kr_protocol::input::InputInterruptParams
 );
 mutate_command!(
     /// Launches an installed profile or a named command at a verified empty prompt.
@@ -1555,7 +1536,8 @@ mod tests {
             BTreeSet::from(["pairing_start_read"])
         );
         // A terminal view's calls are the view's own, on its own link: no page method attaches,
-        // subscribes, reports a window, resizes, configures, writes input or detaches.
+        // subscribes, reports a window, resizes, configures, takes or gives back the input lease,
+        // writes input, interrupts under the lease or detaches.
         for method in [
             Method::SessionAttach,
             Method::SessionDetach,
@@ -1564,7 +1546,10 @@ mod tests {
             Method::TerminalResize,
             Method::EventsSubscribe,
             Method::EventsSnapshot,
+            Method::InputAcquire,
+            Method::InputRelease,
             Method::InputWrite,
+            Method::InputInterrupt,
         ] {
             assert!(!page.contains(&method), "{method} is a page method");
         }
@@ -1669,9 +1654,6 @@ mod tests {
             session_read,
             session_create,
             session_close,
-            input_acquire,
-            input_release,
-            input_interrupt,
             shell_launch,
             draft_create,
             draft_update,
