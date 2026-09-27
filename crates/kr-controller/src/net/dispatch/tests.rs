@@ -42,15 +42,15 @@ fn attach(claim_geometry: bool, requested: &[AttachmentCapability]) -> MutationR
 #[test]
 fn a_requested_capability_is_not_a_geometry_claim() {
     assert!(
-        super::claims_geometry(&attach(true, &[])),
+        super::decision::claims_geometry(&attach(true, &[])),
         "the flag that registers a claim is a claim"
     );
     assert!(
-        !super::claims_geometry(&attach(false, &[AttachmentCapability::Geometry])),
+        !super::decision::claims_geometry(&attach(false, &[AttachmentCapability::Geometry])),
         "asking for the capability is a request the host intersects, not a claim"
     );
     assert!(
-        !super::claims_geometry(&attach(
+        !super::decision::claims_geometry(&attach(
             false,
             &[
                 AttachmentCapability::ObserveTerminal,
@@ -547,7 +547,7 @@ async fn every_read_the_method_table_admits_for_a_device_is_served_or_refused_by
         let entry = method.entry();
         let request = entry.effect == EffectClass::Read || *method == Method::InputWrite;
         let admitted = request && entry.ingress.contains(&ActorIngress::PairedDevice);
-        if super::DeviceRead::of(*method).is_some() != admitted {
+        if super::routes::DeviceRead::of(*method).is_some() != admitted {
             undecided.push((entry.name, admitted));
         }
     }

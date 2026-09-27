@@ -9,7 +9,7 @@ use kr_protocol::scalars::{DurationMs, Nullable};
 use kr_protocol::method::Method;
 use kr_protocol::rights::ActionRight;
 
-use super::{Authorisation, FrameSink, RelayGrant, Relaying, RemoteOutput, Written};
+use super::output::{Authorisation, FrameSink, RelayGrant, Relaying, RemoteOutput, Written};
 use crate::grants::organisation::testing::TestOrganisation;
 use crate::grants::policy::{HeldBound, Stands};
 use crate::service::Controller;
@@ -790,7 +790,7 @@ fn member(
     TestOrganisation,
     kr_protocol::grant::Grant,
     super::RemoteConnection,
-    super::Asked,
+    super::decision::Asked,
 ) {
     let organisation = TestOrganisation::new(byte, now - 60 * 60 * 1000);
     let (grant, _) = super::super::tests::leased_member(controller, &organisation, now);
@@ -812,7 +812,7 @@ fn gate(
     let controller = Arc::clone(controller);
     let under = under.to_vec();
     std::thread::spawn(move || {
-        let _ = answer.send(super::bounds_hold(&controller, &under, judge));
+        let _ = answer.send(super::output::bounds_hold(&controller, &under, judge));
     });
     answered
         .recv_timeout(WAIT_BOUND)
