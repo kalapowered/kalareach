@@ -1091,15 +1091,41 @@ impl<'destination> DownloadWriter<'destination> {
         // name. What publishes is the *name*, so the name has to be shown to still hold the
         // object that was verified before it is published: something that took the temporary name
         // in between would otherwise be what the destination ends up holding.
+        // After an attempt was refused the bytes are read again as well: a file written in place
+        // keeps its identity, and on Windows the publication waits while another program holds a
+        // file it needs, long enough for that.
         let destination = self.destination;
-        let still_verified = || match destination.open_read(&temporary, ObjectPolicy::ReadableFile)
-        {
-            Ok(staged) if staged.identity() == verified => ControlFlow::Continue(()),
-            Ok(_) => ControlFlow::Break(TransferError::integrity(format!(
-                "{} no longer holds the object this download verified",
-                temporary.as_str()
-            ))),
-            Err(error) => ControlFlow::Break(TransferError::from(error)),
+        let placement = &self.placement;
+        let mut attempts = 0_u32;
+        let still_verified = || {
+            attempts += 1;
+            let mut staged = match destination.open_read(&temporary, ObjectPolicy::ReadableFile) {
+                Ok(staged) if staged.identity() == verified => staged,
+                Ok(_) => {
+                    return ControlFlow::Break(TransferError::integrity(format!(
+                        "{} no longer holds the object this download verified",
+                        temporary.as_str()
+                    )));
+                }
+                Err(error) => return ControlFlow::Break(TransferError::from(error)),
+            };
+            if attempts == 1 {
+                return ControlFlow::Continue(());
+            }
+            match digest_of(&mut staged) {
+                Ok((digest, byte_len))
+                    if digest == placement.content_digest
+                        && byte_len == placement.byte_len.get() =>
+                {
+                    ControlFlow::Continue(())
+                }
+                Ok(_) => ControlFlow::Break(TransferError::integrity(format!(
+                    "{} was written again while its publication waited, so this download \
+                     published nothing",
+                    temporary.as_str()
+                ))),
+                Err(error) => ControlFlow::Break(error),
+            }
         };
         if self.placement.allow_overwrite {
             // The user asked for this destination to be replaced. A rename replaces atomically, so
@@ -1124,9 +1150,9 @@ impl<'destination> DownloadWriter<'destination> {
             // The one portable atomic no-replace publish: it fails when the name is taken, so a
             // file that appeared while the download ran is never overwritten, and the check that
             // the temporary name holds what was verified is made again before every attempt. The
-            // handle is closed first, as for a replacement: on Windows the publication renames
-            // the name it holds.
-            self.file = None;
+            // download's own handle stays open through it, as it keeps the object's identity from
+            // being given to another file; on Windows it shares deletion, so the rename is made
+            // with it open.
             match self.destination.publish_into(
                 &temporary,
                 self.destination,
@@ -1166,6 +1192,7 @@ impl<'destination> DownloadWriter<'destination> {
             drop(published);
             // The temporary name goes only once the published one holds the file. On Windows the
             // publication took it already, and its removal finds nothing.
+            self.file = None;
             self.destination.remove(&temporary)?;
         }
         // The name now has to hold the object that was verified. A rename and a publication both

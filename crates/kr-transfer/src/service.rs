@@ -1255,26 +1255,42 @@ impl TransferService {
                 return self.abandon_publication(row, &detail, now);
             }
             // The move checks again before every attempt that the incomplete name still holds the
-            // verified object, since on Windows it waits while another program holds the file:
-            // a name something else took meanwhile is not moved, and the publication is abandoned.
+            // verified object, since on Windows it waits while another program holds the file: a
+            // name something else took meanwhile is not moved. After an attempt was refused the
+            // bytes are read again as well, since a payload rewritten in place keeps its identity
+            // and the move waited long enough for that. Either way the publication is abandoned.
+            let mut attempts = 0_u32;
+            let still_verified = || {
+                attempts += 1;
+                let mut file = match self.holds(self.staging.incomplete(), &incomplete, identity) {
+                    Ok(Some(file)) => file,
+                    Ok(None) => {
+                        return ControlFlow::Break(Ok(
+                            "the incomplete name no longer holds the object that was verified"
+                                .to_owned(),
+                        ));
+                    }
+                    Err(error) => return ControlFlow::Break(Err(error)),
+                };
+                if attempts == 1 {
+                    return ControlFlow::Continue(());
+                }
+                match PayloadIntegrity::of(&mut file, row.declared_byte_len, verified) {
+                    Ok(PayloadIntegrity::Verified) => ControlFlow::Continue(()),
+                    Ok(PayloadIntegrity::Altered(detail)) => ControlFlow::Break(Ok(detail)),
+                    Err(error) => ControlFlow::Break(Err(error)),
+                }
+            };
             match self.staging.incomplete().rename_into(
                 &incomplete,
                 self.staging.complete(),
                 &published,
-                || match self.holds(self.staging.incomplete(), &incomplete, identity) {
-                    Ok(Some(_)) => ControlFlow::Continue(()),
-                    Ok(None) => ControlFlow::Break(None),
-                    Err(error) => ControlFlow::Break(Some(error)),
-                },
+                still_verified,
             )? {
                 ControlFlow::Continue(()) => {}
-                ControlFlow::Break(Some(error)) => return Err(error),
-                ControlFlow::Break(None) => {
-                    return self.abandon_publication(
-                        row,
-                        "the incomplete name no longer holds the object that was verified",
-                        now,
-                    );
+                ControlFlow::Break(Err(error)) => return Err(error),
+                ControlFlow::Break(Ok(reason)) => {
+                    return self.abandon_publication(row, &reason, now);
                 }
             }
             // The name is durable before the record that depends on it. Without this the journal
