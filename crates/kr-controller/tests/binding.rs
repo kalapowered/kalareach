@@ -755,6 +755,9 @@ async fn end(process: &ProcessStartIdentity) {
     }
 }
 
+/// KR-REQ-23.29: `plugin.list` and `plugin.remove` count live bindings from the hosted workers' own
+/// answers.
+///
 /// A worker is a member from its claim, and once it is recorded a round reconciles it: the next
 /// `plugin.list` counts its bindings, none yet, and a removal counts what its refresh found.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
@@ -777,6 +780,9 @@ async fn a_recorded_worker_is_reconciled_and_counted_from_its_answer() {
     );
 }
 
+/// KR-REQ-23.29: after `plugin.disable`, `plugin.list` counts nothing and `plugin.remove` counts
+/// nothing while a hosted worker has not answered at the new admission revision.
+///
 /// A change leaves a worker pending until it answers at the new revision. A refresh whose caller
 /// goes away part way through a round, as a paired device's read does when its connection drops,
 /// leaves that round to finish on its own: once the worker answers again the member is reconciled.
@@ -846,6 +852,8 @@ async fn a_worker_is_pending_after_a_change_until_it_answers_at_the_new_revision
     drop(stopped);
 }
 
+/// KR-REQ-23.29: `plugin.list` counts bindings from the workers whose sessions are live.
+///
 /// A session that closes takes its worker out of the member set: the workers left answer, and the
 /// counts are known again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
@@ -879,6 +887,9 @@ async fn a_closed_session_takes_its_worker_out_of_the_member_set() {
     );
 }
 
+/// KR-REQ-23.29: a worker this host stopped trusting keeps `plugin.list`'s count unknown until its
+/// process has ended.
+///
 /// A second claim that lands after a worker's claim is committed and before its specification is
 /// made fences the member the first claim added: the worker it launched, holding its first
 /// snapshot, is never sent a round and keeps the counts unknown until its process has ended, and
@@ -943,6 +954,9 @@ async fn a_worker_fenced_between_its_claim_and_its_specification_leaves_once_its
     assert!(hosted.pending().await.is_empty());
 }
 
+/// KR-REQ-23.29: the binding count stays unknown across a daemon restart while an untrusted worker
+/// runs.
+///
 /// A daemon that restarts seeds its member set from the registry before it serves anything: a
 /// worker the host stopped trusting is a member again, pending and never sent a round, until its
 /// process has ended.
@@ -977,6 +991,9 @@ async fn a_fenced_worker_is_a_member_again_after_a_restart_until_its_process_end
     assert!(hosted.pending().await.is_empty());
 }
 
+/// KR-REQ-23.29: an installation past the owner's package limit is left out of the admissions new
+/// bindings use, by the limit's name, and the hosted worker answers at the new revision.
+///
 /// A configuration that lowers a package limit below an admitted package moves the admissions with
 /// no catalogue change: the admission revision rises, the package is left out by the limit's name,
 /// and the hosted worker is reconciled again at the new revision.
@@ -1212,6 +1229,9 @@ async fn a_lowered_package_limit_comes_into_force_with_its_revision_in_one_step(
     );
 }
 
+/// KR-REQ-23.29: `plugin.list` counts the binding of a program a worker adopted while it runs, and
+/// none once it has exited.
+///
 /// A worker reconciled with an empty report adopts a program a person started in its session,
 /// with no change to the catalogue: the program is the one the example package recognises, which
 /// has no connector table, so it is adopted by the package's match rule alone and bound. The next
@@ -1274,6 +1294,9 @@ async fn a_program_adopted_with_no_catalogue_change_is_counted_while_it_runs() {
     );
 }
 
+/// KR-REQ-23.29: a `plugin.disable` ends the package's bindings: the host asks again until the worker
+/// reports the binding closed.
+///
 /// A binding due to end closes at the first snapshot after every request it admitted settles, and
 /// only a round brings a snapshot. A worker answers the round of a disabling with its binding
 /// ending while such a request is open; the release is still installed, and the worker is
@@ -1336,6 +1359,8 @@ fn left_out(summary: &wire::PluginSummary) -> (wire::PluginLeftOutReason, String
     }
 }
 
+/// KR-REQ-23.29: `plugin.list` says whether new bindings may use each installation, and why not.
+///
 /// `plugin.list` says whether the admissions in force let new bindings use each installation,
 /// and why not where they do not, by kind and in words that name the package: admitted, then
 /// disabled, then past a package limit the owner set, and, once a file of the store's copy is
@@ -1390,6 +1415,9 @@ async fn plugin_list_says_why_the_admissions_leave_an_installation_out() {
     );
 }
 
+/// KR-REQ-23.29: the environment check: an installation for another platform is left out of what
+/// new bindings on this host may use.
+///
 /// An installation whose own manifest names only another platform is listed as one this host
 /// does not support.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]

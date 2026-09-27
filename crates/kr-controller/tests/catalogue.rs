@@ -2098,6 +2098,8 @@ async fn a_synchronisation_is_held_to_the_configured_transfer_limit() {
     );
 }
 
+/// KR-REQ-23.29: a binding count is shown only at the admission revision it was read at.
+///
 /// Counts the workers gave at one admission revision are shown only while that is the revision
 /// the answer renders: a change committed after the workers answered leaves them unknown.
 #[tokio::test]
