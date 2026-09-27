@@ -210,7 +210,12 @@ fn package(root: &Path) -> ConnectorSource {
 /// A snapshot whose package read stalls holds nothing a replacement of the authority needs: the
 /// replacement completes while the read is stalled, the stalled snapshot then publishes nothing and
 /// is refused, and the replacement's own snapshot applies.
-#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+///
+/// The runtime has one thread, so a read that held it would hold everything the replacement needs
+/// too: the listener, its connection and the timers. The bound on the replacement is therefore
+/// kept by a thread of its own, which lets the reads go on once it has passed and says whether it
+/// had to.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn a_stalled_package_read_holds_no_replacement_and_its_snapshot_publishes_nothing() {
     let host = host().await;
     let root = tempfile::tempdir().expect("a directory");
@@ -231,10 +236,18 @@ async fn a_stalled_package_read_holds_no_replacement_and_its_snapshot_publishes_
         .expect("the snapshot's reads began");
 
     // A newer daemon takes the authority while the read is stalled, without waiting for it.
-    let mut replacement = tokio::time::timeout(REPLACEMENT, daemon(&host, 2))
-        .await
-        .expect("a stalled package read holds nothing the replacement needs");
-    release.send(()).expect("the reads go on");
+    let (replaced, watched) = std::sync::mpsc::channel::<()>();
+    let watchdog = std::thread::spawn(move || {
+        let late = watched.recv_timeout(REPLACEMENT).is_err();
+        release.send(()).expect("the reads go on");
+        late
+    });
+    let mut replacement = daemon(&host, 2).await;
+    let _ = replaced.send(());
+    assert!(
+        !watchdog.join().expect("the watchdog ends"),
+        "a stalled package read holds nothing the replacement needs"
+    );
     let refused = exchange.await.expect("the exchange ends");
     assert!(
         refused.is_err(),

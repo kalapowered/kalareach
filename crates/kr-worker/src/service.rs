@@ -530,7 +530,7 @@ impl WorkerService {
     /// Only the authority connection of the generation this connection proved hands this worker
     /// admissions. A part out of order discards the snapshot it would belong to, and a snapshot
     /// whose connection ends part way is never applied.
-    fn plugin_admissions_part(
+    async fn plugin_admissions_part(
         &self,
         state: &mut ConnectionState,
         part: kr_protocol::admission::PluginAdmissions,
@@ -591,9 +591,18 @@ impl WorkerService {
             return None;
         }
         let parts = std::mem::take(&mut state.admissions_parts);
-        // Read and checked before anything a connection needs is taken: a package slow to read
-        // holds this snapshot alone, never a replacement of the authority.
-        let prepared = self.plugin_admissions.prepare(&parts);
+        // Read and checked before anything a connection needs is taken, and on the blocking pool:
+        // a package slow to read holds this snapshot alone, never a replacement of the authority
+        // and never a thread the runtime serves the other connections, the listener and the timers
+        // with.
+        let admissions = Arc::clone(&self.plugin_admissions);
+        let prepared = match tokio::task::spawn_blocking(move || admissions.prepare(&parts)).await {
+            Ok(prepared) => prepared,
+            // A read that panicked ends this connection, as it did on the connection's own task.
+            Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+            // The runtime is shutting down, and this connection with it.
+            Err(_) => return None,
+        };
         {
             // Published inside the authority's own boundary, and checked again there: a
             // replacement that fences this connection takes the same lock, so it lands wholly
@@ -1623,7 +1632,7 @@ impl WorkerService {
             ControlFrame::AuthorityRevision(notice) => {
                 Some(self.acknowledge_revision(state, &notice))
             }
-            ControlFrame::PluginAdmissions(part) => self.plugin_admissions_part(state, *part),
+            ControlFrame::PluginAdmissions(part) => self.plugin_admissions_part(state, *part).await,
             ControlFrame::Request(request) => {
                 // A source that asked to wait waits here: outside the session lock, outside the
                 // dispatch barrier and outside any transaction. Section 11 makes a long poll an
