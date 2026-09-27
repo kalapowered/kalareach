@@ -64,9 +64,15 @@ impl RemoteConnection {
             return self.output.send(&frame).await;
         };
         for _ in 0..RELAY_DECISIONS {
+            // What the answer shows is the decision's it is written under, as its bounds are.
+            let shown = super::super::close_answer_shown(
+                &frame,
+                asked.entry.method,
+                &asked.decision.decided.permitted.rights,
+            );
             match self
                 .output
-                .write(&frame, &asked.decision.bounds(), None)
+                .write(&shown, &asked.decision.bounds(), None)
                 .await
             {
                 Written::Sent => return true,

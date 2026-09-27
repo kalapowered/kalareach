@@ -980,6 +980,54 @@ async fn keep_the_record(
     }
 }
 
+/// The answer to a device's request of `method` as a decision whose rights are `rights` shows it.
+///
+/// A worker's acceptance of a close carries its description of the session, which is what
+/// `session.read` shows, and `session.read` needs `session.view` over the session a close names.
+/// So the answer to a `session.close`, fresh or retained, goes whole only under a decision that
+/// holds `session.view`; under one that does not, the acceptance goes without the description.
+/// Every other answer goes as it came.
+pub(crate) fn close_answer_shown<'a>(
+    frame: &'a kr_protocol::envelope::ControlFrame,
+    method: kr_protocol::method::Method,
+    rights: &kr_protocol::scalars::CanonicalSet<kr_protocol::rights::ActionRight>,
+) -> std::borrow::Cow<'a, kr_protocol::envelope::ControlFrame> {
+    use kr_protocol::envelope::{ControlFrame, Outcome, Response};
+
+    if method != kr_protocol::method::Method::SessionClose
+        || rights.contains(&kr_protocol::rights::ActionRight::SessionView)
+    {
+        return std::borrow::Cow::Borrowed(frame);
+    }
+    let ControlFrame::Response(Response {
+        request_id,
+        outcome: Outcome::Ok(value),
+    }) = frame
+    else {
+        return std::borrow::Cow::Borrowed(frame);
+    };
+    let Ok(mut answer) = value.to_typed::<kr_protocol::session::SessionCloseResult>() else {
+        return std::borrow::Cow::Borrowed(frame);
+    };
+    if answer.session.take().is_none() {
+        return std::borrow::Cow::Borrowed(frame);
+    }
+    // An answer that could not be written again without the description is not written with it.
+    let outcome = kr_protocol::envelope::ParamsValue::from_typed(&answer).map_or_else(
+        |error| {
+            Outcome::Error(kr_protocol::error::ProtocolError::new(
+                kr_protocol::error::ErrorCode::InvalidArgument,
+                error.to_string(),
+            ))
+        },
+        Outcome::Ok,
+    );
+    std::borrow::Cow::Owned(ControlFrame::Response(Response {
+        request_id: *request_id,
+        outcome,
+    }))
+}
+
 /// What a remote close settled as.
 #[derive(Debug)]
 pub(crate) struct ClosedRemotely {
