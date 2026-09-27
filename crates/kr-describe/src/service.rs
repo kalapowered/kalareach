@@ -833,8 +833,11 @@ impl DescriptionService {
         self.epochs.insert(session_id, session_epoch);
         self.live_sessions.insert(session_id);
         // A session opened afresh starts with a context of its own, and owes nothing to what an
-        // earlier job of the same identifier went through, even one still in the process.
+        // earlier job of the same identifier went through: one still in the process, one waiting
+        // in the queue with the old context, or the retry an earlier failure used up.
         self.outlive_job_of(&session_id);
+        self.scheduler.cancel(&session_id);
+        self.retried.remove(&session_id);
         self.superseded.remove(&session_id);
         self.waiting.remove(&session_id);
         self.no_sessions_since_ms = None;
@@ -871,6 +874,7 @@ impl DescriptionService {
         self.generations.remove(session_id);
         self.live_sessions.remove(session_id);
         self.outlive_job_of(session_id);
+        self.retried.remove(session_id);
         self.superseded.remove(session_id);
         self.waiting.remove(session_id);
         // The fence and the debt go only when the cleanup they describe has actually finished.

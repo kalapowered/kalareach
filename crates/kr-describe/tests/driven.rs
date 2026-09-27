@@ -992,8 +992,23 @@ fn a_caller_cancellation_outlasts_a_pause() {
             session_id: session(1)
         }
     );
-    let mut now = at(40_000);
-    let request = loop {
+    let (now, id, request) = next_job(&mut service, at(40_000));
+    assert!(matches!(
+        service
+            .finished(id, produced(&request.prompt, 0), now.after_ms(500))
+            .expect("the answer"),
+        Outcome::Published { .. }
+    ));
+}
+
+/// Does what the service says, loading when it asks and letting time pass when it waits, until it
+/// sends a job, and returns when, with the job.
+fn next_job(
+    service: &mut DescriptionService,
+    from: Reading,
+) -> (Reading, u64, kr_describe::service::GenerationRequest) {
+    let mut now = from;
+    loop {
         match service.next(&roomy(), now).expect("an instruction") {
             Instruction::Load { id, .. } => {
                 service
@@ -1007,20 +1022,17 @@ fn a_caller_cancellation_outlasts_a_pause() {
                     )
                     .expect("the load");
             }
-            Instruction::Generate { id, request, .. } => break (id, request),
+            Instruction::Generate { id, request, .. } => return (now, id, request),
             Instruction::Unload { .. } | Instruction::Cancel { .. } => {}
             Instruction::Wait { .. } => {
-                assert!(now.monotonic_ms() < 400_000, "the job was not sent again");
+                assert!(
+                    now.monotonic_ms() < from.monotonic_ms() + 400_000,
+                    "no job was sent"
+                );
                 now = now.after_ms(1_000);
             }
         }
-    };
-    assert!(matches!(
-        service
-            .finished(request.0, produced(&request.1.prompt, 0), now.after_ms(500))
-            .expect("the answer"),
-        Outcome::Published { .. }
-    ));
+    }
 }
 
 /// A superseded job whose session closes, or opens again, before its answer arrives leaves no
@@ -1267,6 +1279,114 @@ fn an_outlived_job_neither_publishes_nor_comes_back() {
             "closed {closed}"
         );
         assert_eq!(service.scheduler().queued(), 0, "closed {closed}");
+    }
+}
+
+/// KR-REQ-22.19: a session opened again before its queued job is sent starts afresh. The job built
+/// from its earlier context is dropped rather than sent, so a change that then settles as the same
+/// revision number is described from what the session is now, and nothing of the earlier context is
+/// published. The control is the same queued job with the session left alone, which is sent and
+/// describes its directory.
+#[test]
+fn a_session_opened_again_before_its_job_is_sent_drops_that_job() {
+    for reopened in [true, false] {
+        let mut service = service();
+        queue(&mut service, &session(1), "kalareach", at(0));
+        if reopened {
+            service.session_opened(session(1), SessionEpoch::V1, binding());
+            assert!(
+                matches!(
+                    service.next(&roomy(), at(2_100)).expect("an instruction"),
+                    Instruction::Wait { .. }
+                ),
+                "nothing from the earlier context is sent"
+            );
+            change(&mut service, &session(1), "docs", at(2_200));
+            assert!(
+                service
+                    .settle(&session(1), Priority::Ordinary, at(4_200))
+                    .is_some()
+            );
+            assert_eq!(service.revision(&session(1)), Some(ContextRevision::new(1)));
+        }
+        let (now, id, request) = next_job(&mut service, at(5_000));
+        assert!(matches!(
+            service
+                .finished(id, produced(&request.prompt, 0), now.after_ms(500))
+                .expect("the answer"),
+            Outcome::Published { .. }
+        ));
+        let described = service
+            .store()
+            .generated(&session(1))
+            .expect("a read")
+            .expect("a description");
+        assert_eq!(
+            described.title.as_str(),
+            if reopened { "docs" } else { "kalareach" },
+            "reopened {reopened}"
+        );
+    }
+}
+
+/// KR-REQ-22.21: a session opened again owes nothing to an earlier failure: the retry its old
+/// job was queued for is dropped with that job, and its own first job, when its process fails, is
+/// queued again once like any other. The control is the same failure with the session left alone,
+/// whose retry fails for good.
+#[test]
+fn a_session_opened_again_owes_nothing_to_an_earlier_failure() {
+    for reopened in [true, false] {
+        let mut service = service();
+        queue(&mut service, &session(1), "kalareach", at(0));
+        assert!(matches!(
+            loaded(&mut service, at(3_000)),
+            Instruction::Generate { .. }
+        ));
+        assert_eq!(
+            service
+                .process_ended(ProcessEnd::Exited, at(3_100))
+                .expect("the end")[0],
+            Outcome::Requeued {
+                session_id: session(1)
+            }
+        );
+        if reopened {
+            service.session_opened(session(1), SessionEpoch::new(2), binding());
+            assert_eq!(
+                service.scheduler().queued(),
+                0,
+                "the retry goes with its job"
+            );
+            change(&mut service, &session(1), "docs", at(3_200));
+            assert!(
+                service
+                    .settle(&session(1), Priority::Ordinary, at(5_200))
+                    .is_some()
+            );
+        }
+        let from = if reopened {
+            at(3_000 + Budgets::DEFAULTS.session_cooldown_ms)
+        } else {
+            at(3_100 + RESTART_FIRST_MS)
+        };
+        let (now, _, _) = next_job(&mut service, from);
+        let ended = service
+            .process_ended(ProcessEnd::Exited, now.after_ms(100))
+            .expect("the end");
+        if reopened {
+            assert_eq!(
+                ended[0],
+                Outcome::Requeued {
+                    session_id: session(1)
+                },
+                "the session's own first failure is retried"
+            );
+        } else {
+            assert!(
+                matches!(ended[0], Outcome::Failed { .. }),
+                "the retry fails for good: {ended:?}"
+            );
+        }
     }
 }
 
