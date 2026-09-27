@@ -1052,8 +1052,23 @@ fn keychain_readable_in_a_session(stage: &Stage<'_, '_>, variables: &[(String, S
         variables,
         "a session that reads its default keychain",
     );
-    // The status comes back as 1000 more than itself, so the line that shows it is not the
-    // command's own echo.
+    // What the session names its default keychain and its search list, for the record; then the
+    // status, as 1000 more than itself, so the line that shows it is not the command's own echo.
+    session
+        .window
+        .type_text(b"echo kr-keychain-default-$(/usr/bin/security default-keychain -d user | tr -d ' \"')-end\r");
+    let named = session.window.wait_for_screen(
+        "kr-keychain-default-/",
+        "the session names its default keychain",
+    );
+    let default = named
+        .iter()
+        .find_map(|row| {
+            let at = row.find("kr-keychain-default-/")?;
+            let rest = &row[at + "kr-keychain-default-".len()..];
+            rest.find("-end").map(|end| rest[..end].to_owned())
+        })
+        .unwrap_or_default();
     session.window.type_text(
         b"/usr/bin/security show-keychain-info >/dev/null 2>&1; echo kr-keychain-probe-$(( $? + 1000 ))\r",
     );
@@ -1079,9 +1094,9 @@ fn keychain_readable_in_a_session(stage: &Stage<'_, '_>, variables: &[(String, S
     session.remote.close();
     assert!(
         status == Some(0),
-        "{LOGIN_UNPROVEN} in a session made as the agent's own, `security show-keychain-info` \
-         exits {status:?}, where the agent's own check takes 36 (user interaction not allowed) as \
-         a keychain it cannot read its login from"
+        "{LOGIN_UNPROVEN} in a session made as the agent's own, whose default keychain is \
+         {default}, `security show-keychain-info` exits {status:?}, where the agent's own check \
+         takes 36 (user interaction not allowed) as a keychain it cannot read its login from"
     );
 }
 
