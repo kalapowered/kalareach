@@ -222,6 +222,7 @@ pub const END_TO_END_SUITES: &[(&str, &str)] = &[
     ("kr-controller", "changeset"),
     ("kr-cli", "attach"),
     ("kr-cli", "lifecycle"),
+    ("kr-faults", "kills"),
     ("kr-controller", "network"),
 ];
 
