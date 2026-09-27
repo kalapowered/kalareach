@@ -3014,7 +3014,7 @@ impl WorkerService {
             Method::EventsSnapshot => self.events_snapshot(state, &request.params, caller),
             Method::HistoryPage => self.history_page(state, &request.params, caller),
             Method::EventsSubscribe => self.events_subscribe(state, &request.params, caller),
-            Method::ActionRead => self.action_read(&caller.actor_id, &request.params),
+            Method::ActionRead => self.action_read(state, &caller.actor_id, &request.params),
             Method::InputWrite => self.input_write(state, &request.params, caller),
             Method::QuestionReadOwn => self.question_read_own(state, &request.params),
             Method::QuestionRead => self.question_read(&request.params, caller),
@@ -5264,9 +5264,19 @@ impl WorkerService {
     /// find this caller's own action. An identifier belonging to somebody else simply is not
     /// present, which is what keeps an action identifier from being a way to read another actor's
     /// result.
-    fn action_read(&self, actor_id: &ActorId, params: &ParamsValue) -> Result<ParamsValue> {
+    fn action_read(
+        &self,
+        state: &ConnectionState,
+        actor_id: &ActorId,
+        params: &ParamsValue,
+    ) -> Result<ParamsValue> {
         let params: kr_protocol::receipt::ActionReadParams = parse(params)?;
         let mut session = self.runtime.session();
+        // A worker serves the receipts of the one session it owns. A read that names a session
+        // names this one, as every other state recovery read does.
+        if let Some(named) = params.session_id {
+            Self::check_session(&session, named)?;
+        }
         let journal = session
             .journal_mut()
             .ok_or_else(|| WorkerError::JournalUnavailable {
@@ -5286,10 +5296,22 @@ impl WorkerService {
                     .map_err(|error| WorkerError::InvalidArgument(error.to_string()))
             })
             .transpose()?;
-        encode(&kr_protocol::receipt::ActionReadResult {
+        let answer = kr_protocol::receipt::ActionReadResult {
             receipt,
             result: Nullable(result),
-        })
+        };
+        // The result travels whole with the receipt, so the answer is held to what this connection
+        // said it can receive, and a reader with a smaller frame is refused with both sizes rather
+        // than sent a frame it would have to discard.
+        let measured = Self::answer_bytes(&answer);
+        if measured > Self::frame_bytes(state) {
+            return Err(WorkerError::InvalidArgument(format!(
+                "this receipt and the result it keeps are {measured} bytes, and this connection \
+                 said it receives control frames of at most {} bytes",
+                state.peer_limits.max_control_frame_len.get()
+            )));
+        }
+        encode(&answer)
     }
 
     /// Reads one question back to the source that created it.

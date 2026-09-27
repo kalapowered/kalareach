@@ -425,9 +425,19 @@ async fn owner(host: &Host, limits: ReceiveLimits) -> LocalClient {
 
 /// Connects as the control daemon and proves the generation, to forward a device's reads.
 async fn daemon(host: &Host) -> LocalClient {
+    daemon_receiving(host, ReceiveLimits::default()).await
+}
+
+/// Connects as the control daemon receiving `limits`, and proves the generation.
+async fn daemon_receiving(host: &Host, limits: ReceiveLimits) -> LocalClient {
     let mut daemon = within(
         "the daemon's connection",
-        LocalClient::connect(&host.endpoint, LocalClientKind::Controller, build()),
+        LocalClient::connect_receiving(
+            &host.endpoint,
+            LocalClientKind::Controller,
+            build(),
+            limits,
+        ),
     )
     .await
     .expect("connects as the daemon");
@@ -496,6 +506,54 @@ async fn forwarded<T: serde::Serialize>(
             .write_message(&read)
             .await
             .expect("writes the read");
+        loop {
+            match daemon.recv().await.expect("the worker answers") {
+                ControlFrame::Response(response) if response.request_id == request_id => {
+                    return match response.outcome {
+                        Outcome::Ok(value) => Ok(value),
+                        Outcome::Error(error) => Err(error),
+                    };
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+}
+
+/// Forwards one of the device's mutations as the daemon does, admitted under a grant that lets it
+/// watch the session.
+async fn forwarded_mutation<T: serde::Serialize>(
+    daemon: &mut LocalClient,
+    host: &Host,
+    method: Method,
+    params: &T,
+) -> Result<ParamsValue, ProtocolError> {
+    let request_id = next_request();
+    let mutation = ControlFrame::Forwarded(Box::new(kr_protocol::local::ForwardedMutation {
+        mutation: kr_protocol::envelope::MutationRequest {
+            request_id,
+            method: method.into(),
+            method_version: MethodVersion::V1,
+            action_id: ActionId::new(kr_ipc::new_uuid()),
+            grant_id: Nullable::null(),
+            target: host.target(),
+            expected: ParamsValue::empty(),
+            action_window_id: kr_protocol::ids::ActionWindowId::new("forwarded")
+                .expect("a window identifier"),
+            requested_ttl_ms: kr_protocol::limits::DEFAULT_MUTATION_TTL,
+            params: ParamsValue::from_typed(params).expect("encodes"),
+        },
+        actor: device(),
+        grant_rights: [ActionRight::SessionView].into_iter().collect(),
+        accepted_deadline_boot_ms: U64::new(kr_ipc::clock::boot_elapsed_ms() + 30_000),
+    }));
+    within("the worker's answer", async {
+        daemon
+            .writer()
+            .write_message(&mutation)
+            .await
+            .expect("writes the mutation");
         loop {
             match daemon.recv().await.expect("the worker answers") {
                 ControlFrame::Response(response) if response.request_id == request_id => {
@@ -881,5 +939,178 @@ async fn kr_req_23_48_retained_history_is_served_to_the_owner_and_not_to_a_paire
         refused.code,
         kr_protocol::error::ErrorCode::PermissionDenied,
         "{refused:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_23_48_a_receipt_read_names_its_own_session_and_fits_its_readers_frame() {
+    // `action.read` is a state recovery read like the others: one that names a session names its
+    // own, and its answer - the receipt and the result it keeps - is held to the frame its reader
+    // declared, refused with both sizes rather than sent in a frame the reader has to discard.
+    let host = host().await;
+    let caller =
+        ActorId::new(format!("local:{}", kr_ipc::paths::current_uid())).expect("the local caller");
+    let action_id = kr_worker::journal::action_id_from([6; 16]);
+    // A result larger than the smallest frame, kept with the owner's action.
+    let result = kr_cbor::to_canonical_vec(&"r".repeat(20_000)).expect("encodes");
+    {
+        let mut session = host.runtime.session();
+        let journal = session.journal_mut().expect("a journal");
+        journal
+            .accept(&kr_worker::journal::Submission {
+                actor_id: caller.clone(),
+                action_id,
+                method: Method::SessionAttach.into(),
+                method_version: MethodVersion::V1,
+                payload_digest: Digest256::from_bytes([6; 32]),
+                subject_digest: Digest256::from_bytes([6; 32]),
+                intent: vec![0xa0],
+                accepted_deadline_ms: Some(TimestampMs::new(kr_ipc::now_ms().get() + 120_000)),
+                now_ms: kr_ipc::now_ms(),
+            })
+            .expect("the owner's action is admitted");
+        journal
+            .mark_dispatching(caller.clone(), action_id, kr_ipc::now_ms())
+            .expect("dispatched");
+        journal
+            .settle(
+                caller,
+                action_id,
+                kr_protocol::receipt::ReceiptState::Applied,
+                Some(result.as_slice()),
+                None,
+                kr_ipc::now_ms(),
+            )
+            .expect("settled with its result");
+    }
+    let read = |session_id| ActionReadParams {
+        action_id,
+        session_id,
+    };
+
+    // The control: its own session, named, read by a reader whose frame holds the answer.
+    let mut window = owner(&host, ReceiveLimits::default()).await;
+    let own: ActionReadResult = within(
+        "the read",
+        window.request(Method::ActionRead, &read(Some(host.session_id))),
+    )
+    .await
+    .expect("the call reaches the worker")
+    .expect("its own session's receipt is read")
+    .to_typed()
+    .expect("decodes");
+    assert_eq!(own.receipt.action_id, action_id);
+    assert!(own.result.is_present(), "with the result it keeps");
+
+    let elsewhere = SessionId::new(kr_ipc::new_uuid());
+    let refused = within(
+        "the read",
+        window.request(Method::ActionRead, &read(Some(elsewhere))),
+    )
+    .await
+    .expect("the call reaches the worker")
+    .expect_err("a read naming another session is not this endpoint's to answer");
+    assert!(
+        refused.message.contains(&elsewhere.to_string()),
+        "{refused:?}"
+    );
+
+    let mut small = owner(&host, smallest()).await;
+    let refused = within("the read", small.request(Method::ActionRead, &read(None)))
+        .await
+        .expect("the call reaches the worker, and its answer reaches the reader")
+        .expect_err("an answer larger than the reader's frame is refused");
+    assert!(
+        refused.message.contains(&FRAME.to_string())
+            || refused
+                .message
+                .contains(&(FRAME + kr_protocol::limits::MAX_STREAM_HEADER_LEN).to_string()),
+        "the refusal names the frame: {refused:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_23_48_a_devices_subscription_is_held_to_its_grant_and_its_frame_on_every_page() {
+    // A subscription's resources are paged as a snapshot's are, and every page of a device's is
+    // held to both bounds: the present view its grant reaches, and the frame its daemon connection
+    // declared. The owner's pages, at the same frame, carry every resource once.
+    let host = host().await;
+    let early: BTreeSet<PendingResourceId> =
+        (0..40).map(|index| arrive(&host, 1_000 + index)).collect();
+    let late: BTreeSet<PendingResourceId> =
+        (0..100).map(|index| arrive(&host, 5_000 + index)).collect();
+
+    let mut daemon = daemon_receiving(&host, smallest()).await;
+    let attached: SessionAttachResult =
+        forwarded_mutation(&mut daemon, &host, Method::SessionAttach, &host.terminal())
+            .await
+            .expect("the device attaches")
+            .to_typed()
+            .expect("decodes");
+    let answer = forwarded(
+        &mut daemon,
+        Some(reaching_back_to(3_000)),
+        Method::EventsSubscribe,
+        &EventsSubscribeParams {
+            session_id: host.session_id,
+            attachment_id: attached.attachment.attachment_id,
+            streams: [EventStream::Output].into_iter().collect(),
+            from_cursor: Nullable::null(),
+        },
+    )
+    .await
+    .expect("the device's subscription is answered");
+    fits(&answer, FRAME);
+    let first = answer
+        .to_typed::<EventsSubscribeResult>()
+        .expect("decodes")
+        .agent_resources;
+    let mut shown: Vec<PendingResourceId> = first
+        .resources
+        .iter()
+        .map(|resource| resource.resource_id)
+        .collect();
+    let mut pages = 1;
+    let mut after = first.continue_after.0;
+    while let Some(after_resource_id) = after {
+        let answer = forwarded(
+            &mut daemon,
+            Some(reaching_back_to(3_000)),
+            Method::EventsSnapshot,
+            &EventsSnapshotParams {
+                session_id: host.session_id,
+                agent_resources_from: Nullable::some(AgentResourceSnapshotContinuation {
+                    snapshot_id: first.snapshot_id,
+                    after_resource_id,
+                }),
+            },
+        )
+        .await
+        .expect("a page the subscription began is read");
+        fits(&answer, FRAME);
+        let page = answer
+            .to_typed::<EventsSnapshotResult>()
+            .expect("decodes")
+            .agent_resources;
+        shown.extend(page.resources.iter().map(|resource| resource.resource_id));
+        pages += 1;
+        after = page.continue_after.0;
+    }
+    assert!(pages > 1, "the resources took more than one page");
+    assert_eq!(shown.len(), late.len(), "each resource once: {shown:?}");
+    assert_eq!(
+        shown.into_iter().collect::<BTreeSet<_>>(),
+        late,
+        "every page is held to what the grant reaches"
+    );
+
+    let mut window = owner(&host, smallest()).await;
+    let (seen, pages) = every_page(&mut window, &host, FRAME).await;
+    assert!(pages > 1);
+    assert_eq!(seen.len(), early.len() + late.len(), "each resource once");
+    assert_eq!(
+        seen.into_iter().collect::<BTreeSet<_>>(),
+        early.union(&late).copied().collect(),
+        "the owner is shown everything"
     );
 }
