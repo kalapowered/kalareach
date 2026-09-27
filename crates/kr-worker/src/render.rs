@@ -253,11 +253,11 @@ impl Writer {
             // still scroll back through, and reset a palette the next operation sets anyway.
             RestoreOp::ResetProjection { .. } => {
                 self.csi(b"!p");
-                self.csi(b"2J");
-                self.csi(b"H");
                 // A soft reset leaves the terminal in the default rendition, which is a fact about
                 // the terminal rather than an assumption about it.
                 self.pen = Some(Rendition::default());
+                self.erase(b"2J");
+                self.csi(b"H");
             }
             // The canonical size belongs to the session, not to this terminal. A terminal is never
             // told to resize itself: a viewport shows the part of the grid it can, and a direct
@@ -359,6 +359,16 @@ impl Writer {
         self.out.push(ESC);
         self.out.push(b'[');
         self.out.extend_from_slice(body);
+    }
+
+    /// Writes one erase, in the plain rendition.
+    ///
+    /// A terminal erases with the pen it holds, and whatever run was drawn last would otherwise
+    /// colour, underline or reverse every cell the erase empties. Every erase this writer makes goes
+    /// through here, so none can.
+    fn erase(&mut self, body: &[u8]) {
+        self.rendition(Rendition::default());
+        self.csi(body);
     }
 
     /// Writes one OSC command, terminated with ST.
@@ -494,11 +504,8 @@ impl Writer {
         };
         self.move_to(line, 0);
         // The row is drawn from an empty line, so a shorter row does not leave the tail of
-        // whatever the terminal had there before. The line is emptied in the plain rendition: a
-        // terminal erases with the pen it holds, and the pen the row above was left in would
-        // otherwise colour, underline or reverse every blank cell of this one.
-        self.rendition(Rendition::default());
-        self.csi(b"K");
+        // whatever the terminal had there before.
+        self.erase(b"K");
         let mut clipped = false;
         for run in &row.runs {
             clipped |= self.run(run);
@@ -767,7 +774,7 @@ impl Writer {
         self.pen = None;
         self.link = None;
         self.csi(b"H");
-        self.csi(b"2J");
+        self.erase(b"2J");
         // The other buffer's rows have their own stable identifiers, which are not the active
         // buffer's: anchoring them on the active window's top row would place them somewhere else
         // entirely, or nowhere at all.
@@ -1361,6 +1368,67 @@ mod tests {
             rows[0].runs.iter().any(|run| run.rendition.reverse),
             "while the first keeps its own rendition"
         );
+    }
+
+    /// Every erase in a restoration is made with the plain rendition: the last rendition sequence
+    /// before it is the plain one, or a soft reset came after it. The restoration here has a
+    /// reversed run in each buffer and ends a row on one, so every erase follows one.
+    #[test]
+    fn every_erase_a_restoration_makes_is_made_with_the_plain_rendition() {
+        let mut reversed = row(0, 0, "bar");
+        reversed.runs[0].rendition = Rendition {
+            reverse: true,
+            ..Rendition::default()
+        };
+        let mut other = reversed.clone();
+        other.stable_id = 0;
+        let mut second = reversed.clone();
+        second.stable_id = 1;
+        let rendered = render(
+            &[
+                RestoreOp::ResetProjection { generation: 1 },
+                RestoreOp::SelectBuffer {
+                    buffer: ActiveBuffer::Alternate,
+                },
+                RestoreOp::PaintInactiveRow { row: other },
+                RestoreOp::PaintRow { row: reversed },
+                RestoreOp::PaintRow { row: second },
+            ],
+            viewport(3, 8),
+            Keyboard::Install,
+            Scope::WholeScreen,
+        );
+        let bytes = rendered.bytes;
+        let mut erases = 0;
+        let mut plain = false;
+        let mut at = 0;
+        while at < bytes.len() {
+            if !bytes[at..].starts_with(b"\x1b[") {
+                at += 1;
+                continue;
+            }
+            let end = at
+                + 2
+                + bytes[at + 2..]
+                    .iter()
+                    .position(|byte| (0x40..=0x7e).contains(byte))
+                    .expect("every sequence is finished");
+            let sequence = &bytes[at..=end];
+            match bytes[end] {
+                b'm' => plain = sequence == b"\x1b[0m",
+                b'p' if sequence == b"\x1b[!p" => plain = true,
+                b'K' | b'J' => {
+                    erases += 1;
+                    assert!(
+                        plain,
+                        "an erase at byte {at} follows a rendition that is not the plain one"
+                    );
+                }
+                _ => {}
+            }
+            at = end + 1;
+        }
+        assert!(erases >= 4, "the screen, the other buffer and each row: {erases}");
     }
 
     #[test]
