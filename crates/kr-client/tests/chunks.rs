@@ -253,6 +253,7 @@ impl Host {
             action_window: window,
             capabilities: CanonicalSet::new(),
             max_receive: kr_protocol::hello::ReceiveLimits::default(),
+            build: None,
         }))
     }
 

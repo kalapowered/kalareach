@@ -10,7 +10,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::envelope::{MutationRequest, Request};
-use crate::hello::{ActionWindow, ProtocolVersion, ReceiveLimits};
+use crate::hello::{ActionWindow, PACKAGE_VERSION, PackageVersion, ProtocolVersion, ReceiveLimits};
 use crate::identity::BootIdentity;
 use crate::ids::{BuildId, CapabilityId, ConnectionId, EnvironmentId};
 use crate::scalars::{CanonicalSet, Nullable, U64};
@@ -115,6 +115,41 @@ pub struct LocalHelloAck {
     pub capabilities: CanonicalSet<CapabilityId>,
     /// The limits both sides will use.
     pub max_receive: ReceiveLimits,
+    /// The build of the process that answered: its build identifier, and the version of the
+    /// protocol package it was built from.
+    ///
+    /// A client that attaches a terminal refuses a worker on this before it asks the worker for
+    /// anything, when the two versions do not share a compatibility level
+    /// ([`PackageVersion::shares_frames_with`]), rather than meet a frame it cannot read. A
+    /// process of a build before this member states none. Its answer is still read, by a daemon
+    /// that goes on speaking to the workers that outlived its upgrade and by every client, and a
+    /// client that attaches takes it for an earlier build.
+    ///
+    /// Remove the default and the omission once no process of a build before this member can
+    /// still be running, which is when every session that was live across the upgrade has closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build: Option<LocalBuild>,
+}
+
+/// The build of a local host process, as it states it in its answer to a hello.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LocalBuild {
+    /// The process's build identifier: its program name and its release.
+    pub build_id: BuildId,
+    /// The version of the protocol package the process was built from.
+    pub protocol_version: PackageVersion,
+}
+
+impl LocalBuild {
+    /// This build, as the process whose build identifier is `build_id` states it.
+    #[must_use]
+    pub fn this(build_id: BuildId) -> Self {
+        Self {
+            build_id,
+            protocol_version: PACKAGE_VERSION,
+        }
+    }
 }
 
 /// The capability a worker states when it reads the UTC deadline beside each forwarded copy's
@@ -626,5 +661,107 @@ mod tests {
         let decoded: ControlFrame =
             kr_cbor::from_canonical_slice(&bytes, &kr_cbor::Limits::DEFAULT).expect("decodes");
         assert_eq!(decoded, frame);
+    }
+
+    /// The version a build states is the one `packages/protocol/package.json` states, read here as
+    /// the JSON document it is rather than as the text the compile-time reading scans.
+    #[test]
+    fn the_package_version_is_the_one_the_protocol_package_states() {
+        let manifest: serde_json::Value =
+            serde_json::from_str(include_str!("../../../packages/protocol/package.json"))
+                .expect("the manifest is a document");
+        let stated = manifest["version"]
+            .as_str()
+            .expect("the manifest states a version");
+        assert_eq!(crate::hello::PACKAGE_VERSION.to_string(), stated);
+    }
+
+    /// Below 1.0.0 the minor number is the compatibility level, and from 1.0.0 the major number
+    /// is. The patch number never decides, and the answer is the same whichever build asks.
+    #[test]
+    fn below_one_the_minor_number_is_the_compatibility_level_and_the_patch_never_decides() {
+        use crate::hello::PackageVersion as Version;
+
+        let pairs = [
+            (Version::new(0, 46, 0), Version::new(0, 46, 3), true),
+            (Version::new(0, 46, 2), Version::new(0, 46, 2), true),
+            (Version::new(0, 46, 0), Version::new(0, 45, 0), false),
+            (Version::new(0, 46, 0), Version::new(0, 47, 0), false),
+            (Version::new(1, 2, 0), Version::new(1, 9, 4), true),
+            (Version::new(1, 0, 0), Version::new(2, 0, 0), false),
+            (Version::new(0, 1, 0), Version::new(1, 1, 0), false),
+        ];
+        for (one, other, shared) in pairs {
+            assert_eq!(one.shares_frames_with(other), shared, "{one} and {other}");
+            assert_eq!(other.shares_frames_with(one), shared, "{other} and {one}");
+        }
+    }
+
+    /// A process states its build in its answer to a hello. The answer of a process of an earlier
+    /// build has no such member, and it is read, with no build.
+    #[test]
+    fn an_answer_to_a_hello_states_the_build_and_an_earlier_build_s_answer_is_read_without_one() {
+        use crate::hello::{ActionWindow, ReceiveLimits};
+        use crate::identity::{BootIdentity, BootIdentitySource};
+        use crate::ids::{ActionWindowId, BootEpoch, BuildId, ConnectionId, EnvironmentId};
+        use crate::scalars::{Bytes, CanonicalSet, DurationMs, Nullable, TimestampMs, U64, Uuid};
+
+        let connection_id = ConnectionId::new(Uuid::from_bytes([4; 16]));
+        let answer = |build: Option<super::LocalBuild>| {
+            ControlFrame::HelloAck(Box::new(super::LocalHelloAck {
+                selected_version: crate::hello::PROTOCOL_VERSION,
+                role: super::LocalRole::Worker,
+                connection_id,
+                environment_id: EnvironmentId::new(Uuid::from_bytes([5; 16])),
+                boot_identity: BootIdentity {
+                    source: BootIdentitySource::LinuxBootId,
+                    value: Bytes::new(b"a boot".to_vec()),
+                },
+                peer: super::LocalPeer {
+                    uid: U64::new(501),
+                    gid: U64::new(20),
+                    pid: Nullable::null(),
+                },
+                action_window: ActionWindow {
+                    action_window_id: ActionWindowId::new("worker:test").expect("a window"),
+                    connection_id,
+                    boot_epoch: BootEpoch::new(1),
+                    issued_at_ms: TimestampMs::new(0),
+                    valid_for_ms: DurationMs::new(60_000),
+                },
+                capabilities: CanonicalSet::new(),
+                max_receive: ReceiveLimits::default(),
+                build,
+            }))
+        };
+        let read = |frame: &ControlFrame| -> ControlFrame {
+            let bytes = kr_cbor::to_canonical_vec(frame).expect("encodes");
+            kr_cbor::from_canonical_slice(&bytes, &kr_cbor::Limits::DEFAULT).expect("decodes")
+        };
+
+        let stated = answer(Some(super::LocalBuild::this(
+            BuildId::new("kr-worker/0.1.0").expect("a build identifier"),
+        )));
+        assert_eq!(read(&stated), stated);
+        let ControlFrame::HelloAck(stated) = stated else {
+            unreachable!("built as an answer to a hello");
+        };
+        assert_eq!(
+            stated.build.as_ref().map(|build| build.protocol_version),
+            Some(crate::hello::PACKAGE_VERSION)
+        );
+
+        // An answer without the member is what a build before it wrote, byte for byte, and it is
+        // read with no build.
+        let earlier = answer(None);
+        let ControlFrame::HelloAck(written) = &earlier else {
+            unreachable!("built as an answer to a hello");
+        };
+        let document = serde_json::to_value(written).expect("a document");
+        assert!(document.get("build").is_none(), "{document}");
+        let ControlFrame::HelloAck(read_back) = read(&earlier) else {
+            panic!("an answer to a hello is read as one");
+        };
+        assert_eq!(read_back.build, None);
     }
 }

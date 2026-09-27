@@ -6118,6 +6118,21 @@ export interface LocalHelloAck {
   action_window: ActionWindow2
   boot_identity: BootIdentity1
   /**
+   * The build of the process that answered: its build identifier, and the version of the
+   * protocol package it was built from.
+   *
+   * A client that attaches a terminal refuses a worker on this before it asks the worker for
+   * anything, when the two versions do not share a compatibility level
+   * ([`PackageVersion::shares_frames_with`]), rather than meet a frame it cannot read. A
+   * process of a build before this member states none. Its answer is still read, by a daemon
+   * that goes on speaking to the workers that outlived its upgrade and by every client, and a
+   * client that attaches takes it for an earlier build.
+   *
+   * Remove the default and the omission once no process of a build before this member can
+   * still be running, which is when every session that was live across the upgrade has closed.
+   */
+  build?: LocalBuild | null
+  /**
    * The capabilities both sides will use.
    */
   capabilities: CapabilityId[]
@@ -6179,6 +6194,33 @@ export interface BootIdentity1 {
    * The opaque value. Compared for equality, never interpreted.
    */
   value: string
+}
+/**
+ * The build of a local host process, as it states it in its answer to a hello.
+ */
+export interface LocalBuild {
+  /**
+   * The process's build identifier: its program name and its release.
+   */
+  build_id: string
+  protocol_version: PackageVersion
+}
+/**
+ * The version of the protocol package the process was built from.
+ */
+export interface PackageVersion {
+  /**
+   * The major number.
+   */
+  major: number
+  /**
+   * The minor number, which is the compatibility level below 1.0.0.
+   */
+  minor: number
+  /**
+   * The patch number, which never changes a type.
+   */
+  patch: number
 }
 /**
  * The limits both sides will use.

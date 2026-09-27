@@ -1612,6 +1612,7 @@ async fn a_worker_that_withholds_its_attachments(host: &Standalone, session_id: 
                             },
                             capabilities: CanonicalSet::new(),
                             max_receive: kr_protocol::hello::ReceiveLimits::default(),
+                            build: None,
                         }))
                     }
                     ControlFrame::VerifyChallenge(challenge) => ControlFrame::VerifyProof(

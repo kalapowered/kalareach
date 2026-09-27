@@ -122,6 +122,7 @@ async fn serve(
             max_send_queue_bytes: U64::new(queue_bytes),
             ..ReceiveLimits::default()
         },
+        build: None,
     };
     if writer
         .write_message(&ControlFrame::HelloAck(Box::new(acknowledgement)))

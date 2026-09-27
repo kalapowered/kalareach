@@ -16451,6 +16451,25 @@
       ],
       "type": "object"
     },
+    "LocalBuild": {
+      "additionalProperties": false,
+      "description": "The build of a local host process, as it states it in its answer to a hello.",
+      "properties": {
+        "build_id": {
+          "$ref": "#/$defs/BuildId",
+          "description": "The process's build identifier: its program name and its release."
+        },
+        "protocol_version": {
+          "$ref": "#/$defs/PackageVersion",
+          "description": "The version of the protocol package the process was built from."
+        }
+      },
+      "required": [
+        "build_id",
+        "protocol_version"
+      ],
+      "type": "object"
+    },
     "LocalClientKind": {
       "description": "What kind of client opened a local connection.",
       "oneOf": [
@@ -16523,6 +16542,17 @@
         "boot_identity": {
           "$ref": "#/$defs/BootIdentity",
           "description": "The boot the host is running."
+        },
+        "build": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LocalBuild"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The build of the process that answered: its build identifier, and the version of the\nprotocol package it was built from.\n\nA client that attaches a terminal refuses a worker on this before it asks the worker for\nanything, when the two versions do not share a compatibility level\n([`PackageVersion::shares_frames_with`]), rather than meet a frame it cannot read. A\nprocess of a build before this member states none. Its answer is still read, by a daemon\nthat goes on speaking to the workers that outlived its upgrade and by every client, and a\nclient that attaches takes it for an earlier build.\n\nRemove the default and the omission once no process of a build before this member can\nstill be running, which is when every session that was live across the upgrade has closed."
         },
         "capabilities": {
           "description": "The capabilities both sides will use.",
@@ -19866,6 +19896,39 @@
         "package_digest",
         "detail",
         "detail_cut"
+      ],
+      "type": "object"
+    },
+    "PackageVersion": {
+      "additionalProperties": false,
+      "description": "A version of the protocol package: the number both generated packages are published under.\n\nIt moves with the wire types, which the public [`ProtocolVersion`] does not. Below 1.0.0 every\nchange to a type or to a member of one, an optional member included, takes the next minor\nnumber, and from 1.0.0 the next major (`docs/releases/packages.md`); a change that takes only\nthe next patch number changes no type. So it says which frames a build reads and writes, and two\nbuilds read each other's when their versions share a compatibility level\n([`PackageVersion::shares_frames_with`]).",
+      "properties": {
+        "major": {
+          "description": "The major number.",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "minor": {
+          "description": "The minor number, which is the compatibility level below 1.0.0.",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "patch": {
+          "description": "The patch number, which never changes a type.",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "major",
+        "minor",
+        "patch"
       ],
       "type": "object"
     },

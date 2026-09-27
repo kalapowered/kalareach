@@ -67,3 +67,16 @@ pub mod testing;
 pub mod windows;
 
 pub use crate::error::{Result, WorkerError};
+
+/// The build identifier a worker gives: its program name and its release.
+///
+/// It goes in the worker's hello to the control daemon and in its answer to every hello.
+///
+/// # Panics
+///
+/// Never: the text is a fixed name and this crate's own release.
+#[must_use]
+pub fn build_id() -> kr_protocol::ids::BuildId {
+    kr_protocol::ids::BuildId::new(concat!("kr-worker/", env!("CARGO_PKG_VERSION")))
+        .expect("a fixed name and a release are a well-formed build identifier")
+}

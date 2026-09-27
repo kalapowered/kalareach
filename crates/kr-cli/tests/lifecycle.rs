@@ -3331,6 +3331,7 @@ async fn serve_as_another_build(
         },
         capabilities: CanonicalSet::new(),
         max_receive: hello.max_receive,
+        build: None,
     };
     let Stated::Nothing = stated;
     if writer

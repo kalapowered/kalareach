@@ -362,6 +362,7 @@ async fn serve_daemon(
         },
         capabilities: CanonicalSet::new(),
         max_receive: hello.max_receive,
+        build: None,
     };
     if writer
         .write_message(&ControlFrame::HelloAck(Box::new(acknowledgement)))
@@ -519,6 +520,7 @@ async fn serve_one(
         },
         capabilities: CanonicalSet::new(),
         max_receive: hello.max_receive,
+        build: None,
     };
     if writer
         .write_message(&ControlFrame::HelloAck(Box::new(acknowledgement)))

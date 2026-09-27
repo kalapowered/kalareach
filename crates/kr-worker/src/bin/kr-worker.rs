@@ -27,7 +27,7 @@ use kr_protocol::envelope::ControlFrame;
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::frame::StreamKind;
 use kr_protocol::hello::PROTOCOL_VERSION;
-use kr_protocol::ids::{BuildId, EnvironmentId, SessionEpoch, SessionId};
+use kr_protocol::ids::{EnvironmentId, SessionEpoch, SessionId};
 use kr_protocol::local::{LocalClientKind, LocalHello};
 use kr_protocol::scalars::Uuid;
 use kr_protocol::session::{ClosureReason, DisplayNumber, SessionCreateParams, ShellMode};
@@ -43,9 +43,6 @@ use kr_worker::pty::ShellCommand;
 use kr_worker::runtime::{CLOSURE_NOTICE_TIMEOUT, start_or_record};
 use kr_worker::service::{ServiceBinding, WorkerService};
 use kr_worker::session::SessionConfig;
-
-/// The release this build reports as its terminal program version.
-const RELEASE: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug, Parser)]
 #[command(
@@ -145,7 +142,7 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
     writer
         .write_message(&ControlFrame::Hello(LocalHello {
             offered_versions: vec![PROTOCOL_VERSION],
-            build_id: build_id(),
+            build_id: kr_worker::build_id(),
             client: LocalClientKind::Worker,
             capabilities: kr_protocol::scalars::CanonicalSet::new(),
             max_receive: kr_protocol::hello::ReceiveLimits::default(),
@@ -303,7 +300,7 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
                 boot_identity,
                 controller_public_key: specification.controller_public_key,
                 controller_generation: specification.controller_generation,
-                build_id: build_id(),
+                build_id: kr_worker::build_id(),
                 journal_path: Some(environment.journal_database(specification.session_id)),
             },
         )?
@@ -730,10 +727,6 @@ fn default_shell() -> String {
         // fallback when it is not installed.
         std::env::var("ComSpec").unwrap_or_else(|_| "powershell.exe".to_owned())
     }
-}
-
-fn build_id() -> BuildId {
-    BuildId::new(format!("kr-worker/{RELEASE}")).expect("the build identifier is well formed")
 }
 
 /// Leaves the session and controlling terminal of whatever started this worker.

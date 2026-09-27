@@ -66,6 +66,135 @@ impl core::fmt::Display for ProtocolVersion {
 /// The protocol version this build implements.
 pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 0);
 
+/// A version of the protocol package: the number both generated packages are published under.
+///
+/// It moves with the wire types, which the public [`ProtocolVersion`] does not. Below 1.0.0 every
+/// change to a type or to a member of one, an optional member included, takes the next minor
+/// number, and from 1.0.0 the next major (`docs/releases/packages.md`); a change that takes only
+/// the next patch number changes no type. So it says which frames a build reads and writes, and two
+/// builds read each other's when their versions share a compatibility level
+/// ([`PackageVersion::shares_frames_with`]).
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(deny_unknown_fields)]
+pub struct PackageVersion {
+    /// The major number.
+    pub major: u16,
+    /// The minor number, which is the compatibility level below 1.0.0.
+    pub minor: u16,
+    /// The patch number, which never changes a type.
+    pub patch: u16,
+}
+
+impl PackageVersion {
+    /// Builds a version.
+    #[must_use]
+    pub const fn new(major: u16, minor: u16, patch: u16) -> Self {
+        Self {
+            major,
+            minor,
+            patch,
+        }
+    }
+
+    /// Whether a build at `other` reads and writes the frames a build at this version does: the
+    /// same major number, and below 1.0.0 the same minor number too.
+    ///
+    /// The patch number never decides, because a change that takes only the next patch number
+    /// changes no type. A frame on a session's local path is a closed schema, so a member one
+    /// build added is refused by a build without it; that is why a new member takes a new minor
+    /// number even when it is optional.
+    #[must_use]
+    pub const fn shares_frames_with(self, other: Self) -> bool {
+        self.major == other.major && (self.major != 0 || self.minor == other.minor)
+    }
+
+    /// Reads the version a package manifest states, when this crate is compiled: the value of the
+    /// manifest's first `"version"` member, three numbers separated by dots.
+    ///
+    /// # Panics
+    ///
+    /// When the manifest states no such version. Evaluated for [`PACKAGE_VERSION`], that is a
+    /// build that does not compile.
+    const fn from_manifest(manifest: &str) -> Self {
+        let text = manifest.as_bytes();
+        let key = b"\"version\"";
+        // Past the member's name.
+        let mut at = 0;
+        loop {
+            assert!(
+                at + key.len() <= text.len(),
+                "the package manifest states no version"
+            );
+            let mut matched = 0;
+            while matched < key.len() && text[at + matched] == key[matched] {
+                matched += 1;
+            }
+            at += if matched == key.len() { key.len() } else { 1 };
+            if matched == key.len() {
+                break;
+            }
+        }
+        // Past the colon and any space, to the opening quote.
+        while at < text.len() && matches!(text[at], b' ' | b'\t' | b'\n' | b'\r' | b':') {
+            at += 1;
+        }
+        assert!(
+            at < text.len() && text[at] == b'"',
+            "the package manifest's version is not text"
+        );
+        at += 1;
+        let mut numbers = [0_u16; 3];
+        let mut index = 0;
+        while index < numbers.len() {
+            if index > 0 {
+                assert!(
+                    at < text.len() && text[at] == b'.',
+                    "the package manifest's version is not three numbers separated by dots"
+                );
+                at += 1;
+            }
+            let start = at;
+            let mut value: u32 = 0;
+            while at < text.len() && text[at].is_ascii_digit() {
+                value = value * 10 + (text[at] - b'0') as u32;
+                assert!(
+                    value <= u16::MAX as u32,
+                    "a number of the package manifest's version is larger than a version carries"
+                );
+                at += 1;
+            }
+            assert!(
+                at > start,
+                "the package manifest's version is not three numbers separated by dots"
+            );
+            numbers[index] = value as u16;
+            index += 1;
+        }
+        assert!(
+            at < text.len() && text[at] == b'"',
+            "the package manifest's version is not three numbers separated by dots"
+        );
+        Self::new(numbers[0], numbers[1], numbers[2])
+    }
+}
+
+impl core::fmt::Display for PackageVersion {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(formatter, "{}.{}.{}", self.major, self.minor, self.patch)
+    }
+}
+
+/// The version of the protocol package this build was built from, as
+/// `packages/protocol/package.json` states it.
+///
+/// It is read from that file when this crate is compiled, so the commit that sets the packages'
+/// version sets this one as well, and a process states the version of the types it was compiled
+/// with.
+pub const PACKAGE_VERSION: PackageVersion =
+    PackageVersion::from_manifest(include_str!("../../../packages/protocol/package.json"));
+
 /// The receive limits a peer declares.
 ///
 /// Both sides state their own bounds; the selection carries the negotiated values and the

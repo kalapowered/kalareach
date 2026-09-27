@@ -138,6 +138,7 @@ async fn serve(
         },
         capabilities: CanonicalSet::new(),
         max_receive: ReceiveLimits::default(),
+        build: None,
     };
     if writer
         .write_message(&ControlFrame::HelloAck(Box::new(acknowledgement)))

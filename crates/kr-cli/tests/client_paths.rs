@@ -187,6 +187,7 @@ async fn serve_one_local_caller(
         },
         capabilities: kr_protocol::scalars::CanonicalSet::new(),
         max_receive: hello.max_receive,
+        build: None,
     };
     if writer
         .write_message(&ControlFrame::HelloAck(Box::new(acknowledgement)))

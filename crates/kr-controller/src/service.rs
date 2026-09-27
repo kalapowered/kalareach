@@ -4429,6 +4429,7 @@ impl Controller {
             action_window,
             capabilities: CanonicalSet::new(),
             max_receive: ReceiveLimits::default(),
+            build: Some(kr_protocol::local::LocalBuild::this(self.build_id.clone())),
         })
     }
 
@@ -13209,6 +13210,7 @@ mod a_close_a_worker_never_answers {
                     },
                     capabilities: stated.clone(),
                     max_receive: ReceiveLimits::default(),
+                    build: None,
                 })),
                 ControlFrame::GenerationChallenge(GenerationChallenge {
                     nonce: kr_ipc::verify::fresh_challenge()

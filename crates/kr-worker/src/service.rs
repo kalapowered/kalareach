@@ -1835,6 +1835,9 @@ impl WorkerService {
             action_window,
             capabilities: self.stated_capabilities(),
             max_receive: kr_protocol::hello::ReceiveLimits::default(),
+            // The build this worker is, so that a client of another build refuses it at once
+            // rather than meeting a frame it cannot read.
+            build: Some(kr_protocol::local::LocalBuild::this(crate::build_id())),
         }))
     }
 
