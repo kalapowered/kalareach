@@ -31,7 +31,6 @@ pub mod environments;
 pub mod helper;
 pub mod pipe;
 
-use kr_client::shown;
 use kr_client::shown::Shown;
 use kr_protocol::identity::{
     EnvironmentEnrolment, EnvironmentInventoryRow, EnvironmentRefreshResult,
@@ -39,7 +38,7 @@ use kr_protocol::identity::{
 
 use crate::cli::BridgeCommand;
 use crate::error::Result;
-use crate::output::{self, Asked, Document, Request, closed};
+use crate::output::{self, Asked, Document, Line, Request, closed};
 use crate::stdout_line;
 
 /// Runs one `kr bridge` operation and writes its result.
@@ -61,27 +60,7 @@ pub async fn print(command: &BridgeCommand, json: bool) -> Result<()> {
                         .with("rows", inventory.rows.iter().map(row).collect::<Vec<_>>()),
                 );
             } else {
-                if inventory.rows.is_empty() {
-                    output::say(&Shown::said("no environments are enrolled"));
-                }
-                for row in &inventory.rows {
-                    let enrolment = &row.enrolment;
-                    output::line(&stdout_line!(
-                        "{}  {}  {}  {}  {}  last seen {} ms  {}",
-                        asked(&enrolment.label),
-                        enrolment.access.as_str(),
-                        asked(&enrolment.target),
-                        asked(&enrolment.os_user),
-                        Asked::path(Request::Bridges, &enrolment.helper_path),
-                        row.last_observed_at_ms.get(),
-                        environments::presence_text(row.status),
-                    ));
-                    output::say(&shown!(
-                        "    {}; {}",
-                        environments::observation_text(row.observation),
-                        readiness_detail(row)
-                    ));
-                }
+                output::lines(&list_lines(&inventory.rows));
             }
         }
         BridgeCommand::Enrol(arguments) => {
@@ -89,11 +68,7 @@ pub async fn print(command: &BridgeCommand, json: bool) -> Result<()> {
             if json {
                 output::document(&Document::new().with("row", row(&enrolled.row)));
             } else {
-                output::line(&stdout_line!(
-                    "enrolled {} as environment {}",
-                    asked(&enrolled.row.enrolment.label),
-                    enrolled.row.enrolment.environment_id
-                ));
+                output::line(&enrolled_line(&enrolled.row));
             }
         }
         BridgeCommand::Forget(arguments) => {
@@ -114,30 +89,74 @@ pub async fn print(command: &BridgeCommand, json: bool) -> Result<()> {
             if json {
                 output::document(&refresh(&refreshed));
             } else {
-                output::line(&stdout_line!(
-                    "{} is {}{}",
-                    asked(&refreshed.row.enrolment.label),
-                    environments::presence_text(refreshed.row.status),
-                    if refreshed.started {
-                        ", started by this refresh"
-                    } else {
-                        ""
-                    }
-                ));
-                // What opening the bridge did, whether it answered or not, as the host's sentence.
-                output::say(&shown!("    {}", connection(&refreshed)));
-                if let Some(verification) = refreshed.verification.as_ref() {
-                    output::say(&shown!(
-                        "    speaks protocol {}.{}, carries frames to {} bytes",
-                        verification.protocol_version.major,
-                        verification.protocol_version.minor,
-                        verification.max_frame_len.get()
-                    ));
-                }
+                output::lines(&refresh_lines(&refreshed));
             }
         }
     }
     Ok(())
+}
+
+/// The inventory as lines for a person: each row, and what was observed of it.
+fn list_lines(rows: &[EnvironmentInventoryRow]) -> Vec<Line> {
+    if rows.is_empty() {
+        return vec![stdout_line!("no environments are enrolled")];
+    }
+    let mut lines = Vec::new();
+    for row in rows {
+        let enrolment = &row.enrolment;
+        lines.push(stdout_line!(
+            "{}  {}  {}  {}  {}  last seen {} ms  {}",
+            asked(&enrolment.label),
+            enrolment.access.as_str(),
+            asked(&enrolment.target),
+            asked(&enrolment.os_user),
+            Asked::path(Request::Bridges, &enrolment.helper_path),
+            row.last_observed_at_ms.get(),
+            environments::presence_text(row.status),
+        ));
+        lines.push(stdout_line!(
+            "    {}; {}",
+            environments::observation_text(row.observation),
+            readiness_detail(row)
+        ));
+    }
+    lines
+}
+
+/// What enrolling an environment tells a person.
+fn enrolled_line(row: &EnvironmentInventoryRow) -> Line {
+    stdout_line!(
+        "enrolled {} as environment {}",
+        asked(&row.enrolment.label),
+        row.enrolment.environment_id
+    )
+}
+
+/// What a refresh tells a person: the row, what opening the bridge did, whether it answered or
+/// not, as the host's sentence, and what the helper said it speaks.
+fn refresh_lines(refreshed: &EnvironmentRefreshResult) -> Vec<Line> {
+    let mut lines = vec![
+        stdout_line!(
+            "{} is {}{}",
+            asked(&refreshed.row.enrolment.label),
+            environments::presence_text(refreshed.row.status),
+            if refreshed.started {
+                ", started by this refresh"
+            } else {
+                ""
+            }
+        ),
+        stdout_line!("    {}", connection(refreshed)),
+    ];
+    if let Some(verification) = refreshed.verification.as_ref() {
+        lines.push(stdout_line!(
+            "    speaks protocol {}.{}, carries frames to {} bytes",
+            verification.protocol_version.major,
+            verification.protocol_version.minor,
+            verification.max_frame_len.get()
+        ));
+    }
+    lines
 }
 
 /// What an enrolment holds, which its owner recorded.
@@ -214,4 +233,62 @@ fn refresh(refreshed: &EnvironmentRefreshResult) -> Document {
             }),
         )
         .with("connection", connection(refreshed))
+}
+
+#[cfg(test)]
+mod tests {
+    use kr_protocol::identity::{
+        EnvironmentEnrolResult, EnvironmentInventoryResult, EnvironmentRefreshResult,
+    };
+
+    use super::*;
+    use crate::output::planted::{only_asked, only_asked_lines, planted, planted_text};
+    use crate::shown::marker::MARKER;
+
+    /// KR-REQ-23.25: planted text in the bridge's answers shows only where the person asked for it
+    /// (what they recorded of an enrolment: its label, target, user, helper and clipboard
+    /// destination, and the user a helper verified), in the documents and in the lines. What the
+    /// host says of a bridge's readiness and of opening one is said as its class and its length.
+    #[test]
+    fn planted_text_in_the_bridge_shows_only_where_it_was_asked_for() {
+        let mut shown = std::collections::BTreeSet::new();
+        for inventory in planted::<EnvironmentInventoryResult>() {
+            shown.extend(only_asked(
+                "kr bridge list",
+                &Document::new().with("rows", inventory.rows.iter().map(row).collect::<Vec<_>>()),
+            ));
+            only_asked_lines("kr bridge list", &list_lines(&inventory.rows));
+        }
+        for enrolled in planted::<EnvironmentEnrolResult>() {
+            shown.extend(only_asked(
+                "kr bridge enrol",
+                &Document::new().with("row", row(&enrolled.row)),
+            ));
+            only_asked_lines("kr bridge enrol", &[enrolled_line(&enrolled.row)]);
+        }
+        for refreshed in planted::<EnvironmentRefreshResult>() {
+            shown.extend(only_asked("kr bridge refresh", &refresh(&refreshed)));
+            only_asked_lines("kr bridge refresh", &refresh_lines(&refreshed));
+            let withheld = format!("[message withheld, {} bytes]", planted_text().len());
+            assert_eq!(
+                refresh(&refreshed).json()["connection"],
+                serde_json::json!(withheld)
+            );
+            assert!(!connection(&refreshed).as_str().contains(MARKER));
+        }
+        for asked in [
+            "rows[].enrolment.label",
+            "rows[].enrolment.target",
+            "rows[].enrolment.os_user",
+            "rows[].enrolment.helper_path",
+            "rows[].enrolment.clipboard_destination",
+            "row.enrolment.label",
+            "verification.os_user",
+        ] {
+            assert!(
+                shown.contains(asked),
+                "{asked} shows what was asked for: {shown:?}"
+            );
+        }
+    }
 }

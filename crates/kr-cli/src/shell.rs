@@ -20,7 +20,7 @@ use kr_shell_integration::host::package::{
 use kr_shell_integration::host::startup::{self, Change, EntryRecord, HomeLayout, RecordError};
 
 use crate::error::{CliError, Result};
-use crate::output::{self, Asked, Document, Request};
+use crate::output::{self, Asked, Document, Line, Request};
 use crate::stdout_line;
 
 /// What one shell's integration is, as `kr shell status` reports it.
@@ -439,17 +439,24 @@ pub fn document(reports: &[ShellReport]) -> Document {
 
 /// Prints one report for a person.
 pub fn print(reports: &[ShellReport]) {
+    output::lines(&lines(reports));
+}
+
+/// One report as lines for a person: the files and what the package resolved to are the shell's
+/// own, shown to the person who asked about it.
+#[must_use]
+pub fn lines(reports: &[ShellReport]) -> Vec<Line> {
     if reports.is_empty() {
-        output::say(&shown!(
+        return vec![stdout_line!(
             "no qualified shell packages are installed; set {} to a directory that holds one",
             PACKAGE_ROOT_VARIABLE
-        ));
-        return;
+        )];
     }
     let asked = |text: &str| Asked::text(Request::ShellFiles, text);
+    let mut lines = Vec::new();
     for report in reports {
         match &report.package {
-            Some(package) => output::line(&stdout_line!(
+            Some(package) => lines.push(stdout_line!(
                 "{} {}: {} ({}), editor ABI {}, integration {}, mode managed",
                 report.kind.as_str(),
                 asked(&package.version),
@@ -462,7 +469,7 @@ pub fn print(reports: &[ShellReport]) {
                 asked(&package.editor_abi),
                 asked(&package.integration_version),
             )),
-            None => output::say(&Shown::said(report.kind.as_str())),
+            None => lines.push(stdout_line!("{}", report.kind.as_str())),
         }
         for entry in &report.entries {
             let state = entry.change.map_or(
@@ -473,7 +480,7 @@ pub fn print(reports: &[ShellReport]) {
                 },
                 change_name,
             );
-            output::line(&stdout_line!(
+            lines.push(stdout_line!(
                 "  {}: {} ({})",
                 Asked::path(Request::ShellFiles, &entry.path),
                 state,
@@ -481,6 +488,7 @@ pub fn print(reports: &[ShellReport]) {
             ));
         }
     }
+    lines
 }
 
 /// Returns the stable word for one change.
@@ -498,6 +506,52 @@ pub const fn change_name(change: Change) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::output::planted::{only_asked, only_asked_lines, planted_text};
+    use crate::shown::marker::MARKER;
+
+    /// KR-REQ-23.25: text planted in every field a shell's report holds shows only where the person
+    /// asked for it, which is every one of them: the package's executable, flags, version, editor
+    /// ABI and integration version, and each startup file.
+    #[test]
+    fn planted_text_in_a_shell_report_shows_only_where_it_was_asked_for() {
+        let planted = planted_text();
+        let reports = [ShellKind::Zsh, ShellKind::Bash, ShellKind::Fish]
+            .into_iter()
+            .map(|kind| ShellReport {
+                kind,
+                package: Some(PackageReport {
+                    executable: format!("/{planted}/bin/shell"),
+                    flags: vec![planted.clone(), planted.clone()],
+                    version: planted.clone(),
+                    editor_abi: planted.clone(),
+                    integration_version: planted.clone(),
+                }),
+                entries: vec![EntryReport {
+                    path: format!("/{planted}/.profile"),
+                    reason: "the file an interactive login reads",
+                    installed: true,
+                    change: Some(Change::Added),
+                }],
+            })
+            .collect::<Vec<_>>();
+        let shown = only_asked("kr shell status", &document(&reports));
+        for asked in [
+            "shells[].executable",
+            "shells[].flags[]",
+            "shells[].version",
+            "shells[].editor_abi",
+            "shells[].integration_version",
+            "shells[].entries[].path",
+        ] {
+            assert!(
+                shown.contains(asked),
+                "{asked} shows what was asked for: {shown:?}"
+            );
+        }
+        let said = lines(&reports);
+        only_asked_lines("kr shell status", &said);
+        assert!(said.iter().all(|line| line.text().contains(MARKER)));
+    }
 
     #[test]
     fn every_change_has_a_stable_word() {

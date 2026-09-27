@@ -409,6 +409,44 @@ pub fn is_intact(result: &AgentToolsStatusResult) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::output::planted::{only_asked, only_asked_lines, planted};
+
+    /// KR-REQ-23.25: planted text in the skill's answers shows only where the person asked for it
+    /// (the agent's own files and configuration: the root, each path, entry and entry point, the
+    /// version and the drift the installation reads out of them), in the documents and in the
+    /// lines; a file's digest is said only when it is one.
+    #[test]
+    fn planted_text_in_the_skill_shows_only_where_it_was_asked_for() {
+        let mut shown = std::collections::BTreeSet::new();
+        for result in planted::<AgentToolsInstallResult>() {
+            shown.extend(only_asked("kr skill install", &installed(&result)));
+            only_asked_lines("kr skill install", &install_lines(&result));
+        }
+        for result in planted::<AgentToolsStatusResult>() {
+            shown.extend(only_asked("kr skill status", &reported(&result)));
+            only_asked_lines("kr skill status", &status_lines(&result));
+        }
+        for result in planted::<AgentToolsRemoveResult>() {
+            shown.extend(only_asked("kr skill remove", &removed(&result)));
+            only_asked_lines("kr skill remove", &remove_lines(&result));
+        }
+        for asked in [
+            "root",
+            "skill_version",
+            "entry_point[]",
+            "unresolved[]",
+            "operations[].path",
+            "operations[].entry",
+            "files[].path",
+            "drift[]",
+            "retained[]",
+        ] {
+            assert!(
+                shown.contains(asked),
+                "{asked} shows what was asked for: {shown:?}"
+            );
+        }
+    }
 
     #[test]
     fn an_unknown_agent_names_the_ones_that_are_supported() {
