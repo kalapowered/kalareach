@@ -669,7 +669,20 @@ pub fn stopped(identity: &ProcessStartIdentity) -> Option<bool> {
         }
         Some(info.pbi_status == STOPPED)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    {
+        if !matches!(process_state(identity), ProcessState::Running) {
+            return None;
+        }
+        let stat = std::fs::read_to_string(format!("/proc/{}/stat", identity.pid.get())).ok()?;
+        // The state follows the command's name, which is in parentheses and may hold any byte.
+        let state = stat[stat.rfind(')')? + 1..].trim_start().chars().next()?;
+        if !matches!(process_state(identity), ProcessState::Running) {
+            return None;
+        }
+        Some(matches!(state, 'T' | 't'))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = identity;
         None
