@@ -33,8 +33,9 @@ refusal name the release a program runs.
 
 A program finds its release from the kernel's record of its own image, never from the path it was
 started through, and holds that release for as long as it runs: a shared lock on its release's
-`release.json`. A release is removed only once nothing holds it, and a program whose release is
-being removed does not start:
+`release.json`. A release is removed only once nothing holds it. A program whose release is being
+removed does not start, and neither does one anywhere under `staging/`, whose release is still
+being installed, or one inside a release but outside its `bin/`, which would run it unheld:
 
 ```text
 kr: ~/Library/Application Support/KalaReach/host/trash/0.1.0+aaaaaaaaaaaa-… is being removed from this host, so this program of it does not start
@@ -75,6 +76,13 @@ read-only and current, and says where its programs are: put `current/bin` on you
 release through `kr host update`, which hands its daemons over first. The search path and the
 shells' profiles are yours, or your installer's, to change.
 
+An install holds the update lock throughout, so it waits, exit 9, while another install or update
+of the store runs. It writes the store's record before any program of the release is in the store,
+so each program started from there holds its release from its first moment, and it puts the
+release in `versions/` and makes it current under the install lock, so a control daemon of it
+started meanwhile waits for `current` to name it. An install that stopped between the two is
+finished by installing the same release again; another release under the same name is refused.
+
 ## Updating
 
 ```sh
@@ -85,25 +93,30 @@ kr host versions                             # the releases this host keeps
 
 Only the current release's `kr` updates the host. An update, in order:
 
-1. takes the update lock, so one update runs at a time, and finishes or undoes an update an
-   earlier run left part way;
+1. takes the update lock, so one update runs at a time and `current` stays as it is, checks under
+   it that it is still the current release's `kr`, and finishes or undoes an update an earlier run
+   left part way;
 2. stages the release and checks it, as below;
 3. asks every worker the store's environments describe what it is, and stops nothing: a live
    worker at a compatibility level the new release's control daemon does not speak holds the
    update;
 4. asks each control daemon to prepare, and records how each was started before any is told to
    stop;
-5. once every daemon has stopped, holds the install lock and every environment's lock, and reads
-   every environment's registry: a worker at a level the new release does not retain, a worker
-   that does not answer its challenge and has not ended, and a session still being started each
-   hold the update;
+5. once every daemon has stopped, holds the install lock and reads the store's environments again,
+   so an environment whose daemon started after the first look is found; holds every
+   environment's lock, where a daemon the update did not stop holds the update; and reads every
+   environment's registry: a worker at a level the new release does not retain, a worker that does
+   not answer its challenge and has not ended, and a session still being started each hold the
+   update;
 6. switches `current` in one rename, lets go of the locks, starts each daemon as it was started
    before, now from the new release, and waits for each to answer as a daemon of it;
 7. removes the releases nothing needs: not the current one, not the previous one, not one staged
    for a later update, and not one a running program holds.
 
 An update that is held waits. It starts again every daemon it stopped, from the release still
-current, keeps the new release staged for the next attempt, and exits with 9:
+current, keeps the new release staged for the next attempt, and exits with 9. When a daemon it
+stopped does not start again, it exits with 1 instead, says which, and keeps the update recorded,
+as below:
 
 ```text
 kr: the update to 0.3.0+9f1c2b3a4d5e waits: session 7 runs kr-worker/0.2.0+4254aa6e62e5 with protocol 0.45.0, which the control daemon of 0.3.0+9f1c2b3a4d5e does not speak; run kr host update again once that has changed
@@ -170,14 +183,17 @@ in its log which session it has left running unreached, and why.
 ## When an update stops part way
 
 The store's record says how far an update came, and each daemon's restart is recorded before that
-daemon is told to stop. The next `kr host update` settles an update left part way before anything
-else, by what `current` actually names. Naming the release the update started from, the switch did
-not happen: every daemon the update recorded is started again from it, and the new release stays
-staged. Naming the new release, the switch happened: every recorded daemon that is not running is
-started from it, and one that runs and does not answer as its daemon is named with how to stop it:
+daemon is told to stop. The update stays recorded until every daemon it stopped answers again, so
+a daemon that does not start, before the switch or after it, is started by the next run. The next
+`kr host update` settles an update left part way before anything else, by what `current` actually
+names. Naming the release the update started from, the switch did not happen: every daemon the
+update recorded is started again from it, and the new release stays staged. Naming the new
+release, the switch happened: every recorded daemon that is not running is started from it, and
+one that runs and does not answer as its daemon is named with how to stop it. A daemon that still
+does not start leaves the update recorded, and the run exits with 1:
 
 ```text
-kr: the control daemon of environment 7c9e… (process 4242) is still running and does not answer; stop it with `kill 4242` and run kr host update again
+kr: an update an earlier run left part way is not settled yet: a control daemon it stopped did not start again, and the next kr host update starts it before anything else: the control daemon of environment 7c9e… (process 4242) is still running and does not answer; stop it with `kill 4242` and run kr host update again
 ```
 
 ## Windows

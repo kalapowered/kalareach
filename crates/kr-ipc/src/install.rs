@@ -706,7 +706,8 @@ impl Store {
 #[cfg(unix)]
 impl Store {
     /// Takes the update lock, which one update holds from its first look at the host to its last
-    /// start, when no other update holds it.
+    /// start, when no other update holds it. A first install holds it too, and `current` changes
+    /// only under it ([`Self::switch`]).
     ///
     /// # Errors
     ///
@@ -748,15 +749,22 @@ impl Store {
     /// Makes `release` current: one new link, renamed over `current`, and the store's directory
     /// flushed so the rename survives a crash. Nothing else changes.
     ///
-    /// `held` is the install lock, taken exclusively: nothing starts a control daemon of this
-    /// store while `current` changes.
+    /// `update` is the update lock, so what `current` names stays what an install or an update
+    /// found it to be for as long as that holds it. `install` is the install lock, taken
+    /// exclusively: nothing starts a control daemon of this store while `current` changes.
     ///
     /// # Errors
     ///
     /// Returns [`InstallError::Io`] when the link cannot be made, renamed or flushed, and
     /// [`InstallError::Replaced`] when the release is not in this store.
-    pub fn switch(&self, release: &ReleaseName, held: &StoreLock) -> Result<()> {
-        debug_assert_eq!(held.path, self.root.join("install.lock"));
+    pub fn switch(
+        &self,
+        release: &ReleaseName,
+        update: &StoreLock,
+        install: &StoreLock,
+    ) -> Result<()> {
+        debug_assert_eq!(update.path, self.root.join("update.lock"));
+        debug_assert_eq!(install.path, self.root.join("install.lock"));
         if !self.manifest(release).is_file() {
             return Err(InstallError::Replaced {
                 path: self.release_directory(release),
@@ -1236,10 +1244,15 @@ mod tests {
         install(&test.store, &one);
         install(&test.store, &two);
         assert_eq!(test.store.current().expect("reads"), None);
+        let update = test
+            .store
+            .try_lock_update()
+            .expect("locks")
+            .expect("nothing else updates");
         let held = test.store.lock_install().expect("locks");
-        test.store.switch(&one, &held).expect("switches");
+        test.store.switch(&one, &update, &held).expect("switches");
         assert_eq!(test.store.current().expect("reads"), Some(one.clone()));
-        test.store.switch(&two, &held).expect("switches");
+        test.store.switch(&two, &update, &held).expect("switches");
         assert_eq!(test.store.current().expect("reads"), Some(two.clone()));
         assert_eq!(
             std::fs::read_link(test.store.current_link()).expect("a link"),
@@ -1252,7 +1265,7 @@ mod tests {
         );
         // The control: a release that is not in the store is never made current.
         let absent = release("0.3.0+cccccccccccc");
-        assert!(test.store.switch(&absent, &held).is_err());
+        assert!(test.store.switch(&absent, &update, &held).is_err());
         assert_eq!(test.store.current().expect("reads"), Some(two));
         let leftovers: Vec<_> = std::fs::read_dir(test.store.root())
             .expect("the store")

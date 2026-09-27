@@ -7,7 +7,8 @@
 //!
 //! # An update, in order
 //!
-//! 1. The update lock is taken, so one update runs at a time, and an update an earlier run left
+//! 1. The update lock is taken, so one update runs at a time and `current` stays as it is, and
+//!    this `kr` is checked to be the current release's under it. An update an earlier run left
 //!    part way is settled first, by what `current` actually names ([`recover`]).
 //! 2. The release is staged and checked ([`release`]): signed by the release keys the current
 //!    release's channel root names, every file as listed, for this system, newer than the current
@@ -17,16 +18,20 @@
 //!    (exit 9) and says why.
 //! 4. Each daemon is asked to prepare, and how each was started is recorded durably before any is
 //!    told to stop. A daemon that does not prepare holds the update: the others resume.
-//! 5. Once every daemon has stopped, the install lock and every environment's lock are held, and
-//!    every record of every registry is classed ([`inventory::classify`]). Anything that holds the
-//!    update restarts the daemons it stopped, from the release still current, and the update waits.
+//! 5. Once every daemon has stopped, the install lock is held and the environments are read
+//!    again, so a daemon that started after the first look is found: it holds the update. Every
+//!    environment's lock is held, and every record of every registry is classed
+//!    ([`inventory::classify`]). Anything that holds the update restarts the daemons it stopped,
+//!    from the release still current, and the update waits.
 //! 6. `current` is switched in one rename, the locks are let go, each daemon is started as it was
 //!    before, from the new release, and each is waited for to answer as a daemon of it.
 //! 7. Releases nothing needs are removed: not the current one, not the previous one, not one
 //!    staged for a later update, and not one a running process holds.
 //!
 //! The record of the update under way is written before each step that changes what runs, so a
-//! run that stops part way leaves what the next needs to finish it or undo it.
+//! run that stops part way leaves what the next needs to finish it or undo it. It is let go of
+//! only once every daemon the update stopped answers again: a daemon that does not start keeps it
+//! for the next run, which starts that daemon before anything else.
 
 #[cfg(unix)]
 mod handover;
@@ -36,6 +41,8 @@ mod inventory;
 pub mod release;
 
 use kr_client::shown;
+#[cfg(unix)]
+use kr_client::shown::Said as _;
 use kr_client::shown::Shown;
 use kr_ipc::install::{InstallError, Store};
 use kr_protocol::ids::EnvironmentId;
@@ -396,9 +403,9 @@ impl Updated {
 }
 
 /// The store the running program is a release of, and which release that is, refusing a program
-/// outside a store and one of a release that is not current.
+/// outside a store.
 #[cfg(unix)]
-fn current_release_store() -> Result<(Store, ReleaseName)> {
+fn this_release_store() -> Result<(Store, ReleaseName)> {
     let running = kr_ipc::install::this_process().map_err(|error| CliError::Other(said(error)))?;
     let (Some(store), Some(release)) = (running.store(), running.release()) else {
         return Err(CliError::HostUnavailable(Shown::said(
@@ -406,24 +413,34 @@ fn current_release_store() -> Result<(Store, ReleaseName)> {
              kr host install, and runs as the current release's kr",
         )));
     };
+    Ok((store.clone(), release.clone()))
+}
+
+/// Refuses unless `release` is the store's current release.
+///
+/// Asked under the update lock: `current` changes only under it, so the answer holds until the
+/// lock is let go, and an update that another finished first is refused rather than checked
+/// against the release it replaced.
+#[cfg(unix)]
+fn ensure_current(store: &Store, release: &ReleaseName) -> Result<()> {
     let current = store
         .current()
         .map_err(|error| CliError::Other(said(&error)))?;
-    if current.as_ref() != Some(release) {
-        return Err(CliError::HostUnavailable(match current {
-            Some(current) => shown!(
-                "this kr is of release {}, and this host's current release is {}: run {} instead",
-                crate::shown::release(release),
-                crate::shown::release(&current),
-                Shown::root(&store.stable(kr_ipc::install::Program::Kr))
-            ),
-            None => shown!(
-                "the store at {} names no current release",
-                Shown::root(store.root())
-            ),
-        }));
+    if current.as_ref() == Some(release) {
+        return Ok(());
     }
-    Ok((store.clone(), release.clone()))
+    Err(CliError::HostUnavailable(match current {
+        Some(current) => shown!(
+            "this kr is of release {}, and this host's current release is {}: run {} instead",
+            crate::shown::release(release),
+            crate::shown::release(&current),
+            Shown::root(&store.stable(kr_ipc::install::Program::Kr))
+        ),
+        None => shown!(
+            "the store at {} names no current release",
+            Shown::root(store.root())
+        ),
+    }))
 }
 
 /// `kr host install`: puts the unpacked release `tree` into the store at `root` and makes it
@@ -434,10 +451,16 @@ fn current_release_store() -> Result<(Store, ReleaseName)> {
 /// runs this, from the unpacked tree, so what is installed is the program that installs it; the
 /// search path and the shells' profiles are the person's, or their installer's, to change.
 ///
+/// The store's record is written before any program of the release is in the store, so a program
+/// started from there is a release of the store from its first moment and holds its release, and
+/// the release is published and made current under the install lock, so a control daemon of it
+/// started meanwhile waits for `current` rather than finding none.
+///
 /// # Errors
 ///
-/// Returns a refusal when the tree is not a release this host installs, or the store already has a
-/// current release, and the failure to write the store otherwise.
+/// Returns a refusal when the tree is not a release this host installs, the store already has a
+/// current release, or another install or update of the store is running, and the failure to
+/// write the store otherwise.
 #[cfg(unix)]
 pub fn install(
     tree: Option<&std::path::Path>,
@@ -475,11 +498,25 @@ pub fn install(
         })?,
     };
     let store = Store::at(root);
-    if store.is_store()
-        && store
-            .current()
-            .map_err(|error| CliError::Other(said(&error)))?
-            .is_some()
+    store
+        .create_directories()
+        .map_err(|error| CliError::Other(said(&error)))?;
+    // One install or update of a store at a time, and whether the store has a current release is
+    // decided under the same lock, which every switch of `current` is made under.
+    let update_lock = store
+        .try_lock_update()
+        .map_err(|error| CliError::Other(said(&error)))?
+        .ok_or_else(|| {
+            CliError::UpdateDeferred(shown!(
+                "another install or update of the store at {} is running; run kr host install \
+                 again once it has finished",
+                Shown::root(store.root())
+            ))
+        })?;
+    if store
+        .current()
+        .map_err(|error| CliError::Other(said(&error)))?
+        .is_some()
     {
         return Err(CliError::Usage(shown!(
             "the store at {} already has a current release; install another with kr host update \
@@ -487,19 +524,17 @@ pub fn install(
             Shown::root(store.root())
         )));
     }
-    store
-        .create_directories()
-        .map_err(|error| CliError::Other(said(&error)))?;
-    let staging = store.staging().join(kr_ipc::new_uuid().to_string());
-    let staged = stage_tree(&store, &tree, &staging);
-    let _ = remove_staging(&staging);
-    let (release, has_root) = staged?;
-    // The record last: until it exists nothing takes the directory for a store.
+    // The record first: from here the directory is a store, and a program started from its
+    // `versions/` holds the release it is of.
     Record {
         format: RECORD_FORMAT,
         ..Record::default()
     }
     .write(&store)?;
+    let staging = store.staging().join(kr_ipc::new_uuid().to_string());
+    let staged = stage_tree(&store, &tree, &staging, &update_lock);
+    let _ = remove_staging(&staging);
+    let (release, has_root) = staged?;
     Ok(Installed {
         store,
         release,
@@ -508,11 +543,15 @@ pub fn install(
 }
 
 /// Copies, checks, seals and admits the release at `tree`, and makes it current.
+///
+/// The same release already in `versions/`, as an install stopped before its switch leaves it, is
+/// made current as it is: its manifest, signatures and all, is the one just checked.
 #[cfg(unix)]
 fn stage_tree(
     store: &Store,
     tree: &std::path::Path,
     staging: &std::path::Path,
+    update_lock: &kr_ipc::install::StoreLock,
 ) -> Result<(ReleaseName, bool)> {
     let (staged, written) = release::copy_tree(tree, staging)?;
     let document = release::manifest_document(&staged)?;
@@ -525,13 +564,29 @@ fn stage_tree(
     };
     release::check_files(&manifest, &written)?;
     release::check_system(&manifest)?;
-    release::seal(&staged, &manifest)?;
-    release::admit(&staged, store, &manifest.release)?;
-    let held = store
+    let kept = store.release_directory(&manifest.release).exists();
+    if kept {
+        let document_kept =
+            release::manifest_document(&store.release_directory(&manifest.release))?;
+        if document_kept != document {
+            return Err(CliError::Other(shown!(
+                "the store already holds a release named {} that is not this one",
+                crate::shown::release(&manifest.release)
+            )));
+        }
+    } else {
+        release::seal(&staged, &manifest)?;
+    }
+    // Published and made current under the install lock: a control daemon of the release started
+    // in between waits for `current` to name it.
+    let install = store
         .lock_install()
         .map_err(|error| CliError::Other(said(&error)))?;
+    if !kept {
+        release::admit(&staged, store, &manifest.release)?;
+    }
     store
-        .switch(&manifest.release, &held)
+        .switch(&manifest.release, update_lock, &install)
         .map_err(|error| CliError::Other(said(&error)))?;
     Ok((manifest.release, root.is_some()))
 }
@@ -613,7 +668,7 @@ pub fn versions() -> Result<Vec<Kept>> {
 /// a refusal or a failure otherwise.
 #[cfg(unix)]
 pub async fn update(archive: Option<&std::path::Path>, check: bool) -> Result<Updated> {
-    let (store, source) = current_release_store()?;
+    let (store, source) = this_release_store()?;
     let Some(archive) = archive else {
         return Err(CliError::Usage(Shown::said(
             "this host has no update channel to fetch a release from; name a release archive with \
@@ -629,6 +684,9 @@ pub async fn update(archive: Option<&std::path::Path>, check: bool) -> Result<Up
                  finished",
             ))
         })?;
+    // Only now: what `current` names, the root it carries and its sequence are what this update
+    // is checked against, and another update may have moved it on before this one took the lock.
+    ensure_current(&store, &source)?;
     let mut record = Record::read(&store)?;
     // An update an earlier run left part way is settled first. It never switches `current`, so
     // this kr is still the current release's afterwards.
@@ -703,7 +761,7 @@ pub async fn update(archive: Option<&std::path::Path>, check: bool) -> Result<Up
         restarts: Vec::new(),
     });
     record.write(&store)?;
-    let restarted = hand_over(&store, &mut record, &environments, &target).await?;
+    let restarted = hand_over(&store, &update_lock, &mut record, &environments, &target).await?;
     let removed = collect(&store, &record, &update_lock);
     Ok(Updated {
         source,
@@ -797,6 +855,7 @@ fn deferred(target: &kr_protocol::update::ReleaseManifest, held: Shown) -> CliEr
 #[cfg(unix)]
 async fn hand_over(
     store: &Store,
+    update_lock: &kr_ipc::install::StoreLock,
     record: &mut Record,
     environments: &[inventory::Environment],
     target: &kr_protocol::update::ReleaseManifest,
@@ -837,37 +896,57 @@ async fn hand_over(
         forget_update(store, record);
         return Err(error);
     }
+    let stopped: Vec<EnvironmentId> = prepared
+        .iter()
+        .map(|(environment, _)| environment.environment_id)
+        .collect();
     for (environment, daemon) in prepared {
         handover::stop(daemon, environment, &target.release).await;
     }
-    // The install lock, then every environment's lock in the order of their identities: no daemon
-    // starts in any of them until `current` has been decided.
+    // The install lock: no daemon of this store starts until `current` has been decided.
     let install = match store.lock_install() {
         Ok(install) => install,
         Err(error) => {
-            restart_all(store, record).await;
-            return Err(CliError::Other(said(&error)));
+            gone(environments, &stopped).await;
+            return Err(undo(store, record, CliError::Other(said(&error))).await);
         }
     };
+    // The environments again, now that no daemon can start: one whose daemon started after the
+    // first look recorded its roots before it took its environment, and was never asked to make
+    // way. Each environment's lock, in the order of their identities.
+    let again = match inventory::environments(store) {
+        Ok(again) => again,
+        Err(error) => {
+            drop(install);
+            gone(environments, &stopped).await;
+            return Err(undo(store, record, error).await);
+        }
+    };
+    let every = every_environment(environments, &again);
     let mut held = Vec::new();
     let mut holding: Option<Shown> = None;
-    for environment in environments {
-        match handover::hold(environment).await {
+    let mut failed: Option<CliError> = None;
+    // Every daemon the update stopped is waited for, whatever holds the update or fails: one still
+    // stopping when the update starts again what it stopped would pass for running, then be gone.
+    for environment in &every {
+        let told_to_stop = stopped.contains(&environment.environment_id);
+        match handover::hold(environment, told_to_stop).await {
             Ok(lock) => held.push(lock),
             Err(CliError::UpdateDeferred(said)) => {
-                holding = Some(said);
-                break;
+                holding.get_or_insert(said);
             }
             Err(error) => {
-                drop(held);
-                drop(install);
-                restart_all(store, record).await;
-                return Err(error);
+                failed.get_or_insert(error);
             }
         }
     }
+    if let Some(error) = failed {
+        drop(held);
+        drop(install);
+        return Err(undo(store, record, error).await);
+    }
     if holding.is_none() {
-        for environment in environments {
+        for environment in &every {
             match inventory::classify(environment, target).await {
                 Ok(found) => {
                     if let Some(first) = found.first() {
@@ -878,8 +957,7 @@ async fn hand_over(
                 Err(error) => {
                     drop(held);
                     drop(install);
-                    restart_all(store, record).await;
-                    return Err(error);
+                    return Err(undo(store, record, error).await);
                 }
             }
         }
@@ -887,27 +965,90 @@ async fn hand_over(
     if let Some(held_by) = holding {
         drop(held);
         drop(install);
-        restart_all(store, record).await;
-        return Err(deferred(target, held_by));
+        return Err(undo(store, record, deferred(target, held_by)).await);
     }
-    if let Err(error) = store.switch(&target.release, &install) {
+    if let Err(error) = store.switch(&target.release, update_lock, &install) {
         drop(held);
         drop(install);
-        restart_all(store, record).await;
-        return Err(CliError::Other(said(&error)));
+        return Err(undo(store, record, CliError::Other(said(&error))).await);
     }
-    // From here the switch has happened. A record that cannot say so is left for the next update,
-    // whose recovery reads `current` itself; the daemons are started either way.
+    // From here the switch has happened. The update is settled only once every daemon it stopped
+    // answers as a daemon of the target; until then the record keeps it, and the next run starts
+    // what did not start. A record that cannot say it switched is read right all the same: the
+    // next run goes by what `current` names.
     if let Some(update) = record.update.as_mut() {
         update.state = TransactionState::Switched;
     }
     let written = record.write(store);
     drop(held);
     drop(install);
-    let restarted = start_recorded(store, record).await;
+    let restarted = start_recorded(store, record).await.map_err(|failed| {
+        CliError::Other(shown!(
+            "this host's current release is {} now, and a control daemon the update stopped did \
+             not start from it: {}; the next kr host update starts it before anything else",
+            crate::shown::release(&target.release),
+            failed.said()
+        ))
+    })?;
     written?;
     settle(store, record)?;
-    restarted
+    Ok(restarted)
+}
+
+/// Waits for every daemon the update told to stop, in `environments`, to have gone, as long as
+/// [`handover::hold`] waits for one: a daemon still stopping when the update starts again what it
+/// stopped would pass for running, and then be gone.
+#[cfg(unix)]
+async fn gone(environments: &[inventory::Environment], stopped: &[EnvironmentId]) {
+    for environment in environments
+        .iter()
+        .filter(|environment| stopped.contains(&environment.environment_id))
+    {
+        let _ = handover::hold(environment, true).await;
+    }
+}
+
+/// Every environment an update holds and classes once no daemon can start: those read again under
+/// the install lock, and any the first look found that the second reading did not, in the order of
+/// their identities.
+#[cfg(unix)]
+fn every_environment<'a>(
+    first: &'a [inventory::Environment],
+    again: &'a [inventory::Environment],
+) -> Vec<&'a inventory::Environment> {
+    let mut every: Vec<&inventory::Environment> = again.iter().collect();
+    for known in first {
+        if !again
+            .iter()
+            .any(|found| found.environment_id == known.environment_id)
+        {
+            every.push(known);
+        }
+    }
+    every.sort_by_key(|environment| environment.environment_id.to_string());
+    every
+}
+
+/// Starts again every daemon the update under way stopped, from the release still current, and
+/// returns what ended the update, `ended_by`.
+///
+/// The update is forgotten, what it staged staying staged, only once every one of those daemons
+/// answers. Until then the record keeps it, the next run starts what did not start before anything
+/// else, and what is returned says so.
+#[cfg(unix)]
+async fn undo(store: &Store, record: &mut Record, ended_by: CliError) -> CliError {
+    match start_recorded(store, record).await {
+        Ok(_) => {
+            forget_update(store, record);
+            ended_by
+        }
+        Err(failed) => CliError::Other(shown!(
+            "{}. A control daemon the update stopped did not start again, and the next kr host \
+             update starts it before anything else: {}",
+            ended_by.said(),
+            failed.said()
+        )),
+    }
 }
 
 /// Starts every daemon the update under way recorded, from whatever `current` names now, and waits
@@ -958,7 +1099,7 @@ async fn start_one(store: &Store, restart: &Restart, current: &ReleaseName) -> R
     )
     .is_err();
     if running {
-        return handover::answers_as(&environment, current)
+        return handover::answers_as(&environment, current, None)
             .await
             .map_err(|_| CliError::Other(handover::still_running(&environment)));
     }
@@ -969,7 +1110,7 @@ async fn start_one(store: &Store, restart: &Restart, current: &ReleaseName) -> R
                 paths: environment.paths.clone(),
             };
             crate::startup::open_or_start(&environment.host, &known).await?;
-            handover::answers_as(&environment, current).await
+            handover::answers_as(&environment, current, None).await
         }
         Start::Arguments {
             arguments,
@@ -981,21 +1122,13 @@ async fn start_one(store: &Store, restart: &Restart, current: &ReleaseName) -> R
                 arguments,
                 std::path::Path::new(working_directory),
             )?;
-            let answered = handover::answers_as(&environment, current).await;
+            let answered = handover::answers_as(&environment, current, Some(&mut child)).await;
             // Collected if it has already ended, as one that could not take the environment has;
             // a daemon that runs goes on without this command.
             let _ = child.try_wait();
             answered
         }
     }
-}
-
-/// Starts again every daemon the update under way stopped, from the release still current, and
-/// forgets the update: what it staged stays staged.
-#[cfg(unix)]
-async fn restart_all(store: &Store, record: &mut Record) {
-    let _ = start_recorded(store, record).await;
-    forget_update(store, record);
 }
 
 /// Forgets the update under way, keeping what it staged.
@@ -1050,33 +1183,37 @@ fn restart_of(
     })
 }
 
-/// Settles an update an earlier run left part way, by what `current` actually names.
+/// Settles an update an earlier run left part way, by what `current` actually names. The caller
+/// holds the update lock, so `current` does not change meanwhile.
 ///
 /// Naming the source, the switch never happened: every daemon the update recorded is started
 /// again from the source, and the target stays staged. Naming the target, the switch happened:
 /// every recorded daemon that is not running is started from the target, and one that is running
-/// and does not answer as the target's is named with how to stop it. Either way the update is
-/// then forgotten, and a switch back to the source is an update of its own.
+/// and does not answer as the target's is named with how to stop it. Once every one answers the
+/// update is forgotten, and a switch back to the source is an update of its own; while any does
+/// not, the record keeps the update for the next run.
 #[cfg(unix)]
 async fn recover(store: &Store, record: &mut Record) -> Result<()> {
     let Some(update) = record.update.clone() else {
         return Ok(());
     };
-    let current = {
-        let _install = store
-            .lock_install()
-            .map_err(|error| CliError::Other(said(&error)))?;
-        store
-            .current()
-            .map_err(|error| CliError::Other(said(&error)))?
-    };
-    let started = start_recorded(store, record).await;
+    let current = store
+        .current()
+        .map_err(|error| CliError::Other(said(&error)))?;
+    start_recorded(store, record).await.map_err(|failed| {
+        CliError::Other(shown!(
+            "an update an earlier run left part way is not settled yet: a control daemon it \
+             stopped did not start again, and the next kr host update starts it before anything \
+             else: {}",
+            failed.said()
+        ))
+    })?;
     if current.as_ref() == Some(&update.target) {
-        settle(store, record)?;
+        settle(store, record)
     } else {
         forget_update(store, record);
+        Ok(())
     }
-    started.map(|_| ())
 }
 
 /// Removes every release nothing needs: not the current one, not the previous one, not one staged
@@ -1129,4 +1266,41 @@ fn unsupported() -> CliError {
     CliError::HostUnavailable(Shown::said(
         "this host keeps no store of releases on Windows: its installer replaces the release",
     ))
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    fn environment(environment_id: EnvironmentId, root: &str) -> inventory::Environment {
+        let host =
+            kr_ipc::paths::HostPaths::new(format!("/{root}/runtime"), format!("/{root}/state"))
+                .expect("absolute roots");
+        inventory::Environment {
+            environment_id,
+            paths: host.environment(environment_id),
+            host,
+        }
+    }
+
+    /// An environment whose daemon started after the first look is held and classed with the
+    /// rest, and so is one the first look found that the second reading does not.
+    #[test]
+    fn every_environment_either_reading_found_is_held() {
+        let [one, two, three] = [1_u8, 2, 3]
+            .map(|byte| EnvironmentId::new(kr_protocol::scalars::Uuid::from_bytes([byte; 16])));
+        let first = [environment(one, "one"), environment(two, "two")];
+        let again = [environment(two, "two"), environment(three, "three")];
+        let every: Vec<EnvironmentId> = every_environment(&first, &again)
+            .iter()
+            .map(|environment| environment.environment_id)
+            .collect();
+        assert_eq!(every, vec![one, two, three]);
+        // The control: with nothing new, the first look is what is held.
+        let every: Vec<EnvironmentId> = every_environment(&first, &first)
+            .iter()
+            .map(|environment| environment.environment_id)
+            .collect();
+        assert_eq!(every, vec![one, two]);
+    }
 }

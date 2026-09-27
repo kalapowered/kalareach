@@ -505,10 +505,17 @@ impl Host {
         directory
     }
 
-    /// Makes a release current.
+    /// Makes a release current, under the locks every switch is made under.
     fn switch(&self, name: &ReleaseName) {
-        let held = self.store.lock_install().expect("the install lock");
-        self.store.switch(name, &held).expect("switches");
+        let update = self
+            .store
+            .try_lock_update()
+            .expect("the update lock")
+            .expect("nothing else updates");
+        let install = self.store.lock_install().expect("the install lock");
+        self.store
+            .switch(name, &update, &install)
+            .expect("switches");
     }
 
     /// A program of a release, by its path in the store.
@@ -555,6 +562,25 @@ impl Host {
     /// Runs `kr` of the current release and reads what it printed as JSON.
     fn kr_json(&self, arguments: &[&str]) -> (Output, Value) {
         let output = self.run(&self.store.stable(Program::Kr), arguments);
+        let said = serde_json::from_slice(&output.stdout).unwrap_or(Value::Null);
+        (output, said)
+    }
+
+    /// Runs `kr host update` of the current release with `archive` and `--json`, with a variable
+    /// set that no control daemon of a store starts with: every daemon it starts refuses to run.
+    fn update_whose_daemons_fail(&self, archive: &str) -> (Output, Value) {
+        let output = self
+            .command(
+                &self.store.stable(Program::Kr),
+                &["host", "update", "--archive", archive, "--json"],
+            )
+            .env(
+                kr_shell_integration::host::package::PACKAGE_ROOT_VARIABLE,
+                self.tree.root(),
+            )
+            .stdin(Stdio::null())
+            .output()
+            .expect("kr runs");
         let said = serde_json::from_slice(&output.stdout).unwrap_or(Value::Null);
         (output, said)
     }
@@ -1233,6 +1259,272 @@ async fn an_update_left_after_its_switch_is_finished_by_the_next_run() {
     let record = host.record();
     assert!(record["update"].is_null(), "{record}");
     assert_eq!(record["previous"], one.name().as_str(), "{record}");
+}
+
+/// KR-REQ-26.09: a daemon the update stopped that does not start from the new release keeps the
+/// update recorded, as switched, through every run that meets the same failure; the run after the
+/// failure has gone starts it from the release `current` names and settles the update.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_daemon_that_does_not_start_after_the_switch_keeps_the_update_for_the_next_run() {
+    let mut host = Host::bare();
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
+    let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2);
+    host.install(&one);
+    let started_through_current = host.store.stable(Program::Controller);
+    host.start_daemon(&started_through_current).await;
+    let scratch = host.scratch("archives");
+    let archive = scratch.join("two.tar.gz");
+    two.archive(&scratch, &archive);
+    let archive = archive.display().to_string();
+
+    let (output, said) = host.update_whose_daemons_fail(&archive);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "{said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let message = said["message"].as_str().unwrap_or_default().to_owned();
+    assert!(
+        message.contains(&format!(
+            "this host's current release is {} now, and a control daemon the update stopped did \
+             not start from it",
+            two.name()
+        )),
+        "{said}"
+    );
+    assert!(
+        message.contains("ended with exit code 1 before it answered"),
+        "{said}"
+    );
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(two.name().clone())
+    );
+    let record = host.record();
+    assert_eq!(record["update"]["state"], "switched", "{record}");
+    assert_eq!(
+        record["update"]["restarts"].as_array().map(Vec::len),
+        Some(1),
+        "the daemon's restart is kept: {record}"
+    );
+
+    // A second run that meets the same failure keeps the update as well.
+    let (output, said) = host.update_whose_daemons_fail(&archive);
+    assert_eq!(output.status.code(), Some(1), "{said}");
+    assert!(
+        said["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("an update an earlier run left part way is not settled yet"),
+        "{said}"
+    );
+    assert_eq!(host.record()["update"]["state"], "switched");
+
+    // The control: once the daemon can start, the next run starts it from the release `current`
+    // names, and the update settles.
+    let (output, said) = host.kr_json(&["host", "update", "--archive", &archive, "--json"]);
+    assert!(
+        output.status.success(),
+        "kr host update: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        host.daemon_build().await,
+        format!("kr-controller/{}", two.name())
+    );
+    let record = host.record();
+    assert!(record["update"].is_null(), "{record}");
+    assert_eq!(record["previous"], one.name().as_str(), "{record}");
+}
+
+/// KR-REQ-26.09: an update that a daemon it never stopped holds waits, and when a daemon it did
+/// stop does not start again from the release still current, the update stays recorded; the next
+/// run starts that daemon before anything else, and then updates the host.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_daemon_that_does_not_start_again_before_the_switch_keeps_the_update_for_the_next_run() {
+    let mut host = Host::bare();
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
+    let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2);
+    host.install(&one);
+    let started_through_current = host.store.stable(Program::Controller);
+    host.start_daemon(&started_through_current).await;
+    // A second environment of the store, held by something that is not listening: it was not
+    // there to be asked to make way, so the update stops nothing of it and is held by it.
+    let other = kr_ipc::testing::TempHost::create();
+    host.store
+        .record_roots(other.paths().runtime_root(), other.paths().state_root())
+        .expect("records the other environment's roots");
+    let other_lock = kr_controller::singleton::SingletonLock::hold(
+        &other.environment().singleton_lock(),
+        other.environment_id(),
+    )
+    .expect("holds the other environment");
+    let scratch = host.scratch("archives");
+    let archive = scratch.join("two.tar.gz");
+    two.archive(&scratch, &archive);
+    let archive = archive.display().to_string();
+
+    let (output, said) = host.update_whose_daemons_fail(&archive);
+    assert_eq!(output.status.code(), Some(1), "{said}");
+    let message = said["message"].as_str().unwrap_or_default().to_owned();
+    assert!(
+        message.contains(&format!(
+            "the update to {} waits: a control daemon holds environment {}",
+            two.name(),
+            other.environment_id()
+        )),
+        "{said}"
+    );
+    assert!(
+        message.contains("A control daemon the update stopped did not start again"),
+        "{said}"
+    );
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(one.name().clone())
+    );
+    let record = host.record();
+    assert_eq!(record["update"]["state"], "handing_over", "{record}");
+    assert_eq!(record["staged"], two.name().as_str(), "{record}");
+
+    // The control: once nothing holds the update and the daemon can start, the next run starts it
+    // again from the release that is still current, and then updates the host.
+    drop(other_lock);
+    let (output, said) = host.kr_json(&["host", "update", "--archive", &archive, "--json"]);
+    assert!(
+        output.status.success(),
+        "kr host update: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(said["source"], one.name().as_str(), "{said}");
+    assert_eq!(said["target"], two.name().as_str(), "{said}");
+    assert_eq!(
+        host.daemon_build().await,
+        format!("kr-controller/{}", two.name())
+    );
+    let record = host.record();
+    assert!(record["update"].is_null(), "{record}");
+    assert_eq!(record["previous"], one.name().as_str(), "{record}");
+}
+
+/// KR-REQ-26.09: an install stopped between putting its release in the store and making it
+/// current is finished by the next install of the same release, and no daemon of the release
+/// starts meanwhile; another release under the same name is refused, and an install waits while
+/// another install or update of the store runs.
+#[test]
+fn an_install_stopped_before_its_switch_is_finished_by_the_next() {
+    let host = Host::create();
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
+    // What such an install leaves: the store's record, and the release in `versions/`.
+    host.put(&one);
+    let store = host.store.root().display().to_string();
+    let arguments = host.daemon_arguments();
+    let arguments: Vec<&str> = arguments.iter().map(String::as_str).collect();
+    let refused = host.run(&host.program(one.name(), Program::Controller), &arguments);
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("names no current release"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+
+    let unpacked = |name: &str, assembled: &Assembled| {
+        let tree = host.scratch(name).join(assembled.name().as_str());
+        assembled.write(&tree);
+        tree.join("bin").join(Program::Kr.file_name())
+    };
+    {
+        let _update = host
+            .store
+            .try_lock_update()
+            .expect("locks")
+            .expect("nothing else updates");
+        let waited = host.run(
+            &unpacked("waiting", &one),
+            &["host", "install", "--store", &store],
+        );
+        assert_eq!(waited.status.code(), Some(9));
+        assert!(
+            String::from_utf8_lossy(&waited.stderr)
+                .contains("another install or update of the store"),
+            "{}",
+            String::from_utf8_lossy(&waited.stderr)
+        );
+    }
+    let impostor = Assembled::at_this_level(one.name().as_str(), 5);
+    let refused = host.run(
+        &unpacked("impostor", &impostor),
+        &["host", "install", "--store", &store],
+    );
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr)
+            .contains("already holds a release named 0.1.0+aaaaaaaaaaaa that is not this one"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert_eq!(host.store.current().expect("reads"), None);
+
+    // The control: the same release is made current as it is.
+    host.install(&one);
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(one.name().clone())
+    );
+    assert!(host.record()["update"].is_null());
+}
+
+/// KR-REQ-26.06: a program of a release still being staged does not start once it is runnable,
+/// where an install copies it and where an update unpacks it; the same tree outside the store
+/// starts.
+#[test]
+fn no_program_of_a_release_being_staged_starts() {
+    use std::os::unix::fs::DirBuilderExt as _;
+
+    let host = Host::create();
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
+    let tree = host.scratch("unpacked").join(one.name().as_str());
+    one.write(&tree);
+    let started = host.run(
+        &tree.join("bin").join(Program::Kr.file_name()),
+        &["--version"],
+    );
+    assert!(
+        started.status.success(),
+        "outside the store it starts: {}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let private = |name: &str| {
+        let path = host.store.staging().join(name);
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&path)
+            .expect("a staging directory");
+        path
+    };
+    let (copied, _) = kr_cli::update::release::copy_tree(&tree, &private("copied"))
+        .unwrap_or_else(|error| panic!("copies: {error}"));
+    let archives = host.scratch("archives");
+    let archive = archives.join("one.tar.gz");
+    one.archive(&archives, &archive);
+    let (unpacked, _) = kr_cli::update::release::unpack(&archive, &private("unpacked"))
+        .unwrap_or_else(|error| panic!("unpacks: {error}"));
+    for staged in [copied, unpacked] {
+        kr_cli::update::release::seal(&staged, &one.manifest)
+            .unwrap_or_else(|error| panic!("seals: {error}"));
+        let refused = host.run(
+            &staged.join("bin").join(Program::Kr.file_name()),
+            &["--version"],
+        );
+        assert!(!refused.status.success(), "{}", staged.display());
+        assert!(
+            String::from_utf8_lossy(&refused.stderr).contains("is still being installed"),
+            "{}: {}",
+            staged.display(),
+            String::from_utf8_lossy(&refused.stderr)
+        );
+    }
 }
 
 /// Only the current release's `kr` updates the host: another release's refuses, naming the one to

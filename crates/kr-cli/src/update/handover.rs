@@ -160,14 +160,23 @@ async fn step(
     }
 }
 
-/// Takes an environment's lock once its daemon's process has gone, waiting up to [`DAEMON_STOP`].
+/// Takes an environment's lock: once its daemon's process has gone, waiting up to [`DAEMON_STOP`],
+/// where the update `told_to_stop` its daemon, and at once where it told none.
 ///
 /// # Errors
 ///
-/// Returns a refusal naming the process the lock names when the daemon has not gone by then.
-pub async fn hold(environment: &Environment) -> Result<SingletonLock> {
+/// Returns a refusal naming the process the lock names when a daemon the update stopped has not
+/// gone by then, and one saying a daemon holds the environment where the update stopped none: it
+/// started after the update asked each daemon to make way, or was not listening then, and was
+/// never asked.
+pub async fn hold(environment: &Environment, told_to_stop: bool) -> Result<SingletonLock> {
     let path = environment.paths.singleton_lock();
-    let deadline = tokio::time::Instant::now() + DAEMON_STOP;
+    let deadline = tokio::time::Instant::now()
+        + if told_to_stop {
+            DAEMON_STOP
+        } else {
+            Duration::ZERO
+        };
     loop {
         match SingletonLock::hold(&path, environment.environment_id) {
             Ok(held) => return Ok(held),
@@ -176,8 +185,15 @@ pub async fn hold(environment: &Environment) -> Result<SingletonLock> {
             {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
-            Err(kr_controller::ControllerError::AlreadyRunning { .. }) => {
+            Err(kr_controller::ControllerError::AlreadyRunning { .. }) if told_to_stop => {
                 return Err(CliError::UpdateDeferred(still_running(environment)));
+            }
+            Err(kr_controller::ControllerError::AlreadyRunning { .. }) => {
+                return Err(CliError::UpdateDeferred(shown!(
+                    "a control daemon holds environment {}, and it was not listening when the \
+                     update asked each daemon to make way",
+                    environment.environment_id
+                )));
             }
             Err(error) => {
                 return Err(CliError::Other(shown!(
@@ -211,10 +227,18 @@ pub fn still_running(environment: &Environment) -> Shown {
 
 /// Waits up to [`DAEMON_START`] for an environment's daemon to answer as a daemon of `target`.
 ///
+/// `started` is the process this run started to be that daemon, where it started one: once it has
+/// ended and no other daemon holds the environment, nothing is going to answer, and the wait ends
+/// there.
+///
 /// # Errors
 ///
 /// Returns a failure naming what answered instead, or that nothing did.
-pub async fn answers_as(environment: &Environment, target: &ReleaseName) -> Result<()> {
+pub async fn answers_as(
+    environment: &Environment,
+    target: &ReleaseName,
+    mut started: Option<&mut std::process::Child>,
+) -> Result<()> {
     let endpoint = environment.paths.controller_endpoint()?;
     let expected = format!("kr-controller/{target}");
     let deadline = tokio::time::Instant::now() + DAEMON_START;
@@ -245,6 +269,35 @@ pub async fn answers_as(environment: &Environment, target: &ReleaseName) -> Resu
                 ),
                 crate::shown::release(target)
             )));
+        }
+        if let Some(child) = started.as_deref_mut()
+            && let Ok(Some(status)) = child.try_wait()
+        {
+            if SingletonLock::hold(
+                &environment.paths.singleton_lock(),
+                environment.environment_id,
+            )
+            .is_ok()
+            {
+                let how = match (
+                    status.code(),
+                    std::os::unix::process::ExitStatusExt::signal(&status),
+                ) {
+                    (Some(code), _) => shown!("with exit code {}", code),
+                    (None, Some(signal)) => shown!("on signal {}", signal),
+                    (None, None) => Shown::said("for a reason its status does not say"),
+                };
+                return Err(CliError::Other(shown!(
+                    "the control daemon of environment {} ended {} before it answered; what it \
+                     wrote is in its log in {}",
+                    environment.environment_id,
+                    how,
+                    Shown::root(environment.paths.state_dir())
+                )));
+            }
+            // Another daemon holds the environment, which is why this one ended: that one is
+            // waited for.
+            started = None;
         }
         if tokio::time::Instant::now() >= deadline {
             return Err(CliError::Other(shown!(
