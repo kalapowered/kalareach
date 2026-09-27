@@ -252,6 +252,25 @@ impl InFlight {
     pub fn total(&self) -> u64 {
         self.total.load(Ordering::Acquire)
     }
+
+    /// Returns how many jobs are in flight for one session, or why that cannot be read.
+    ///
+    /// A count left locked by a call that failed is not a count of nought, and privacy mode's
+    /// reconciliation reads it through this.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Unavailable`] when the count was left locked by a call that failed.
+    pub fn read(&self, session_id: &SessionId) -> Result<u64, Unavailable> {
+        self.by_session
+            .lock()
+            .map(|held| held.get(session_id).copied().unwrap_or(0))
+            .map_err(|_| {
+                Unavailable::new(
+                    "the count of description jobs in flight was left locked by a call that failed",
+                )
+            })
+    }
 }
 
 /// The job the runtime is executing right now, and the token that cancels it.
@@ -366,6 +385,24 @@ impl CleanupDebt {
             .and_then(|held| held.get(session_id).cloned())
     }
 
+    /// Returns why a session's cleanup is outstanding, when it is, or why that cannot be read.
+    ///
+    /// A record left locked by a call that failed is not a record of nothing owed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Unavailable`] when the record was left locked by a call that failed.
+    pub fn read(&self, session_id: &SessionId) -> Result<Option<String>, Unavailable> {
+        self.owed
+            .lock()
+            .map(|held| held.get(session_id).cloned())
+            .map_err(|_| {
+                Unavailable::new(
+                    "the record of description cleanup owed was left locked by a call that failed",
+                )
+            })
+    }
+
     /// Returns how many sessions have cleanup outstanding.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -455,7 +492,7 @@ impl PrivacySubsystem for DescriptionPrivacy<'_> {
     ) -> Result<Cancelled, Unavailable> {
         Ok(Cancelled {
             undispatched: u64::from(self.scheduler.cancel(&self.session_id)),
-            in_flight: self.in_flight.get(&self.session_id),
+            in_flight: self.in_flight.read(&self.session_id)?,
         })
     }
 
@@ -491,10 +528,10 @@ impl PrivacySubsystem for DescriptionPrivacy<'_> {
     }
 
     fn outstanding(&self) -> Result<u64, Unavailable> {
-        if let Some(owed) = self.debt.owed(&self.session_id) {
+        if let Some(owed) = self.debt.read(&self.session_id)? {
             return Err(Unavailable::new(owed));
         }
-        Ok(self.in_flight.get(&self.session_id))
+        self.in_flight.read(&self.session_id)
     }
 
     fn kept(&self) -> Vec<KeptExplicitly> {
