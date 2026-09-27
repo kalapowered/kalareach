@@ -132,8 +132,9 @@ struct Stage<'a, 'r> {
     /// The local dates `{date}` stands for in the build list's paths: the day the part started and
     /// the next.
     dates: &'a [String],
-    /// When the part chose its mark: no file written before then can hold it.
-    started: std::time::SystemTime,
+    /// The files under the agent's conversation roots as the part found them before anything
+    /// started: one that is still as it was cannot hold the part's mark.
+    conversations_before: &'a Inventory,
     /// What each probe that stands in for the vendor's model service found the agent offer its
     /// model: the tools' kinds and names, which say what of the person's own it loaded.
     offered: &'a std::sync::Mutex<Vec<serde_json::Value>>,
@@ -147,7 +148,6 @@ struct Shared<'a> {
     held: &'a std::sync::atomic::AtomicBool,
     declined: &'a std::sync::Mutex<Vec<String>>,
     dates: &'a [String],
-    started: std::time::SystemTime,
     offered: &'a std::sync::Mutex<Vec<serde_json::Value>>,
 }
 
@@ -667,7 +667,6 @@ fn staged(
         }
     };
     let runtime = runtime();
-    let started = std::time::SystemTime::now();
     let mark = nonce();
     let dates = local_dates();
     let directories = login
@@ -759,7 +758,6 @@ fn staged(
                 held: &held,
                 declined: &declined,
                 dates: &dates,
-                started,
                 offered: &offered,
             },
             guards.as_ref(),
@@ -1236,7 +1234,6 @@ fn run_part(
         held,
         declined,
         dates,
-        started,
         offered,
     }: Shared<'_>,
     guards: Option<&Guards>,
@@ -1288,6 +1285,10 @@ fn run_part(
         }
         let ending = {
             let _watching = StopWatching(guards);
+            // The conversation roots' files before the agent starts.
+            let conversations_before = login.map_or_else(Inventory::new, |login| {
+                inventory(&roots_of_conversations(login, run, dates))
+            });
             let mut stage = Stage {
                 build: &inputs.build,
                 run,
@@ -1302,7 +1303,7 @@ fn run_part(
                 held,
                 declined,
                 dates,
-                started,
+                conversations_before: &conversations_before,
                 offered,
                 guards,
             };
@@ -1713,19 +1714,61 @@ fn prepare_login(stage: &Stage<'_, '_>) -> (Installation, Variables, Variables) 
 /// directory of the run's own where it has one, and under the home it runs with otherwise; one
 /// directory for each of the part's dates where the build list's path has `{date}`.
 fn conversation_roots(stage: &Stage<'_, '_>) -> Vec<PathBuf> {
-    let login = stage.login.expect("a part with a login");
-    let base = if login.account.config_directory.is_some() {
-        stage.run.root().join(CONFIG_DIRECTORY)
-    } else {
-        login_home(stage)
-    };
-    with_dates(
-        std::slice::from_ref(&login.account.conversations),
+    roots_of_conversations(
+        stage.login.expect("a part with a login"),
+        stage.run,
         stage.dates,
     )
-    .iter()
-    .map(|relative| base.join(relative))
-    .collect()
+}
+
+/// Where the agent keeps its conversations for a part with `login` in `run`, on `dates`.
+fn roots_of_conversations(login: &Login, run: &Run, dates: &[String]) -> Vec<PathBuf> {
+    let base = if login.account.config_directory.is_some() {
+        run.root().join(CONFIG_DIRECTORY)
+    } else {
+        match login.account.home {
+            AccountHome::Run => run.home(),
+            AccountHome::Person => login.person_home.clone(),
+        }
+    };
+    with_dates(std::slice::from_ref(&login.account.conversations), dates)
+        .iter()
+        .map(|relative| base.join(relative))
+        .collect()
+}
+
+/// The files under a part's conversation roots, each with its length, modification time and
+/// inode, as the part found them before its agent started.
+type Inventory = std::collections::HashMap<PathBuf, FileState>;
+
+/// A file's length, modification time and inode, where its metadata could be read.
+type FileState = (u64, Option<std::time::SystemTime>, u64);
+
+/// A file's [`FileState`] now.
+fn file_state(path: &Path) -> Option<FileState> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path)
+        .ok()
+        .map(|metadata| (metadata.len(), metadata.modified().ok(), metadata.ino()))
+}
+
+/// The files under `roots` now, each with its [`FileState`]; a file whose metadata cannot be read
+/// is left out, so it is read at every search.
+fn inventory(roots: &[PathBuf]) -> Inventory {
+    let mut found = Inventory::new();
+    let mut pending = roots.to_vec();
+    while let Some(path) = pending.pop() {
+        if path.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(&path) {
+                pending.extend(entries.flatten().map(|entry| entry.path()));
+            }
+            continue;
+        }
+        if let Some(state) = file_state(&path) {
+            found.insert(path, state);
+        }
+    }
+    found
 }
 
 /// The local dates a part's `{date}` stands for, as `YYYY/MM/DD`: today, as the system's own clock
@@ -2581,20 +2624,17 @@ fn image_input(account: &Account, file: &Path) -> String {
     }
 }
 
-/// The lines of the files under `roots` that hold both `needle` and `marker`, by file. Only files
-/// written since `since`, when the part chose the mark a needle carries, are read: an agent's
+/// The lines of the files under `roots` that hold both `needle` and `marker`, by file. A file still
+/// as `before` found it before the agent started, with the same length, modification time and
+/// inode, cannot hold the part's mark, which a needle carries, and is not read: an agent's
 /// directory of the day can hold hundreds of megabytes of the person's own conversations, and
-/// reading them all at every look would take seconds. A file whose time cannot be read is read.
+/// reading them all at every look would take seconds. Every other file is read, whatever its time.
 fn conversation_lines(
     roots: &[PathBuf],
     needle: &str,
     marker: &str,
-    since: std::time::SystemTime,
+    before: &Inventory,
 ) -> Vec<(PathBuf, usize)> {
-    // File times are coarse on some file systems, and the clock may step a little.
-    let since = since
-        .checked_sub(Duration::from_secs(2))
-        .unwrap_or(std::time::UNIX_EPOCH);
     let mut found = Vec::new();
     let mut pending = roots.to_vec();
     while let Some(path) = pending.pop() {
@@ -2604,9 +2644,9 @@ fn conversation_lines(
             }
             continue;
         }
-        if std::fs::metadata(&path)
-            .and_then(|metadata| metadata.modified())
-            .is_ok_and(|modified| modified < since)
+        if before
+            .get(&path)
+            .is_some_and(|earlier| file_state(&path).as_ref() == Some(earlier))
         {
             continue;
         }
@@ -4230,9 +4270,9 @@ fn conversation_of(
     roots: &[PathBuf],
     needle: &str,
     marker: &str,
-    since: std::time::SystemTime,
+    before: &Inventory,
 ) -> Option<PathBuf> {
-    match conversation_lines(roots, needle, marker, since).as_slice() {
+    match conversation_lines(roots, needle, marker, before).as_slice() {
         [(file, _)] => Some(file.clone()),
         _ => None,
     }
@@ -4244,7 +4284,7 @@ fn recorded(stage: &Stage<'_, '_>, roots: &[PathBuf], needle: &str, marker: &str
     let started = std::time::Instant::now();
     loop {
         guards_hold_while_waiting(stage);
-        if let Some(file) = conversation_of(roots, needle, marker, stage.started) {
+        if let Some(file) = conversation_of(roots, needle, marker, stage.conversations_before) {
             return file;
         }
         assert!(
@@ -5079,14 +5119,18 @@ fn a_local_and_a_remote_answer_raced_to_one_approval_resolve_it_once() {
         let ran = executions(&log, &tag);
         loser_reached_nothing(ran).unwrap_or_else(|why| panic!("one resolution: {why}"));
         let conversations = conversation_roots(stage);
-        let conversation =
-            conversation_of(&conversations, &mark, &account.prompt_line, stage.started)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "one conversation under {} holds the command",
-                        listed(&conversations)
-                    )
-                });
+        let conversation = conversation_of(
+            &conversations,
+            &mark,
+            &account.prompt_line,
+            stage.conversations_before,
+        )
+        .unwrap_or_else(|| {
+            panic!(
+                "one conversation under {} holds the command",
+                listed(&conversations)
+            )
+        });
         let prompt_at = first_line_with(&conversation, None, &[&mark, &account.prompt_line]);
         let decided = decisions(
             stage,
@@ -5254,14 +5298,22 @@ fn a_local_and_a_remote_answer_raced_to_one_approval_resolve_it_once() {
             ),
             decided + 1,
         );
-        let control = loser_reached_nothing(executions(&log, &second));
+        let control_executions = executions(&log, &second);
+        let control = loser_reached_nothing(control_executions);
         assert_eq!(
             refusals(stage),
             refused_before,
             "the control: the agent asked for nothing but the second approval"
         );
+        // The denial is the lease holder's: the command never ran, the device's allow was refused
+        // for the lease, and the conversation records the denial as one more answer.
         assert!(
-            control.is_err() && device_refused.is_some() && decided_control == decided + 1,
+            control.is_err()
+                && control_executions == 0
+                && device_refused
+                    .as_deref()
+                    .is_some_and(|detail| detail.contains("LEASE_LOST"))
+                && decided_control == decided + 1,
             "the check fails once the other side holds the lease: {control:?}, the device's answer \
              {device_refused:?}, and the conversation records the denial as one more answer \
              ({decided_control} after {decided})"
@@ -5368,9 +5420,12 @@ fn a_disconnection_after_the_agent_took_a_prompt_leaves_one_reply_and_no_duplica
                 code_seen |= rows.iter().any(|row| row.contains(&code_start));
                 reached |= code_seen || marks(&rows) > marks_before;
             }
-            if let Some(file) =
-                conversation_of(&conversations, &mark, &account.prompt_line, stage.started)
-            {
+            if let Some(file) = conversation_of(
+                &conversations,
+                &mark,
+                &account.prompt_line,
+                stage.conversations_before,
+            ) {
                 break file;
             }
             assert!(
@@ -5591,15 +5646,19 @@ fn a_second_process_on_the_same_saved_conversation_is_another_execution_not_merg
         );
         let _ = first.answered(stage, &sum, "session A is answered");
         let _ = first.wait_idle(stage, "session A is back at its composer");
-        let conversation =
-            conversation_of(&conversations, &mark, &account.prompt_line, stage.started)
-                .map(|file| conversation_id(&file))
-                .unwrap_or_else(|| {
-                    panic!(
-                        "one conversation under {} holds the code",
-                        listed(&conversations)
-                    )
-                });
+        let conversation = conversation_of(
+            &conversations,
+            &mark,
+            &account.prompt_line,
+            stage.conversations_before,
+        )
+        .map(|file| conversation_id(&file))
+        .unwrap_or_else(|| {
+            panic!(
+                "one conversation under {} holds the code",
+                listed(&conversations)
+            )
+        });
         let resume: Vec<String> = account
             .resume
             .iter()
@@ -5885,52 +5944,46 @@ fn kill_and_wait(processes: &[ProcessStartIdentity]) -> bool {
     true
 }
 
-/// The conversation search reads only files written since the part chose its mark: one written
-/// before, even one that holds the needle, is not read, and one written since is.
+/// The conversation search skips only files still as they were before the agent started: one
+/// unchanged, even one that holds the needle, is not read; one new, even with a modification time
+/// older than the part, or one that changed, is.
 #[test]
-fn a_conversation_search_reads_only_files_written_since_the_part_began() {
+fn a_conversation_search_skips_only_files_unchanged_since_before_the_agent_started() {
     let root = std::env::temp_dir().join(format!("kr-conversations-{}", nonce()));
     let day = root.join("2026").join("09").join("27");
     std::fs::create_dir_all(&day).expect("a day's directory");
-    let old = day.join("old.jsonl");
-    std::fs::write(&old, "{\"role\":\"user\",\"text\":\"kr0123\"}\n").expect("an old file");
-    let an_hour_ago = std::time::SystemTime::now() - Duration::from_secs(3600);
-    std::fs::File::options()
-        .write(true)
-        .open(&old)
-        .and_then(|file| file.set_times(std::fs::FileTimes::new().set_modified(an_hour_ago)))
-        .expect("the old file's time");
-    let since = std::time::SystemTime::now() - Duration::from_secs(60);
+    let line = "{\"role\":\"user\",\"text\":\"kr0123\"}\n";
+    let marker = "\"role\":\"user\"";
+    let set_old_time = |path: &Path| {
+        let an_hour_ago = std::time::SystemTime::now() - Duration::from_secs(3600);
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .and_then(|file| file.set_times(std::fs::FileTimes::new().set_modified(an_hour_ago)))
+            .expect("a file's time");
+    };
+    let unchanged = day.join("unchanged.jsonl");
+    std::fs::write(&unchanged, line).expect("a file there before");
+    let appended = day.join("appended.jsonl");
+    std::fs::write(&appended, "{\"role\":\"user\",\"text\":\"theirs\"}\n").expect("another file");
+    let before = inventory(std::slice::from_ref(&root));
     assert_eq!(
-        conversation_lines(
-            std::slice::from_ref(&root),
-            "kr0123",
-            "\"role\":\"user\"",
-            since
-        ),
+        conversation_lines(std::slice::from_ref(&root), "kr0123", marker, &before),
         Vec::<(PathBuf, usize)>::new(),
-        "a file written before the part began is not read"
+        "a file still as it was before the agent started is not read, whatever it holds"
     );
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&appended)
+        .and_then(|mut file| std::io::Write::write_all(&mut file, line.as_bytes()))
+        .expect("an appended line");
     let new = day.join("new.jsonl");
-    std::fs::write(&new, "{\"role\":\"user\",\"text\":\"kr0123\"}\n").expect("a new file");
+    std::fs::write(&new, line).expect("a new file");
+    set_old_time(&new);
     assert_eq!(
-        conversation_lines(
-            std::slice::from_ref(&root),
-            "kr0123",
-            "\"role\":\"user\"",
-            since
-        ),
-        vec![(new.clone(), 1)]
-    );
-    assert_eq!(
-        conversation_lines(
-            std::slice::from_ref(&root),
-            "kr0123",
-            "\"role\":\"user\"",
-            std::time::UNIX_EPOCH
-        ),
-        vec![(new, 1), (old, 1)],
-        "from the start of time both are read"
+        conversation_lines(std::slice::from_ref(&root), "kr0123", marker, &before),
+        vec![(appended, 1), (new, 1)],
+        "a changed file and a new one are read, the new one though its time is older than the part"
     );
     let _ = std::fs::remove_dir_all(&root);
 }
