@@ -9,13 +9,17 @@
 //! table alone and the receipt table with results and a closure - and nothing else. It reads a
 //! journal once, forward only, in one transaction:
 //!
-//! * the version, every object in the file, every column of every table and every row are checked
-//!   against those shapes, and anything else is refused by name: a version, an object, a column,
-//!   a row;
+//! * the version, and every object in the file against the statement one of those builds ran to
+//!   make it, are checked, and anything else is refused by name: a version, an object no build
+//!   made, one that is missing, one whose statement differs - a constraint or a column added, an
+//!   index on something else;
+//! * every row is read as the current build reads it, a receipt through the journal's own reader,
+//!   so a row the running host would refuse is refused here instead;
 //! * the receipts gain the columns later versions added, every object of the current schema is
 //!   created from the journal's own definition of it, the starting privacy record is written and
 //!   the version is set;
-//! * the result is checked against a fresh current schema before anything is committed.
+//! * the result - its tables' columns and every index, its receipts read again - is checked
+//!   against a fresh current schema before anything is committed.
 //!
 //! Any failure rolls the transaction back, so a refused journal is left exactly as it was. An
 //! imported journal records the current version, so it is never read in its old shape again.
@@ -43,6 +47,19 @@ pub const IMPORTS: i64 = 1;
 /// The importer runs while the environment's daemon is stopped, so nothing should hold the file;
 /// a holder that does is answered with a refusal rather than waited for without end.
 const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+#[cfg(feature = "testing")]
+thread_local! {
+    /// Whether the next import on this thread stops after its changes and before its commit.
+    static STOP_BEFORE_THE_COMMIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Stops the next import this thread runs after every change it makes and before its commit, as a
+/// failure there would, for this host's own tests. It is compiled away in every shipped build.
+#[cfg(feature = "testing")]
+pub fn stop_the_next_import_before_its_commit() {
+    STOP_BEFORE_THE_COMMIT.with(|stop| stop.set(true));
+}
 
 /// What importing one journal came to.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -102,19 +119,26 @@ pub enum ImportRefusal {
         /// Its name.
         name: String,
     },
-    /// A table version 1 always had is missing.
-    #[error("this journal records version 1 and has no {table} table")]
-    MissingTable {
-        /// The table.
-        table: String,
+    /// An object the build that wrote this journal always made is missing.
+    #[error("this journal records version 1 and has no {kind} {name}")]
+    Missing {
+        /// What kind of object it is.
+        kind: String,
+        /// Its name.
+        name: String,
     },
-    /// A table's columns are not the ones version 1 made.
-    #[error("the {table} table is not the one version 1 made: {detail}")]
-    Columns {
-        /// The table.
-        table: String,
-        /// What differs.
-        detail: String,
+    /// An object is not the one a build recording version 1 made: its statement differs.
+    #[error(
+        "the {kind} {name} is not the one a build recording version 1 made: it is made by \
+         {found:?}"
+    )]
+    Definition {
+        /// What kind of object it is.
+        kind: String,
+        /// Its name.
+        name: String,
+        /// The statement that made it, as the file keeps it.
+        found: String,
     },
     /// A row cannot be read by this build.
     #[error("a row of the {table} table cannot be read: {detail}")]
@@ -172,13 +196,7 @@ pub fn import_journal(path: impl AsRef<Path>) -> Result<Imported, ImportRefusal>
             reads: IMPORTS,
         });
     }
-    let second_shape = check_objects(&transaction)?;
-    check_columns(&transaction, "schema_version", SCHEMA_VERSION_COLUMNS)?;
-    check_columns(&transaction, "receipts", RECEIPTS_COLUMNS)?;
-    if second_shape {
-        check_columns(&transaction, "results", RESULTS_COLUMNS)?;
-        check_columns(&transaction, "closure", CLOSURE_COLUMNS)?;
-    }
+    let second_shape = check_statements(&transaction)?;
     let receipts = check_receipts(&transaction)?;
     if second_shape {
         check_results(&transaction)?;
@@ -209,12 +227,21 @@ pub fn import_journal(path: impl AsRef<Path>) -> Result<Imported, ImportRefusal>
             detail: difference(&expected, &produced),
         });
     }
-    let kept: i64 = transaction
-        .query_row("SELECT COUNT(*) FROM receipts", [], |row| row.get(0))
-        .map_err(unreadable)?;
-    if u64::try_from(kept).unwrap_or(0) != receipts {
+    // Every receipt, read as the running host reads one, in the shape it will be read in.
+    let kept =
+        crate::journal::read_every_receipt(&transaction).map_err(|detail| ImportRefusal::Row {
+            table: "receipts".to_owned(),
+            detail,
+        })?;
+    if kept != receipts {
         return Err(ImportRefusal::Result {
             detail: format!("{receipts} receipts were read and {kept} are there"),
+        });
+    }
+    #[cfg(feature = "testing")]
+    if STOP_BEFORE_THE_COMMIT.with(|stop| stop.replace(false)) {
+        return Err(ImportRefusal::Unreadable {
+            detail: "a test stopped this import after its changes and before its commit".to_owned(),
         });
     }
     transaction.commit().map_err(unreadable)?;
@@ -225,38 +252,73 @@ pub fn import_journal(path: impl AsRef<Path>) -> Result<Imported, ImportRefusal>
     })
 }
 
-/// One column as a build recording version 1 made it: its name, its declared type, whether it is
-/// `NOT NULL`, and its place in the primary key, nought for none.
-type Column = (&'static str, &'static str, bool, i64);
-
-const SCHEMA_VERSION_COLUMNS: &[Column] = &[("version", "INTEGER", true, 0)];
-
-const RECEIPTS_COLUMNS: &[Column] = &[
-    ("actor_id", "TEXT", true, 1),
-    ("action_id", "BLOB", true, 2),
-    ("method", "TEXT", true, 0),
-    ("method_version", "INTEGER", true, 0),
-    ("revision", "INTEGER", true, 0),
-    ("state", "TEXT", true, 0),
-    ("reason", "TEXT", false, 0),
-    ("payload_digest", "BLOB", true, 0),
-    ("accepted_deadline_ms", "INTEGER", false, 0),
-    ("error_code", "TEXT", false, 0),
-    ("error_message", "TEXT", false, 0),
-    ("created_at_ms", "INTEGER", true, 0),
-    ("updated_at_ms", "INTEGER", true, 0),
+/// The statement each object of the two version 1 shapes was made by, as the build that made it
+/// spelled it. SQLite keeps each statement as it was run, without its `IF NOT EXISTS`, and the
+/// comparison reads both with their white space collapsed.
+///
+/// The first build made the version, the receipts and their index
+/// (`927ecc84d5f2ed3575705510bca563f093e031d2`); the second made the same three and added the
+/// results and the closure (`a665d5e6cf8f898e03018fccce567abcae83b020`). No other build recorded
+/// version 1.
+const FIRST_SHAPE: &[(&str, &str, &str)] = &[
+    (
+        "table",
+        "schema_version",
+        "CREATE TABLE schema_version (version INTEGER NOT NULL)",
+    ),
+    (
+        "table",
+        "receipts",
+        "CREATE TABLE receipts (
+                     actor_id             TEXT    NOT NULL,
+                     action_id            BLOB    NOT NULL,
+                     method               TEXT    NOT NULL,
+                     method_version       INTEGER NOT NULL,
+                     revision             INTEGER NOT NULL,
+                     state                TEXT    NOT NULL,
+                     reason               TEXT,
+                     payload_digest       BLOB    NOT NULL,
+                     accepted_deadline_ms INTEGER,
+                     error_code           TEXT,
+                     error_message        TEXT,
+                     created_at_ms        INTEGER NOT NULL,
+                     updated_at_ms        INTEGER NOT NULL,
+                     PRIMARY KEY (actor_id, action_id)
+                 )",
+    ),
+    (
+        "index",
+        "receipts_created_at",
+        "CREATE INDEX receipts_created_at ON receipts (created_at_ms)",
+    ),
 ];
 
-const RESULTS_COLUMNS: &[Column] = &[
-    ("actor_id", "TEXT", true, 1),
-    ("action_id", "BLOB", true, 2),
-    ("result", "BLOB", true, 0),
+/// What the second build added to [`FIRST_SHAPE`].
+const SECOND_SHAPE_ADDS: &[(&str, &str, &str)] = &[
+    (
+        "table",
+        "results",
+        "CREATE TABLE results (
+                     actor_id  TEXT NOT NULL,
+                     action_id BLOB NOT NULL,
+                     result    BLOB NOT NULL,
+                     PRIMARY KEY (actor_id, action_id)
+                 )",
+    ),
+    (
+        "table",
+        "closure",
+        "CREATE TABLE closure (
+                     session_id BLOB PRIMARY KEY,
+                     record     BLOB NOT NULL
+                 )",
+    ),
 ];
 
-const CLOSURE_COLUMNS: &[Column] = &[
-    ("session_id", "BLOB", false, 1),
-    ("record", "BLOB", true, 0),
-];
+/// A statement with its white space collapsed, which is how two spellings of one are compared.
+fn collapsed(statement: &str) -> String {
+    statement.split_whitespace().collect::<Vec<_>>().join(" ")
+}
 
 /// Reads the one version the file records.
 fn recorded_version(connection: &Connection) -> Result<i64, ImportRefusal> {
@@ -293,14 +355,15 @@ fn recorded_version(connection: &Connection) -> Result<i64, ImportRefusal> {
     }
 }
 
-/// Checks every object in the file against the two version 1 shapes, and says which it is.
+/// Checks every object in the file against the statement a build recording version 1 made it
+/// by, and says which of the two shapes the file is: `true` for the second.
 ///
-/// SQLite's own objects - its internal tables and the indexes it makes for a primary key - are
-/// its, not a build's, and are not asked about.
-fn check_objects(connection: &Connection) -> Result<bool, ImportRefusal> {
-    let objects: Vec<(String, String, String)> = {
+/// SQLite's own objects - its internal tables and the indexes it makes for a key - follow from the
+/// tables' statements, so they are not asked about separately.
+fn check_statements(connection: &Connection) -> Result<bool, ImportRefusal> {
+    let objects: Vec<(String, String, Option<String>)> = {
         let mut statement = connection
-            .prepare("SELECT type, name, tbl_name FROM sqlite_master")
+            .prepare("SELECT type, name, sql FROM sqlite_master")
             .map_err(unreadable)?;
         statement
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
@@ -308,97 +371,47 @@ fn check_objects(connection: &Connection) -> Result<bool, ImportRefusal> {
             .collect::<rusqlite::Result<_>>()
             .map_err(unreadable)?
     };
-    let mut tables = BTreeSet::new();
-    for (kind, name, table) in &objects {
+    let mut found = BTreeSet::new();
+    for (kind, name, made_by) in &objects {
         if name.starts_with("sqlite_") {
             continue;
         }
-        let known = match kind.as_str() {
-            "table" => {
-                ["schema_version", "receipts", "results", "closure"].contains(&name.as_str())
-            }
-            "index" => name == "receipts_created_at" && table == "receipts",
-            _ => false,
-        };
-        if !known {
+        let Some((_, _, statement)) = FIRST_SHAPE
+            .iter()
+            .chain(SECOND_SHAPE_ADDS)
+            .find(|(known_kind, known_name, _)| known_kind == kind && known_name == name)
+        else {
             return Err(ImportRefusal::UnknownObject {
                 kind: kind.clone(),
                 name: name.clone(),
             });
-        }
-        if kind == "table" {
-            tables.insert(name.as_str());
-        }
-    }
-    if !tables.contains("receipts") {
-        return Err(ImportRefusal::MissingTable {
-            table: "receipts".to_owned(),
-        });
-    }
-    // The second shape had both tables, because one build made both.
-    match (tables.contains("results"), tables.contains("closure")) {
-        (true, true) => Ok(true),
-        (false, false) => Ok(false),
-        (true, false) => Err(ImportRefusal::MissingTable {
-            table: "closure".to_owned(),
-        }),
-        (false, true) => Err(ImportRefusal::MissingTable {
-            table: "results".to_owned(),
-        }),
-    }
-}
-
-/// Checks a table's columns against the ones version 1 made, in name, type, nullability and key.
-fn check_columns(
-    connection: &Connection,
-    table: &str,
-    expected: &[Column],
-) -> Result<(), ImportRefusal> {
-    let found: Vec<(String, String, bool, i64)> = {
-        let mut statement = connection
-            .prepare(&format!("PRAGMA table_info({table})"))
-            .map_err(unreadable)?;
-        statement
-            .query_map([], |row| {
-                Ok((
-                    row.get(1)?,
-                    row.get::<_, String>(2)?.to_ascii_uppercase(),
-                    row.get::<_, i64>(3)? != 0,
-                    row.get(5)?,
-                ))
-            })
-            .map_err(unreadable)?
-            .collect::<rusqlite::Result<_>>()
-            .map_err(unreadable)?
-    };
-    let refused = |detail: String| ImportRefusal::Columns {
-        table: table.to_owned(),
-        detail,
-    };
-    for (name, kind, not_null, key) in expected {
-        let Some(column) = found.iter().find(|column| column.0 == *name) else {
-            return Err(refused(format!("it has no {name} column")));
         };
-        if column.1 != *kind || column.2 != *not_null || column.3 != *key {
-            return Err(refused(format!(
-                "its {name} column is {} {}{}",
-                column.1,
-                if column.2 { "NOT NULL" } else { "nullable" },
-                if column.3 > 0 {
-                    ", part of the key"
-                } else {
-                    ""
-                }
-            )));
+        let made_by = made_by.as_deref().unwrap_or_default();
+        if collapsed(made_by) != collapsed(statement) {
+            return Err(ImportRefusal::Definition {
+                kind: kind.clone(),
+                name: name.clone(),
+                found: collapsed(made_by),
+            });
+        }
+        found.insert(name.as_str());
+    }
+    // The second shape is the first with both of its additions, because one build made both.
+    let second = SECOND_SHAPE_ADDS
+        .iter()
+        .any(|(_, name, _)| found.contains(name));
+    let shape = FIRST_SHAPE
+        .iter()
+        .chain(if second { SECOND_SHAPE_ADDS } else { &[] });
+    for (kind, name, _) in shape {
+        if !found.contains(name) {
+            return Err(ImportRefusal::Missing {
+                kind: (*kind).to_owned(),
+                name: (*name).to_owned(),
+            });
         }
     }
-    if let Some(extra) = found
-        .iter()
-        .find(|column| !expected.iter().any(|(name, ..)| *name == column.0))
-    {
-        return Err(refused(format!("it has a {} column", extra.0)));
-    }
-    Ok(())
+    Ok(second)
 }
 
 /// Checks every receipt reads as this build reads one, and returns how many there are.
@@ -549,11 +562,16 @@ fn check_closures(connection: &Connection) -> Result<(), ImportRefusal> {
 /// its default, and its place in the primary key.
 type ColumnShape = (String, String, bool, Option<String>, i64);
 
-/// A schema as the comparison reads it: each table's columns, and the named indexes.
+/// One index as the comparison reads it: its table, whether it is unique, how it was made (by a
+/// statement, a key or a constraint), whether it is partial, and its columns in order.
+type IndexShape = (String, bool, String, bool, Vec<String>);
+
+/// A schema as the comparison reads it: each table's columns, and every index by name, SQLite's
+/// own included.
 #[derive(Debug, PartialEq, Eq)]
 struct Shape {
     tables: BTreeMap<String, BTreeSet<ColumnShape>>,
-    indexes: BTreeSet<String>,
+    indexes: BTreeMap<String, IndexShape>,
 }
 
 /// The current schema, created fresh, which is what an import has to arrive at.
@@ -564,25 +582,56 @@ fn current_shape() -> rusqlite::Result<Shape> {
     shape_of(&fresh)
 }
 
-/// Reads the tables and named indexes a connection's schema holds, SQLite's own left out.
+/// Reads the tables a connection's schema holds, SQLite's own left out, and every index of them.
 fn shape_of(connection: &Connection) -> rusqlite::Result<Shape> {
-    let names: Vec<(String, String)> = {
+    let names: Vec<String> = {
         let mut statement = connection.prepare(
-            "SELECT type, name FROM sqlite_master
-             WHERE name NOT LIKE 'sqlite_%' AND type IN ('table', 'index')",
+            "SELECT name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' AND type = 'table'",
         )?;
         statement
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .query_map([], |row| row.get(0))?
             .collect::<rusqlite::Result<_>>()?
     };
     let mut shape = Shape {
         tables: BTreeMap::new(),
-        indexes: BTreeSet::new(),
+        indexes: BTreeMap::new(),
     };
-    for (kind, name) in names {
-        if kind == "index" {
-            shape.indexes.insert(name);
-            continue;
+    for name in names {
+        let listed: Vec<(String, bool, String, bool)> = {
+            let mut statement = connection.prepare(&format!("PRAGMA index_list({name})"))?;
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get(1)?,
+                        row.get::<_, i64>(2)? != 0,
+                        row.get(3)?,
+                        row.get::<_, i64>(4)? != 0,
+                    ))
+                })?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        for (index, unique, origin, partial) in listed {
+            let mut statement = connection.prepare(&format!("PRAGMA index_info({index})"))?;
+            let columns = statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(2)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut columns = columns;
+            columns.sort_by_key(|(position, _)| *position);
+            shape.indexes.insert(
+                index,
+                (
+                    name.clone(),
+                    unique,
+                    origin,
+                    partial,
+                    columns
+                        .into_iter()
+                        .map(|(_, column)| column.unwrap_or_default())
+                        .collect(),
+                ),
+            );
         }
         let mut statement = connection.prepare(&format!("PRAGMA table_info({name})"))?;
         let columns = statement
@@ -619,10 +668,21 @@ fn difference(expected: &Shape, produced: &Shape) -> String {
     {
         return format!("it has a {extra} table the current schema does not");
     }
-    format!(
-        "its indexes are {:?} and the current schema's are {:?}",
-        produced.indexes, expected.indexes
-    )
+    for (index, made) in &expected.indexes {
+        match produced.indexes.get(index) {
+            None => return format!("it has no index {index}"),
+            Some(found) if found != made => return format!("its index {index} differs"),
+            Some(_) => {}
+        }
+    }
+    match produced
+        .indexes
+        .keys()
+        .find(|index| !expected.indexes.contains_key(*index))
+    {
+        Some(extra) => format!("it has an index {extra} the current schema does not"),
+        None => "it differs from the current schema".to_owned(),
+    }
 }
 
 fn unreadable(error: rusqlite::Error) -> ImportRefusal {

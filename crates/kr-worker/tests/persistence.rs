@@ -1068,6 +1068,14 @@ fn the_importer_brings_a_version_one_journal_to_the_current_version_once() {
         if with_results {
             add_version_one_results_and_closure(&path);
         }
+        // An error this build names is kept, and read back as this build reads it.
+        rusqlite::Connection::open(&path)
+            .expect("opens the fixture")
+            .execute(
+                "UPDATE receipts SET error_code = ?1, error_message = 'it was refused'",
+                [ErrorCode::PermissionDenied.as_str()],
+            )
+            .expect("records an error");
         assert_eq!(
             import_journal(&path).expect("imports"),
             Imported::Imported {
@@ -1098,6 +1106,11 @@ fn the_importer_brings_a_version_one_journal_to_the_current_version_once() {
             .expect("reads")
             .expect("the receipt survived");
         assert_eq!(receipt.state, ReceiptState::Accepted);
+        assert_eq!(
+            receipt.error.as_ref().map(|error| error.code),
+            Some(ErrorCode::PermissionDenied),
+            "its error came with it"
+        );
         if with_results {
             assert_eq!(
                 journal
@@ -1178,6 +1191,126 @@ fn a_journal_the_importer_cannot_read_is_refused_by_name_and_left_as_it_was() {
         },
         "closure",
     );
+    // Every field a receipt keeps is read as the running host reads it, the error included.
+    refused(
+        "import-unknown-error-code",
+        &|connection| {
+            connection
+                .execute(
+                    "UPDATE receipts SET error_code = 'NOT_A_CODE', error_message = 'it failed'",
+                    [],
+                )
+                .expect("records an error no build names");
+        },
+        "error code",
+    );
+}
+
+#[test]
+fn an_import_that_fails_after_its_changes_leaves_the_journal_as_it_was() {
+    // Every refusal above comes before the import changes anything. This one comes after all of
+    // it - the columns added, the current objects made, the privacy record written, the version
+    // set - and before the commit, and it goes back with the transaction: the file is the version 1
+    // journal it was, byte for byte, and the next import brings it forward.
+    use kr_worker::persistence::import::{
+        Imported, import_journal, stop_the_next_import_before_its_commit,
+    };
+    for with_results in [false, true] {
+        let path = journal_path("import-stopped");
+        write_version_one_fixture(&path);
+        if with_results {
+            add_version_one_results_and_closure(&path);
+        }
+        let before = std::fs::read(&path).expect("reads the fixture");
+        let statements = schema_statements(&path);
+        stop_the_next_import_before_its_commit();
+        import_journal(&path).expect_err("the import stops before its commit");
+        assert_eq!(
+            std::fs::read(&path).expect("reads the store again"),
+            before,
+            "the file is as it was"
+        );
+        assert_eq!(schema_statements(&path), statements);
+        assert_eq!(
+            Journal::recorded_schema_version(&path).expect("reads the version"),
+            1
+        );
+        assert_eq!(
+            import_journal(&path).expect("imports"),
+            Imported::Imported {
+                from: 1,
+                to: migration::CURRENT,
+                receipts: 1,
+            }
+        );
+        std::fs::remove_dir_all(path.parent().expect("a parent")).ok();
+    }
+}
+
+/// Every object a store holds, with the statement that made it.
+fn schema_statements(path: &std::path::Path) -> Vec<(String, String, Option<String>)> {
+    let connection = rusqlite::Connection::open(path).expect("opens the store");
+    let mut statement = connection
+        .prepare("SELECT type, name, sql FROM sqlite_master ORDER BY type, name")
+        .expect("reads the schema");
+    statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .expect("reads the schema")
+        .collect::<rusqlite::Result<_>>()
+        .expect("reads the schema")
+}
+
+#[test]
+fn a_journal_whose_statements_no_version_one_build_ran_is_refused_and_left_as_it_was() {
+    // The two shapes are the statements two builds ran, and a table with a constraint neither
+    // made, or an index on another column, is not one of them: the constraint would come forward
+    // into the current schema and refuse actions the host takes. Each is refused naming the
+    // object, before anything is changed.
+    use kr_worker::persistence::import::import_journal;
+    let unique = VERSION_ONE_RECEIPTS.replace(
+        "PRIMARY KEY (actor_id, action_id)",
+        "PRIMARY KEY (actor_id, action_id), UNIQUE (payload_digest)",
+    );
+    let checked = VERSION_ONE_RECEIPTS.replace(
+        "revision             INTEGER NOT NULL,",
+        "revision             INTEGER NOT NULL CHECK (revision >= 0),",
+    );
+    let elsewhere = VERSION_ONE_INDEX.replace("(created_at_ms)", "(updated_at_ms)");
+    for (name, receipts, index, named) in [
+        (
+            "import-unique-digest",
+            unique.as_str(),
+            VERSION_ONE_INDEX,
+            "receipts",
+        ),
+        (
+            "import-checked-revision",
+            checked.as_str(),
+            VERSION_ONE_INDEX,
+            "receipts",
+        ),
+        (
+            "import-index-elsewhere",
+            VERSION_ONE_RECEIPTS,
+            elsewhere.as_str(),
+            "receipts_created_at",
+        ),
+    ] {
+        let path = journal_path(name);
+        write_version_one_fixture_as(&path, receipts, index);
+        let before = std::fs::read(&path).expect("reads the fixture");
+        let error = import_journal(&path).expect_err("refused");
+        assert!(
+            error.to_string().contains(named),
+            "{name}: the refusal names {named}: {error}"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("reads the store again"),
+            before,
+            "{name}: a refused import leaves the file as it was"
+        );
+        std::fs::remove_dir_all(path.parent().expect("a parent")).ok();
+    }
 }
 
 /// The session the version 1 fixture's closure belongs to.
@@ -1401,11 +1534,11 @@ fn every_migration_path_ends_at_the_one_version_this_build_reads() {
 /// The shape is `927ecc84`'s exactly - the receipt table and its one index, and nothing else -
 /// because a fixture that already had the later tables would not exercise what the ladder does.
 fn write_version_one_fixture(path: &std::path::Path) {
-    let connection = rusqlite::Connection::open(path).expect("creates the fixture");
-    connection
-        .execute_batch(
-            "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
-             CREATE TABLE IF NOT EXISTS receipts (
+    write_version_one_fixture_as(path, VERSION_ONE_RECEIPTS, VERSION_ONE_INDEX);
+}
+
+/// The receipt table the builds recording version 1 made, as their statement spelled it.
+const VERSION_ONE_RECEIPTS: &str = "CREATE TABLE IF NOT EXISTS receipts (
                  actor_id             TEXT    NOT NULL,
                  action_id            BLOB    NOT NULL,
                  method               TEXT    NOT NULL,
@@ -1420,10 +1553,22 @@ fn write_version_one_fixture(path: &std::path::Path) {
                  created_at_ms        INTEGER NOT NULL,
                  updated_at_ms        INTEGER NOT NULL,
                  PRIMARY KEY (actor_id, action_id)
-             );
-             CREATE INDEX IF NOT EXISTS receipts_created_at ON receipts (created_at_ms);
-             INSERT INTO schema_version (version) VALUES (1);",
-        )
+             );";
+
+/// The receipt index the builds recording version 1 made.
+const VERSION_ONE_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS receipts_created_at ON receipts (created_at_ms);";
+
+/// Writes the version 1 fixture with the receipt table and index given, and one receipt.
+fn write_version_one_fixture_as(path: &std::path::Path, receipts: &str, index: &str) {
+    let connection = rusqlite::Connection::open(path).expect("creates the fixture");
+    connection
+        .execute_batch(&format!(
+            "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
+             {receipts}
+             {index}
+             INSERT INTO schema_version (version) VALUES (1);"
+        ))
         .expect("the version 1 schema");
     connection
         .execute(

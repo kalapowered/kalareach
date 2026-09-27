@@ -3533,6 +3533,49 @@ impl Journal {
     }
 }
 
+/// Reads every receipt a connection's `receipts` table holds, as [`Journal::read`] reads one, and
+/// returns how many there are, or what the first one it cannot read is.
+///
+/// The explicit importer asks this of a journal before it commits, so a receipt the running host
+/// would refuse to read is refused there, while the journal can still be left as it was.
+pub(crate) fn read_every_receipt(connection: &Connection) -> std::result::Result<u64, String> {
+    let mut statement = connection
+        .prepare(
+            "SELECT actor_id, action_id, method, method_version, revision, state, reason,
+                    payload_digest, accepted_deadline_ms, error_code, error_message, updated_at_ms
+             FROM receipts",
+        )
+        .map_err(|error| error.to_string())?;
+    let mut rows = statement.query([]).map_err(|error| error.to_string())?;
+    let mut count = 0;
+    while let Some(row) = rows.next().map_err(|error| error.to_string())? {
+        let read = |error: rusqlite::Error| error.to_string();
+        let actor: String = row.get(0).map_err(read)?;
+        let action: Vec<u8> = row.get(1).map_err(read)?;
+        let actor_id = ActorId::new(actor.clone())
+            .map_err(|_| format!("the actor {actor:?} is not one this build reads"))?;
+        let action_id = <[u8; 16]>::try_from(action.as_slice())
+            .map(|bytes| ActionId::new(Uuid::from_bytes(bytes)))
+            .map_err(|_| format!("an action of {actor} is not named in sixteen bytes"))?;
+        RawReceipt {
+            method: row.get(2).map_err(read)?,
+            method_version: row.get(3).map_err(read)?,
+            revision: row.get(4).map_err(read)?,
+            state: row.get(5).map_err(read)?,
+            reason: row.get(6).map_err(read)?,
+            payload_digest: row.get(7).map_err(read)?,
+            accepted_deadline_ms: row.get(8).map_err(read)?,
+            error_code: row.get(9).map_err(read)?,
+            error_message: row.get(10).map_err(read)?,
+            updated_at_ms: row.get(11).map_err(read)?,
+        }
+        .into_receipt(actor_id, action_id)
+        .map_err(|error| format!("a receipt of {actor} cannot be read: {error}"))?;
+        count += 1;
+    }
+    Ok(count)
+}
+
 struct RawReceipt {
     method: String,
     method_version: i64,
