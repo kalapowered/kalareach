@@ -915,9 +915,16 @@ fn belongs(process: &AgentProcess, marks: &[PathBuf]) -> bool {
 /// Panics when the search does not finish, which the run's closing check would also fail on.
 #[must_use]
 pub fn beneath(run: &Run, ancestor: &ProcessStartIdentity, what: &str) -> Vec<AgentProcess> {
+    // A search that does not finish keeps its reason with the run before it stops the part, so the
+    // run's close fails on it too: what was not found was not ended either.
+    let fail = |why: String| -> ! {
+        run.undiscovered(&why);
+        panic!("{why}")
+    };
     run.record_descendants(ancestor, what)
         .unwrap_or_else(|why| panic!("the processes beneath {what}: {why}"));
-    let table = process_table().unwrap_or_else(|why| panic!("{why}"));
+    let table =
+        process_table().unwrap_or_else(|why| fail(format!("the processes beneath {what}: {why}")));
     let mut found = Vec::new();
     let mut under = vec![ancestor.clone()];
     while let Some(parent) = under.pop() {
@@ -934,42 +941,36 @@ pub fn beneath(run: &Run, ancestor: &ProcessStartIdentity, what: &str) -> Vec<Ag
                         entry.pid,
                         &error.to_string(),
                     ) else {
-                        panic!(
+                        fail(format!(
                             "process {} beneath {what} could not be identified: {error}",
                             entry.pid
-                        )
+                        ))
                     };
                     run.note_system_program(entry.pid, &path);
                     if let Some(child) = table.iter().find(|child| child.parent == entry.pid) {
-                        // Kept with the run, as its own search keeps what it could not finish, so
-                        // the close fails too.
-                        let why = format!(
+                        fail(format!(
                             "the system program {} (process {}) beneath {what} started process \
                              {}, which cannot be followed back to it",
                             path.display(),
                             entry.pid,
                             child.pid
-                        );
-                        run.undiscovered(&why);
-                        panic!("{why}")
+                        ))
                     }
                     continue;
                 }
             };
             let Some(described) = describe(&identity)
-                .unwrap_or_else(|why| panic!("the processes beneath {what}: {why}"))
+                .unwrap_or_else(|why| fail(format!("the processes beneath {what}: {why}")))
             else {
                 continue;
             };
             match process_state(&parent) {
                 ProcessState::Running => {}
                 ProcessState::Ended => continue,
-                ProcessState::Unknown { detail } => {
-                    panic!(
-                        "whether the parent of process {} runs is not established: {detail}",
-                        entry.pid
-                    )
-                }
+                ProcessState::Unknown { detail } => fail(format!(
+                    "whether the parent of process {} runs is not established: {detail}",
+                    entry.pid
+                )),
             }
             if described.parent != parent_pid {
                 continue;

@@ -297,6 +297,9 @@ fn staged(
         for why in provenance.untracked() {
             run.undiscovered(&why);
         }
+        for (identity, command) in provenance.identified() {
+            run.record(identity, &format!("beneath a session: {command}"));
+        }
         run.end_everything();
         run.remove_loaded_jobs();
         run.nothing_running().map(|_| ())
@@ -661,9 +664,13 @@ fn run_part(
     for (pid, path) in run.system_programs() {
         provenance.note_system_program(pid, &path);
     }
-    // What the sampler could not find, the close cannot have found ended either.
+    // What the sampler could not find, the close cannot have found ended either; and what it did
+    // find, the close requires ended.
     for why in provenance.untracked() {
         run.undiscovered(&why);
+    }
+    for (identity, command) in provenance.identified() {
+        run.record(identity, &format!("beneath a session: {command}"));
     }
     let checked = run
         .closing_check()
