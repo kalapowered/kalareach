@@ -39,32 +39,48 @@ const DEFAULT_SIXTEEN = [
 /** The steps of the 6×6×6 colour cube that indices 16 to 231 name. */
 const CUBE = [0, 95, 135, 175, 215, 255] as const
 
-function hex(red: number, green: number, blue: number): string {
-  return `#${[red, green, blue].map((part) => Math.min(255, Math.max(0, Math.trunc(part))).toString(16).padStart(2, '0')).join('')}`
+/** A colour's three parts, each a byte. */
+export type Rgb = readonly [number, number, number]
+
+/** A part of a colour held to a byte. */
+function part(value: number): number {
+  return Math.min(255, Math.max(0, Math.trunc(value)))
 }
 
-/** An indexed colour: the palette's override, or the standard colour at that index. */
-function indexed(index: number, palette: PaletteState): string {
+function hex(red: number, green: number, blue: number): string {
+  return `#${[red, green, blue].map((each) => part(each).toString(16).padStart(2, '0')).join('')}`
+}
+
+/** An indexed colour's parts: the palette's override, or the standard colour at that index. */
+function indexed(index: number, palette: PaletteState): Rgb {
   const override = palette.overrides.find((each) => each.index === index)
-  if (override) return hex(override.colour.red, override.colour.green, override.colour.blue)
-  if (index < 16) return DEFAULT_SIXTEEN[index] ?? DEFAULT_SIXTEEN[7]
+  if (override) return [part(override.colour.red), part(override.colour.green), part(override.colour.blue)]
+  if (index < 16) {
+    const standard = DEFAULT_SIXTEEN[index] ?? DEFAULT_SIXTEEN[7]
+    return [1, 3, 5].map((at) => parseInt(standard.slice(at, at + 2), 16)) as unknown as Rgb
+  }
   if (index < 232) {
     const cube = index - 16
-    return hex(
-      CUBE[Math.floor(cube / 36) % 6] ?? 0,
-      CUBE[Math.floor(cube / 6) % 6] ?? 0,
-      CUBE[cube % 6] ?? 0
-    )
+    return [CUBE[Math.floor(cube / 36) % 6] ?? 0, CUBE[Math.floor(cube / 6) % 6] ?? 0, CUBE[cube % 6] ?? 0]
   }
   const grey = 8 + (index - 232) * 10
-  return hex(grey, grey, grey)
+  return [grey, grey, grey]
+}
+
+/**
+ * A cell colour's parts as the view draws it, through the session's palette, or null for the
+ * palette's default, which the caller supplies.
+ */
+export function rgbOf(colour: Colour, palette: PaletteState): Rgb | null {
+  if (typeof colour !== 'object') return null
+  if ('indexed' in colour) return indexed(Math.min(255, Math.max(0, colour.indexed)), palette)
+  return [part(colour.direct.red), part(colour.direct.green), part(colour.direct.blue)]
 }
 
 /** A cell colour as CSS, with `fallback` for the default. */
 function css<Fallback>(colour: Colour, palette: PaletteState, fallback: Fallback): string | Fallback {
-  if (typeof colour !== 'object') return fallback
-  if ('indexed' in colour) return indexed(Math.min(255, Math.max(0, colour.indexed)), palette)
-  return hex(colour.direct.red, colour.direct.green, colour.direct.blue)
+  const parts = rgbOf(colour, palette)
+  return parts === null ? fallback : hex(...parts)
 }
 
 /** A colour from `hex` at half strength, which is how faint text is drawn. */

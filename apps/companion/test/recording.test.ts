@@ -182,7 +182,7 @@ describe('a screen as a recording draws it (KR-REQ-25.08)', () => {
     expect(play(screenText(outside), 8, 2).cursor).toBeNull()
   })
 
-  it('draws each piece in its colours, a box of colour included, and leaves the rest plain', () => {
+  it('draws each piece in the colours the view resolves through the palette, and the rest in its background', () => {
     const red: CellRendition = { ...PLAIN, foreground: { indexed: 1 }, bold: true }
     const filled: CellRendition = { ...PLAIN, background: { direct: { red: 10, green: 20, blue: 300 } } }
     const played = play(
@@ -191,10 +191,19 @@ describe('a screen as a recording draws it (KR-REQ-25.08)', () => {
       1
     )
     const tints = played.colours[0] ?? []
-    expect(tints.slice(0, 2)).toEqual(['0;1;38;5;1', '0;1;38;5;1'])
-    // A box with no text is still drawn in its colours, at exactly its cells, held to a byte.
-    expect(tints.slice(3, 6)).toEqual(['0;48;2;10;20;255', '0;48;2;10;20;255', '0;48;2;10;20;255'])
-    expect([tints[2], tints[6], tints[7]]).toEqual(['0', '0', '0'])
+    // Index 1 is the palette's own red, and the default background is the palette's.
+    expect(tints.slice(0, 2)).toEqual(Array(2).fill('0;1;38;2;162;53;46;48;2;7;18;23'))
+    // A box with no text is still drawn in its colours, at exactly its cells, held to a byte, in
+    // the palette's default text colour.
+    expect(tints.slice(3, 6)).toEqual(Array(3).fill('0;38;2;220;220;218;48;2;10;20;255'))
+    // Every cell no piece covers is the session's background, not the player's.
+    expect([tints[2], tints[6], tints[7]]).toEqual(Array(3).fill('0;48;2;7;18;23'))
+  })
+
+  it('draws an underline in its own colour', () => {
+    const underlined: CellRendition = { ...PLAIN, underline: 'single', underline_colour: { indexed: 1 } }
+    const played = play(screenText(screenOf(4, 1, [[piece(0, 'ul', 2, underlined)]])), 4, 1)
+    expect(played.colours[0]?.[0]).toBe('0;4;38;2;220;220;218;48;2;7;18;23;58;2;162;53;46')
   })
 
   it('keeps text a player lays out wider than its cells inside the cells the view gave it', () => {
@@ -260,6 +269,53 @@ describe('the recording the raw view keeps (KR-REQ-25.08)', () => {
         count: 1
       }
     ])
+  })
+
+  it('keeps a screen whose palette alone changed, since the view drew it in other colours', () => {
+    const one = screenOf(10, 2, [[piece(0, 'same')]])
+    const other = { ...one, palette: { ...one.palette, background: { red: 250, green: 250, blue: 250 } } }
+    let recording = recorded(emptyRecording(), one, 0)
+    recording = recorded(recording, other, 10)
+    expect(recordingExport(recording)?.frames).toHaveLength(2)
+  })
+
+  it('declares what a player draws in its own way: the cursor, and underlines other than single or double', () => {
+    const curly: CellRendition = { ...PLAIN, underline: 'curly' }
+    let recording = recorded(
+      emptyRecording(),
+      screenOf(10, 2, [[piece(0, 'wavy', 4, curly)]], { line: 0, column: 4, style: 3, visible: true }),
+      0
+    )
+    recording = recorded(recording, screenOf(10, 2, [[piece(0, 'plain')]]), 10)
+    expect(recordingExport(recording)?.omissions).toEqual([
+      {
+        kind: 'underline_styles',
+        detail: 'Curly, dotted and dashed underlines, which play back as single ones',
+        count: 1
+      },
+      {
+        kind: 'cursor_style',
+        detail: "The cursor's shape and colour, which a player draws in its own",
+        count: 1
+      }
+    ])
+  })
+
+  it('counts its bound in bytes, and keeps no screen larger than the whole bound', () => {
+    // Each of these is under the bound in UTF-16 units and over half of it in bytes.
+    const wide = (mark: string) => screenOf(10, 1, [[piece(0, mark.repeat(1_500_000), 10)]])
+    let recording = recorded(emptyRecording(), wide('€'), 0)
+    recording = recorded(recording, wide('₹'), 10)
+    expect(recording.frames).toHaveLength(1)
+    expect(recording.dropped).toBe(1)
+    // One screen larger than the whole bound is not kept at all, and is declared.
+    recording = recorded(recording, screenOf(10, 1, [[piece(0, '€'.repeat(3_000_000), 10)]]), 20)
+    expect(recording.frames).toHaveLength(1)
+    expect(recordingExport(recording)?.omissions).toContainEqual({
+      kind: 'oversized_screens',
+      detail: 'Screens larger than the whole recording keeps',
+      count: 1
+    })
   })
 
   it('records no screen of no cells', () => {

@@ -3,47 +3,63 @@
  *
  * Section 25's asciicast carries timestamps, dimensions and declared omissions, and safe rendering
  * data. What this records is exactly that: each screen the view drew, when it drew it, at the grid
- * it drew it in, written as the drawing a player repeats. A screen is written as a clear, then each
- * piece the view placed, at its own cells in its own rendition, then the cursor where the view drew
- * it: positions and colours, nothing that would act on the machine that plays it back, and nothing
- * the session printed is passed through as a sequence.
+ * it drew it in, written as the drawing a player repeats. A screen is written as a clear in the
+ * session's background, then each piece the view placed, at its own cells in the colours the view
+ * drew it in, then the cursor where the view drew it: positions and colours, nothing that would act
+ * on the machine that plays it back, and nothing the session printed is passed through as a
+ * sequence. Every colour is resolved through the session's palette as the view resolves it, so a
+ * player's own colours never stand in for the session's, and a change of palette alone is a new
+ * screen. What a player cannot be told without changing its own settings is declared instead: the
+ * cursor's shape and colour, and underline styles other than single and double.
  *
  * The recording is bounded: past its bound the oldest screens go, and the export says how many.
  * A screen drawn at another size than the last is played at the last one, and the export says so.
  */
 
-import type { CellRendition } from '@kalareach/protocol'
+import type { CellRendition, PaletteState, Rgb10 } from '@kalareach/protocol'
 
 import type { ExportDimensions, Omission, RecordedFrame, TerminalScreen } from '../host/port'
+import { rgbOf, type Rgb } from '../terminal/cells'
 import { count, placedCursor, placedPieces } from '../terminal/frame'
 
 /** The most screens a recording keeps. */
 export const MAX_RECORDED_FRAMES = 2000
 
-/** The most text a recording keeps across its screens. */
-export const MAX_RECORDED_TEXT = 8 * 1024 * 1024
+/** The most drawing a recording keeps across its screens, in bytes of UTF-8. */
+export const MAX_RECORDED_BYTES = 8 * 1024 * 1024
 
 /** One screen the view drew. */
 interface Drawn {
   /** When it was drawn, on this device's clock. */
   readonly atMs: number
   readonly text: string
+  /** How many bytes of UTF-8 the text is. */
+  readonly bytes: number
   readonly dimensions: ExportDimensions
+  /** Whether it has an underline a player draws as a single one. */
+  readonly restyled: boolean
+  /** Whether the view drew the cursor, in a shape and colour a player draws in its own. */
+  readonly cursor: boolean
 }
 
 /** What a raw terminal view drew while it was open. */
 export interface Recording {
   readonly frames: readonly Drawn[]
-  /** How much text the frames hold. */
-  readonly text: number
+  /** How many bytes the frames hold. */
+  readonly bytes: number
   /** How many screens went to stay inside the bound. */
   readonly dropped: number
+  /** How many screens were larger than the whole bound, and were not kept. */
+  readonly oversized: number
 }
 
 /** A recording with nothing in it. */
 export function emptyRecording(): Recording {
-  return { frames: [], text: 0, dropped: 0 }
+  return { frames: [], bytes: 0, dropped: 0, oversized: 0 }
 }
+
+/** The underline styles a player draws as they are. */
+const PLAYED_UNDERLINES: readonly CellRendition['underline'][] = ['none', 'single', 'double']
 
 /**
  * The recording with one more screen, drawn at `atMs`. A screen the same as the last adds nothing,
@@ -62,15 +78,27 @@ export function recorded(recording: Recording, screen: TerminalScreen, atMs: num
   ) {
     return recording
   }
-  let frames = [...recording.frames, { atMs, text, dimensions }]
-  let held = recording.text + text.length
+  const bytes = utf8Length(text)
+  if (bytes > MAX_RECORDED_BYTES) return { ...recording, oversized: recording.oversized + 1 }
+  const frame: Drawn = {
+    atMs,
+    text,
+    bytes,
+    dimensions,
+    restyled: placedPieces(screen).some(
+      (piece) => !PLAYED_UNDERLINES.includes(piece.rendition.underline)
+    ),
+    cursor: placedCursor(screen) !== null
+  }
+  let frames = [...recording.frames, frame]
+  let held = recording.bytes + bytes
   let dropped = recording.dropped
-  while (frames.length > 1 && (frames.length > MAX_RECORDED_FRAMES || held > MAX_RECORDED_TEXT)) {
-    held -= frames[0]?.text.length ?? 0
+  while (frames.length > 1 && (frames.length > MAX_RECORDED_FRAMES || held > MAX_RECORDED_BYTES)) {
+    held -= frames[0]?.bytes ?? 0
     frames = frames.slice(1)
     dropped += 1
   }
-  return { frames, text: held, dropped }
+  return { ...recording, frames, bytes: held, dropped }
 }
 
 /** What the export writes: when it began, at what size, each screen, and what it leaves out. */
@@ -91,6 +119,8 @@ export function recordingExport(recording: Recording): RecordingExport | null {
     (frame) =>
       frame.dimensions.columns !== dimensions.columns || frame.dimensions.rows !== dimensions.rows
   ).length
+  const restyled = recording.frames.filter((frame) => frame.restyled).length
+  const cursors = recording.frames.filter((frame) => frame.cursor).length
   const omissions: Omission[] = []
   if (recording.dropped > 0) {
     omissions.push({
@@ -99,11 +129,32 @@ export function recordingExport(recording: Recording): RecordingExport | null {
       count: recording.dropped
     })
   }
+  if (recording.oversized > 0) {
+    omissions.push({
+      kind: 'oversized_screens',
+      detail: 'Screens larger than the whole recording keeps',
+      count: recording.oversized
+    })
+  }
   if (resized > 0) {
     omissions.push({
       kind: 'resized_screens',
       detail: `Screens drawn at another size, which play back at ${dimensions.columns}×${dimensions.rows}`,
       count: resized
+    })
+  }
+  if (restyled > 0) {
+    omissions.push({
+      kind: 'underline_styles',
+      detail: 'Curly, dotted and dashed underlines, which play back as single ones',
+      count: restyled
+    })
+  }
+  if (cursors > 0) {
+    omissions.push({
+      kind: 'cursor_style',
+      detail: "The cursor's shape and colour, which a player draws in its own",
+      count: cursors
     })
   }
   return {
@@ -114,27 +165,41 @@ export function recordingExport(recording: Recording): RecordingExport | null {
   }
 }
 
+/** How many bytes `text` is in UTF-8. */
+function utf8Length(text: string): number {
+  let bytes = 0
+  for (const character of text) {
+    const code = character.codePointAt(0) ?? 0
+    bytes += code < 0x80 ? 1 : code < 0x800 ? 2 : code < 0x10000 ? 3 : 4
+  }
+  return bytes
+}
+
 /** The escape that starts a control sequence. */
 const CSI = '\u001b['
 
 /**
- * One screen as the drawing a player repeats: a clear, each piece the view placed at its cells in
- * its rendition, and the cursor where the view drew it, or hidden when the view drew none.
+ * One screen as the drawing a player repeats: a clear in the session's background, each piece the
+ * view placed at its cells in its colours, and the cursor where the view drew it, or hidden when
+ * the view drew none.
  *
  * The view draws each piece as a box of its cells in the piece's colours, and cuts a glyph wider
  * than its cells at the box's edge. A player lays text out by its own idea of each glyph's width,
  * so the drawing does the same by hand: each box's cells are cleared in its colours before its text
  * is drawn, line wrapping is off while a screen is drawn, and the cells after each box are cleared
- * before the next piece is drawn over them, so nothing spills past the cells the view gave it.
- * Line wrapping is back on at the end.
+ * in the session's background before the next piece is drawn over them, so nothing spills past the
+ * cells the view gave it. Line wrapping is back on at the end.
  */
 export function screenText(screen: TerminalScreen): string {
+  const palette = screen.palette
   const columns = count(screen.window.columns)
-  let out = `${CSI}0m${CSI}?7l${CSI}H${CSI}2J`
+  // The cells no piece covers, in the session's own background.
+  const blank = `${CSI}0;${colour(48, parts(palette.background))}m`
+  let out = `${blank}${CSI}?7l${CSI}H${CSI}2J`
   for (const piece of placedPieces(screen)) {
-    out += `${CSI}${piece.line + 1};${piece.column + 1}H${CSI}${sgrOf(piece.rendition)}m${CSI}${piece.cells}X${piece.text}`
+    out += `${CSI}${piece.line + 1};${piece.column + 1}H${CSI}${sgrOf(piece.rendition, palette)}m${CSI}${piece.cells}X${piece.text}`
     const after = piece.column + piece.cells
-    if (after < columns) out += `${CSI}0m${CSI}${piece.line + 1};${after + 1}H${CSI}K`
+    if (after < columns) out += `${blank}${CSI}${piece.line + 1};${after + 1}H${CSI}K`
   }
   out += `${CSI}0m${CSI}?7h`
   const cursor = placedCursor(screen)
@@ -143,8 +208,22 @@ export function screenText(screen: TerminalScreen): string {
     : `${out}${CSI}${cursor.line + 1};${cursor.column + 1}H${CSI}?25h`
 }
 
-/** The select-graphic-rendition parameters a rendition is drawn with. */
-function sgrOf(rendition: CellRendition): string {
+/** A palette colour's parts, each held to a byte. */
+function parts(rgb: Rgb10): Rgb {
+  const byte = (value: number) => Math.min(255, Math.max(0, Math.trunc(Number(value) || 0)))
+  return [byte(rgb.red), byte(rgb.green), byte(rgb.blue)]
+}
+
+/** A colour's parameters: 38 for the text, 48 for the background, 58 for the underline. */
+function colour(base: 38 | 48 | 58, rgb: Rgb): string {
+  return `${base};2;${rgb[0]};${rgb[1]};${rgb[2]}`
+}
+
+/**
+ * The select-graphic-rendition parameters a piece is drawn with: its attributes, and its colours
+ * resolved through the palette, a default one included, as the view draws them.
+ */
+function sgrOf(rendition: CellRendition, palette: PaletteState): string {
   const parameters = ['0']
   if (rendition.bold) parameters.push('1')
   if (rendition.faint) parameters.push('2')
@@ -154,20 +233,12 @@ function sgrOf(rendition: CellRendition): string {
   if (rendition.invisible) parameters.push('8')
   if (rendition.strikethrough) parameters.push('9')
   if (rendition.overline) parameters.push('53')
-  parameters.push(...colourOf(rendition.foreground, 38), ...colourOf(rendition.background, 48))
+  parameters.push(
+    colour(38, rgbOf(rendition.foreground, palette) ?? parts(palette.foreground)),
+    colour(48, rgbOf(rendition.background, palette) ?? parts(palette.background))
+  )
+  // An underline in the default colour takes the text's, which a player's does too.
+  const underline = rendition.underline === 'none' ? null : rgbOf(rendition.underline_colour, palette)
+  if (underline !== null) parameters.push(colour(58, underline))
   return parameters.join(';')
-}
-
-/** A colour's parameters, for the foreground (38) or the background (48), held to what the view draws. */
-function colourOf(colour: CellRendition['foreground'], base: 38 | 48): string[] {
-  if (typeof colour !== 'object') return []
-  if ('indexed' in colour) return [String(base), '5', String(byte(colour.indexed))]
-  const { red, green, blue } = colour.direct
-  return [String(base), '2', String(byte(red)), String(byte(green)), String(byte(blue))]
-}
-
-/** A number held to a byte, whatever a malformed state carried. */
-function byte(value: unknown): number {
-  const number = Math.trunc(Number(value))
-  return Number.isFinite(number) ? Math.min(255, Math.max(0, number)) : 0
 }

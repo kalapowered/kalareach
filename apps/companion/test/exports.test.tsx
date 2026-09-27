@@ -59,8 +59,17 @@ describe("a session's exports (KR-REQ-25.08)", () => {
     expect(cast?.frames[0]?.text).toContain('$ cargo test -p kr-client')
     expect(cast?.frames[0]?.text).toContain('\u001b[6;3H\u001b[?25h')
     expect(cast?.frames[1]?.text).toContain('\u001b[2;5H\u001b[?25h')
-    expect(cast?.omissions).toEqual([])
-    expect(await screen.findByText(`Written to /tmp/session-${SESSION_MAIN}.cast.`)).toBeInTheDocument()
+    // The view drew the cursor on both screens, in a shape and colour a player draws in its own.
+    expect(cast?.omissions).toEqual([
+      {
+        kind: 'cursor_style',
+        detail: "The cursor's shape and colour, which a player draws in its own",
+        count: 2
+      }
+    ])
+    expect(
+      await screen.findByText(`Written to /tmp/session-${SESSION_MAIN}.cast, with 1 declared omission.`)
+    ).toBeInTheDocument()
   })
 
   it('offers no recording until the terminal view has drawn', async () => {
