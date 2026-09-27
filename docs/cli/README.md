@@ -768,7 +768,11 @@ not_applicable Catalogue metadata and its capability evidence
 ```
 
 Each engineering default the product makes configurable is printed with the value in force and the
-rung it came from, so what this host is doing and why are one reading rather than two. The
+rung it came from, so what this host is doing and why are one reading rather than two. A value is
+printed by what it is made of: a word or a number as itself; a relay or a proxy as its scheme, host,
+port and path, never a user name, a password or a query written into it; a path with this host's
+runtime and state directories whole and any other name only when this installation writes it; and
+anything else as its class and its length. The
 locations are printed twice over: the paths this host resolved, which is where your files are, and
 the rule this platform follows, which is where the next one would go. A location an allowlisted
 variable chose says so in place of the rule. This is your own host answering you about your own
@@ -1219,8 +1223,8 @@ against automatic sleep while it has verified foreground work or a request it ha
 answered, and releases it when that ends:
 
 ```text
-sleep inhibited (mains_only): the host has requests it has not answered, held as a
-power-management assertion against idle system sleep, held on behalf of process 82035 on mains power
+sleep inhibited (mains_only): the host has requests it has not answered, held as
+[name withheld, 87 bytes] on mains power
 ```
 
 Two kinds of work count. The host knows the first from its own bookkeeping: a request it has
@@ -1230,9 +1234,10 @@ about itself: an agent at work, or a decision waiting to be answered. A session 
 neither of those contributes neither, and an idle shell is not work however much output it has
 produced.
 
-That line appears in `kr status` and `kr doctor` too. The process it names is the one the operating
-system's own listing shows, so `pmset -g assertions` on macOS can be compared with it directly.
-`docs/host/platforms.md` has the facility each platform uses and what an assertion does not
+That line appears in `kr status` and `kr doctor` too. The assertion's name carries what the
+platform's own listing said of it, and why none is held can carry what its facility said, so the
+line says each as its class and its length; `pmset -g assertions` on macOS lists the assertion
+itself. `docs/host/platforms.md` has the facility each platform uses and what an assertion does not
 promise.
 
 ## `--json` shapes
@@ -1381,7 +1386,7 @@ inhibition line.
 `kr host power --json` returns `{ "ok": true, "environment_id": "...", "power": { ... } }`. The
 power object holds the setting, whether an assertion is held, its reason, the facility holding it,
 the power source, the counts behind the decision, and either the holder or the reason nothing is
-held.
+held, each as its class and its length.
 
 `kr host startup --json` returns what is chosen and where it was chosen. `controller` is
 `standalone` or null, `source` is `host_configuration` or `default`, `document_state` is the
@@ -1439,7 +1444,11 @@ A direct invitation has `"mode": "direct"` and no `code` or `rendezvous_origin`.
 `platform`.
 
 `kr project`, `kr workspace`, `kr changeset`, `kr diff`, `kr device` and `kr plugin` print the
-host's answer exactly as it sent it, with `ok` beside it. `kr project list --json` is
+host's answer in the shape it sent it, with `ok` beside it: each value of the protocol's own
+vocabulary, each identifier and each number as the protocol encodes it; what the command was asked
+for, such as a repository's path, a change's paths or a device's name, as it arrived; a Git
+revision or a file mode only when it is one; and any other text the host wrote as its class and its
+length. `kr project list --json` is
 `{ "ok": true, "projects": [ ... ] }`, and `kr workspace create --json` carries `workspace`, which
 is null for a preview, beside `preview` and `unapplied`. Identifiers are strings, and so are 64-bit
 counts, which the host writes as decimal text.

@@ -162,17 +162,52 @@ file's imports, and only code that cannot compile without `test` left out. It na
 line of anything that could put other text in a rendering: a hand-written `Display`, a `Plain`
 claim outside the two `shown.rs` files, an error field a rendering reaches that is none of the
 types above, a formatted panic, an `unwrap` or `expect` in either call form, an assertion that
-prints what it compares, a log line, standard error written outside the reporter, and source it
-cannot follow: a renamed import, a macro, a derive it does not know, an attribute under `cfg_attr`
-that it reads, a `#[path]` or an `include!`. The marker tests plant
-one marker where input goes (each text leaf, map key and other leaf of a stored file, malformed
-bytes, typed arguments, origins) and look for it in every rendering that comes back, as text, as
-decimal and hexadecimal bytes, and in base64; beside each, the same planting of another value is
-held to naming the fault's class and its place. A service's answer that cannot be read is said
+prints what it compares, a log line, standard error written outside the reporter, standard output
+written, opened or taken whole outside the command line's writer, a JSON value or a tool result
+built outside it, and source it cannot follow: a renamed import, a macro, a derive it does not
+know, an attribute under `cfg_attr` that it reads, a `#[path]` or an `include!`. It holds every
+`Debug` of the two crates as well: a derived one only over fields whose own `Debug` prints nothing
+that arrived, found across every crate of the workspace, and one written by hand only formatting
+what a `Shown` may hold. The marker tests plant one marker where input goes (each text leaf, map
+key and other leaf of a stored file, malformed bytes, typed arguments, origins) and look for it in
+every rendering that comes back, as text, as decimal and hexadecimal bytes, and in base64; beside
+each, the same planting of another value is held to naming the fault's class and its place. A service's answer that cannot be read is said
 through `json` or `cbor`, whose renderings carry none of the answer by their types.
 
-Standard output, the `--json` answers other than a failure document and the account token's, and
-the derived `Debug` of a type that is not a failure are outside this rule.
+## What the command line prints
+
+Standard output follows the same rule, with one addition: content the person asked a command for
+is shown to them. `kr_cli::output` is the only writer. It writes a `Shown`, a `Line` composed from a
+template of the program's own and parts that are each `Plain` or `Asked`, or a `--json` `Document`
+built from those, numbers, switches, lists and other documents; nothing converts a string or a JSON
+value into one. `Asked` is content that arrived and that the command was asked for, such as a
+question's text, a repository's path or the name a paired device gave itself, and it names the
+request that asked for it. It has no `Display` and no `Debug` and never becomes a `Shown`, so it
+cannot reach standard error, a failure or a `Debug`. An asked location keeps its scheme, host, port
+and path, and never user information, a query or a fragment.
+
+The rest of what a command prints is decided by what it is:
+
+- A value from the protocol's closed vocabulary, an identifier, a digest or a number is printed as
+  the protocol encodes it. An answer the host sends whole, such as `kr project list`'s, is printed
+  leaf by leaf in its own shape, each text leaf by one of these rules.
+- A Git revision, a file mode, a digest or a build identity that arrives as text is printed when it
+  matches its grammar, and as a placeholder when it does not.
+- A path goes through the reducers above: `host_path` for this installation's tree, `root` for one
+  the command derived itself, `named` for one the person typed.
+- The host's own sentences, which it composes only from its source's words, numbers, its own terms,
+  identifiers it generated and the measure of anything else, are printed as the host wrote them,
+  over the owner's own connection to the host. `kr doctor`'s report of this host's locations and of
+  each effective value is content the person asked for; a value is printed by its class: a word or
+  a number as itself, a location by its shape, a path through `host_path`, and anything else as its
+  class and its length.
+- Any other text a host wrote is printed as its class and its length.
+
+Three commands own standard output for a protocol or a terminal rather than for lines: the tool
+server, `kr bridge --stdio` and the attach guard. They are the only callers of the writer's two raw
+handles. The marker tests plant the marker in every text leaf of each answer a command prints,
+built from the answer type's schema, and find it only in the fields that hold asked content or the
+host's own sentences.
 
 ## Drafts
 
