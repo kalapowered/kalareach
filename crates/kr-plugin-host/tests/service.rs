@@ -933,13 +933,15 @@ async fn kr_req_05_07_a_plugin_host_crash_kills_no_worker_and_loses_no_request()
 //
 // Everything here is measured while a component is working, and what keeps it working is this
 // test, not an amount of work sized for some machine. The binding is given observations at a
-// steady pace until the test opens a gate, so there is a component at work for the whole window
-// and after it, however fast or slow the machine is. Each call is one short observation that ends
-// far inside its deadline, so a slow machine does not overrun it. A machine that stalls outright
-// can still hold one call past its deadline, which the runtime records as a fault and the binding
-// survives; nothing here measures how long a call takes, so that is not a failure. A disabled
-// binding would leave a window with nothing running in it, so that fails the test, and so does a
-// call that failed any other way.
+// steady pace until the test opens a gate, so the component goes on finishing calls through the
+// whole window and after it, however fast or slow the machine is. That is continued activity, a
+// short call after a short call, not one call that lasts the window. Each call is one short
+// observation that ends far inside its deadline, so a slow machine does not overrun it. A machine
+// that stalls outright can still hold a call past its deadline now and then, which the runtime
+// records as a fault and the binding survives until three come within a minute; nothing here
+// measures how long a call takes, so such a fault is not a failure. A disabled binding would leave
+// a window with nothing running in it, so that fails the test, and so does a call that failed any
+// other way.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_11_39_a_terminal_drains_and_is_answered_while_a_component_runs() {
     let Some(well_behaved) = component("well-behaved") else {
@@ -1073,11 +1075,30 @@ async fn kr_req_11_39_a_terminal_drains_and_is_answered_while_a_component_runs()
         "the drained output could not be handed to the runtime: {handed_back:?}"
     );
 
-    // The binding was never disabled, and no call failed but by running past its deadline. A fault
-    // or a disabling is never dropped from the notice queue, so every one there has been is still
-    // in it.
+    // The binding was never disabled, and no call failed but by running past its deadline. A binding
+    // answers its observations in order and its notices reach this client in that order, and a
+    // fault or a disabling is never dropped on the way, so every notice the observations above
+    // produced has arrived once the document of one handed over after them has. That last one
+    // carries a text of its own, which the component draws.
     let mut plugin = Arc::into_inner(plugin).expect("the supply has let go of the client");
-    while let Some(notice) = plugin.try_notice() {
+    let last = "the last observation this test hands over";
+    let admitted = plugin
+        .deliver(binding, &scrape("se-last", last))
+        .await
+        .expect("the last observation reaches the host");
+    assert!(
+        !matches!(
+            admitted,
+            kr_plugin_service::vocabulary::Admission::Refused { .. }
+        ),
+        "the last observation was refused: {admitted:?}"
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let notice = tokio::time::timeout_at(deadline, plugin.notice())
+            .await
+            .expect("the last observation's document arrived")
+            .expect("the connection to the plugin host is open");
         match notice {
             Notice::Fault { call, detail, .. }
                 if detail != format!("{call} used its whole deadline allowance") =>
@@ -1085,6 +1106,11 @@ async fn kr_req_11_39_a_terminal_drains_and_is_answered_while_a_component_runs()
                 panic!("the component faulted in {call}: {detail}")
             }
             Notice::Disabled { reason, .. } => panic!("the binding disabled itself: {reason}"),
+            Notice::Document { call, nodes, .. }
+                if call == "observe" && nodes.iter().any(|node| node.body_json.contains(last)) =>
+            {
+                break;
+            }
             Notice::Fault { .. } | Notice::Document { .. } | Notice::Gap { .. } => {}
         }
     }
