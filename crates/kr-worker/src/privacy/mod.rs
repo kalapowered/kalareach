@@ -559,8 +559,9 @@ impl PrivacyMode {
     ///
     /// A subsystem whose step fails takes no further step: a cancellation or a removal behind a
     /// fence that did not go up would be cleanup reported over a queue that is still filling. It
-    /// is listed in [`Enabling::unfinished`] with the step and its store's reason, and the other
-    /// subsystems are taken through every step. A caller retries it by applying it again.
+    /// is listed among the enabling's unfinished subsystems with the step and its store's reason,
+    /// and the other subsystems are taken through every step. A caller retries it by applying it
+    /// again.
     ///
     /// It does not report completion. In-flight work is reconciled by [`Self::reconcile`], and
     /// until that says so this is an enabling rather than a finished cleanup.
