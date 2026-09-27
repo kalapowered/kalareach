@@ -2246,10 +2246,38 @@ fn keychain_readable_in_a_session(stage: &Stage<'_, '_>, variables: &[(String, S
     session.remote.close();
     assert!(
         status == Some(0),
-        "{LOGIN_UNPROVEN} in a session made as the agent's own, whose default keychain is \
-         {default}, `security show-keychain-info` exits {status:?}, where the agent's own check \
-         takes 36 (user interaction not allowed) as a keychain it cannot read its login from"
+        "{LOGIN_UNPROVEN} in a session made as the agent's own, whose default keychain is {}, \
+         `security show-keychain-info` exits {status:?}, where the agent's own check takes 36 \
+         (user interaction not allowed) as a keychain it cannot read its login from",
+        keychain_kind(
+            &default,
+            &stage.login.expect("a part with a login").person_home,
+            Some(&stage.run.home())
+        )
     );
+}
+
+/// What kind of keychain `named`, a path `security default-keychain` printed, possibly quoted, is,
+/// said without its name, which can be the person's own: their login keychain, another in their
+/// home, one in the run's home, another, or none.
+fn keychain_kind(named: &str, home: &Path, run_home: Option<&Path>) -> &'static str {
+    let path = Path::new(named.trim().trim_matches('"'));
+    if path.as_os_str().is_empty() {
+        "none"
+    } else if path
+        == home
+            .join("Library")
+            .join("Keychains")
+            .join("login.keychain-db")
+    {
+        "the person's login keychain"
+    } else if path.starts_with(home) {
+        "another keychain in the person's home"
+    } else if run_home.is_some_and(|run_home| path.starts_with(run_home)) {
+        "a keychain in the run's home"
+    } else {
+        "another keychain"
+    }
 }
 
 /// Checks, where the build list names the agent's status command, that the login holds, and with
@@ -5867,28 +5895,20 @@ fn a_session_started_with_a_persons_own_home_keeps_their_login_keychain_as_its_d
         .closing_check()
         .unwrap_or_else(|left| panic!("still running after the own-home check: {left}"));
     println!("{checked}");
-    let login = home
-        .join("Library")
-        .join("Keychains")
-        .join("login.keychain-db");
-    // Said without the home's path or the keychain's name, which can be the person's own: this
-    // text goes into the record.
+    // Compared as a path, and said by its kind without its name, which can be the person's own:
+    // this text goes into the record.
+    let kind = keychain_kind(&named, &home, None);
     assert!(
-        named.contains(&login.display().to_string()),
-        "a session with the person's own home names a default keychain that is not their login \
-         keychain ({})",
-        if named.contains(&home.display().to_string()) {
-            "another keychain in their home"
-        } else {
-            "a keychain outside their home, or none"
-        }
+        kind == "the person's login keychain",
+        "a session with the person's own home names as its default keychain {kind}, not the \
+         person's login keychain"
     );
     Outcome::passed(
         "own-home",
         TEST,
         json!({
             "home": home,
-            "default_keychain": named,
+            "default_keychain": kind,
             "worker_profile": own.worker_profile,
             "bound_to_a_desktop": own.bound_to_a_desktop,
             "show_keychain_info_status": own.keychain_info_status,
@@ -6017,6 +6037,36 @@ fn a_conversation_search_skips_only_files_unchanged_since_before_the_agent_start
         "a changed file and a new one are read, the new one though its time is older than the part"
     );
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A default keychain is said by its kind, compared as a path: a name that only begins like the
+/// login keychain's is another keychain, and no name is said.
+#[test]
+fn a_default_keychain_is_said_by_its_kind_compared_as_a_path() {
+    let home = Path::new("/Users/someone");
+    let run_home = Path::new("/private/var/folders/xx/T/krm-1/h");
+    let kind = |named: &str| keychain_kind(named, home, Some(run_home));
+    assert_eq!(
+        kind("    \"/Users/someone/Library/Keychains/login.keychain-db\""),
+        "the person's login keychain"
+    );
+    assert_eq!(
+        kind("/Users/someone/Library/Keychains/login.keychain-db-client.keychain-db"),
+        "another keychain in the person's home"
+    );
+    assert_eq!(
+        kind("/Users/someone/Library/Keychains/client-someone.keychain-db"),
+        "another keychain in the person's home"
+    );
+    assert_eq!(
+        kind("/private/var/folders/xx/T/krm-1/h/Library/Keychains/kr.keychain-db"),
+        "a keychain in the run's home"
+    );
+    assert_eq!(
+        kind("/Library/Keychains/System.keychain"),
+        "another keychain"
+    );
+    assert_eq!(kind("  "), "none");
 }
 
 #[test]
