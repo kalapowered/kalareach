@@ -63,6 +63,9 @@ pub enum CliError {
     },
     /// Local IPC failed.
     Ipc(kr_ipc::IpcError),
+    /// An update of this host waits: something live holds it, or another update is running. What
+    /// it stopped runs again, and the sentence says what holds it and what to do.
+    UpdateDeferred(Shown),
     /// Something else failed.
     Other(Shown),
 }
@@ -77,6 +80,7 @@ impl Said for CliError {
             | Self::Terminal(said)
             | Self::TerminalProbeFailed(said)
             | Self::SessionClosed(said)
+            | Self::UpdateDeferred(said)
             | Self::Other(said)
             | Self::Unfinished { message: said, .. }
             | Self::AnswerKept { message: said, .. } => said.clone(),
@@ -121,6 +125,7 @@ impl CliError {
             Self::NotATerminal | Self::Terminal(_) | Self::TerminalProbeFailed(_) => 6,
             Self::TerminalUnavailable(_) => 7,
             Self::Refused(_) => 8,
+            Self::UpdateDeferred(_) => 9,
             Self::Ipc(_) | Self::AnswerKept { .. } => 3,
             Self::SessionClosed(_) | Self::Unfinished { .. } | Self::Other(_) => 1,
         }
@@ -147,7 +152,9 @@ impl CliError {
             Self::Refused(error) => error.code,
             Self::SessionClosed(_) => kr_protocol::error::ErrorCode::SessionClosed,
             Self::Unfinished { code, .. } | Self::AnswerKept { code, .. } => *code,
-            Self::Other(_) => kr_protocol::error::ErrorCode::ResourceUnavailable,
+            Self::UpdateDeferred(_) | Self::Other(_) => {
+                kr_protocol::error::ErrorCode::ResourceUnavailable
+            }
         }
     }
 }
@@ -176,6 +183,7 @@ mod tests {
             CliError::AmbiguousSession(Shown::said("")).exit_code(),
             CliError::NotATerminal.exit_code(),
             CliError::TerminalUnavailable(Shown::said("")).exit_code(),
+            CliError::UpdateDeferred(Shown::said("")).exit_code(),
         ];
         let mut sorted = codes;
         sorted.sort_unstable();

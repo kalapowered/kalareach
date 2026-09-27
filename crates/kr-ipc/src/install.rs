@@ -803,6 +803,16 @@ impl Store {
             .trash()
             .join(format!("{release}-{}", crate::new_uuid()));
         let directory = self.release_directory(release);
+        // A release is installed read-only, and on some systems a directory moves to another
+        // parent only while its own entries can be written.
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(
+                &directory,
+                std::fs::Permissions::from_mode(crate::paths::OWNER_ONLY_DIRECTORY_MODE),
+            )
+            .map_err(|error| InstallError::io("open to removal", &directory, error))?;
+        }
         std::fs::rename(&directory, &removed)
             .map_err(|error| InstallError::io("move", &directory, error))?;
         sync_directory(&self.versions())?;

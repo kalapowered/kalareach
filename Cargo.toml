@@ -74,6 +74,9 @@ exacl = { version = "=0.13.0", default-features = false }
 # Stream combinators. The catalogue wraps the update client's transport to hold a whole metadata
 # fetch inside the repository's approved byte budget, whatever length the metadata declares.
 futures = "=0.3.34"
+# Reads a release archive, `.tar.gz`, when `kr host update` stages one. The exact releases the
+# workspace already builds for its own build scripts, with the Rust decompressor.
+flate2 = "=1.1.10"
 # How the rendezvous room's WebSocket is read and written: as a stream of messages and a sink for
 # them, the only interface its WebSocket library has.
 futures-util = { version = "=0.3.34", default-features = false, features = ["sink"] }
@@ -194,6 +197,9 @@ tauri-build = { version = "=2.6.3", default-features = false }
 # The companion reads an invitation from the pasteboard in native code, so the text never passes
 # through the page.
 tauri-plugin-clipboard-manager = "=2.3.3"
+# The entries of a release archive, each read and checked before anything is written: no link, no
+# device and no path outside the release. Extended attributes are never read.
+tar = { version = "=0.4.46", default-features = false }
 tauri-plugin-dialog = "=2.7.3"
 tauri-plugin-opener = "=2.5.5"
 tempfile = "=3.27.0"

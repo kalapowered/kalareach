@@ -943,6 +943,48 @@ async fn run(cli: Cli) -> Result<Completion> {
                 Ok(Completion::Done)
             }
             HostCommand::ImportJournals => kr_cli::import::run(&paths, cli.json),
+            HostCommand::Install(install) => {
+                let installed =
+                    kr_cli::update::install(install.release.as_deref(), install.store.as_deref())?;
+                if cli.json {
+                    output::document(&installed.document());
+                } else {
+                    for line in installed.lines() {
+                        output::say(&line);
+                    }
+                }
+                Ok(Completion::Done)
+            }
+            HostCommand::Update(update) => {
+                let updated =
+                    kr_cli::update::update(update.archive.as_deref(), update.check).await?;
+                if cli.json {
+                    output::document(&updated.document());
+                } else {
+                    for line in updated.lines() {
+                        output::say(&line);
+                    }
+                }
+                Ok(Completion::Done)
+            }
+            HostCommand::Versions => {
+                let kept = kr_cli::update::versions()?;
+                if cli.json {
+                    output::document(
+                        &Document::new().with("ok", true).with(
+                            "releases",
+                            kept.iter()
+                                .map(kr_cli::update::Kept::document)
+                                .collect::<Vec<_>>(),
+                        ),
+                    );
+                } else {
+                    for release in &kept {
+                        output::say(&release.said());
+                    }
+                }
+                Ok(Completion::Done)
+            }
         },
         Command::Account(arguments) => match arguments.command {
             AccountCommand::Token(token) => match token {

@@ -733,6 +733,41 @@ async fn standalone(
     )))
 }
 
+/// Starts a control daemon as a daemon was started before an update stopped it: `program`, the
+/// daemon through the store's `current`, with the arguments it was started with and in the
+/// directory it was started in, writing where the standalone start's daemon writes.
+///
+/// It does not wait for the daemon to answer; an update waits for each daemon it starts to answer
+/// as a daemon of the release it made current, and then collects the child if it has ended.
+///
+/// # Errors
+///
+/// Returns the failure to open the log or to start the program.
+#[cfg(unix)]
+pub(crate) fn start_as_before(
+    environment: &EnvironmentPaths,
+    program: &std::path::Path,
+    arguments: &[String],
+    working_directory: &std::path::Path,
+) -> Result<std::process::Child> {
+    environment.create()?;
+    let log = Log::open(&environment.state_dir().join(LOG_FILE))?;
+    std::process::Command::new(program)
+        .args(arguments)
+        .current_dir(working_directory)
+        .stdin(std::process::Stdio::null())
+        .stdout(log.output()?)
+        .stderr(log.output()?)
+        .spawn()
+        .map_err(|error| {
+            CliError::HostUnavailable(shown!(
+                "the control daemon {} could not be started: {}",
+                Shown::root(program),
+                Shown::io(&error)
+            ))
+        })
+}
+
 /// What a failure says of the last line a daemon's log holds.
 ///
 /// The daemon's refusal of an environment another daemon already holds is said, because it is the

@@ -876,6 +876,35 @@ pub enum HostCommand {
     /// Bring this environment's journals that are older than this build migrates forward, once,
     /// while its control daemon is stopped.
     ImportJournals,
+    /// Put a first release into this user's store of releases and make it current. Run it as the
+    /// unpacked release's own kr.
+    Install(InstallArguments),
+    /// Update this host to a newer release: its control daemons are handed over, and every live
+    /// session goes on with the release it started from.
+    Update(UpdateArguments),
+    /// Show the releases this host keeps, and which one is current.
+    Versions,
+}
+
+/// `kr host install`.
+#[derive(Args)]
+pub struct InstallArguments {
+    /// The unpacked release to install. Without it, the release this kr is part of.
+    pub release: Option<PathBuf>,
+    /// The store to install into. Without it, this user's own.
+    #[arg(long)]
+    pub store: Option<PathBuf>,
+}
+
+/// `kr host update`.
+#[derive(Args)]
+pub struct UpdateArguments {
+    /// The release archive to update to, `kalareach-<target>-<release>.tar.gz`.
+    #[arg(long)]
+    pub archive: Option<PathBuf>,
+    /// Check the release and what holds an update now, and change nothing.
+    #[arg(long)]
+    pub check: bool,
 }
 
 /// `kr host startup`.

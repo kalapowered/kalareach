@@ -18,6 +18,8 @@ path = "src/bin/kr-attach-guard.rs"
 
 [dependencies]
 clap.workspace = true
+# A release archive `kr host update` stages: gzip, then tar.
+flate2.workspace = true
 kr-cbor.workspace = true
 kr-client = { workspace = true, features = ["terminal"] }
 kr-controller = { workspace = true }
@@ -34,15 +36,27 @@ kr-term.workspace = true
 qrcodegen.workspace = true
 rmcp.workspace = true
 schemars.workspace = true
-rustix = { workspace = true, features = ["stdio", "termios"] }
+# The free space staging a release needs is read from the filesystem it goes to.
+rustix = { workspace = true, features = ["fs", "stdio", "termios"] }
 serde.workspace = true
 serde_json.workspace = true
+# The digest of each file a release lists, read as it is unpacked or copied.
+sha2.workspace = true
 signal-hook.workspace = true
+tar.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util.workspace = true
+# A release is checked against the update channel's root: a threshold of the keys that root names
+# for its targets role signs each release's manifest. The root's format and its signature check
+# are The Update Framework's, the same code the plugin catalogue verifies with; the role types it
+# checks carry an expiry, which is why its time type is here too.
+jiff.workspace = true
+tough.workspace = true
 
 [dev-dependencies]
+# The update tests make channel roots and sign release manifests with keys of their own.
+aws-lc-rs.workspace = true
 # The tests act exactly when a held rename was refused, through the retry's own seam.
 kr-flush = { workspace = true, features = ["testing"] }
 # The Windows start and pairing tests register a test environment's scheduled task and host a
