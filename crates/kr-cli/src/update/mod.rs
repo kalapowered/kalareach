@@ -906,10 +906,7 @@ async fn hand_over(
     // The install lock: no daemon of this store starts until `current` has been decided.
     let install = match store.lock_install() {
         Ok(install) => install,
-        Err(error) => {
-            gone(environments, &stopped).await;
-            return Err(undo(store, record, CliError::Other(said(&error))).await);
-        }
+        Err(error) => return Err(undo(store, record, CliError::Other(said(&error))).await),
     };
     // The environments again, now that no daemon can start: one whose daemon started after the
     // first look recorded its roots before it took its environment, and was never asked to make
@@ -918,7 +915,6 @@ async fn hand_over(
         Ok(again) => again,
         Err(error) => {
             drop(install);
-            gone(environments, &stopped).await;
             return Err(undo(store, record, error).await);
         }
     };
@@ -926,8 +922,8 @@ async fn hand_over(
     let mut held = Vec::new();
     let mut holding: Option<Shown> = None;
     let mut failed: Option<CliError> = None;
-    // Every daemon the update stopped is waited for, whatever holds the update or fails: one still
-    // stopping when the update starts again what it stopped would pass for running, then be gone.
+    // Every daemon the update stopped is waited for, whatever holds the update or fails, so what
+    // it stopped is started again once it has gone.
     for environment in &every {
         let told_to_stop = stopped.contains(&environment.environment_id);
         match handover::hold(environment, told_to_stop).await {
@@ -995,19 +991,6 @@ async fn hand_over(
     Ok(restarted)
 }
 
-/// Waits for every daemon the update told to stop, in `environments`, to have gone, as long as
-/// [`handover::hold`] waits for one: a daemon still stopping when the update starts again what it
-/// stopped would pass for running, and then be gone.
-#[cfg(unix)]
-async fn gone(environments: &[inventory::Environment], stopped: &[EnvironmentId]) {
-    for environment in environments
-        .iter()
-        .filter(|environment| stopped.contains(&environment.environment_id))
-    {
-        let _ = handover::hold(environment, true).await;
-    }
-}
-
 /// Every environment an update holds and classes once no daemon can start: those read again under
 /// the install lock, and any the first look found that the second reading did not, in the order of
 /// their identities.
@@ -1070,7 +1053,7 @@ async fn start_recorded(store: &Store, record: &Record) -> Result<Vec<Environmen
     let mut started = Vec::new();
     let mut failed = None;
     for restart in &update.restarts {
-        match start_one(store, restart, &current).await {
+        match start_one(store, restart, &current, &update.target).await {
             Ok(()) => started.push(restart.environment),
             Err(error) => failed = failed.or(Some(error)),
         }
@@ -1082,26 +1065,35 @@ async fn start_recorded(store: &Store, record: &Record) -> Result<Vec<Environmen
 }
 
 /// Starts one recorded daemon, unless one already runs there, and waits for it to answer as a
-/// daemon of `current`.
+/// daemon of `current`. `target` is the release the update under way makes current.
+///
+/// A daemon already there is asked to resume first. It may be the one the update prepared, which
+/// it may have told to stop, or one a person or the service manager started meanwhile. One that
+/// resumes goes on serving, and no stop of the handover can end it after, so it is left as it is
+/// once it answers as a daemon of `current`; one that does not is named, with how to stop it. One
+/// told to stop is going: it is waited for, and then the daemon is started as recorded.
 #[cfg(unix)]
-async fn start_one(store: &Store, restart: &Restart, current: &ReleaseName) -> Result<()> {
+async fn start_one(
+    store: &Store,
+    restart: &Restart,
+    current: &ReleaseName,
+    target: &ReleaseName,
+) -> Result<()> {
     let host = kr_ipc::paths::HostPaths::new(&restart.runtime_root, &restart.state_root)?;
     let environment = inventory::Environment {
         environment_id: restart.environment,
         paths: host.environment(restart.environment),
         host,
     };
-    // A daemon already there, which a person or the service manager started meanwhile, is left
-    // as it is; one that does not answer as a daemon of `current` is named, with how to stop it.
-    let running = kr_controller::singleton::SingletonLock::hold(
-        &environment.paths.singleton_lock(),
-        environment.environment_id,
-    )
-    .is_err();
-    if running {
-        return handover::answers_as(&environment, current, None)
-            .await
-            .map_err(|_| CliError::Other(handover::still_running(&environment)));
+    if handover::held(store, &environment)? {
+        match handover::resume_holder(&environment, target).await? {
+            handover::Resumed::Serving | handover::Resumed::NotListening => {
+                return handover::answers_as(store, &environment, current, None)
+                    .await
+                    .map_err(|_| CliError::Other(handover::still_running(&environment)));
+            }
+            handover::Resumed::Stopping => handover::gone(store, &environment).await?,
+        }
     }
     match &restart.start {
         Start::Service => {
@@ -1110,7 +1102,7 @@ async fn start_one(store: &Store, restart: &Restart, current: &ReleaseName) -> R
                 paths: environment.paths.clone(),
             };
             crate::startup::open_or_start(&environment.host, &known).await?;
-            handover::answers_as(&environment, current, None).await
+            handover::answers_as(store, &environment, current, None).await
         }
         Start::Arguments {
             arguments,
@@ -1122,7 +1114,8 @@ async fn start_one(store: &Store, restart: &Restart, current: &ReleaseName) -> R
                 arguments,
                 std::path::Path::new(working_directory),
             )?;
-            let answered = handover::answers_as(&environment, current, Some(&mut child)).await;
+            let answered =
+                handover::answers_as(store, &environment, current, Some(&mut child)).await;
             // Collected if it has already ended, as one that could not take the environment has;
             // a daemon that runs goes on without this command.
             let _ = child.try_wait();
@@ -1302,5 +1295,42 @@ mod tests {
             .map(|environment| environment.environment_id)
             .collect();
         assert_eq!(every, vec![one, two]);
+    }
+
+    /// Whether a daemon holds an environment is asked only once no daemon is part way through
+    /// taking one: the look waits while a daemon holds the install lock for its start, so the
+    /// daemon takes its environment, and the look then finds it held.
+    #[test]
+    fn the_look_at_an_environment_refuses_no_daemon_that_is_starting() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let store = Store::at(temp.root().join("store"));
+        store.create_directories().expect("the store's directories");
+        let environment = inventory::Environment {
+            environment_id: temp.environment_id(),
+            paths: temp.environment(),
+            host: temp.paths().clone(),
+        };
+        // A daemon part way through its start holds the install lock, shared.
+        let starting = store.lock_start().expect("the start lock");
+        let looked = std::thread::scope(|scope| {
+            let looking = scope.spawn(|| handover::held(&store, &environment));
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            assert!(
+                !looking.is_finished(),
+                "the look waits for the daemon's start"
+            );
+            let daemon = kr_controller::singleton::SingletonLock::acquire(
+                &environment.paths.singleton_lock(),
+                environment.environment_id,
+            )
+            .expect("the starting daemon takes its environment");
+            drop(starting);
+            let looked = looking.join().expect("the look ends");
+            drop(daemon);
+            looked
+        });
+        assert!(looked.expect("looks"), "the look finds the daemon");
+        // The control: with no daemon there, the environment is free.
+        assert!(!handover::held(&store, &environment).expect("looks"));
     }
 }

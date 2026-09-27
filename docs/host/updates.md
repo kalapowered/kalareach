@@ -166,7 +166,7 @@ A control daemon is replaced by the release that updates the host, through
 | --- | --- |
 | `prepare` | Closes its gate to new sessions, waits up to 45 seconds for the creates it has already started to settle, and answers with its process, the arguments it was started with and the directory it was started in. The gate stays closed for five minutes unless a `stop` or a `resume` comes first. |
 | `stop` | Stops. It is refused when the gate is open, so a daemon whose preparation lapsed is never stopped while it is starting sessions. |
-| `resume` | Opens the gate again. The update is not going ahead now. |
+| `resume` | Opens the gate again. The update is not going ahead now. Refused, `ENVIRONMENT_UNAVAILABLE`, once the daemon has been told to stop: a stop and a resume are decided in the order they arrive, so a daemon that resumes is one no stop of the handover ends. |
 
 A create that arrives while the gate is closed is refused with `RESOURCE_UNAVAILABLE`, naming the
 release the host is being updated to; the caller creates the session again once the new daemon is
@@ -175,6 +175,12 @@ whichever release it launched, that worker has taken its own hold on its release
 that does not settle within the 45 seconds makes the daemon refuse the step, and the update waits.
 Nothing a session is doing stops at any step: a worker belongs to the service manager, and the next
 daemon finds it again.
+
+An update that starts a stopped daemon again, or settles one an earlier run left, and finds a
+daemon already holding the environment asks it to resume before it takes it for the environment's
+daemon. One that resumes goes on serving, from then on whatever stop of the handover arrives; one
+that has been told to stop is waited for until it has gone, and then the daemon is started again
+as it was recorded.
 
 A control daemon speaks to a worker only at a compatibility level its release retains. It refuses a
 worker at another level before anything but the hello is exchanged, `UNSUPPORTED_SCHEMA`, and says

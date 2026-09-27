@@ -606,7 +606,10 @@ fn whoami() -> String {
 ///
 /// A closed gate opens again by itself after [`HANDOVER_HOLD_MS`], so a daemon whose updater
 /// stopped between asking it to prepare and telling it to stop goes on starting sessions; a stop
-/// that comes after that is refused, so a daemon is never stopped with its gate open.
+/// that comes after that is refused, so a daemon is never stopped with its gate open. A stop and a
+/// resume are decided under the lock the gate is under: a daemon told to stop refuses to resume,
+/// and one that has resumed refuses a stop, so an updater that sees a daemon resume knows no stop
+/// of the handover will end it.
 #[derive(Debug)]
 pub(super) struct Handover {
     gate: std::sync::Mutex<Gate>,
@@ -707,6 +710,28 @@ impl Handover {
         self.lock().closed = None;
     }
 
+    /// Opens the gate for an update that is not going ahead, unless this daemon has been told to
+    /// stop.
+    ///
+    /// # Errors
+    ///
+    /// `ENVIRONMENT_UNAVAILABLE` once this daemon has been told to stop: it is going, and the
+    /// environment is served again by the daemon that starts after it.
+    pub(super) fn resume(&self) -> Result<()> {
+        let mut gate = self.lock();
+        if *self.stopping.borrow() {
+            return Err(ControllerError::Refused {
+                code: ErrorCode::EnvironmentUnavailable,
+                detail: "this control daemon has been told to stop for an update of this host, \
+                         and is stopping; the environment is served again once a daemon of the \
+                         current release starts"
+                    .to_owned(),
+            });
+        }
+        gate.closed = None;
+        Ok(())
+    }
+
     /// Waits up to `within` for every create under way to settle, and says how many have not.
     pub(super) async fn settle(&self, within: std::time::Duration) -> usize {
         let deadline = tokio::time::Instant::now() + within;
@@ -764,7 +789,8 @@ impl Controller {
     /// # Errors
     ///
     /// `RESOURCE_UNAVAILABLE` when the creates under way do not settle within
-    /// [`HANDOVER_SETTLE_MS`] (the gate opens again), or when `stop` finds the gate open.
+    /// [`HANDOVER_SETTLE_MS`] (the gate opens again), or when `stop` finds the gate open;
+    /// `ENVIRONMENT_UNAVAILABLE` when `resume` comes after a `stop`.
     pub(super) async fn update_handover(&self, mutation: &MutationRequest) -> Result<ParamsValue> {
         let params: HostUpdateHandoverParams = parse(&mutation.params)?;
         match params.step {
@@ -792,7 +818,7 @@ impl Controller {
                 }
             }
             HandoverStep::Stop => self.handover.stop()?,
-            HandoverStep::Resume => self.handover.open(),
+            HandoverStep::Resume => self.handover.resume()?,
         }
         encode(&self.started_as()?)
     }

@@ -109,6 +109,26 @@ async fn only_a_prepared_daemon_is_told_to_stop() {
         .expect("the waiter ends");
 }
 
+/// A daemon told to stop does not resume, and one that has resumed is not stopped: whichever comes
+/// first decides, so an updater that sees a daemon resume knows no stop of the handover will end it.
+#[test]
+fn a_stopping_daemon_does_not_resume_and_a_resumed_one_does_not_stop() {
+    let stopped = Handover::default();
+    stopped.close(&target(), Duration::from_secs(300));
+    stopped.stop().expect("a prepared daemon stops");
+    let refused = stopped
+        .resume()
+        .expect_err("a stopping daemon does not resume");
+    assert_eq!(refused.code(), ErrorCode::EnvironmentUnavailable);
+
+    // The control: resumed first, it is not stopped, and its gate is open.
+    let resumed = Handover::default();
+    resumed.close(&target(), Duration::from_secs(300));
+    resumed.resume().expect("a prepared daemon resumes");
+    assert!(resumed.stop().is_err(), "a resumed daemon is not stopped");
+    drop(resumed.admit().expect("its gate is open"));
+}
+
 /// The whole handover through the daemon's own door: `prepare` answers how the daemon was
 /// started and closes the gate, a create is refused while it is closed and started after
 /// `resume`, and a second `prepare` and a `stop` end the daemon's service.
@@ -283,5 +303,17 @@ async fn a_daemon_makes_way_through_its_own_door() {
     tokio::time::timeout(LIVENESS_DEADLINE, controller.handed_over())
         .await
         .expect("the daemon is told to stop");
+    // Still serving while it goes, it answers, and does not resume.
+    let refused = client
+        .mutate(
+            Method::HostUpdateHandover,
+            ActionId::new(kr_ipc::new_uuid()),
+            target_of.clone(),
+            &step(HandoverStep::Resume),
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .expect_err("a stopping daemon does not resume");
+    assert_eq!(refused.code, ErrorCode::EnvironmentUnavailable);
     serving.abort();
 }
