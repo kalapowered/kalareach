@@ -796,6 +796,61 @@ mod tests {
         );
     }
 
+    /// A worker's ready report carries the worker's own description of its session, which is what
+    /// the daemon that started it keeps of the session from then on.
+    #[test]
+    fn the_ready_report_carries_the_sessions_own_description() {
+        use kr_cbor::CanonicalValue;
+        use kr_protocol::envelope::ParamsValue;
+        use kr_protocol::identity::{DesktopBinding, WorkerProfile};
+        use kr_protocol::ids::{SessionEpoch, SessionId};
+        use kr_protocol::session::{Dimensions, DisplayNumber, ShellMode};
+        use kr_worker::session::{Session, SessionConfig};
+
+        let host = kr_ipc::testing::TempHost::create();
+        let environment = host.environment();
+        let session_id = SessionId::new(kr_ipc::new_uuid());
+        let mut session = Session::open(SessionConfig {
+            session_id,
+            session_epoch: SessionEpoch::V1,
+            environment_id: host.environment_id(),
+            display_number: DisplayNumber::new(1),
+            shell: kr_worker::testing::posix_script("exec cat"),
+            shell_mode: ShellMode::NativeCompat,
+            worker_profile: WorkerProfile::HeadlessUser,
+            desktop: DesktopBinding::none(),
+            dimensions: Dimensions::new(80, 24),
+            journal_path: None,
+            spool_directory: None,
+            worker_endpoint: None,
+            send_queue_bytes: 1024 * 1024,
+            resident_bytes: 64 * 1024,
+            time: kr_worker::action::time::TimeSources::system(),
+            launch_profile: LaunchProfile::default(),
+        })
+        .expect("opens the session");
+        session.launch().expect("launches the shell");
+        let endpoint = environment
+            .worker_endpoint(DisplayNumber::new(1))
+            .expect("an endpoint");
+
+        let report = super::ready_report(session_id, &endpoint, &session).expect("a report");
+        let CanonicalValue::Map(written) = ParamsValue::from_typed(&report)
+            .expect("the report encodes")
+            .into_value()
+        else {
+            panic!("a report is a map of its members");
+        };
+        let described = ParamsValue::from_typed(&session.summary())
+            .expect("the description encodes")
+            .into_value();
+        assert_eq!(
+            written.get("session"),
+            Some(&described),
+            "the report carries the session as its own worker describes it"
+        );
+    }
+
     /// KR-REQ-23.38: a stock shell reads the startup files the profile asks for, like a packaged
     /// one.
     #[test]

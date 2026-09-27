@@ -1173,4 +1173,85 @@ mod tests {
         assert!(!ShellMode::NativeCompat.claims_managed_editor());
         assert!(ShellMode::Managed.claims_managed_editor());
     }
+
+    /// A close answer carries its worker's own description of the session, and one without it
+    /// reads as carrying none: the answer of a worker built before the description, of a host
+    /// answering from a recorded closure, or of a caller that may not read the session. None writes
+    /// no key, so such an answer is byte for byte the shape a reader built before the description
+    /// expects, and a key the schema does not declare is still refused.
+    #[test]
+    fn a_close_answer_carries_its_workers_description_or_reads_as_carrying_none() {
+        use kr_cbor::{CanonicalMap, CanonicalValue};
+
+        use crate::envelope::ParamsValue;
+
+        let session_id = SessionId::new(crate::scalars::Uuid::from_bytes([9; 16]));
+        let described = closing(session_id);
+        let answer = |extra: Option<(&str, CanonicalValue)>| {
+            let mut entries = vec![
+                ("session_id".to_owned(), encoded(&session_id)),
+                ("state".to_owned(), encoded(&SessionState::Closing)),
+                ("durability".to_owned(), encoded(&Durability::Durable)),
+                ("closure".to_owned(), CanonicalValue::Null),
+            ];
+            entries.extend(extra.map(|(name, value)| (name.to_owned(), value)));
+            ParamsValue::new(CanonicalValue::Map(
+                CanonicalMap::from_entries(entries).expect("an answer's members"),
+            ))
+        };
+
+        let with = answer(Some(("session", encoded(&described))));
+        let read: SessionCloseResult = with
+            .to_typed()
+            .expect("an answer with its worker's description reads");
+        assert_eq!(
+            ParamsValue::from_typed(&read).expect("encodes"),
+            with,
+            "and writes back as it came"
+        );
+
+        let without = answer(None);
+        let read: SessionCloseResult = without
+            .to_typed()
+            .expect("an answer without a description reads");
+        assert_eq!(
+            ParamsValue::from_typed(&read).expect("encodes"),
+            without,
+            "an answer that carries none writes no key"
+        );
+
+        assert!(
+            answer(Some(("described", encoded(&described))))
+                .to_typed::<SessionCloseResult>()
+                .is_err(),
+            "a key the schema does not declare is refused"
+        );
+    }
+
+    /// `session_id` as its worker describes it once a close has been admitted.
+    fn closing(session_id: SessionId) -> SessionSummary {
+        SessionSummary {
+            session_id,
+            session_epoch: SessionEpoch::V1,
+            environment_id: EnvironmentId::new(crate::scalars::Uuid::from_bytes([8; 16])),
+            display_number: DisplayNumber::new(1),
+            state: SessionState::Closing,
+            shell_mode: ShellMode::NativeCompat,
+            shell_path: "/bin/sh".to_owned(),
+            cwd: "/work".to_owned(),
+            worker_profile: WorkerProfile::HeadlessUser,
+            desktop: DesktopBinding::none(),
+            created_at_ms: TimestampMs::new(1),
+            dimensions: Dimensions::new(80, 24),
+            attachment_count: U64::ZERO,
+            application_state: Nullable::null(),
+            root_process: Nullable::null(),
+            closure: Nullable::null(),
+        }
+    }
+
+    /// `value` as KR-CBOR-1 writes it.
+    fn encoded(value: &impl Serialize) -> kr_cbor::CanonicalValue {
+        kr_cbor::to_canonical_value(value).expect("encodes")
+    }
 }

@@ -501,6 +501,68 @@ mod tests {
         assert_eq!(generation.len(), 4);
     }
 
+    /// A ready report carries its worker's own description of the session, and a report without
+    /// one is refused. The report passes only between a daemon and the worker it started from its
+    /// own installation, so no report of another shape reaches a reader.
+    #[test]
+    fn a_ready_report_carries_its_workers_description_of_its_session() {
+        use crate::envelope::ParamsValue;
+        use crate::identity::DesktopBinding;
+        use crate::session::{Dimensions, SessionState, SessionSummary, ShellMode};
+
+        let session_id = SessionId::new(Uuid::from_bytes([9; 16]));
+        let described = SessionSummary {
+            session_id,
+            session_epoch: SessionEpoch::V1,
+            environment_id: EnvironmentId::new(Uuid::from_bytes([8; 16])),
+            display_number: DisplayNumber::new(1),
+            state: SessionState::Live,
+            shell_mode: ShellMode::NativeCompat,
+            shell_path: "/bin/sh".to_owned(),
+            cwd: "/work".to_owned(),
+            worker_profile: WorkerProfile::HeadlessUser,
+            desktop: DesktopBinding::none(),
+            created_at_ms: TimestampMs::new(1),
+            dimensions: Dimensions::new(80, 24),
+            attachment_count: U64::ZERO,
+            application_state: Nullable::null(),
+            root_process: Nullable::some(start()),
+            closure: Nullable::null(),
+        };
+        let report = |described: Option<&SessionSummary>| {
+            let mut entries = vec![
+                ("session_id".to_owned(), encoded(&session_id)),
+                ("endpoint".to_owned(), CanonicalValue::text("/run/w1.sock")),
+                ("root_process".to_owned(), encoded(&start())),
+                ("shell_path".to_owned(), CanonicalValue::text("/bin/sh")),
+                ("dimensions".to_owned(), encoded(&Dimensions::new(80, 24))),
+            ];
+            entries.extend(described.map(|described| ("session".to_owned(), encoded(described))));
+            ParamsValue::new(CanonicalValue::Map(
+                kr_cbor::CanonicalMap::from_entries(entries).expect("a report's members"),
+            ))
+        };
+
+        let with = report(Some(&described));
+        let read: WorkerReady = with
+            .to_typed()
+            .expect("a report with its worker's description reads");
+        assert_eq!(
+            ParamsValue::from_typed(&read).expect("encodes"),
+            with,
+            "and writes back as it came"
+        );
+        assert!(
+            report(None).to_typed::<WorkerReady>().is_err(),
+            "a report without its worker's description is refused"
+        );
+    }
+
+    /// `value` as KR-CBOR-1 writes it.
+    fn encoded(value: &impl Serialize) -> CanonicalValue {
+        kr_cbor::to_canonical_value(value).expect("encodes")
+    }
+
     #[test]
     fn a_different_nonce_produces_a_different_transcript() {
         let first = verify_elements(

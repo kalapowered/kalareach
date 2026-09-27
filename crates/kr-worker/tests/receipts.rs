@@ -969,6 +969,50 @@ async fn a_duplicate_returns_the_retained_receipt_and_lost_authority_returns_not
     );
 }
 
+/// KR-REQ-07.55: a worker's acceptance of a close carries its own description of the session,
+/// taken as the close is admitted, and an exact retry is answered from the journal with that same
+/// acceptance, the description included.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_close_is_accepted_with_the_sessions_own_description_and_a_retry_returns_it() {
+    let host = host().await;
+    let mut client = controller_client(&host).await;
+    let mutation = close_mutation(
+        &client,
+        &host,
+        DEFAULT_MUTATION_TTL.get(),
+        ParamsValue::empty(),
+    );
+    let Outcome::Ok(accepted) = send_mutation(&mut client, mutation.clone()).await else {
+        panic!("the close is accepted");
+    };
+    // The acceptance is held until this connection says it was delivered, so nothing has been
+    // signalled yet and the session is still as its worker described it in the acceptance.
+    let described = ParamsValue::from_typed(&host.service.runtime().session().summary())
+        .expect("the description encodes")
+        .into_value();
+    assert_eq!(
+        member(&accepted, "session"),
+        Some(&described),
+        "the acceptance carries the session as its own worker describes it, closing"
+    );
+
+    let Outcome::Ok(again) = send_mutation(&mut client, mutation).await else {
+        panic!("an exact retry is answered");
+    };
+    assert_eq!(
+        again, accepted,
+        "an exact retry is answered with the acceptance the journal kept, its description included"
+    );
+}
+
+/// The member `name` of a map-shaped answer, where it has one.
+fn member<'a>(value: &'a ParamsValue, name: &str) -> Option<&'a kr_cbor::CanonicalValue> {
+    match value.as_value() {
+        kr_cbor::CanonicalValue::Map(map) => map.get(name),
+        _ => None,
+    }
+}
+
 /// KR-REQ-23.24: an automatically issued replacement identifier after an uncertain result is
 /// rejected, and an explicit later request that shows the earlier result is admitted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
