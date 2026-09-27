@@ -612,6 +612,16 @@ pub fn host_name(text: &str) -> Option<Shown> {
     named.then(|| shown!("{}", Checked(text.to_owned())))
 }
 
+/// Returns the name a value of a closed set has in this build's source, as its derived `Debug`
+/// writes it.
+///
+/// A value that can be copied and lives for the whole program holds no text that arrived, so what
+/// its `Debug` writes is a variant's name, a number or this program's own words.
+#[must_use]
+pub fn variant_name<T: fmt::Debug + Copy + 'static>(value: T) -> Shown {
+    shown!("{}", Withheld(format!("{value:?}")))
+}
+
 /// This program's help or version, as clap renders what the command declares.
 pub struct Help(String);
 

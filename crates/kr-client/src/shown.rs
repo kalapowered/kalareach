@@ -1393,6 +1393,7 @@ plain!(
     kr_protocol::scalars::Uuid,
     kr_protocol::scalars::U64,
     kr_protocol::ids::ActionId,
+    kr_protocol::ids::ApplicationInstanceId,
     kr_protocol::ids::AttachmentId,
     kr_protocol::ids::DeviceId,
     kr_protocol::ids::DraftId,

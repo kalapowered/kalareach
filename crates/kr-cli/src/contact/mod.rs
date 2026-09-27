@@ -38,7 +38,6 @@ use rmcp::service::{MaybeSendFuture, NotificationContext, RequestContext, RoleSe
 use rmcp::{ErrorData, ServerHandler, ServiceExt, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use kr_protocol::error::ErrorCode;
@@ -52,6 +51,7 @@ use kr_protocol::question::{
 use kr_protocol::scalars::{DurationMs, Nullable};
 
 use crate::bind::{self, Bound, SETUP_INSTRUCTION};
+use crate::output::{self, Asked, Document, Request};
 
 /// The variable an installation names this client's tool deadline in.
 ///
@@ -601,7 +601,7 @@ impl Contact {
             let question = self
                 .cancelled(call, &bound, question_id, &created.caller_token)
                 .await?;
-            return Ok(CallToolResult::structured(created_value(
+            return Ok(output::tool_result(created_value(
                 &question,
                 &token,
                 created.deduplicated,
@@ -634,7 +634,7 @@ impl Contact {
             },
             _ => created.question,
         };
-        Ok(CallToolResult::structured(created_value(
+        Ok(output::tool_result(created_value(
             &question,
             &token,
             created.deduplicated,
@@ -659,7 +659,7 @@ impl Contact {
             Polled::Read(question) => *question,
             Polled::Cancelled => self.cancelled(call, &bound, question_id, &token).await?,
         };
-        Ok(CallToolResult::structured(question_value(&question)))
+        Ok(output::tool_result(question_value(&question)))
     }
 
     async fn withdraw(&self, params: CancelQuestionParams) -> crate::error::Result<CallToolResult> {
@@ -678,7 +678,7 @@ impl Contact {
             },
         )
         .await?;
-        Ok(CallToolResult::structured(question_value(&result.question)))
+        Ok(output::tool_result(question_value(&result.question)))
     }
 
     async fn notify(&self, params: SendNotificationParams) -> crate::error::Result<CallToolResult> {
@@ -698,13 +698,17 @@ impl Contact {
             },
         )
         .await?;
-        Ok(CallToolResult::structured(json!({
-            "session_id": result.alert.session_id.to_string(),
-            "dedup_id": result.alert.dedup_id,
-            "severity": result.alert.severity.as_str(),
-            "created_at_ms": result.alert.created_at_ms.get(),
-            "deduplicated": result.deduplicated,
-        })))
+        Ok(output::tool_result(
+            Document::new()
+                .with("session_id", output::said(&result.alert.session_id))
+                .with(
+                    "dedup_id",
+                    Asked::text(Request::ToolAnswer, &result.alert.dedup_id),
+                )
+                .with("severity", result.alert.severity.as_str())
+                .with("created_at_ms", result.alert.created_at_ms.get())
+                .with("deduplicated", result.deduplicated),
+        ))
     }
 
     /// Long-polls one question until it resolves, the wait runs out, or the client cancels the call.
@@ -883,7 +887,7 @@ pub async fn run_stdio(build_id: BuildId) -> crate::error::Result<()> {
     let transport = ServedTransport {
         inner: rmcp::transport::async_rw::AsyncRwTransport::new_server(
             tokio::io::stdin(),
-            tokio::io::stdout(),
+            output::protocol_stream().asynchronous(),
         ),
         ended: Arc::clone(&contact.transport_ended),
     };
@@ -920,53 +924,80 @@ fn refusal(error: CliError) -> CallToolResult {
         CliError::Refused(refused) => refused.clone(),
         other => kr_client::error::refusal(other.code(), other.said()),
     };
-    let mut value = json!({
-        "code": protocol.code.as_str(),
-        "message": protocol.message,
-        "retry": format!("{:?}", protocol.code.retry_category()),
-    });
-    if protocol.code == ErrorCode::NotInKrSession
-        && let Some(object) = value.as_object_mut()
-    {
-        object.insert("setup".to_owned(), json!(SETUP_INSTRUCTION));
+    let mut document = Document::new()
+        .with("code", output::said(&protocol.code))
+        .with("message", Shown::protocol(&protocol))
+        .with(
+            "retry",
+            crate::shown::variant_name(protocol.code.retry_category()),
+        );
+    if protocol.code == ErrorCode::NotInKrSession {
+        document.set("setup", SETUP_INSTRUCTION);
     }
-    CallToolResult::structured_error(value)
+    output::tool_error(document)
 }
 
-fn created_value(question: &Question, caller_token: &str, deduplicated: bool) -> Value {
-    let mut value = question_value(question);
-    if let Some(object) = value.as_object_mut() {
-        object.insert("caller_token".to_owned(), json!(caller_token));
-        object.insert("deduplicated".to_owned(), json!(deduplicated));
-    }
-    value
+/// A question the agent created, with the token it holds for it: the token is the caller's own,
+/// returned to it.
+fn created_value(question: &Question, caller_token: &str, deduplicated: bool) -> Document {
+    question_value(question)
+        .with(
+            "caller_token",
+            Asked::text(Request::ToolCaller, caller_token),
+        )
+        .with("deduplicated", deduplicated)
 }
 
-fn question_value(question: &Question) -> Value {
-    json!({
-        "question_id": question.question_id.to_string(),
-        "revision": question.revision.get(),
-        "state": question.state.as_str(),
-        "session_id": question.session_id.to_string(),
-        "type": question.kind.as_str(),
-        "choices": question
-            .choices
-            .iter()
-            .map(|choice| json!({"choice_id": choice.choice_id, "label": choice.label}))
-            .collect::<Vec<_>>(),
-        "expires_at_ms": question.expires_at_ms.get(),
-        "answer": question.answer.as_ref().map(|record| answer_value(&record.answer)),
-    })
+/// A question as the agent that asked it reads it back: its choices and its answer are what the
+/// agent and its person wrote.
+fn question_value(question: &Question) -> Document {
+    Document::new()
+        .with("question_id", output::said(&question.question_id))
+        .with("revision", question.revision.get())
+        .with("state", question.state.as_str())
+        .with("session_id", output::said(&question.session_id))
+        .with("type", question.kind.as_str())
+        .with(
+            "choices",
+            question
+                .choices
+                .iter()
+                .map(|choice| {
+                    Document::new()
+                        .with(
+                            "choice_id",
+                            Asked::text(Request::ToolAnswer, &choice.choice_id),
+                        )
+                        .with("label", Asked::text(Request::ToolAnswer, &choice.label))
+                })
+                .collect::<Vec<_>>(),
+        )
+        .with("expires_at_ms", question.expires_at_ms.get())
+        .with(
+            "answer",
+            question
+                .answer
+                .as_ref()
+                .map(|record| answer_value(&record.answer)),
+        )
 }
 
-fn answer_value(answer: &QuestionAnswer) -> Value {
+fn answer_value(answer: &QuestionAnswer) -> Document {
     match answer {
-        QuestionAnswer::Input { text } => json!({"kind": "input", "text": text}),
-        QuestionAnswer::Choice { choice_id } => json!({"kind": "choice", "choice_id": choice_id}),
-        QuestionAnswer::Decision { decided } => json!({"kind": "decision", "decided": decided}),
+        QuestionAnswer::Input { text } => Document::new()
+            .with("kind", "input")
+            .with("text", Asked::text(Request::ToolAnswer, text)),
+        QuestionAnswer::Choice { choice_id } => Document::new()
+            .with("kind", "choice")
+            .with("choice_id", Asked::text(Request::ToolAnswer, choice_id)),
+        QuestionAnswer::Decision { decided } => Document::new()
+            .with("kind", "decision")
+            .with("decided", *decided),
         // Free text stays free text all the way out. Nothing here folds it into a listed choice
         // or into a yes.
-        QuestionAnswer::Other { text } => json!({"kind": "other", "text": text}),
+        QuestionAnswer::Other { text } => Document::new()
+            .with("kind", "other")
+            .with("text", Asked::text(Request::ToolAnswer, text)),
     }
 }
 
@@ -1259,12 +1290,32 @@ mod tests {
         );
     }
 
+    /// KR-REQ-23.25: text planted in every leaf of a question that can hold free text reaches the
+    /// agent that asked it only as what it and its person wrote, and the caller token only as its
+    /// own.
+    #[test]
+    fn planted_text_reaches_the_agent_only_as_its_own() {
+        use crate::output::planted::{only_asked, planted, planted_text};
+
+        let mut shown = std::collections::BTreeSet::new();
+        for question in planted::<Question>() {
+            shown.extend(only_asked(
+                "ask_user",
+                &created_value(&question, &planted_text(), false),
+            ));
+        }
+        for asked in ["caller_token", "choices[].label", "answer.text"] {
+            assert!(shown.contains(asked), "{asked} reaches the agent");
+        }
+    }
+
     /// KR-REQ-11.59: an `other` answer reaches the agent as free text, never as a choice or a yes.
     #[test]
     fn a_free_text_answer_is_reported_as_free_text() {
         let value = answer_value(&QuestionAnswer::Other {
             text: "a third way".to_owned(),
-        });
+        })
+        .json();
         assert_eq!(value["kind"], "other");
         assert_eq!(value["text"], "a third way");
     }

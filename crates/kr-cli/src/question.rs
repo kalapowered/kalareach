@@ -50,10 +50,11 @@ use kr_protocol::question::{
 };
 use kr_protocol::scalars::Nullable;
 use kr_protocol::worker::WorkerDescriptor;
-use serde_json::{Value, json};
 
 use crate::error::{CliError, Result};
+use crate::output::{self, Asked, Document, Line, Request, left, right};
 use crate::resolve::{KnownEnvironment, SessionSelector, environments, find, open_worker};
+use crate::stdout_line;
 
 /// The directory, in this user's state directory, the answers kept on this device are in.
 pub const KEPT_ANSWERS: &str = "kept-answers";
@@ -589,50 +590,50 @@ fn retired_because(reason: Retired) -> Shown {
 
 /// Renders one kept answer, as `kr question drafts` found it, for a script.
 #[must_use]
-pub fn kept_rendered(reconciled: &Reconciled) -> Value {
+pub fn kept_rendered(reconciled: &Reconciled) -> Document {
     let (draft, state, reason, reason_code) = match reconciled {
         Reconciled::Offered(draft) => (draft, "offered", None, None),
         Reconciled::Unlisted(draft) => (
             draft,
             "unlisted",
-            Some(UNLISTED_BECAUSE.to_owned()),
+            Some(Shown::said(UNLISTED_BECAUSE)),
             Some(AnswerError::Unlisted.code()),
         ),
         Reconciled::Retired { draft, reason } => (
             draft,
             "retired",
-            Some(retired_because(*reason).into_string()),
+            Some(retired_because(*reason)),
             Some(AnswerError::Retired(*reason).code()),
         ),
     };
-    json!({
-        "question_id": draft.question_id.to_string(),
-        "session_id": draft.session_id.to_string(),
-        "state": state,
-        "reason": reason,
-        "reason_code": reason_code.map(ErrorCode::as_str),
-        "question_revision": draft.question_revision.get(),
-        "answer": answer_document(&draft.answer),
-        "drafted_at_ms": draft.drafted_at_ms.get(),
-    })
+    Document::new()
+        .with("question_id", output::said(&draft.question_id))
+        .with("session_id", output::said(&draft.session_id))
+        .with("state", state)
+        .with("reason", reason)
+        .with("reason_code", reason_code.map(ErrorCode::as_str))
+        .with("question_revision", draft.question_revision.get())
+        .with("answer", answer_document(&draft.answer))
+        .with("drafted_at_ms", draft.drafted_at_ms.get())
 }
 
 /// Renders one kept answer, as `kr question drafts` found it, as a line for a person.
 #[must_use]
-pub fn kept_line(reconciled: &Reconciled) -> String {
+pub fn kept_line(reconciled: &Reconciled) -> Line {
     match reconciled {
-        Reconciled::Offered(draft) => format!(
+        Reconciled::Offered(draft) => stdout_line!(
             "{}  offered  {} at revision {}; send it with kr question send {}",
             draft.question_id,
             answer_words(&draft.answer),
             draft.question_revision.get(),
             draft.question_id
         ),
-        Reconciled::Unlisted(draft) => format!(
+        Reconciled::Unlisted(draft) => stdout_line!(
             "{}  unlisted  {}; it is still kept, and this command did not send it",
-            draft.question_id, UNLISTED_BECAUSE
+            draft.question_id,
+            UNLISTED_BECAUSE
         ),
-        Reconciled::Retired { draft, reason } => format!(
+        Reconciled::Retired { draft, reason } => stdout_line!(
             "{}  retired  {}; this command did not send it, and it is no longer kept",
             draft.question_id,
             retired_because(*reason)
@@ -640,28 +641,47 @@ pub fn kept_line(reconciled: &Reconciled) -> String {
     }
 }
 
-/// An answer, for a script.
-fn answer_document(answer: &QuestionAnswer) -> Value {
-    json!({
-        "kind": answer.kind(),
-        "text": answer.text(),
-        "choice_id": match answer {
-            QuestionAnswer::Choice { choice_id } => Some(choice_id.clone()),
-            _ => None,
-        },
-        "decided": match answer {
-            QuestionAnswer::Decision { decided } => Some(*decided),
-            _ => None,
-        },
-    })
+/// An answer, for a script: its text and its choice are the person's own.
+fn answer_document(answer: &QuestionAnswer) -> Document {
+    Document::new()
+        .with("kind", answer.kind())
+        .with(
+            "text",
+            answer
+                .text()
+                .map(|text| Asked::text(Request::Question, text)),
+        )
+        .with(
+            "choice_id",
+            match answer {
+                QuestionAnswer::Choice { choice_id } => {
+                    Some(Asked::text(Request::Question, choice_id))
+                }
+                _ => None,
+            },
+        )
+        .with(
+            "decided",
+            match answer {
+                QuestionAnswer::Decision { decided } => Some(*decided),
+                _ => None,
+            },
+        )
 }
 
-/// An answer, in the words a person is shown.
-fn answer_words(answer: &QuestionAnswer) -> String {
+/// An answer, in the words a person is shown: text as it was written, quoted, and a choice by its
+/// identifier.
+fn answer_words(answer: &QuestionAnswer) -> Asked {
     match answer {
-        QuestionAnswer::Input { text } | QuestionAnswer::Other { text } => format!("{text:?}"),
-        QuestionAnswer::Choice { choice_id } => format!("choice {choice_id}"),
-        QuestionAnswer::Decision { decided } => if *decided { "yes" } else { "no" }.to_owned(),
+        QuestionAnswer::Input { text } | QuestionAnswer::Other { text } => {
+            Asked::text(Request::Question, &format!("{text:?}"))
+        }
+        QuestionAnswer::Choice { choice_id } => {
+            Asked::text(Request::Question, &format!("choice {choice_id}"))
+        }
+        QuestionAnswer::Decision { decided } => {
+            Asked::text(Request::Question, if *decided { "yes" } else { "no" })
+        }
     }
 }
 
@@ -1102,138 +1122,184 @@ pub async fn cancel(
     Ok(result.question)
 }
 
-/// Renders one question for a script.
+/// Renders one question for a script. Its text, its context, its choices, its label, the
+/// executable that asked it and its answer are what an agent and its person wrote, shown to the
+/// person who asked for the question.
 #[must_use]
-pub fn rendered(descriptor: &WorkerDescriptor, question: &Question) -> Value {
-    json!({
-        "question_id": question.question_id.to_string(),
-        "revision": question.revision.get(),
-        "state": question.state.as_str(),
-        "session_id": question.session_id.to_string(),
-        "display_number": descriptor.display_number.get(),
-        "type": question.kind.as_str(),
-        "context": question.context,
-        "question": question.question,
-        "choices": question
-            .choices
-            .iter()
-            .map(|choice| json!({"choice_id": choice.choice_id, "label": choice.label}))
-            .collect::<Vec<_>>(),
+pub fn rendered(descriptor: &WorkerDescriptor, question: &Question) -> Document {
+    Document::new()
+        .with("question_id", output::said(&question.question_id))
+        .with("revision", question.revision.get())
+        .with("state", question.state.as_str())
+        .with("session_id", output::said(&question.session_id))
+        .with("display_number", descriptor.display_number.get())
+        .with("type", question.kind.as_str())
+        .with("context", Asked::text(Request::Question, &question.context))
+        .with(
+            "question",
+            Asked::text(Request::Question, &question.question),
+        )
+        .with(
+            "choices",
+            question
+                .choices
+                .iter()
+                .map(|choice| {
+                    Document::new()
+                        .with(
+                            "choice_id",
+                            Asked::text(Request::Question, &choice.choice_id),
+                        )
+                        .with("label", Asked::text(Request::Question, &choice.label))
+                })
+                .collect::<Vec<_>>(),
+        )
         // The identity the broker verified, and the label the caller supplied, kept apart.
-        "verified_source": {
-            "executable": question.source.executable.as_ref().cloned(),
-            "pid": question.source.process.pid.get(),
-            "application_instance_id": question.source.application_instance_id.to_string(),
-            "session_member": question.source.session_member,
-            "ancestry": question.source.ancestry,
-            "launch_channel": question.source.launch_channel,
-        },
-        "unverified_agent_label": question.source.agent_label.as_ref().cloned(),
-        "created_at_ms": question.created_at_ms.get(),
-        "expires_at_ms": question.expires_at_ms.get(),
-        "answer": question.answer.as_ref().map(|record| json!({
-            "kind": record.answer.kind(),
-            "text": record.answer.text(),
-            "choice_id": match &record.answer {
-                QuestionAnswer::Choice { choice_id } => Some(choice_id.clone()),
-                _ => None,
-            },
-            "decided": match &record.answer {
-                QuestionAnswer::Decision { decided } => Some(*decided),
-                _ => None,
-            },
-            "actor_id": record.actor_id.to_string(),
-            "device_id": record.device_id.as_ref().map(ToString::to_string),
-            "question_revision": record.question_revision.get(),
-            "answered_at_ms": record.answered_at_ms.get(),
-        })),
-    })
+        .with(
+            "verified_source",
+            Document::new()
+                .with(
+                    "executable",
+                    question
+                        .source
+                        .executable
+                        .as_ref()
+                        .map(|executable| Asked::path(Request::Question, executable)),
+                )
+                .with("pid", question.source.process.pid.get())
+                .with(
+                    "application_instance_id",
+                    output::said(&question.source.application_instance_id),
+                )
+                .with("session_member", question.source.session_member)
+                .with("ancestry", question.source.ancestry)
+                .with("launch_channel", question.source.launch_channel),
+        )
+        .with(
+            "unverified_agent_label",
+            question
+                .source
+                .agent_label
+                .as_ref()
+                .map(|label| Asked::text(Request::Question, label)),
+        )
+        .with("created_at_ms", question.created_at_ms.get())
+        .with("expires_at_ms", question.expires_at_ms.get())
+        .with(
+            "answer",
+            question.answer.as_ref().map(|record| {
+                answer_document(&record.answer)
+                    .with(
+                        "actor_id",
+                        Asked::text(Request::Question, &record.actor_id.to_string()),
+                    )
+                    .with(
+                        "device_id",
+                        record.device_id.as_ref().map(|device| output::said(device)),
+                    )
+                    .with("question_revision", record.question_revision.get())
+                    .with("answered_at_ms", record.answered_at_ms.get())
+            }),
+        )
 }
 
 /// Renders one question as a line for a person.
 #[must_use]
-pub fn line(descriptor: &WorkerDescriptor, question: &Question) -> String {
-    format!(
-        "{:<36} {:>4}  {:<9} {:<8} {}  [{}]",
-        question.question_id.to_string(),
-        descriptor.display_number.get(),
-        question.state.as_str(),
-        question.kind.as_str(),
-        first_line(&question.question),
-        verified_identity(question),
-    )
+pub fn line(descriptor: &WorkerDescriptor, question: &Question) -> Line {
+    let text = Asked::text(Request::Question, &first_line(&question.question));
+    let pid = question.source.process.pid.get();
+    match question.source.executable.as_ref() {
+        Some(executable) => stdout_line!(
+            "{} {}  {} {} {}  [{} ({})]",
+            left(36, &question.question_id),
+            right(4, &descriptor.display_number.get()),
+            left(9, &question.state.as_str()),
+            left(8, &question.kind.as_str()),
+            text,
+            Asked::path(Request::Question, executable),
+            pid
+        ),
+        None => stdout_line!(
+            "{} {}  {} {} {}  [process {}]",
+            left(36, &question.question_id),
+            right(4, &descriptor.display_number.get()),
+            left(9, &question.state.as_str()),
+            left(8, &question.kind.as_str()),
+            text,
+            pid
+        ),
+    }
 }
 
 /// Renders one question in full, for a person about to answer it.
 #[must_use]
-pub fn detail(descriptor: &WorkerDescriptor, question: &Question) -> String {
-    let mut text = String::new();
-    text.push_str(&format!("question  {}\n", question.question_id));
-    text.push_str(&format!(
-        "session   {} (display {})\n",
-        question.session_id,
-        descriptor.display_number.get()
-    ));
-    text.push_str(&format!(
-        "asked by  {}  (verified)\n",
-        verified_identity(question)
-    ));
+pub fn detail(descriptor: &WorkerDescriptor, question: &Question) -> Vec<Line> {
+    let asked = |text: &str| Asked::text(Request::Question, text);
+    let pid = question.source.process.pid.get();
+    let mut lines = vec![
+        stdout_line!("question  {}", question.question_id),
+        stdout_line!(
+            "session   {} (display {})",
+            question.session_id,
+            descriptor.display_number.get()
+        ),
+        match question.source.executable.as_ref() {
+            Some(executable) => stdout_line!(
+                "asked by  {} ({})  (verified)",
+                Asked::path(Request::Question, executable),
+                pid
+            ),
+            None => stdout_line!("asked by  process {}  (verified)", pid),
+        },
+    ];
     if let Some(label) = question.source.agent_label.as_ref() {
-        text.push_str(&format!(
-            "label     {label}  (unverified, supplied by the caller)\n"
+        lines.push(stdout_line!(
+            "label     {}  (unverified, supplied by the caller)",
+            asked(label)
         ));
     }
-    text.push_str(&format!(
-        "state     {} at revision {}\n",
+    lines.push(stdout_line!(
+        "state     {} at revision {}",
         question.state.as_str(),
         question.revision.get()
     ));
-    text.push_str(&format!("expires   {}\n", question.expires_at_ms.get()));
-    text.push('\n');
+    lines.push(stdout_line!("expires   {}", question.expires_at_ms.get()));
+    lines.push(stdout_line!(""));
     if !question.context.trim().is_empty() {
-        text.push_str(&format!("{}\n\n", question.context));
+        lines.push(stdout_line!("{}", asked(&question.context)));
+        lines.push(stdout_line!(""));
     }
-    text.push_str(&format!("{}\n", question.question));
+    lines.push(stdout_line!("{}", asked(&question.question)));
     if !question.choices.is_empty() {
-        text.push('\n');
+        lines.push(stdout_line!(""));
         for choice in &question.choices {
             let note = if choice.choice_id == SOMETHING_ELSE_CHOICE {
                 "   (--other \"...\")"
             } else {
                 ""
             };
-            text.push_str(&format!(
-                "  {:<20} {}{note}\n",
-                choice.choice_id, choice.label
+            lines.push(stdout_line!(
+                "  {} {}{}",
+                left(20, &asked(&choice.choice_id)),
+                asked(&choice.label),
+                note
             ));
         }
     }
     if let Some(record) = question.answer.as_ref() {
-        text.push('\n');
-        text.push_str(&format!(
-            "answered  {} by {}\n",
-            match &record.answer {
-                QuestionAnswer::Input { text } | QuestionAnswer::Other { text } => text.clone(),
-                QuestionAnswer::Choice { choice_id } => choice_id.clone(),
-                QuestionAnswer::Decision { decided } =>
-                    if *decided {
-                        "yes".to_owned()
-                    } else {
-                        "no".to_owned()
-                    },
-            },
-            record.actor_id
+        let answered = match &record.answer {
+            QuestionAnswer::Input { text } | QuestionAnswer::Other { text } => asked(text),
+            QuestionAnswer::Choice { choice_id } => asked(choice_id),
+            QuestionAnswer::Decision { decided } => asked(if *decided { "yes" } else { "no" }),
+        };
+        lines.push(stdout_line!(""));
+        lines.push(stdout_line!(
+            "answered  {} by {}",
+            answered,
+            asked(&record.actor_id.to_string())
         ));
     }
-    text
-}
-
-/// Returns the verified application identity a person reads before answering.
-fn verified_identity(question: &Question) -> String {
-    question.source.executable.as_ref().map_or_else(
-        || format!("process {}", question.source.process.pid.get()),
-        |executable| format!("{executable} ({})", question.source.process.pid.get()),
-    )
+    lines
 }
 
 fn first_line(text: &str) -> String {
@@ -1422,10 +1488,17 @@ mod tests {
     #[test]
     fn the_verified_identity_leads_and_the_caller_label_is_marked_unverified() {
         let question = question(QuestionState::Pending);
-        let text = detail(&descriptor(), &question);
-        assert!(text.contains("/usr/bin/some-agent (42)  (verified)"));
+        let text = detail(&descriptor(), &question)
+            .iter()
+            .map(|line| line.text().to_owned())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("/usr/bin/some-agent (42)  (verified)"),
+            "{text}"
+        );
         assert!(text.contains("Totally The Host  (unverified, supplied by the caller)"));
-        let value = rendered(&descriptor(), &question);
+        let value = rendered(&descriptor(), &question).json();
         assert_eq!(
             value["verified_source"]["executable"],
             "/usr/bin/some-agent"
@@ -1435,7 +1508,11 @@ mod tests {
 
     #[test]
     fn the_free_text_option_is_shown_with_the_flag_that_answers_it() {
-        let text = detail(&descriptor(), &question(QuestionState::Pending));
+        let text = detail(&descriptor(), &question(QuestionState::Pending))
+            .iter()
+            .map(|line| line.text().to_owned())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(text.contains("something_else"));
         assert!(text.contains("--other"));
     }
@@ -1457,9 +1534,13 @@ mod tests {
     fn a_kept_answer_says_whether_it_can_be_sent_and_why_not() {
         let draft = kept_draft_for(&question(QuestionState::Pending));
         let offered = Reconciled::Offered(draft.clone());
-        assert!(kept_line(&offered).contains("offered  choice left at revision 1"));
-        assert_eq!(kept_rendered(&offered)["state"], "offered");
-        assert!(kept_rendered(&offered)["reason"].is_null());
+        assert!(
+            kept_line(&offered)
+                .text()
+                .contains("offered  choice left at revision 1")
+        );
+        assert_eq!(kept_rendered(&offered).json()["state"], "offered");
+        assert!(kept_rendered(&offered).json()["reason"].is_null());
         for (reason, words, code) in [
             (
                 Retired::Ended(QuestionState::Expired),
@@ -1488,12 +1569,12 @@ mod tests {
                 draft: draft.clone(),
                 reason,
             };
-            let line = kept_line(&retired);
+            let line = kept_line(&retired).text().to_owned();
             assert!(line.contains("retired"), "{line}");
             assert!(line.contains(words), "{line}");
             assert!(line.contains("this command did not send it"), "{line}");
             assert!(!line.contains("was not sent"), "{line}");
-            let document = kept_rendered(&retired);
+            let document = kept_rendered(&retired).json();
             assert_eq!(document["state"], "retired");
             assert_eq!(document["reason_code"], code, "{document}");
             let refused = answer_failure(AnswerError::Retired(reason));
@@ -1508,9 +1589,40 @@ mod tests {
         }
     }
 
+    /// KR-REQ-23.25: text planted in every leaf of a question that can hold free text reaches its
+    /// document and its lines only as content the person asked for: what the agent asked, its
+    /// context, choices and label, the executable that asked it, and the answer.
+    #[test]
+    fn planted_text_in_a_question_shows_only_where_it_was_asked_for() {
+        use crate::output::planted::{only_asked, only_asked_lines, planted};
+
+        let mut shown = std::collections::BTreeSet::new();
+        for question in planted::<Question>() {
+            shown.extend(only_asked(
+                "kr question show",
+                &rendered(&descriptor(), &question),
+            ));
+            let mut lines = detail(&descriptor(), &question);
+            lines.push(line(&descriptor(), &question));
+            only_asked_lines("kr question show", &lines);
+        }
+        for asked in [
+            "question",
+            "context",
+            "choices[].choice_id",
+            "choices[].label",
+            "verified_source.executable",
+            "unverified_agent_label",
+            "answer.text",
+        ] {
+            assert!(shown.contains(asked), "{asked} shows what was asked for");
+        }
+    }
+
     #[test]
     fn a_listing_line_carries_the_state_and_the_verified_identity() {
-        let text = line(&descriptor(), &question(QuestionState::Pending));
+        let line = line(&descriptor(), &question(QuestionState::Pending));
+        let text = line.text();
         assert!(text.contains("pending"));
         assert!(text.contains("/usr/bin/some-agent"));
     }

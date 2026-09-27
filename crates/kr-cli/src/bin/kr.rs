@@ -1426,18 +1426,20 @@ async fn question(
             let found =
                 question::list(paths, &scope, arguments.include_resolved, build_id()).await?;
             if json {
-                print_json(&serde_json::json!({
-                    "ok": true,
-                    "questions": found
-                        .iter()
-                        .map(|(descriptor, item)| question::rendered(descriptor, item))
-                        .collect::<Vec<_>>(),
-                }));
+                output::document(
+                    &Document::new().with("ok", true).with(
+                        "questions",
+                        found
+                            .iter()
+                            .map(|(descriptor, item)| question::rendered(descriptor, item))
+                            .collect::<Vec<_>>(),
+                    ),
+                );
             } else if found.is_empty() {
-                println!("no questions are waiting");
+                output::say(&Shown::said("no questions are waiting"));
             } else {
                 for (descriptor, item) in &found {
-                    println!("{}", question::line(descriptor, item));
+                    output::line(&question::line(descriptor, item));
                 }
             }
             Ok(Completion::Done)
@@ -1446,12 +1448,13 @@ async fn question(
             let question_id = parse_question(&arguments.question)?;
             let (descriptor, item) = question::show(paths, question_id, build_id()).await?;
             if json {
-                print_json(&serde_json::json!({
-                    "ok": true,
-                    "question": question::rendered(&descriptor, &item),
-                }));
+                output::document(
+                    &Document::new()
+                        .with("ok", true)
+                        .with("question", question::rendered(&descriptor, &item)),
+                );
             } else {
-                print!("{}", question::detail(&descriptor, &item));
+                output::lines(&question::detail(&descriptor, &item));
             }
             Ok(Completion::Done)
         }
@@ -1464,18 +1467,20 @@ async fn question(
         QuestionCommand::Drafts => {
             let reconciled = question::drafts(paths, build_id()).await?;
             if json {
-                print_json(&serde_json::json!({
-                    "ok": true,
-                    "drafts": reconciled
-                        .iter()
-                        .map(question::kept_rendered)
-                        .collect::<Vec<_>>(),
-                }));
+                output::document(
+                    &Document::new().with("ok", true).with(
+                        "drafts",
+                        reconciled
+                            .iter()
+                            .map(question::kept_rendered)
+                            .collect::<Vec<_>>(),
+                    ),
+                );
             } else if reconciled.is_empty() {
-                println!("no answers are kept on this device");
+                output::say(&Shown::said("no answers are kept on this device"));
             } else {
                 for item in &reconciled {
-                    println!("{}", question::kept_line(item));
+                    output::line(&question::kept_line(item));
                 }
             }
             Ok(Completion::Done)
@@ -1489,13 +1494,14 @@ async fn question(
             let question_id = parse_question(&arguments.question)?;
             let item = question::cancel(paths, question_id, build_id()).await?;
             if json {
-                print_json(&serde_json::json!({
-                    "ok": true,
-                    "state": item.state.as_str(),
-                    "question_id": item.question_id.to_string(),
-                }));
+                output::document(
+                    &Document::new()
+                        .with("ok", true)
+                        .with("state", item.state.as_str())
+                        .with("question_id", output::said(&item.question_id)),
+                );
             } else {
-                println!("{} is {}", item.question_id, item.state.as_str());
+                output::say(&shown!("{} is {}", item.question_id, item.state.as_str()));
             }
             Ok(Completion::Done)
         }
@@ -1515,14 +1521,15 @@ fn report_answered(
     match answered {
         Ok(item) => {
             if json {
-                print_json(&serde_json::json!({
-                    "ok": true,
-                    "state": item.state.as_str(),
-                    "revision": item.revision.get(),
-                    "question_id": item.question_id.to_string(),
-                }));
+                output::document(
+                    &Document::new()
+                        .with("ok", true)
+                        .with("state", item.state.as_str())
+                        .with("revision", item.revision.get())
+                        .with("question_id", output::said(&item.question_id)),
+                );
             } else {
-                println!("{} is {}", item.question_id, item.state.as_str());
+                output::say(&shown!("{} is {}", item.question_id, item.state.as_str()));
             }
             Ok(Completion::Done)
         }

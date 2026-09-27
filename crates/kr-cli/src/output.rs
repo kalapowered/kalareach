@@ -584,6 +584,13 @@ pub fn tool_result(document: Document) -> rmcp::model::CallToolResult {
     rmcp::model::CallToolResult::structured(serde_json::Value::Object(document.values))
 }
 
+/// The document a contact tool returns to the agent that called it when the call failed, as the
+/// tool's structured error.
+#[must_use]
+pub fn tool_error(document: Document) -> rmcp::model::CallToolResult {
+    rmcp::model::CallToolResult::structured_error(serde_json::Value::Object(document.values))
+}
+
 /// Whether standard output is a terminal.
 #[must_use]
 pub fn is_terminal() -> bool {
