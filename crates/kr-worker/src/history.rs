@@ -276,7 +276,11 @@ impl OutputHistory {
             // Privacy mode has disabled retention. The cursor still advances, because it is the
             // session's own position and a client that asked for what it missed is told the range
             // is gone rather than served later output under an earlier cursor.
+            // The window ends where the output does, so the output it does not keep empties it:
+            // left in place, its bytes would be read at cursors they were never written at.
             self.next_cursor += bytes.len() as u64;
+            self.resident.clear();
+            self.resident_marks.clear();
             self.resident_start = self.next_cursor;
             if let Some(spool) = self.spool.as_mut() {
                 spool.note_position(self.next_cursor);
@@ -1843,6 +1847,25 @@ mod tests {
             Some(HistoryGapCause::SessionCapacity)
         );
         std::fs::remove_dir_all(&directory).ok();
+    }
+
+    #[test]
+    fn output_that_is_not_kept_leaves_no_bytes_at_the_wrong_cursors() {
+        // The resident window ends where the output does. Output privacy mode does not keep moves
+        // that end on, so the window is emptied rather than left holding bytes that would then be
+        // read as the output at cursors they were never written at.
+        let mut history = OutputHistory::in_memory(64);
+        history.append(b"kept");
+        history.stop_retaining();
+        history.append(b"private");
+        history.resume_retaining();
+        history.append(b"after");
+        assert_eq!(history.next_cursor(), 16);
+        let page = history.page(0, 64).expect("a page");
+        assert_eq!(page.from_cursor.get(), 11);
+        assert_eq!(page.bytes.as_slice(), b"after");
+        let gap = page.gap.0.expect("what was not kept is a gap");
+        assert_eq!((gap.from_cursor.get(), gap.to_cursor.get()), (0, 11));
     }
 
     #[test]
