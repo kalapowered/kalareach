@@ -3088,6 +3088,9 @@ fn slash_commands_interrupts_queued_prompts_and_steering_each_work_from_a_device
             "a long turn to interrupt",
         );
         let _ = logged.wait_for(stage, &account.busy, "the turn runs");
+        // Interrupted before its reply begins, a turn can be withdrawn whole rather than stopped:
+        // the key goes once the reply is on the screen.
+        let _ = logged.wait_for(stage, &account.reply_mark, "the turn's reply begins");
         logged.type_text(stage, &account.interrupt.input);
         let interrupted = logged.wait_for(
             stage,
