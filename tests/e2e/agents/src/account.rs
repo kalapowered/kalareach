@@ -790,6 +790,35 @@ impl Snapshot {
         counts.retain(|(_, count)| *count > 0);
         counts
     }
+
+    /// How many of `paths` lie under each root, for each root that has any, in the order of the
+    /// roots, compared as paths, whatever bytes their names hold: a path counts under the longest
+    /// root that is it or holds it, and one under none under `None`, last.
+    #[must_use]
+    pub fn count_paths_by_root<'a>(
+        &self,
+        paths: impl IntoIterator<Item = &'a Path>,
+    ) -> Vec<(Option<PathBuf>, usize)> {
+        let mut counts: Vec<(Option<PathBuf>, usize)> = self
+            .roots
+            .iter()
+            .map(|root| (Some(root.clone()), 0))
+            .chain(std::iter::once((None, 0)))
+            .collect();
+        for path in paths {
+            let holder = self
+                .roots
+                .iter()
+                .filter(|root| path.starts_with(root))
+                .max_by_key(|root| root.as_os_str().len())
+                .cloned();
+            if let Some((_, count)) = counts.iter_mut().find(|(root, _)| *root == holder) {
+                *count += 1;
+            }
+        }
+        counts.retain(|(_, count)| *count > 0);
+        counts
+    }
 }
 
 /// Reads every file under each of `directories`, relative to `home`: size, modification time and
@@ -1277,6 +1306,19 @@ mod tests {
             vec![(agent.clone(), 3), (home.join(".absent"), 1)],
             "a root itself, what it holds and a root followed by why count under it; a sibling \
              whose name only begins like it does not"
+        );
+        let unnamed = {
+            use std::os::unix::ffi::OsStrExt;
+            agent.join(std::ffi::OsStr::from_bytes(b"not \xff utf-8"))
+        };
+        assert_eq!(
+            before.count_paths_by_root([
+                agent.as_path(),
+                unnamed.as_path(),
+                home.join(".agentx").join("b").as_path(),
+            ]),
+            vec![(Some(agent.clone()), 2), (None, 1)],
+            "paths count whatever bytes their names hold, and one under no root is counted too"
         );
         std::fs::write(closed.join("history"), "the person's kr0123").expect("an edit");
         std::fs::write(agent.join("ours"), "kr0123").expect("a marked file");
