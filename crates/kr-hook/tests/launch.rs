@@ -232,8 +232,7 @@ impl Shell {
             fixture::COMMAND,
             |store, forwarder| {
                 installed(
-                    fixture::claude_code_package(store, forwarder)
-                        .expect("the package is written"),
+                    fixture::claude_code_package(store, forwarder).expect("the package is written"),
                 )
             },
             viewed,
@@ -975,14 +974,21 @@ fn kr_req_12_20_an_integrated_launch_runs_with_the_declared_variable() {
             .iter()
             .map(|variable| variable.name.as_str())
             .collect();
-        assert_eq!(exported, ["KR_REGISTRATION"], "the shell exports the registration alone");
+        assert_eq!(
+            exported,
+            ["KR_REGISTRATION"],
+            "the shell exports the registration alone"
+        );
         let own: Vec<(&str, &str)> = own
             .map(|value| ("GEMINI_CLI_NO_RELAUNCH", value))
             .into_iter()
             .collect();
         let child = shell.launch_as_the_shell_does(&answer, &gemini_typed(), name, &own);
         let report = shell.report(name);
-        assert_eq!(report["registered"], "yes", "{name}: the launch was committed");
+        assert_eq!(
+            report["registered"], "yes",
+            "{name}: the launch was committed"
+        );
         assert_eq!(report["variable"], answer.environment[0].value, "{name}");
         assert_eq!(
             report["relaunch"], "true",
@@ -1018,7 +1024,10 @@ fn kr_req_12_20_an_as_typed_run_keeps_the_person_s_own_variable() {
         let report = shell.report(name);
         assert_eq!(report["registered"], "no", "{name}");
         assert_eq!(report["variable"], "none", "{name}");
-        assert_eq!(report["relaunch"], expected, "{name}: the person's own environment");
+        assert_eq!(
+            report["relaunch"], expected,
+            "{name}: the person's own environment"
+        );
     }
 
     // A backend that never answers: the launcher runs as typed after its deadline.

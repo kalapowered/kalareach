@@ -474,6 +474,9 @@ fn the_released_declarations_are_what_a_launch_adds() {
     assert_eq!(qoder.command, "qodercli");
     let pinned: Vec<String> =
         serde_json::from_slice(&fixture("qoder-cli", "flags.json")).expect("the two elements");
-    assert_eq!(qoder.flags, pinned, "the release declares the pinned registration");
+    assert_eq!(
+        qoder.flags, pinned,
+        "the release declares the pinned registration"
+    );
     assert!(qoder.variables.is_empty());
 }

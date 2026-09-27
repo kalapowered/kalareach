@@ -531,7 +531,11 @@ async fn kr_req_12_07_a_declared_package_establishes_with_its_flags_and_variable
         .iter()
         .map(|variable| variable.name.as_str())
         .collect();
-    assert_eq!(exported, ["KR_REGISTRATION"], "the shell exports the registration alone");
+    assert_eq!(
+        exported,
+        ["KR_REGISTRATION"],
+        "the shell exports the registration alone"
+    );
     assert_eq!(
         recorded_variables(&answer),
         [("GEMINI_CLI_NO_RELAUNCH".to_owned(), "true".to_owned())]
