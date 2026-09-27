@@ -227,6 +227,10 @@ export interface FakeHostControls {
   dropFiles(files: readonly DroppedFile[]): void
   /** What the interface asked the platform to save, in order. */
   readonly savedExports: Written[]
+  /** Every semantic archive the interface asked native code to write, as it asked. */
+  readonly exportedArchives: readonly Parameters<HostPort['exportSemanticJson']>[0][]
+  /** Every recording the interface asked native code to write, as it asked. */
+  readonly exportedCasts: readonly Parameters<HostPort['exportAsciicast']>[0][]
   /** What the interface asked the platform to open, in order. */
   readonly openedLinks: string[]
   /** What the interface explicitly imported, in order. */
@@ -475,6 +479,8 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
   const listeners = new Set<(event: HostEvent) => void>()
   const dropListeners = new Set<(files: readonly DroppedFile[]) => void>()
   const savedExports: Written[] = []
+  const exportedArchives: Parameters<HostPort['exportSemanticJson']>[0][] = []
+  const exportedCasts: Parameters<HostPort['exportAsciicast']>[0][] = []
   const openedLinks: string[] = []
   const importedImages: string[] = []
   const uploaded: string[] = []
@@ -999,6 +1005,7 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
       } satisfies ImportedImage)
     },
     exportSemanticJson: (request) => {
+      exportedArchives.push(request)
       const written: Written = {
         path: request.path,
         byte_len: JSON.stringify(request.nodes).length,
@@ -1008,6 +1015,7 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
       return Promise.resolve(written)
     },
     exportAsciicast: (request) => {
+      exportedCasts.push(request)
       const written: Written = {
         path: request.path,
         byte_len: request.frames.reduce((total, frame) => total + frame.text.length, 0),
@@ -1319,6 +1327,8 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
       for (const listener of dropListeners) listener(files)
     },
     savedExports,
+    exportedArchives,
+    exportedCasts,
     openedLinks,
     importedImages,
     uploaded,

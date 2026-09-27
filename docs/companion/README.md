@@ -66,6 +66,15 @@ titles, cursor moves and clipboard writes. Where the host no longer keeps output
 why. Each view keeps its own place across a change of view: the conversation and the output return
 the reader to the node or page they were reading, or to the live end if they were following it.
 
+A session exports two files, each where the platform's save dialog puts it. The semantic archive
+holds each entry of every live agent's history as the session's worker gives it, with its time, at
+the session's own size, and declares the entries this device's filter withheld, the ones cut short
+and the ranges the host no longer kept. The recording holds each screen the raw terminal view drew
+while it was open, when it drew it and at the size it drew it, and plays back at the last size. A
+screen is written as positions and colours, never as the bytes the session printed. The recording
+keeps at most 2,000 screens and 8 MiB, and declares the earlier screens it let go and the screens
+drawn at another size. Before the terminal view has drawn, there is no recording to export.
+
 A draft keeps the conversation it was written for: the agent's instance and the binding revision the
 person wrote to. If the agent moves to another conversation while the draft is on screen, the draft
 is conflicted and nothing sends it on; the person chooses whether it goes to the new one. A draft

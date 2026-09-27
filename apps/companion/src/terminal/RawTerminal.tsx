@@ -264,10 +264,13 @@ function Grid({
 /** The raw view of one session. */
 export function RawTerminal({
   sessionId,
-  onLeave
+  onLeave,
+  onFrame
 }: {
   readonly sessionId: string
   readonly onLeave: () => void
+  /** Told each screen the view draws, as a recording keeps it. */
+  readonly onFrame?: (screen: TerminalScreen) => void
 }): ReactNode {
   const { port } = useApp()
   const host = useRef<HTMLDivElement | null>(null)
@@ -323,6 +326,11 @@ export function RawTerminal({
     refuse,
     unsent
   } = useTerminalView(port, sessionId, measure)
+
+  // Each screen the view draws is what a recording of it keeps.
+  useEffect(() => {
+    if (frame !== null) onFrame?.(frame)
+  }, [frame, onFrame])
   const drawnCell = cell ?? UNMEASURED_CELL
   const ended = state?.state === 'ended'
   const mode = modeOf(control)

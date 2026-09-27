@@ -21,6 +21,7 @@ import type {
 import type { WithheldCount } from './agent'
 import { emptyConversation, type ConversationState } from './conversation'
 import { emptyOutput, type OutputWindow } from './output'
+import { emptyRecording, type Recording } from './recording'
 import { startDraft, type Draft } from './drafts'
 import type { Submission } from './receipts'
 
@@ -85,6 +86,8 @@ export interface SessionState {
   readonly agent: AgentReading
   /** The window over the session's retained output, and where the reader is in it. */
   readonly output: OutputWindow
+  /** What the raw terminal view drew while it was open, for the recording export. */
+  readonly recording: Recording
   /** What this device has sent, and what became of it. */
   readonly submissions: readonly Submission[]
   /** The draft for this session. */
@@ -101,6 +104,7 @@ export function emptySessionState(sessionId: string, now: number): SessionState 
     conversation: emptyConversation(),
     agent: unreadAgent(),
     output: emptyOutput(),
+    recording: emptyRecording(),
     submissions: [],
     draft: startDraft(
       `draft-${sessionId}`,

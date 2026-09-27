@@ -12,11 +12,19 @@ import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import type { SessionReadResult } from '@kalareach/protocol'
 
 import { Badge, Banner, Button, Card, CommitButton, Segmented, Sheet, Switch, ThemeChooser } from '../components/ui'
-import { useApp } from '../app/state'
-import { failureMessage, watch, type HostPort, type SessionSubject, type Watch } from '../host/port'
+import { useApp, useSession } from '../app/state'
+import {
+  failureMessage,
+  watch,
+  type HostPort,
+  type SessionSubject,
+  type TerminalScreen,
+  type Watch
+} from '../host/port'
 import type { LaunchSurface } from '../model/pending'
 import { answeredState, outcomeMessage, outcomeTone } from '../model/receipts'
 import { readSemanticArchive } from '../model/exports'
+import { recorded, recordingExport } from '../model/recording'
 import { Conversation } from './Conversation'
 import { RetainedOutput } from './Output'
 import { Sharing } from './Sharing'
@@ -60,7 +68,18 @@ export function Session({
   readonly sessionId: string
   readonly pane: 'semantic' | 'terminal' | 'output'
 }): ReactNode {
-  const { port, go, say, tabs, closeTab } = useApp()
+  const { port, go, say, tabs, closeTab, sessions } = useApp()
+  // Each screen the raw terminal draws is kept, bounded, for the recording export. The view only
+  // writes to the store: nothing here redraws because a screen was recorded.
+  const record = useCallback(
+    (screen: TerminalScreen) => {
+      sessions.update(sessionId, (current) => {
+        const next = recorded(current.recording, screen, Date.now())
+        return next === current.recording ? current : { ...current, recording: next }
+      })
+    },
+    [sessions, sessionId]
+  )
   const [reading, setReading] = useState<SessionReading | null>(null)
   const [launch, setLaunch] = useState<Launch | null>(null)
   const [connected, setConnected] = useState(true)
@@ -301,6 +320,7 @@ export function Session({
           onLeave={() => {
             go({ view: 'session', sessionId, pane: 'semantic' })
           }}
+          onFrame={record}
         />
       )}
 
@@ -495,6 +515,7 @@ function ExportPanel({
   readonly session: SessionReadResult['session'] | null
 }): ReactNode {
   const { port, say } = useApp()
+  const { state } = useSession(sessionId)
   // The session's own size, as the host reported it: an export states the dimensions it was made
   // at, and a size this page invented would be a claim about a terminal nobody measured.
   const dimensions =
@@ -530,17 +551,22 @@ function ExportPanel({
     })
   }
 
+  // What the raw terminal view drew while it was open, at the grid it drew it in.
+  const recording = recordingExport(state.recording)
+
   const exportRecording = () => {
+    if (recording === null) return
     void port.chooseExportPath(`session-${sessionId}.cast`).then((path) => {
       if (!path) return
       port
         .exportAsciicast({
           path,
-          title: `Session ${sessionId}`,
-          startedAtUnixSeconds: Math.floor(Date.now() / 1000),
-          dimensions: { columns: 120, rows: 40 },
-          frames: [],
-          omissions: []
+          title:
+            session === null ? `Session ${sessionId}` : `Session ${session.display_number}`,
+          startedAtUnixSeconds: recording.startedAtUnixSeconds,
+          dimensions: recording.dimensions,
+          frames: recording.frames,
+          omissions: recording.omissions
         })
         .then((written) => {
           say(
@@ -579,11 +605,17 @@ function ExportPanel({
             <div className="spacer">
               <strong>Terminal recording</strong>
               <p className="muted small">
-                An asciicast. Sequences that would act on the machine that plays it back, such as a
+                An asciicast of each screen the terminal view drew, when it drew it, at the size it
+                drew it. Sequences that would act on the machine that plays it back, such as a
                 clipboard write, are removed and declared.
               </p>
+              <p className="small faint" data-testid="recording-held">
+                {recording === null
+                  ? 'The terminal view has drawn nothing yet. Open the terminal, and what it shows is recorded.'
+                  : `${recording.frames.length} ${recording.frames.length === 1 ? 'screen' : 'screens'} at ${recording.dimensions.columns}×${recording.dimensions.rows}.`}
+              </p>
             </div>
-            <Button data-testid="export-cast" onClick={exportRecording}>
+            <Button data-testid="export-cast" disabled={recording === null} onClick={exportRecording}>
               Export recording
             </Button>
           </div>
