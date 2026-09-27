@@ -677,9 +677,15 @@ pub fn publish(
     expected: StagedWitness,
 ) -> Result<ObjectIdentity> {
     let parent = destination.reach()?;
-    let found = staged_in(&staging.directory)?;
-    if !expected.same_object(&found) {
-        return Err(ProjectError::IdentityChanged {
+    // The staged object is the recorded one, looked at before the rename, and on Windows before
+    // every attempt at it: there the rename waits while another program holds a file inside the
+    // tree, and something else can take the staging name meanwhile.
+    let still_staged = || -> Result<()> {
+        let found = staged_in(&staging.directory)?;
+        if expected.same_object(&found) {
+            return Ok(());
+        }
+        Err(ProjectError::IdentityChanged {
             detail: format!(
                 "this operation staged the repository {} and {} now holds {}; nothing is published",
                 expected.identity,
@@ -687,11 +693,17 @@ pub fn publish(
                 found.identity
             )
             .into(),
-        });
-    }
-    let staged = found.identity;
+        })
+    };
+    let staged = expected.identity;
     let tree = RelativeName::parse(STAGED_TREE)?;
-    rename_no_replace(&staging.directory, &tree, parent, destination.name())?;
+    rename_no_replace(
+        &staging.directory,
+        &tree,
+        parent,
+        destination.name(),
+        &still_staged,
+    )?;
     parent.sync(kr_flush::NameKind::Directory)?;
     // The object at the destination has to be the object that was staged. A rename preserves the
     // identity, so a mismatch here is something else having taken the name.
@@ -710,7 +722,8 @@ pub fn publish(
     Ok(staged)
 }
 
-/// Renames one directory into another's single name, refusing to replace anything.
+/// Renames one directory into another's single name, refusing to replace anything, once
+/// `unchanged`, the caller's check of what the rename stands on, has passed.
 ///
 /// On Linux and Apple platforms this is one system call that fails when the destination name is
 /// taken: `renameat2` with `RENAME_NOREPLACE` and `renameatx_np` with `RENAME_EXCL`. Nothing
@@ -728,9 +741,11 @@ fn rename_no_replace(
     from_name: &RelativeName,
     to: &AuthorisedDirectory,
     to_name: &RelativeName,
+    unchanged: &dyn Fn() -> Result<()>,
 ) -> Result<()> {
     use std::os::fd::AsFd as _;
 
+    unchanged()?;
     rustix::fs::renameat_with(
         from.handle().as_fd(),
         from_name.as_str(),
@@ -764,6 +779,7 @@ fn rename_no_replace(
     from_name: &RelativeName,
     to: &AuthorisedDirectory,
     to_name: &RelativeName,
+    unchanged: &dyn Fn() -> Result<()>,
 ) -> Result<()> {
     let taken = || ProjectError::Destination {
         detail: format!(
@@ -772,16 +788,21 @@ fn rename_no_replace(
         )
         .into(),
     };
-    let unchanged = || match to.occupied(to_name) {
-        Ok(false) => {
-            #[cfg(test)]
-            tests::between_check_and_attempt();
-            std::ops::ControlFlow::Continue(())
+    let checked = || {
+        if let Err(changed) = unchanged() {
+            return std::ops::ControlFlow::Break(changed);
         }
-        Ok(true) => std::ops::ControlFlow::Break(taken()),
-        Err(error) => std::ops::ControlFlow::Break(ProjectError::from(error)),
+        match to.occupied(to_name) {
+            Ok(false) => {
+                #[cfg(test)]
+                tests::between_check_and_attempt();
+                std::ops::ControlFlow::Continue(())
+            }
+            Ok(true) => std::ops::ControlFlow::Break(taken()),
+            Err(error) => std::ops::ControlFlow::Break(ProjectError::from(error)),
+        }
     };
-    match from.publish_into(from_name, to, to_name, unchanged) {
+    match from.publish_into(from_name, to, to_name, checked) {
         Ok(std::ops::ControlFlow::Continue(())) => Ok(()),
         Ok(std::ops::ControlFlow::Break(refused)) => Err(refused),
         // Taken in the instant between the last check and the rename, which refused it.
@@ -1074,25 +1095,42 @@ mod tests {
         });
     }
 
-    /// Holds `file` open with a handle that shares reading and writing but not its deletion, as a
-    /// program that reads each file as it is written does for a moment, and lets go after 300 ms
-    /// on a thread of its own.
+    /// Opens `file` with a handle that shares reading and writing but not its deletion, as a
+    /// program that reads each file as it is written holds it.
     #[cfg(windows)]
-    fn held_for_a_moment(file: &Path) -> std::thread::JoinHandle<()> {
+    fn hold(file: &Path) -> std::fs::File {
         use std::os::windows::fs::OpenOptionsExt as _;
 
         /// Reading and writing are shared; deleting is not.
         const FILE_SHARE_READ_WRITE: u32 = 0x0001 | 0x0002;
 
-        let holding = std::fs::OpenOptions::new()
+        std::fs::OpenOptions::new()
             .read(true)
             .share_mode(FILE_SHARE_READ_WRITE)
             .open(file)
-            .expect("the file is held");
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(300));
-            drop(holding);
-        })
+            .expect("the file is held")
+    }
+
+    /// Counts the renames refused as held on this thread while the guard stands. At the first of
+    /// them, `meanwhile` is given the hold, and lets go of it when it drops it.
+    #[cfg(windows)]
+    fn at_the_first_refusal(
+        holding: std::fs::File,
+        meanwhile: impl FnOnce(std::fs::File) + 'static,
+    ) -> (
+        std::rc::Rc<std::cell::Cell<u32>>,
+        kr_flush::testing::AfterHeldRefusal,
+    ) {
+        let refusals = std::rc::Rc::new(std::cell::Cell::new(0));
+        let counted = std::rc::Rc::clone(&refusals);
+        let mut first = Some((holding, meanwhile));
+        let hook = kr_flush::testing::after_held_refusal(move || {
+            counted.set(counted.get() + 1);
+            if let Some((holding, meanwhile)) = first.take() {
+                meanwhile(holding);
+            }
+        });
+        (refusals, hook)
     }
 
     /// A staged tree with a file in it, the directory it is staged in and the one it is published
@@ -1128,10 +1166,21 @@ mod tests {
     #[test]
     fn a_tree_holding_a_held_file_is_published_once_it_is_let_go() {
         let (root, staging, parent, file) = a_tree_to_publish();
-        let letting_go = held_for_a_moment(&file);
-        let published = rename_no_replace(&staging, &name("tree"), &parent, &name("published"));
-        letting_go.join().expect("let go");
+        let (refusals, guard) = at_the_first_refusal(hold(&file), drop);
+        let published = rename_no_replace(
+            &staging,
+            &name("tree"),
+            &parent,
+            &name("published"),
+            &|| Ok(()),
+        );
+        drop(guard);
         published.expect("published once it is let go");
+        assert_eq!(
+            refusals.get(),
+            1,
+            "refused once while a file inside was held"
+        );
         assert!(root.path().join("parent/published/objects/pack").is_file());
         assert!(!root.path().join("staging/tree").exists());
     }
@@ -1143,21 +1192,20 @@ mod tests {
     #[test]
     fn a_name_taken_while_the_publication_waits_is_not_replaced() {
         let (root, staging, parent, file) = a_tree_to_publish();
-        let letting_go = held_for_a_moment(&file);
         let taken = root.path().join("parent/published");
-        let mut attempts = 0;
-        BEFORE_ATTEMPT.with(|hook| {
-            *hook.borrow_mut() = Some(Box::new(move || {
-                attempts += 1;
-                if attempts == 2 {
-                    std::fs::write(&taken, b"somebody's file")
-                        .expect("somebody takes the name meanwhile");
-                }
-            }));
+        let (refusals, guard) = at_the_first_refusal(hold(&file), move |holding| {
+            std::fs::write(&taken, b"somebody's file").expect("somebody takes the name meanwhile");
+            drop(holding);
         });
-        let published = rename_no_replace(&staging, &name("tree"), &parent, &name("published"));
-        BEFORE_ATTEMPT.with(|hook| *hook.borrow_mut() = None);
-        letting_go.join().expect("let go");
+        let published = rename_no_replace(
+            &staging,
+            &name("tree"),
+            &parent,
+            &name("published"),
+            &|| Ok(()),
+        );
+        drop(guard);
+        assert_eq!(refusals.get(), 1);
         let refused = published.expect_err("the name was taken meanwhile");
         assert!(
             refused
@@ -1190,7 +1238,13 @@ mod tests {
                 }
             }));
         });
-        let published = rename_no_replace(&staging, &name("tree"), &parent, &name("published"));
+        let published = rename_no_replace(
+            &staging,
+            &name("tree"),
+            &parent,
+            &name("published"),
+            &|| Ok(()),
+        );
         BEFORE_ATTEMPT.with(|hook| *hook.borrow_mut() = None);
         let refused = published.expect_err("the name was taken after the check");
         assert!(
@@ -1204,6 +1258,37 @@ mod tests {
             b"somebody's file"
         );
         assert!(root.path().join("staging/tree/objects/pack").is_file());
+    }
+
+    /// On Windows the staged repository is compared with the one recorded before every attempt
+    /// at its publication: a tree put in its place while the held publication waits is never
+    /// published, the publication says the staged object changed, and the destination stays
+    /// absent.
+    #[cfg(windows)]
+    #[test]
+    fn a_staged_tree_replaced_while_its_publication_waits_is_not_published() {
+        let (_parent, destination, sibling) = staged();
+        let witness = staged_in(&sibling.directory).expect("the staged tree's witness");
+        let tree = sibling.tree_path();
+        let (refusals, guard) = at_the_first_refusal(hold(&tree.join("objects/pack")), {
+            let tree = tree.clone();
+            move |holding| {
+                drop(holding);
+                std::fs::rename(&tree, tree.with_extension("recorded"))
+                    .expect("the recorded tree goes");
+                std::fs::create_dir_all(tree.join("objects")).expect("another tree takes its name");
+                std::fs::write(tree.join("objects/pack"), b"another\n").expect("a file in it");
+            }
+        });
+        let published = publish(&sibling, &destination, witness);
+        drop(guard);
+        let refused = published.expect_err("another tree is not published");
+        assert_eq!(refusals.get(), 1);
+        assert!(
+            matches!(refused, ProjectError::IdentityChanged { .. }),
+            "{refused:?}"
+        );
+        assert!(!destination.path().exists(), "the destination stays absent");
     }
 
     #[test]
@@ -1236,7 +1321,6 @@ mod tests {
 
     /// A staging directory with something staged in it, beside a destination in a directory of
     /// its own.
-    #[cfg(unix)]
     fn staged() -> (tempfile::TempDir, Destination, StagingSibling) {
         let parent = tempfile::tempdir().expect("a directory to stage beside");
         let environment_id = EnvironmentId::new(kr_protocol::scalars::Uuid::from_bytes([3; 16]));
