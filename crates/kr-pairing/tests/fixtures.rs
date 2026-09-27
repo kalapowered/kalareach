@@ -306,3 +306,102 @@ fn the_pake_is_the_pinned_spake2_release() {
     assert_eq!(kr_pairing::spake::SPAKE2_VERSION, "0.4.0");
     assert_eq!(kr_pairing::spake::SPAKE2_PROFILE, "Spake2<Ed25519Group>");
 }
+
+/// KR-REQ-10.26: the signed bundle vectors. Each device signed its own bundle and `T` with its own
+/// authorisation key: the published host and client bundles verify against `T` and the
+/// authorisation key each declares, each signature is over exactly the signing input the vector
+/// publishes, and neither verifies under the other device's key. Each substitution the vector
+/// lists (a bundle changed after signing, a key-purpose declaration changed under the same key, a
+/// bundle offered to another attempt, and a signature replayed from another transcript) is refused
+/// the way it says.
+#[test]
+fn the_signed_bundle_vectors_verify_and_their_substitutions_do_not() {
+    use kr_crypto::sign::SigningTranscript;
+    use kr_pairing::PairingError;
+    use kr_pairing::bundles::{verify_client_bundle, verify_host_bundle};
+    use kr_protocol::pairing::{
+        CLIENT_BUNDLE_DOMAIN, HOST_BUNDLE_DOMAIN, SignedClientBundle, SignedHostBundle,
+    };
+    use kr_protocol::scalars::Digest256;
+
+    let vectors = fixture("bundles.json");
+    let digest = |pointer: &str| {
+        Digest256::from_bytes(bytes(&vectors, pointer).try_into().expect("32 bytes"))
+    };
+    fn decode<T: serde::de::DeserializeOwned + serde::Serialize>(canonical: &[u8]) -> T {
+        kr_cbor::from_canonical_slice(canonical, &kr_cbor::Limits::DEFAULT)
+            .expect("a signed bundle")
+    }
+    let transcript = digest("/transcript_hex");
+    let host: SignedHostBundle = decode(&bytes(&vectors, "/host/signed_canonical_hex"));
+    let client: SignedClientBundle = decode(&bytes(&vectors, "/client/signed_canonical_hex"));
+    verify_host_bundle(&host, transcript).expect("the host bundle verifies");
+    verify_client_bundle(&client, transcript).expect("the client bundle verifies");
+
+    for (role, domain, key, signature) in [
+        (
+            "/host",
+            HOST_BUNDLE_DOMAIN,
+            &host.bundle.keys.authorisation,
+            &host.signature,
+        ),
+        (
+            "/client",
+            CLIENT_BUNDLE_DOMAIN,
+            &client.bundle.keys.authorisation,
+            &client.signature,
+        ),
+    ] {
+        assert_eq!(
+            hex::encode(signature.as_bytes()),
+            text(&vectors, &format!("{role}/signature_hex"))
+        );
+        let signing_input = SigningTranscript::from_canonical_bytes(
+            domain,
+            bytes(&vectors, &format!("{role}/signing_input_hex")),
+        )
+        .expect("the published signing input");
+        kr_crypto::sign::verify(key, &signing_input, signature)
+            .expect("the signature is over the published input, under the declared key");
+        let other = if role == "/host" {
+            &client.bundle.keys.authorisation
+        } else {
+            &host.bundle.keys.authorisation
+        };
+        assert!(
+            kr_crypto::sign::verify(other, &signing_input, signature).is_err(),
+            "{role}'s signature is its own device's"
+        );
+    }
+
+    let rejected = vectors["rejected"].as_array().expect("the refused cases");
+    assert_eq!(rejected.len(), 4);
+    for case in rejected {
+        let id = case["id"].as_str().expect("an identifier");
+        let signed = hex::decode(case["signed_canonical_hex"].as_str().expect("hex"))
+            .expect("the case decodes");
+        let against = Digest256::from_bytes(
+            hex::decode(case["transcript_hex"].as_str().expect("hex"))
+                .expect("the transcript decodes")
+                .try_into()
+                .expect("32 bytes"),
+        );
+        let refusal = match case["domain"].as_str().expect("a domain") {
+            HOST_BUNDLE_DOMAIN => verify_host_bundle(&decode(&signed), against),
+            CLIENT_BUNDLE_DOMAIN => verify_client_bundle(&decode(&signed), against),
+            other => panic!("{id} names the domain {other}"),
+        }
+        .expect_err(id);
+        match case["refusal"].as_str().expect("a refusal") {
+            "authentication_failed" => assert!(
+                matches!(refusal, PairingError::AuthenticationFailed),
+                "{id}: {refusal:?}"
+            ),
+            "context_mismatch" => assert!(
+                matches!(refusal, PairingError::ContextMismatch { .. }),
+                "{id}: {refusal:?}"
+            ),
+            other => panic!("{id} names the refusal {other}"),
+        }
+    }
+}

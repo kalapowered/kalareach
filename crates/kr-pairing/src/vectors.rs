@@ -5,9 +5,11 @@
 //! context `C`, its hash, the two role identities, the transcript `T` for two given library
 //! messages, the five HKDF keys for a given shared key, both confirmation tags, the bundle
 //! additional authenticated data, the `pair.finish` tag, the verification value, the direct
-//! transcript `D` and its proofs, and the two QR payload encodings.
+//! transcript `D` and its proofs, the two QR payload encodings, and a host and a client key bundle
+//! signed over `T` with the substitutions their verification refuses.
 //!
-//! Every input below is a literal. They are test material and nothing else pairs with them.
+//! Every input below is a literal, the device keys included: each is read from fixed seeds, and
+//! Ed25519 signs deterministically. They are test material and nothing else pairs with them.
 
 use std::path::Path;
 
@@ -16,9 +18,9 @@ use kr_protocol::ids::{AttemptId, InvitationId, PairingSequence};
 use kr_protocol::pairing::{
     BundleDirection, BundleMessageType, CLIENT_IDENTITY_DOMAIN, CodeQrPayload, DIRECT_DOMAIN,
     DIRECT_VERIFY_DOMAIN, DevicePublicKeys, DirectQrPayload, DirectTranscript, HKDF_INFO_STRINGS,
-    HOST_IDENTITY_DOMAIN, Locator, NetworkConfig, PAIRING_DOMAIN, PairingContext, ProposedGrant,
-    QR_PAYLOAD_VERSION, QrPayload, RendezvousOrigin, ShortCode, VERIFY_DOMAIN, bundle_aad,
-    direct_verification_value, finish_mac_input, verification_value,
+    HOST_IDENTITY_DOMAIN, KeyPurpose, Locator, NetworkConfig, PAIRING_DOMAIN, PairingContext,
+    ProposedGrant, QR_PAYLOAD_VERSION, QrPayload, RendezvousOrigin, ShortCode, VERIFY_DOMAIN,
+    bundle_aad, direct_verification_value, finish_mac_input, verification_value,
 };
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{
@@ -39,6 +41,9 @@ pub const DIRECT_FILE_NAME: &str = "direct.json";
 
 /// The code parsing and QR payload vectors.
 pub const CODES_FILE_NAME: &str = "codes.json";
+
+/// The signed key bundle vectors.
+pub const BUNDLES_FILE_NAME: &str = "bundles.json";
 
 /// The fixed shared key the derivations are vectored from.
 const SHARED_KEY: [u8; 32] = [0x5a; 32];
@@ -114,6 +119,7 @@ pub fn generated_files() -> Result<Vec<(&'static str, String)>> {
         (TRANSCRIPT_FILE_NAME, render(&transcript_vectors()?)),
         (DIRECT_FILE_NAME, render(&direct_vectors()?)),
         (CODES_FILE_NAME, render(&code_vectors()?)),
+        (BUNDLES_FILE_NAME, render(&bundle_vectors()?)),
     ])
 }
 
@@ -353,6 +359,175 @@ fn code_vectors() -> Result<Value> {
                 "text": direct_payload.to_text()?.as_str(),
             },
         },
+    }))
+}
+
+/// A device's four keys from four fixed seeds, `first` to `first + 3` repeated, read back the way a
+/// store gives a device its keys.
+fn fixed_keys(first: u8) -> Result<kr_crypto::keys::DeviceKeys> {
+    use kr_crypto::store::{MemoryStore, SecretName, SecretStore as _};
+
+    let store = MemoryStore::default();
+    for (offset, purpose) in [
+        KeyPurpose::Transport,
+        KeyPurpose::Authorisation,
+        KeyPurpose::StoredEnvelope,
+        KeyPurpose::NotificationPreview,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        store.set(
+            &SecretName::device_key("vectors", purpose)?,
+            &[first.wrapping_add(offset as u8); 32],
+        )?;
+    }
+    Ok(kr_crypto::store::load_device_keys(&store, "vectors")?.expect("the four seeds were stored"))
+}
+
+/// One signed bundle as a vector: its canonical encoding, and the parts a reader checks it by.
+fn signed_entry<T: serde::Serialize>(
+    domain: &str,
+    bundle: &T,
+    transcript: Digest256,
+    signed: &impl serde::Serialize,
+    signature: &kr_protocol::scalars::Signature64,
+) -> Result<Value> {
+    let signing_input = kr_crypto::sign::SigningTranscript::from_elements(
+        domain,
+        vec![
+            kr_cbor::to_canonical_value(bundle)?,
+            kr_cbor::CanonicalValue::bytes(transcript.as_bytes().as_slice()),
+        ],
+    );
+    Ok(json!({
+        "domain": domain,
+        "bundle": serde_json::to_value(bundle).expect("a bundle is JSON"),
+        "bundle_canonical_hex": hex::encode(kr_cbor::to_canonical_vec(bundle)?),
+        "signing_input_hex": hex::encode(signing_input.as_bytes()),
+        "signature_hex": hex::encode(signature.as_bytes()),
+        "signed_canonical_hex": hex::encode(kr_cbor::to_canonical_vec(signed)?),
+    }))
+}
+
+fn bundle_vectors() -> Result<Value> {
+    use kr_protocol::pairing::{
+        CLIENT_BUNDLE_DOMAIN, ClientBundle, DeviceName, DevicePlatform, HOST_BUNDLE_DOMAIN,
+        HostBundle,
+    };
+
+    let transcript = context().transcript(&MESSAGE_A, &MESSAGE_B);
+    let mut elsewhere = context();
+    elsewhere.attempt_id = AttemptId::new(Uuid::from_bytes([0x23; 16]));
+    let other_transcript = elsewhere.transcript(&MESSAGE_A, &MESSAGE_B);
+
+    let host_keys = fixed_keys(0x10)?;
+    let client_keys = fixed_keys(0x20)?;
+    let host_bundle = HostBundle {
+        invitation_id: InvitationId::new(Uuid::from_bytes([0x11; 16])),
+        device_id: kr_protocol::ids::DeviceId::new(Uuid::from_bytes([0x12; 16])),
+        device_key_revision: kr_protocol::ids::DeviceKeyRevision::new(1),
+        endpoint_id: *host_keys.transport.public(),
+        keys: host_keys.public_keys(),
+        network_config: NetworkConfig {
+            relay_urls: vec![
+                kr_protocol::pairing::NetworkHint::new("https://relay.kala.to").expect("a hint"),
+            ],
+            pkarr_publisher_url: Nullable::null(),
+            pkarr_resolver_url: Nullable::null(),
+            dns_origin: Nullable::null(),
+            direct_addresses: vec![
+                kr_protocol::pairing::NetworkHint::new("192.0.2.1:41234").expect("a hint"),
+            ],
+        },
+        proposed_grant: proposal(),
+    };
+    let client_bundle = ClientBundle {
+        endpoint_id: *client_keys.transport.public(),
+        keys: client_keys.public_keys(),
+        device_key_revision: kr_protocol::ids::DeviceKeyRevision::new(1),
+        device_name: DeviceName::new("Kala's phone").expect("a name"),
+        platform: DevicePlatform::Ios,
+    };
+    let host = crate::bundles::sign_host_bundle(
+        &host_keys.authorisation,
+        host_bundle.clone(),
+        transcript,
+    )?;
+    let client = crate::bundles::sign_client_bundle(
+        &client_keys.authorisation,
+        client_bundle.clone(),
+        transcript,
+    )?;
+
+    // A declared content changed after signing: the proposed grant now asks for terminal input.
+    let mut enlarged = host.clone();
+    enlarged
+        .bundle
+        .proposed_grant
+        .actions
+        .insert(ActionRight::TerminalInput);
+    // A key-purpose declaration changed under the same authorisation key and signature.
+    let mut redeclared = client.clone();
+    redeclared.bundle.keys.stored_envelope = *host_keys.stored_envelope.public();
+    // The client's signature over T, carried onto the same bundle naming another attempt.
+    let mut replayed = client.clone();
+    replayed.transcript = other_transcript;
+    let rejected = vec![
+        json!({
+            "id": "host_bundle_substituted",
+            "description": "The host bundle's proposed grant was changed after it was signed.",
+            "domain": HOST_BUNDLE_DOMAIN,
+            "signed_canonical_hex": hex::encode(kr_cbor::to_canonical_vec(&enlarged)?),
+            "transcript_hex": hex::encode(transcript.as_bytes()),
+            "refusal": "authentication_failed",
+        }),
+        json!({
+            "id": "client_declaration_substituted",
+            "description": "The client bundle declares another stored-envelope key under the same authorisation key and signature.",
+            "domain": CLIENT_BUNDLE_DOMAIN,
+            "signed_canonical_hex": hex::encode(kr_cbor::to_canonical_vec(&redeclared)?),
+            "transcript_hex": hex::encode(transcript.as_bytes()),
+            "refusal": "authentication_failed",
+        }),
+        json!({
+            "id": "host_bundle_from_another_attempt",
+            "description": "The host bundle signed for T, offered to an attempt whose transcript is another.",
+            "domain": HOST_BUNDLE_DOMAIN,
+            "signed_canonical_hex": hex::encode(kr_cbor::to_canonical_vec(&host)?),
+            "transcript_hex": hex::encode(other_transcript.as_bytes()),
+            "refusal": "context_mismatch",
+        }),
+        json!({
+            "id": "client_signature_replayed_from_another_transcript",
+            "description": "The client's signature over T, on its bundle naming another attempt's transcript.",
+            "domain": CLIENT_BUNDLE_DOMAIN,
+            "signed_canonical_hex": hex::encode(kr_cbor::to_canonical_vec(&replayed)?),
+            "transcript_hex": hex::encode(other_transcript.as_bytes()),
+            "refusal": "authentication_failed",
+        }),
+    ];
+
+    Ok(json!({
+        "name": "bundles",
+        "description": "A host and a client key bundle, each signed with its own authorisation key over its bundle and the transcript T, and four substitutions verification refuses.",
+        "note": "Each device's keys come from fixed seeds and are test material; nothing pairs with them. Ed25519 signatures are deterministic, so the signatures are fixed as well.",
+        "transcript_hex": hex::encode(transcript.as_bytes()),
+        "host": signed_entry(
+            HOST_BUNDLE_DOMAIN,
+            &host.bundle,
+            transcript,
+            &host,
+            &host.signature,
+        )?,
+        "client": signed_entry(
+            CLIENT_BUNDLE_DOMAIN,
+            &client.bundle,
+            transcript,
+            &client,
+            &client.signature,
+        )?,
+        "rejected": rejected,
     }))
 }
 
