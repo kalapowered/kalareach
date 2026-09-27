@@ -1917,31 +1917,36 @@ What a device reaches, in order:
    it presents a generation token, so a device's attachment, subscription and input lane belong to a
    connection of their own without displacing the daemon's authority connection.
 
-Each read a paired device may make is decided in one place, method by method: a service answers
-it, or it is refused by name with its reason. A test walks the method table and fails on any read
-the table admits for a device that is neither served nor refused by name. The reads that go to a
+Each read a paired device may make is decided in one place, method by method: a service answers it,
+or it is refused by name with its reason. A test walks the method table and fails on any read the
+table admits for a device that is neither served nor refused by name. The reads that go to a
 session's worker travel over the one link a connection holds, so a connection reads the questions
-and agent state of the session it serves. `question.read` is answered by that worker and narrowed
-to the grant's history scope: a device sees a question its grant names, or one asked at or after
-the moment its grant reaches back to, so a device whose grant keeps no history and names no
-question sees none. Asking for one question outside that scope is refused rather than answered
-empty. The agent reads name their session inside the subject they read, and that session is the one
-the grant is checked against and the read is routed to. `agent.snapshot` and
-`agent.approval.inspect` carry retained content, so each goes to the worker with the history scope
-of the device's grant, and the worker holds the answer to it through the shared history filter: a
-snapshot carries what the agent said at or after the moment the grant reaches back to, and says how
-much it withheld, and an approval's record from before that moment is answered as a resource the
-host does not hold, unless the grant names that approval and it can still be decided. A worker says
-in its answer to the daemon's hello that it reads such a scope, one that names approvals by the
-broker's resource identity, and one that does not say so is sent none and refuses both reads
-itself. `events.subscribe` and `events.snapshot` go to the worker with the same scope, and the
-worker holds the resources the broker arbitrates to it by the rule the approval record follows: a
-snapshot, every page of it, carries an approval the grant names while it can still be decided, and
-any other resource only when it was recorded at or after the moment the grant reaches back to; a
-subscription is told a later transition only of a resource it was shown or of one that rule admits.
-A grant that keeps no retained history reaches, beside what it names, what is recorded after the
-device's first subscription of that attachment began. The local owner, and a read that comes with
-no scope, are shown every resource and every transition. `grant.list` answers with
+and agent state of the session it serves. `question.read` goes to that worker with the history scope
+of the device's grant, and the worker holds its answer to that scope through the shared history
+filter, as it does for every caller under a grant: a device sees a question asked at or after the
+moment its grant reaches back to, in any state, and one its grant names however early it was asked,
+while it is open, so a device whose grant keeps no history and names no question sees none. Asking
+for one question outside that scope is refused rather than answered empty. The daemon passes the
+worker's answer on as the worker gave it, and sends a question read with a scope only to a worker
+that says, in its answer to the daemon's hello, that it holds one to it: a worker of an earlier
+build answered with every question it held, so a device's question read to one is refused as
+`UNSUPPORTED_CAPABILITY` before anything reaches it. The agent reads name their session inside the
+subject they read, and that session is the one the grant is checked against and the read is routed
+to. `agent.snapshot` and `agent.approval.inspect` carry retained content, so each goes to the worker
+with the history scope of the device's grant, and the worker holds the answer to it through the
+shared history filter: a snapshot carries what the agent said at or after the moment the grant
+reaches back to, and says how much it withheld, and an approval's record from before that moment is
+answered as a resource the host does not hold, unless the grant names that approval and it can still
+be decided. A worker says in its answer to the daemon's hello that it reads such a scope, one that
+names approvals by the broker's resource identity, and one that does not say so is sent none and
+refuses both reads itself. `events.subscribe` and `events.snapshot` go to the worker with the same
+scope, and the worker holds the resources the broker arbitrates to it by the rule the approval
+record follows: a snapshot, every page of it, carries an approval the grant names while it can still
+be decided, and any other resource only when it was recorded at or after the moment the grant
+reaches back to; a subscription is told a later transition only of a resource it was shown or of one
+that rule admits. A grant that keeps no retained history reaches, beside what it names, what is
+recorded after the device's first subscription of that attachment began. The local owner, and a read
+that comes with no scope, are shown every resource and every transition. `grant.list` answers with
 the grants the device issued and everything delegated from them, and it needs `session.share`.
 
 Four reads are refused as `UNSUPPORTED_CAPABILITY`, with the read and the reason in the message:
@@ -3905,10 +3910,18 @@ under its own permissions.
 
 **An issuer is shown what it is sharing.** The preview is computed by the same code that writes the
 grant, and an invitation that names a question, an approval or the live screen is refused unless
-text for that thing arrives with it and the two name the same things. The request is refused when
-the notices the issuer states it accepted are not the ones the grant carries. A shared live screen
-can hold text printed long before the invitation, so the preview carries the text rather than a
-description of it. A new recipient receives no historical attachment keys.
+text for that thing arrives with it and the two name the same things. `grant.create` reads that text
+from the session's worker before anything is written: a named question's text, its revision and the
+moment it was asked, while it is open, and what a named approval asks and when its request arrived,
+while it can still be decided, pending or claimed. What an approval asks is its decoder's summary,
+or where the decoder gave none, as the Claude Code channel's table gives none, the request as its
+upstream wrote it, when that is text of at most 4,096 bytes; an approval with neither cannot be
+named, because a preview cut short would show its issuer less than the recipient will read. An
+invitation names at most 32 questions and approvals together. One that names anything the worker
+holds no current record of is refused with one reason per kind, and nothing is written. The request
+is refused when the notices the issuer states it accepted are not the ones the grant carries. A
+shared live screen can hold text printed long before the invitation, so the preview carries the text
+rather than a description of it. A new recipient receives no historical attachment keys.
 
 **Invitations are single use and they expire.** The default is `session.view` for one hour, from the
 moment the invitation is issued: the recipient sees the selected live screen and what happens next,
