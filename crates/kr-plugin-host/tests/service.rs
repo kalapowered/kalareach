@@ -1082,23 +1082,18 @@ async fn kr_req_11_39_a_terminal_drains_and_is_answered_while_a_component_runs()
         "the drained output could not be handed to the runtime: {handed_back:?}"
     );
 
-    // The binding was never disabled, and no call failed but by running past its deadline. A binding
-    // answers its observations in order and its notices reach this client in that order, and a
-    // fault or a disabling is never dropped on the way, so every notice the observations above
-    // produced has arrived once the document of one handed over after them has. That last one
-    // carries a text of its own, which the component draws.
+    // The binding was never disabled, and no call failed but by running past its deadline. Every
+    // observation above went by the same path, which writes them in the order they were handed over;
+    // a binding answers its observations in that order and its notices reach this client in that
+    // order; and a fault or a disabling is never dropped on the way. So every notice those
+    // observations produced has arrived once the document of one handed over after them, by the same
+    // path, has. That last one carries a text of its own, which the component draws.
     let mut plugin = Arc::into_inner(plugin).expect("the supply has let go of the client");
     let last = "the last observation this test hands over";
-    let admitted = plugin
-        .deliver(binding, &scrape("se-last", last))
-        .await
-        .expect("the last observation reaches the host");
+    let handed = plugin.offer(binding, &scrape("se-last", last));
     assert!(
-        !matches!(
-            admitted,
-            kr_plugin_service::vocabulary::Admission::Refused { .. }
-        ),
-        "the last observation was refused: {admitted:?}"
+        matches!(handed, kr_plugin_service::client::Handoff::Accepted),
+        "the last observation was handed over as {handed:?}"
     );
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
