@@ -441,14 +441,35 @@ pub struct Snapshot {
     files: BTreeMap<PathBuf, Entry>,
     directories: std::collections::BTreeSet<PathBuf>,
     hash_limit: u64,
+    /// Every entry that could not be read, with why.
+    unread: Vec<String>,
+}
+
+impl Snapshot {
+    /// Whether every entry under the roots was read: a snapshot that is not whole says nothing
+    /// about what it missed, which could later be taken for something new.
+    #[must_use]
+    pub const fn whole(&self) -> bool {
+        self.unread.is_empty()
+    }
+
+    /// The entries that could not be read, with why.
+    #[must_use]
+    pub fn unread(&self) -> &[String] {
+        &self.unread
+    }
 }
 
 /// Reads every file under each of `directories`, relative to `home`: size, modification time and
-/// inode for all, and the SHA-256 of each no larger than `hash_limit` bytes.
+/// inode for all, and the SHA-256 of each no larger than `hash_limit` bytes. A root that does not
+/// exist, and an entry gone between its directory's listing and its own read, are not there; any
+/// other entry that cannot be read, a file that cannot be hashed whole included, is recorded, and
+/// the snapshot is then not whole.
 #[must_use]
 pub fn snapshot(home: &Path, directories: &[String], hash_limit: u64) -> Snapshot {
     let mut files = BTreeMap::new();
     let mut seen_directories = std::collections::BTreeSet::new();
+    let mut unread = Vec::new();
     let roots: Vec<PathBuf> = directories
         .iter()
         .map(|relative| home.join(relative))
@@ -456,12 +477,25 @@ pub fn snapshot(home: &Path, directories: &[String], hash_limit: u64) -> Snapsho
     for top in &roots {
         let mut pending = vec![top.clone()];
         while let Some(path) = pending.pop() {
-            let Ok(metadata) = std::fs::symlink_metadata(&path) else {
-                continue;
+            let metadata = match std::fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    unread.push(format!("{}: {error}", path.display()));
+                    continue;
+                }
             };
             if metadata.is_dir() {
-                if let Ok(entries) = std::fs::read_dir(&path) {
-                    pending.extend(entries.flatten().map(|entry| entry.path()));
+                match std::fs::read_dir(&path) {
+                    Ok(entries) => {
+                        for entry in entries {
+                            match entry {
+                                Ok(entry) => pending.push(entry.path()),
+                                Err(error) => unread.push(format!("{}: {error}", path.display())),
+                            }
+                        }
+                    }
+                    Err(error) => unread.push(format!("{}: {error}", path.display())),
                 }
                 seen_directories.insert(path);
                 continue;
@@ -469,9 +503,19 @@ pub fn snapshot(home: &Path, directories: &[String], hash_limit: u64) -> Snapsho
             if !metadata.is_file() {
                 continue;
             }
-            let digest = (metadata.len() <= hash_limit)
-                .then(|| digest_of(&path, metadata.len()))
-                .flatten();
+            let digest = if metadata.len() <= hash_limit {
+                let digest = digest_of(&path, metadata.len());
+                if digest.is_none() {
+                    unread.push(format!(
+                        "{}: its {} bytes could not be read whole",
+                        path.display(),
+                        metadata.len()
+                    ));
+                }
+                digest
+            } else {
+                None
+            };
             files.insert(
                 path,
                 Entry {
@@ -489,6 +533,7 @@ pub fn snapshot(home: &Path, directories: &[String], hash_limit: u64) -> Snapsho
         files,
         directories: seen_directories,
         hash_limit,
+        unread,
     }
 }
 
@@ -559,13 +604,16 @@ pub fn changes(before: &Snapshot, after: &Snapshot) -> Changes {
 /// (the part's own marker, or the run's own directory, which the agent writes as the working
 /// directory), and then each directory the part created there that is left empty; returns what it
 /// removed and what it left. Nothing that existed before the part, a file or a directory, is
-/// touched.
+/// touched, and nothing at all when `before` is not whole, since what it missed may have existed.
 #[must_use]
 pub fn remove_created(
     before: &Snapshot,
     changes: &Changes,
     marks: &[&str],
 ) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    if !before.whole() {
+        return (Vec::new(), changes.created.clone());
+    }
     let inside = |path: &Path| before.roots.iter().any(|root| path.starts_with(root));
     let mut removed = Vec::new();
     let mut left = Vec::new();
@@ -772,6 +820,48 @@ mod tests {
             agent.join("empty").is_dir() && !agent.join("empty").join("ours").exists(),
             "an empty directory that was there stays when the file the part put in it goes"
         );
+    }
+
+    #[test]
+    fn a_snapshot_that_could_not_read_a_directory_is_not_whole_and_nothing_is_removed_after_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = Scratch::new("unread");
+        let home = &scratch.0;
+        let agent = home.join(".agent");
+        let closed = agent.join("closed");
+        std::fs::create_dir_all(&closed).expect("the agent's directory");
+        std::fs::write(closed.join("history"), "the person's").expect("a file in it");
+        std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o000))
+            .expect("a directory nobody can list");
+        let directories = vec![".agent".to_owned(), ".absent".to_owned()];
+        let before = snapshot(home, &directories, 1 << 20);
+        std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o700))
+            .expect("the directory listed again");
+        assert!(
+            !before.whole(),
+            "a directory it could not list leaves it not whole"
+        );
+        assert_eq!(
+            before.unread().len(),
+            1,
+            "only that directory: {:?}",
+            before.unread()
+        );
+        std::fs::write(closed.join("history"), "the person's kr0123").expect("an edit");
+        std::fs::write(agent.join("ours"), "kr0123").expect("a marked file");
+        let after = snapshot(home, &directories, 1 << 20);
+        assert!(
+            after.whole(),
+            "a root that does not exist is not an unread entry"
+        );
+        let found = changes(&before, &after);
+        let (removed, left) = remove_created(&before, &found, &["kr0123"]);
+        assert!(
+            removed.is_empty(),
+            "nothing is removed after a snapshot that is not whole"
+        );
+        assert_eq!(left.len(), found.created.len());
+        assert!(closed.join("history").exists() && agent.join("ours").exists());
     }
 
     #[test]

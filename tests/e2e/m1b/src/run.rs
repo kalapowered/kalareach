@@ -239,6 +239,18 @@ impl Run {
     /// Returns what is still running: a recorded process, a process running out of this run's
     /// directory, or a service-manager job this run's daemon defined.
     pub fn closing_check(&self) -> Result<String, String> {
+        let checked = self.nothing_running()?;
+        *self.passed.lock().unwrap_or_else(PoisonError::into_inner) = true;
+        Ok(checked)
+    }
+
+    /// Checks, as [`Run::closing_check`] does, that nothing this run started is still running,
+    /// without taking the run as passed: its directory is kept when it is dropped.
+    ///
+    /// # Errors
+    ///
+    /// Returns what is still running, as [`Run::closing_check`] does.
+    pub fn nothing_running(&self) -> Result<String, String> {
         let owned = self.owned();
         let started = Instant::now();
         while started.elapsed() < CLOSING_WAIT && owned.iter().any(|o| running(&o.identity)) {
@@ -269,7 +281,6 @@ impl Run {
                 .map(|why| format!("not every process could be found: {why}")),
         );
         if left.is_empty() {
-            *self.passed.lock().unwrap_or_else(PoisonError::into_inner) = true;
             Ok(format!(
                 "none of the {} processes this run started is running, no process runs out of \
                  its directory and no job it defined is loaded",
