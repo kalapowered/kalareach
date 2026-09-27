@@ -1057,10 +1057,17 @@ async fn kr_req_11_39_a_terminal_drains_and_is_answered_while_a_component_runs()
 
     // The gate opens only now, and the component is given nothing more.
     let _ = open.send(());
-    let slowest = supplying.await.expect("the observations were supplied");
+    let taken = supplying.await.expect("the observations were supplied");
+    // Handing an observation over waits for nothing, so it is quick every time but when the machine
+    // stalls the whole test, which holds up only the one it happens to catch. A path that waited on
+    // the runtime would be slow far more often than one time in a hundred.
+    let bound = Duration::from_millis(50);
+    let slow = taken.iter().filter(|took| **took >= bound).count();
     assert!(
-        slowest < Duration::from_millis(50),
-        "handing an observation over took {slowest:?}, so the terminal path waited on the runtime"
+        slow <= taken.len().div_ceil(100),
+        "{slow} of {} observations took {bound:?} or more to hand over, more than one in a \
+         hundred, so the terminal path waited on the runtime",
+        taken.len()
     );
 
     // And what the terminal produced goes to the runtime by the same handoff, which is what a
@@ -1126,8 +1133,8 @@ async fn kr_req_11_39_a_terminal_drains_and_is_answered_while_a_component_runs()
 /// can hold one past its deadline.
 const OBSERVATION_PACE: Duration = Duration::from_millis(10);
 
-/// Gives a binding one observation each [`OBSERVATION_PACE`] until the gate opens, and returns the
-/// longest any of them took to hand over.
+/// Gives a binding one observation each [`OBSERVATION_PACE`] until the gate opens, and returns how
+/// long each took to hand over.
 ///
 /// This is what holds a component's work open. Observations handed over in advance last as long as
 /// the machine takes to work through them, which is a guess about the machine: on a fast one the
@@ -1142,10 +1149,10 @@ async fn supply(
     plugin: Arc<PluginClient>,
     binding: BindingId,
     mut gate: tokio::sync::oneshot::Receiver<()>,
-) -> Duration {
+) -> Vec<Duration> {
     let mut pace = tokio::time::interval(OBSERVATION_PACE);
     pace.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut slowest = Duration::ZERO;
+    let mut taken = Vec::new();
     for index in 0_u64.. {
         tokio::select! {
             biased;
@@ -1154,7 +1161,7 @@ async fn supply(
         }
         let offered = std::time::Instant::now();
         let handed = plugin.offer(binding, &scrape(&format!("se-{index}"), "output"));
-        slowest = slowest.max(offered.elapsed());
+        taken.push(offered.elapsed());
         assert!(
             matches!(
                 handed,
@@ -1164,7 +1171,7 @@ async fn supply(
             "an observation was handed over as {handed:?}"
         );
     }
-    slowest
+    taken
 }
 
 /// Returns how many calls into a component this connection's bindings have finished.
