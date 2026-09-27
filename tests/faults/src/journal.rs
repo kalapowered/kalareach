@@ -442,9 +442,18 @@ fn copy_while_written(path: &Path, sql: &[String], accept: u8) -> Result<(), Str
     build(&written, sql)?;
     let mut journal =
         Journal::open(&written).map_err(|error| format!("the journal did not open: {error}"))?;
+    let database = std::fs::read(&written).map_err(io)?;
     journal
         .accept(&submission(accept)?)
         .map_err(|error| format!("the journal did not accept action {accept}: {error}"))?;
+    // The commit has to be in the log and nowhere else, or cutting the log would not take it
+    // away: a checkpoint that moved it into the database file would have changed the file.
+    if std::fs::read(&written).map_err(io)? != database {
+        return Err(format!(
+            "a checkpoint moved the accept of action {accept} into the database file, so cutting \
+             the log would not remove it"
+        ));
+    }
     std::fs::copy(&written, path).map_err(io)?;
     std::fs::copy(log_of(&written), log_of(path)).map_err(io)?;
     drop(journal);
@@ -474,6 +483,17 @@ fn cut_inside_last_frame(log: &Path) -> Result<(), String> {
             "{} holds {frames} bytes of frames, which is not a whole number of {frame}-byte frames",
             log.display()
         ));
+    }
+    // A frame that ends a commit records the database's size after it at byte 4 of its header,
+    // and every other frame records nought there. The last frame has to end the commit being cut.
+    let mut last = [0_u8; FRAME_HEADER];
+    let mut reader = std::fs::File::open(log).map_err(io)?;
+    reader
+        .seek(SeekFrom::Start((length - frame) as u64))
+        .map_err(io)?;
+    std::io::Read::read_exact(&mut reader, &mut last).map_err(io)?;
+    if u32::from_be_bytes([last[4], last[5], last[6], last[7]]) == 0 {
+        return Err(format!("{}'s last frame ends no commit", log.display()));
     }
     let file = std::fs::OpenOptions::new()
         .write(true)
