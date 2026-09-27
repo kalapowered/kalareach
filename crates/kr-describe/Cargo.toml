@@ -20,6 +20,9 @@ kr-worker.workspace = true
 # Names, pins and generated-description provenance are a store of their own beside the session
 # journal, because section 24 gives them their own owner and they outlive the session.
 rusqlite = { workspace = true, features = ["bundled"] }
+# The wire to the description process is section 23's frame, read against each message's schema
+# before it is decoded, as every other frame in this product is.
+schemars.workspace = true
 serde = { workspace = true }
 serde_json.workspace = true
 # The qualified available-memory signal the reserve is checked against, and the process figures

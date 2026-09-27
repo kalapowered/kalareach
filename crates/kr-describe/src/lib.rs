@@ -25,6 +25,7 @@
 //! | [`privacy`] | Privacy mode's four calls over this crate's own stores |
 //! | [`runtime`] | The inference seam, and the deterministic runtime the tests drive |
 //! | [`service`] | The whole of it: admit, dispatch, validate, publish, unload |
+//! | [`wire`] | The frames between the control daemon and the description process |
 //! | [`qualification`] | The matrix section 22 ends with, and what has and has not been run |
 //! | [`error`] | What this crate refuses |
 //!
@@ -93,6 +94,7 @@ pub mod runtime;
 pub mod service;
 pub mod store;
 pub mod time;
+pub mod wire;
 
 pub use crate::error::{DescribeError, Result};
 pub use crate::metadata::{SessionFacts, SessionLabel, Title, VerifiedStatus};
