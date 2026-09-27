@@ -323,6 +323,7 @@ fn planted_text_in_the_diagnostics_shows_only_where_it_was_asked_for() {
         "state_directory",
         "stale_documents[]",
         "values[].origin",
+        "values[].value",
         "ceilings[].origin",
     ] {
         assert!(shown.contains(asked), "{asked} shows what was asked for");
@@ -344,6 +345,35 @@ fn planted_text_in_the_diagnostics_shows_only_where_it_was_asked_for() {
         );
     }
     assert!(!integrations.contains("command_integrations[].reason"));
+}
+
+/// Section 26: each effective value is shown; one made of names the owner wrote down, the packages
+/// whose command integration a new session applies, whole, and a path or a word by its class.
+#[test]
+fn each_effective_value_is_shown_by_what_it_is_made_of() {
+    let said = |declared: &Declared| {
+        let value = EffectiveValue::new(
+            "command_integrations",
+            "the installed packages whose command integration a new session applies",
+            declared,
+            ValueSource::HostConfiguration,
+            Nullable::null(),
+            Nullable::null(),
+            ValueEffect::NewSessionsOnly,
+        );
+        crate::output::Document::new()
+            .with("value", value_said(&value))
+            .json()["value"]
+            .clone()
+    };
+    assert_eq!(
+        said(&Declared::names([
+            "kalareach/claude-code",
+            "kalareach/gemini-cli"
+        ])),
+        "kalareach/claude-code, kalareach/gemini-cli"
+    );
+    assert_eq!(said(&Declared::term("mains_only")), "mains_only");
 }
 
 /// The marker this file plants in every text-bearing field of a reply.

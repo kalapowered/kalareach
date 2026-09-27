@@ -113,13 +113,14 @@ async fn integration(
                     "in_force",
                     in_force.map(|value| {
                         Document::new()
-                            .with("value", output::configured(value.class(), value.value()))
+                            .with("value", crate::doctor::value_said(value))
                             .with("source", value.source.as_str())
                             .with(
                                 "origin",
-                                value.origin.as_ref().map(|origin| {
-                                    output::configured_field("EffectiveValue", "origin", origin)
-                                }),
+                                value
+                                    .origin
+                                    .as_ref()
+                                    .map(|origin| crate::doctor::origin_of(value.source, origin)),
                             )
                     }),
                 )
@@ -137,7 +138,7 @@ async fn integration(
     if let Some(value) = in_force {
         output::line(&stdout_line!(
             "a new session applies the command integrations of: {}",
-            output::configured(value.class(), value.value())
+            crate::doctor::value_said(value)
         ));
         if value.source == ValueSource::Profile {
             output::line(&stdout_line!(

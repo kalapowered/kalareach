@@ -502,10 +502,22 @@ fn location(path: &str) -> Asked {
     Asked::path(Request::Diagnostics, path)
 }
 
+/// One effective value, which section 26 has `kr doctor` show: a value made of names the owner
+/// wrote down (the packages whose command integration a new session applies) whole, as content the
+/// person asked the diagnostics for, and a value of every other class as [`configured`] says it.
+pub(crate) fn value_said(value: &kr_protocol::hostinfo::EffectiveValue) -> Asked {
+    match value.class() {
+        kr_protocol::hostinfo::export::ContentClass::Name => {
+            Asked::text(Request::Diagnostics, value.value())
+        }
+        class => configured(class, value.value()),
+    }
+}
+
 /// Where in its rung a value came from: the configuration document's path, said whole as this
 /// host's other locations are, or the name of the profile the person selected. Section 26 has
 /// `kr doctor` show each value's source.
-fn origin_of(source: ValueSource, origin: &str) -> Asked {
+pub(crate) fn origin_of(source: ValueSource, origin: &str) -> Asked {
     match source {
         ValueSource::HostConfiguration => location(origin),
         _ => Asked::text(Request::Diagnostics, origin),
@@ -602,7 +614,7 @@ pub fn configuration_report(effective: &EffectiveConfiguration) -> Document {
                     Document::new()
                         .with("key", configured_field("EffectiveValue", "key", &value.key))
                         .with("about", host_text(value.stated_about()))
-                        .with("value", configured(value.class(), value.value()))
+                        .with("value", value_said(value))
                         // What the value is made of, which is what decides how it leaves this
                         // host. A reader that sees a path and a word in the same shape of row has
                         // no other way to tell them apart.
@@ -818,7 +830,7 @@ pub fn configurable_lines(effective: &EffectiveConfiguration) -> Vec<Line> {
     }
     for value in &effective.values {
         let key = configured_field("EffectiveValue", "key", &value.key);
-        let said = configured(value.class(), value.value());
+        let said = value_said(value);
         let effect = value.effect.describe();
         let origin = value
             .variable
