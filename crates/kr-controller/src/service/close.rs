@@ -216,33 +216,60 @@ impl Controller {
                 let Ok(reply) = value.to_typed::<SessionCloseResult>() else {
                     return Ok(value);
                 };
-                match reply.closure.as_ref() {
-                    // The worker's own account of how its session ended, which is the best one
-                    // there is, written through the same boundary as every other closure so that
-                    // nothing this daemon writes afterwards can replace it.
-                    Some(record) => {
-                        self.record_closure_once(record).await?;
-                    }
-                    // The worker has accepted the close and is stopping its processes.
-                    None => self.close_accepted(params.session_id).await,
-                }
+                self.settle_close_answer(params.session_id, &reply).await?;
                 encode(&reply)
             }
             Err(error) => Err(ControllerError::InvalidArgument(error.to_string())),
         }
     }
 
+    /// Settles a worker's answer to a close of `session_id` that this daemon passes on, whether
+    /// the worker gave it now or from its journal, and on either door: every answer a close gets
+    /// is settled here, before it goes, so none reaches its caller without this daemon knowing
+    /// what it said.
+    ///
+    /// An answer with the worker's own account of how its session ended is recorded, written
+    /// through the same boundary as every other closure so that nothing this daemon writes
+    /// afterwards can replace it. One without is the worker's acceptance: the session is closing,
+    /// as the worker's description in it says, until its closure is recorded
+    /// ([`Self::close_accepted`]). The answer itself is not changed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a closure the answer carries cannot be recorded.
+    pub(crate) async fn settle_close_answer(
+        self: &Arc<Self>,
+        session_id: SessionId,
+        answer: &SessionCloseResult,
+    ) -> Result<()> {
+        match answer.closure.as_ref() {
+            Some(record) => self.retire(record).await,
+            None => {
+                self.close_accepted(session_id, answer.session.as_ref())
+                    .await;
+                Ok(())
+            }
+        }
+    }
+
     /// Settles what follows a worker's acceptance of a close this daemon passed to it.
     ///
     /// The session is closing from here until its closure is recorded, which is what a read that
-    /// meets the worker on its way out is answered with (`Directory::ending`). Nothing is asked of
-    /// the worker here: the link the acceptance came over is the one the worker is holding its
-    /// close on until the caller has the acceptance, and an exchange that ended that link would
-    /// start the close early. Something also has to notice when the worker finishes, so the
-    /// tombstone is written and the descriptor removed rather than left pointing at a process that
-    /// has gone.
-    pub(crate) async fn close_accepted(self: &Arc<Self>, session_id: SessionId) {
-        self.directory.lock().await.accepted_close(session_id);
+    /// meets the worker on its way out is answered with (`Directory::ending`), from the worker's
+    /// own description of the session where the acceptance carries one. Nothing is asked of the
+    /// worker here: the link the acceptance came over is the one the worker is holding its close
+    /// on until the caller has the acceptance, and an exchange that ended that link would start
+    /// the close early. Something also has to notice when the worker finishes, so the tombstone is
+    /// written and the descriptor removed rather than left pointing at a process that has gone.
+    async fn close_accepted(
+        self: &Arc<Self>,
+        session_id: SessionId,
+        described: Option<&kr_protocol::session::SessionSummary>,
+    ) {
+        self.directory
+            .lock()
+            .await
+            .accepted_close(session_id, described);
         tokio::spawn(Arc::clone(self).watch_closure(session_id, ClosureReason::CloseRequested));
     }
 
@@ -407,25 +434,6 @@ impl Controller {
             .map(|summary| summary.desktop)
     }
 
-    /// Records a closure a worker handed over, unless one is already recorded.
-    ///
-    /// This, [`Self::record_final`] and [`Self::retire`] are the three entry points that write one,
-    /// and each holds the same lock for the whole of its check and its write. A worker's own
-    /// account of how its session ended carries the root's result and what it stopped, and a record
-    /// written from outside knows neither, so one must never be able to replace the other.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the registry cannot be read or written.
-    async fn record_closure_once(&self, record: &ClosureRecord) -> Result<ClosureRecord> {
-        let _finalising = self.finalising.lock().await;
-        if let Some(existing) = self.registry.lock().await.closure(record.session_id)? {
-            return Ok(existing);
-        }
-        self.write_closure(record).await?;
-        Ok(record.clone())
-    }
-
     /// Records how a session ended, once.
     ///
     /// The whole of it is one transaction: the closure already recorded is the answer where there
@@ -516,12 +524,12 @@ impl Controller {
     /// Records a closure from outside this daemon's own bookkeeping, unless one is already
     /// recorded, and looks at the sleep setting afterwards.
     ///
-    /// This is the entry point for a closure a caller outside this module has been handed, which
-    /// today is the answer a worker gives a paired device. It holds the same lock across its check
-    /// and its write as [`Self::record_closure_once`] and [`Self::record_final`], so a worker's own
-    /// account of how its session ended can never be replaced by a later record, whichever path
-    /// carried it. A session that has ended is work that has ended, so the setting is looked at
-    /// once the record is written; the caller's own answer never waits for that.
+    /// This is the entry point for a closure a worker hands over in its answer to a close, on
+    /// either door ([`Self::settle_close_answer`]). It holds the same lock across its check and
+    /// its write as [`Self::record_final`], so a worker's own account of how its session ended can
+    /// never be replaced by a later record, whichever path carried it. A session that has ended is
+    /// work that has ended, so the setting is looked at once the record is written; the caller's
+    /// own answer never waits for that.
     ///
     /// # Errors
     ///

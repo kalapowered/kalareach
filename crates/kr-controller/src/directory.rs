@@ -8,7 +8,8 @@
 //! spawned from. It might be stale, or it might have been planted; the daemon cannot tell and does
 //! not need to, because either way it is not a session.
 //!
-//! Beside each worker is what it last said about its session. A worker that has finished its
+//! Beside each worker is what it last said about its session: its ready report, its answers to
+//! reads and its acceptance of a close each describe the session. A worker that has finished its
 //! closure stops answering before the kernel says its process has ended, and in between that is
 //! what the daemon knows of the session. A worker this daemon finds when it starts is asked for
 //! its description over the connection it proved itself on.
@@ -60,11 +61,33 @@ pub struct Quarantined {
 #[derive(Debug, Default)]
 struct Heard {
     /// The session as the worker last described it, where one of its answers has reached this
-    /// daemon since it started. The description alone: what else a read carries either reaches
-    /// the worker or is the session's content, and neither is this daemon's to hand out.
+    /// daemon since it started: its ready report, a read, its answer to a close. The description
+    /// alone: what else a read carries either reaches the worker or is the session's content, and
+    /// neither is this daemon's to hand out.
     session: Option<SessionSummary>,
     /// Whether the worker accepted a close this daemon passed to it.
     closing: bool,
+}
+
+impl Heard {
+    /// Keeps a worker's description of the session `session_id`, unless it describes another
+    /// session or puts this one earlier in its lifecycle than the description kept.
+    ///
+    /// The lifecycle only moves forward, so an answer that puts the session earlier is one an
+    /// earlier moment gave and a later one overtook. A description of another session says nothing
+    /// about this one, whatever carried it.
+    fn keep(&mut self, session_id: SessionId, described: &SessionSummary) {
+        if described.session_id != session_id {
+            return;
+        }
+        if self
+            .session
+            .as_ref()
+            .is_none_or(|kept| stage(described.state) >= stage(kept.state))
+        {
+            self.session = Some(described.clone());
+        }
+    }
 }
 
 /// The result of rebuilding the directory.
@@ -151,19 +174,18 @@ impl Directory {
     /// Adds a worker, with its own description of its session where this daemon has one.
     ///
     /// Proving itself is what admits a worker, because a close has to be able to reach every
-    /// worker that has. A worker found at a start or recovered later is asked for its description
-    /// as it is admitted ([`describe`]), and a worker the rendezvous has just established is asked
-    /// by the create waiting on it; either may be admitted without one.
+    /// worker that has. A worker the rendezvous has just established describes its session in its
+    /// ready report. A worker found at a start or recovered later is asked for its description as
+    /// it is admitted ([`describe`]), and may be admitted without one; its answer to a close this
+    /// daemon passes on describes the session then ([`Self::accepted_close`]).
     pub fn insert(&mut self, worker: KnownWorker, described: Option<SessionSummary>) {
         let session_id = worker.descriptor.session_id;
         self.verified.insert(session_id, worker);
-        self.heard.insert(
-            session_id,
-            Heard {
-                session: described,
-                closing: false,
-            },
-        );
+        let mut heard = Heard::default();
+        if let Some(described) = &described {
+            heard.keep(session_id, described);
+        }
+        self.heard.insert(session_id, heard);
     }
 
     /// Removes a worker whose session has closed, and what it last said.
@@ -180,27 +202,32 @@ impl Directory {
     /// Keeps how a worker in the directory has just described its session.
     ///
     /// A worker that has left the directory had its closure recorded while it was being asked,
-    /// and the record is the answer from then on, so what it said is not kept. A description that
-    /// puts the session earlier in its lifecycle than the one kept is not kept either: the
-    /// lifecycle only moves forward, so such an answer is one an earlier moment gave and a later
-    /// one overtook.
+    /// and the record is the answer from then on, so what it said is not kept. Nor is a
+    /// description of another session, or one that puts the session earlier in its lifecycle than
+    /// the one kept ([`Heard::keep`]).
     pub fn heard(&mut self, session_id: SessionId, described: &SessionSummary) {
         if !self.verified.contains_key(&session_id) {
             return;
         }
-        let kept = &mut self.heard.entry(session_id).or_default().session;
-        if kept
-            .as_ref()
-            .is_none_or(|kept| stage(described.state) >= stage(kept.state))
-        {
-            *kept = Some(described.clone());
-        }
+        self.heard
+            .entry(session_id)
+            .or_default()
+            .keep(session_id, described);
     }
 
-    /// Notes that a worker in the directory accepted a close this daemon passed to it.
-    pub fn accepted_close(&mut self, session_id: SessionId) {
-        if self.verified.contains_key(&session_id) {
-            self.heard.entry(session_id).or_default().closing = true;
+    /// Notes that a worker in the directory accepted a close this daemon passed on, and keeps
+    /// the description of the session its acceptance carried, as [`Self::heard`] keeps one.
+    ///
+    /// A worker built before its acceptance described the session carries none, and then the
+    /// session is closing with whatever description this daemon already had.
+    pub fn accepted_close(&mut self, session_id: SessionId, described: Option<&SessionSummary>) {
+        if !self.verified.contains_key(&session_id) {
+            return;
+        }
+        let heard = self.heard.entry(session_id).or_default();
+        heard.closing = true;
+        if let Some(described) = described {
+            heard.keep(session_id, described);
         }
     }
 
@@ -324,4 +351,170 @@ pub(crate) async fn describe(
     crate::service::reported_read(&answer)
         .ok()
         .map(|read| read.session)
+}
+
+#[cfg(test)]
+mod tests {
+    use kr_protocol::identity::{
+        BootIdentity, BootIdentitySource, DesktopBinding, ProcessStartIdentity, ProcessStartSource,
+        WorkerProfile,
+    };
+    use kr_protocol::ids::{EnvironmentId, SessionEpoch, SessionId};
+    use kr_protocol::scalars::{AuthorisationKey, Bytes, Nullable, TimestampMs, U64, Uuid};
+    use kr_protocol::session::{
+        Dimensions, DisplayNumber, SessionState, SessionSummary, ShellMode,
+    };
+    use kr_protocol::worker::WorkerDescriptor;
+
+    use super::{Directory, KnownWorker};
+
+    /// A verified worker of `session_id`, on an endpoint of `host`.
+    fn worker(host: &kr_ipc::testing::TempHost, session_id: SessionId) -> KnownWorker {
+        let endpoint = host
+            .environment()
+            .worker_endpoint(DisplayNumber::new(1))
+            .expect("an endpoint");
+        KnownWorker {
+            descriptor: WorkerDescriptor {
+                session_id,
+                session_epoch: SessionEpoch::V1,
+                environment_id: host.environment_id(),
+                display_number: DisplayNumber::new(1),
+                boot_identity: BootIdentity {
+                    source: BootIdentitySource::LinuxBootId,
+                    value: Bytes::new(b"boot".to_vec()),
+                },
+                process_start_identity: ProcessStartIdentity::new(
+                    11,
+                    ProcessStartSource::LinuxProcStat,
+                    22,
+                ),
+                protocol_version: kr_protocol::hello::PROTOCOL_VERSION,
+                endpoint: endpoint.as_text(),
+                worker_public_key: AuthorisationKey::from_bytes([7; 32]),
+                worker_profile: WorkerProfile::HeadlessUser,
+                published_at_ms: TimestampMs::new(1),
+            },
+            endpoint,
+        }
+    }
+
+    /// `session_id` in `state`, `columns` wide, as a worker describes it.
+    fn described(session_id: SessionId, state: SessionState, columns: u64) -> SessionSummary {
+        SessionSummary {
+            session_id,
+            session_epoch: SessionEpoch::V1,
+            environment_id: EnvironmentId::new(Uuid::from_bytes([8; 16])),
+            display_number: DisplayNumber::new(1),
+            state,
+            shell_mode: ShellMode::NativeCompat,
+            shell_path: "/bin/sh".to_owned(),
+            cwd: "/work".to_owned(),
+            worker_profile: WorkerProfile::HeadlessUser,
+            desktop: DesktopBinding::none(),
+            created_at_ms: TimestampMs::new(1),
+            dimensions: Dimensions::new(columns, 24),
+            attachment_count: U64::ZERO,
+            application_state: Nullable::null(),
+            root_process: Nullable::null(),
+            closure: Nullable::null(),
+        }
+    }
+
+    /// What the directory answers a read that meets the worker on its way out with.
+    fn ending(directory: &Directory, session_id: SessionId) -> Option<SessionSummary> {
+        directory.ending(session_id).map(|read| read.session)
+    }
+
+    /// A description of another session is not kept as this one's, whichever way it arrives:
+    /// with the worker's admission, in its answer to a read, or in its acceptance of a close.
+    #[test]
+    fn a_description_of_another_session_is_never_kept() {
+        let host = kr_ipc::testing::TempHost::create();
+        let session_id = SessionId::new(Uuid::from_bytes([1; 16]));
+        let other = SessionId::new(Uuid::from_bytes([2; 16]));
+        let mut directory = Directory::default();
+        directory.insert(
+            worker(&host, session_id),
+            Some(described(other, SessionState::Live, 80)),
+        );
+        directory.heard(session_id, &described(other, SessionState::Closing, 80));
+        directory.accepted_close(
+            session_id,
+            Some(&described(other, SessionState::Closing, 80)),
+        );
+        assert_eq!(
+            ending(&directory, session_id),
+            None,
+            "nothing kept describes this session"
+        );
+
+        directory.accepted_close(
+            session_id,
+            Some(&described(session_id, SessionState::Closing, 100)),
+        );
+        assert_eq!(
+            ending(&directory, session_id),
+            Some(described(session_id, SessionState::Closing, 100)),
+            "and this session's own description is kept"
+        );
+    }
+
+    /// An acceptance's description is kept by the lifecycle's order like any answer's: it
+    /// replaces a live description, a later live answer does not take it back, and it does not take
+    /// back a description that says the session has closed.
+    #[test]
+    fn an_acceptance_is_kept_in_the_lifecycles_order() {
+        let host = kr_ipc::testing::TempHost::create();
+        let session_id = SessionId::new(Uuid::from_bytes([1; 16]));
+        let mut directory = Directory::default();
+        directory.insert(
+            worker(&host, session_id),
+            Some(described(session_id, SessionState::Live, 80)),
+        );
+        directory.accepted_close(
+            session_id,
+            Some(&described(session_id, SessionState::Closing, 100)),
+        );
+        directory.heard(session_id, &described(session_id, SessionState::Live, 90));
+        assert_eq!(
+            ending(&directory, session_id),
+            Some(described(session_id, SessionState::Closing, 100))
+        );
+
+        directory.heard(
+            session_id,
+            &described(session_id, SessionState::Closed, 110),
+        );
+        directory.accepted_close(
+            session_id,
+            Some(&described(session_id, SessionState::Closing, 120)),
+        );
+        assert_eq!(
+            ending(&directory, session_id),
+            Some(described(session_id, SessionState::Closed, 110))
+        );
+    }
+
+    /// An acceptance without a description, as a worker built before it gives one, still marks
+    /// the session closing, from the description already kept.
+    #[test]
+    fn an_acceptance_without_a_description_marks_the_kept_one_closing() {
+        let host = kr_ipc::testing::TempHost::create();
+        let session_id = SessionId::new(Uuid::from_bytes([1; 16]));
+        let mut directory = Directory::default();
+        directory.insert(worker(&host, session_id), None);
+        directory.accepted_close(session_id, None);
+        assert_eq!(
+            ending(&directory, session_id),
+            None,
+            "a session nothing described stays undescribed"
+        );
+
+        directory.heard(session_id, &described(session_id, SessionState::Live, 80));
+        assert_eq!(
+            ending(&directory, session_id),
+            Some(described(session_id, SessionState::Closing, 80))
+        );
+    }
 }

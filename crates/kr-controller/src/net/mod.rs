@@ -1427,20 +1427,23 @@ impl Controller {
             }
         };
         if *retained {
-            // The close this answers happened, and whatever settled it settled then: the record
-            // was written and the closure watched by the submission that performed it. What comes
-            // back now is that action's retained answer, which may be its result or its receipt,
-            // and it is passed through as it is rather than read as a close result it need not be.
+            // The close this answers happened, and what comes back now is that action's retained
+            // answer, which may be its result or its receipt. It is passed through as it is rather
+            // than read as a close result it need not be. A close result is settled on the way, as
+            // one given now is: the daemon that passed the close on first may not be this one, and
+            // what the answer says is then this daemon's only word of the end. The answer is the
+            // worker's receipt either way, so it goes whatever the settling found.
+            if let Ok(reply) = value.to_typed::<kr_protocol::session::SessionCloseResult>() {
+                let _ = self.settle_close_answer(session_id, &reply).await;
+            }
             return Ok(value);
         }
         let reply: kr_protocol::session::SessionCloseResult = value
             .to_typed()
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
-        match reply.closure.as_ref() {
-            Some(record) => self.retire(record).await?,
-            // The worker has accepted the close and is stopping its processes.
-            None => self.close_accepted(session_id).await,
-        }
+        // The worker's description of the session goes on in the answer as it came: what a device
+        // is shown of it is decided where its answer is written.
+        self.settle_close_answer(session_id, &reply).await?;
         crate::service::encode(&reply)
     }
 

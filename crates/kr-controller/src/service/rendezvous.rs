@@ -424,13 +424,15 @@ impl Controller {
         };
         kr_ipc::descriptor::publish(&self.paths, &descriptor)?;
         let endpoint = Endpoint::from_path(&ready.endpoint)?;
-        // No description yet: the create waiting on this report asks the worker for one at once.
+        // The worker's own description of its session, as its report gives it: nothing is asked of
+        // the worker here, and a report that came after its create stopped waiting still leaves
+        // the session described, as a read that meets the worker on its way out needs it.
         self.add_worker(
             KnownWorker {
                 descriptor,
                 endpoint,
             },
-            None,
+            Some(ready.session.clone()),
         )
         .await;
         Ok(())

@@ -425,10 +425,22 @@ impl RemoteConnection {
         // The result when the action produced one, and the receipt when it has not: a caller that
         // resubmitted is told what became of its action, and nothing is dispatched again.
         Ok(Some(match read.result.0 {
-            Some(result) => ControlFrame::Response(Response {
-                request_id: mutation.request_id,
-                outcome: Outcome::Ok(result),
-            }),
+            Some(result) => {
+                // A close's result is settled as one given now is, and goes as it came.
+                if mutation.method == Method::SessionClose.into()
+                    && let Ok(answer) =
+                        result.to_typed::<kr_protocol::session::SessionCloseResult>()
+                {
+                    let _ = self
+                        .controller
+                        .settle_close_answer(session_id, &answer)
+                        .await;
+                }
+                ControlFrame::Response(Response {
+                    request_id: mutation.request_id,
+                    outcome: Outcome::Ok(result),
+                })
+            }
             None => ControlFrame::Receipt(Box::new(kr_protocol::receipt::ReceiptResponse {
                 request_id: mutation.request_id,
                 receipt: read.receipt,
