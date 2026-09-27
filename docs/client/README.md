@@ -159,21 +159,22 @@ its kind.
 Two tests hold this. `crates/kr-client/tests/shown_rule.rs` reads both crates' sources as the
 compiler does, with each literal's escapes decoded, each type named by its full path through the
 file's imports, and only code that cannot compile without `test` left out. It names the file and
-line of anything that could put other text in a rendering: a hand-written `Display`, a `Plain`
-claim outside the two `shown.rs` files, an error field a rendering reaches that is none of the
-types above, a formatted panic, an `unwrap` or `expect` in either call form, an assertion that
-prints what it compares, a log line, standard error written outside the reporter, standard output
-written or opened outside the command line's writer, serde_json's value API named or a tool result
-made outside it, a raw handle on standard output named anywhere but in the three commands that own
-one, a glob of the writer's module or of serde_json there, and source it cannot follow: a renamed import, a macro, a derive it does not know, an
-attribute under `cfg_attr` that it reads, a `#[path]` or an `include!`. It holds every
-`Debug` of the two crates as well: a derived one only over fields whose own `Debug` prints nothing
-that arrived, found across every crate of the workspace, and one written by hand only formatting
-what a `Shown` may hold. The marker tests plant one marker where input goes (each text leaf, map
-key and other leaf of a stored file, malformed bytes, typed arguments, origins) and look for it in
-every rendering that comes back, as text, as decimal and hexadecimal bytes, and in base64; beside
-each, the same planting of another value is held to naming the fault's class and its place. A service's answer that cannot be read is said
-through `json` or `cbor`, whose renderings carry none of the answer by their types.
+line of anything that could put other text in a rendering: a hand-written `Display`, a `Plain` claim
+outside the two `shown.rs` files, an error field a rendering reaches that is none of the types
+above, a formatted panic, an `unwrap` or `expect` in either call form, an assertion that prints what
+it compares, a log line, standard error written outside the reporter, standard output named outside
+the command line's writer, serde_json named there for more than its typed functions, a tool result
+made there, a glob of the writer's module, a raw handle on standard output named anywhere but in the
+three commands that own one, and source it cannot follow: a renamed import, a macro, a derive it
+does not know, an attribute under `cfg_attr` that it reads, a `#[path]` or an `include!`. It holds
+every `Debug` of the two crates as well: a derived one only over fields whose own `Debug` prints
+nothing that arrived, found across every crate of the workspace, and one written by hand only
+formatting what a `Shown` may hold. The marker tests plant one marker where input goes (each text
+leaf, map key and other leaf of a stored file, malformed bytes, typed arguments, origins) and look
+for it in every rendering that comes back, as text, as decimal and hexadecimal bytes, and in base64;
+beside each, the same planting of another value is held to naming the fault's class and its place. A
+service's answer that cannot be read is said through `json` or `cbor`, whose renderings carry none
+of the answer by their types.
 
 ## What the command line prints
 
@@ -211,10 +212,12 @@ The rest of what a command prints is decided by what it is:
 
 Three commands own standard output for a protocol or a terminal rather than for lines: the tool
 server, `kr bridge --stdio` and the attach guard. They are the only callers of the writer's two raw
-handles. The marker tests build values of each type a command prints from that type's schema, with
-the marker in every text leaf and every alternative of every choice built at least once, and find
-the marker only in the fields that hold asked content, element by element, or the host's own
-sentences.
+handles. The source test reads these rules by name in ordinary code, and its own documentation
+writes down what it does not read, such as another crate's name for one of serde_json's types; the
+writer is what stops such a value at standard output. The marker tests build values of each type a
+command prints from that type's schema, with the marker in every text leaf and every alternative of
+every choice built at least once, and find the marker only in the fields that hold asked content,
+element by element, or the host's own sentences.
 
 ## Drafts
 
