@@ -3775,12 +3775,25 @@ once the kernel agrees the worker has gone. A worker that disappears without a c
 reconciled the same way and recorded as an abnormal closure. A daemon that merely cannot reach a
 worker records nothing: not reaching a process is not evidence that it died.
 
+A worker that has finished its closure stops answering a moment before the kernel says its process
+has ended. A `session.read` or `session.list` that meets it then is answered from what the daemon
+holds: the session as the worker last described it, `closing`, with no endpoint and none of the
+session's content. The worker describes its session in its ready report, in its answer to each
+read and in its acceptance of a close, and the daemon keeps the description furthest along the
+lifecycle, so a close it passed on, the first time or as a retry, leaves it one to answer with.
+Where the daemon holds no word of an end, the read is refused with `RESOURCE_UNAVAILABLE` to be
+tried again, and a list leaves the session out. A paired device's close answer carries the
+worker's description only when the decision it is written under lets the device read the session
+(`session.view`).
+
 ## Recovery
 
 A replacement daemon takes the environment's singleton lock, advances its persistent generation,
 and rebuilds its directory from the registry rows and the published descriptors — never from a list
 of process names. Each worker is verified by a fresh challenge. A descriptor that fails is
-quarantined and never spawned from. No worker is killed because the daemon restarted.
+quarantined and never spawned from. A descriptor whose reservation this host fenced is quarantined
+without a challenge: the fence says the worker is not to be reached again, and recovery leaves such
+a worker alone for the same reason. No worker is killed because the daemon restarted.
 
 A worker accepts its current generation again only after a fresh challenge, which fences that
 generation's previous connection; it refuses a lower generation and requires a strictly higher one
