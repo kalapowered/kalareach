@@ -650,8 +650,12 @@ fn the_doctor_carries_whole_reports_within_its_bytes() {
     let store = Store::new("report-bytes");
     let reading = Integrations::new().read(&many(&store, "big", 8, &largest_flags()));
     let reported = report(Some(&reading), &[], &[], &able(Vec::new()));
-    assert!(reported.omitted > 0, "eight of the largest do not fit");
-    assert_eq!(reported.reports.len() + reported.omitted, 8);
+    assert_eq!(
+        reported.reports.len(),
+        5,
+        "five of the largest declarations fit, and a sixth would not"
+    );
+    assert_eq!(reported.omitted, 3);
     let carried: usize = reported
         .reports
         .iter()
@@ -699,8 +703,10 @@ fn the_doctor_carries_at_most_its_number_of_reports_configured_first() {
     );
 }
 
-/// KR-REQ-07.45: the doctor's whole answer, with the most its reports may take, fits the one
-/// response frame it travels in, in the owner's form and in the withheld one.
+/// KR-REQ-07.45: the doctor's answer fits the one response frame it travels in, in the owner's form
+/// and in the withheld one, with its reports filling their budget and its catalogue check carrying
+/// the sixteen notes it keeps, each naming as many packages as long as a configuration can turn on,
+/// and room left over for the rest of its checks.
 #[test]
 fn the_doctor_answer_fits_one_response_frame() {
     use kr_protocol::envelope::{ControlFrame, Outcome, ParamsValue, Response};
@@ -712,6 +718,37 @@ fn the_doctor_answer_fits_one_response_frame() {
     let reading = Integrations::new().read(&packages);
     let enabled = many_named("big", 8);
     let reported = report(Some(&reading), &[], &enabled, &able(Vec::new()));
+    let carried: usize = reported
+        .reports
+        .iter()
+        .map(|report| encoded(report).max(encoded(&report.withheld_form())))
+        .sum();
+    assert!(
+        carried >= MAX_REPORT_BYTES * 3 / 4,
+        "{carried} bytes of reports fill most of their budget"
+    );
+    let longest: Vec<PluginId> = (0
+        ..kr_protocol::hostinfo::configuration::MAX_COMMAND_INTEGRATIONS)
+        .map(|index| {
+            PluginId::new(format!("{}/{index:0>64}", "p".repeat(64))).expect("an identifier")
+        })
+        .collect();
+    let notes: Vec<String> = (0..16u8)
+        .map(|index| {
+            omission_note(
+                SessionId::new(kr_protocol::scalars::Uuid::from_bytes([index; 16])),
+                &longest,
+            )
+            .expect("a note")
+        })
+        .collect();
+    let catalogue = crate::config::catalogue::check(
+        Some(&crate::catalogue::evidence::Evidence {
+            repositories: Vec::new(),
+            warnings: notes,
+        }),
+        kr_protocol::hostinfo::configuration::EnrolmentBudgets::default(),
+    );
     let temp = kr_ipc::testing::TempHost::create();
     let environment = temp.environment();
     environment.create().expect("the environment's directories");
@@ -723,7 +760,7 @@ fn the_doctor_answer_fits_one_response_frame() {
         crate::config::HardLimits::default(),
         kr_protocol::identity::WorkerProfile::HeadlessUser,
     );
-    let checks = vec![check(&reported, &enabled)];
+    let checks = vec![catalogue, check(&reported, &enabled)];
     let result = kr_protocol::hostinfo::HostDoctorResult::new(checks, effective)
         .with_command_integrations(reported.reports);
     let answer = |value: ParamsValue| {
@@ -733,16 +770,28 @@ fn the_doctor_answer_fits_one_response_frame() {
         })
     };
     let codec = kr_protocol::frame::FrameCodec::new(kr_protocol::frame::StreamKind::Control);
-    codec
-        .encode_message(&answer(
+    // The daemon's other checks are sentences of a line or two each: a quarter of the frame is
+    // many times what they take.
+    let room = kr_protocol::limits::MAX_CONTROL_FRAME_LEN / 4;
+    for (form, value) in [
+        (
+            "the owner's",
             ParamsValue::from_typed(&result).expect("the owner's form"),
-        ))
-        .expect("the owner's answer fits");
-    codec
-        .encode_message(&answer(
+        ),
+        (
+            "the withheld",
             ParamsValue::from_typed(result.for_export().get()).expect("the withheld form"),
-        ))
-        .expect("the withheld answer fits");
+        ),
+    ] {
+        let framed = codec
+            .encode_message(&answer(value))
+            .unwrap_or_else(|error| panic!("{form} answer fits: {error:?}"));
+        assert!(
+            framed.len() + room <= kr_protocol::limits::MAX_CONTROL_FRAME_LEN,
+            "{form} answer takes {} bytes",
+            framed.len()
+        );
+    }
 }
 
 /// KR-REQ-07.45: where the admissions in force could not be read, each package the configuration
