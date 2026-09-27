@@ -89,24 +89,26 @@ impl Asked {
         }
     }
 
-    /// A location: a URL as its scheme, host, port and path; an SCP-style location
-    /// (`user@host:path`) as its host and path; anything else as a local path. User information, a
-    /// query and a fragment are never kept.
+    /// A location: a URL as its scheme, host, port and path as they were written, a file URL as
+    /// its path; an SCP-style location (`user@host:path`) as its host and path; anything else as a
+    /// local path. User information, a query and a fragment are never kept, and text written as a
+    /// URL that none of those reads is said as its class and its length.
     #[must_use]
     pub fn location(request: Request, location: &str) -> Self {
-        if let Some(located) = kr_client::shown::located(location) {
-            return Self {
-                request,
-                text: located,
-            };
-        }
-        match scp(location) {
-            Some((host, path)) => Self {
-                request,
-                text: format!("{host}:{path}"),
-            },
-            None => Self::path(request, location),
-        }
+        use kr_protocol::hostinfo::export::{ContentClass, withheld};
+
+        let text = if let Some(located) =
+            kr_client::shown::located(location).or_else(|| kr_client::shown::file_located(location))
+        {
+            located
+        } else if kr_client::shown::written_as_url(location) {
+            withheld(ContentClass::Location, location)
+        } else if let Some((host, path)) = scp(location) {
+            format!("{host}:{path}")
+        } else {
+            kr_client::shown::spelled(Path::new(location))
+        };
+        Self { request, text }
     }
 
     /// Why it is shown.
@@ -795,6 +797,37 @@ mod tests {
         let drive = Asked::location(Request::Repositories, "C:/work/repository");
         assert!(drive.text.starts_with("C:"), "{}", drive.text);
         assert!(!drive.text.contains("C:work"), "{}", drive.text);
+        // A file URL keeps its path and loses its query and fragment; a URL with no host this reads
+        // and one that does not parse keep nothing but their class and length.
+        for (location, expected) in [
+            (
+                format!("file:///tmp/catalogue?token={MARKER}#{MARKER}"),
+                "file:///tmp/catalogue".to_owned(),
+            ),
+            (
+                format!("https://someone:{MARKER}@relay.example:port/x"),
+                format!(
+                    "[location withheld, {} bytes]",
+                    format!("https://someone:{MARKER}@relay.example:port/x").len()
+                ),
+            ),
+            (
+                format!("https:someone:{MARKER}@relay.example/x"),
+                format!(
+                    "[location withheld, {} bytes]",
+                    format!("https:someone:{MARKER}@relay.example/x").len()
+                ),
+            ),
+            // Nothing to leave out: the text as it was written.
+            (
+                "https://example.com:443/repo.git".to_owned(),
+                "https://example.com:443/repo.git".to_owned(),
+            ),
+        ] {
+            let asked = Asked::location(Request::Plugins, &location);
+            assert_eq!(asked.text, expected, "{location}");
+            assert!(!asked.text.contains(MARKER), "{location}");
+        }
     }
 
     /// A path is spelled with the platform's own separator throughout, however it was written.
