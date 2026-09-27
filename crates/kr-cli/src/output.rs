@@ -17,8 +17,9 @@
 //! `Shown` or a `Plain` value, so it cannot reach standard error, a failure or a `Debug`.
 //!
 //! Three commands own standard output for a protocol or a terminal rather than for lines: the tool
-//! server, `kr bridge --stdio` and the attach guard. [`protocol_stream`] and [`terminal`] are their
-//! handles. The source test holds every other use of standard output to this module.
+//! server, `kr bridge --stdio` and the attach guard. [`protocol_stream`] and [`attached_terminal`]
+//! are their handles, under names nothing else goes by. The source test holds every other use of
+//! standard output to this module.
 
 use std::fmt::Write as _;
 use std::path::Path;
@@ -799,7 +800,7 @@ impl ProtocolStream {
 
 /// Standard output as the terminal the attach guard gives its modes and sequences back to.
 #[must_use]
-pub fn terminal() -> std::io::Stdout {
+pub fn attached_terminal() -> std::io::Stdout {
     std::io::stdout()
 }
 

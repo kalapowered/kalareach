@@ -19,15 +19,16 @@
 //! * production code logs, writes standard error outside the command line's reporter, formats a
 //!   panic, asserts on values, or calls `unwrap` or `expect`, whose panic renders what failed;
 //! * the command line's production code, outside its writer (`output.rs`), writes standard output
-//!   (`print!`, `println!`, a `print_json`) or opens it (`stdout()`, the standard library's or
-//!   tokio's), names serde_json's value API (its `Value`, `Map` and `Number`, `json!`, `to_value`
-//!   and `from_value`, wherever a path or an import names them; the two files that define what
-//!   may be shown read a closed value's word through `to_value`) or makes a tool result, or names
-//!   one of the writer's raw handles on standard output (`output::protocol_stream`,
-//!   `output::terminal`), in a call, a function value or an import, anywhere but in the functions
-//!   that own standard output for a protocol or a terminal: the tool server's, `kr bridge
-//!   --stdio`'s and the attach guard's. A glob of the writer's module or of serde_json is a
-//!   finding there too, so every name of either is placed where it is written;
+//!   (`print!`, `println!`, a `print_json`) or names it (`stdout`, the standard library's or
+//!   tokio's, called, taken or imported; a method or a field of that name is not it), names
+//!   serde_json for more than its typed functions (serialising a record into bytes or text and
+//!   reading one back, and its error: its `Value`, `Map` and `Number`, `json!`, `to_value` and
+//!   `from_value` build or read a JSON value; the two files that define what may be shown read a
+//!   closed value's word through `to_value`), makes a tool result, imports the writer's module by a
+//!   glob, or names one of the writer's raw handles on standard output (`protocol_stream`,
+//!   `attached_terminal`, names nothing else goes by) anywhere but in the functions that own
+//!   standard output for a protocol or a terminal: the tool server's, `kr bridge --stdio`'s and the
+//!   attach guard's;
 //! * the source is one this reading cannot follow: an `Error` derive not spelled
 //!   `thiserror::Error`, an import of `thiserror`, a renamed import of a trait or a type the rule
 //!   names, a macro that defines a type or writes an `impl`, a module whose file a `#[path]` names,
@@ -36,6 +37,15 @@
 //! Test code is not held to the rule: an item whose `cfg` cannot hold without `test`, and every
 //! file such an item declares, is passed over. An item that may compile without `test`, such as
 //! one under `cfg(any(test, unix))`, is read like any other.
+//!
+//! The standard output rules read names, and they read the code the command line writes, not every
+//! program Rust accepts: they keep ordinary code from reaching standard output or building JSON
+//! from text outside the writer, and they do not try to hold code written to get past them. What
+//! they do not read: another crate's name for one of serde_json's types (rmcp's `JsonObject` is
+//! its `Map`), a value of those types another crate's function returns, and a tool's result that
+//! the tool server's own conversion makes from what a tool returns. What stops any of those at
+//! standard output is the writer: it is the only code that names standard output, and a
+//! `kr_cli::output::Document` takes no string and no JSON value.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -1428,35 +1438,45 @@ const COMMAND_LINE: &str = "crates/kr-cli/";
 /// tool result made.
 const WRITER_FILE: &str = "crates/kr-cli/src/output.rs";
 
-/// The writer's raw handles on standard output, by full path.
-const RAW_HANDLES: [&str; 2] = [
-    "kr_cli::output::protocol_stream",
-    "kr_cli::output::terminal",
-];
-
 /// The functions that own standard output for a protocol or a terminal, each with the raw handle
-/// it takes: the tool server's, `kr bridge --stdio`'s and the attach guard's.
+/// it takes, by the name only that handle goes by: the tool server's, `kr bridge --stdio`'s and the
+/// attach guard's.
 const HANDLE_OWNERS: [(&str, &str, &str); 4] = [
     (
         "crates/kr-cli/src/contact/mod.rs",
         "run_stdio",
-        "kr_cli::output::protocol_stream",
+        "protocol_stream",
     ),
     (
         "crates/kr-cli/src/bridge/helper.rs",
         "run",
-        "kr_cli::output::protocol_stream",
+        "protocol_stream",
     ),
     (
         "crates/kr-cli/src/bin/kr-attach-guard.rs",
         "give_back_the_keyboard",
-        "kr_cli::output::terminal",
+        "attached_terminal",
     ),
     (
         "crates/kr-cli/src/bin/kr-attach-guard.rs",
         "restore",
-        "kr_cli::output::terminal",
+        "attached_terminal",
     ),
+];
+
+/// What the command line names serde_json for outside the writer: serialising its own typed records
+/// into bytes and reading them back, and the error either gives.
+const SERDE_JSON_TYPED: [&str; 10] = [
+    "to_vec",
+    "to_vec_pretty",
+    "to_string",
+    "to_string_pretty",
+    "to_writer",
+    "to_writer_pretty",
+    "from_slice",
+    "from_str",
+    "from_reader",
+    "Error",
 ];
 
 /// What every rendering may hold, by full path.
@@ -1816,43 +1836,12 @@ fn defined_after(tokens: &[Located], at: usize) -> Option<String> {
     None
 }
 
-/// serde_json's value API: its value, map and number types and their modules, and what builds a
-/// value or reads one back into a type.
-const JSON_VALUE_PATHS: [&str; 8] = [
-    "serde_json::Value",
-    "serde_json::Map",
-    "serde_json::Number",
-    "serde_json::value",
-    "serde_json::map",
-    "serde_json::json",
-    "serde_json::to_value",
-    "serde_json::from_value",
-];
-
-/// Whether a full path names serde_json's value API or something inside it.
-fn names_json_value(path: &str) -> bool {
-    JSON_VALUE_PATHS.iter().any(|named| {
-        path == *named
-            || path
-                .strip_prefix(named)
-                .is_some_and(|rest| rest.starts_with("::"))
-    })
-}
-
-/// Whether the identifier at `index` starts a path rather than continuing one: it is not after a
-/// `::` that follows a name or a generic argument list's `>`. A `::` at the start of a path, as in
-/// `::serde_json::Value` or `-> ::serde_json::Value`, starts one.
-fn starts_path(tokens: &[Located], index: usize) -> bool {
-    if !(index >= 2 && punct(tokens.get(index - 1), ':') && punct(tokens.get(index - 2), ':')) {
-        return true;
-    }
-    let before = index.checked_sub(3).and_then(|at| tokens.get(at));
-    let continues = ident(before).is_some()
-        || (punct(before, '>')
-            && !index
-                .checked_sub(4)
-                .is_some_and(|at| punct(tokens.get(at), '-')));
-    !continues
+/// Whether the path that ends at the identifier at `index` is written after `->`: a function's
+/// return type.
+fn returned_type(tokens: &[Located], index: usize) -> bool {
+    let segments = path_ending_at(tokens, index).len().max(1);
+    let start = index + 3 - 3 * segments;
+    start >= 2 && punct(tokens.get(start - 1), '>') && punct(tokens.get(start - 2), '-')
 }
 
 /// The path written up to and including the identifier at `index`.
@@ -1960,20 +1949,18 @@ fn check_source(
     // The command line's standard output is its writer's, and so are its JSON values.
     let held_output = source.name.starts_with(COMMAND_LINE) && source.name != WRITER_FILE;
     // A glob gives names this reading does not place, so outside the writer no glob imports the
-    // writer's module or serde_json's: every name of either is then placed where it is written.
+    // writer's module. (A glob of serde_json names serde_json, which the rule below holds.)
     if held_output && !shown_file {
         for glob in &source.globs {
             let path = source
                 .resolve(&glob.written, glob.scope, aliases)
                 .unwrap_or_else(|| glob.written.join("::"));
-            if path == "kr_cli::output" || path == "serde_json" || names_json_value(&path) {
+            if path == "kr_cli::output" {
                 findings.insert(Finding {
                     file: source.name.clone(),
                     line: glob.line,
                     item: format!("use {path}::*"),
-                    what: "a glob of the writer or of serde_json, whose names this reading cannot \
-                           place"
-                        .to_owned(),
+                    what: "a glob of the writer, whose names this reading cannot place".to_owned(),
                 });
             }
         }
@@ -1993,18 +1980,6 @@ fn check_source(
         };
         let next_is_bang = punct(tokens.get(index + 1), '!');
         let after_dot = index > 0 && punct(tokens.get(index - 1), '.');
-        // serde_json's value API, named at the start of any path, an import's and one written from
-        // the crates' root (`::serde_json`) included: outside the writer and the two files that
-        // define what may be shown, the command line holds no JSON value to fill, convert text into
-        // or print.
-        if held_output && !shown_file && starts_path(tokens, index) && !after_dot {
-            let (segments, _) = written_path(&tokens[index..]);
-            if let Some(path) = source.resolve(&segments, source.scope_at(index), aliases)
-                && names_json_value(&path)
-            {
-                find(line, &path, "a JSON value named outside the writer");
-            }
-        }
         match word.as_str() {
             "Plain" if ident(tokens.get(index + 1)) == Some("for") && !shown_file => {
                 find(
@@ -2125,13 +2100,33 @@ fn check_source(
             "print_json" if held_output => {
                 find(line, word, "standard output written outside the writer");
             }
-            // A call of `stdout()`, not a method of that name such as a command's.
-            "stdout" if punct(tokens.get(index + 1), '(') && !after_dot && held_output => {
-                find(
-                    line,
-                    "stdout()",
-                    "standard output opened outside the writer",
-                );
+            // `stdout` by name, the standard library's or tokio's, called, taken as a value or
+            // imported: not a method or a field after a dot, nor a field a struct literal or a
+            // pattern names (`stdout: bytes`).
+            "stdout"
+                if !after_dot
+                    && held_output
+                    && !(punct(tokens.get(index + 1), ':')
+                        && !punct(tokens.get(index + 2), ':')) =>
+            {
+                find(line, word, "standard output opened outside the writer");
+            }
+            // serde_json by name, however the path around it is written or imported: outside the
+            // writer and the two files that define what may be shown, only its typed functions
+            // and its error. Its value, map and number types, `json!`, `to_value` and `from_value`
+            // build or read a JSON value, and a glob or a list of its names hides which.
+            "serde_json" if !after_dot && held_output && !shown_file => {
+                let typed = punct(tokens.get(index + 1), ':')
+                    && punct(tokens.get(index + 2), ':')
+                    && ident(tokens.get(index + 3))
+                        .is_some_and(|name| SERDE_JSON_TYPED.contains(&name));
+                if !typed {
+                    find(
+                        line,
+                        word,
+                        "serde_json named outside the writer for more than its typed functions",
+                    );
+                }
             }
             "json" if next_is_bang && held_output && !shown_file => {
                 find(line, "json!", "a JSON value built outside the writer");
@@ -2157,37 +2152,28 @@ fn check_source(
             {
                 find(line, word, "a JSON value built outside the writer");
             }
-            "CallToolResult" if punct(tokens.get(index + 1), ':') && held_output => {
+            // A tool result made by its constructors or as a literal; a function's return type
+            // before its body is neither.
+            "CallToolResult"
+                if (punct(tokens.get(index + 1), ':')
+                    || (punct(tokens.get(index + 1), '{') && !returned_type(tokens, index)))
+                    && held_output =>
+            {
                 find(line, word, "a tool result made outside the writer");
             }
-            // A raw handle named anywhere but in a function that owns it: a call, a function value
-            // or an import, placed through the file's imports. A call this reading cannot place
-            // could be one; a name it cannot place that is not called is a local's.
-            "protocol_stream" | "terminal" if !after_dot && held_output => {
-                let called = punct(tokens.get(index + 1), '(');
-                let path = source.resolve(
-                    &path_ending_at(tokens, index),
-                    source.scope_at(index),
-                    aliases,
-                );
-                let handle = match path.as_deref() {
-                    Some(path) => RAW_HANDLES.contains(&path).then_some(path),
-                    None => called.then_some(word.as_str()),
-                };
-                if let Some(handle) = handle {
-                    let function = enclosing_function(tokens, index);
-                    let owned = HANDLE_OWNERS.iter().any(|(file, owner, owned)| {
-                        *file == source.name
-                            && function.as_deref() == Some(*owner)
-                            && *owned == handle
-                    });
-                    if !owned {
-                        find(
-                            line,
-                            handle,
-                            "a raw handle on standard output outside the functions that own it",
-                        );
-                    }
+            // A raw handle, by the name only it goes by, wherever it is written but in a function
+            // that owns it: a call, a function value or an import.
+            "protocol_stream" | "attached_terminal" if !after_dot && held_output => {
+                let function = enclosing_function(tokens, index);
+                let owned = HANDLE_OWNERS.iter().any(|(file, owner, handle)| {
+                    *file == source.name && function.as_deref() == Some(*owner) && handle == word
+                });
+                if !owned {
+                    find(
+                        line,
+                        word,
+                        "a raw handle on standard output outside the functions that own it",
+                    );
                 }
             }
             "assert_eq" | "assert_ne" | "debug_assert_eq" | "debug_assert_ne"
@@ -3105,7 +3091,7 @@ fn each_break_of_the_rule_is_named_with_its_class_and_place() {
         ),
         (
             "a command writing text through a raw handle",
-            "fn f(text: &str) {\n    use std::io::Write as _;\n    let _ = crate::output::terminal().write_all(text.as_bytes());\n}\n",
+            "fn f(text: &str) {\n    use std::io::Write as _;\n    let _ = crate::output::attached_terminal().write_all(text.as_bytes());\n}\n",
             3,
             "a raw handle on standard output",
         ),
@@ -3123,13 +3109,13 @@ fn each_break_of_the_rule_is_named_with_its_class_and_place() {
         ),
         (
             "a raw handle taken as a function value",
-            "fn f(text: &str) {\n    use std::io::Write as _;\n    let open = crate::output::terminal;\n    let _ = open().write_all(text.as_bytes());\n}\n",
+            "fn f(text: &str) {\n    use std::io::Write as _;\n    let open = crate::output::attached_terminal;\n    let _ = open().write_all(text.as_bytes());\n}\n",
             3,
             "a raw handle on standard output",
         ),
         (
             "a raw handle imported",
-            "use crate::output::terminal;\nfn f() -> bool {\n    true\n}\n",
+            "use crate::output::attached_terminal;\nfn f() -> bool {\n    true\n}\n",
             1,
             "a raw handle on standard output",
         ),
@@ -3137,43 +3123,67 @@ fn each_break_of_the_rule_is_named_with_its_class_and_place() {
             "a JSON object given and filled with text",
             "fn f(document: &mut serde_json::Map<String, serde_json::Value>, text: &str) {\n    document.insert(\"field\".to_owned(), text.into());\n}\n",
             1,
-            "a JSON value named outside the writer",
+            "serde_json named outside the writer",
         ),
         (
             "a JSON value converted from text",
             "fn f(text: String) -> serde_json::Value {\n    text.into()\n}\n",
             1,
-            "a JSON value named outside the writer",
+            "serde_json named outside the writer",
         ),
         (
             "a JSON value's type imported",
             "use serde_json::Value;\nfn f(text: String) -> Value {\n    text.into()\n}\n",
             1,
-            "a JSON value named outside the writer",
+            "serde_json named outside the writer",
         ),
         (
             "a JSON value named from the crates' root",
             "fn make(text: String) -> ::serde_json::Value {\n    text.into()\n}\n",
             1,
-            "a JSON value named outside the writer",
+            "serde_json named outside the writer",
         ),
         (
             "a glob of serde_json",
             "use serde_json::*;\nfn make(text: String) -> Value {\n    text.into()\n}\n",
             1,
-            "a glob of the writer or of serde_json",
+            "serde_json named outside the writer",
         ),
         (
             "a glob of the writer",
-            "use crate::output::*;\nfn f(text: &str) {\n    use std::io::Write as _;\n    let open = terminal;\n    let _ = open().write_all(text.as_bytes());\n}\n",
+            "use crate::output::*;\nfn f() -> bool {\n    is_terminal()\n}\n",
             1,
-            "a glob of the writer or of serde_json",
+            "a glob of the writer",
+        ),
+        (
+            "a raw handle through a glob of an imported module",
+            "use crate::output;\nuse self::output::*;\nfn f(text: &str) {\n    use std::io::Write as _;\n    let open = attached_terminal;\n    let _ = open().write_all(text.as_bytes());\n}\n",
+            5,
+            "a raw handle on standard output",
+        ),
+        (
+            "a JSON value named from the crates' root after a match arm",
+            "fn f(text: String) {\n    let mut value = match () {\n        () => ::serde_json::Value::Null,\n    };\n    value[\"field\"] = text.into();\n}\n",
+            3,
+            "serde_json named outside the writer",
+        ),
+        (
+            "standard output taken as a function value",
+            "fn f(text: &str) {\n    use std::io::Write as _;\n    let open = std::io::stdout;\n    let _ = open().write_all(text.as_bytes());\n}\n",
+            3,
+            "standard output opened outside the writer",
+        ),
+        (
+            "a tool result written as a literal",
+            "fn f() -> rmcp::model::CallToolResult {\n    rmcp::model::CallToolResult {\n        content: Vec::new(),\n        structured_content: None,\n        is_error: None,\n        meta: None,\n    }\n}\n",
+            2,
+            "a tool result made outside the writer",
         ),
         (
             "a JSON value read back",
             "fn f(value: &kr_protocol::scalars::Uuid) {\n    let _ = serde_json::from_value::<kr_protocol::scalars::Uuid>(serde_json::Value::Null);\n    let _ = value;\n}\n",
             2,
-            "a JSON value named outside the writer",
+            "serde_json named outside the writer",
         ),
     ];
     for (position, (class, text, line, what)) in cases.iter().enumerate() {
@@ -3274,14 +3284,16 @@ fn the_writer_and_the_owners_of_standard_output_are_not_named() {
                  let terminal = crate::output::is_terminal();\n    terminal\n}\n\
                  fn g(record: &kr_protocol::scalars::Uuid) -> Option<kr_protocol::scalars::Uuid> {\n    \
                  let bytes = serde_json::to_vec_pretty(record).ok()?;\n    \
-                 serde_json::from_slice(&bytes).ok()\n}\n",
+                 serde_json::from_slice(&bytes).ok()\n}\n\
+                 fn h(status: std::process::ExitStatus) -> std::process::Output {\n    \
+                 std::process::Output { status, stdout: Vec::new(), stderr: Vec::new() }\n}\n",
             ),
             (
                 "bin/kr-attach-guard.rs",
-                "fn restore() -> bool {\n    let terminal = kr_cli::output::terminal();\n    \
+                "fn restore() -> bool {\n    let terminal = kr_cli::output::attached_terminal();\n    \
                  let _ = terminal.lock();\n    true\n}\n\
                  fn give_back_the_keyboard() -> bool {\n    \
-                 let mut handle = kr_cli::output::terminal();\n    \
+                 let mut handle = kr_cli::output::attached_terminal();\n    \
                  use std::io::Write as _;\n    handle.flush().is_ok()\n}\n",
             ),
         ],
