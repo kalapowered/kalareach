@@ -45,7 +45,7 @@ fn a_create_request_recorded_by_an_earlier_build_is_read_with_the_defaults() {
 
     let environment_id =
         kr_protocol::ids::EnvironmentId::new(kr_protocol::scalars::Uuid::from_bytes([3; 16]));
-    let legacy = super::RecordedCreate {
+    let legacy = super::create::RecordedCreate {
         environment_id,
         presentation: Presentation::Terminal,
         shell: Nullable::some("zsh".to_owned()),
@@ -57,7 +57,8 @@ fn a_create_request_recorded_by_an_earlier_build_is_read_with_the_defaults() {
         palette: Nullable::null(),
     };
     let recorded = kr_cbor::to_canonical_vec(&legacy).expect("encodes");
-    let read = super::recorded_create(&recorded).expect("an earlier build's record still reads");
+    let read =
+        super::create::recorded_create(&recorded).expect("an earlier build's record still reads");
     assert_eq!(
         read.worker_profile,
         kr_protocol::identity::WorkerProfile::DesktopBound,
@@ -69,8 +70,8 @@ fn a_create_request_recorded_by_an_earlier_build_is_read_with_the_defaults() {
 
     // This build's own shape reads as itself, and a record that is neither is refused.
     let current = kr_cbor::to_canonical_vec(&create_params(environment_id)).expect("encodes");
-    assert!(super::recorded_create(&current).is_ok());
-    assert!(super::recorded_create(b"not a record").is_err());
+    assert!(super::create::recorded_create(&current).is_ok());
+    assert!(super::create::recorded_create(b"not a record").is_err());
 }
 
 fn create_params(environment_id: kr_protocol::ids::EnvironmentId) -> SessionCreateParams {

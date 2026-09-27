@@ -1,0 +1,414 @@
+//! The creates and claims an earlier daemon left unresolved, and the workers it left running.
+
+use kr_ipc::client::LocalClient;
+use kr_ipc::paths::Endpoint;
+use kr_protocol::identity::WorkerProfile;
+use kr_protocol::ids::{SessionEpoch, SessionId};
+use kr_protocol::local::LocalClientKind;
+use kr_protocol::session::{ClosureReason, SessionState, SessionSummary};
+use kr_protocol::worker::{ReservationId, WorkerDescriptor};
+
+use crate::directory::KnownWorker;
+use crate::error::{ControllerError, Result};
+use crate::registry::{LaunchPhase, WorkerRecord};
+
+use super::Controller;
+
+/// One reservation, held by whichever of a look and a publication took it.
+///
+/// Giving it back wakes everybody who is waiting, and each of them looks for the one reservation it
+/// came for: whoever was waiting for this one takes it, and the rest wait again.
+pub(super) struct ReservationHold<'a> {
+    controller: &'a Controller,
+    reservation_id: ReservationId,
+}
+
+impl Drop for ReservationHold<'_> {
+    fn drop(&mut self) {
+        self.controller
+            .recovering
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.reservation_id);
+        self.controller.recovered.notify_waiters();
+    }
+}
+
+impl Controller {
+    /// Resolves every create that a previous daemon did not finish.
+    ///
+    /// The rule is the one section 24 asks for: a launch that is confirmed not to have started is
+    /// resolved and stops occupying the environment; a launch that may have started is preserved,
+    /// never respawned, and keeps its slot until something confirms what happened to it.
+    pub(super) async fn recover_reservations(&self) -> Result<()> {
+        let unresolved = {
+            let registry = self.registry.lock().await;
+            let mut rows = registry.reservations_in(LaunchPhase::Reserved)?;
+            rows.extend(registry.reservations_in(LaunchPhase::Spawned)?);
+            rows.extend(registry.reservations_in(LaunchPhase::Claimed)?);
+            rows
+        };
+        for reservation in unresolved {
+            match reservation.phase {
+                // Nothing was ever handed to the service manager: the phase moves to `spawned`
+                // before the call and this one never got there.
+                LaunchPhase::Reserved => {
+                    let mut registry = self.registry.lock().await;
+                    registry.set_phase(reservation.reservation_id, LaunchPhase::Failed)?;
+                }
+                // Spawned and never claimed. A worker starts its shell only after the rendezvous
+                // hands it a launch specification, and that never happened, so an ended process
+                // means nothing came of this launch. A process still running, or one the kernel
+                // will not describe, keeps its slot.
+                LaunchPhase::Spawned => match reservation.launcher_identity.as_ref() {
+                    Some(identity) => {
+                        if matches!(
+                            kr_ipc::identity::process_state(identity),
+                            kr_ipc::identity::ProcessState::Ended
+                        ) {
+                            let mut registry = self.registry.lock().await;
+                            registry.set_phase(reservation.reservation_id, LaunchPhase::Failed)?;
+                        }
+                    }
+                    // Spawned with no launcher recorded: the daemon died between handing the launch
+                    // to the service manager and writing down what it returned. A process may be
+                    // running, but it cannot have started a shell: a worker starts one only after
+                    // the rendezvous hands it a launch specification, and this reservation's claim
+                    // was never consumed. Resolving it as failed both frees the slot and fences it,
+                    // because a claim is admitted only against a reservation that is still spawned.
+                    None => {
+                        let mut registry = self.registry.lock().await;
+                        registry.set_phase(reservation.reservation_id, LaunchPhase::Failed)?;
+                    }
+                },
+                // Claimed. This worker received its launch specification, so it may have started a
+                // shell. It is recovered by challenge where it still answers, and recorded as an
+                // abnormal closure where its process is confirmed gone; a claim is never resolved
+                // as though nothing had run.
+                LaunchPhase::Claimed => self.recover_claim(&reservation).await?,
+                _ => {}
+            }
+        }
+        self.recover_workers().await?;
+        Ok(())
+    }
+
+    /// Recovers a worker whose claim was consumed but whose session never reached the directory.
+    async fn recover_claim(&self, reservation: &crate::registry::Reservation) -> Result<()> {
+        let endpoint = self.paths.worker_endpoint(reservation.display_number)?;
+        if let Some(key) = reservation.claimed_key
+            && let Ok((proof, described)) = self
+                .challenge(&endpoint, &key, reservation.session_id)
+                .await
+        {
+            // The worker is alive and is the one this reservation admitted. Its descriptor and its
+            // registry row are rebuilt from its own signed answer.
+            self.adopt(
+                reservation.display_number,
+                &key,
+                &proof,
+                &endpoint,
+                described,
+            )
+            .await?;
+            let mut registry = self.registry.lock().await;
+            registry.resolve_claim(reservation.reservation_id, LaunchPhase::Live)?;
+            return Ok(());
+        }
+        let ended = reservation
+            .launcher_identity
+            .as_ref()
+            .is_some_and(|identity| {
+                matches!(
+                    kr_ipc::identity::process_state(identity),
+                    kr_ipc::identity::ProcessState::Ended
+                )
+            });
+        if ended {
+            // The worker that held this claim is gone. It may have started a shell, so this is
+            // recorded as a session that ended abnormally rather than as a launch that never
+            // happened, and the coverage says the host did not watch it end.
+            let identity = reservation
+                .launcher_identity
+                .clone()
+                .expect("the identity was just read");
+            self.record_final(
+                reservation.session_id,
+                ClosureReason::WorkerCrash,
+                &identity,
+                &crate::archive::ArchiveService::nothing_fenced(reservation.session_id),
+                true,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Looks again for a worker whose claim this daemon has not resolved.
+    ///
+    /// A daemon that restarts while a managed session is still qualifying is refused its own
+    /// startup challenge, because a worker whose root integration has never qualified proves
+    /// nothing for the session it is still making. That worker qualifies a moment later, and
+    /// nothing would look again until the next restart. So every request that goes looking for a
+    /// session looks here too: a reservation still recorded as claimed is a live process this
+    /// daemon has not adopted yet.
+    ///
+    /// A claim whose worker is gone is resolved the same way it is at startup, and one whose worker
+    /// is alive and still unqualified is simply left for the next look.
+    pub(super) async fn recover_claims(&self) -> Result<()> {
+        let claimed = {
+            let registry = self.registry.lock().await;
+            registry.reservations_in(LaunchPhase::Claimed)?
+        };
+        for reservation in claimed {
+            // One session's failure is not another's, and a list asks about every session. A
+            // reservation that cannot be recovered now is left claimed for the next look.
+            let _ = self.recover_unresolved(reservation.reservation_id).await;
+        }
+        Ok(())
+    }
+
+    /// Looks again for one session's own unresolved claim, and says what went wrong.
+    ///
+    /// The same look as [`Self::recover_claims`], for a caller that asked about one session and is
+    /// owed the reason rather than a session that is simply not there.
+    pub(super) async fn recover_claim_for(
+        &self,
+        session_id: kr_protocol::ids::SessionId,
+    ) -> Result<()> {
+        let reservation = {
+            let registry = self.registry.lock().await;
+            registry.reservation_for_session(session_id)?
+        };
+        let Some(reservation) = reservation else {
+            return Ok(());
+        };
+        self.recover_unresolved(reservation.reservation_id).await
+    }
+
+    /// Recovers one claim, after asking again whether it is still this daemon's to recover.
+    ///
+    /// The reservation is read here rather than trusted from whatever the caller saw, because a
+    /// challenge takes time and the answer can be stale by the time its turn comes: a create that
+    /// finished during an earlier challenge in the same scan has already resolved its own claim and
+    /// published its worker, and challenging that worker again would present a second generation
+    /// token and fence the connection this daemon is already using.
+    ///
+    /// Three things say it is not this daemon's to recover: a reservation that is no longer
+    /// claimed, a create this daemon is still running, and a worker already in the directory.
+    async fn recover_unresolved(&self, reservation_id: ReservationId) -> Result<()> {
+        let _held = self.hold_reservation(reservation_id).await;
+        let reservation = {
+            let registry = self.registry.lock().await;
+            registry.reservation(reservation_id)?
+        };
+        let Some(reservation) = reservation else {
+            return Ok(());
+        };
+        if reservation.phase != LaunchPhase::Claimed
+            || self.pending.lock().await.contains_key(&reservation_id)
+            || self
+                .directory
+                .lock()
+                .await
+                .get(reservation.session_id)
+                .is_some()
+        {
+            return Ok(());
+        }
+        self.recover_claim(&reservation).await
+    }
+
+    /// Takes one reservation from whatever else would look at it, and gives it back on drop.
+    ///
+    /// Only that reservation: a caller waiting here is waiting for one worker's own turn, never for
+    /// a scan of somebody else's.
+    pub(super) async fn hold_reservation(
+        &self,
+        reservation_id: ReservationId,
+    ) -> ReservationHold<'_> {
+        loop {
+            // Created before the set is read, so a reservation given back between the two is not
+            // missed: a wake from that moment on is already counted for this waiter, and the wait
+            // below ends at once rather than sleeping through it.
+            let given_back = self.recovered.notified();
+            {
+                let mut held = self
+                    .recovering
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if held.insert(reservation_id) {
+                    return ReservationHold {
+                        controller: self,
+                        reservation_id,
+                    };
+                }
+            }
+            given_back.await;
+        }
+    }
+
+    /// Restores the directory entry of every worker the registry records.
+    ///
+    /// A daemon that crashed between recording a worker and publishing its descriptor left a row
+    /// with nothing on disk pointing at it. The row carries the key and the endpoint, which is
+    /// everything a challenge needs, and the worker's own answer carries everything a descriptor
+    /// needs.
+    pub(super) async fn recover_workers(&self) -> Result<()> {
+        let rows = {
+            let registry = self.registry.lock().await;
+            registry.workers()?
+        };
+        for row in rows {
+            if self.directory.lock().await.get(row.session_id).is_some() {
+                continue;
+            }
+            // A fenced reservation is one the host stopped trusting. Publishing its worker again
+            // because a descriptor happened to be missing would undo the fence through the back
+            // door, so recovery leaves it alone and it stays out of the directory.
+            let reservation = {
+                let registry = self.registry.lock().await;
+                registry.reservation_for_session(row.session_id)?
+            };
+            let Some(reservation) = reservation else {
+                continue;
+            };
+            if reservation.phase == LaunchPhase::Fenced {
+                continue;
+            }
+            // This row's own reservation, taken from whatever else would look at it. A challenge
+            // here presents a generation token too, and one presented while that worker's own
+            // report is being published fences the connection the daemon has just opened.
+            let _held = self.hold_reservation(reservation.reservation_id).await;
+            // The directory again, now that nothing else can be publishing into it: the report may
+            // have landed while this row was waiting its turn.
+            if self.directory.lock().await.get(row.session_id).is_some() {
+                continue;
+            }
+            let Ok(endpoint) = Endpoint::from_path(&row.endpoint) else {
+                continue;
+            };
+            match self
+                .challenge(&endpoint, &row.public_key, row.session_id)
+                .await
+            {
+                Ok((proof, described)) => {
+                    self.adopt(
+                        row.display_number,
+                        &row.public_key,
+                        &proof,
+                        &endpoint,
+                        described,
+                    )
+                    .await?;
+                }
+                // A worker that does not answer is not necessarily gone. Reconciliation asks the
+                // kernel; only a confirmed death produces a closure record.
+                Err(_) => {
+                    let _ = self.reconcile(row.session_id).await;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Challenges a worker against a key this daemon already holds, presents its generation, and
+    /// then asks the worker to describe its session ([`crate::directory::describe`]), which it may
+    /// not do.
+    async fn challenge(
+        &self,
+        endpoint: &Endpoint,
+        worker_public_key: &kr_protocol::scalars::AuthorisationKey,
+        session_id: SessionId,
+    ) -> Result<(
+        kr_protocol::worker::WorkerVerifyProof,
+        Option<SessionSummary>,
+    )> {
+        let identity = &self.identity;
+        let generation = self.generation;
+        let boot = self.boot_identity.clone();
+        let endpoint_text = endpoint.as_text();
+        let (proof, mut client) =
+            tokio::time::timeout(crate::directory::RECONNECT_TIMEOUT, async move {
+                let mut client = LocalClient::connect(
+                    endpoint,
+                    LocalClientKind::Controller,
+                    self.build_id.clone(),
+                )
+                .await?;
+                let proof = client
+                    .challenge_worker(
+                        worker_public_key,
+                        session_id,
+                        SessionEpoch::V1,
+                        &endpoint_text,
+                    )
+                    .await?;
+                client
+                    .present_generation(move |nonce| {
+                        identity
+                            .generation_token(generation, &boot, nonce)
+                            .map_err(kr_ipc::IpcError::from)
+                    })
+                    .await?;
+                Ok::<_, ControllerError>((proof, client))
+            })
+            .await
+            .map_err(|_| {
+                ControllerError::supervision("the worker did not answer its challenge in time")
+            })??;
+        let described = crate::directory::describe(&mut client, session_id).await;
+        Ok((proof, described))
+    }
+
+    /// Records a recovered worker and republishes its descriptor, and admits the worker with the
+    /// description of its session it gave after its challenge, where it gave one.
+    async fn adopt(
+        &self,
+        display_number: kr_protocol::session::DisplayNumber,
+        worker_public_key: &kr_protocol::scalars::AuthorisationKey,
+        proof: &kr_protocol::worker::WorkerVerifyProof,
+        endpoint: &Endpoint,
+        described: Option<SessionSummary>,
+    ) -> Result<()> {
+        let record = WorkerRecord {
+            session_id: proof.session_id,
+            display_number,
+            public_key: *worker_public_key,
+            process_identity: proof.process_start_identity.clone(),
+            endpoint: proof.endpoint.clone(),
+            profile: WorkerProfile::HeadlessUser,
+            state: SessionState::Live,
+            // A worker starts having acknowledged nothing. The first announcement it receives is
+            // what moves this.
+            acknowledged_revision: kr_protocol::ids::AuthorityRevision::new(0),
+        };
+        {
+            let mut registry = self.registry.lock().await;
+            registry.adopt_worker(&record)?;
+        }
+        let descriptor = WorkerDescriptor {
+            session_id: proof.session_id,
+            session_epoch: proof.session_epoch,
+            environment_id: self.paths.environment_id(),
+            display_number,
+            boot_identity: proof.boot_identity.clone(),
+            process_start_identity: proof.process_start_identity.clone(),
+            protocol_version: proof.protocol_version,
+            endpoint: proof.endpoint.clone(),
+            worker_public_key: *worker_public_key,
+            worker_profile: WorkerProfile::HeadlessUser,
+            published_at_ms: kr_ipc::now_ms(),
+        };
+        kr_ipc::descriptor::publish(&self.paths, &descriptor)?;
+        self.add_worker(
+            KnownWorker {
+                descriptor,
+                endpoint: endpoint.clone(),
+            },
+            described,
+        )
+        .await;
+        Ok(())
+    }
+}
