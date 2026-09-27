@@ -1332,12 +1332,13 @@ test.describe("the phone's room for its terminal", () => {
           )
           expect(past).toEqual([])
           // A keyboard over the page, as a phone's browser measures it: the bar yields, and the
-          // field sits on the keyboard's top edge with the terminal keys above it.
+          // field sits on the keyboard's top edge with the terminal keys above it. In control mode
+          // the field is the program's keyboard, in the draft field's place and size.
           await keyboard(page, phone.keyboard)
           await expect(page.locator('.m-terminal-hud')).toBeHidden()
           await expectRoom(page, phone.typing, 'with the keyboard up')
           const edge = phone.height - phone.keyboard
-          const field = page.getByLabel('Message this session')
+          const field = page.getByLabel(mode === 'control' ? 'Type to the program' : 'Message this session')
           await expect(field).toBeInViewport({ ratio: 1 })
           const box = await field.boundingBox()
           expect(Math.abs((box === null ? 0 : box.y + box.height) - edge)).toBeLessThanOrEqual(1)
@@ -1365,7 +1366,8 @@ test.describe("the phone's room for its terminal", () => {
           await page.setViewportSize({ width: phone.width, height: phone.height - phone.keyboard })
           await expectRoom(page, FLOOR, 'on a page the keyboard made shorter')
           // Whole to the pixel: WebKit can leave a scrolled box's last fraction of a pixel out.
-          expect(await hiddenPart(page.getByLabel('Message this session'))).toBeLessThanOrEqual(1)
+          const field = page.getByLabel(mode === 'control' ? 'Type to the program' : 'Message this session')
+          expect(await hiddenPart(field)).toBeLessThanOrEqual(1)
         })
       }
     }
