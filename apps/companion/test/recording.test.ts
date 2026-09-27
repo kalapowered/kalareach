@@ -21,6 +21,7 @@ import {
   screenText
 } from '../src/model/recording'
 import { copiedText, placedPieces } from '../src/terminal/frame'
+import drawn from './fixtures/drawn-screens.json'
 
 const SESSION_MAIN = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
 
@@ -224,6 +225,43 @@ describe('a screen as a recording draws it (KR-REQ-25.08)', () => {
     const played = play(text, 12, 1)
     expect(played.lines[0]).toBe('a\u{FFFD}]52;c;x\u{FFFD}b')
     expect(text).not.toContain('\u0007')
+  })
+
+  it('writes each screen exactly as the export is checked to keep it', () => {
+    // The native export keeps what the view draws with, byte for byte, and removes every other
+    // sequence. Between them these two screens use every sequence the view draws with, and the
+    // export's own tests replay the same text, so a sequence the view starts to write is one the
+    // export has to be taught to keep.
+    const prompt: CellRendition = { ...PLAIN, bold: true, foreground: { indexed: 2 } }
+    const styled: CellRendition = {
+      ...PLAIN,
+      faint: true,
+      italic: true,
+      underline: 'double',
+      underline_colour: { indexed: 1 },
+      background: { direct: { red: 10, green: 20, blue: 30 } }
+    }
+    const marked: CellRendition = {
+      ...PLAIN,
+      reverse: true,
+      invisible: true,
+      strikethrough: true,
+      overline: true,
+      underline: 'single'
+    }
+    const shown = screenOf(
+      12,
+      2,
+      [[piece(0, '$ ls', 4, prompt), piece(5, 'é界', 3, styled)], [piece(0, 'x', 1, marked)]],
+      { line: 1, column: 2, style: 1, visible: true }
+    )
+    const hidden = screenOf(4, 1, [[piece(0, 'ok')]])
+    const shownText = drawn.screens['colours, attributes and wide text, with the cursor shown']
+    const hiddenText = drawn.screens['a plain line, with the cursor hidden']
+    expect(screenText(shown)).toBe(shownText)
+    expect(screenText(hidden)).toBe(hiddenText)
+    expect(play(shownText, 12, 2).cursor).toEqual({ line: 1, column: 2 })
+    expect(play(hiddenText, 4, 1).cursor).toBeNull()
   })
 
   it('draws only the pieces the view places: none past the right edge, none inside another', () => {

@@ -1433,13 +1433,13 @@ pub async fn export_asciicast(
     })
 }
 
-/// One recorded slice of terminal output, as the page hands it over.
+/// One screen the raw terminal view drew, as the page hands it over.
 #[derive(Clone, Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RecordedFrame {
     /// Milliseconds since the recording began.
     pub at_ms: u64,
-    /// The bytes, as text.
+    /// The screen, as the drawing a player repeats.
     pub text: String,
 }
 

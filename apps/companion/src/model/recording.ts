@@ -192,6 +192,10 @@ const CSI = '\u001b['
  * is drawn, line wrapping is off while a screen is drawn, and the cells after each box are cleared
  * in the session's background before the next piece is drawn over them, so nothing spills past the
  * cells the view gave it. Line wrapping is back on at the end.
+ *
+ * The export keeps the sequences written here and removes every other, so a sequence added here is
+ * one the export has to be taught to keep. The recording tests and the export's own tests hold the
+ * two to the same screens.
  */
 export function screenText(screen: TerminalScreen): string {
   const palette = screen.palette
