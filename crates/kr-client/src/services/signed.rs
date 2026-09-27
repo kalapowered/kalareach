@@ -2153,14 +2153,27 @@ mod tests {
     }
 
     /// KR-REQ-23.57: a request that is not safe to repeat is never sent again, whatever the service
-    /// asked: an authority-feed change, which sent again could undo a later one; a settings-sync
-    /// exchange that names no request identity, which no receipt can settle; and a deletion.
+    /// asked: each of the authority feed's six changes, any of which sent again could undo a later
+    /// one; a settings-sync exchange that names no request identity, which no receipt can settle;
+    /// and a deletion.
     #[tokio::test(start_paused = true)]
     async fn kr_req_23_57_a_request_not_safe_to_repeat_is_never_sent_again() {
         for (method, body) in [
             (
                 Method::AuthoritySync,
                 serde_json::json!({ "publish": { "request": {} } }),
+            ),
+            (
+                Method::AuthoritySync,
+                serde_json::json!({ "revise": { "revision": {} } }),
+            ),
+            (
+                Method::AuthoritySync,
+                serde_json::json!({ "acknowledge": { "acknowledgement": {} } }),
+            ),
+            (
+                Method::AuthoritySync,
+                serde_json::json!({ "reject": { "request_id": "a request", "reason": "no_owner_authority" } }),
             ),
             (
                 Method::AuthoritySync,
