@@ -706,6 +706,13 @@ impl DescriptionService {
         self.mapping.mapped_environments()
     }
 
+    /// Returns the resident set past which the description process is ended, in bytes: section
+    /// 22's ceiling, or an owner's stricter one.
+    #[must_use]
+    pub const fn ceiling_bytes(&self) -> u64 {
+        self.policy.budgets().process_memory_ceiling_bytes
+    }
+
     /// Returns the next load's earliest time after a failure, when one is waiting.
     #[must_use]
     pub const fn restart_not_before_ms(&self) -> Option<u64> {
@@ -1095,6 +1102,20 @@ impl DescriptionService {
                     .then(|| now.monotonic_ms().saturating_add(PAUSE_RECHECK_MS)),
             });
         }
+        // A process that passed its ceiling leaves inference paused until the next load may
+        // happen, whether or not work is waiting.
+        if let Some(reason) = self.restart.pause {
+            if now.monotonic_ms() < self.restart.not_before_ms {
+                self.state = ResourceState::ResourcePaused {
+                    reason,
+                    unloaded: true,
+                };
+                return Ok(Instruction::Wait {
+                    until_ms: Some(self.restart.not_before_ms),
+                });
+            }
+            self.restart.pause = None;
+        }
         if !resident {
             return Ok(self.load_when_due(profile, now));
         }
@@ -1249,12 +1270,6 @@ impl DescriptionService {
             };
         }
         if self.restart.failures > 0 && now.monotonic_ms() < self.restart.not_before_ms {
-            if let Some(reason) = self.restart.pause {
-                self.state = ResourceState::ResourcePaused {
-                    reason,
-                    unloaded: true,
-                };
-            }
             return Instruction::Wait {
                 until_ms: Some(self.restart.not_before_ms),
             };
@@ -1450,9 +1465,10 @@ impl DescriptionService {
             dispatched.queue_wait_ms,
             execution_ms,
         );
-        // A job that was being stopped for a pause or a replaced profile is still wanted, and its
-        // token is cancelled, so what it produced is not published: it goes back in the queue.
-        if dispatched.stopping.is_some_and(Stop::requeues) {
+        // A job that was being stopped for a pause is still wanted, and its token is cancelled, so
+        // what it produced is not published: it goes back in the queue. So does a job whose
+        // answer arrives after descriptions were turned off, which publish nothing new.
+        if dispatched.stopping.is_some_and(Stop::requeues) || !self.settings.enabled {
             return Ok(self.requeue(dispatched, false));
         }
         let outcome = self.publish(&dispatched, &bytes, execution_ms, now)?;

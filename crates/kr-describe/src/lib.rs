@@ -21,6 +21,7 @@
 //! | [`priority`] | Background CPU and IO priority, through the mechanism each platform qualifies |
 //! | [`queue`] | One latest job per session, aging, fairness and the cadence |
 //! | [`metrics`] | Queue-wait and execution latency, published separately, beside whole-product figures |
+//! | [`supervise`] | The daemon's side of the description process: starting it, its timers, ending it |
 //! | [`store`] | Names, pins and generated-description provenance, which outlive the session |
 //! | [`privacy`] | Privacy mode's four calls over this crate's own stores |
 //! | [`serve`] | The description process's side: its control and model threads, its watchdog and its lock |
@@ -93,6 +94,7 @@ pub mod resource;
 pub mod serve;
 pub mod service;
 pub mod store;
+pub mod supervise;
 #[cfg(feature = "testing")]
 pub mod testing;
 pub mod time;

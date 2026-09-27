@@ -436,6 +436,9 @@ pub fn stub_build() -> String {
 #[must_use]
 pub fn stub_main() -> i32 {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
+    if arguments.first().map(String::as_str) == Some("--daemon") {
+        return run_daemon(&arguments);
+    }
     let script = match Script::parse(&std::env::var(SCRIPT_VARIABLE).unwrap_or_default()) {
         Ok(script) => script,
         Err(error) => {
@@ -465,6 +468,110 @@ pub fn stub_main() -> i32 {
     let input = Wedging::reading(std::io::stdin(), script.wedge_input_after);
     let output = Wedging::writing(std::io::stdout(), script.wedge_output_from);
     crate::serve::run(options, StubModel::new(script), input, output).code()
+}
+
+/// Runs a stub daemon, which a test ends to see its description process go with it.
+///
+/// It drives the description service over a child of its own - this executable, serving a job that
+/// runs until it is cancelled - until that job is in the child, prints the child's start identity
+/// on its own output as one line, and then waits to be ended.
+fn run_daemon(arguments: &[String]) -> i32 {
+    use crate::context::{ContextBinding, ContextSignal};
+    use crate::environment::{EnvironmentKind, ExecutionEnvironment, build_target};
+    use crate::profile::catalogue::MetGates;
+    use crate::queue::Priority;
+    use crate::resource::{HostConditions, PowerSource, ResourceSettings, ThermalState};
+    use crate::service::{DescriptionService, HostPlacement};
+    use crate::store::DescriptionStore;
+    use crate::supervise::{Driver, Launch};
+    use crate::time::Reading;
+    use kr_protocol::ids::{EnvironmentId, SessionEpoch, SessionId};
+    use kr_protocol::scalars::Uuid;
+
+    let (Some(runtime_dir), Ok(program), Ok(catalogue), Ok(store)) = (
+        flag(arguments, "--runtime-dir").map(PathBuf::from),
+        std::env::current_exe(),
+        Catalogue::builtin(),
+        DescriptionStore::in_memory(),
+    ) else {
+        eprintln!("usage: kr-describe-stub --daemon --runtime-dir <directory>");
+        return 64;
+    };
+    let child = Script {
+        generate_until_cancelled: true,
+        ..Script::default()
+    };
+    let launch = Launch {
+        program,
+        arguments: vec!["--runtime-dir".into(), runtime_dir.clone().into()],
+        working_directory: runtime_dir.clone(),
+        environment: vec![(SCRIPT_VARIABLE.into(), child.to_env().into())],
+        models: runtime_dir,
+    };
+    let service = DescriptionService::new(
+        HostPlacement {
+            environment: ExecutionEnvironment::new(
+                EnvironmentId::new(Uuid::from_bytes([7; 16])),
+                EnvironmentKind::Native,
+            ),
+            data_access: None,
+            target: build_target().to_owned(),
+        },
+        catalogue,
+        MetGates::default(),
+        ResourceSettings::default(),
+        store,
+    );
+    let mut driver = Driver::new(service, launch, stub_build());
+    let session_id = SessionId::new(Uuid::from_bytes([1; 16]));
+    let service = driver.service_mut();
+    service.session_opened(
+        session_id,
+        SessionEpoch::V1,
+        ContextBinding::new("stub-daemon"),
+    );
+    service.observe(
+        &session_id,
+        ContextSignal::WorkingDirectory {
+            directory: "kalareach".to_owned(),
+            repository: None,
+        },
+        Reading::new(0, 0),
+    );
+    service.settle(&session_id, Priority::Ordinary, Reading::new(2_000, 2_000));
+    let conditions = HostConditions::measured(
+        16 << 30,
+        12 << 30,
+        PowerSource::Mains,
+        ThermalState::Nominal,
+    );
+    let until = Instant::now() + Duration::from_secs(20);
+    loop {
+        if driver
+            .turn(&conditions, Reading::new(3_000, 3_000))
+            .is_err()
+        {
+            return 70;
+        }
+        if driver.service().in_flight() == 1
+            && let Some(identity) = driver.identity()
+        {
+            let line = serde_json::to_string(identity).unwrap_or_default();
+            let mut output = std::io::stdout();
+            if writeln!(output, "{line}")
+                .and_then(|()| output.flush())
+                .is_err()
+            {
+                return 74;
+            }
+            stop_for_good();
+        }
+        if Instant::now() >= until {
+            eprintln!("kr-describe-stub: the job did not reach the child in time");
+            return 70;
+        }
+        driver.wait(Duration::from_millis(50));
+    }
 }
 
 /// Returns the value after a flag.

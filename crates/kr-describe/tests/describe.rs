@@ -46,7 +46,8 @@ use kr_worker::privacy::{
 };
 
 use support::{
-    MAC, at, binding, built_in, default_profile, environment_id, native, roomy, session,
+    MAC, a_pin_not_yet_committed, at, binding, built_in, default_profile, environment_id, native,
+    roomy, session,
 };
 
 /// A service over one environment, with settings a test chooses.
@@ -1161,24 +1162,6 @@ fn a_pinned_name_is_never_overwritten_by_generated_text() {
         .expect("a label");
     assert_eq!(label.source, LabelSource::Pinned);
     assert_eq!(label.title.as_str(), "Release prep");
-}
-
-/// Opens a second connection to a store on disk that holds a pin in a write transaction it has not
-/// committed, which is where a pin written by another connection is while a publication races it.
-fn a_pin_not_yet_committed(root: &std::path::Path, session_id: &SessionId) -> rusqlite::Connection {
-    let other = rusqlite::Connection::open(root.join("descriptions.sqlite3"))
-        .expect("a second connection to the same store");
-    other
-        .execute_batch("BEGIN IMMEDIATE")
-        .expect("the second connection takes the write lock");
-    other
-        .execute(
-            "INSERT INTO describe_pins (session_id, title, pinned_by, pinned_at_ms)
-             VALUES (?1, 'Release prep', 'local:501', 1700000000000)",
-            [session_id.to_string()],
-        )
-        .expect("a pin, not yet committed");
-    other
 }
 
 /// KR-REQ-22.19 and KR-REQ-24.14: a pin that another connection commits while a publication is

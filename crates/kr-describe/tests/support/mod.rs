@@ -62,3 +62,24 @@ pub fn roomy() -> HostConditions {
         ThermalState::Nominal,
     )
 }
+
+/// Opens a second connection to a store on disk that holds a pin in a write transaction it has not
+/// committed, which is where a pin written by another connection is while a publication races it.
+pub fn a_pin_not_yet_committed(
+    root: &std::path::Path,
+    session_id: &SessionId,
+) -> rusqlite::Connection {
+    let other = rusqlite::Connection::open(root.join("descriptions.sqlite3"))
+        .expect("a second connection to the same store");
+    other
+        .execute_batch("BEGIN IMMEDIATE")
+        .expect("the second connection takes the write lock");
+    other
+        .execute(
+            "INSERT INTO describe_pins (session_id, title, pinned_by, pinned_at_ms)
+             VALUES (?1, 'Release prep', 'local:501', 1700000000000)",
+            [session_id.to_string()],
+        )
+        .expect("a pin, not yet committed");
+    other
+}
