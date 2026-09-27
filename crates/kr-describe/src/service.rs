@@ -460,8 +460,8 @@ struct Dispatched {
     cancellation: Cancellation,
     stopping: Option<Stop>,
     requeued_before: bool,
-    /// Whether its session closed, or was opened again, while it ran: what it comes to then leaves
-    /// no mark on the session that is there now.
+    /// Whether its session closed, or was opened again, while it ran. Such a job is stopped,
+    /// publishes nothing, is never queued again, and leaves no mark on the session there now.
     outlived: bool,
 }
 
@@ -1303,7 +1303,7 @@ impl DescriptionService {
             let ran_at = dispatched.produced_under.context_revision;
             let stop = if cancelled {
                 Stop::Cancelled
-            } else if !self.live_sessions.contains(&session_id) {
+            } else if dispatched.outlived || !self.live_sessions.contains(&session_id) {
                 Stop::Closed
             } else if self.revision(&session_id) != Some(ran_at) {
                 Stop::Superseded
@@ -1639,6 +1639,11 @@ impl DescriptionService {
             Ok(description) => description,
             Err(rejection) => return Ok(rejected(&mut self.counts, rejection)),
         };
+        // A job that outlived the session it was admitted for describes a session that is gone,
+        // even when the session there now has the same epoch, binding and revision.
+        if dispatched.outlived {
+            return Ok(rejected(&mut self.counts, Rejection::SessionClosed));
+        }
         let gate = self.fence.publish_under_lock(
             &self.store,
             &session_id,
@@ -1821,7 +1826,11 @@ impl DescriptionService {
     /// back once: its session's next failure is not retried.
     fn requeue(&mut self, dispatched: Dispatched, after_failure: bool) -> Outcome {
         let session_id = dispatched.job.session_id;
-        if !self.live_sessions.contains(&session_id) || self.fence.is_fenced(&session_id) {
+        // A job whose session closed, or opened again, belongs to a session that is gone.
+        if dispatched.outlived
+            || !self.live_sessions.contains(&session_id)
+            || self.fence.is_fenced(&session_id)
+        {
             self.counts.cancelled = self.counts.cancelled.saturating_add(1);
             return Outcome::Cancelled { session_id };
         }

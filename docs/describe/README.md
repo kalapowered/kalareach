@@ -187,9 +187,11 @@ session's changes wait for it, and they settle as one revision the moment it end
 turn that never stops changing, then, at least every other job runs to its end rather than being
 refused for a change; what it publishes, when its output is valid and nothing else stops it, is at
 most one job behind the session, and the revision catches up as soon as it lands. Without that, a
-host whose jobs take longer than the debounce would refuse every job the turn produced. A job whose
-session closes, or opens again, before it ends leaves no such mark on the session that is there
-then.
+host whose jobs take longer than the debounce would refuse every job the turn produced.
+
+A job whose session closes, or opens again, before it ends describes a session that has gone. It is
+stopped, what it produced is refused, it is never queued again, and it leaves no mark on the
+session there now, whatever that session's epoch, binding and revision happen to be.
 
 The input is bounded directory and repository metadata plus recent authorised semantic events.
 Raw keystrokes, hidden input, environment values, file bodies and whole histories are excluded, and
@@ -309,9 +311,10 @@ The model stays loaded while there is work and sessions to justify it, and a hos
 at all unloads after fifteen minutes.
 
 A load is cancelled when its reason goes: descriptions turned off, a pause, or no work left for it.
-A job is cancelled when privacy mode fences its session, when its session closes, when a change to
-the session settles, when a pause arrives, or when a caller cancels it, and a job stopped for a
-pause keeps its place in the queue. A cancellation and a passed deadline publish nothing.
+A job is cancelled when privacy mode fences its session, when its session closes or opens again,
+when a change to the session settles, when a pause arrives, or when a caller cancels it, and a job
+stopped for a pause keeps its place in the queue. A cancellation and a passed deadline publish
+nothing.
 
 A process that exits, breaks the wire or is ended for breaking a bound takes the model with it and
 nothing else. The store, the pins, the provenance, every session and every deterministic title

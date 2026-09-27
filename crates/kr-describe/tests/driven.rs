@@ -1120,6 +1120,156 @@ fn a_superseded_job_that_outlives_its_session_leaves_no_mark() {
     }
 }
 
+/// A job that outlived its session publishes nothing and never comes back, however the session
+/// there now is identified. Its answer, arriving after the session closed and opened again under
+/// the same epoch and binding with a new directory already at revision 1, is refused; a crash after
+/// the session opened again under a new epoch ends it rather than queueing it, and the session
+/// there now is not protected by it; a job a pause stopped, whose session then closed or opened
+/// again, is not queued again. The controls are the same answer and the same crash with the session left alone,
+/// which publish and queue the job again.
+#[test]
+fn an_outlived_job_neither_publishes_nor_comes_back() {
+    // The answer, after the session closed and opened again.
+    for reopened in [true, false] {
+        let mut service = service();
+        queue(&mut service, &session(1), "kalareach", at(0));
+        let Instruction::Generate { id, request, .. } = loaded(&mut service, at(3_000)) else {
+            panic!("the job is sent");
+        };
+        if reopened {
+            service.session_closed(&session(1), at(3_100));
+            queue(&mut service, &session(1), "docs", at(3_200));
+            assert_eq!(service.revision(&session(1)), Some(ContextRevision::new(1)));
+        }
+        let outcome = service
+            .finished(id, produced(&request.prompt, 0), at(5_300))
+            .expect("the answer");
+        if reopened {
+            assert_eq!(
+                outcome,
+                Outcome::Rejected {
+                    session_id: session(1),
+                    rejection: Rejection::SessionClosed
+                }
+            );
+            assert!(
+                service
+                    .store()
+                    .generated(&session(1))
+                    .expect("a read")
+                    .is_none()
+            );
+        } else {
+            assert!(matches!(outcome, Outcome::Published { .. }), "{outcome:?}");
+        }
+    }
+
+    // A crash, after the session opened again under a new epoch.
+    for reopened in [true, false] {
+        let mut service = service();
+        queue(&mut service, &session(1), "kalareach", at(0));
+        assert!(matches!(
+            loaded(&mut service, at(3_000)),
+            Instruction::Generate { .. }
+        ));
+        if reopened {
+            service.session_opened(session(1), SessionEpoch::new(2), binding());
+        }
+        let ended = service
+            .process_ended(ProcessEnd::Exited, at(3_100))
+            .expect("the end");
+        if !reopened {
+            assert_eq!(
+                ended[0],
+                Outcome::Requeued {
+                    session_id: session(1)
+                }
+            );
+            continue;
+        }
+        assert_eq!(
+            ended[0],
+            Outcome::Cancelled {
+                session_id: session(1)
+            }
+        );
+        assert_eq!(
+            service.scheduler().queued(),
+            0,
+            "the old job is not queued again"
+        );
+        // The session there now: its first job is superseded by a change that settles under it.
+        change(&mut service, &session(1), "docs", at(3_200));
+        assert!(
+            service
+                .settle(&session(1), Priority::Ordinary, at(5_200))
+                .is_some()
+        );
+        // The identifier's cooldown still runs from the old job's dispatch.
+        let now = at(3_000 + Budgets::DEFAULTS.session_cooldown_ms);
+        let Instruction::Generate { id, .. } = loaded(&mut service, now) else {
+            panic!("the session's first job is sent");
+        };
+        change(&mut service, &session(1), "tests", now.after_ms(100));
+        assert!(
+            service
+                .settle(&session(1), Priority::Ordinary, now.after_ms(2_100))
+                .is_some(),
+            "nothing the old job went through protects this one"
+        );
+        assert_eq!(
+            service
+                .next(&roomy(), now.after_ms(2_100))
+                .expect("an instruction"),
+            Instruction::Cancel {
+                id,
+                work: Work::Job
+            }
+        );
+    }
+
+    // A pause, then the session closes, or opens again.
+    let hot = HostConditions::measured(
+        16 * GIB,
+        12 * GIB,
+        PowerSource::Mains,
+        ThermalState::Critical,
+    );
+    for closed in [true, false] {
+        let mut service = service();
+        queue(&mut service, &session(1), "kalareach", at(0));
+        let Instruction::Generate { id, .. } = loaded(&mut service, at(3_000)) else {
+            panic!("the job is sent");
+        };
+        assert!(matches!(
+            service.next(&hot, at(3_050)).expect("an instruction"),
+            Instruction::Cancel { .. }
+        ));
+        if closed {
+            service.session_closed(&session(1), at(3_060));
+        } else {
+            service.session_opened(session(1), SessionEpoch::new(2), binding());
+        }
+        assert_eq!(
+            service
+                .finished(
+                    id,
+                    Answered::Ended {
+                        why: JobEnd::Cancelled,
+                        detail: None,
+                    },
+                    at(3_100),
+                )
+                .expect("the answer"),
+            Outcome::Cancelled {
+                session_id: session(1)
+            },
+            "closed {closed}"
+        );
+        assert_eq!(service.scheduler().queued(), 0, "closed {closed}");
+    }
+}
+
 /// Builds a service over a store of the test's own.
 fn service_over(store: DescriptionStore) -> DescriptionService {
     DescriptionService::new(
