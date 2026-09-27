@@ -755,6 +755,17 @@ impl ContextTracker {
         if now.since_ms(since) < self.debounce_ms {
             return Settled::NotYet;
         }
+        self.settle_pending()
+    }
+
+    /// Advances the revision over every pending change now, whatever the debounce.
+    ///
+    /// It is for changes that have already waited longer than a debounce would have held them:
+    /// changes that waited for the job that follows a superseded one.
+    pub fn settle_pending(&mut self) -> Settled {
+        if self.pending == 0 {
+            return Settled::NotYet;
+        }
         let coalesced = self.pending;
         self.pending = 0;
         self.pending_since_ms = None;

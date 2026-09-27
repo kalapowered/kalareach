@@ -750,6 +750,103 @@ fn a_job_stays_running_until_its_description_is_in_the_store() {
     assert_eq!(service.in_flight(), 0);
 }
 
+/// KR-REQ-22.16: a long active turn still gets text. A session's intent changes every tenth of a
+/// second for four minutes, and each job takes five seconds, longer than the debounce. A job whose
+/// change settles under it is refused and cancelled, but the job after it runs to its end while the
+/// changes wait for it, so descriptions are published all through the turn, one for each job
+/// superseded. The control is the same session changing once, whose job is never superseded.
+#[test]
+fn a_long_active_turn_is_described_while_it_keeps_changing() {
+    let (published, superseded) = active_turn(5_000, true);
+    assert!(
+        published >= 3,
+        "{published} published and {superseded} superseded in four minutes"
+    );
+    assert!(
+        superseded >= 3,
+        "a job whose change settled under it is still refused: {superseded}"
+    );
+    assert!(
+        published.abs_diff(superseded) <= 1,
+        "the job after a superseded one publishes: {published} published, {superseded} superseded"
+    );
+
+    // The control: a session that changes once is described once, and nothing is superseded.
+    assert_eq!(active_turn(5_000, false), (1, 0));
+}
+
+/// Drives one session for four minutes, whose intent changes every 100 ms when `changing` and only
+/// at the start otherwise, with a process that answers each job `job_ms` after it is sent and a
+/// cancellation at once, and counts the jobs published and the jobs superseded.
+fn active_turn(job_ms: u64, changing: bool) -> (u32, u32) {
+    let mut service = service();
+    service.session_opened(session(1), SessionEpoch::V1, binding());
+    // The job in the process: its identifier, when it was sent, its prompt, and whether it was
+    // told to cancel.
+    let mut running: Option<(u64, u64, String, bool)> = None;
+    let (mut published, mut superseded) = (0, 0);
+    for step in 0..2_400_u64 {
+        let now = at(step * 100);
+        if changing || step == 0 {
+            service.observe(
+                &session(1),
+                ContextSignal::TaskIntent(format!("step {step} of the turn")),
+                now,
+            );
+        }
+        let _ = service.settle(&session(1), Priority::Foreground, now);
+        let answer = match &running {
+            Some((_, _, _, true)) => Some(Answered::Ended {
+                why: JobEnd::Cancelled,
+                detail: None,
+            }),
+            Some((_, sent_at, prompt, false)) if now.monotonic_ms() >= sent_at + job_ms => {
+                Some(produced(prompt, 0))
+            }
+            _ => None,
+        };
+        if let (Some(answer), Some((id, ..))) = (answer, running.clone()) {
+            running = None;
+            match service.finished(id, answer, now).expect("the answer") {
+                Outcome::Published { .. } => published += 1,
+                Outcome::Cancelled { .. }
+                | Outcome::Rejected {
+                    rejection: Rejection::ChangedContext { .. },
+                    ..
+                } => superseded += 1,
+                other => panic!("a job in the turn ended {other:?}"),
+            }
+        }
+        loop {
+            match service.next(&roomy(), now).expect("an instruction") {
+                Instruction::Load { id, .. } => {
+                    service
+                        .finished(
+                            id,
+                            Answered::Loaded {
+                                load_ms: 0,
+                                rss_bytes: 0,
+                            },
+                            now,
+                        )
+                        .expect("the load");
+                }
+                Instruction::Generate { id, request, .. } => {
+                    running = Some((id, now.monotonic_ms(), request.prompt, false));
+                }
+                Instruction::Cancel { id, .. } => {
+                    let job = running.as_mut().expect("the job being cancelled");
+                    assert_eq!(job.0, id);
+                    job.3 = true;
+                }
+                Instruction::Wait { .. } => break,
+                Instruction::Unload { why } => panic!("the model was unloaded: {why:?}"),
+            }
+        }
+    }
+    (published, superseded)
+}
+
 /// Builds a service over a store of the test's own.
 fn service_over(store: DescriptionStore) -> DescriptionService {
     DescriptionService::new(

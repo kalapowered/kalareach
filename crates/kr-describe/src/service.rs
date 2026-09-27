@@ -523,6 +523,10 @@ pub struct DescriptionService {
     counts: JobCounts,
     /// Sessions whose job failed once and is queued again: a second failure is not retried.
     retried: BTreeSet<SessionId>,
+    /// Sessions whose last job was superseded: the next one runs to its end.
+    superseded: BTreeSet<SessionId>,
+    /// Sessions whose changes are waiting for that next job to end, with the priority last given.
+    waiting: BTreeMap<SessionId, Priority>,
 }
 
 impl std::fmt::Debug for DescriptionService {
@@ -596,6 +600,8 @@ impl DescriptionService {
             restart: Restart::default(),
             counts: JobCounts::default(),
             retried: BTreeSet::new(),
+            superseded: BTreeSet::new(),
+            waiting: BTreeMap::new(),
         }
     }
 
@@ -856,6 +862,8 @@ impl DescriptionService {
         self.events.remove(session_id);
         self.generations.remove(session_id);
         self.live_sessions.remove(session_id);
+        self.superseded.remove(session_id);
+        self.waiting.remove(session_id);
         // The fence and the debt go only when the cleanup they describe has actually finished.
         // A closed session whose generated row this host could not remove still has one, and
         // lowering its fence would let a later read show it; clearing its debt would let
@@ -913,18 +921,49 @@ impl DescriptionService {
     /// Advances a session's revision when its debounce has elapsed, and queues a job when it does.
     ///
     /// A revision that advances while the session's job is in the process refuses that job's
-    /// result, which describes the session as it was; the next job describes it as it is now.
+    /// result, which describes the session as it was, and the job is cancelled. A session is
+    /// superseded at most once in a row, though: while the job after a superseded one runs, the
+    /// session's changes wait for it, and they settle as one revision the moment it ends. So a
+    /// session that never stops changing, in a long active turn, is still described at least every
+    /// other job, and what is published is at most one job behind it (section 22 coalesces events
+    /// *so a long active turn can receive useful text without invalidating every job*).
     pub fn settle(
         &mut self,
         session_id: &SessionId,
         priority: Priority,
         now: Reading,
     ) -> Option<Enqueued> {
+        if self.superseded.contains(session_id)
+            && self
+                .job
+                .as_ref()
+                .is_some_and(|dispatched| dispatched.job.session_id == *session_id)
+        {
+            self.waiting.insert(*session_id, priority);
+            return None;
+        }
+        self.settle_with(session_id, priority, now, false)
+    }
+
+    /// Settles a session's pending changes into a queued job: once the debounce has elapsed, or at
+    /// once for changes that waited for a job.
+    fn settle_with(
+        &mut self,
+        session_id: &SessionId,
+        priority: Priority,
+        now: Reading,
+        at_once: bool,
+    ) -> Option<Enqueued> {
         if self.fence.is_fenced(session_id) {
             return None;
         }
         let tracker = self.trackers.get_mut(session_id)?;
-        let Settled::Advanced { revision, .. } = tracker.settle(now) else {
+        let settled = if at_once {
+            tracker.settle_pending()
+        } else {
+            tracker.settle(now)
+        };
+        let Settled::Advanced { revision, .. } = settled else {
             return None;
         };
         let facts = tracker.facts();
@@ -1140,7 +1179,19 @@ impl DescriptionService {
                 .job
                 .take()
                 .unwrap_or_else(|| unreachable!("the job was just found"));
-            return self.finish_job(dispatched, answer, now);
+            let (session_id, stop) = (dispatched.job.session_id, dispatched.stopping);
+            let outcome = self.finish_job(dispatched, answer, now);
+            let superseded = stop == Some(Stop::Superseded)
+                || matches!(
+                    outcome,
+                    Ok(Outcome::Rejected {
+                        rejection: Rejection::ChangedContext { .. },
+                        ..
+                    })
+                );
+            let requeued = matches!(outcome, Ok(Outcome::Requeued { .. }));
+            self.after_job(&session_id, superseded, requeued, now);
+            return outcome;
         }
         self.counts.dropped_answers = self.counts.dropped_answers.saturating_add(1);
         Ok(Outcome::Dropped { id })
@@ -1158,7 +1209,11 @@ impl DescriptionService {
     pub fn process_ended(&mut self, why: ProcessEnd, now: Reading) -> Result<Vec<Outcome>> {
         let mut outcomes = Vec::new();
         if let Some(dispatched) = self.job.take() {
-            outcomes.push(self.job_ended_with_process(dispatched, why, now));
+            let (session_id, stop) = (dispatched.job.session_id, dispatched.stopping);
+            let outcome = self.job_ended_with_process(dispatched, why, now);
+            let requeued = matches!(outcome, Outcome::Requeued { .. });
+            self.after_job(&session_id, stop == Some(Stop::Superseded), requeued, now);
+            outcomes.push(outcome);
         }
         if let Model::Loading { cancel_sent, .. } = &self.model {
             let load_why = match why {
@@ -1185,6 +1240,28 @@ impl DescriptionService {
         }
         outcomes.push(Outcome::ProcessEnded { why });
         Ok(outcomes)
+    }
+
+    /// Notes whether a session's job was superseded, and settles the changes that waited for the
+    /// job after a superseded one, now that it has ended.
+    ///
+    /// A job queued again keeps its session's standing, so the attempt that runs it next is still
+    /// the one after a superseded job.
+    fn after_job(
+        &mut self,
+        session_id: &SessionId,
+        superseded: bool,
+        requeued: bool,
+        now: Reading,
+    ) {
+        if superseded {
+            self.superseded.insert(*session_id);
+        } else if !requeued {
+            self.superseded.remove(session_id);
+        }
+        if let Some(priority) = self.waiting.remove(session_id) {
+            let _ = self.settle_with(session_id, priority, now, true);
+        }
     }
 
     /// Decides whether the work in flight stops, and says to cancel it once when it does.

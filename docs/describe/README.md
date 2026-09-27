@@ -182,6 +182,12 @@ at once rather than left to finish, and the new revision is described once the s
 has passed. A change still inside its debounce when the answer arrives refuses nothing: the answer
 is judged at the revision in force, and the change settles after it.
 
+A session is superseded at most once in a row. While the job after a superseded one runs, the
+session's changes wait for it, and they settle as one revision the moment it ends. In a long active
+turn that never stops changing, then, at least every other job publishes, what it publishes is at
+most one job behind the session, and the revision catches up as soon as it lands. Without that, a
+host whose jobs take longer than the debounce would refuse every job the turn produced.
+
 The input is bounded directory and repository metadata plus recent authorised semantic events.
 Raw keystrokes, hidden input, environment values, file bodies and whole histories are excluded, and
 there is no setting that admits them.
