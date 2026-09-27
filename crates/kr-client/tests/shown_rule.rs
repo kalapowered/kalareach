@@ -26,7 +26,8 @@
 //!   one of the writer's raw handles on standard output (`output::protocol_stream`,
 //!   `output::terminal`), in a call, a function value or an import, anywhere but in the functions
 //!   that own standard output for a protocol or a terminal: the tool server's, `kr bridge
-//!   --stdio`'s and the attach guard's;
+//!   --stdio`'s and the attach guard's. A glob of the writer's module or of serde_json is a
+//!   finding there too, so every name of either is placed where it is written;
 //! * the source is one this reading cannot follow: an `Error` derive not spelled
 //!   `thiserror::Error`, an import of `thiserror`, a renamed import of a trait or a type the rule
 //!   names, a macro that defines a type or writes an `impl`, a module whose file a `#[path]` names,
@@ -1838,6 +1839,22 @@ fn names_json_value(path: &str) -> bool {
     })
 }
 
+/// Whether the identifier at `index` starts a path rather than continuing one: it is not after a
+/// `::` that follows a name or a generic argument list's `>`. A `::` at the start of a path, as in
+/// `::serde_json::Value` or `-> ::serde_json::Value`, starts one.
+fn starts_path(tokens: &[Located], index: usize) -> bool {
+    if !(index >= 2 && punct(tokens.get(index - 1), ':') && punct(tokens.get(index - 2), ':')) {
+        return true;
+    }
+    let before = index.checked_sub(3).and_then(|at| tokens.get(at));
+    let continues = ident(before).is_some()
+        || (punct(before, '>')
+            && !index
+                .checked_sub(4)
+                .is_some_and(|at| punct(tokens.get(at), '-')));
+    !continues
+}
+
 /// The path written up to and including the identifier at `index`.
 fn path_ending_at(tokens: &[Located], index: usize) -> Vec<String> {
     let mut segments: Vec<String> = ident(tokens.get(index))
@@ -1942,6 +1959,25 @@ fn check_source(
     let shown_file = SHOWN_FILES.contains(&source.name.as_str());
     // The command line's standard output is its writer's, and so are its JSON values.
     let held_output = source.name.starts_with(COMMAND_LINE) && source.name != WRITER_FILE;
+    // A glob gives names this reading does not place, so outside the writer no glob imports the
+    // writer's module or serde_json's: every name of either is then placed where it is written.
+    if held_output && !shown_file {
+        for glob in &source.globs {
+            let path = source
+                .resolve(&glob.written, glob.scope, aliases)
+                .unwrap_or_else(|| glob.written.join("::"));
+            if path == "kr_cli::output" || path == "serde_json" || names_json_value(&path) {
+                findings.insert(Finding {
+                    file: source.name.clone(),
+                    line: glob.line,
+                    item: format!("use {path}::*"),
+                    what: "a glob of the writer or of serde_json, whose names this reading cannot \
+                           place"
+                        .to_owned(),
+                });
+            }
+        }
+    }
     let mut find = |line: usize, item: &str, what: &str| {
         findings.insert(Finding {
             file: source.name.clone(),
@@ -1957,12 +1993,11 @@ fn check_source(
         };
         let next_is_bang = punct(tokens.get(index + 1), '!');
         let after_dot = index > 0 && punct(tokens.get(index - 1), '.');
-        // serde_json's value API, named at the start of any path, an import's included: outside
-        // the writer and the two files that define what may be shown, the command line holds no
-        // JSON value to fill, convert text into or print.
-        let starts_path =
-            !(index >= 2 && punct(tokens.get(index - 1), ':') && punct(tokens.get(index - 2), ':'));
-        if held_output && !shown_file && starts_path && !after_dot {
+        // serde_json's value API, named at the start of any path, an import's and one written from
+        // the crates' root (`::serde_json`) included: outside the writer and the two files that
+        // define what may be shown, the command line holds no JSON value to fill, convert text into
+        // or print.
+        if held_output && !shown_file && starts_path(tokens, index) && !after_dot {
             let (segments, _) = written_path(&tokens[index..]);
             if let Some(path) = source.resolve(&segments, source.scope_at(index), aliases)
                 && names_json_value(&path)
@@ -3115,6 +3150,24 @@ fn each_break_of_the_rule_is_named_with_its_class_and_place() {
             "use serde_json::Value;\nfn f(text: String) -> Value {\n    text.into()\n}\n",
             1,
             "a JSON value named outside the writer",
+        ),
+        (
+            "a JSON value named from the crates' root",
+            "fn make(text: String) -> ::serde_json::Value {\n    text.into()\n}\n",
+            1,
+            "a JSON value named outside the writer",
+        ),
+        (
+            "a glob of serde_json",
+            "use serde_json::*;\nfn make(text: String) -> Value {\n    text.into()\n}\n",
+            1,
+            "a glob of the writer or of serde_json",
+        ),
+        (
+            "a glob of the writer",
+            "use crate::output::*;\nfn f(text: &str) {\n    use std::io::Write as _;\n    let open = terminal;\n    let _ = open().write_all(text.as_bytes());\n}\n",
+            1,
+            "a glob of the writer or of serde_json",
         ),
         (
             "a JSON value read back",
