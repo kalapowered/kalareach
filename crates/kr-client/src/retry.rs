@@ -513,6 +513,8 @@ pub fn decision(failure: Failure, class: RequestClass) -> Decision {
 mod tests {
     use super::*;
 
+    /// KR-REQ-23.57: every required code has one retry step and one direct action a client
+    /// translates, and every action but signing in is some code's.
     #[test]
     fn every_code_has_a_decision_and_an_action() {
         for code in ErrorCode::ALL {
@@ -552,6 +554,9 @@ mod tests {
         }
     }
 
+    /// KR-REQ-23.57: over every code and every request class, only idempotent reads, transfer
+    /// chunks and requests whose receipt proves no dispatch are sent again automatically, and only
+    /// for a transient code.
     #[test]
     fn only_the_three_classes_section_twenty_three_names_retry_automatically() {
         for code in ErrorCode::ALL {
@@ -577,6 +582,8 @@ mod tests {
         assert!(!RequestClass::Dispatchable.permits_automatic_retry());
     }
 
+    /// KR-REQ-23.57: OUTCOME_UNKNOWN is never retried, whatever the class, the budget or the delay
+    /// asked for; the person is asked to check the outcome.
     #[test]
     fn an_unknown_outcome_never_retries_however_it_is_asked() {
         for class in RequestClass::ALL {
@@ -595,6 +602,7 @@ mod tests {
         assert_eq!(attempts.remaining(), 64, "nothing was sent again");
     }
 
+    /// KR-REQ-23.57: RESYNC_REQUIRED asks for a new snapshot rather than a retry.
     #[test]
     fn a_resynchronisation_asks_for_a_new_snapshot_rather_than_a_retry() {
         let decision = decision(
@@ -605,6 +613,8 @@ mod tests {
         assert_eq!(decision.action, UserAction::Resync);
     }
 
+    /// KR-REQ-23.57: authentication and schema failures are never retried; each names a
+    /// configuration or software change.
     #[test]
     fn authentication_pairing_and_schema_failures_need_a_change_rather_than_a_delay() {
         for code in [
@@ -746,6 +756,8 @@ mod tests {
         ));
     }
 
+    /// KR-REQ-23.57: no code, transient or not, sends a request that may have been dispatched again
+    /// automatically.
     #[test]
     fn a_transient_failure_of_a_dispatchable_request_is_never_retried_by_the_library() {
         for code in ErrorCode::ALL {
