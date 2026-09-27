@@ -7319,7 +7319,7 @@
           "type": "boolean"
         },
         "flags": {
-          "description": "The flags the agent needs, added to an interactive invocation.",
+          "description": "The flags the agent needs, added to an interactive invocation.\n\nAn entry that is off carries none: nothing is added under it.",
           "items": {
             "type": "string"
           },
@@ -7455,12 +7455,12 @@
       "oneOf": [
         {
           "const": "on",
-          "description": "The configuration turns it on and the installed release's integration applies: an\ninvocation of its command gets its flags and variables behind a worker-owned backend.",
+          "description": "The configuration turns it on and the admitted release's integration applies: an\ninvocation of its command gets its flags and variables behind a worker-owned backend.",
           "type": "string"
         },
         {
           "const": "off",
-          "description": "The installed release's integration applies and the configuration does not turn it on: an\ninvocation of its command runs as typed.",
+          "description": "The admitted release's integration applies and the configuration does not turn it on: an\ninvocation of its command runs as typed.",
           "type": "string"
         },
         {
@@ -7470,7 +7470,7 @@
         },
         {
           "const": "none_declared",
-          "description": "The installed release declares none.",
+          "description": "The configuration names it, and the admitted release declares none.",
           "type": "string"
         },
         {
@@ -7491,6 +7491,11 @@
         {
           "const": "not_installed",
           "description": "The configuration names it and it is not installed in this environment.",
+          "type": "string"
+        },
+        {
+          "const": "unknown",
+          "description": "The configuration names it, and the admissions in force could not be computed or their\npackages read, so what a new session gets of it is not known.",
           "type": "string"
         }
       ]
@@ -14634,7 +14639,7 @@
           "type": "array"
         },
         "command_integrations": {
-          "description": "Every command integration an installed release declares or the configuration names, and\nwhat a session created now gets of it.\n\nSection 7: diagnostics show the resolved executable, flags, version and integration mode.",
+          "description": "Every command integration an admitted release declares, and every package the\nconfiguration names, with what a session created now gets of each.\n\nSection 7: diagnostics show the resolved executable, flags, version and integration mode.",
           "items": {
             "$ref": "#/$defs/CommandIntegrationReport"
           },

@@ -6660,6 +6660,8 @@ export interface CommandIntegration {
   enabled: boolean
   /**
    * The flags the agent needs, added to an interactive invocation.
+   *
+   * An entry that is off carries none: nothing is added under it.
    */
   flags: string[]
   /**
@@ -13711,8 +13713,8 @@ export interface HostDoctorResult {
    */
   checks: DoctorCheck[]
   /**
-   * Every command integration an installed release declares or the configuration names, and
-   * what a session created now gets of it.
+   * Every command integration an admitted release declares, and every package the
+   * configuration names, with what a session created now gets of each.
    *
    * Section 7: diagnostics show the resolved executable, flags, version and integration mode.
    */
@@ -13805,6 +13807,7 @@ export interface CommandIntegrationReport {
     | 'unreadable'
     | 'conflict'
     | 'not_installed'
+    | 'unknown'
   /**
    * Why a session created now could not launch through it on this host, where one could not.
    */
@@ -24457,8 +24460,8 @@ export interface HostDoctorResult1 {
    */
   checks: DoctorCheck[]
   /**
-   * Every command integration an installed release declares or the configuration names, and
-   * what a session created now gets of it.
+   * Every command integration an admitted release declares, and every package the
+   * configuration names, with what a session created now gets of each.
    *
    * Section 7: diagnostics show the resolved executable, flags, version and integration mode.
    */
