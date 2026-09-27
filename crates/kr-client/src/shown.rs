@@ -883,47 +883,74 @@ pub fn spelled(path: &Path) -> String {
         .collect()
 }
 
-/// A network location as a person may read it back: a URL written with its host (`scheme://host`),
-/// said as it was written up to the end of its path, with its user information, its query and its
-/// fragment left out. `None` when the text is not such a URL, a URL that does not parse among them.
+/// A network location as a person may read it back: a URL with a host, said as its scheme, its host,
+/// its port and its path, never its user information, its query or its fragment. `None` when the
+/// text is not a URL with a host, a URL that does not parse among them.
 ///
 /// Not a [`Shown`]: this is what the command line shows a person of a location they asked to read.
 /// What it leaves out is left out here, in one place, so no caller keeps a password written in front
-/// of a host or a token carried in a query. What it keeps is the text as the person wrote it rather
-/// than the parser's rewriting of it, so a port that is the scheme's default, a host in capitals
-/// and a path's own spelling read back unchanged; the parser decides only whether this is a URL and
-/// what it names, and the text is kept only when it names the same host, port and path with nothing
-/// else in it.
+/// of a host or a token carried in a query. The text is kept as the person wrote it up to the end
+/// of its path when it reads back through the parser as the same place with nothing else in it, so
+/// a port that is the scheme's default, a host in capitals and a path's own spelling read back
+/// unchanged; otherwise the location is said from the parser's own reading of those four parts.
+/// Either way nothing but those parts is said.
 #[must_use]
 pub fn located(text: &str) -> Option<String> {
     let address = url::Url::parse(text).ok()?;
     address.host_str().filter(|host| !host.is_empty())?;
-    as_written(text, &address)
+    Some(as_written(text, &address).unwrap_or_else(|| from_parts(text, &address)))
 }
 
-/// A file URL (`file://` and a path) as a person may read it back: as it was written, with its
-/// query and its fragment left out. `None` for any other text.
+/// A file URL (`file://` and a path) as a person may read it back: its host where it has one and
+/// its path, never its query or its fragment, kept as written on the terms [`located`] keeps a URL.
+/// `None` for any other text.
 #[must_use]
 pub fn file_located(text: &str) -> Option<String> {
     let address = url::Url::parse(text).ok()?;
     if address.scheme() != "file" {
         return None;
     }
-    as_written(text, &address)
+    Some(as_written(text, &address).unwrap_or_else(|| from_parts(text, &address)))
 }
 
+/// The schemes the URL standard reads whatever follows their colon, however many slashes there
+/// are and whether or not the rest parses.
+const SPECIAL_SCHEMES: [&str; 6] = ["http", "https", "ws", "wss", "ftp", "file"];
+
 /// Whether text is written as a URL: with `://`, or in one of the schemes the URL standard reads
-/// whatever follows their colon (`http`, `https`, `ws`, `wss`, `ftp`, `file`). Such text is never a
-/// host and a path, however its colon falls.
+/// whatever follows their colon (`http`, `https`, `ws`, `wss`, `ftp`, `file`), whether or not the
+/// rest parses. Such text is never a host and a path, however its colons fall.
 #[must_use]
 pub fn written_as_url(text: &str) -> bool {
     text.contains("://")
-        || url::Url::parse(text).is_ok_and(|address| {
-            matches!(
-                address.scheme(),
-                "http" | "https" | "ws" | "wss" | "ftp" | "file"
-            )
+        || text.split_once(':').is_some_and(|(scheme, _)| {
+            SPECIAL_SCHEMES
+                .iter()
+                .any(|special| scheme.trim().eq_ignore_ascii_case(special))
         })
+}
+
+/// A URL said from the parser's own reading of it: its scheme, host, port and path, the root path
+/// only where the text wrote one.
+fn from_parts(text: &str, address: &url::Url) -> String {
+    let mut said = format!(
+        "{}://{}",
+        address.scheme(),
+        address.host_str().unwrap_or_default()
+    );
+    if let Some(port) = address.port() {
+        said.push(':');
+        said.push_str(&port.to_string());
+    }
+    let path = address.path();
+    let written_root = text
+        .split(['?', '#'])
+        .next()
+        .is_some_and(|base| base.ends_with('/'));
+    if path != "/" || written_root {
+        said.push_str(path);
+    }
+    said
 }
 
 /// A URL's scheme, its authority after any user information and its path, as `text` wrote them,
@@ -1556,9 +1583,10 @@ mod tests {
         }
     }
 
-    /// A location a person asked to read keeps its scheme, host, port and path as they were written,
-    /// and never its user information, query or fragment; text that is not a URL with a host,
-    /// or a URL that does not parse, is not a location here.
+    /// A location a person asked to read keeps its scheme, host, port and path, as they were written
+    /// where the text reads back as the same place and from the parser's reading otherwise, and
+    /// never its user information, query or fragment; text that is not a URL with a host, or a URL
+    /// that does not parse, is not a location here.
     #[test]
     fn a_location_keeps_its_scheme_host_port_and_path_and_nothing_else() {
         for (text, expected) in [
@@ -1596,12 +1624,23 @@ mod tests {
                 format!("https://someone:{MARKER}@relay.example:port/x"),
                 None,
             ),
-            // A split the parser would not make is not vouched for.
             (
-                format!("ssh://someone:{MARKER}\\x@git.example/repository"),
+                format!("https:someone:{MARKER}@relay.example:port/x?token={MARKER}#{MARKER}"),
                 None,
             ),
-            (format!("https:someone:{MARKER}@relay.example/x"), None),
+            // Text the parser reads another way than it was written is said from its reading.
+            (
+                format!("ssh://someone:{MARKER}\\x@git.example/repository"),
+                Some("ssh://git.example/repository"),
+            ),
+            (
+                format!("https:someone:{MARKER}@relay.example/x"),
+                Some("https://relay.example/x"),
+            ),
+            (
+                "https:/example.com/repo.git".to_owned(),
+                Some("https://example.com/repo.git"),
+            ),
             (MARKER.to_owned(), None),
             ("C:\\work\\repository".to_owned(), None),
             ("file:///srv/repository".to_owned(), None),
@@ -1634,6 +1673,8 @@ mod tests {
         for text in [
             "https://relay.example",
             "https:someone@relay.example/x",
+            "https:someone:secret@relay.example:port/x?token=secret#fragment",
+            "HTTPS:relay.example",
             "file:///srv/repository",
             "ssh://git.example/repository",
             "custom+scheme://anything",

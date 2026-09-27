@@ -89,10 +89,14 @@ impl Asked {
         }
     }
 
-    /// A location: a URL as its scheme, host, port and path as they were written, a file URL as
-    /// its path; an SCP-style location (`user@host:path`) as its host and path; anything else as a
-    /// local path. User information, a query and a fragment are never kept, and text written as a
-    /// URL that none of those reads is said as its class and its length.
+    /// A location: a URL as its scheme, host, port and path, a file URL as its path
+    /// ([`kr_client::shown::located`]); an SCP-style location (`user@host:path`) as its host and its
+    /// path; anything else as a local path.
+    ///
+    /// Nothing is said of a location but those parts, so user information, a query and a fragment
+    /// are never kept: text written as a URL that the parser does not read, and SCP-style text
+    /// whose host is not a host name or whose path holds an `@`, a `?` or a `#`, which is how a URL
+    /// read the wrong way would look, are said as their class and their length.
     #[must_use]
     pub fn location(request: Request, location: &str) -> Self {
         use kr_protocol::hostinfo::export::{ContentClass, withheld};
@@ -104,7 +108,11 @@ impl Asked {
         } else if kr_client::shown::written_as_url(location) {
             withheld(ContentClass::Location, location)
         } else if let Some((host, path)) = scp(location) {
-            format!("{host}:{path}")
+            if crate::shown::host_name(host).is_some() && !path.contains(['@', '?', '#']) {
+                format!("{host}:{path}")
+            } else {
+                withheld(ContentClass::Location, location)
+            }
         } else {
             kr_client::shown::spelled(Path::new(location))
         };
@@ -815,8 +823,11 @@ mod tests {
         let drive = Asked::location(Request::Repositories, "C:/work/repository");
         assert!(drive.text.starts_with("C:"), "{}", drive.text);
         assert!(!drive.text.contains("C:work"), "{}", drive.text);
-        // A file URL keeps its path and loses its query and fragment; a URL with no host this reads
-        // and one that does not parse keep nothing but their class and length.
+        // A file URL keeps its path and loses its query and fragment; a URL the parser reads
+        // another way than it was written is said from its reading; text written as a URL that
+        // does not parse, and SCP-style text that holds what a URL would carry or no host name,
+        // keep nothing but their class and length.
+        let withheld = |text: &str| format!("[location withheld, {} bytes]", text.len());
         for (location, expected) in [
             (
                 format!("file:///tmp/catalogue?token={MARKER}#{MARKER}"),
@@ -824,17 +835,33 @@ mod tests {
             ),
             (
                 format!("https://someone:{MARKER}@relay.example:port/x"),
-                format!(
-                    "[location withheld, {} bytes]",
-                    format!("https://someone:{MARKER}@relay.example:port/x").len()
-                ),
+                withheld(&format!("https://someone:{MARKER}@relay.example:port/x")),
+            ),
+            (
+                format!("https:someone:{MARKER}@relay.example:port/x?token={MARKER}#{MARKER}"),
+                withheld(&format!(
+                    "https:someone:{MARKER}@relay.example:port/x?token={MARKER}#{MARKER}"
+                )),
             ),
             (
                 format!("https:someone:{MARKER}@relay.example/x"),
-                format!(
-                    "[location withheld, {} bytes]",
-                    format!("https:someone:{MARKER}@relay.example/x").len()
-                ),
+                "https://relay.example/x".to_owned(),
+            ),
+            (
+                "https:/example.com/repo.git".to_owned(),
+                "https://example.com/repo.git".to_owned(),
+            ),
+            (
+                format!("git.example:team/repository.git?token={MARKER}"),
+                withheld(&format!("git.example:team/repository.git?token={MARKER}")),
+            ),
+            (
+                format!("someone:{MARKER}@git.example:team"),
+                withheld(&format!("someone:{MARKER}@git.example:team")),
+            ),
+            (
+                format!("{MARKER} x:team/repository.git"),
+                withheld(&format!("{MARKER} x:team/repository.git")),
             ),
             // Nothing to leave out: the text as it was written.
             (
