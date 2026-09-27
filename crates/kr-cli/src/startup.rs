@@ -910,34 +910,40 @@ impl Log {
     }
 
     /// What a failure says of this start's part of the log: its last line where that is the
-    /// daemon's own refusal, that it holds a line, or `nothing`, the sentence for a log that holds
-    /// nothing since the start began.
+    /// daemon's own refusal, that it holds a line, `nothing`, the sentence for a log that holds
+    /// nothing since the start began, or that it could not be read.
     fn said(&self, nothing: &'static str) -> Shown {
-        self.last_line()
-            .map_or_else(|| Shown::said(nothing), |line| last_line_said(&line))
+        match self.last_line() {
+            Ok(Some(line)) => last_line_said(&line),
+            Ok(None) => Shown::said(nothing),
+            Err(error) => shown!("its log could not be read: {}", Shown::io(&error)),
+        }
     }
 
     /// The last line written since this start began, read through the handle that was checked.
     ///
     /// Several starts can share the log, so the line is the log's rather than certainly this
-    /// start's daemon's.
-    fn last_line(&self) -> Option<String> {
-        let length = self.file.metadata().ok()?.len();
+    /// start's daemon's. A read that fails is that failure, never a log that holds nothing.
+    fn last_line(&self) -> std::io::Result<Option<String>> {
+        let length = self.file.metadata()?.len();
         let begin = self.from.max(length.saturating_sub(LOG_TAIL));
-        let mut bytes = vec![0; usize::try_from(length.saturating_sub(begin)).ok()?];
+        let tail = usize::try_from(length.saturating_sub(begin)).map_err(std::io::Error::other)?;
+        let mut bytes = vec![0; tail];
         let mut read = 0;
         while read < bytes.len() {
             match read_at(&self.file, &mut bytes[read..], begin + read as u64) {
-                Ok(0) | Err(_) => break,
+                Ok(0) => break,
                 Ok(count) => read += count,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
             }
         }
         bytes.truncate(read);
-        String::from_utf8_lossy(&bytes)
+        Ok(String::from_utf8_lossy(&bytes)
             .lines()
             .map(str::trim)
             .rfind(|line| !line.is_empty())
-            .map(str::to_owned)
+            .map(str::to_owned))
     }
 }
 
@@ -2121,14 +2127,25 @@ mod tests {
         let log = directory.join(LOG_FILE);
         let opened = Log::open(&log).expect("opens a new log");
         assert_eq!(opened.from, 0);
-        assert_eq!(opened.last_line(), None, "a start that wrote nothing");
+        assert_eq!(
+            opened.last_line().expect("reads"),
+            None,
+            "a start that wrote nothing"
+        );
         drop(opened);
         std::fs::write(&log, "an earlier start\n").expect("an earlier start's line");
         let opened = Log::open(&log).expect("opens the log");
-        assert_eq!(opened.last_line(), None, "which is not this start's");
+        assert_eq!(
+            opened.last_line().expect("reads"),
+            None,
+            "which is not this start's"
+        );
         std::fs::write(&log, "an earlier start\nthis start\nand its last word\n\n")
             .expect("this start's lines");
-        assert_eq!(opened.last_line().as_deref(), Some("and its last word"));
+        assert_eq!(
+            opened.last_line().expect("reads").as_deref(),
+            Some("and its last word")
+        );
 
         std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o644))
             .expect("widens the log");
