@@ -66,15 +66,18 @@ titles, cursor moves and clipboard writes. Where the host no longer keeps output
 why. Each view keeps its own place across a change of view: the conversation and the output return
 the reader to the node or page they were reading, or to the live end if they were following it.
 
-A draft keeps the conversation it was written for: the agent's instance and the binding revision
-the person wrote to. If the agent moves to another conversation while the draft is on screen, the
-draft is conflicted and nothing sends it on; the person chooses whether it goes to the new one. A
-draft written before the agent was read keeps the first conversation it learns. A file dropped on
-the window is on the draft from that moment, goes through the transfer service, and stays whether
-the upload succeeds or fails; a prompt sent from here carries its text inline and cannot carry the
-file, so a draft that holds one is not sent until the person removes it. Nothing that needs a right is offered before the connection
-has said what it may do. In a session, when the launch surface was read at an older
-prompt generation than the view has heard since, its buttons start disabled.
+A draft keeps the conversation it was written for: the agent's instance and the binding revision the
+person wrote to. If the agent moves to another conversation while the draft is on screen, the draft
+is conflicted and nothing sends it on; the person chooses whether it goes to the new one. A draft
+written before the agent was read keeps the first conversation it learns. A file dropped on the
+window, or pasted into the composer, is on the draft from that moment, goes through the transfer
+service, and stays whether the upload succeeds or fails. A dropped file reaches native code as the
+path the platform handed it, so the page never holds its bytes; a pasted file reaches the page
+itself, which hands its bytes to native code, up to 64 MiB, for the same upload; a prompt sent from
+here carries its text inline and cannot carry the file, so a draft that holds one is not sent until
+the person removes it. Nothing that needs a right is offered before the connection has said what it
+may do. In a session, when the launch surface was read at an older prompt generation than the view
+has heard since, its buttons start disabled.
 
 Nothing claims contact, or its loss, before an answer says which. Until the first answer the
 desktop's bar and the phone's say they are checking the connection, with no status dot, and a phone
