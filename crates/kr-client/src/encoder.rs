@@ -690,19 +690,24 @@ fn legacy(
     }
     let application = encoding.application_cursor_keys();
     match event.key {
-        Key::Char(character) => Ok(legacy_character(
-            character,
-            event.modifiers,
-            modify_other_keys,
-        )),
-        // Level one reports Return with any modifier, as xterm does.
-        Key::Enter => Ok(special_key(
-            b'\r',
-            13,
-            event.modifiers,
-            modify_other_keys,
-            !event.modifiers.is_empty(),
-        )),
+        Key::Char(character) => legacy_character(character, event.modifiers, modify_other_keys),
+        Key::Enter => {
+            if modify_other_keys == 1 && event.modifiers.alt && event.modifiers.shift {
+                // xterm reports this chord at level one with Alt left out.
+                return Err(Unsupported::NotExpressible {
+                    what: "Alt with Shift on Return",
+                });
+            }
+            // Level one reports Shift and Control on Return, and leaves Alt to the escape prefix,
+            // Control going with it, as xterm does.
+            Ok(special_key(
+                b'\r',
+                13,
+                event.modifiers,
+                modify_other_keys,
+                !event.modifiers.alt && !event.modifiers.is_empty(),
+            ))
+        }
         Key::Tab => {
             if modify_other_keys >= 2 && !event.modifiers.is_empty() {
                 // Level two reports Shift-Tab too, which is how an application tells it from the
@@ -720,13 +725,14 @@ fn legacy(
                 }
                 return Ok(b"\x1b[Z".to_vec());
             }
-            // Level one reports Control and Alt on Tab, as xterm does.
+            // Level one reports Control on Tab, and leaves Alt to the escape prefix, Control going
+            // with it, as xterm does.
             Ok(special_key(
                 b'\t',
                 9,
                 event.modifiers,
                 modify_other_keys,
-                !event.modifiers.is_empty(),
+                !event.modifiers.alt && event.modifiers.control,
             ))
         }
         // Control makes the backarrow key send the other of DEL and BS, as xterm's does, and level
@@ -738,15 +744,26 @@ fn legacy(
             modify_other_keys,
             false,
         )),
-        // Escape is a control character already, so level one leaves Shift or Control on its own
-        // to it, and reports Alt, or Shift and Control together, as xterm does.
-        Key::Escape => Ok(special_key(
-            0x1b,
-            27,
-            event.modifiers,
-            modify_other_keys,
-            event.modifiers.alt || (event.modifiers.shift && event.modifiers.control),
-        )),
+        Key::Escape => {
+            if modify_other_keys == 1
+                && event.modifiers.alt
+                && (event.modifiers.shift || event.modifiers.control)
+            {
+                // xterm reports these chords at level one with Alt left out.
+                return Err(Unsupported::NotExpressible {
+                    what: "Alt with Shift or Control on Escape",
+                });
+            }
+            // Escape is a control character already, so level one leaves Shift and Control to its
+            // byte, and Alt to the escape prefix, as xterm does.
+            Ok(special_key(
+                0x1b,
+                27,
+                event.modifiers,
+                modify_other_keys,
+                false,
+            ))
+        }
         Key::Arrow(arrow) => Ok(cursor_key(arrow, event.modifiers, application)),
         Key::Home => Ok(edit_key(b'H', event.modifiers, application)),
         Key::End => Ok(edit_key(b'F', event.modifiers, application)),
@@ -782,7 +799,14 @@ fn legacy(
 }
 
 /// Spells a printable key under the ordinary encoding, with `modifyOtherKeys` where it applies.
-fn legacy_character(character: char, modifiers: Modifiers, modify_other_keys: u8) -> Vec<u8> {
+///
+/// Level one is xterm's with Alt as the escape prefix (its `metaSendsEscape`): a chord xterm would
+/// report there with Alt left out is refused rather than sent without it.
+fn legacy_character(
+    character: char,
+    modifiers: Modifiers,
+    modify_other_keys: u8,
+) -> Result<Vec<u8>, Unsupported> {
     // Control and a character has the spelling X11 gives it at every level of `modifyOtherKeys`
     // below two.
     if modifiers.control
@@ -797,11 +821,11 @@ fn legacy_character(character: char, modifiers: Modifiers, modify_other_keys: u8
                 bytes.push(0x1b);
             }
             bytes.push(byte);
-            return bytes;
+            return Ok(bytes);
         }
         // Level two reports even the keys that already had a spelling, which is the whole point of
         // it: an application can then tell Control-I from Tab.
-        return modify_other_keys_report(u32::from(character), modifiers);
+        return Ok(modify_other_keys_report(u32::from(character), modifiers));
     }
     // Level two reports a shift-only chord over the range xterm reports it over: the characters
     // from `@` to `~`, which are the ones a control chord can also reach, plus Space, whose shifted
@@ -809,7 +833,8 @@ fn legacy_character(character: char, modifiers: Modifiers, modify_other_keys: u8
     // key produces, so it is sent as that byte, and an encoder that reported it would tell an
     // application about a chord no terminal reports. Level one reports only Control on a key X11
     // has no control character for: Shift is already in the character, and xterm leaves Alt, with
-    // Shift or without, to its escape prefix at that level.
+    // Shift or without, to its escape prefix at that level, and reports Control with Alt as Control
+    // alone.
     let ambiguous_when_shifted = character == ' ' || ('\u{40}'..='\u{7f}').contains(&character);
     let reported = if modify_other_keys >= 2 {
         modifiers.control || modifiers.alt || (modifiers.shift && ambiguous_when_shifted)
@@ -817,7 +842,12 @@ fn legacy_character(character: char, modifiers: Modifiers, modify_other_keys: u8
         modify_other_keys > 0 && modifiers.control
     };
     if reported {
-        return modify_other_keys_report(u32::from(character), modifiers);
+        if modify_other_keys == 1 && modifiers.alt {
+            return Err(Unsupported::NotExpressible {
+                what: "Alt with Control on a key that has no control character",
+            });
+        }
+        return Ok(modify_other_keys_report(u32::from(character), modifiers));
     }
     let mut bytes = Vec::new();
     if modifiers.alt {
@@ -825,7 +855,7 @@ fn legacy_character(character: char, modifiers: Modifiers, modify_other_keys: u8
         bytes.push(0x1b);
     }
     bytes.extend_from_slice(&utf8(character));
-    bytes
+    Ok(bytes)
 }
 
 /// Spells Return, Tab, Backspace or Escape, whose byte is a control character, outside the Kitty
@@ -1619,11 +1649,13 @@ mod tests {
         assert_eq!(spelled(control_semicolon, LEVEL_ONE), b"\x1b[27;5;59~");
     }
 
-    /// KR-REQ-08.59: `modifyOtherKeys` level 1 spells Escape, Backspace, Return and Tab as xterm
-    /// does. Escape keeps its byte with Shift or Control alone, and is reported with Alt or with both
-    /// of them. Backspace is never reported, and Control makes it the other of DEL and BS, as xterm's
-    /// backarrow key does in the ordinary encoding too. Return and Tab are reported with any
-    /// modifier, except Shift alone on Tab, which is the back-tab. Level 2 reports all four.
+    /// KR-REQ-08.59: `modifyOtherKeys` level 1 spells Escape, Backspace, Return and Tab as xterm's
+    /// input path does with Alt as the escape prefix (its `metaSendsEscape`). Escape keeps its byte
+    /// with Shift or Control. Backspace is never reported, and Control makes it the other of DEL and
+    /// BS, as xterm's backarrow key does in the ordinary encoding too. Return is reported with Shift
+    /// and Control, Tab with Control, and Shift alone on Tab is the back-tab. Alt is the escape
+    /// prefix, and a chord xterm would report with Alt left out is refused. Level 2 reports all four
+    /// with any modifier.
     #[test]
     fn level_one_spells_escape_backspace_return_and_tab_as_xterm_does() {
         let shift = Modifiers::shift();
@@ -1634,15 +1666,12 @@ mod tests {
             control: true,
             superkey: false,
         };
-        let cases: [(Key, Modifiers, &[u8]); 24] = [
+        let spelled_cases: [(Key, Modifiers, &[u8]); 20] = [
             (Key::Escape, Modifiers::NONE, b"\x1b"),
             (Key::Escape, shift, b"\x1b"),
             (Key::Escape, control, b"\x1b"),
-            (Key::Escape, CONTROL_SHIFT, b"\x1b[27;6;27~"),
-            (Key::Escape, ALT, b"\x1b[27;3;27~"),
-            (Key::Escape, SHIFT_ALT, b"\x1b[27;4;27~"),
-            (Key::Escape, CONTROL_ALT, b"\x1b[27;7;27~"),
-            (Key::Escape, all, b"\x1b[27;8;27~"),
+            (Key::Escape, CONTROL_SHIFT, b"\x1b"),
+            (Key::Escape, ALT, b"\x1b\x1b"),
             (Key::Backspace, Modifiers::NONE, b"\x7f"),
             (Key::Backspace, shift, b"\x7f"),
             (Key::Backspace, control, b"\x08"),
@@ -1652,28 +1681,60 @@ mod tests {
             (Key::Enter, Modifiers::NONE, b"\r"),
             (Key::Enter, shift, b"\x1b[27;2;13~"),
             (Key::Enter, control, b"\x1b[27;5;13~"),
-            (Key::Enter, ALT, b"\x1b[27;3;13~"),
-            (Key::Enter, CONTROL_ALT, b"\x1b[27;7;13~"),
+            (Key::Enter, CONTROL_SHIFT, b"\x1b[27;6;13~"),
+            (Key::Enter, ALT, b"\x1b\r"),
             (Key::Tab, Modifiers::NONE, b"\t"),
             (Key::Tab, shift, b"\x1b[Z"),
             (Key::Tab, control, b"\x1b[27;5;9~"),
-            (Key::Tab, ALT, b"\x1b[27;3;9~"),
-            (Key::Tab, CONTROL_ALT, b"\x1b[27;7;9~"),
+            (Key::Tab, ALT, b"\x1b\t"),
         ];
-        for (pressed, held, expected) in cases {
+        for (pressed, held, expected) in spelled_cases {
             assert_eq!(
                 spelled(KeyEvent::with(pressed, held), LEVEL_ONE),
                 expected,
                 "{pressed:?} with {held:?}"
             );
         }
-        // The back-tab has no room for a second modifier at level 1, as in the ordinary encoding.
+        // Control goes with Alt on Return and Tab, as it does in the ordinary encoding.
         assert_eq!(
-            key(KeyEvent::with(Key::Tab, CONTROL_SHIFT), LEVEL_ONE),
-            Err(Unsupported::NotExpressible {
-                what: "Shift together with another modifier on Tab"
-            })
+            spelled(KeyEvent::with(Key::Enter, CONTROL_ALT), LEVEL_ONE),
+            b"\x1b\r"
         );
+        assert_eq!(
+            spelled(KeyEvent::with(Key::Tab, CONTROL_ALT), LEVEL_ONE),
+            b"\x1b\t"
+        );
+        for (pressed, held, what) in [
+            (
+                Key::Escape,
+                SHIFT_ALT,
+                "Alt with Shift or Control on Escape",
+            ),
+            (
+                Key::Escape,
+                CONTROL_ALT,
+                "Alt with Shift or Control on Escape",
+            ),
+            (Key::Escape, all, "Alt with Shift or Control on Escape"),
+            (Key::Enter, SHIFT_ALT, "Alt with Shift on Return"),
+            (Key::Enter, all, "Alt with Shift on Return"),
+            (
+                Key::Tab,
+                CONTROL_SHIFT,
+                "Shift together with another modifier on Tab",
+            ),
+            (
+                Key::Tab,
+                SHIFT_ALT,
+                "Shift together with another modifier on Tab",
+            ),
+        ] {
+            assert_eq!(
+                key(KeyEvent::with(pressed, held), LEVEL_ONE),
+                Err(Unsupported::NotExpressible { what }),
+                "{pressed:?} with {held:?}"
+            );
+        }
         // The ordinary encoding's Backspace is the same, Control making the other byte.
         assert_eq!(
             spelled(KeyEvent::with(Key::Backspace, control), LEGACY),
@@ -1690,7 +1751,7 @@ mod tests {
             (Key::Enter, 13),
             (Key::Tab, 9),
         ] {
-            for (held, parameter) in [(shift, 2), (ALT, 3), (control, 5)] {
+            for (held, parameter) in [(shift, 2), (ALT, 3), (control, 5), (all, 8)] {
                 assert_eq!(
                     spelled(KeyEvent::with(pressed, held), LEVEL_TWO),
                     format!("\x1b[27;{parameter};{code}~").into_bytes(),
@@ -1700,21 +1761,40 @@ mod tests {
         }
     }
 
-    /// KR-REQ-08.59: at level 1, Alt on an ordinary key is the escape prefix, with Shift or without:
-    /// xterm leaves a bare Alt to its meta handling there, and reports it only at level 2. Control
-    /// with Alt still reports a chord X11 has no character for.
+    /// KR-REQ-08.59: at level 1, Alt on an ordinary key is the escape prefix, with Shift or without,
+    /// and goes in front of a control character; Control reports a key X11 gives no control
+    /// character, and with Alt that chord is refused, because xterm reports it with Alt left out.
+    /// Level 2 reports Alt.
     #[test]
     fn level_one_leaves_alt_on_an_ordinary_key_to_the_escape_prefix() {
         assert_eq!(spelled(on('c', 'c', ALT), LEVEL_ONE), b"\x1bc");
         assert_eq!(spelled(on('c', 'C', SHIFT_ALT), LEVEL_ONE), b"\x1bC");
         assert_eq!(spelled(on('1', '!', SHIFT_ALT), LEVEL_ONE), b"\x1b!");
+        assert_eq!(spelled(on('c', 'c', CONTROL_ALT), LEVEL_ONE), b"\x1b\x03");
         assert_eq!(
-            spelled(on('1', '1', CONTROL_ALT), LEVEL_ONE),
-            b"\x1b[27;7;49~"
+            spelled(on('1', '1', Modifiers::control()), LEVEL_ONE),
+            b"\x1b[27;5;49~"
         );
+        assert_eq!(
+            spelled(on('1', '!', CONTROL_SHIFT), LEVEL_ONE),
+            b"\x1b[27;6;33~"
+        );
+        for (base, produced, held) in [('1', '1', CONTROL_ALT), (';', ';', CONTROL_ALT)] {
+            assert_eq!(
+                key(on(base, produced, held), LEVEL_ONE),
+                Err(Unsupported::NotExpressible {
+                    what: "Alt with Control on a key that has no control character"
+                }),
+                "{produced}"
+            );
+        }
         assert_eq!(
             spelled(on('c', 'C', SHIFT_ALT), LEVEL_TWO),
             b"\x1b[27;4;67~"
+        );
+        assert_eq!(
+            spelled(on('1', '1', CONTROL_ALT), LEVEL_TWO),
+            b"\x1b[27;7;49~"
         );
     }
 
