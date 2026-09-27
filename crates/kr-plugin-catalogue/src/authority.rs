@@ -9,8 +9,8 @@
 //!
 //! This is enforced by what the store accepts rather than by where calls happen to be. Every
 //! durable effect the catalogue has (a state transaction, a payload written into the cache, a
-//! package moved into place, a payload reclaimed) takes a [`Permit`], and the only place a permit
-//! exists is inside [`committed`], which obtains it from the authority's own commit. A code path
+//! package moved into place, a payload reclaimed) takes a `Permit`, and the only place a permit
+//! exists is inside `committed`, which obtains it from the authority's own commit. A code path
 //! that wrote without asking has nothing to write with.
 //!
 //! Every commit also names the [`Effect`] it makes. An action can commit several changes before
@@ -176,7 +176,7 @@ pub struct Committed {
 
 /// An authority that keeps a record of what its commits made durable.
 ///
-/// Every durable change takes a [`Permit`], every permit is lent inside [`Authority::commit`],
+/// Every durable change takes a `Permit`, every permit is lent inside [`Authority::commit`],
 /// and this authority wraps that commit, so no change reaches the store without this record
 /// seeing it. What the wrapped commit returns decides what is recorded: success is a change that
 /// committed, [`CatalogueError::PublicationUncertain`] is one that may have, and any other error

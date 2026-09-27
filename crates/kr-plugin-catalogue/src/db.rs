@@ -11,9 +11,9 @@
 //! * **Every change reads what it changes inside its own transaction.** A second catalogue on the
 //!   same directory, or a second request on this one, changes rows rather than rewriting a copy of
 //!   everything it read earlier, so neither can lose the other's work.
-//! * **A change to the catalogue's state needs a [`Permit`].** [`Pending::run`] takes one, and a
+//! * **A change to the catalogue's state needs a `Permit`.** `Pending::run` takes one, and a
 //!   permit exists only inside the admitting authority's commit, so no state reaches disk without
-//!   the admission standing at that moment. The write lock is taken first, by [`Db::begin`], so no
+//!   the admission standing at that moment. The write lock is taken first, by `Db::begin`, so no
 //!   wait for another writer comes between the authority's answer and the change.
 //! * **An action's effect and its receipt commit together.** The transaction that changes the
 //!   state also records the result the action answered with, so no crash can leave an effect

@@ -29,7 +29,7 @@
 //!   directory is renamed into place once all of them verify. A package is therefore never half
 //!   installed, and a package activation that fails leaves an installed package usable.
 //!
-//! Every write a reader could come to rely on takes a [`Permit`], so it happens inside the
+//! Every write a reader could come to rely on takes a `Permit`, so it happens inside the
 //! admitting authority's commit. Staging does not: a staging directory is this attempt's own, and
 //! nothing reads it.
 //!
@@ -39,7 +39,7 @@
 //! link afterwards redirects nothing, because the handle holds the directory rather than its name.
 //!
 //! Reclaiming space never takes a payload a live binding or a pinned generation still needs.
-//! Section 11 is explicit that a sync does not evict those to finish, so [`Store::plan_reclaim`]
+//! Section 11 is explicit that a sync does not evict those to finish, so `Store::plan_reclaim`
 //! refuses rather than freeing the last thing that was keeping something working.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -499,7 +499,7 @@ pub enum PackageCheck {
 ///
 /// The client writes into its datastore as it goes: roots one after another, then each role's
 /// metadata, each written in place. None of that reaches the accepted checkpoint until the load
-/// has verified, when [`Store::publish_checkpoint`] moves it there under the admitting
+/// has verified, when `Store::publish_checkpoint` moves it there under the admitting
 /// authority's permit. A load that fails or is interrupted leaves only this copy, which is removed
 /// with it.
 ///
@@ -782,7 +782,7 @@ impl Store {
     ///
     /// It holds the metadata the client last verified whole, which is what the next verification
     /// starts from. The client never writes here: it works in a [`WorkingDatastore`], and what it
-    /// verified is moved here by [`Self::publish_checkpoint`].
+    /// verified is moved here by `Self::publish_checkpoint`.
     #[must_use]
     pub fn datastore(&self) -> PathBuf {
         self.root.join("datastore")
@@ -790,7 +790,7 @@ impl Store {
 
     /// Copies the accepted trust checkpoint into a private working copy for one verification.
     ///
-    /// Only the documents the client reads back are copied ([`CLIENT_READS`]); the rest it writes
+    /// Only the documents the client reads back are copied (`CLIENT_READS`); the rest it writes
     /// again as it verifies. `reset` drops the timestamp and snapshot documents from the copy. The client drops them
     /// itself when a load moves to a root whose timestamp or snapshot keys differ from the root it
     /// started from; a root advance kept by an earlier load that then failed is the root the next
