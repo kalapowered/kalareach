@@ -9,14 +9,19 @@
 //!
 //! Test code is not held to the rule: a test finds its own binary to start copies of it. An item
 //! whose `cfg` cannot hold without `test` or without the `testing` feature, which only this
-//! workspace's tests turn on, is passed over, and so is every file such an item declares. An item
-//! under any other condition, `cfg(any(test, unix))` among them, may compile into a program and is
-//! read like any other.
+//! workspace's tests turn on, is passed over. An item under any other condition,
+//! `cfg(any(test, unix))` among them, may compile into a program and is read like any other.
+//!
+//! A file is passed over only when nothing but test code declares it: every `mod` that names it
+//! is under such a `cfg`, or is in a file that is itself test code. A file any production `mod`
+//! names is read, whatever else names it, and so is a file no `mod` names, a crate's root among
+//! them. A `mod` inside an inline module names its file under that module's directory, as the
+//! compiler places it.
 //!
 //! The reading is by tokens: comments and string and character literals are not code and are
 //! passed over, so a sentence that mentions `current_exe` is not a use of it.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 /// The one file that may ask.
@@ -219,13 +224,27 @@ fn lex(text: &str) -> Vec<Located> {
     tokens
 }
 
+/// One `mod name;` a file declares.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Declaration {
+    /// The module's name.
+    name: String,
+    /// The file its `#[path]` names, relative as written.
+    path: Option<String>,
+    /// The inline modules it is declared inside, outermost first, each as the directory it gives
+    /// what is declared in it: its `#[path]`, or its name.
+    inline: Vec<String>,
+    /// Whether it compiles only into tests.
+    test_only: bool,
+}
+
 /// What reading one file found.
 #[derive(Debug, Default)]
 struct Reading {
     /// The lines production code names [`NAME`] on.
     uses: Vec<usize>,
-    /// The modules the file declares under `cfg(test)`, each as `(name, path attribute)`.
-    test_modules: Vec<(String, Option<String>)>,
+    /// The modules the file declares out of line.
+    declarations: Vec<Declaration>,
 }
 
 /// Whether a `cfg` predicate, its tokens from just inside `cfg(`, cannot hold without `test` or
@@ -301,86 +320,162 @@ fn attribute(tokens: &[Located], at: usize) -> (bool, Option<String>, usize) {
     (only_test, path, end)
 }
 
-/// Reads one source: every production use of [`NAME`], and the modules declared under `cfg(test)`.
+/// Reads one source: every production use of [`NAME`], and every module it declares out of line.
 fn read(text: &str) -> Reading {
     let tokens = lex(text);
     let mut reading = Reading::default();
-    let mut at = 0;
-    while at < tokens.len() {
-        if tokens[at].token == Token::Punct('#')
-            && tokens.get(at + 1).map(|located| &located.token) == Some(&Token::Punct('['))
-        {
-            // One or more attributes, then the item they are on.
-            let mut test_only = false;
-            let mut path = None;
-            while at < tokens.len()
-                && tokens[at].token == Token::Punct('#')
-                && tokens.get(at + 1).map(|located| &located.token) == Some(&Token::Punct('['))
-            {
-                let (only_test, named_path, end) = attribute(&tokens, at + 2);
-                test_only |= only_test;
-                if named_path.is_some() {
-                    path = named_path;
-                }
-                at = end;
+    block(
+        &tokens,
+        0,
+        tokens.len(),
+        false,
+        &mut Vec::new(),
+        &mut reading,
+    );
+    reading
+}
+
+/// Reads the items of one module body, the tokens `at..end`: inside test code when `test_only`,
+/// and inside the inline modules `inline` names.
+fn block(
+    tokens: &[Located],
+    mut at: usize,
+    end: usize,
+    test_only: bool,
+    inline: &mut Vec<String>,
+    reading: &mut Reading,
+) {
+    let starts_attribute = |index: usize| {
+        index + 1 < end
+            && tokens[index].token == Token::Punct('#')
+            && tokens[index + 1].token == Token::Punct('[')
+    };
+    while at < end {
+        // One or more attributes, then the item they are on.
+        let mut item_test_only = test_only;
+        let mut path = None;
+        let mut attributed = false;
+        while starts_attribute(at) {
+            let (only_test, named_path, after) = attribute(tokens, at + 2);
+            item_test_only |= only_test;
+            if named_path.is_some() {
+                path = named_path;
             }
-            if test_only {
-                // The item the attributes are on: to the `;` or `,` that ends it at its own depth,
-                // or through the braces it opens and a `;` or `,` right after them. A bracket that
-                // closes what the item is inside ends the item without being part of it: an
-                // attribute on the last field of a struct is followed by the struct's own `}`.
-                let start = at;
-                let mut depth = 0_i32;
-                while at < tokens.len() {
-                    match tokens[at].token {
-                        Token::Punct('{' | '(' | '[') => depth += 1,
-                        Token::Punct('}' | ')' | ']') => {
-                            if depth == 0 {
-                                break;
-                            }
-                            depth -= 1;
-                            if depth == 0 && tokens[at].token == Token::Punct('}') {
-                                at += 1;
-                                if tokens.get(at).is_some_and(|next| {
-                                    matches!(next.token, Token::Punct(';' | ','))
-                                }) {
-                                    at += 1;
-                                }
-                                break;
-                            }
-                        }
-                        Token::Punct(';' | ',') if depth == 0 => {
-                            at += 1;
-                            break;
-                        }
-                        _ => {}
-                    }
-                    at += 1;
+            attributed = true;
+            at = after;
+        }
+        if let Some((name, after_name)) = module_item(tokens, at, end) {
+            match tokens.get(after_name).map(|located| &located.token) {
+                Some(Token::Punct(';')) => {
+                    reading.declarations.push(Declaration {
+                        name,
+                        path,
+                        inline: inline.clone(),
+                        test_only: item_test_only,
+                    });
+                    at = after_name + 1;
+                    continue;
                 }
-                // `mod name;` declares a file that is test code as a whole.
-                let item: Vec<&Token> = tokens[start..at]
-                    .iter()
-                    .map(|located| &located.token)
-                    .collect();
-                if let [
-                    ..,
-                    Token::Ident(keyword),
-                    Token::Ident(name),
-                    Token::Punct(';'),
-                ] = item.as_slice()
-                    && keyword == "mod"
-                {
-                    reading.test_modules.push((name.clone(), path));
+                Some(Token::Punct('{')) => {
+                    let close = closing_brace(tokens, after_name, end);
+                    inline.push(path.unwrap_or(name));
+                    block(
+                        tokens,
+                        after_name + 1,
+                        close,
+                        item_test_only,
+                        inline,
+                        reading,
+                    );
+                    inline.pop();
+                    at = close + 1;
+                    continue;
                 }
+                _ => {}
             }
+        }
+        if attributed && item_test_only && !test_only {
+            at = past_item(tokens, at, end);
             continue;
         }
-        if tokens[at].token == Token::Ident(NAME.to_owned()) {
-            reading.uses.push(tokens[at].line);
+        if at < end {
+            if !test_only && tokens[at].token == Token::Ident(NAME.to_owned()) {
+                reading.uses.push(tokens[at].line);
+            }
+            at += 1;
+        }
+    }
+}
+
+/// When the tokens at `at` are `mod name`, after any visibility, the name and the index just past
+/// it.
+fn module_item(tokens: &[Located], at: usize, end: usize) -> Option<(String, usize)> {
+    let token = |index: usize| (index < end).then(|| &tokens[index].token);
+    let mut next = at;
+    if token(next) == Some(&Token::Ident("pub".to_owned())) {
+        next += 1;
+        // `pub(crate)`, `pub(super)`, `pub(in path)`.
+        if token(next) == Some(&Token::Punct('(')) {
+            while next < end && token(next) != Some(&Token::Punct(')')) {
+                next += 1;
+            }
+            next += 1;
+        }
+    }
+    match (token(next), token(next + 1)) {
+        (Some(Token::Ident(keyword)), Some(Token::Ident(name))) if keyword == "mod" => {
+            Some((name.clone(), next + 2))
+        }
+        _ => None,
+    }
+}
+
+/// The index of the brace that closes the one at `open`, or `end` when none does.
+fn closing_brace(tokens: &[Located], open: usize, end: usize) -> usize {
+    let mut depth = 0_usize;
+    for (index, located) in tokens.iter().enumerate().take(end).skip(open) {
+        match located.token {
+            Token::Punct('{') => depth += 1,
+            Token::Punct('}') => {
+                depth -= 1;
+                if depth == 0 {
+                    return index;
+                }
+            }
+            _ => {}
+        }
+    }
+    end
+}
+
+/// The index just past the item starting at `at`: to the `;` or `,` that ends it at its own depth,
+/// or through the braces it opens and a `;` or `,` right after them. A bracket that closes what the
+/// item is inside ends the item without being part of it: an attribute on the last field of a
+/// struct is followed by the struct's own `}`.
+fn past_item(tokens: &[Located], mut at: usize, end: usize) -> usize {
+    let mut depth = 0_i32;
+    while at < end {
+        match tokens[at].token {
+            Token::Punct('{' | '(' | '[') => depth += 1,
+            Token::Punct('}' | ')' | ']') => {
+                if depth == 0 {
+                    return at;
+                }
+                depth -= 1;
+                if depth == 0 && tokens[at].token == Token::Punct('}') {
+                    at += 1;
+                    if at < end && matches!(tokens[at].token, Token::Punct(';' | ',')) {
+                        at += 1;
+                    }
+                    return at;
+                }
+            }
+            Token::Punct(';' | ',') if depth == 0 => return at + 1,
+            _ => {}
         }
         at += 1;
     }
-    reading
+    at
 }
 
 /// Where the files a file's out-of-line modules live: beside `lib.rs`, `main.rs` and `mod.rs`, and
@@ -420,6 +515,98 @@ fn workspace() -> PathBuf {
         .expect("the workspace")
 }
 
+/// The directory a declaration inside the inline modules `inline` of `file` names its files from.
+fn inline_directory(file: &Path, inline: &[String]) -> PathBuf {
+    inline
+        .iter()
+        .fold(module_directory(file), |directory, part| {
+            directory.join(part)
+        })
+}
+
+/// The files a declaration of `file` can name: its `#[path]`, relative to the declaring file's
+/// directory outside an inline module and to the inline module's directory inside one, and
+/// otherwise `name.rs` or `name/mod.rs`.
+fn declared_files(file: &Path, declaration: &Declaration) -> Vec<PathBuf> {
+    match &declaration.path {
+        Some(path) if declaration.inline.is_empty() => vec![normalise(
+            &file.parent().unwrap_or_else(|| Path::new("")).join(path),
+        )],
+        Some(path) => vec![normalise(
+            &inline_directory(file, &declaration.inline).join(path),
+        )],
+        None => {
+            let directory = inline_directory(file, &declaration.inline);
+            vec![
+                normalise(&directory.join(format!("{}.rs", declaration.name))),
+                normalise(&directory.join(&declaration.name).join("mod.rs")),
+            ]
+        }
+    }
+}
+
+/// A path with its `.` and `..` parts taken out, as far as the path itself says.
+fn normalise(path: &Path) -> PathBuf {
+    let mut normal = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normal.pop();
+            }
+            other => normal.push(other),
+        }
+    }
+    normal
+}
+
+/// Every production use of [`NAME`] in `sources`, each `(file, text)`, as `(file, line)`.
+///
+/// A file is production code when no `mod` names it, a crate's root among them, or when a `mod`
+/// that is not test code names it from a file that is production code; the rest is test code.
+fn production_uses(sources: &[(PathBuf, String)]) -> Vec<(PathBuf, usize)> {
+    let readings: BTreeMap<PathBuf, Reading> = sources
+        .iter()
+        .map(|(file, text)| (normalise(file), read(text)))
+        .collect();
+    let named: BTreeSet<PathBuf> = readings
+        .iter()
+        .flat_map(|(file, reading)| {
+            reading
+                .declarations
+                .iter()
+                .flat_map(|declaration| declared_files(file, declaration))
+        })
+        .collect();
+    let mut production: BTreeSet<PathBuf> = readings
+        .keys()
+        .filter(|file| !named.contains(*file))
+        .cloned()
+        .collect();
+    // What production code declares is production code, until nothing more is.
+    loop {
+        let found: Vec<PathBuf> = production
+            .iter()
+            .flat_map(|file| {
+                readings[file]
+                    .declarations
+                    .iter()
+                    .filter(|declaration| !declaration.test_only)
+                    .flat_map(|declaration| declared_files(file, declaration))
+            })
+            .filter(|declared| readings.contains_key(declared) && !production.contains(declared))
+            .collect();
+        if found.is_empty() {
+            break;
+        }
+        production.extend(found);
+    }
+    production
+        .iter()
+        .flat_map(|file| readings[file].uses.iter().map(|line| (file.clone(), *line)))
+        .collect()
+}
+
 /// Every production use of [`NAME`] under `crates/*/src`, as `(file, line)` relative to the
 /// workspace, and the number of files read.
 fn uses_in(workspace: &Path) -> (Vec<(String, usize)>, usize) {
@@ -435,45 +622,26 @@ fn uses_in(workspace: &Path) -> (Vec<(String, usize)>, usize) {
     for source in members {
         sources(&source, &mut files);
     }
-    // Files a `cfg(test)` module declares are test code, and so is every file below them.
-    let mut test_files: BTreeSet<PathBuf> = BTreeSet::new();
-    let mut readings = Vec::new();
-    for file in &files {
-        let text = std::fs::read_to_string(file).expect("a source");
-        let reading = read(&text);
-        for (name, path) in &reading.test_modules {
-            let directory = module_directory(file);
-            match path {
-                Some(path) => {
-                    test_files.insert(file.parent().unwrap_or_else(|| Path::new("")).join(path));
-                }
-                None => {
-                    test_files.insert(directory.join(format!("{name}.rs")));
-                    test_files.insert(directory.join(name));
-                }
-            }
-        }
-        readings.push((file.clone(), reading));
-    }
-    let under_test = |file: &Path| {
-        test_files
-            .iter()
-            .any(|test| file == test || file.starts_with(test))
-    };
-    let mut uses = Vec::new();
-    for (file, reading) in readings {
-        if under_test(&file) {
-            continue;
-        }
-        let relative = file
-            .strip_prefix(workspace)
-            .expect("inside the workspace")
-            .to_string_lossy()
-            .replace('\\', "/");
-        for line in reading.uses {
-            uses.push((relative.clone(), line));
-        }
-    }
+    let sources: Vec<(PathBuf, String)> = files
+        .iter()
+        .map(|file| {
+            (
+                file.clone(),
+                std::fs::read_to_string(file).expect("a source"),
+            )
+        })
+        .collect();
+    let uses = production_uses(&sources)
+        .into_iter()
+        .map(|(file, line)| {
+            let relative = file
+                .strip_prefix(workspace)
+                .expect("inside the workspace")
+                .to_string_lossy()
+                .replace('\\', "/");
+            (relative, line)
+        })
+        .collect();
     (uses, files.len())
 }
 
@@ -550,18 +718,126 @@ fn the_reading_tells_code_from_tests_and_from_words() {
     assert_eq!(after.uses, vec![3]);
     // A test module's own file is declared, and the declaration is found.
     let declared = read("#[cfg(test)]\nmod tests;\nfn g() {}");
-    assert_eq!(declared.test_modules, vec![("tests".to_owned(), None)]);
-    let by_path = read("#[cfg(test)]\n#[path = \"checks/one.rs\"]\nmod one;");
     assert_eq!(
-        by_path.test_modules,
-        vec![("one".to_owned(), Some("checks/one.rs".to_owned()))]
+        declared.declarations,
+        vec![Declaration {
+            name: "tests".to_owned(),
+            path: None,
+            inline: Vec::new(),
+            test_only: true,
+        }]
+    );
+    let by_path = read("#[cfg(test)]\n#[path = \"checks/one.rs\"]\npub(crate) mod one;");
+    assert_eq!(
+        by_path.declarations,
+        vec![Declaration {
+            name: "one".to_owned(),
+            path: Some("checks/one.rs".to_owned()),
+            inline: Vec::new(),
+            test_only: true,
+        }]
+    );
+    // Inside inline modules, with the directory each gives, and test code inside a test module.
+    let nested = read(
+        "mod outer {\n    mod inner;\n    #[path = \"moved\"]\n    mod away { mod deep; }\n}\n\
+         #[cfg(test)]\nmod tests { mod helpers; fn f() { current_exe(); } }",
+    );
+    assert!(nested.uses.is_empty());
+    assert_eq!(
+        nested
+            .declarations
+            .iter()
+            .map(|declaration| (
+                declaration.name.as_str(),
+                declaration.inline.join("/"),
+                declaration.test_only
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            ("inner", "outer".to_owned(), false),
+            ("deep", "outer/moved".to_owned(), false),
+            ("helpers", "tests".to_owned(), true),
+        ]
     );
     assert_eq!(
         module_directory(Path::new("crates/x/src/service.rs")),
         Path::new("crates/x/src/service")
     );
     assert_eq!(
+        normalise(Path::new("crates/x/src/../../y/tests/mod.rs")),
+        Path::new("crates/y/tests/mod.rs")
+    );
+    assert_eq!(
         module_directory(Path::new("crates/x/src/lib.rs")),
         Path::new("crates/x/src")
+    );
+}
+
+/// A file is passed over only when nothing but test code declares it, and a declaration inside an
+/// inline module names the file the compiler reads for it.
+#[test]
+fn a_file_is_test_code_only_when_nothing_else_declares_it() {
+    let uses = |files: &[(&str, &str)]| {
+        let sources: Vec<(PathBuf, String)> = files
+            .iter()
+            .map(|(path, text)| (PathBuf::from(path), (*text).to_owned()))
+            .collect();
+        let mut found: Vec<String> = production_uses(&sources)
+            .into_iter()
+            .map(|(file, _)| file.to_string_lossy().replace('\\', "/"))
+            .collect();
+        found.sort();
+        found
+    };
+    let asks = "pub fn f() { let _ = std::env::current_exe(); }";
+    // A file a test module and a production module both load is production code.
+    assert_eq!(
+        uses(&[
+            (
+                "src/lib.rs",
+                "#[cfg(test)]\n#[path = \"shared.rs\"]\nmod tests;\nmod shared;",
+            ),
+            ("src/shared.rs", asks),
+        ]),
+        vec!["src/shared.rs"]
+    );
+    // The control: loaded by the test module alone, it is test code.
+    assert!(
+        uses(&[
+            (
+                "src/lib.rs",
+                "#[cfg(test)]\n#[path = \"shared.rs\"]\nmod tests;"
+            ),
+            ("src/shared.rs", asks),
+        ])
+        .is_empty()
+    );
+    // Nested: an inline module's declarations are under its directory, in a file named for its
+    // module and in `lib.rs` alike; a test module's are test code, and so is what a test file
+    // declares.
+    assert_eq!(
+        uses(&[
+            (
+                "src/lib.rs",
+                "mod outer { mod inner; #[cfg(test)] mod checks; }\nmod a;\n#[cfg(test)]\nmod tests;",
+            ),
+            ("src/outer/inner.rs", asks),
+            ("src/outer/checks.rs", asks),
+            ("src/a.rs", "mod inline { #[path = \"other.rs\"] mod c; }"),
+            ("src/a/inline/other.rs", asks),
+            ("src/tests.rs", "mod deeper;"),
+            ("src/tests/deeper.rs", asks),
+        ]),
+        vec!["src/a/inline/other.rs", "src/outer/inner.rs"]
+    );
+    // The control: a file at the place a reading that forgot the inline module would give is not
+    // what the declaration names, and is read as a file nothing declares.
+    assert_eq!(
+        uses(&[
+            ("src/lib.rs", "mod outer { #[cfg(test)] mod checks; }"),
+            ("src/checks.rs", asks),
+            ("src/outer/checks.rs", asks),
+        ]),
+        vec!["src/checks.rs"]
     );
 }
