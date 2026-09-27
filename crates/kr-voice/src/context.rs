@@ -24,7 +24,7 @@
 //!
 //! Everything selected here is project text. The separation from application-authored instructions
 //! is in the types: [`Selection`] produces
-//! [`VoiceContextSelection`](kr_protocol::voice::VoiceContextSelection), and instructions are
+//! [`VoiceContextSelection`], and instructions are
 //! [`VoiceInstructions`](kr_protocol::voice::VoiceInstructions), which this module cannot produce
 //! and never touches.
 
