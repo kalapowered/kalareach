@@ -109,10 +109,22 @@ pub fn report(
         .filter_map(|name| {
             let (answer, identity) = identified(name, answer(name, &desktop));
             let capability = CapabilityId::new(name).ok()?;
+            // The display server's record is about the server, not a binary: the protocol it
+            // speaks is its schema and the compositor is the application it is about, so a
+            // compositor or a protocol that changes changes the record as a replaced tool does.
+            let server = name == capabilities::DISPLAY_SERVER;
+            let subject = if server {
+                CapabilitySubject {
+                    application: desktop.compositor.clone(),
+                    ..subject.clone()
+                }
+            } else {
+                subject.clone()
+            };
             Some(CapabilityRecord {
                 capability,
                 version: U64::new(CAPABILITY_VERSION),
-                subject: subject.clone(),
+                subject,
                 revision,
                 state: answer.state,
                 evidence_source: answer.evidence,
@@ -120,7 +132,7 @@ pub fn report(
                     version: Nullable(identity),
                     binary: Nullable(answer.tool),
                     package: Nullable::null(),
-                    schema: Nullable::null(),
+                    schema: Nullable(server.then(|| desktop.display_server.as_str().to_owned())),
                     profile: Nullable::some(desktop.worker_profile),
                 },
                 invalidation: invalidation(name),
@@ -195,16 +207,14 @@ pub fn answer(capability: &str, desktop: &DesktopContext) -> Answer {
     if let Some(refusal) = context_refusal(capability, desktop) {
         return refusal;
     }
+    // The display server is the one capability whose evidence turns on no binary: the answer is
+    // about the server, which the record names by its protocol and its compositor.
     if capability == capabilities::DISPLAY_SERVER {
         return Answer {
             state: CapabilityState::QualifiedAvailable,
             evidence: CapabilityEvidenceSource::PlatformQuery,
             reason: None,
-            tool: desktop
-                .compositor
-                .as_ref()
-                .cloned()
-                .or_else(|| Some(desktop.display_server.as_str().to_owned())),
+            tool: None,
         };
     }
     let tool = facility(capability, desktop.display_server);
@@ -1059,6 +1069,61 @@ mod tests {
                 .contains(&CapabilityInvalidation::OsPermission),
             "a permission change invalidates a permission-gated capability"
         );
+    }
+
+    #[test]
+    fn the_display_server_record_names_no_binary_and_changes_with_its_compositor() {
+        // A record in the form two reports are compared in: everything but the revision and the
+        // moment it was observed, which is how the daemon decides whether the evidence changed.
+        let server = |context: DesktopContext| {
+            let report = report(environment(), None, context, CapabilityRevision::new(1));
+            let mut record = report
+                .record(capabilities::DISPLAY_SERVER)
+                .expect("the display server is a capability of its own")
+                .clone();
+            record.revision = CapabilityRevision::new(0);
+            record.observed_at_ms = kr_protocol::scalars::TimestampMs::new(0);
+            record
+        };
+        let sway = server(desktop(DisplayServer::Wayland, Some("sway")));
+        let gnome = server(desktop(DisplayServer::Wayland, Some("gnome")));
+        let x11 = server(desktop(DisplayServer::X11, Some("sway")));
+        for record in [&sway, &gnome, &x11] {
+            // A field named for a binary names one or nothing, and there is no binary here.
+            assert!(!record.identity.binary.is_present(), "{record:?}");
+            assert!(!record.identity.version.is_present(), "{record:?}");
+        }
+        // The compositor is the application the record is about, and the protocol the server
+        // speaks is its schema.
+        assert_eq!(
+            sway.subject.application.as_ref().map(String::as_str),
+            Some("sway")
+        );
+        assert_eq!(
+            sway.identity.schema.as_ref().map(String::as_str),
+            Some("wayland")
+        );
+        assert_eq!(
+            x11.identity.schema.as_ref().map(String::as_str),
+            Some("x11")
+        );
+        // So a compositor that changed, and a display server that changed, are each a record that
+        // changed, and the daemon moves the revision it stamps on the report.
+        assert_ne!(sway, gnome);
+        assert_ne!(sway, x11);
+        // The compositor is not the application any other record is about.
+        let report = report(
+            environment(),
+            None,
+            desktop(DisplayServer::Wayland, Some("sway")),
+            CapabilityRevision::new(1),
+        );
+        for record in &report.records {
+            if record.capability.as_str() != capabilities::DISPLAY_SERVER {
+                assert!(!record.subject.application.is_present(), "{record:?}");
+                assert!(!record.identity.schema.is_present(), "{record:?}");
+            }
+        }
     }
 
     #[test]
