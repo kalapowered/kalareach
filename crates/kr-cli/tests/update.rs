@@ -1571,13 +1571,95 @@ fn an_install_stopped_before_its_switch_is_finished_by_the_next() {
     );
     assert_eq!(host.store.current().expect("reads"), None);
 
-    // The control: the same release is made current as it is.
+    // The control: the same release, whole, is made current as it is, and sealed as it is used:
+    // what an install left before it made the release read-only is read-only now.
     host.install(&one);
     assert_eq!(
         host.store.current().expect("reads"),
         Some(one.name().clone())
     );
     assert!(host.record()["update"].is_null());
+    let kept = host.store.release_directory(one.name());
+    for path in [
+        kept.clone(),
+        kept.join("bin"),
+        kept.join(module_tree()[0].0),
+    ] {
+        assert!(
+            std::fs::metadata(&path)
+                .expect("installed")
+                .permissions()
+                .readonly(),
+            "{} is read-only",
+            path.display()
+        );
+    }
+}
+
+/// KR-REQ-26.09: a release already in the store is used again only when it is every file its
+/// manifest lists and nothing else, files and directories only, and it is sealed read-only as it is
+/// used.
+#[test]
+fn a_release_kept_in_the_store_is_used_again_only_when_whole() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let (manifest, files, document) = small_release(&keys().targets);
+    let kept = |change: &dyn Fn(&Path)| {
+        let directory = tempfile::tempdir().expect("a directory");
+        let store = Store::at(directory.path().join("host"));
+        store.create_directories().expect("the store's directories");
+        let release = store.release_directory(&manifest.release);
+        for (path, contents) in &files {
+            let file = release.join(path);
+            std::fs::create_dir_all(file.parent().expect("a directory")).expect("the tree");
+            std::fs::write(&file, contents).expect("a file");
+        }
+        std::fs::write(release.join(kr_protocol::update::MANIFEST_FILE), &document)
+            .expect("the manifest");
+        change(&release);
+        let used = kr_cli::update::release::readmit(&store, &manifest);
+        (directory, store, used)
+    };
+    // The control: whole, and writable as an install that stopped before sealing it leaves it.
+    let (directory, store, used) = kept(&|_| {});
+    used.unwrap_or_else(|error| panic!("a whole release is used again: {error}"));
+    let release = store.release_directory(&manifest.release);
+    for (path, mode) in [
+        ("", 0o555),
+        ("bin", 0o555),
+        ("bin/kr", 0o555),
+        ("share/update-root.json", 0o444),
+        (kr_protocol::update::MANIFEST_FILE, 0o444),
+    ] {
+        let found = std::fs::metadata(release.join(path))
+            .expect("there")
+            .permissions()
+            .mode();
+        assert_eq!(found & 0o777, mode, "{path} is sealed");
+    }
+    writable(directory.path());
+    /// What is done to a kept release before it is offered again.
+    type Change = fn(&Path);
+    let changes: [(&str, Change); 4] = [
+        ("a missing file", |release: &Path| {
+            std::fs::remove_file(release.join("bin/kr")).expect("removed");
+        }),
+        ("a changed file", |release: &Path| {
+            std::fs::write(release.join("bin/kr"), b"#!/bin/zsh\n").expect("changed");
+        }),
+        ("a link", |release: &Path| {
+            std::fs::remove_file(release.join("bin/kr")).expect("removed");
+            std::os::unix::fs::symlink("/bin/sh", release.join("bin/kr")).expect("linked");
+        }),
+        ("a file it does not list", |release: &Path| {
+            std::fs::write(release.join("share/extra"), b"x").expect("written");
+        }),
+    ];
+    for (what, change) in changes {
+        let (directory, _, used) = kept(&change);
+        assert!(used.is_err(), "a release with {what} is not used again");
+        writable(directory.path());
+    }
 }
 
 /// KR-REQ-26.06: a program of a release still being staged does not start once it is runnable,
