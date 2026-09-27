@@ -503,6 +503,24 @@ pub fn appended_since<'a>(before: Option<&[u8]>, now: Option<&'a [u8]>) -> Optio
     )
 }
 
+/// What a line appended to a file only appended to says of itself, where it is a JSON object: the
+/// conversation it names (its `id`, or its `session_id` as an agent's history line names it) and
+/// its time (its `updated_at`, or its `ts`), each as the line has it. Nothing else of the line is
+/// read.
+#[must_use]
+pub fn line_identity(line: &[u8]) -> (Option<String>, Option<Value>) {
+    let Ok(Value::Object(fields)) = serde_json::from_slice::<Value>(line) else {
+        return (None, None);
+    };
+    let id = ["id", "session_id"]
+        .iter()
+        .find_map(|key| fields.get(*key).and_then(Value::as_str).map(str::to_owned));
+    let time = ["updated_at", "ts"]
+        .iter()
+        .find_map(|key| fields.get(*key).cloned());
+    (id, time)
+}
+
 /// Whether `bytes` hold one of `needles`.
 #[must_use]
 pub fn holds_any(bytes: &[u8], needles: &[&str]) -> bool {
@@ -1304,6 +1322,25 @@ mod tests {
             "an earlier line went"
         );
         assert_eq!(lines(Some("a\nb\n"), Some("a\n")), None, "the file shrank");
+    }
+
+    #[test]
+    fn an_appended_line_names_its_conversation_and_time_as_an_index_or_a_history_line_does() {
+        assert_eq!(
+            line_identity(
+                br#"{"id":"01a0e3de-f28d-78b3-a902-158410b19f5b","thread_name":"x","updated_at":"2026-09-27T17:17:55Z"}"#
+            ),
+            (
+                Some("01a0e3de-f28d-78b3-a902-158410b19f5b".to_owned()),
+                Some(json!("2026-09-27T17:17:55Z"))
+            )
+        );
+        assert_eq!(
+            line_identity(b"{\"session_id\":\"s1\",\"ts\":1790529467,\"text\":\"kr0123\"}\n"),
+            (Some("s1".to_owned()), Some(json!(1_790_529_467)))
+        );
+        assert_eq!(line_identity(b"not json\n"), (None, None));
+        assert_eq!(line_identity(b"[1,2]\n"), (None, None));
     }
 
     #[test]
