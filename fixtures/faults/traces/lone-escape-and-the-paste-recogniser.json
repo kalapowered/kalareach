@@ -1,0 +1,28 @@
+{
+  "format": "kalareach.trace/1",
+  "name": "lone-escape-and-the-paste-recogniser",
+  "about": "a lone escape typed while the application has not asked for bracketed paste is forwarded at once; typed after it has, it could start a paste delimiter, so it is held, and the recogniser's timer releases it once its 25 ms have passed on the clock, with no further keystroke",
+  "columns": 20,
+  "rows": 3,
+  "wall_ms": 1790000000000,
+  "steps": [
+    { "do": "output", "text": "$ " },
+    { "do": "attach", "client": "a", "form": "direct" },
+    { "do": "acquire", "client": "a" },
+    { "do": "input", "client": "a", "text": "\u001b" },
+    {
+      "do": "take_input",
+      "expect": [
+        { "batch": "lease_changed" },
+        { "batch": "input", "client": "a", "text": "\u001b" }
+      ]
+    },
+    { "do": "output", "text": "\u001b[?2004h" },
+    { "do": "input", "client": "a", "text": "\u001b" },
+    { "do": "take_input", "expect": [] },
+    { "do": "advance", "ms": 24 },
+    { "do": "take_input", "expect": [] },
+    { "do": "advance", "ms": 1 },
+    { "do": "take_input", "expect": [{ "batch": "input", "client": "a", "text": "\u001b" }] }
+  ]
+}

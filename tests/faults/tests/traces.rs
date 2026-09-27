@@ -10,9 +10,10 @@ use kr_faults::trace::{self, Batch, Cause, Step, Trace};
 use kr_protocol::projection::ProjectedBuffer;
 
 /// The kept traces, each with the test below that replays it.
-const KEPT: [&str; 4] = [
+const KEPT: [&str; 5] = [
     "attach-inside-a-1049-switch",
     "clipboard-before-and-after-an-attach",
+    "lone-escape-and-the-paste-recogniser",
     "takeover-during-a-paste",
     "time-rollback-and-suspension",
 ];
@@ -60,6 +61,15 @@ fn a_client_attaching_inside_a_1049_switch_holds_the_screen_on_each_side_of_it()
 #[test]
 fn a_clipboard_write_before_an_attach_is_never_performed_and_one_after_it_is_once() {
     replays("clipboard-before-and-after-an-attach");
+}
+
+/// KR-REQ-29.03: a lone escape and the paste recogniser, replayed from the retained trace on
+/// simulated time: forwarded at once while the application has not asked for bracketed paste, and
+/// held after it has until the recogniser's deadline passes, then released by its timer with no
+/// further keystroke.
+#[test]
+fn a_lone_escape_is_held_only_while_it_could_start_a_paste_and_only_until_its_deadline() {
+    replays("lone-escape-and-the-paste-recogniser");
 }
 
 #[test]
