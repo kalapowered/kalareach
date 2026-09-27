@@ -10,7 +10,10 @@
 //!   being permanently newer than one that changed once, which is the same sentence as *coalescing
 //!   must not keep a quiet session at the back* seen from the other end.
 //! * *Use measured service time and eligible session count to adapt cadence.* [`Scheduler::cadence_ms`]
-//!   is exactly that product, floored at the cooldown, never fixed at it.
+//!   is exactly that product, floored at the cooldown, never fixed at it. It also gates dispatch: an
+//!   ordinary session is described again once the cadence has passed since its last job, so the
+//!   cadence a client is shown is the one the queue runs at. Foreground and attention work keeps
+//!   the cooldown alone.
 //! * *30 seconds is a minimum cooldown, not a refresh SLA for every session.* Nothing here promises
 //!   a refresh. A session's next description arrives when the queue reaches it.
 //! * *Service an oldest waiting ordinary job after at most three priority jobs.* [`Scheduler::dequeue`]
@@ -87,7 +90,7 @@ pub enum Enqueued {
 pub enum NothingToDequeue {
     /// The queue is empty.
     Empty,
-    /// Every queued session is still inside its cooldown.
+    /// Every queued session is still inside its cooldown, or an ordinary one inside the cadence.
     EveryoneCoolingDown,
 }
 
@@ -239,14 +242,16 @@ impl Scheduler {
     /// that product is the soonest a session can be described again without the queue growing.
     /// Section 22's thirty seconds is the floor beneath it, never the answer.
     ///
-    /// Eligible means eligible now: a session inside its cooldown is not going to be served on this
-    /// pass, and counting it would publish a cadence longer than the one the queue will run at.
+    /// Eligible means past its cooldown now: a session inside its cooldown is not going to be served
+    /// on this pass, and counting it would publish a cadence longer than the one the queue will run
+    /// at. The count is of the cooldown rather than of the cadence itself, which would make the
+    /// cadence depend on its own answer.
     #[must_use]
     pub fn cadence_ms(&self, now: Reading) -> u64 {
         let eligible = self
             .queued
             .values()
-            .filter(|job| self.is_eligible(&job.session_id, now))
+            .filter(|job| self.past_cooldown(&job.session_id, now))
             .count()
             .max(1) as u64;
         let pass = self
@@ -292,9 +297,28 @@ impl Scheduler {
         Enqueued::Admitted
     }
 
-    /// Returns whether a session's cooldown has elapsed.
+    /// Returns whether a session may be described now.
+    ///
+    /// A session whose queued job is ordinary waits for the cadence since its last job; any other
+    /// session waits for the cooldown. A session that has never been described waits for nothing.
     #[must_use]
     pub fn is_eligible(&self, session_id: &SessionId, now: Reading) -> bool {
+        self.eligible_under(session_id, now, self.cadence_ms(now))
+    }
+
+    /// Returns whether a session may be described now, with the cadence already worked out.
+    fn eligible_under(&self, session_id: &SessionId, now: Reading, cadence_ms: u64) -> bool {
+        let wait_ms = match self.queued.get(session_id) {
+            Some(job) if job.priority == Priority::Ordinary => cadence_ms,
+            _ => self.budgets.session_cooldown_ms,
+        };
+        self.last_dispatch_ms
+            .get(session_id)
+            .is_none_or(|dispatched| now.since_ms(*dispatched) >= wait_ms)
+    }
+
+    /// Returns whether a session's cooldown has elapsed.
+    fn past_cooldown(&self, session_id: &SessionId, now: Reading) -> bool {
         self.last_dispatch_ms
             .get(session_id)
             .is_none_or(|dispatched| now.since_ms(*dispatched) >= self.budgets.session_cooldown_ms)
@@ -311,10 +335,11 @@ impl Scheduler {
         if self.queued.is_empty() {
             return Err(NothingToDequeue::Empty);
         }
+        let cadence_ms = self.cadence_ms(now);
         let eligible: Vec<&QueuedJob> = self
             .queued
             .values()
-            .filter(|job| self.is_eligible(&job.session_id, now))
+            .filter(|job| self.eligible_under(&job.session_id, now, cadence_ms))
             .collect();
         if eligible.is_empty() {
             return Err(NothingToDequeue::EveryoneCoolingDown);

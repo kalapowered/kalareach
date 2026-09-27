@@ -297,6 +297,93 @@ fn the_cadence_follows_measured_service_time_and_the_eligible_count() {
     assert!(scheduler.cadence_ms(at(60_000)) > Budgets::DEFAULTS.session_cooldown_ms);
 }
 
+/// KR-REQ-22.14: under mixed demand an ordinary session is described again only once the measured
+/// cadence has passed, a priority session once the thirty-second cooldown has, and an ordinary job
+/// that is due still waits behind at most three priority jobs.
+///
+/// One ordinary session and ten foreground sessions all change without pause, each queuing its next
+/// job the moment its last one is taken, and every job takes ten seconds. A queue gated by the
+/// cooldown alone serves the ordinary session every fourth job, forty seconds apart, while it
+/// publishes a cadence of eighty: the cadence it shows is not the one it runs at.
+#[test]
+fn under_mixed_demand_an_ordinary_session_waits_for_the_measured_cadence() {
+    let mut scheduler = Scheduler::new(Budgets::DEFAULTS);
+    let ordinary = session(1);
+    let foreground: Vec<SessionId> = (2..=11_u8).map(session).collect();
+    scheduler.enqueue(Priority::Ordinary, context_for(&ordinary, 1), at(0));
+    for session_id in &foreground {
+        scheduler.enqueue(Priority::Foreground, context_for(session_id, 1), at(0));
+    }
+    let service_ms = 10_000;
+    let cooldown_ms = Budgets::DEFAULTS.session_cooldown_ms;
+    let mut now = 1_000;
+    let mut revision = 1;
+    let mut last_dispatch: std::collections::BTreeMap<SessionId, u64> =
+        std::collections::BTreeMap::new();
+    let mut priority_jobs_while_the_ordinary_one_was_due = 0;
+    let mut ordinary_dispatches = 0;
+    let mut gaps = Vec::new();
+    for _ in 0..200 {
+        let cadence = scheduler.cadence_ms(at(now));
+        let ordinary_due = scheduler.is_eligible(&ordinary, at(now));
+        let Ok(job) = scheduler.dequeue(at(now)) else {
+            now += 1_000;
+            continue;
+        };
+        let since = last_dispatch
+            .get(&job.session_id)
+            .map(|previous| now - previous);
+        match job.priority {
+            Priority::Ordinary => {
+                if let Some(since) = since {
+                    assert!(
+                        since >= cadence,
+                        "the ordinary session was described again after {since} ms, inside the \
+                         cadence of {cadence} ms this queue publishes"
+                    );
+                    gaps.push(since);
+                }
+                ordinary_dispatches += 1;
+                priority_jobs_while_the_ordinary_one_was_due = 0;
+            }
+            Priority::Foreground => {
+                if let Some(since) = since {
+                    assert!(
+                        since >= cooldown_ms,
+                        "a priority session inside its cooldown"
+                    );
+                }
+                if ordinary_due {
+                    priority_jobs_while_the_ordinary_one_was_due += 1;
+                    assert!(
+                        priority_jobs_while_the_ordinary_one_was_due <= PRIORITY_RUN_LIMIT,
+                        "a due ordinary job waited behind more than {PRIORITY_RUN_LIMIT} priority jobs"
+                    );
+                }
+            }
+        }
+        last_dispatch.insert(job.session_id, now);
+        scheduler.record_service(service_ms);
+        now += service_ms;
+        revision += 1;
+        scheduler.enqueue(
+            job.priority,
+            context_for(&job.session_id, revision),
+            at(now),
+        );
+    }
+    assert!(
+        ordinary_dispatches >= 5,
+        "the ordinary session is still described, {ordinary_dispatches} times"
+    );
+    // The control: the cadence is well above the cooldown here, so a queue that gated on the
+    // cooldown alone would have served the ordinary session sooner than it did.
+    assert!(
+        gaps.iter().all(|gap| *gap > cooldown_ms + service_ms),
+        "every gap is longer than the cooldown-only queue's forty seconds: {gaps:?}"
+    );
+}
+
 /// KR-REQ-22.14: a client is shown queued age and the last success rather than a promise.
 #[test]
 fn a_client_is_shown_queued_age_and_the_last_success() {
