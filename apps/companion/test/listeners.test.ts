@@ -337,7 +337,17 @@ describe('the scripted host', () => {
     const asked: Promise<unknown>[] = []
     // Held or not, a read out of contact is refused, and the refusal is the promise's.
     const held = controls.hold('sessionList')
-    expect(() => asked.push(port.agentSnapshot({}))).not.toThrow()
+    expect(() =>
+      asked.push(
+        port.agentSnapshot({
+          subject: {
+            session_id: '8a7b6c50-22bb-4c3d-8e4f-000000000101',
+            application_instance_id: 'a1a1a1a1-0000-4000-8000-000000000001'
+          },
+          from_node: null
+        })
+      )
+    ).not.toThrow()
     expect(() => asked.push(port.hostInfo())).not.toThrow()
     expect(() => asked.push(port.sessionList({}))).not.toThrow()
     held.release()

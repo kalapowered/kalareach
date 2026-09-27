@@ -28,6 +28,47 @@ export interface ControlState {
   readonly flags: ReadonlyMap<string, boolean>
 }
 
+/** The facts a control's visibility is decided from, as this device has been told them. */
+export interface ControlFacts {
+  /** The live instance's capability records, or null before they have been read. */
+  readonly capabilities: ReadonlyMap<string, { readonly state: string }> | null
+  /** The rights this connection holds, or null when it has not been told. */
+  readonly rights: readonly string[] | null
+  /** The binding's state, or null while it is not known. */
+  readonly bindingState: string | null
+  /** Whether a request is waiting on a person, or null before the requests have been read. */
+  readonly waitingOnPerson: boolean | null
+  /** The nodes the document holds. */
+  readonly presentNodes: ReadonlySet<string>
+  /** Whether this client is a small screen. */
+  readonly compact: boolean
+}
+
+/**
+ * The state a control's visibility is decided from: every fact this device has been told, and
+ * nothing it has not. A capability is its record's state, the rights are the connection's, the
+ * binding's state is what its instance reports, and a waiting request and a small screen are the
+ * presentation's own facts. What nobody has said stays unknown, so a control that turns on it stays
+ * hidden, and one whose condition holds is shown: the upstream composer's own text, an upload in
+ * progress and the input lease are facts this view is not told, and a named approval request is
+ * one it cannot match to what the worker lists.
+ */
+export function controlStateOf(facts: ControlFacts): ControlState {
+  const flags = new Map<string, boolean>([['compact_layout', facts.compact]])
+  if (facts.waitingOnPerson !== null) flags.set('pending_approval', facts.waitingOnPerson)
+  return {
+    capabilities: new Map(
+      [...(facts.capabilities ?? new Map<string, { readonly state: string }>())].map(
+        ([capability, record]) => [capability, record.state]
+      )
+    ),
+    rights: facts.rights === null ? null : new Set(facts.rights),
+    bindingState: facts.bindingState,
+    presentNodes: facts.presentNodes,
+    flags
+  }
+}
+
 /** An empty state: nothing known, which hides everything conditional. */
 export function emptyControlState(): ControlState {
   return {

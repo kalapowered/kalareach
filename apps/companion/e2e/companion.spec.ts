@@ -162,12 +162,13 @@ async function ringHidden(locator: Locator): Promise<number> {
 test.describe('the attention inbox', () => {
   test('shows the four states and never calls a lost connection a failure', async ({ page }) => {
     await open(page)
-    await expect(page.getByTestId('attention-pending_decision')).toBeVisible()
+    await expect(page.getByTestId('attention-pending_decision').first()).toBeVisible()
     await expect(page.getByTestId('attention-failed_action')).toBeVisible()
     await expect(page.getByTestId('attention-awaiting_review')).toBeVisible()
+    await expect(page.getByTestId('attention-notice')).toContainText('It is not a request from the host.')
     const disconnected = page.getByTestId('attention-disconnected')
     await expect(disconnected).toBeVisible()
-    await expect(disconnected).toContainText('does not')
+    await expect(disconnected).toContainText('may still be running')
     await expect(disconnected).not.toContainText(/failed|stuck/i)
     await page.screenshot({ path: shot('attention-13.01'), fullPage: true })
   })
@@ -177,13 +178,15 @@ test.describe('the attention inbox', () => {
   // completed press decides once.
   test('a press that slides off an approval decides nothing', async ({ page }) => {
     await open(page)
-    const allow = page
-      .getByTestId('attention-pending_decision')
-      .getByRole('button', { name: 'Allow' })
-    // Every decision the interface sends is an action the host issues, at the moment it is sent.
-    const issued = (): Promise<number> =>
-      page.evaluate(() => window.krTestHost?.actions.length ?? -1)
-    const before = await issued()
+    const allow = page.getByTestId('approval').getByRole('button', { name: 'Allow once' })
+    // What the session's worker holds for the request: pending until a decision reaches it.
+    const state = (): Promise<string | null> =>
+      page.evaluate(
+        () =>
+          window.krTestHost?.records.agentOf('8a7b6c50-22bb-4c3d-8e4f-000000000101').resources[0]
+            ?.state ?? null
+      )
+    expect(await state()).toBe('pending')
     const box = await allow.boundingBox()
     if (!box) throw new Error('the approval has no control')
 
@@ -191,18 +194,22 @@ test.describe('the attention inbox', () => {
     await page.mouse.down()
     await page.mouse.move(box.x + box.width / 2, box.y + box.height + 160, { steps: 6 })
     await page.mouse.up()
-    expect(await issued()).toBe(before)
+    expect(await state()).toBe('pending')
 
     await allow.click()
-    await expect(page.getByText('Allowed.')).toBeVisible()
-    expect(await issued()).toBe(before + 1)
+    await expect(page.getByText('You chose “Allow once”.')).toBeVisible()
+    expect(await state()).toBe('resolved')
   })
 
-  test('shows the command before a decision is allowed', async ({ page }) => {
+  test('shows what a decision is about, and what the agent sent, before it is allowed', async ({
+    page
+  }) => {
     await open(page)
-    await expect(page.getByTestId('attention-pending_decision')).toContainText(
-      'scripts/release.sh --publish'
-    )
+    const approval = page.getByTestId('approval')
+    await expect(approval.getByRole('heading')).toContainText('scripts/release.sh --publish')
+    await approval.getByText('What the agent sent').click()
+    await expect(approval.getByTestId('approval-source')).toContainText('execCommandApproval')
+    await page.screenshot({ path: shot('approval-11.26'), fullPage: true })
   })
 })
 
@@ -408,7 +415,7 @@ test.describe('reading once it is listening', () => {
     await expect(connection).toHaveText('In contact with this host')
     await expect(page.getByRole('button', { name: 'Sign in' })).toBeVisible()
     await page.getByRole('button', { name: /^Attention/ }).click()
-    await expect(page.locator('[data-attention="a-2"]')).toBeVisible()
+    await expect(page.locator('[data-kind="failed_action"]')).toBeVisible()
     await page.screenshot({ path: shotFor('phone-13.02-after-answer'), fullPage: true })
   })
 })
@@ -542,6 +549,23 @@ test.describe('settings over a live session', () => {
       'input the agent may act on'
     )
     await page.screenshot({ path: shot('sharing-25.08'), fullPage: true })
+  })
+
+  test('shows what an invitation carries before it exists, and issues exactly that', async ({
+    page
+  }) => {
+    await openSession(page)
+    await page.getByTestId('open-settings').click()
+    await page.getByRole('button', { name: 'Sharing' }).click()
+    const carries = page.getByTestId('invitation-carries')
+    await expect(carries).toContainText('See the live screen and what follows it')
+    await page.getByRole('switch', { name: 'Let a viewer or reviewer answer questions' }).click()
+    await expect(carries.locator('[data-notice="agent_permissions"]')).toBeVisible()
+    await page.getByRole('radio', { name: /Sam's iPhone/ }).check()
+    await page.screenshot({ path: shot('sharing-25.08-invitation'), fullPage: true })
+    await page.getByTestId('invite').click()
+    await expect(page.getByText(/Invitation issued to Sam's iPhone\. It is used once/)).toBeVisible()
+    await expect(page.getByTestId('issued-grants')).toContainText('Waiting to be used')
   })
 })
 
@@ -2402,11 +2426,20 @@ test.describe('packages', () => {
     await open(page)
     await page.getByRole('button', { name: 'Plugins' }).click()
     await expect(page.getByTestId('offline-search-note')).toBeVisible()
+    await expect(page.getByTestId('installed-list')).toContainText('openai.codex')
+    await page.getByTestId('catalogue-search').fill('tmux')
+    await expect(page.getByTestId('installed-list')).toContainText('community.tmux-status')
+    await expect(page.getByTestId('installed-list')).not.toContainText('openai.codex')
+    await page.screenshot({ path: shot('packages-11.03-installed'), fullPage: true })
     await page.getByRole('tab', { name: 'Catalogue' }).click()
-    await page.getByTestId('catalogue-search').fill('gemini')
-    await expect(page.getByTestId('catalogue-list')).toContainText('Gemini presentation')
-    await expect(page.getByTestId('catalogue-list')).not.toContainText('tmux status')
+    await page.getByTestId('catalogue-search').fill('mirror')
+    await expect(page.getByTestId('catalogue-list')).toContainText('community-mirror')
+    await expect(page.getByTestId('catalogue-list')).not.toContainText('packages.kala.to')
     await page.screenshot({ path: shot('packages-11.03'), fullPage: true })
+    await page.getByRole('tab', { name: 'Repositories' }).click()
+    await page.getByTestId('catalogue-search').fill('')
+    await expect(page.getByTestId('repository-list')).toContainText('https://packages.kala.to/metadata')
+    await page.screenshot({ path: shot('packages-11.03-repositories'), fullPage: true })
   })
 })
 

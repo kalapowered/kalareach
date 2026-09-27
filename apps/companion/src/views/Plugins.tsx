@@ -1,25 +1,48 @@
 /**
  * Installed, Catalogue and Repositories.
  *
- * The host holds the whole signed catalogue index, so search here is a filter over what is already
- * on the machine: it works with no network and says so. A package whose payload is not cached and
- * cannot be fetched is shown as exactly that, never as a capability that is quietly unavailable.
+ * The host keeps each repository's whole signed catalogue index and its installed packages on the
+ * machine, so what this screen lists is read from the host alone and its search is a filter over
+ * what is already here: it works with no network, and says so. A package the admissions leave out
+ * says why in the host's words, and a release a live binding still holds after an upgrade stays
+ * listed until its bindings close.
  */
 
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
+
+import type { CatalogueListResult, PluginListResult } from '@kalareach/protocol'
 
 import { Badge, Banner, Button, Card, Segmented } from '../components/ui'
 import { useApp } from '../app/state'
 import { failureMessage, watch, type Watch } from '../host/port'
 import { ask } from '../mobile/model/call'
-import type { PackageViews } from '../model/pending'
 
 type Tab = 'installed' | 'catalogue' | 'repositories'
+
+/** A digest as a person compares one: its first twelve characters. */
+function short(digest: string): string {
+  return digest.slice(0, 12)
+}
+
+/** A size in the units a person reads one in. */
+function bytes(count: string): string {
+  const value = Number(count)
+  if (value >= 1024 ** 3) return `${(value / 1024 ** 3).toFixed(value % 1024 ** 3 === 0 ? 0 : 1)} GiB`
+  if (value >= 1024 ** 2) return `${(value / 1024 ** 2).toFixed(value % 1024 ** 2 === 0 ? 0 : 1)} MiB`
+  if (value >= 1024) return `${Math.round(value / 1024)} KiB`
+  return `${value} bytes`
+}
+
+/** When something happened, as a local date and time. */
+function when(ms: string): string {
+  return new Date(Number(ms)).toLocaleString()
+}
 
 /** The three package views. */
 export function Plugins(): ReactNode {
   const { port } = useApp()
-  const [views, setViews] = useState<PackageViews | null>(null)
+  const [installed, setInstalled] = useState<PluginListResult | null>(null)
+  const [catalogues, setCatalogues] = useState<CatalogueListResult | null>(null)
   const [tab, setTab] = useState<Tab>('installed')
   const [query, setQuery] = useState('')
   const [failure, setFailure] = useState<string | null>(null)
@@ -30,10 +53,22 @@ export function Plugins(): ReactNode {
   const load = useCallback(() => {
     const current = reads.current?.read() ?? null
     if (current === null) return
-    ask(() => port.pluginList({}))
-      .then((result) => {
+    ask(async () => {
+      // The environment is the one this connection belongs to, as the host stamped it.
+      const connection = await port.connectionState()
+      const environment = connection.environment_id
+      if (environment === null) {
+        throw new Error(connection.reason ?? 'This application is not in contact with a host.')
+      }
+      return await Promise.all([
+        port.pluginList({ environment_id: environment }),
+        port.catalogueList({ environment_id: environment })
+      ])
+    })
+      .then(([plugins, enrolled]) => {
         if (!current()) return
-        setViews(result as PackageViews)
+        setInstalled(plugins)
+        setCatalogues(enrolled)
         setFailure(null)
       })
       .catch((error: unknown) => {
@@ -55,13 +90,23 @@ export function Plugins(): ReactNode {
   const matches = (haystack: readonly string[]) =>
     needle.length === 0 || haystack.some((value) => value.toLowerCase().includes(needle))
 
+  const plugins = (installed?.plugins ?? []).filter((plugin) =>
+    matches([plugin.plugin_id, plugin.catalogue_id, plugin.version])
+  )
+  const live = (installed?.live_releases ?? []).filter((release) =>
+    matches([release.plugin_id, release.catalogue_id, release.version])
+  )
+  const enrolled = (catalogues?.catalogues ?? []).filter((catalogue) =>
+    matches([catalogue.catalogue_id, catalogue.kind, catalogue.metadata_url, ...catalogue.ceiling])
+  )
+
   return (
     <>
       <header className="page-heading">
         <div>
           <p className="eyebrow">Plugins</p>
           <h1>Packages</h1>
-          <p>What is installed, what is available, and where it comes from.</p>
+          <p>What is installed, what each repository offers, and where it comes from.</p>
         </div>
         <div className="page-actions">
           <Segmented
@@ -93,108 +138,159 @@ export function Plugins(): ReactNode {
             type="search"
             value={query}
             data-testid="catalogue-search"
-            placeholder="Search the catalogue"
+            placeholder="Search packages and repositories"
             onChange={(event) => {
               setQuery(event.target.value)
             }}
           />
         </label>
-        {views?.index_complete ? (
-          <span className="small faint" data-testid="offline-search-note">
-            The whole index is on this host, so search works with no network.
-          </span>
-        ) : null}
+        <span className="small faint" data-testid="offline-search-note">
+          Search looks through what this host holds, so it works with no network.
+        </span>
       </div>
 
       {tab === 'installed' ? (
-        <div className="card-grid" data-testid="installed-list">
-          {(views?.installed ?? [])
-            .filter((entry) => matches([entry.name, entry.publisher, entry.package_id]))
-            .map((entry) => (
-              <Card key={entry.package_id}>
+        <div className="stack">
+          <div className="card-grid" data-testid="installed-list">
+            {plugins.map((plugin) => (
+              <Card key={plugin.plugin_id} data-plugin={plugin.plugin_id}>
                 <div className="card-header">
                   <div className="spacer">
-                    <h2>{entry.name}</h2>
+                    <h2>{plugin.plugin_id}</h2>
                     <p className="muted small">
-                      {entry.publisher} · {entry.version}
+                      {plugin.version} · from {plugin.catalogue_id}
                     </p>
                   </div>
-                  <Badge tone={entry.enabled ? 'success' : 'neutral'}>
-                    {entry.enabled ? 'Enabled' : 'Disabled'}
-                  </Badge>
+                  <span className="row wrap">
+                    {plugin.revoked ? <Badge tone="danger">Revoked</Badge> : null}
+                    <Badge tone={plugin.enabled ? 'success' : 'neutral'}>
+                      {plugin.enabled ? 'Enabled' : 'Disabled'}
+                    </Badge>
+                    {plugin.pinned ? <Badge tone="neutral">Pinned</Badge> : null}
+                  </span>
                 </div>
                 <div className="card-body">
-                  <ul className="capability-list">
-                    {entry.capabilities.map((capability) => (
-                      <li key={capability}>
-                        <code>{capability}</code>
-                      </li>
-                    ))}
-                  </ul>
-                  {entry.pinned_generation ? (
-                    <p className="small faint">Pinned at generation {entry.pinned_generation}.</p>
+                  <p className="small muted mono">Package {short(plugin.package_digest)}</p>
+                  <p className="small muted">
+                    {plugin.live_bindings === null
+                      ? 'Not every session has reported whether it uses this.'
+                      : `${plugin.live_bindings} live ${plugin.live_bindings === '1' ? 'binding' : 'bindings'}`}
+                  </p>
+                  {plugin.admission?.state === 'left_out' ? (
+                    <p className="small warning-text" data-testid="left-out">
+                      New sessions do not use it: {plugin.admission.detail}
+                    </p>
+                  ) : null}
+                  {plugin.revoked ? (
+                    <p className="small warning-text">
+                      Its repository revoked this release. Sessions already using it keep it until
+                      they end.
+                    </p>
                   ) : null}
                 </div>
               </Card>
             ))}
+          </div>
+          {installed !== null && plugins.length === 0 ? (
+            <p className="muted small">
+              {needle.length > 0 ? 'Nothing installed matches that.' : 'Nothing is installed.'}
+            </p>
+          ) : null}
+          {live.length > 0 ? (
+            <Card data-testid="live-releases">
+              <div className="card-body">
+                <h2>Still in use</h2>
+                <p className="muted small">
+                  Releases that live sessions still hold after an upgrade, a move or a removal. Each
+                  stays until its sessions end.
+                </p>
+                {live.map((release) => (
+                  <div className="divided-row" key={`${release.plugin_id}-${release.package_digest}`}>
+                    <span className="spacer">
+                      <strong>{release.plugin_id}</strong> {release.version}
+                      <span className="faint small mono"> {short(release.package_digest)}</span>
+                    </span>
+                    {release.ending ? <Badge tone="neutral">Ending</Badge> : null}
+                    {release.revoked ? <Badge tone="danger">Revoked</Badge> : null}
+                  </div>
+                ))}
+              </div>
+            </Card>
+          ) : null}
         </div>
       ) : null}
 
       {tab === 'catalogue' ? (
         <div className="card-grid" data-testid="catalogue-list">
-          {(views?.catalogue ?? [])
-            .filter((entry) => matches([entry.name, entry.publisher, entry.summary, entry.package_id]))
-            .map((entry) => (
-              <Card key={entry.package_id}>
-                <div className="card-header">
-                  <div className="spacer">
-                    <h2>{entry.name}</h2>
-                    <p className="muted small">
-                      {entry.publisher} · {entry.version}
-                    </p>
-                  </div>
-                  {entry.installed ? <Badge tone="success">Installed</Badge> : null}
+          {enrolled.map((catalogue) => (
+            <Card key={catalogue.catalogue_id} data-catalogue={catalogue.catalogue_id}>
+              <div className="card-header">
+                <div className="spacer">
+                  <h2>{catalogue.catalogue_id}</h2>
+                  <p className="muted small">
+                    {Number(catalogue.entries).toLocaleString()} packages in its index
+                    {catalogue.generation === null ? '' : ` · generation ${catalogue.generation}`}
+                  </p>
                 </div>
-                <div className="card-body">
-                  <p>{entry.summary}</p>
-                  {!entry.payload_available_offline ? (
-                    <p className="small warning-text" data-testid="payload-offline">
-                      Its payload is not on this host. Installing it needs a connection to{' '}
-                      {entry.repository_id}.
-                    </p>
-                  ) : null}
-                </div>
-              </Card>
-            ))}
+                <Badge tone="neutral">{catalogue.kind}</Badge>
+              </div>
+              <div className="card-body">
+                <p className="small muted">
+                  {catalogue.budgets.full_offline_mirror
+                    ? 'Every package it lists is kept on this host.'
+                    : 'A package is fetched when it is installed, and kept once it is.'}
+                </p>
+                <p className="small">Its packages may, without a further grant:</p>
+                <ul className="capability-list">
+                  {catalogue.ceiling.map((capability) => (
+                    <li key={capability}>
+                      <code>{capability}</code>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            </Card>
+          ))}
+          {catalogues !== null && enrolled.length === 0 ? (
+            <p className="muted small">
+              {needle.length > 0 ? 'No repository matches that.' : 'No repository is enrolled.'}
+            </p>
+          ) : null}
         </div>
       ) : null}
 
       {tab === 'repositories' ? (
         <Card data-testid="repository-list">
           <div className="card-body">
-            {(views?.repositories ?? []).map((repository) => (
-              <div className="divided-row" key={repository.repository_id}>
+            {enrolled.map((catalogue) => (
+              <div className="divided-row" key={catalogue.catalogue_id}>
                 <div className="spacer">
-                  <strong>{repository.label}</strong>
-                  <p className="muted small mono">{repository.origin}</p>
+                  <strong>{catalogue.catalogue_id}</strong>
+                  <p className="muted small mono">{catalogue.metadata_url}</p>
                   <p className="muted small">
-                    {repository.publisher} · generation {repository.generation}
+                    Trust root {short(catalogue.root_digest)} ·{' '}
+                    {catalogue.synced_at_ms === null
+                      ? 'not synchronised'
+                      : `synchronised ${when(catalogue.synced_at_ms)}`}
+                  </p>
+                  <p className="muted small">
+                    Up to {bytes(catalogue.budgets.metadata_bytes)} of metadata and{' '}
+                    {bytes(catalogue.budgets.payload_cache_bytes)} of packages
                   </p>
                 </div>
                 <span className="row wrap">
-                  <Badge tone="neutral">{repository.kind}</Badge>
-                  {repository.automatic_matching ? (
-                    <Badge tone="accent">Matches automatically</Badge>
-                  ) : null}
-                  {repository.pinned ? <Badge tone="neutral">Pinned</Badge> : null}
-                  {repository.metadata_expired ? (
-                    <Badge tone="warning">
-                      Metadata expired · installed packages still work
-                    </Badge>
+                  <Badge tone="neutral">{catalogue.kind}</Badge>
+                  {catalogue.pinned_generation !== null ? (
+                    <Badge tone="neutral">Pinned at {catalogue.pinned_generation}</Badge>
                   ) : null}
                 </span>
               </div>
             ))}
+            {catalogues !== null && enrolled.length === 0 ? (
+              <p className="muted small">
+                {needle.length > 0 ? 'No repository matches that.' : 'No repository is enrolled.'}
+              </p>
+            ) : null}
           </div>
         </Card>
       ) : null}

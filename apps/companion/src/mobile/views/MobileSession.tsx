@@ -25,9 +25,12 @@
 import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { flushSync } from 'react-dom'
 
-import { useApp } from '../../app/state'
+import { useApp, useSession } from '../../app/state'
+import { useSessionAgent } from '../../app/agent'
+import { targetOf } from '../../model/agent'
+import type { ConversationItem } from '../../model/conversation'
 import { Badge, Banner, Button, Segmented } from '../../components/ui'
-import { failureCode, failureMessage, watch, type Watch } from '../../host/port'
+import { failureCode, failureMessage } from '../../host/port'
 import {
   edit,
   notSubmittableBecause,
@@ -36,12 +39,11 @@ import {
   type Draft
 } from '../../model/drafts'
 import {
+  answered,
+  answeredState,
   describeState,
   queued,
   reconnectBanner,
-  sent,
-  settled,
-  stateOfReceipt,
   unresolved,
   wasRefused,
   failed
@@ -140,16 +142,15 @@ export function MobileSession({
 }): ReactNode {
   const { port, say } = useApp()
   const [pane, setPane] = useState<Pane>('semantic')
-  // What each read answered, kept with the session it was read for and shown only for that
-  // session: from the first render after a change of session, nothing of the last one is shown.
-  // The conversation is a refusal's words, or the nodes read, or nothing before the first answer.
-  const [conversation, setConversation] = useState<{
-    readonly sessionId: string
-    readonly nodes: readonly ReadNode[]
-    readonly refusal: string | null
-  } | null>(null)
-  const read = conversation?.sessionId === sessionId ? conversation : null
-  const nodes = read?.nodes ?? []
+  // The session's agent, read from its own worker while this screen is open, into the session's
+  // own store: nothing of another session is ever shown under this one.
+  const { state: session } = useSession(sessionId)
+  const { unread } = useSessionAgent(sessionId)
+  const read = session.loaded || unread !== null ? { refusal: unread } : null
+  const nodes = useMemo(
+    () => session.conversation.nodes.slice(-80).map(readNode),
+    [session.conversation.nodes]
+  )
   const [zoom, setZoom] = useState(ZOOM_DEFAULT_INDEX)
   const [latch, setLatch] = useState<Latch>(NO_LATCH)
   const [busy, setBusy] = useState(false)
@@ -201,28 +202,6 @@ export function MobileSession({
     },
     [lifecycle]
   )
-
-  // The conversation is read under a watch with no listeners that ends with the session: only the
-  // newest read's answer is shown, and what an ended watch read goes with it.
-  useEffect(() => {
-    const reading: Watch = watch([], () => {
-      const current = reading.read()
-      if (current === null) return
-      ask(() => port.agentSnapshot({ session_id: sessionId }))
-        .then((answer) => {
-          if (!current()) return
-          setConversation({ sessionId, nodes: answer.nodes.slice(-80).map(readNode), refusal: null })
-        })
-        .catch((failure: unknown) => {
-          if (!current()) return
-          setConversation({ sessionId, nodes: [], refusal: failureMessage(failure) })
-        })
-    })
-    return () => {
-      reading.stop()
-      setConversation(null)
-    }
-  }, [port, sessionId])
 
   // The terminal's grid: as many cells as its surface shows at the current zoom, a column measured
   // from a probe of the grid's own font and a row as tall as the grid's own lines.
@@ -385,16 +364,26 @@ export function MobileSession({
       // Local feedback first, and it says queued rather than sent, because it has not left yet.
       lifecycle.setSubmissions((current) => [...current, submission])
       setBusy(true)
-      ask(() => port.composerSubmit({ session_id: sessionId, text }, { sessionId }))
+      const { binding, instance } = session.agent
+      ask(() => {
+        if (binding === null || instance === null) {
+          // eslint-disable-next-line @typescript-eslint/only-throw-error -- refused as a command's failure is: data
+          throw { code: 'UNSUPPORTED_CAPABILITY', message: 'No agent is running in this session.' }
+        }
+        return port.composerSubmit({
+          target: targetOf(sessionId, instance, binding),
+          draft_id: null,
+          text
+        })
+      })
         .then((answer) => {
-          const state = answer.receipt ? stateOfReceipt(answer.receipt) : 'sent'
+          const state = answeredState(answer)
           lifecycle.setSubmissions((current) =>
-            current.map((each) => {
-              if (each.localId !== submission.localId) return each
-              const withAction = answer.action_id ? sent(each, answer.action_id) : each
-              // Only a receipt makes it applied. Without one it stays with the host and says so.
-              return answer.receipt ? settled(withAction, answer.receipt) : withAction
-            })
+            current.map((each) =>
+              // A receipt says what became of it; the host's own result says it was performed; an
+              // answer with neither is an outcome nobody knows, and says so.
+              each.localId === submission.localId ? answered(each, answer) : each
+            )
           )
           if (wasRefused(state)) {
             // The submission did not happen. The text stays exactly where it was.
@@ -430,7 +419,7 @@ export function MobileSession({
           setBusy(false)
         })
     },
-    [draft, lifecycle, port, say, sessionId]
+    [draft, lifecycle, port, say, sessionId, session.agent]
   )
 
   // Focus that a terminal key, the program's keyboard or the mode button held when control or the
@@ -1259,8 +1248,24 @@ function RawTerminal({
  * than a rendering of every kind it could be. Each kind names itself, so a node this build does
  * not draw fully is still a node the person can see is there.
  */
-function readNode(node: unknown, index: number): ReadNode {
-  const outer = node as { id?: string; body?: Record<string, unknown> }
+function readNode(item: ConversationItem, index: number): ReadNode {
+  if (item.source === 'entry') {
+    const { entry } = item
+    return {
+      id: item.id,
+      role:
+        entry.kind === 'message'
+          ? 'agent'
+          : entry.kind === 'tool.finished'
+            ? 'tool finished'
+            : entry.kind === 'tool.failed'
+              ? 'tool failed'
+              : entry.kind,
+      text: entry.text,
+      markdown: entry.kind === 'message'
+    }
+  }
+  const outer = item.node as { id?: string; body?: Record<string, unknown> }
   const body = outer.body ?? {}
   // Only a string is text. A field that is not one is a node shape this build does not draw, and
   // showing "[object Object]" to a person would be worse than showing the kind alone.

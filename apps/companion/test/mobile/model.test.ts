@@ -8,7 +8,8 @@
 
 import { describe, expect, it } from 'vitest'
 
-import type { AttentionEntry, AttentionInbox } from '../../src/model/pending'
+import type { AttentionItem, AttentionReadResult } from '@kalareach/protocol'
+
 import { connectionLost, edit, startDraft, type Draft } from '../../src/model/drafts'
 import { queued, sent, unresolved, type Submission } from '../../src/model/receipts'
 import {
@@ -17,8 +18,9 @@ import {
   detailOf,
   emptyMessage,
   filter,
+  inboxNotes,
   order
-} from '../../src/mobile/model/inbox'
+} from '../../src/model/attention'
 import {
   ACCESSORY_KEYS,
   NO_LATCH,
@@ -49,35 +51,58 @@ import { detectSurface, minimumTarget, showsBackControl, TOUCH_TARGET } from '..
 
 const NOW = 1_763_000_000_000
 
-function entry(over: Partial<AttentionEntry> & Pick<AttentionEntry, 'kind'>): AttentionEntry {
+function item(over: Partial<AttentionItem> & Pick<AttentionItem, 'rule'>): AttentionItem {
   return {
-    attention_id: `a-${over.kind}`,
-    title: 'Something',
-    detail: 'A detail.',
-    host_label: 'studio',
-    environment_id: 'e-1',
-    session_id: 's-1',
-    session_epoch: '1',
-    session_display_number: '3',
-    application: 'Codex',
-    raised_at_ms: NOW,
+    key: `${over.rule}|~0123456789abcdef0123456789abcdef`,
+    source: 'semantic',
+    level: 'notable',
+    session_id: '8a7b6c50-22bb-4c3d-8e4f-000000000101',
+    summary: 'Something',
+    trusted: true,
+    routing: 'owner_policy',
+    occurrences: '1',
+    first_seen_ms: String(NOW),
+    last_seen_ms: String(NOW),
+    notification: 'delivered',
+    awaiting_delivery: false,
+    acknowledged: false,
+    uncertain: false,
+    revision: '1',
+    automation: null,
     ...over
   }
 }
 
-const INBOX: AttentionInbox = {
-  entries: [
-    entry({ kind: 'awaiting_review', raised_at_ms: NOW - 1000 }),
-    entry({ kind: 'disconnected', out_of_contact_ms: 2_400_000, session_id: null, session_epoch: null, session_display_number: null, application: null }),
-    entry({ kind: 'failed_action', error_code: 'QUOTA_EXCEEDED', raised_at_ms: NOW - 500 }),
-    entry({ kind: 'pending_decision', command_preview: 'scripts/release.sh', raised_at_ms: NOW - 2000 })
-  ]
+function inbox(items: AttentionItem[], over: Partial<AttentionReadResult> = {}): AttentionReadResult {
+  return {
+    items,
+    more: false,
+    dropped: '0',
+    gaps: [],
+    quiet_hours: null,
+    quiet_now: false,
+    quiet_hours_provable: true,
+    ...over
+  }
 }
+
+const INBOX = inbox([
+  item({ rule: 'attention.review_ready', last_seen_ms: String(NOW - 1000) }),
+  item({
+    rule: 'attention.host_contact_lost',
+    source: 'receipts',
+    session_id: null,
+    summary: 'studio',
+    first_seen_ms: String(NOW - 2_400_000)
+  }),
+  item({ rule: 'attention.command_failed', source: 'host_events', last_seen_ms: String(NOW - 500) }),
+  item({ rule: 'attention.pending_approval', level: 'urgent', last_seen_ms: String(NOW - 2000) })
+])
 
 describe('the attention inbox (KR-REQ-13.01, 13.02)', () => {
   it('tells the four kinds apart and puts what is waiting for a person first', () => {
-    const rows = order(INBOX)
-    expect(rows.map((row) => row.entry.kind)).toEqual([
+    const rows = order(INBOX, NOW)
+    expect(rows.map((row) => row.kind)).toEqual([
       'pending_decision',
       'failed_action',
       'awaiting_review',
@@ -87,9 +112,21 @@ describe('the attention inbox (KR-REQ-13.01, 13.02)', () => {
     expect(new Set(rows.map((row) => row.tone)).size).toBe(4)
   })
 
+  it('sorts the most recent first within a kind, reading the times as counters', () => {
+    const rows = order(
+      inbox([
+        item({ rule: 'attention.command_failed', key: 'older', last_seen_ms: '9007199254740992' }),
+        item({ rule: 'attention.adapter_failed', key: 'newer', last_seen_ms: '9007199254740993' })
+      ]),
+      NOW
+    )
+    expect(rows.map((row) => row.item.key)).toEqual(['newer', 'older'])
+  })
+
   it('never turns lost contact into a claim that anything is stuck or failed', () => {
     const lost = detailOf(
-      entry({ kind: 'disconnected', out_of_contact_ms: 40 * 60 * 1000 })
+      item({ rule: 'attention.host_contact_lost', first_seen_ms: String(NOW - 40 * 60 * 1000) }),
+      NOW
     )
     expect(lost).toContain('No contact for 40 minutes')
     expect(lost).toContain('may still be running')
@@ -111,21 +148,65 @@ describe('the attention inbox (KR-REQ-13.01, 13.02)', () => {
     expect(counts.actionable).toBe(2)
   })
 
-  it('offers no decision on a host it cannot reach', () => {
-    const rows = order(INBOX)
-    expect(rows.find((row) => row.entry.kind === 'disconnected')?.actionable).toBe(false)
-    expect(rows.find((row) => row.entry.kind === 'pending_decision')?.actionable).toBe(true)
+  it('offers a decision only on an approval in a session, and none on a host it cannot reach', () => {
+    const rows = order(INBOX, NOW)
+    expect(rows.find((row) => row.kind === 'disconnected')?.actionable).toBe(false)
+    expect(rows.find((row) => row.kind === 'pending_decision')?.actionable).toBe(true)
+    const question = order(inbox([item({ rule: 'attention.pending_input' })]), NOW)[0]
+    expect(question?.kind).toBe('pending_decision')
+    expect(question?.actionable).toBe(false)
   })
 
   it('reads the kind aloud rather than leaving it to a colour', () => {
-    for (const row of order(INBOX)) {
+    for (const row of order(INBOX, NOW)) {
       expect(row.announcement.startsWith(row.label)).toBe(true)
     }
   })
 
   it('filters to one kind and says what an empty filter means', () => {
-    expect(filter(order(INBOX), 'failed_action')).toHaveLength(1)
+    expect(filter(order(INBOX, NOW), 'failed_action')).toHaveLength(1)
     expect(emptyMessage('disconnected')).toBe('Every host is in contact.')
+  })
+
+  it('says a notice a program printed is not a request from the host, and never a decision', () => {
+    const [notice] = order(
+      inbox([
+        item({
+          rule: 'attention.application_notice',
+          source: 'host_events',
+          trusted: false,
+          routing: 'lease_holder',
+          summary: 'Deploy now?',
+          occurrences: '3'
+        })
+      ]),
+      NOW
+    )
+    expect(notice?.kind).toBe('notice')
+    expect(notice?.actionable).toBe(false)
+    expect(notice?.detail).toContain('A program in the session printed it.')
+    expect(notice?.detail).toContain('It happened 3 times.')
+  })
+
+  it('names the rule when the host withheld the item’s own text, and says it withheld it', () => {
+    const [withheld] = order(inbox([item({ rule: 'attention.pending_input', summary: null })]), NOW)
+    expect(withheld?.title).toBe('A question is waiting for an answer')
+    expect(withheld?.detail).toContain('did not share this item’s text')
+  })
+
+  it('says what the inbox let go, what it can no longer read, and why it is not holding sounds', () => {
+    expect(inboxNotes(INBOX)).toEqual([])
+    const notes = inboxNotes(
+      inbox([], {
+        dropped: '2',
+        gaps: [{ source: 'questions', session_id: null, from_sequence: '4', to_sequence: null }],
+        quiet_hours: { start_minute: '1320', end_minute: '420', zone: null },
+        quiet_hours_provable: false
+      })
+    )
+    expect(notes).toHaveLength(3)
+    expect(notes[0]).toContain('let 2 older items go')
+    expect(notes[2]).toContain('cannot prove what its clock reads')
   })
 })
 

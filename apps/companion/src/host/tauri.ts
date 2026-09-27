@@ -5,9 +5,9 @@
  * value, so the set of commands this file can reach is the set written in it, and the set the
  * backend registers is the set it will answer.
  *
- * Some of the operations the interface knows how to display have no command yet, because their
- * parameters and results are not part of the published contract on this build. Those refuse here,
- * with the protocol's own word for it, rather than sending a request whose shape nobody agrees on.
+ * An operation the interface knows how to display whose parameters or result are not part of the
+ * published contract has no command. It refuses here, with the protocol's own word for it, rather
+ * than sending a request whose shape nobody agrees on.
  */
 
 import { Channel, invoke } from '@tauri-apps/api/core'
@@ -20,6 +20,7 @@ import type {
   AttachmentHandle,
   ConnectionState,
   DroppedFile,
+  GrantNotices,
   HostEvent,
   HostPort,
   ImportedImage,
@@ -28,6 +29,7 @@ import type {
   PairingView,
   PasteView,
   ReviewOutcome,
+  SessionAgents,
   SessionSubject,
   Settled,
   SettingsPane,
@@ -131,13 +133,19 @@ export function tauriPort(): HostPort {
     launchSurface: () => noAgreedShape('the launch surface'),
     shellLaunch: (params, subject) => mutate('shell_launch', params, subject),
 
-    agentSnapshot: () => noAgreedShape("an agent's semantic snapshot"),
-    agentCommands: () => noAgreedShape("an agent's commands"),
-    composerSubmit: () => noAgreedShape('submitting a prompt'),
-    composerQueue: () => noAgreedShape('queueing a prompt'),
-    composerSteer: () => noAgreedShape('steering a turn'),
-    composerInterrupt: () => noAgreedShape('interrupting a turn'),
-    approvalRespond: () => noAgreedShape('answering an approval'),
+    // The agent's calls go to the session's own worker, which native code reaches and which checks
+    // this device's rights itself. A mutation names its session, instance and binding revision in
+    // its own parameters, and native code builds its envelope from exactly those.
+    sessionAgents: (sessionId) => call<SessionAgents>('session_agents', { sessionId }),
+    agentCapabilities: (params) => read('agent_capabilities', params),
+    agentSnapshot: (params) => read('agent_snapshot', params),
+    agentCommands: (params) => read('agent_commands', params),
+    approvalInspect: (params) => read('agent_approval_inspect', params),
+    composerSubmit: (params) => call('agent_prompt_submit', { params }),
+    composerQueue: (params) => call('agent_prompt_queue', { params }),
+    composerSteer: (params) => call('agent_turn_steer', { params }),
+    composerInterrupt: (params) => call('agent_turn_cancel', { params }),
+    approvalRespond: (params) => call('agent_approval_respond', { params }),
     pluginActionInvoke: () => noAgreedShape("invoking a package's action"),
 
     draftCreate: (params, subject) => mutate<Settled>('draft_create', params, subject),
@@ -156,17 +164,22 @@ export function tauriPort(): HostPort {
       mutate<{ bytes: number[]; media_type: string }>('attachment_image', params, {}),
 
     historyPage: (params) => read('history_page', params),
-    attentionRead: () => noAgreedShape('the attention inbox'),
-    attentionAcknowledge: () => noAgreedShape('acknowledging an attention entry'),
+    // Attention and review belong to the environment, so an acknowledgement names no session.
+    attentionRead: (params) => read('attention_read', params),
+    attentionAcknowledge: (params) => mutate('attention_acknowledge', params, {}),
+    reviewRead: (params) => read('review_read', params),
+    reviewAcknowledge: (params) => mutate('review_acknowledge', params, {}),
     questionRead: (params) => read('question_read', params),
     questionAnswer: (params, subject) => mutate<Settled>('question_answer', params, subject),
-    grantList: () => noAgreedShape('the grants a session has issued'),
-    grantCreate: () => noAgreedShape('issuing a grant'),
+    deviceList: (params) => read('device_list', params),
+    grantNotices: (selection) => call<GrantNotices>('grant_notices', { selection }),
+    grantCreate: (params, subject) => mutate('grant_create', params, subject),
+    grantList: (params) => read('grant_list', params),
 
-    pluginList: () => noAgreedShape('the installed packages'),
-    catalogueList: () => noAgreedShape('the package catalogue'),
+    pluginList: (params) => read('plugin_list', params),
+    catalogueList: (params) => read('catalogue_list', params),
 
-    changesetRead: () => noAgreedShape('a change set'),
+    changesetRead: (params) => read('changeset_read', params),
 
     storageStatus: () => noAgreedShape('what this host retains'),
     storageObjectDelete: () => noAgreedShape('deleting a retained artefact'),

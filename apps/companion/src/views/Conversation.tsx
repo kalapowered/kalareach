@@ -1,15 +1,18 @@
 /**
- * The semantic view: the document, and the composer under it.
+ * The semantic view: the agent's own history, the requests waiting on the person, and the composer
+ * under them.
  *
- * The document is the portable node union. Every node has a stable identity and a revision, the
- * rendered set is bounded, and a node kind this client does not draw renders an unsupported block
- * that can invoke nothing.
+ * What the conversation shows is what the session's own worker keeps: each entry of the live
+ * agent's semantic history, with the identity the worker gave it, so a revision replaces an entry
+ * rather than adding one, and a bounded window of them is rendered. A package's declarative
+ * presentation adds its nodes beside them, and a node kind this client does not draw renders an
+ * unsupported block that can invoke nothing.
  *
- * Nothing in this component owns the session's state. The draft, the document, the window and the
+ * Nothing in this component owns the session's state. The draft, the history, the window and the
  * pending actions live in the application's per-session store, so switching to the terminal and
  * back keeps them, and one session's state can never appear under another's name.
  *
- * Streamed output does not animate. Text that fades in each time a token arrives reads as lag, and
+ * Streamed output does not animate. Text that fades in each time an entry arrives reads as lag, and
  * this is the surface a person watches most.
  */
 
@@ -25,31 +28,40 @@ import {
 } from 'react'
 
 import type { DocumentNode } from '@kalareach/plugin-sdk'
+import type { ActionRight, AgentCommand } from '@kalareach/protocol'
+import { promptTextProblem } from '@kalareach/protocol'
 
 import { Badge, Banner, Button, Card, CommitButton, IconButton } from '../components/ui'
 import { useApp, useSession } from '../app/state'
+import { useSessionAgent } from '../app/agent'
 import {
   failureCode,
   failureMessage,
   watch,
   type DroppedFile,
-  type SessionSubject,
-  type Watch
+  type SessionSubject
 } from '../host/port'
 import { renderMarkdown } from '../markdown/render'
-import { ask } from '../mobile/model/call'
+import {
+  actionableApprovals,
+  bindingStateOf,
+  composerOffers,
+  targetOf,
+  withheldTotal,
+  type ComposerOffers
+} from '../model/agent'
 import {
   applyNodes,
-  installSnapshot,
+  nodeItem,
   nodesAbove,
-  prependHistory,
   setFollowing,
   setWindowStart,
   visibleNodes,
-  WINDOW_SIZE
+  WINDOW_SIZE,
+  type ConversationItem
 } from '../model/conversation'
 import {
-  emptyControlState,
+  controlStateOf,
   isRendered,
   readNodeKind,
   visibilityOf,
@@ -67,16 +79,19 @@ import {
 import { FrameBatcher } from '../model/frame'
 import { eventIsFor } from '../model/sessions'
 import {
+  answered,
+  answeredState,
   describeState,
   failed,
+  outcomeMessage,
+  outcomeTone,
   queued,
   reconnectBanner,
-  sent,
   settled,
-  stateOfReceipt,
   wasRefused
 } from '../model/receipts'
 import type { LaunchSurface } from '../model/pending'
+import { ApprovalRequests } from './Approvals'
 
 /** How close to the end still counts as being at it. */
 const AT_END_SLACK = 32
@@ -107,35 +122,42 @@ export function Conversation({
   sessionId,
   subject,
   connected,
+  rights,
   launch,
   onLaunched
 }: {
   readonly sessionId: string
   readonly subject: SessionSubject
   readonly connected: boolean
+  /** The rights this connection holds, or null when it has not been told. */
+  readonly rights: readonly ActionRight[] | null
   /** The launch surface as it was read, and the prompt's generation as the view knows it now. */
   readonly launch: { readonly surface: LaunchSurface; readonly promptGeneration: string } | null
   readonly onLaunched: () => void
 }): ReactNode {
   const { port, say } = useApp()
   const { state, update } = useSession(sessionId)
+  const { unread, refresh } = useSessionAgent(sessionId)
   const [insertion, setInsertion] = useState<string | null>(null)
-  const [commands, setCommands] = useState<readonly AgentCommand[]>([])
-  // Why the newest read of the document was refused, for the session it was read for.
-  const [unread, setUnread] = useState<{ readonly sessionId: string; readonly reason: string } | null>(
-    null
-  )
+  // Why the host's event stream could not be followed, under the visit it was opened in: a failure
+  // from an earlier visit to this session is not shown on a return to it.
+  const visit = useMemo(() => ({ sessionId }), [sessionId])
+  const [unfollowed, setUnfollowed] = useState<{
+    readonly visit: object
+    readonly words: string
+  } | null>(null)
   const scroller = useRef<HTMLDivElement | null>(null)
   const anchor = useRef<{ nodeId: string; offsetTop: number } | null>(null)
+  const agent = state.agent
 
-  // One batch per animation frame. Forty events in one tick are one render, and the composer keeps
-  // taking keystrokes while they arrive.
+  // A package's presentation arrives as nodes on the host's event stream. One batch per animation
+  // frame: forty in one tick are one render, and the composer keeps taking keystrokes meanwhile.
   const batcher = useMemo(
     () =>
       new FrameBatcher<DocumentNode>((batch) => {
         update((current) => ({
           ...current,
-          conversation: applyNodes(current.conversation, batch)
+          conversation: applyNodes(current.conversation, batch.map(nodeItem))
         }))
       }),
     [update]
@@ -162,55 +184,17 @@ export function Conversation({
     [update]
   )
 
-  // The document is read once the stream's listener is registered, so no node can fall between the
-  // read and the listener, and read again when the host is heard to be back. While a read is on its
-  // way, the nodes the stream delivers are held rather than shown, and its answer installs them by
-  // `installSnapshot`'s rule: the snapshot's order stands and what arrived meanwhile follows it.
-  // Only the newest read of the watch that is running is installed.
+  // The host's event stream carries a package's presentation nodes and late receipts. Each is
+  // taken as it arrives, for this session only.
   useEffect(() => {
-    // Held from the start: nothing is shown before the first read has answered.
-    let held: DocumentNode[] | null = []
-    let watching: Watch | null = null
-    const read = () => {
-      const current = watching?.read() ?? null
-      if (current === null) return
-      if (held === null) {
-        // What arrived before this read keeps its place ahead of anything held from now on.
-        batcher.flushNow()
-        held = []
-      }
-      const settle = (snapshot: readonly DocumentNode[] | null, refusal: string | null) => {
-        if (!current()) return
-        const arrived = held ?? []
-        held = null
-        update((session) => ({
-          ...session,
-          conversation:
-            snapshot === null
-              ? applyNodes(session.conversation, arrived)
-              : installSnapshot(session.conversation, snapshot, arrived),
-          loaded: session.loaded || snapshot !== null
-        }))
-        setUnread(refusal === null ? null : { sessionId, reason: refusal })
-      }
-      // A port can refuse before it returns a promise; that refusal is an answer like any other.
-      ask(() => port.agentSnapshot({ session_id: sessionId }))
-        .then((snapshot) => {
-          settle(snapshot.nodes, null)
-        })
-        .catch((failure: unknown) => {
-          settle(null, failureMessage(failure))
-        })
-    }
-    watching = watch(
+    const watching = watch(
       [
         port.subscribe((event) => {
           const body = event.body as { kind?: string; node?: DocumentNode; receipt?: unknown }
           // An event belongs to the stream it names. A view showing one session ignores another's
           // rather than folding it into what the person is looking at.
           if (body.kind === 'node' && body.node && eventIsFor(event.stream_id, sessionId)) {
-            if (held === null) batcher.push(body.node)
-            else held.push(body.node)
+            batcher.push(body.node)
           }
           if (body.kind === 'receipt' && body.receipt) {
             const receipt = body.receipt as Parameters<typeof settled>[1]
@@ -227,86 +211,87 @@ export function Conversation({
             // A refusal that arrives later is the same refusal: the text comes back then too.
             if (refused) returnRefusedText(refused)
           }
-        }),
-        port.onConnection((state) => {
-          if (state.connected) read()
         })
       ],
-      read,
+      undefined,
       (failure) => {
-        // A view that cannot follow the stream reads nothing, and says why.
-        setUnread({ sessionId, reason: failureMessage(failure) })
+        setUnfollowed({ visit, words: failureMessage(failure) })
       }
     )
-    const started = watching
     return () => {
-      started.stop()
+      watching.stop()
       batcher.discard()
-      // A refusal belongs to the watch whose read it answered: a return to the session reads again
-      // and shows nothing from before until that read has answered.
-      setUnread(null)
     }
-  }, [port, sessionId, batcher, update, returnRefusedText])
+  }, [port, sessionId, visit, batcher, update, returnRefusedText])
 
-  useEffect(() => {
-    let cancelled = false
-    port
-      .agentCommands({ session_id: sessionId })
-      .then((answer) => {
-        if (!cancelled) setCommands(readAgentCommands(answer))
-      })
-      .catch(() => {
-        // An agent whose commands this client cannot read offers none, rather than offering a
-        // list written here that the agent may not have.
-        if (!cancelled) setCommands([])
-      })
-    return () => {
-      cancelled = true
-    }
-  }, [port, sessionId])
+  const offers = useMemo(
+    () =>
+      composerOffers({
+        binding: agent.binding,
+        capabilities: agent.capabilities,
+        rights: rights === null ? null : new Set(rights)
+      }),
+    [agent.binding, agent.capabilities, rights]
+  )
+  const waitingOnPerson =
+    agent.instances === null ? null : actionableApprovals(agent.resources).length > 0
 
-  const controlState: ControlState = useMemo(() => {
-    const present = new Set(state.conversation.nodes.map((node) => node.id))
-    return { ...emptyControlState(), presentNodes: present }
-  }, [state.conversation.nodes])
+  // What a control's visibility is decided from: every fact this device has been told.
+  const controlState: ControlState = useMemo(
+    () =>
+      controlStateOf({
+        capabilities: agent.capabilities,
+        rights,
+        bindingState:
+          waitingOnPerson === null ? null : bindingStateOf(agent.binding, waitingOnPerson),
+        waitingOnPerson,
+        presentNodes: new Set(state.conversation.nodes.map((item) => item.id)),
+        compact: false
+      }),
+    [agent.capabilities, agent.binding, rights, waitingOnPerson, state.conversation.nodes]
+  )
 
   const send = useCallback(
     (action: ComposerAction) => {
+      const binding = agent.binding
+      const instance = agent.instance
+      if (binding === null || instance === null) return
       const typed = state.draft.text
+      if (action !== 'interrupt' && promptTextProblem(typed) === 'too-long') {
+        say('That is longer than one prompt carries. It is kept here.', 'danger')
+        return
+      }
       const label = typed.trim() || action
       const local = queued(`s-${Date.now()}-${Math.random()}`, label, Date.now(), typed)
       const clears = action === 'submit' || action === 'queue'
 
       // Local feedback first: the entry appears as queued and the composer clears. The completion
-      // feedback below waits for the receipt.
+      // feedback below waits for the host's answer.
       update((current) => ({
         ...current,
         submissions: [...current.submissions, local],
         draft: clears ? edit(current.draft, '', Date.now()) : current.draft
       }))
 
-      const params = { session_id: sessionId, text: typed }
+      const target = targetOf(sessionId, instance, binding)
+      const turn = binding.turn_id ?? ''
       const call =
         action === 'submit'
-          ? port.composerSubmit(params, subject)
+          ? port.composerSubmit({ target, draft_id: null, text: typed })
           : action === 'queue'
-            ? port.composerQueue(params, subject)
+            ? port.composerQueue({ target, draft_id: null, text: typed })
             : action === 'steer'
-              ? port.composerSteer(params, subject)
-              : port.composerInterrupt({ session_id: sessionId }, subject)
+              ? port.composerSteer({ target, turn_id: turn, text: typed })
+              : port.composerInterrupt({ target, turn_id: turn })
 
       call
         .then((result) => {
-          const outcome = result.receipt ? stateOfReceipt(result.receipt) : 'sent'
+          const outcome = answeredState(result)
           update((current) => ({
             ...current,
-            submissions: current.submissions.map((submission) => {
-              if (submission.localId !== local.localId) return submission
-              const identified = result.action_id
-                ? sent(submission, result.action_id)
-                : submission
-              return result.receipt ? settled(identified, result.receipt) : identified
-            })
+            submissions: current.submissions.map((submission) =>
+              submission.localId === local.localId ? answered(submission, result) : submission
+            )
           }))
           if (wasRefused(outcome)) {
             returnRefusedText(local.localId)
@@ -329,8 +314,9 @@ export function Conversation({
           returnRefusedText(local.localId)
           say(failureMessage(error), 'danger')
         })
+        .finally(refresh)
     },
-    [port, sessionId, subject, state.draft.text, update, say, returnRefusedText]
+    [port, sessionId, agent.binding, agent.instance, state.draft.text, update, say, returnRefusedText, refresh]
   )
 
   /**
@@ -339,11 +325,16 @@ export function Conversation({
    * The transfer publishes a verified handle. The insertion binds that handle to the draft. The
    * submission is a separate act the person performs. Section 12 keeps them apart because a failed
    * insertion must leave the completed upload and the draft alone, and because only upstream
-   * evidence makes an attachment accepted by an agent.
+   * evidence makes an attachment accepted by an agent. A file is sent only where the agent says it
+   * takes attachments now.
    */
   const attach = useCallback(
     (files: readonly DroppedFile[]) => {
       for (const file of files) {
+        if (!offers.attach.offered) {
+          setInsertion(`${file.name} was not sent: ${offers.attach.reason ?? 'this agent takes no attachments here.'}`)
+          continue
+        }
         const path = file.path
         if (!path) {
           setInsertion('That file was not given to this window, so it was not sent.')
@@ -381,11 +372,11 @@ export function Conversation({
                 subject
               )
               .then((result) => {
-                // Only an applied receipt says the attachment reached the draft. The upload is
+                // Only an applied answer says the attachment reached the draft. The upload is
                 // done either way, and the handle above is kept.
                 say(
-                  outcomeMessage(`${handle.original_file_name} attached`, result.receipt),
-                  receiptTone(result.receipt)
+                  outcomeMessage(`${handle.original_file_name} attached`, result),
+                  outcomeTone(result)
                 )
               })
               .catch((error: unknown) => {
@@ -398,7 +389,7 @@ export function Conversation({
           })
       }
     },
-    [port, state.draft.draftId, subject, update, say]
+    [port, state.draft.draftId, subject, update, say, offers.attach]
   )
 
   useEffect(() => watch([port.onFilesDropped(attach)]).stop, [port, attach])
@@ -412,7 +403,6 @@ export function Conversation({
   )
 
   const banner = reconnectBanner(connected, state.submissions)
-  const refusal = unread?.sessionId === sessionId ? unread.reason : null
   const rendered = useMemo(() => visibleNodes(state.conversation), [state.conversation])
   const hidden = nodesAbove(state.conversation)
 
@@ -457,7 +447,7 @@ export function Conversation({
           subject
         )
         .then((result) => {
-          say(outcomeMessage(control.label, result.receipt), receiptTone(result.receipt))
+          say(outcomeMessage(control.label, result), outcomeTone(result))
         })
         .catch((error: unknown) => {
           say(failureMessage(error), 'danger')
@@ -467,41 +457,16 @@ export function Conversation({
   )
 
   /**
-   * Loads the page of history above what is held, and keeps the reader where they are.
-   *
-   * The window moves by exactly the number of nodes that were added, so the node the person was
-   * looking at stays in the same place.
-   */
-  const loadOlder = useCallback(() => {
-    port
-      .historyPage({ session_id: sessionId })
-      .then((page) => {
-        const older = readHistoryNodes(page)
-        if (older.length === 0) {
-          say('There is no more history on this host.')
-          return
-        }
-        update((current) => ({
-          ...current,
-          conversation: prependHistory(current.conversation, older)
-        }))
-      })
-      .catch((error: unknown) => {
-        say(failureMessage(error), 'danger')
-      })
-  }, [port, sessionId, update, say])
-
-  /**
    * Decides whether the view is still following, and brings more of the document into the window
-   * when the reader reaches the top of it.
+   * when the reader reaches either edge of it.
    *
    * Following is what the scroll position says, not a setting: a person who has scrolled up is
    * reading, and new output must not pull them away from it.
    *
-   * Moving the window changes how tall the content is, so the height before the move is recorded
-   * and the scroll position is corrected by the difference once the new window is laid out. Without
-   * that the view jumps, and a jump at the top of the content is indistinguishable from the content
-   * being taken away.
+   * Moving the window changes what is laid out, so the node the reader is looking at is recorded
+   * and the scroll position is corrected by how far it moved once the new window is laid out.
+   * Without that the view jumps, and a jump at the top of the content is indistinguishable from the
+   * content being taken away.
    */
   const onScroll = useCallback(() => {
     const element = scroller.current
@@ -563,13 +528,26 @@ export function Conversation({
     })
   }, [state.conversation.windowStart, state.conversation.nodes.length, update])
 
+  const noAgent = agent.instances !== null && agent.instance === null
+  const withheld = withheldTotal(agent.withheld)
+
   return (
     <div className="conversation" data-testid="conversation">
       {banner ? <Banner tone={banner.tone} title={banner.title} detail={banner.detail} /> : null}
 
-      {refusal !== null ? (
+      {unread !== null ? (
         <div data-testid="conversation-unread">
-          <Banner tone="warning" title="This conversation could not be read" detail={refusal} />
+          <Banner tone="warning" title="This conversation could not be read" detail={unread} />
+        </div>
+      ) : null}
+
+      {unfollowed?.visit === visit ? (
+        <div data-testid="conversation-unfollowed">
+          <Banner
+            tone="warning"
+            title="Live updates are not reaching this view"
+            detail={`${unfollowed.words} What packages show here and late answers wait until the session is opened again; the agent's history is still read.`}
+          />
         </div>
       ) : null}
 
@@ -604,16 +582,32 @@ export function Conversation({
         data-following={state.conversation.following ? 'true' : 'false'}
         data-window-start={state.conversation.windowStart}
       >
-        {hidden > 0 ? (
-          <div className="history-edge">
-            <Button data-testid="load-older" onClick={loadOlder}>
-              Load earlier output
-            </Button>
+        {agent.gap || withheld > 0 || hidden > 0 ? (
+          <div className="history-edge" data-testid="history-notes">
+            {agent.gap ? (
+              <p className="small faint">
+                Some of this agent’s earlier entries were no longer kept when this device read
+                them.
+              </p>
+            ) : null}
+            {withheld > 0 ? (
+              <p className="small faint" data-testid="withheld">
+                {withheld} {withheld === 1 ? 'entry is' : 'entries are'} outside what
+                this device may see.
+              </p>
+            ) : null}
+          </div>
+        ) : null}
+
+        {noAgent && state.conversation.nodes.length === 0 ? (
+          <div className="empty-state" data-testid="no-agent">
+            <h2>No agent is running here</h2>
+            <p>This session runs a shell. The terminal shows what it is doing.</p>
           </div>
         ) : null}
 
         <Document
-          nodes={rendered}
+          items={rendered}
           controlState={controlState}
           images={state.images}
           onOpenLink={openLink}
@@ -621,6 +615,8 @@ export function Conversation({
           onInvoke={invoke}
         />
       </div>
+
+      <ApprovalRequests sessionId={sessionId} onAnswered={refresh} />
 
       {launch?.surface.prompt_is_empty ? (
         <LaunchSurfaceView
@@ -636,7 +632,8 @@ export function Conversation({
       <Composer
         draft={presented}
         connected={connected}
-        commands={commands}
+        offers={offers}
+        commands={agent.commands}
         insertion={insertion}
         onChange={(next) => {
           update((current) => ({ ...current, draft: edit(current.draft, next, Date.now()) }))
@@ -645,58 +642,6 @@ export function Conversation({
       />
     </div>
   )
-}
-
-/** One command the bound agent supports. */
-export interface AgentCommand {
-  readonly name: string
-  readonly summary: string
-}
-
-/** The commands in what `agent.commands` answered, and nothing this client invented. */
-function readAgentCommands(answer: unknown): readonly AgentCommand[] {
-  if (typeof answer !== 'object' || answer === null) return []
-  const commands = (answer as { commands?: unknown }).commands
-  if (!Array.isArray(commands)) return []
-  return commands
-    .filter((command): command is Record<string, unknown> => typeof command === 'object' && command !== null)
-    .map((command) => ({ name: text(command.name), summary: text(command.summary) }))
-    .filter((command) => command.name.length > 0)
-}
-
-/**
- * What one action's receipt means, in words.
- *
- * Only `applied` is completion. Everything else is named for what it is, because "waiting" for an
- * outcome the host has already refused is the one thing the receipt contract exists to prevent.
- */
-export function outcomeMessage(done: string, receipt: { state?: string } | null): string {
-  switch (receipt?.state) {
-    case 'applied':
-      return `${done}.`
-    case 'refused':
-      return 'The host refused that.'
-    case 'rejected':
-      return 'The host rejected that.'
-    case 'unknown':
-      return 'The host could not confirm what became of that.'
-    case undefined:
-      return 'Sent. Waiting for the host to confirm.'
-    default:
-      return 'Sent. Waiting for the host to confirm.'
-  }
-}
-
-/**
- * How an outcome reads.
- *
- * Only an applied receipt is completion. Anything still with the host is pending, and a pending
- * outcome wearing a completion mark is the same false claim in a different shape.
- */
-export function receiptTone(receipt: { state?: string } | null): 'success' | 'danger' | 'pending' {
-  if (!receipt) return 'pending'
-  if (['refused', 'rejected', 'unknown'].includes(receipt.state ?? '')) return 'danger'
-  return receipt.state === 'applied' ? 'success' : 'pending'
 }
 
 /** Whether the view is at the bottom of what is rendered, which is not the same as the live end. */
@@ -734,25 +679,6 @@ function cssEscape(value: string): string {
 }
 
 /**
- * The nodes in one page of retained history.
- *
- * A host that answered with something this client cannot read contributes nothing rather than
- * contributing a guess.
- */
-function readHistoryNodes(page: unknown): readonly DocumentNode[] {
-  if (typeof page !== 'object' || page === null) return []
-  const nodes = (page as { nodes?: unknown }).nodes
-  if (!Array.isArray(nodes)) return []
-  return nodes.filter(
-    (node): node is DocumentNode =>
-      typeof node === 'object' &&
-      node !== null &&
-      typeof (node as DocumentNode).id === 'string' &&
-      typeof (node as DocumentNode).revision === 'string'
-  )
-}
-
-/**
  * The rendered document.
  *
  * It is memoised on purpose, and the memo is the point rather than an optimisation. A keystroke in
@@ -761,14 +687,14 @@ function readHistoryNodes(page: unknown): readonly DocumentNode[] {
  * than a frame. Everything this depends on is a value that changes only when the document does.
  */
 const Document = memo(function Document({
-  nodes,
+  items,
   controlState,
   images,
   onOpenLink,
   onImportImage,
   onInvoke
 }: {
-  readonly nodes: readonly DocumentNode[]
+  readonly items: readonly ConversationItem[]
   readonly controlState: ControlState
   readonly images: ReadonlyMap<string, string>
   readonly onOpenLink: (url: string) => void
@@ -777,18 +703,114 @@ const Document = memo(function Document({
 }): ReactNode {
   return (
     <>
-      {nodes.map((node) => (
-        <NodeView
-          key={node.id}
-          node={node}
-          controlState={controlState}
-          images={images}
-          onOpenLink={onOpenLink}
-          onImportImage={onImportImage}
-          onInvoke={onInvoke}
-        />
-      ))}
+      {items.map((item) =>
+        item.source === 'entry' ? (
+          <EntryView
+            key={item.id}
+            item={item}
+            images={images}
+            onOpenLink={onOpenLink}
+            onImportImage={onImportImage}
+          />
+        ) : (
+          <NodeView
+            key={item.id}
+            node={item.node}
+            controlState={controlState}
+            images={images}
+            onOpenLink={onOpenLink}
+            onImportImage={onImportImage}
+            onInvoke={onInvoke}
+          />
+        )
+      )}
     </>
+  )
+})
+
+/** What each kind of history entry is called beside it. */
+function entryLabel(kind: string): string {
+  switch (kind) {
+    case 'tool.finished':
+      return 'Tool finished'
+    case 'tool.failed':
+      return 'Tool failed'
+    case 'notification':
+      return 'Notice'
+    default:
+      return kind
+  }
+}
+
+/**
+ * One entry of the agent's history.
+ *
+ * A message is the agent's own words and goes through the allowlisted Markdown renderer, which
+ * draws text and never fetches an image. The start, continuation and end of a thread mark where the
+ * conversation moved. A tool's outcome and a notification are one line each. Any other kind, which
+ * a connector's presentation may name, is shown as its text under its own name: an entry carries
+ * text and never an action.
+ */
+const EntryView = memo(function EntryView({
+  item,
+  images,
+  onOpenLink,
+  onImportImage
+}: {
+  readonly item: Extract<ConversationItem, { readonly source: 'entry' }>
+  readonly images: ReadonlyMap<string, string>
+  readonly onOpenLink: (url: string) => void
+  readonly onImportImage: (url: string) => void
+}): ReactNode {
+  const { entry } = item
+  const omitted = Number(entry.omitted_text_bytes)
+  const cut =
+    omitted > 0 ? (
+      <p className="small faint" data-testid="entry-cut">
+        {omitted.toLocaleString()} more bytes of this entry were not carried.
+      </p>
+    ) : null
+  if (entry.kind === 'message') {
+    return (
+      <article className="message" data-node-id={item.id} data-kind="message">
+        <div className="message-content markdown">
+          {renderMarkdown(entry.text, {
+            openLink: onOpenLink,
+            importImage: onImportImage,
+            importedImages: images
+          })}
+          {cut}
+        </div>
+      </article>
+    )
+  }
+  if (entry.kind.startsWith('thread.')) {
+    return (
+      <div className="thread-mark" data-node-id={item.id} data-kind={entry.kind}>
+        <span className="small faint">{entry.text}</span>
+        {cut}
+      </div>
+    )
+  }
+  if (entry.kind === 'tool.finished' || entry.kind === 'tool.failed' || entry.kind === 'notification') {
+    return (
+      <div className="tool-result" data-node-id={item.id} data-kind={entry.kind}>
+        <Badge tone={entry.kind === 'tool.failed' ? 'danger' : entry.kind === 'notification' ? 'neutral' : 'accent'}>
+          {entryLabel(entry.kind)}
+        </Badge>
+        <span className="small">{entry.text}</span>
+        {cut}
+      </div>
+    )
+  }
+  return (
+    <article className="message" data-node-id={item.id} data-kind={entry.kind}>
+      <div className="message-content">
+        <p className="eyebrow">{entryLabel(entry.kind)}</p>
+        <p className="entry-text">{entry.text}</p>
+        {cut}
+      </div>
+    </article>
   )
 })
 
@@ -1111,10 +1133,7 @@ function LaunchSurfaceView({
                     subject
                   )
                   .then((result) => {
-                    say(
-                      outcomeMessage(`${profile.label} started`, result.receipt),
-                      receiptTone(result.receipt)
-                    )
+                    say(outcomeMessage(`${profile.label} started`, result), outcomeTone(result))
                     onLaunched()
                   })
                   .catch((error: unknown) => {
@@ -1158,6 +1177,7 @@ function LaunchSurfaceView({
 function Composer({
   draft,
   connected,
+  offers,
   commands,
   insertion,
   onChange,
@@ -1165,6 +1185,7 @@ function Composer({
 }: {
   readonly draft: Draft
   readonly connected: boolean
+  readonly offers: ComposerOffers
   readonly commands: readonly AgentCommand[]
   readonly insertion: string | null
   readonly onChange: (text: string) => void
@@ -1173,9 +1194,10 @@ function Composer({
   const [showCommands, setShowCommands] = useState(false)
   const typed = draft.text.startsWith('/') ? draft.text.slice(1).toLowerCase() : null
   const offered =
-    typed === null ? [] : commands.filter((command) => command.name.slice(1).startsWith(typed))
-  const reason = notSubmittableBecause(draft)
-  const canSubmit = submittable(draft) && connected
+    typed === null ? [] : commands.filter((command) => command.name.toLowerCase().startsWith(typed))
+  const reason = offers.submit.offered ? notSubmittableBecause(draft) : offers.submit.reason
+  const canSubmit = offers.submit.offered && submittable(draft) && connected
+  const canWrite = submittable(draft) && connected
 
   return (
     <div className="composer" data-testid="composer" data-draft-state={draft.state}>
@@ -1205,7 +1227,9 @@ function Composer({
         <textarea
           value={draft.text}
           data-testid="composer-input"
-          placeholder="Ask for something, or press / for a command"
+          placeholder={
+            commands.length > 0 ? 'Ask for something, or press / for a command' : 'Ask for something'
+          }
           onChange={(event) => {
             onChange(event.target.value)
             setShowCommands(event.target.value.startsWith('/'))
@@ -1227,11 +1251,11 @@ function Composer({
                 type="button"
                 className="text-link"
                 onClick={() => {
-                  onChange(`${command.name} `)
+                  onChange(`/${command.name} `)
                   setShowCommands(false)
                 }}
               >
-                <code>{command.name}</code>
+                <code>/{command.name}</code>
                 <span className="faint">{command.summary}</span>
               </button>
             </li>
@@ -1240,35 +1264,44 @@ function Composer({
       ) : null}
 
       <div className="composer-note between">
-        <span className="faint small">{reason ?? 'Command-Enter sends it.'}</span>
+        <span className="faint small" data-testid="composer-reason">
+          {reason ?? 'Command-Enter sends it.'}
+        </span>
         <span className="row">
-          <IconButton
-            label="Interrupt the current turn"
-            data-testid="composer-interrupt"
-            onClick={() => {
-              onAction('interrupt')
-            }}
-          >
-            &#9632;
-          </IconButton>
-          <Button
-            data-testid="composer-steer"
-            disabled={!canSubmit}
-            onClick={() => {
-              onAction('steer')
-            }}
-          >
-            Steer
-          </Button>
-          <Button
-            data-testid="composer-queue"
-            disabled={!canSubmit}
-            onClick={() => {
-              onAction('queue')
-            }}
-          >
-            Queue
-          </Button>
+          {offers.interrupt.offered ? (
+            <IconButton
+              label="Interrupt the current turn"
+              data-testid="composer-interrupt"
+              disabled={!connected}
+              onClick={() => {
+                onAction('interrupt')
+              }}
+            >
+              &#9632;
+            </IconButton>
+          ) : null}
+          {offers.steer.offered ? (
+            <Button
+              data-testid="composer-steer"
+              disabled={!canWrite}
+              onClick={() => {
+                onAction('steer')
+              }}
+            >
+              Steer
+            </Button>
+          ) : null}
+          {offers.queue.offered ? (
+            <Button
+              data-testid="composer-queue"
+              disabled={!canWrite}
+              onClick={() => {
+                onAction('queue')
+              }}
+            >
+              Queue
+            </Button>
+          ) : null}
           <Button
             tone="primary"
             data-testid="composer-send"

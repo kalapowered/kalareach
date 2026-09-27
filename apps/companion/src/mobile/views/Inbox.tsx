@@ -1,24 +1,36 @@
 /**
  * The attention inbox: what the phone opens on.
  *
- * Every host, every session, one list. The four kinds are told apart three ways at once, because
- * one way is never enough: a word, a tone, and the sentence underneath. A host that cannot be
- * reached is drawn as exactly that, is never counted among the failures, and says in so many words
- * that its sessions may still be running.
+ * Every host, every session, one list. The kinds are told apart three ways at once, because one way
+ * is never enough: a word, a tone, and the sentence underneath. A host that cannot be reached is
+ * drawn as exactly that, is never counted among the failures, and says in so many words that its
+ * sessions may still be running.
  *
- * A decision is answered here rather than three screens away, because answering it is why the
- * person picked up the phone. The control is the one that commits on a completed action, so a
- * pocket press decides nothing.
+ * An approval is answered here rather than three screens away, because answering it is why the
+ * person picked up the phone. The sheet lists what the session's agent is waiting for, with the
+ * decisions its decoder offered, and each control commits on a completed action, so a pocket press
+ * decides nothing.
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 
-import { Banner, Button, CommitButton, Sheet } from '../../components/ui'
+import type { AttentionReadResult } from '@kalareach/protocol'
+
+import { Banner, Button, Sheet } from '../../components/ui'
+import { readOnCadence } from '../../app/cadence'
 import { useApp } from '../../app/state'
 import { failureMessage, watch, type Watch } from '../../host/port'
-import type { AttentionEntry, AttentionInbox } from '../../model/pending'
+import {
+  ATTENTION_READ_CADENCE_MS,
+  count,
+  emptyMessage,
+  filter,
+  order,
+  type AttentionFilter,
+  type AttentionRow
+} from '../../model/attention'
+import { ApprovalRequests } from '../../views/Approvals'
 import { ask } from '../model/call'
-import { count, emptyMessage, filter, locationOf, order, type InboxFilter } from '../model/inbox'
 import { minimumTarget, type Surface } from '../platform'
 
 /** A host's own words, ended so the sentence after them reads as a second sentence. */
@@ -28,13 +40,17 @@ function sentence(text: string): string {
   return /[.!?]$/.test(trimmed) ? trimmed : `${trimmed}.`
 }
 
-const FILTERS: readonly { readonly id: InboxFilter; readonly label: string }[] = [
+const FILTERS: readonly { readonly id: AttentionFilter; readonly label: string }[] = [
   { id: 'all', label: 'Everything' },
   { id: 'pending_decision', label: 'Waiting for you' },
   { id: 'failed_action', label: 'Failed' },
   { id: 'awaiting_review', label: 'To review' },
-  { id: 'disconnected', label: 'Out of contact' }
+  { id: 'disconnected', label: 'Out of contact' },
+  { id: 'notice', label: 'Notices' }
 ]
+
+/** The largest page of the inbox one read asks for. */
+const PAGE_ITEMS = '200'
 
 /** The inbox screen. */
 export function Inbox({
@@ -46,101 +62,84 @@ export function Inbox({
   readonly onOpenSession: (sessionId: string) => void
   readonly onCounts?: (actionable: number) => void
 }): ReactNode {
-  const { port, say } = useApp()
-  const [inbox, setInbox] = useState<AttentionInbox | null>(null)
+  const { port } = useApp()
+  const [inbox, setInbox] = useState<{ readonly result: AttentionReadResult; readonly atMs: number } | null>(
+    null
+  )
   const [error, setError] = useState<string | null>(null)
-  const [chosen, setChosen] = useState<InboxFilter>('all')
-  const [open, setOpen] = useState<AttentionEntry | null>(null)
+  const [chosen, setChosen] = useState<AttentionFilter>('all')
+  const [open, setOpen] = useState<AttentionRow | null>(null)
+  // Each session's display number, by its identifier, as the host listed them.
+  const [numbers, setNumbers] = useState<ReadonlyMap<string, string>>(new Map())
   const target = minimumTarget(surface)
 
-  // The watch the inbox reads under, for the read an answered approval asks for.
-  const watching = useRef<Watch | null>(null)
+  // Every read of the inbox, on opening, on the cadence, when the connection changes and after an
+  // answer, goes through one cadence under one watch: one read at a time, only the newest read's
+  // answer shown, and none once the screen closes.
+  const reads = useRef<Watch | null>(null)
+  const again = useRef<() => void>(() => undefined)
 
-  /**
-   * Reads the inbox under the check `watch` answered, and shows the answer only while it holds:
-   * while this is the newest read and the listeners have not stopped. A read the watch would not
-   * start, before its listeners are registered or after they stopped, is not made.
-   */
-  const read = useCallback(
-    (current: (() => boolean) | null) => {
-      if (current === null) return
-      ask(() => port.attentionRead({}))
-        .then((answer) => {
-          if (!current()) return
-          setInbox(answer)
-          setError(null)
-        })
-        .catch((failure: unknown) => {
-          if (!current()) return
-          // A host that cannot be read is a host out of contact, which is a state the inbox has.
-          // It is never a claim that anything on it failed.
-          setError(failureMessage(failure))
-        })
-    },
-    [port]
-  )
-
-  // The inbox is read once both listeners are registered, so no change falls between the read and
-  // them, and read again on each change they hear.
-  useEffect(() => {
-    let inbox: Watch | null = null
-    const again = () => {
-      read(inbox?.read() ?? null)
-    }
-    inbox = watch(
-      [
-        port.subscribe((event) => {
-          const body = event.body as { kind?: string }
-          if (body.kind === 'attention') again()
-        }),
-        port.onConnection(again)
-      ],
-      again,
-      (failure) => {
-        setError(failureMessage(failure))
-      }
+  const load = useCallback((): Promise<void> => {
+    const current = reads.current?.read() ?? null
+    if (current === null) return Promise.resolve()
+    const inboxRead = ask(() =>
+      port.attentionRead({
+        session_id: null,
+        include_acknowledged: false,
+        max_items: PAGE_ITEMS,
+        after: null
+      })
     )
-    const current = inbox
-    watching.current = current
-    return () => {
-      current.stop()
-      if (watching.current === current) watching.current = null
-    }
-  }, [port, read])
+      .then((answer) => {
+        if (!current()) return
+        setInbox({ result: answer, atMs: Date.now() })
+        setError(null)
+      })
+      .catch((failure: unknown) => {
+        if (!current()) return
+        // A host that cannot be read is a host out of contact, which is a state the inbox has.
+        // It is never a claim that anything on it failed.
+        setError(failureMessage(failure))
+      })
+    const numbersRead = ask(() => port.sessionList({ environment_id: null, include_closed: false }))
+      .then((list) => {
+        if (!current()) return
+        setNumbers(new Map(list.sessions.map((session) => [session.session_id, session.display_number])))
+      })
+      .catch(() => undefined)
+    return Promise.all([inboxRead, numbersRead]).then(() => undefined)
+  }, [port])
 
-  const rows = useMemo(() => (inbox ? order(inbox) : []), [inbox])
-  const counts = useMemo(() => (inbox ? count(inbox) : null), [inbox])
+  // The inbox is read once the connection listener is registered, so no change of connection falls
+  // between the read and it, and read again on the cadence and on each change of connection.
+  useEffect(() => {
+    const cadence = readOnCadence(load, ATTENTION_READ_CADENCE_MS)
+    const reading = watch([port.onConnection(cadence.now)], cadence.now, (failure) => {
+      setError(failureMessage(failure))
+    })
+    reads.current = reading
+    again.current = cadence.now
+    return () => {
+      cadence.stop()
+      reading.stop()
+      if (reads.current === reading) reads.current = null
+      again.current = () => undefined
+    }
+  }, [port, load])
+
+  const rows = useMemo(() => (inbox ? order(inbox.result, inbox.atMs) : []), [inbox])
+  const counts = useMemo(() => (inbox ? count(inbox.result) : null), [inbox])
 
   useEffect(() => {
     if (counts && onCounts) onCounts(counts.actionable)
   }, [counts, onCounts])
 
   const shown = filter(rows, chosen)
-
-  const respond = (entry: AttentionEntry, allowed: boolean) => {
-    ask(() =>
-      port.approvalRespond(
-        { approval_request_id: entry.approval_request_id, decision: allowed ? 'allow' : 'deny' },
-        { sessionId: entry.session_id ?? undefined, sessionEpoch: entry.session_epoch ?? undefined }
-      )
-    )
-      .then((settled) => {
-        // The receipt is the outcome. A request that was accepted is not a request that was applied.
-        const state = settled.receipt?.state ?? 'unknown'
-        say(
-          state === 'applied'
-            ? allowed
-              ? 'Allowed.'
-              : 'Denied.'
-            : `Sent. The host has not confirmed it yet (${state}).`,
-          state === 'applied' ? 'success' : 'pending'
-        )
-        setOpen(null)
-        read(watching.current?.read() ?? null)
-      })
-      .catch((failure: unknown) => {
-        say(failureMessage(failure), 'danger')
-      })
+  const whereOf = (row: AttentionRow): string => {
+    const sessionId = row.item.session_id
+    if (sessionId === null) return 'This host'
+    const number = numbers.get(sessionId)
+    return number === undefined ? 'A session' : `Session ${number}`
   }
 
   return (
@@ -176,25 +175,25 @@ export function Inbox({
       ) : (
         <ul className="m-list">
           {shown.map((row) => (
-            <li key={row.entry.attention_id}>
+            <li key={row.item.key}>
               <button
                 type="button"
                 className="m-row"
                 data-tone={row.tone}
-                data-kind={row.entry.kind}
-                data-attention={row.entry.attention_id}
+                data-kind={row.kind}
+                data-attention={row.item.key}
                 style={{ minBlockSize: target }}
-                aria-label={row.announcement}
+                aria-label={`${row.announcement} ${whereOf(row)}.`}
                 onClick={() => {
-                  if (row.actionable) setOpen(row.entry)
-                  else if (row.entry.session_id) onOpenSession(row.entry.session_id)
+                  if (row.actionable) setOpen(row)
+                  else if (row.item.session_id) onOpenSession(row.item.session_id)
                 }}
               >
                 <span className="m-row-head">
                   <span className="m-row-kind">{row.label}</span>
-                  <span className="m-row-where">{locationOf(row.entry)}</span>
+                  <span className="m-row-where">{whereOf(row)}</span>
                 </span>
-                <span className="m-row-title">{row.entry.title}</span>
+                <span className="m-row-title">{row.title}</span>
                 <span className="m-row-detail">{row.detail}</span>
               </button>
             </li>
@@ -205,44 +204,31 @@ export function Inbox({
       <Sheet
         open={open !== null}
         title={open?.title ?? ''}
-        description={open ? locationOf(open) : undefined}
+        description={open ? whereOf(open) : undefined}
         onClose={() => {
           setOpen(null)
         }}
         footer={
-          open ? (
-            <>
-              <Button
-                onClick={() => {
-                  respond(open, false)
-                }}
-              >
-                Deny
-              </Button>
-              <CommitButton
-                tone="primary"
-                onCommit={() => {
-                  respond(open, true)
-                }}
-              >
-                Allow
-              </CommitButton>
-            </>
+          open?.item.session_id ? (
+            <Button
+              onClick={() => {
+                const sessionId = open.item.session_id
+                setOpen(null)
+                if (sessionId) onOpenSession(sessionId)
+              }}
+            >
+              Open the session
+            </Button>
           ) : null
         }
       >
-        {open ? (
-          <>
-            <p>{open.detail}</p>
-            {open.command_preview ? (
-              <pre className="code-block">
-                <code>{open.command_preview}</code>
-              </pre>
-            ) : null}
-            <p className="m-hint">
-              Allowing runs it on {open.host_label}. Nothing runs until the host confirms it.
-            </p>
-          </>
+        {open?.item.session_id ? (
+          <ApprovalRequests
+            sessionId={open.item.session_id}
+            onAnswered={() => {
+              again.current()
+            }}
+          />
         ) : null}
       </Sheet>
     </>

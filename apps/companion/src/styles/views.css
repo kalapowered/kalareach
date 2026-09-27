@@ -58,18 +58,72 @@
   border-color: var(--danger-line);
 }
 
-.command-preview {
+/* What the inbox as a whole says beyond its items: what it let go, and quiet hours. */
+.inbox-notes {
+  list-style: none;
+  padding: 0;
+  margin: 0 0 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+/* ---- Approvals ------------------------------------------------------------------------------- */
+
+/*
+ * A request an agent is waiting on. It is the most consequential thing on the screen, so it sits on
+ * its own raised surface with the warning edge, and the decisions come last, after what the request
+ * is and what the agent actually sent.
+ */
+.approvals {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin: 14px 0 4px;
+}
+
+.conversation > .approvals {
+  margin: 8px 22px 14px;
+}
+
+.approval {
+  padding: 16px 18px;
+  border: 1px solid var(--warning-line);
+  border-radius: 9px;
+  background: var(--raised);
+}
+
+.approval h3 {
+  font-size: 0.875rem;
+  line-height: 1.45;
+  margin: 4px 0 6px;
+  overflow-wrap: anywhere;
+}
+
+.approval-source {
+  margin: 12px 0 8px;
+  font-size: 0.6875rem;
+}
+
+.approval-source summary {
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 12px 14px;
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  background: var(--bg);
-  margin-top: 14px;
-  font-family: var(--font-mono);
-  font-size: 0.6875rem;
+  min-height: var(--target);
+  color: var(--accent);
+  cursor: pointer;
+}
+
+.approval-source .code-block {
+  max-height: 240px;
+  overflow: auto;
+  white-space: pre-wrap;
   overflow-wrap: anywhere;
+  font: 0.6875rem/1.6 var(--font-mono);
+}
+
+.approval-decisions {
+  gap: 10px;
+  margin-top: 14px;
 }
 
 /* ---- Sessions -------------------------------------------------------------------------------- */
@@ -390,6 +444,33 @@
   gap: 8px;
 }
 
+/* Where a thread started, continued or ended: a quiet rule across the conversation. */
+.thread-mark {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+  margin: 10px 22px;
+}
+
+.thread-mark::before,
+.thread-mark::after {
+  content: '';
+  flex: 1 1 24px;
+  border-top: 1px solid var(--line);
+}
+
+.thread-mark > span {
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+
+/* An entry of a kind the conversation has no drawing for is its text, as the agent wrote it. */
+.entry-text {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 /* ---- The launch surface ---------------------------------------------------------------------- */
 
 .launch-surface {
@@ -597,31 +678,6 @@
   background: var(--accent-soft);
 }
 
-.diff-code {
-  display: flex;
-  flex-direction: column;
-  overflow: auto;
-  padding: 10px 0;
-  font: 0.6875rem/1.9 var(--font-mono);
-  tab-size: 2;
-}
-
-.diff-line {
-  display: block;
-  white-space: pre;
-  padding: 0 12px;
-}
-
-.diff-line.add {
-  color: var(--success);
-  background: var(--success-soft);
-}
-
-.diff-line.remove {
-  color: var(--danger);
-  background: var(--danger-soft);
-}
-
 .consequence-list {
   padding-left: 18px;
   display: flex;
@@ -730,6 +786,35 @@
   color: var(--muted);
   font-size: 0.6875rem;
   line-height: 1.6;
+}
+
+/* Choosing who an invitation is for: one row per paired device, each a full target. */
+.settings-group {
+  margin: 0 0 8px;
+  padding: 0;
+  border: 0;
+}
+
+.settings-group legend {
+  font-size: 0.75rem;
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+
+.choice-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: var(--target);
+  font-size: 0.8125rem;
+  cursor: pointer;
+}
+
+.choice-row input {
+  inline-size: 18px;
+  block-size: 18px;
+  margin: 0;
+  accent-color: var(--accent);
 }
 
 .theme-options {

@@ -15,6 +15,7 @@
 
 import type { DocumentNode } from '@kalareach/plugin-sdk'
 import type {
+  ActionRight,
   AttachmentSummary,
   CapabilityRecord,
   ClosureRecord,
@@ -34,14 +35,7 @@ import type {
   VoiceSessionDescriptor
 } from '@kalareach/protocol'
 
-import type {
-  AttentionInbox,
-  ChangeSets,
-  IssuedGrants,
-  LaunchSurface,
-  PackageViews,
-  RetainedArtefacts
-} from '../model/pending'
+import type { LaunchSurface, RetainedArtefacts } from '../model/pending'
 import type { AccountView, UsageView } from '../model/account'
 import type {
   ApprovedLink,
@@ -73,6 +67,7 @@ import type {
 } from './port'
 import { receivedConnection, viewMoveArguments, viewSizeArguments } from './port'
 import { codeComplete } from '../pairing/words'
+import { EVERY_RIGHT, ScriptedRecords } from './fake-state'
 
 const ENVIRONMENT = '3f1a2c40-11aa-4b2c-9d3e-000000000001'
 const VOICE_SESSION = '6c5d4e30-33cc-4d4e-9f5a-000000000201'
@@ -202,8 +197,15 @@ export interface FakeHostControls {
   readonly account: FakeAccount
   /** Pushes one event to every subscriber. */
   emit(event: HostEvent): void
-  /** Appends one node to a session's conversation and tells the interface about it. */
+  /**
+   * Hands the page one node of a package's declarative presentation, on the host-event stream.
+   *
+   * No published method carries a package's document, so the conversation's own content is the
+   * agent's snapshot and this is the one way a document node reaches a page.
+   */
   appendNode(node: DocumentNode, sessionId?: string): void
+  /** The records behind the published methods: each session's agent, attention and the rest. */
+  readonly records: ScriptedRecords
   /** Moves the prompt generation on, which disables the launch buttons. */
   changePromptGeneration(): void
   /**
@@ -212,6 +214,8 @@ export interface FakeHostControls {
    * contacted right now.
    */
   setConnected(connected: boolean, reason?: string): void
+  /** Sets what the connection may do, and says so as native code does. */
+  setRights(rights: readonly ActionRight[]): void
   /**
    * Holds every answer to `read` from now on, as a slow backend would, until the test answers it.
    * Each answer is what the host held when the read was made, a refusal included, so a test can
@@ -391,13 +395,22 @@ export type HeldRead =
   | 'attentionRead'
   | 'sessionRead'
   | 'launchSurface'
+  | 'sessionAgents'
+  | 'agentCapabilities'
   | 'agentSnapshot'
+  | 'agentCommands'
+  | 'approvalInspect'
+  | 'historyPage'
+  | 'reviewRead'
   | 'sessionList'
   | 'hostInfo'
   | 'environmentList'
   | 'changesetRead'
   | 'storageStatus'
   | 'pluginList'
+  | 'catalogueList'
+  | 'deviceList'
+  | 'grantList'
 
 /** The reads of one kind a test is holding. */
 export interface HeldReads {
@@ -464,7 +477,17 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
   const openedLinks: string[] = []
   const importedImages: string[] = []
   const uploaded: string[] = []
-  const nodes: DocumentNode[] = startingConversation()
+  // How many presentation nodes the host has published.
+  let presentation = 0
+  // The host's records for every method whose shape the protocol publishes: each session's agent,
+  // the attention inbox, review and change sets, sharing, packages and retained output. They are
+  // written against the time the host starts, because a screen says how long ago each one was
+  // against the time it reads them.
+  const records = new ScriptedRecords({
+    environment: ENVIRONMENT,
+    sessions: { main: SESSION_MAIN, build: SESSION_BUILD, offline: SESSION_OFFLINE },
+    nowMs: Date.now()
+  })
   /** The raw terminal views the page has opened, oldest first. */
   const terminalViews: FakeTerminalView[] = []
   let holdingTerminalViews = false
@@ -476,7 +499,6 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
   } = { presentation: 'viewport', reason: 'unqualified_terminal_profile' }
   let terminalWheel: TerminalWheel = 'reaches'
   let holdingTerminalControl = false
-  const acknowledged = new Set<string>()
   const deletedArtefacts = new Set<string>()
   const openedPanes: string[] = []
   let capabilityRevision = 4
@@ -528,11 +550,14 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
     for (const listener of listeners) listener(event)
   }
   // What native code says, taken in the way the desktop port takes it in: a blank reason is none.
+  // What the connection may do: the host's owner holds every right, unless a test says otherwise.
+  let rights: readonly ActionRight[] = EVERY_RIGHT
   const connectionNow = (): ConnectionState =>
     receivedConnection({
       connected,
       environment_id: connected ? ENVIRONMENT : null,
-      reason: connected ? null : lostBecause
+      reason: connected ? null : lostBecause,
+      rights: connected ? rights : null
     })
   const connectionListeners = new Set<(state: ConnectionState) => void>()
 
@@ -657,66 +682,52 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
       })
     },
 
-    agentSnapshot: () =>
+    // The agent's calls, as the session's own worker answers them.
+    sessionAgents: (sessionId) =>
+      reading('sessionAgents', () => {
+        requireConnection()
+        if (!isSessionId(sessionId)) refuse('INVALID_ARGUMENT', 'that is not a session identifier')
+        return records.sessionAgents(sessionId)
+      }),
+    agentCapabilities: (params) =>
+      reading('agentCapabilities', () => {
+        requireConnection()
+        return records.capabilities(params)
+      }),
+    agentSnapshot: (params) =>
       reading('agentSnapshot', () => {
         requireConnection()
-        return { nodes: [...nodes] }
+        return records.snapshot(params)
       }),
-    agentCommands: () =>
-      Promise.resolve({
-        commands: [
-          { name: '/compact', summary: 'Shorten the conversation so far' },
-          { name: '/model', summary: 'Change the model for this session' },
-          { name: '/review', summary: 'Review the current change set' }
-        ]
+    agentCommands: (params) =>
+      reading('agentCommands', () => {
+        requireConnection()
+        return records.commands(params)
+      }),
+    approvalInspect: (params) =>
+      reading('approvalInspect', () => {
+        requireConnection()
+        return records.inspect(params)
       }),
     composerSubmit: (params) => {
       requireConnection()
-      const text = (params as { text?: string }).text ?? ''
-      const actionId = nextActionId()
-      const node: DocumentNode = {
-        id: `n-${actionId}`,
-        revision: '1',
-        body: { kind: 'message', author: 'you', text }
-      }
-      nodes.push(node)
-      emit({
-        stream_id: `semantic:${SESSION_MAIN}`,
-        sequence: String(nodes.length),
-        body: { kind: 'node', node }
-      })
-      return Promise.resolve({
-        receipt: receipt(actionId, 'applied', 'agent.prompt.submit'),
-        value: null,
-        action_id: actionId
-      })
+      return Promise.resolve(records.prompt(params, false))
     },
-    composerQueue: () => {
+    composerQueue: (params) => {
       requireConnection()
-      return Promise.resolve(settledAs('agent.prompt.queue', 'accepted'))
+      return Promise.resolve(records.prompt(params, true))
     },
-    composerSteer: () => {
+    composerSteer: (params) => {
       requireConnection()
-      return Promise.resolve(settledAs('agent.turn.steer', 'applied'))
+      return Promise.resolve(records.steer(params))
     },
-    composerInterrupt: () => {
+    composerInterrupt: (params) => {
       requireConnection()
-      return Promise.resolve(settledAs('agent.turn.cancel', 'applied'))
+      return Promise.resolve(records.cancel(params))
     },
     approvalRespond: (params) => {
       requireConnection()
-      const decision = (params as { decision?: string }).decision ?? 'deny'
-      const actionId = nextActionId()
-      emit({
-        stream_id: 'receipts',
-        sequence: String(actionCounter),
-        body: { kind: 'receipt', receipt: receipt(actionId, 'applied', 'agent.approval.respond') }
-      })
-      return Promise.resolve({
-        receipt: receipt(actionId, 'applied', 'agent.approval.respond'),
-        value: { decision },
-        action_id: actionId
-      })
+      return Promise.resolve(records.respond(params))
     },
     pluginActionInvoke: (params) => {
       requireConnection()
@@ -770,21 +781,28 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
         media_type: 'image/png'
       }),
 
-    historyPage: () =>
-      Promise.resolve({
-        rows: [],
-        oldest_retained_row: 0,
-        eviction_marker: null
+    historyPage: (params) =>
+      reading('historyPage', () => {
+        requireConnection()
+        return records.history(params)
       }),
-    attentionRead: () =>
+    attentionRead: (params) =>
       reading('attentionRead', () => {
         requireConnection()
-        return attention(acknowledged)
+        return records.attentionRead(params)
       }),
     attentionAcknowledge: (params) => {
-      const id = (params as { attention_id?: string }).attention_id
-      if (id) acknowledged.add(id)
-      return Promise.resolve(settledAs('attention.acknowledge', 'applied'))
+      requireConnection()
+      return Promise.resolve(records.attentionAcknowledge(params))
+    },
+    reviewRead: (params) =>
+      reading('reviewRead', () => {
+        requireConnection()
+        return records.reviewRead(params)
+      }),
+    reviewAcknowledge: (params) => {
+      requireConnection()
+      return Promise.resolve(records.reviewAcknowledge(params))
     },
     questionRead: () =>
       Promise.resolve({
@@ -799,32 +817,39 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
       }),
     questionAnswer: () =>
       Promise.resolve(settledAs('question.answer', 'applied')),
-    grantList: () => Promise.resolve(grants() as unknown),
+    deviceList: (params) =>
+      reading('deviceList', () => {
+        requireConnection()
+        return records.deviceList(params)
+      }),
+    // What an invitation would carry is native code's own reading of the protocol's table, and it
+    // reaches no host.
+    grantNotices: (selection) => Promise.resolve(records.grantNotices(selection)),
     grantCreate: (params) => {
-      const asked = params as { role?: string; rights?: string[] }
-      const wantsAnswering = asked.rights?.includes('question.respond') ?? false
-      const isReadOnlyRole = asked.role === 'viewer' || asked.role === 'reviewer'
-      const explained = (params as { answering_explained?: boolean }).answering_explained ?? false
-      if (wantsAnswering && isReadOnlyRole && !explained) {
-        refuse(
-          'PERMISSION_DENIED',
-          'A viewer or reviewer receives question.respond only through the explained invitation option.'
-        )
-      }
-      return Promise.resolve(settledAs('grant.create', 'applied'))
+      requireConnection()
+      return Promise.resolve(records.grantCreate(params))
     },
+    grantList: (params) =>
+      reading('grantList', () => {
+        requireConnection()
+        return records.grantList(params)
+      }),
 
-    pluginList: () =>
+    pluginList: (params) =>
       reading('pluginList', () => {
         requireConnection()
-        return packages()
+        return records.pluginList(params)
       }),
-    catalogueList: () => Promise.resolve(packages() as unknown),
+    catalogueList: (params) =>
+      reading('catalogueList', () => {
+        requireConnection()
+        return records.catalogueList(params)
+      }),
 
-    changesetRead: () =>
+    changesetRead: (params) =>
       reading('changesetRead', () => {
         requireConnection()
-        return changesets()
+        return records.changesetRead(params)
       }),
 
     storageStatus: () =>
@@ -1224,14 +1249,15 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
       }
     },
     emit,
-    appendNode(node) {
-      nodes.push(node)
+    appendNode(node, sessionId = SESSION_MAIN) {
+      presentation += 1
       emit({
-        stream_id: `semantic:${SESSION_MAIN}`,
-        sequence: String(nodes.length),
+        stream_id: `semantic:${sessionId}`,
+        sequence: String(presentation),
         body: { kind: 'node', node }
       })
     },
+    records,
     changePromptGeneration() {
       promptGeneration += 1
       emit({
@@ -1243,6 +1269,10 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
     setConnected(next, reason = UNREACHABLE) {
       connected = next
       lostBecause = reason
+      for (const listener of connectionListeners) listener(connectionNow())
+    },
+    setRights(next) {
+      rights = next
       for (const listener of connectionListeners) listener(connectionNow())
     },
     hold(read) {
@@ -1689,244 +1719,6 @@ function sessions(): SessionListResult {
   } as unknown as SessionListResult
 }
 
-function startingConversation(): DocumentNode[] {
-  return [
-    {
-      id: 'n-1',
-      revision: '1',
-      body: { kind: 'message', author: 'you', text: 'Find why the reconnect test is flaky.' }
-    },
-    {
-      id: 'n-2',
-      revision: '1',
-      body: {
-        kind: 'markdown',
-        source:
-          'The test waits on a **timer**, not on the subscription.\n\n- the deadline is 2 s\n- the host answers in 1.9 s under load\n\nSee [the reconnect notes](https://docs.example.org/reconnect).'
-      }
-    },
-    {
-      id: 'n-3',
-      revision: '2',
-      body: { kind: 'tool', name: 'read_file', outcome: 'succeeded', summary: 'tests/reconnect.rs' }
-    },
-    {
-      id: 'n-4',
-      revision: '1',
-      body: {
-        kind: 'diff',
-        files: [{ path: 'tests/reconnect.rs', added: 6, removed: 2, binary: false }]
-      }
-    },
-    {
-      id: 'n-5',
-      revision: '1',
-      body: { kind: 'approval_ref', approval_request_id: 'ar-1' }
-    },
-    {
-      id: 'n-6',
-      revision: '1',
-      body: {
-        kind: 'action_group',
-        label: 'Change set',
-        controls: [
-          {
-            accessible_description: 'Open the change set this turn produced',
-            action_id: 'changeset.open',
-            disabled_reason: null,
-            enabled_when: { op: 'always' },
-            icon: 'document',
-            id: 'c-open',
-            label: 'Open change set',
-            parameters: { fields: [] },
-            priority: 'primary',
-            revision: '1',
-            visible_when: { op: 'always' }
-          }
-        ]
-      }
-    }
-  ] as unknown as DocumentNode[]
-}
-
-function attention(acknowledged: ReadonlySet<string>): AttentionInbox {
-  const entries = [
-    {
-      attention_id: 'a-1',
-      kind: 'pending_decision' as const,
-      title: 'Run the release script',
-      detail: 'Codex is asking to run a command that writes outside the repository.',
-      host_label: 'studio',
-      environment_id: ENVIRONMENT,
-      session_id: SESSION_MAIN,
-      session_epoch: '1',
-      session_display_number: '1',
-      application: 'Codex',
-      raised_at_ms: FAKE_NOW_MS - 90_000,
-      approval_request_id: 'ar-1',
-      command_preview: 'scripts/release.sh --publish'
-    },
-    {
-      attention_id: 'a-2',
-      kind: 'failed_action' as const,
-      title: 'Upload did not finish',
-      detail: 'The environment is out of staging space.',
-      host_label: 'studio',
-      environment_id: ENVIRONMENT,
-      session_id: SESSION_BUILD,
-      session_epoch: '1',
-      session_display_number: '2',
-      application: 'Claude Code',
-      raised_at_ms: FAKE_NOW_MS - 300_000,
-      error_code: 'QUOTA_EXCEEDED'
-    },
-    {
-      attention_id: 'a-3',
-      kind: 'awaiting_review' as const,
-      title: 'Six files changed',
-      detail: 'The reconnect fix is ready to look at.',
-      host_label: 'studio',
-      environment_id: ENVIRONMENT,
-      session_id: SESSION_MAIN,
-      session_epoch: '1',
-      session_display_number: '1',
-      application: 'Codex',
-      raised_at_ms: FAKE_NOW_MS - 600_000
-    },
-    {
-      attention_id: 'a-4',
-      kind: 'disconnected' as const,
-      title: 'laptop has not been in contact',
-      detail: 'Its sessions may still be running. Nothing here says they are not.',
-      host_label: 'laptop',
-      environment_id: '3f1a2c40-11aa-4b2c-9d3e-000000000002',
-      session_id: null,
-      session_epoch: null,
-      session_display_number: null,
-      application: null,
-      raised_at_ms: FAKE_NOW_MS - 1_800_000,
-      out_of_contact_ms: 1_800_000
-    }
-  ]
-  return { entries: entries.filter((entry) => !acknowledged.has(entry.attention_id)) }
-}
-
-function changesets(): ChangeSets {
-  return {
-    changesets: [
-      {
-        changeset_id: 'cs-1',
-        title: 'Wait on the subscription rather than a timer',
-        session_id: SESSION_MAIN,
-        captured_at_ms: FAKE_NOW_MS - 600_000,
-        reviewed: false,
-        files: [
-          {
-            path: 'tests/reconnect.rs',
-            added: 6,
-            removed: 2,
-            hunks: [
-              {
-                header: '@@ -18,7 +18,11 @@',
-                lines: [
-                  { kind: 'context', text: '    let session = connect().await;' },
-                  { kind: 'remove', text: '    sleep(Duration::from_secs(2)).await;' },
-                  { kind: 'add', text: '    let screen = session.read_screen().await?;' },
-                  { kind: 'add', text: '    assert!(screen.is_drawable());' }
-                ]
-              }
-            ]
-          }
-        ]
-      }
-    ]
-  }
-}
-
-function packages(): PackageViews {
-  return {
-    index_complete: true,
-    installed: [
-      {
-        package_id: 'kala.codex-presentation',
-        name: 'Codex presentation',
-        publisher: 'Kala Powered',
-        version: '1.4.0',
-        enabled: true,
-        pinned_generation: null,
-        capabilities: ['presentation.declarative', 'broker.semantic_events']
-      },
-      {
-        package_id: 'community.tmux-status',
-        name: 'tmux status',
-        publisher: 'community',
-        version: '0.3.1',
-        enabled: false,
-        pinned_generation: '42',
-        capabilities: ['metadata.match']
-      }
-    ],
-    catalogue: [
-      {
-        package_id: 'kala.codex-presentation',
-        name: 'Codex presentation',
-        publisher: 'Kala Powered',
-        summary: 'Rich presentation for Codex sessions.',
-        version: '1.4.0',
-        repository_id: 'official',
-        installed: true,
-        payload_available_offline: true
-      },
-      {
-        package_id: 'kala.gemini-presentation',
-        name: 'Gemini presentation',
-        publisher: 'Kala Powered',
-        summary: 'Rich presentation for Gemini sessions.',
-        version: '1.1.0',
-        repository_id: 'official',
-        installed: false,
-        payload_available_offline: false
-      },
-      {
-        package_id: 'community.tmux-status',
-        name: 'tmux status',
-        publisher: 'community',
-        summary: 'Shows the tmux status line in the session header.',
-        version: '0.3.1',
-        repository_id: 'community',
-        installed: true,
-        payload_available_offline: true
-      }
-    ],
-    repositories: [
-      {
-        repository_id: 'official',
-        label: 'KalaReach official',
-        kind: 'official',
-        publisher: 'Kala Powered',
-        origin: 'https://packages.kala.to',
-        generation: '188',
-        synced_at_ms: FAKE_NOW_MS - 3_600_000,
-        automatic_matching: true,
-        pinned: false,
-        metadata_expired: false
-      },
-      {
-        repository_id: 'community',
-        label: 'Community mirror',
-        kind: 'mirror',
-        publisher: 'community',
-        origin: 'https://mirror.example.org',
-        generation: '42',
-        synced_at_ms: FAKE_NOW_MS - 86_400_000,
-        automatic_matching: false,
-        pinned: true,
-        metadata_expired: true
-      }
-    ]
-  }
-}
-
 function retained(deleted: ReadonlySet<string>): RetainedArtefacts {
   const artefacts = [
     {
@@ -1961,20 +1753,6 @@ function retained(deleted: ReadonlySet<string>): RetainedArtefacts {
     privacy_mode: true,
     privacy_generation: '3',
     artefacts: artefacts.filter((artefact) => !deleted.has(artefact.object_id))
-  }
-}
-
-function grants(): IssuedGrants {
-  return {
-    grants: [
-      {
-        grant_id: 'g-1',
-        role: 'viewer',
-        recipient: 'sam@example.org',
-        rights: ['session.view'],
-        expires_at_ms: FAKE_NOW_MS + 86_400_000
-      }
-    ]
   }
 }
 

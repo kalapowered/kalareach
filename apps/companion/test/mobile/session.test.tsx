@@ -12,8 +12,6 @@ import { describe, expect, it, vi } from 'vitest'
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 
-import type { DocumentNode } from '@kalareach/plugin-sdk'
-
 import { AppProvider } from '../../src/app/state'
 import { fakeHost, LOST_CONTROL, terminalScreen, type HeldReads } from '../../src/host/fake'
 import { describeMode } from '../../src/mobile/model/gestures'
@@ -44,10 +42,6 @@ async function made(held: HeldReads, count: number): Promise<void> {
   await waitFor(() => {
     expect(held.count).toBe(count)
   })
-}
-
-function message(id: string, text: string): DocumentNode {
-  return { id, revision: '1', body: { kind: 'message', author: 'agent', text } }
 }
 
 describe("the phone's session view keeps each read to its own session", () => {
@@ -101,17 +95,15 @@ describe("the phone's session view keeps each read to its own session", () => {
     const { rerender } = render(onSession(SESSION_MAIN))
     await made(held, 1)
 
-    // The host moves on, and the view changes session before the first read answers.
-    act(() => {
-      controls.appendNode(message('n-7', 'Written after the first read.'))
-    })
+    // The view changes session before the first read answers.
     rerender(onSession(SESSION_BUILD))
     await made(held, 2)
 
     await answer(held, 1)
-    expect(screen.getByText('Written after the first read.')).toBeInTheDocument()
+    expect(screen.getByText('Claude Code started.')).toBeInTheDocument()
     await answer(held, 0)
-    expect(screen.getByText('Written after the first read.')).toBeInTheDocument()
+    expect(screen.queryByText('Find why the reconnect test is flaky.')).toBeNull()
+    expect(screen.getByText('Claude Code started.')).toBeInTheDocument()
   })
 
   it('says it is reading the conversation before the first answer, not that it is empty', async () => {

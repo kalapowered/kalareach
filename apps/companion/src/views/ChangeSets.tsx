@@ -2,43 +2,121 @@
  * Change sets, and the retained artefacts a privacy generation left behind.
  *
  * Both are lists of things the person may act on, and both have the same rule underneath: nothing
- * is removed because it looked stale. A change set stays until it is reviewed; a retained artefact
+ * is removed because it looked stale. A change set is an immutable captured version: this shows
+ * exactly what it holds and what it left out, every version of it beside the one read, and marking
+ * one reviewed records that this version was reviewed and changes nothing else. A retained artefact
  * is deleted only by an action that is about that artefact.
  */
 
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 
+import type { ChangesetReadResult, ReviewReadResult, ReviewState } from '@kalareach/protocol'
+
 import { Badge, Banner, Button, Card, CommitButton } from '../components/ui'
 import { useApp } from '../app/state'
 import { failureMessage, watch, type Watch } from '../host/port'
 import { ask } from '../mobile/model/call'
-import { outcomeMessage, receiptTone } from './Conversation'
-import type { ChangeSets as ChangeSetList, RetainedArtefacts } from '../model/pending'
+import { outcomeMessage, outcomeTone } from '../model/receipts'
+import type { RetainedArtefacts } from '../model/pending'
+
+/** The largest page of review state one read asks for. */
+const PAGE_REVIEWS = '200'
+
+/** A review subject that is a change set, with where it was captured. */
+interface ChangeSetReview {
+  readonly review: ReviewState
+  readonly sessionId: string
+  readonly changeSetId: string
+}
+
+/** The change sets among the subjects a review read listed. */
+function changeSetsOf(reviews: ReviewReadResult | null): readonly ChangeSetReview[] {
+  return (reviews?.reviews ?? []).flatMap((review) =>
+    'change_set' in review.subject
+      ? [
+          {
+            review,
+            sessionId: review.subject.change_set.session_id,
+            changeSetId: review.subject.change_set.change_set_id
+          }
+        ]
+      : []
+  )
+}
+
+/** What each consistency class promises, in words. */
+const CONSISTENCY: Readonly<Record<ChangesetReadResult['version']['consistency'], string>> = {
+  atomic_snapshot: 'Read from one atomic snapshot of the repository.',
+  quiesced_capture: 'Read while the workspace was held still.',
+  per_file_capture: 'Read file by file from a live working tree, which may have changed meanwhile.'
+}
+
+/** Why a path was left out, in words. */
+const EXCLUDED: Readonly<Record<ChangesetReadResult['version']['exclusions'][number]['reason'], string>> =
+  {
+    policy: 'Left out by the capture policy',
+    grant: 'Outside the paths the capture was allowed to read',
+    secret_rule: 'Covered by a secret rule, so never read',
+    unsupported: 'Not file content',
+    deleted: 'Deleted in the working tree',
+    unreadable: 'Could not be read'
+  }
 
 /** Change sets and retained artefacts. */
 export function ChangeSets(): ReactNode {
   const { port, say } = useApp()
-  const [sets, setSets] = useState<ChangeSetList | null>(null)
+  const [reviews, setReviews] = useState<ReviewReadResult | null>(null)
+  // Each listed change set's newest version, by its identifier.
+  const [versions, setVersions] = useState<ReadonlyMap<string, ChangesetReadResult>>(new Map())
   const [retained, setRetained] = useState<RetainedArtefacts | null>(null)
   const [failure, setFailure] = useState<string | null>(null)
   const [selected, setSelected] = useState<string | null>(null)
-  // Every read, on opening, after a deletion and on a retry, is made under one watch with no
+  // Every read, on opening, after an action and on a retry, is made under one watch with no
   // listeners, so only the newest read's answer is shown, and none once the screen closes.
   const reads = useRef<Watch | null>(null)
 
   const load = useCallback(() => {
     const current = reads.current?.read() ?? null
     if (current === null) return
-    ask(() => Promise.all([port.changesetRead({}), port.storageStatus({})]))
-      .then(([changes, storage]) => {
+    ask(async () => {
+      const listed = await port.reviewRead({
+        session_id: null,
+        subject: null,
+        max_reviews: PAGE_REVIEWS,
+        after: null
+      })
+      // Each change set is read at its newest version, which is what its review names.
+      const read = await Promise.all(
+        changeSetsOf(listed).map(
+          async (each) =>
+            [
+              each.changeSetId,
+              await port.changesetRead({ change_set_id: each.changeSetId, version: null })
+            ] as const
+        )
+      )
+      return { listed, read }
+    })
+      .then(({ listed, read }) => {
         if (!current()) return
-        setSets(changes as ChangeSetList)
-        setRetained(storage as RetainedArtefacts)
+        setReviews(listed)
+        setVersions(new Map(read))
         setFailure(null)
       })
       .catch((error: unknown) => {
         if (!current()) return
         setFailure(failureMessage(error))
+      })
+    // What a privacy generation left behind is its own read, and one this host may not answer:
+    // the change sets are shown whether or not it does.
+    ask(() => port.storageStatus({}))
+      .then((storage) => {
+        if (!current()) return
+        setRetained(storage as RetainedArtefacts)
+      })
+      .catch(() => {
+        if (!current()) return
+        setRetained(null)
       })
   }, [port])
 
@@ -51,8 +129,29 @@ export function ChangeSets(): ReactNode {
     }
   }, [load])
 
-  const changesets = sets?.changesets ?? []
-  const current = changesets.find((set) => set.changeset_id === selected) ?? changesets[0]
+  const changeSets = changeSetsOf(reviews)
+  const current = changeSets.find((each) => each.changeSetId === selected) ?? changeSets[0]
+  const currentId = current?.changeSetId ?? null
+
+  const shown = currentId === null ? null : (versions.get(currentId) ?? null)
+  const version = shown?.version ?? null
+
+  const markReviewed = (review: ChangeSetReview) => {
+    ask(() =>
+      port.reviewAcknowledge({
+        session_id: review.sessionId,
+        subject: review.review.subject,
+        version: review.review.current_version
+      })
+    )
+      .then((settled) => {
+        say(outcomeMessage('Marked as reviewed', settled), outcomeTone(settled))
+        load()
+      })
+      .catch((error: unknown) => {
+        say(failureMessage(error), 'danger')
+      })
+  }
 
   return (
     <>
@@ -60,7 +159,7 @@ export function ChangeSets(): ReactNode {
         <div>
           <p className="eyebrow">Change sets</p>
           <h1>Changes</h1>
-          <p>What each session changed, kept as it was captured.</p>
+          <p>What each session changed, kept exactly as it was captured.</p>
         </div>
       </header>
 
@@ -73,71 +172,107 @@ export function ChangeSets(): ReactNode {
         />
       ) : null}
 
-      {changesets.length === 0 ? (
+      {changeSets.length === 0 ? (
         <div className="empty-state">
-          <h2>No changes captured</h2>
+          <h2>{reviews === null ? 'Reading the change sets…' : 'No changes captured'}</h2>
           <p>A session that changes files records a change set here.</p>
         </div>
       ) : (
         <div className="review-layout">
           <Card className="file-nav">
             <div className="card-body">
-              {changesets.map((set) => (
+              {changeSets.map((each) => (
                 <button
-                  key={set.changeset_id}
+                  key={each.changeSetId}
                   type="button"
                   className="file-button"
-                  aria-current={set.changeset_id === current?.changeset_id}
+                  aria-current={each.changeSetId === currentId}
+                  data-testid={`change-set-${each.changeSetId}`}
                   onClick={() => {
-                    setSelected(set.changeset_id)
+                    setSelected(each.changeSetId)
                   }}
                 >
-                  <span className="spacer">{set.title}</span>
-                  {set.reviewed ? <Badge tone="success">Reviewed</Badge> : null}
+                  <span className="spacer">
+                    {versions.get(each.changeSetId)?.version.label ?? 'Change set'}
+                  </span>
+                  {each.review.outstanding ? (
+                    <Badge tone="warning">To review</Badge>
+                  ) : (
+                    <Badge tone="success">Reviewed</Badge>
+                  )}
                 </button>
               ))}
             </div>
           </Card>
-          <Card>
+          <Card data-testid="change-set">
             <div className="card-header">
               <div className="spacer">
-                <h2>{current?.title ?? ''}</h2>
-                <p className="muted small">
-                  {current?.files.length ?? 0} file
-                  {(current?.files.length ?? 0) === 1 ? '' : 's'} changed
+                <h2>{version?.label ?? 'Reading this change set…'}</h2>
+                {version ? (
+                  <p className="muted small">
+                    Version {version.version} of {shown?.versions.length ?? 1} · against{' '}
+                    <span className="mono">
+                      {version.base_reference ?? version.base_revision.slice(0, 12)}
+                    </span>{' '}
+                    · {Number(version.summary.total_paths).toLocaleString()} paths
+                  </p>
+                ) : null}
+              </div>
+              {current?.review.outstanding && version ? (
+                <CommitButton
+                  data-testid="mark-reviewed"
+                  onCommit={() => {
+                    markReviewed(current)
+                  }}
+                >
+                  Mark version {current.review.current_version} reviewed
+                </CommitButton>
+              ) : null}
+            </div>
+            {version ? (
+              <div className="card-body">
+                <p className="small muted">{CONSISTENCY[version.consistency]}</p>
+                <p className="small faint">{version.consistency_detail}</p>
+                <h3>Changed</h3>
+                {version.changes.map((path) => (
+                  <div className="divided-row" key={path.path} data-change={path.change}>
+                    <span className="mono spacer">{path.path}</span>
+                    <span className="small muted">
+                      {path.change === 'deleted'
+                        ? 'Deleted'
+                        : path.change === 'unmerged'
+                          ? 'Unmerged'
+                          : `${Number(path.byte_len).toLocaleString()} bytes${path.content === 'binary' ? ', binary' : ''}`}
+                    </span>
+                  </div>
+                ))}
+                {Number(version.omitted_changes) > 0 ? (
+                  <p className="small faint">
+                    And {version.omitted_changes} more changed paths this read does not list.
+                  </p>
+                ) : null}
+                {version.exclusions.length > 0 ? (
+                  <>
+                    <h3>Left out</h3>
+                    {version.exclusions.map((exclusion) => (
+                      <div className="divided-row" key={exclusion.path}>
+                        <span className="mono spacer">{exclusion.path}</span>
+                        <span className="small muted">{EXCLUDED[exclusion.reason]}</span>
+                      </div>
+                    ))}
+                  </>
+                ) : null}
+                {version.limitations.map((limitation) => (
+                  <p className="small faint" key={limitation}>
+                    {limitation}
+                  </p>
+                ))}
+                <p className="small faint">
+                  Marking a version reviewed records that you reviewed it. It approves nothing,
+                  applies nothing and changes no file; a later version is new work to review.
                 </p>
               </div>
-              <Button
-                data-testid="mark-reviewed"
-                onClick={() => {
-                  say('Marked as reviewed.')
-                }}
-              >
-                Mark reviewed
-              </Button>
-            </div>
-            <div className="card-body">
-              {(current?.files ?? []).map((file) => (
-                <div key={file.path}>
-                  <div className="divided-row">
-                    <span className="mono spacer">{file.path}</span>
-                    <span className="success-text small">+{file.added}</span>
-                    <span className="danger-text small">-{file.removed}</span>
-                  </div>
-                  {file.hunks.map((hunk) => (
-                    <pre className="diff-code" key={hunk.header}>
-                      <span className="diff-line faint">{hunk.header}</span>
-                      {hunk.lines.map((line, index) => (
-                        <span className={`diff-line ${line.kind}`} key={`${hunk.header}-${index}`}>
-                          {line.kind === 'add' ? '+' : line.kind === 'remove' ? '-' : ' '}
-                          {line.text}
-                        </span>
-                      ))}
-                    </pre>
-                  ))}
-                </div>
-              ))}
-            </div>
+            ) : null}
           </Card>
         </div>
       )}
@@ -184,9 +319,9 @@ export function ChangeSets(): ReactNode {
                           say(
                             outcomeMessage(
                               'Deleted, which removes the record rather than the physical bytes',
-                              result.receipt
+                              result
                             ),
-                            receiptTone(result.receipt)
+                            outcomeTone(result)
                           )
                           load()
                         })

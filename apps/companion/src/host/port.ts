@@ -11,15 +11,56 @@
  */
 
 import type {
+  ActionRight,
+  AgentApprovalInspectParams,
+  AgentApprovalInspectResult,
+  AgentApprovalRespondParams,
+  AgentApprovalRespondResult,
+  AgentCancelParams,
+  AgentCapabilitiesParams,
+  AgentCapabilitiesResult,
+  AgentCommandsParams,
+  AgentCommandsResult,
+  AgentInstanceList,
+  AgentMutationResult,
+  AgentPromptParams,
+  AgentSnapshotParams,
+  AgentSnapshotResult,
+  AgentSteerParams,
   AttachmentSummary,
+  AttentionAcknowledgeParams,
+  AttentionAcknowledgeResult,
+  AttentionReadParams,
+  AttentionReadResult,
+  AuthorityNotice,
+  CatalogueListParams,
+  CatalogueListResult,
   CellRendition,
+  ChangesetReadParams,
+  ChangesetReadResult,
   ClosureRecord,
+  DeviceListParams,
+  DeviceListResult,
   Dimensions,
   EnvironmentCapabilitiesResult,
   EnvironmentListResult,
+  GrantCreateParams,
+  GrantCreateResult,
+  GrantListParams,
+  GrantListResult,
+  HistoryPageParams,
+  HistoryPageResult,
   HostInfoResult,
   PaletteState,
+  PendingResource,
+  PluginListParams,
+  PluginListResult,
   Receipt,
+  ReviewAcknowledgeParams,
+  ReviewAcknowledgeResult,
+  ReviewReadParams,
+  ReviewReadResult,
+  RoleSelection,
   SessionListResult,
   SessionReadResult,
   ShellLaunchResult,
@@ -29,10 +70,9 @@ import type {
   VoiceStartResult,
   VoiceStopResult
 } from '@kalareach/protocol'
-import type { DocumentNode } from '@kalareach/plugin-sdk'
 
 import type { AccountView, UsageView } from '../model/account'
-import type { AttentionInbox, LaunchSurface } from '../model/pending'
+import type { LaunchSurface } from '../model/pending'
 
 /** A failure a command answered with. */
 export interface HostError {
@@ -70,6 +110,12 @@ export interface ConnectionState {
    * reader's own words for a loss with no reason show in its place.
    */
   readonly reason: string | null
+  /**
+   * What this connection may do, while it is live, or null when native code has not said. The
+   * host checks every right again when an action arrives; this is what a control's visibility is
+   * decided from.
+   */
+  readonly rights: readonly ActionRight[] | null
 }
 
 /**
@@ -444,6 +490,20 @@ export interface Settled<T = unknown> {
   readonly action_id: string | null
 }
 
+/** A session's live agent instances, and every request its agents' broker is still arbitrating. */
+export interface SessionAgents {
+  readonly instances: AgentInstanceList
+  readonly resources: readonly PendingResource[]
+}
+
+/** What an invitation would carry, in the host's own terms and words. */
+export interface GrantNotices {
+  /** The actions its role and choices compile to. The host authorises from these, never a role. */
+  readonly actions: readonly ActionRight[]
+  /** Every notice those actions carry, with the one sentence that states it. */
+  readonly notices: readonly { readonly notice: AuthorityNotice; readonly sentence: string }[]
+}
+
 /** One event the host pushed. */
 export interface HostEvent {
   /** The stream it belongs to. */
@@ -519,13 +579,37 @@ export interface HostPort {
   launchSurface(params: unknown): Promise<LaunchSurface>
   shellLaunch(params: unknown, subject: SessionSubject): Promise<Settled<ShellLaunchResult>>
 
-  agentSnapshot(params: unknown): Promise<{ nodes: DocumentNode[] }>
-  agentCommands(params: unknown): Promise<unknown>
-  composerSubmit(params: unknown, subject: SessionSubject): Promise<Settled>
-  composerQueue(params: unknown, subject: SessionSubject): Promise<Settled>
-  composerSteer(params: unknown, subject: SessionSubject): Promise<Settled>
-  composerInterrupt(params: unknown, subject: SessionSubject): Promise<Settled>
-  approvalRespond(params: unknown, subject: SessionSubject): Promise<Settled>
+  /**
+   * A session's live agent instances, and every request its agents' broker is still arbitrating.
+   *
+   * Read on the session's own worker, as every page of one snapshot: the page is given the
+   * instances and the requests, never parts of two states.
+   */
+  sessionAgents(sessionId: string): Promise<SessionAgents>
+  /** What one agent instance can do now, with the evidence behind each capability. */
+  agentCapabilities(params: AgentCapabilitiesParams): Promise<AgentCapabilitiesResult>
+  /**
+   * One part of an agent instance's semantic history, from the node the parameters name, filtered
+   * as this device's authority requires.
+   */
+  agentSnapshot(params: AgentSnapshotParams): Promise<AgentSnapshotResult>
+  /** The commands an agent instance advertises. */
+  agentCommands(params: AgentCommandsParams): Promise<AgentCommandsResult>
+  /**
+   * What an installed decoder read of one approval request and the decisions it offered, with the
+   * request's original bytes.
+   */
+  approvalInspect(params: AgentApprovalInspectParams): Promise<AgentApprovalInspectResult>
+  /**
+   * The agent mutations. Each names the session, the instance and the binding revision it was
+   * prepared against in its own parameters, and nothing else: native code builds the envelope from
+   * exactly those, so the two cannot disagree.
+   */
+  composerSubmit(params: AgentPromptParams): Promise<Settled<AgentMutationResult>>
+  composerQueue(params: AgentPromptParams): Promise<Settled<AgentMutationResult>>
+  composerSteer(params: AgentSteerParams): Promise<Settled<AgentMutationResult>>
+  composerInterrupt(params: AgentCancelParams): Promise<Settled<AgentMutationResult>>
+  approvalRespond(params: AgentApprovalRespondParams): Promise<Settled<AgentApprovalRespondResult>>
   pluginActionInvoke(params: unknown, subject: SessionSubject): Promise<Settled>
 
   draftCreate(params: unknown, subject: SessionSubject): Promise<Settled>
@@ -541,18 +625,35 @@ export interface HostPort {
   /** Reads the bytes behind one validated attachment handle. */
   attachmentImage(params: unknown): Promise<{ bytes: number[]; media_type: string }>
 
-  historyPage(params: unknown): Promise<unknown>
-  attentionRead(params: unknown): Promise<AttentionInbox>
-  attentionAcknowledge(params: unknown, subject: SessionSubject): Promise<Settled>
+  /**
+   * One page of a session's retained output, from the cursor and within the byte bound the
+   * parameters name. A live session's is read on its own worker, and an ended one's from the host's
+   * archive.
+   */
+  historyPage(params: HistoryPageParams): Promise<HistoryPageResult>
+  attentionRead(params: AttentionReadParams): Promise<AttentionReadResult>
+  /** Records that items were seen, each at the revision shown. An environment's, not a session's. */
+  attentionAcknowledge(params: AttentionAcknowledgeParams): Promise<Settled<AttentionAcknowledgeResult>>
+  /** Which completed turns and change sets wait for review, at which versions. */
+  reviewRead(params: ReviewReadParams): Promise<ReviewReadResult>
+  /** Records that one exact version was reviewed. It approves nothing and changes no file. */
+  reviewAcknowledge(params: ReviewAcknowledgeParams): Promise<Settled<ReviewAcknowledgeResult>>
   questionRead(params: unknown): Promise<unknown>
   questionAnswer(params: unknown, subject: SessionSubject): Promise<Settled>
-  grantList(params: unknown): Promise<unknown>
-  grantCreate(params: unknown, subject: SessionSubject): Promise<Settled>
+  /** The devices paired with this host, which is who an invitation can go to. */
+  deviceList(params: DeviceListParams): Promise<DeviceListResult>
+  /**
+   * What an invitation with this role and these choices would carry: the actions they compile to,
+   * and every notice those actions carry in the one sentence that states it. It reaches nothing.
+   */
+  grantNotices(selection: RoleSelection): Promise<GrantNotices>
+  grantCreate(params: GrantCreateParams, subject: SessionSubject): Promise<Settled<GrantCreateResult>>
+  grantList(params: GrantListParams): Promise<GrantListResult>
 
-  pluginList(params: unknown): Promise<unknown>
-  catalogueList(params: unknown): Promise<unknown>
+  pluginList(params: PluginListParams): Promise<PluginListResult>
+  catalogueList(params: CatalogueListParams): Promise<CatalogueListResult>
 
-  changesetRead(params: unknown): Promise<unknown>
+  changesetRead(params: ChangesetReadParams): Promise<ChangesetReadResult>
 
   storageStatus(params: unknown): Promise<unknown>
   storageObjectDelete(params: unknown, subject: SessionSubject): Promise<Settled>

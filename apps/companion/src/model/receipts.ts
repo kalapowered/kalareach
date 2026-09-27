@@ -172,3 +172,79 @@ export function reconnectBanner(
   }
   return null
 }
+
+/**
+ * What a mutation's answer carries: the receipt, the method's own result, or only the action's
+ * identity when the host never confirmed what became of it.
+ */
+export interface Answer {
+  readonly receipt: Receipt | null
+  readonly value: unknown
+  readonly action_id: string | null
+}
+
+/**
+ * The state one answer puts a submission in.
+ *
+ * A receipt says it in its own state. A host answers with the method's own result only for an
+ * action it performed, so a result is applied. An answer that carries neither is an action whose
+ * outcome nobody knows, which is never rounded up to a success or down to a refusal.
+ */
+export function answeredState(answer: Answer): InputState {
+  if (answer.receipt !== null) return stateOfReceipt(answer.receipt)
+  if (answer.value !== null && answer.value !== undefined) return 'applied'
+  return 'unknown'
+}
+
+/**
+ * What one answer means, in words.
+ *
+ * Only an applied action is completion. Everything else is named for what it is, because "waiting"
+ * for an outcome the host has already refused is the one thing the receipt contract exists to
+ * prevent.
+ */
+export function outcomeMessage(done: string, answer: Answer): string {
+  switch (answeredState(answer)) {
+    case 'applied':
+      return `${done}.`
+    case 'refused':
+      return 'The host refused that.'
+    case 'rejected':
+      return 'The host rejected that.'
+    case 'unknown':
+      return 'The host could not confirm what became of that.'
+    case 'queued':
+    case 'sent':
+      return 'Sent. Waiting for the host to confirm.'
+  }
+}
+
+/**
+ * How an answer reads. Only an applied action is completion; anything still with the host is
+ * pending, and a pending outcome wearing a completion mark is the same false claim in another
+ * shape.
+ */
+export function outcomeTone(answer: Answer): 'success' | 'danger' | 'pending' {
+  switch (answeredState(answer)) {
+    case 'applied':
+      return 'success'
+    case 'queued':
+    case 'sent':
+      return 'pending'
+    case 'refused':
+    case 'rejected':
+    case 'unknown':
+      return 'danger'
+  }
+}
+
+/**
+ * Records what one answer said about a submission: its receipt's state, applied for a host's own
+ * result, and unknown for an answer that carried only the action's identity.
+ */
+export function answered(submission: Submission, answer: Answer): Submission {
+  if (answer.receipt !== null) return settled(submission, answer.receipt)
+  const identified =
+    answer.action_id === null ? submission : { ...submission, actionId: answer.action_id }
+  return { ...identified, state: answeredState(answer), error: null }
+}

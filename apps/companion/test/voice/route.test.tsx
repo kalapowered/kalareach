@@ -513,7 +513,8 @@ describe('whether this device is reaching the host', () => {
         Promise.resolve({
           connected: false,
           environment_id: null,
-          reason: 'this host cannot be contacted right now'
+          reason: 'this host cannot be contacted right now',
+          rights: null
         })
     })
     await startCall()

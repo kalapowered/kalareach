@@ -28,6 +28,29 @@ import {
 } from './model'
 import './voice.css'
 
+/**
+ * The turn a cancellation names: the instance running it, the binding revision it was read at, and
+ * the turn itself. The host refuses a cancellation whose binding has since moved, so a turn read
+ * before the agent moved on cancels nothing it was not about.
+ */
+export interface CurrentTurn {
+  readonly sessionId: string
+  readonly instanceId: string
+  readonly bindingRevision: string
+  readonly turnId: string
+}
+
+/** Whether two turns are the same turn at the same binding. */
+function sameTurn(a: CurrentTurn | null, b: CurrentTurn | null): boolean {
+  if (a === null || b === null) return a === b
+  return (
+    a.sessionId === b.sessionId &&
+    a.instanceId === b.instanceId &&
+    a.bindingRevision === b.bindingRevision &&
+    a.turnId === b.turnId
+  )
+}
+
 /** What the screen can do, supplied by whatever is hosting it. */
 export interface VoiceSurfaceActions {
   /** Starts a call. The offer is made natively; this screen never touches media. */
@@ -39,7 +62,7 @@ export interface VoiceSurfaceActions {
   /** Ends the call and revokes its grant. Local, and the host is told after. */
   readonly hangUp: () => void
   /** Cancels the current turn on a host. Typed, and it names the turn. */
-  readonly cancelTask: (sessionId: string, turnId: string) => void
+  readonly cancelTask: (turn: CurrentTurn) => void
   /** Asks the host what it selected for the call. A read from the host; nothing is sent onward. */
   readonly readSelection: () => void
 }
@@ -50,8 +73,8 @@ export interface VoiceSurfaceProps {
   readonly choice: ProviderChoice | null
   /** The running call, or null before one starts. */
   readonly call: RunningCall | null
-  /** The session and turn a cancellation would name, when the host has published one. */
-  readonly currentTurn: { readonly sessionId: string; readonly turnId: string } | null
+  /** The turn a cancellation would name, when the host has published one. */
+  readonly currentTurn: CurrentTurn | null
   /** True while a request this screen made is in flight. */
   readonly busy: boolean
   /**
@@ -293,7 +316,7 @@ function CallScreen({
   actions
 }: {
   readonly call: RunningCall
-  readonly currentTurn: { readonly sessionId: string; readonly turnId: string } | null
+  readonly currentTurn: CurrentTurn | null
   readonly busy: boolean
   readonly notice: string | null
   readonly actions: VoiceSurfaceActions
@@ -307,16 +330,10 @@ function CallScreen({
    * no longer see has not been answered, and it must not come back answered if the host returns to
    * the turn it was asked about.
    */
-  const [confirmingCancel, setConfirmingCancel] = useState<{
-    readonly sessionId: string
-    readonly turnId: string
-  } | null>(null)
+  const [confirmingCancel, setConfirmingCancel] = useState<CurrentTurn | null>(null)
   const [turnWhenAsked, setTurnWhenAsked] = useState(currentTurn)
 
-  if (
-    turnWhenAsked?.sessionId !== currentTurn?.sessionId ||
-    turnWhenAsked?.turnId !== currentTurn?.turnId
-  ) {
+  if (!sameTurn(turnWhenAsked, currentTurn)) {
     setTurnWhenAsked(currentTurn)
     if (confirmingCancel) setConfirmingCancel(null)
   }
@@ -352,7 +369,7 @@ function CallScreen({
     // while the question is on screen, and a cancellation that cannot be delivered must not be
     // reported to the person as one that was.
     if (!confirmingCancel || !controlAvailable('cancel_task', call)) return
-    actions.cancelTask(confirmingCancel.sessionId, confirmingCancel.turnId)
+    actions.cancelTask(confirmingCancel)
     setConfirmingCancel(null)
   }, [actions, call, confirmingCancel])
 

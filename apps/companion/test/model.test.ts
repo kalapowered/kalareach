@@ -6,7 +6,6 @@
 
 import { describe, expect, it, vi } from 'vitest'
 
-import type { DocumentNode } from '@kalareach/plugin-sdk'
 import type { AttachmentSummary, PresentationReason } from '@kalareach/protocol'
 
 import {
@@ -14,6 +13,7 @@ import {
   applyNodes,
   emptyConversation,
   installSnapshot,
+  type ConversationState,
   isNewer,
   nodesAbove,
   prependHistory,
@@ -62,26 +62,31 @@ import { failureMessage } from '../src/host/port'
 // The protocol crate's source, as text: the sentences the host gives each presentation reason.
 import attachmentSource from '../../../crates/kr-protocol/src/attachment.rs?raw'
 
-function node(id: string, revision: string, text = id): DocumentNode {
-  return {
-    id,
-    revision,
-    body: { kind: 'message', author: 'agent', text }
-  } as unknown as DocumentNode
+/** An item with an identity, a revision and some text: all the conversation's rules look at. */
+interface Item {
+  readonly id: string
+  readonly revision: string
+  readonly body: { readonly text: string }
 }
+
+function node(id: string, revision: string, text = id): Item {
+  return { id, revision, body: { text } }
+}
+
+const empty = (): ConversationState<Item> => emptyConversation<Item>()
 
 describe('the conversation', () => {
   it('replaces a node with the same identity rather than adding one', () => {
-    let state = applyNode(emptyConversation(), node('a', '1', 'first'))
+    let state = applyNode(empty(), node('a', '1', 'first'))
     state = applyNode(state, node('a', '2', 'second'))
     expect(state.nodes).toHaveLength(1)
-    expect((state.nodes[0].body as { text: string }).text).toBe('second')
+    expect(state.nodes[0].body.text).toBe('second')
   })
 
   it('ignores a revision that is not newer, so an out-of-order delivery does not go backwards', () => {
-    let state = applyNode(emptyConversation(), node('a', '5', 'current'))
+    let state = applyNode(empty(), node('a', '5', 'current'))
     state = applyNode(state, node('a', '4', 'stale'))
-    expect((state.nodes[0].body as { text: string }).text).toBe('current')
+    expect(state.nodes[0].body.text).toBe('current')
   })
 
   it('compares revisions as counters even when they are longer than a safe integer', () => {
@@ -92,14 +97,14 @@ describe('the conversation', () => {
 
   it('renders a bounded window however long the conversation is', () => {
     const many = Array.from({ length: 5_000 }, (_, index) => node(`n${index}`, '1'))
-    const state = applyNodes(emptyConversation(), many)
+    const state = applyNodes(empty(), many)
     expect(state.nodes).toHaveLength(5_000)
     expect(visibleNodes(state).length).toBeLessThanOrEqual(WINDOW_SIZE + 40)
   })
 
   it('follows the live end only while the view is at it', () => {
     let state = applyNodes(
-      emptyConversation(),
+      empty(),
       Array.from({ length: 300 }, (_, index) => node(`n${index}`, '1'))
     )
     const followingStart = state.windowStart
@@ -114,7 +119,7 @@ describe('the conversation', () => {
 
   it('keeps the reader anchored when a page of older content is loaded', () => {
     let state = applyNodes(
-      emptyConversation(),
+      empty(),
       Array.from({ length: 300 }, (_, index) => node(`n${index}`, '1'))
     )
     state = setWindowStart(state, 100)
@@ -132,29 +137,29 @@ describe('the conversation', () => {
   })
 
   it('ignores a history page it already holds', () => {
-    let state = applyNodes(emptyConversation(), [node('a', '1'), node('b', '1')])
+    let state = applyNodes(empty(), [node('a', '1'), node('b', '1')])
     state = prependHistory(state, [node('a', '1')])
     expect(state.nodes).toHaveLength(2)
   })
 })
 
 describe('a snapshot and the nodes held while it was read', () => {
-  const ids = (state: ReturnType<typeof emptyConversation>) => state.nodes.map((each) => each.id)
-  const texts = (state: ReturnType<typeof emptyConversation>) =>
-    state.nodes.map((each) => (each.body as { text: string }).text)
+  const ids = (state: ConversationState<Item>) => state.nodes.map((each) => each.id)
+  const texts = (state: ConversationState<Item>) =>
+    state.nodes.map((each) => each.body.text)
   const snapshot = [node('a', '1'), node('b', '2'), node('c', '1')]
 
   it('keeps the snapshot in its presentation order', () => {
-    expect(ids(installSnapshot(emptyConversation(), snapshot, []))).toEqual(['a', 'b', 'c'])
+    expect(ids(installSnapshot(empty(), snapshot, []))).toEqual(['a', 'b', 'c'])
   })
 
   it('puts a held node the snapshot lacks after it, in the order the stream delivered it', () => {
-    const state = installSnapshot(emptyConversation(), snapshot, [node('e', '1'), node('d', '1')])
+    const state = installSnapshot(empty(), snapshot, [node('e', '1'), node('d', '1')])
     expect(ids(state)).toEqual(['a', 'b', 'c', 'e', 'd'])
   })
 
   it('takes a held node in place of the snapshot’s copy only when its revision is newer', () => {
-    const state = installSnapshot(emptyConversation(), snapshot, [
+    const state = installSnapshot(empty(), snapshot, [
       node('b', '3', 'newer b'),
       node('a', '0', 'older a'),
       node('c', '1', 'same c')
@@ -164,7 +169,7 @@ describe('a snapshot and the nodes held while it was read', () => {
   })
 
   it('leaves the nodes already held where they are, and adds the snapshot’s new ones after', () => {
-    const before = applyNodes(emptyConversation(), [node('a', '1'), node('b', '1')])
+    const before = applyNodes(empty(), [node('a', '1'), node('b', '1')])
     const state = installSnapshot(before, [node('a', '1'), node('b', '2', 'newer b'), node('c', '1')], [])
     expect(ids(state)).toEqual(['a', 'b', 'c'])
     expect(texts(state)).toEqual(['a', 'newer b', 'c'])

@@ -4,7 +4,8 @@
  * A screen that reads again, on a retry, a refresh or an action, can have two reads on their way at
  * once, and they answer in whatever order the host answers them. The one that answers last is not
  * the newer: a screen shows the answer of the newest read it started, and nothing a read answers
- * for a session the screen has left.
+ * for a session the screen has left. A screen that reads again on a cadence, as the inbox does,
+ * has one read on its way at a time, and a read asked for meanwhile follows it.
  */
 
 import type { ReactNode } from 'react'
@@ -19,6 +20,9 @@ import { AppProvider, type Place } from '../src/app/state'
 import { fakeHost, type HeldReads } from '../src/host/fake'
 import type { HostPort } from '../src/host/port'
 import { MobileHosts, MobileSessions } from '../src/mobile/views/Places'
+
+const SESSION_MAIN = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
+const CHANGE_SET = 'c3c3c3c3-0000-4000-8000-000000000001'
 
 function open(port: HostPort, initialPlace: Place): void {
   render(
@@ -51,7 +55,32 @@ async function made(held: HeldReads, count: number): Promise<void> {
 describe('the attention inbox shows its newest read', () => {
   const shows = (kind: string) => document.querySelector(`[data-testid="attention-${kind}"]`) !== null
 
-  it('keeps the newer inbox when two reads answer in reverse order', async () => {
+  /** Marks the one item of `kind` seen, as its own control does. */
+  const markSeen = (kind: string) =>
+    within(screen.getByTestId(`attention-${kind}`)).getByTestId('acknowledge')
+
+  /** Another device marks the item `rule` raised seen, at the revision it is at now. */
+  async function seenElsewhere(
+    port: HostPort,
+    controls: ReturnType<typeof fakeHost>['controls'],
+    rule: 'attention.command_failed'
+  ): Promise<void> {
+    const item = controls.records.attentionItem(rule)
+    await act(async () => {
+      await port.attentionAcknowledge({ items: [{ key: item.key, revision: item.revision }] })
+    })
+  }
+
+  /** Lets a little time pass, in which a read that was going to start would have. */
+  async function pause(): Promise<void> {
+    await act(async () => {
+      await new Promise((resolve) => {
+        setTimeout(resolve, 20)
+      })
+    })
+  }
+
+  it('has one read on its way at a time, and a read an action asks for follows it', async () => {
     const person = userEvent.setup()
     const { port, controls } = fakeHost()
     const held = controls.hold('attentionRead')
@@ -60,24 +89,24 @@ describe('the attention inbox shows its newest read', () => {
     await answer(held, 0)
     expect(shows('failed_action')).toBe(true)
 
-    // Each decision reads the inbox again. Between the two, another device clears the failure.
-    const allow = () =>
-      within(screen.getByTestId('attention-pending_decision')).getByRole('button', { name: 'Allow' })
-    await person.click(allow())
+    // Marking an item seen reads the inbox again. While that read is on its way, another device
+    // marks the failure seen, and a second mark asks for a read of its own.
+    await person.click(markSeen('notice'))
     await made(held, 2)
-    await act(async () => {
-      await port.attentionAcknowledge({ attention_id: 'a-2' }, {})
-    })
-    await person.click(allow())
-    await made(held, 3)
+    await seenElsewhere(port, controls, 'attention.command_failed')
+    await person.click(markSeen('awaiting_review'))
+    await pause()
+    expect(held.count).toBe(2)
 
+    await answer(held, 1)
+    expect(shows('failed_action')).toBe(true)
+    await made(held, 3)
     await answer(held, 2)
     expect(shows('failed_action')).toBe(false)
-    await answer(held, 1)
-    expect(shows('failed_action')).toBe(false)
+    expect(shows('awaiting_review')).toBe(false)
   })
 
-  it('lets a retry give way to a later one', async () => {
+  it('lets a retry follow the read on its way', async () => {
     const person = userEvent.setup()
     const { port, controls } = fakeHost()
     const held = controls.hold('attentionRead')
@@ -92,17 +121,35 @@ describe('the attention inbox shows its newest read', () => {
     })
     await person.click(again())
     await made(held, 2)
-    await act(async () => {
-      await port.attentionAcknowledge({ attention_id: 'a-2' }, {})
-    })
+    await seenElsewhere(port, controls, 'attention.command_failed')
     await person.click(again())
-    await made(held, 3)
+    await pause()
+    expect(held.count).toBe(2)
 
-    await answer(held, 2)
     await answer(held, 1)
+    await made(held, 3)
+    await answer(held, 2)
     expect(shows('pending_decision')).toBe(true)
     expect(shows('failed_action')).toBe(false)
     expect(screen.queryByText('This list could not be read')).toBeNull()
+  })
+
+  it('reads the inbox again when the page is shown again', async () => {
+    const { port, controls } = fakeHost()
+    open(port, { view: 'attention' })
+    await waitFor(() => {
+      expect(shows('failed_action')).toBe(true)
+    })
+
+    await seenElsewhere(port, controls, 'attention.command_failed')
+    await act(async () => {
+      document.dispatchEvent(new Event('visibilitychange'))
+      await Promise.resolve()
+    })
+
+    await waitFor(() => {
+      expect(shows('failed_action')).toBe(false)
+    })
   })
 
   it('shows the inbox it read when nothing changed in between', async () => {
@@ -143,28 +190,34 @@ describe('change sets and retained artefacts show their newest read', () => {
   it('lets a retry give way to a later one', async () => {
     const person = userEvent.setup()
     const { port, controls } = fakeHost()
-    const held = controls.hold('storageStatus')
+    const held = controls.hold('reviewRead')
     controls.setConnected(false)
     open(port, { view: 'changesets' })
+    await made(held, 1)
+    await answer(held, 0)
     await screen.findByText('This could not be read')
     const again = () => screen.getByRole('button', { name: 'Try again' })
 
     act(() => {
       controls.setConnected(true)
     })
-    const before = held.count
     await person.click(again())
-    await made(held, before + 1)
+    await made(held, 2)
+    // Another device marks the change set reviewed while the retry is on its way.
     await act(async () => {
-      await port.storageObjectDelete({ object_id: 'obj-2' }, {})
+      await port.reviewAcknowledge({
+        session_id: SESSION_MAIN,
+        subject: { change_set: { session_id: SESSION_MAIN, change_set_id: CHANGE_SET } },
+        version: '2'
+      })
     })
     await person.click(again())
-    await made(held, before + 2)
+    await made(held, 3)
 
-    await answer(held, before + 1)
-    await answer(held, before)
-    expect(shows('obj-1')).toBe(true)
-    expect(shows('obj-2')).toBe(false)
+    await answer(held, 2)
+    await answer(held, 1)
+    const listed = await screen.findByTestId(`change-set-${CHANGE_SET}`)
+    expect(within(listed).getByText('Reviewed')).toBeInTheDocument()
     expect(screen.queryByText('This could not be read')).toBeNull()
   })
 
@@ -277,31 +330,29 @@ describe('the packages show their newest read', () => {
     const held = controls.hold('pluginList')
     controls.setConnected(false)
     open(port, { view: 'plugins' })
-    await made(held, 1)
-    await answer(held, 0)
+    await screen.findByText('This host is not answering')
     const again = () => screen.getByRole('button', { name: 'Try again' })
 
     act(() => {
       controls.setConnected(true)
     })
     await person.click(again())
-    await made(held, 2)
+    await made(held, 1)
+    // The host goes before the first retry answers; the second is refused before it reads.
     act(() => {
       controls.setConnected(false)
     })
     await person.click(again())
-    await made(held, 3)
 
-    await answer(held, 2)
-    await answer(held, 1)
+    await answer(held, 0)
     expect(screen.getByText('This host is not answering')).toBeInTheDocument()
-    expect(screen.queryAllByText('Codex presentation')).toEqual([])
+    expect(screen.queryAllByText('openai.codex')).toEqual([])
   })
 
   it('shows what it read when nothing changed in between', async () => {
     const { port } = fakeHost()
     open(port, { view: 'plugins' })
-    expect((await screen.findAllByText('Codex presentation')).length).toBeGreaterThan(0)
+    expect((await screen.findAllByText('openai.codex')).length).toBeGreaterThan(0)
   })
 })
 

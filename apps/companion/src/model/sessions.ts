@@ -10,14 +10,70 @@
  * list, and the two reads React needs to subscribe to it.
  */
 
+import type {
+  AgentBindingState,
+  AgentCommand,
+  AgentInstanceSummary,
+  InstanceCapabilityRecord,
+  PendingResource
+} from '@kalareach/protocol'
+
+import type { WithheldCount } from './agent'
 import { emptyConversation, type ConversationState } from './conversation'
 import { startDraft, type Draft } from './drafts'
 import type { Submission } from './receipts'
+
+/**
+ * What the session's own worker last said about its agent.
+ *
+ * Every field is null or empty until it has been read: a fact nobody has told this device is not a
+ * fact it guesses.
+ */
+export interface AgentReading {
+  /** The session's live instances, or null before the first read. */
+  readonly instances: readonly AgentInstanceSummary[] | null
+  /** Every request the session's broker is arbitrating. */
+  readonly resources: readonly PendingResource[]
+  /** The instance the composer speaks to, when one is live. */
+  readonly instance: string | null
+  /** That instance's binding, as its newest read reported it. */
+  readonly binding: AgentBindingState | null
+  /** That instance's capability records, or null before they have been read. */
+  readonly capabilities: ReadonlyMap<string, InstanceCapabilityRecord> | null
+  /** The commands that instance advertises. */
+  readonly commands: readonly AgentCommand[]
+  /** The instance the commands were read for. */
+  readonly commandsOf: string | null
+  /** Where each instance's history continues: the next entry to read. */
+  readonly nextNode: ReadonlyMap<string, string>
+  /** How many entries the host's filter withheld from this device, instance by instance. */
+  readonly withheld: ReadonlyMap<string, WithheldCount>
+  /** Whether a read found that entries it asked for were no longer retained. */
+  readonly gap: boolean
+}
+
+/** Nothing read yet. */
+export function unreadAgent(): AgentReading {
+  return {
+    instances: null,
+    resources: [],
+    instance: null,
+    binding: null,
+    capabilities: null,
+    commands: [],
+    commandsOf: null,
+    nextNode: new Map(),
+    withheld: new Map(),
+    gap: false
+  }
+}
 
 /** Everything one session's views share. */
 export interface SessionState {
   /** The document, its window and where the reader is. */
   readonly conversation: ConversationState
+  /** What the session's worker last said about its agent. */
+  readonly agent: AgentReading
   /** What this device has sent, and what became of it. */
   readonly submissions: readonly Submission[]
   /** The draft for this session. */
@@ -32,6 +88,7 @@ export interface SessionState {
 export function emptySessionState(sessionId: string, now: number): SessionState {
   return {
     conversation: emptyConversation(),
+    agent: unreadAgent(),
     submissions: [],
     draft: startDraft(
       `draft-${sessionId}`,

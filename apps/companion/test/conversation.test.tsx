@@ -1,10 +1,12 @@
 /**
- * The conversation listens, then reads.
+ * The conversation reads the agent's history from its worker, and listens for what packages show.
  *
- * The document is read once the host-event listener is registered, and the nodes the stream
- * delivers while that read is on its way are held until it answers. A node can then neither fall
- * between the read and the listener nor land ahead of the document it follows, and a refusal to
- * read is shown for what it is.
+ * The history is an ordered log with a number on every entry, and the host announces nothing when
+ * an entry is added, so the view reads it again while it is shown, each time from the entry after
+ * the last one it holds: nothing falls between two reads and nothing is read twice. One read is on
+ * its way at a time. What a package shows arrives on the host's event stream, for the session the
+ * stream names. A refusal to read, and a stream that cannot be followed, are each shown for what
+ * they are, and what the host's filter withheld is counted once however often the view reads.
  */
 
 import { describe, expect, it } from 'vitest'
@@ -12,6 +14,7 @@ import { act, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 
 import type { DocumentNode } from '@kalareach/plugin-sdk'
+import type { AgentSnapshotParams } from '@kalareach/protocol'
 
 import { App } from '../src/App'
 import { AppProvider } from '../src/app/state'
@@ -20,9 +23,14 @@ import type { HostEvent, HostPort } from '../src/host/port'
 import { animationFrame } from '../src/model/frame'
 
 const SESSION_MAIN = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
+const SESSION_BUILD = '8a7b6c50-22bb-4c3d-8e4f-000000000102'
+const INSTANCE_MAIN = 'a1a1a1a1-0000-4000-8000-000000000001'
 
-/** The document the scripted host starts with, in its presentation order. */
-const DOCUMENT = ['n-1', 'n-2', 'n-3', 'n-4', 'n-5', 'n-6']
+/** The identity the conversation gives the main agent's entry `node`. */
+const entry = (node: number) => `${INSTANCE_MAIN}:${node}`
+
+/** The main agent's history as the scripted host starts it. */
+const HISTORY = [1, 2, 3, 4, 5].map(entry)
 
 /** The application on the main session's conversation, against a host the test has prepared. */
 function openConversation(port: HostPort): void {
@@ -36,14 +44,14 @@ function openConversation(port: HostPort): void {
   )
 }
 
-/** The nodes the document shows, in the order it shows them. */
+/** The items the conversation shows, in the order it shows them. */
 function shown(): string[] {
   return [
     ...document.querySelectorAll<HTMLElement>('[data-testid="conversation-scroll"] [data-node-id]')
   ].map((node) => node.dataset.nodeId ?? '')
 }
 
-/** What one shown node says. */
+/** What one shown item says. */
 function said(id: string): string {
   return (
     document.querySelector(`[data-testid="conversation-scroll"] [data-node-id="${id}"]`)
@@ -55,20 +63,25 @@ function message(id: string, revision: string, text: string): DocumentNode {
   return { id, revision, body: { kind: 'message', author: 'agent', text } }
 }
 
-/** One node on the main session's stream, as the host publishes it. */
-function streamed(node: DocumentNode, sequence: string): HostEvent {
-  return { stream_id: `semantic:${SESSION_MAIN}`, sequence, body: { kind: 'node', node } }
+/** One node on a session's presentation stream, as the host publishes it. */
+function streamed(node: DocumentNode, sequence: string, sessionId = SESSION_MAIN): HostEvent {
+  return { stream_id: `semantic:${sessionId}`, sequence, body: { kind: 'node', node } }
 }
 
-/**
- * Lets the frame the stream's batch is published on pass. A node the view applied as it arrived is
- * on the page after this; a node it is holding is not.
- */
+/** Lets the frame a streamed batch is published on pass. */
 async function nextFrame(): Promise<void> {
   await act(async () => {
     await new Promise<void>((resolve) => {
       animationFrame(resolve)
     })
+  })
+}
+
+/** The page is shown again, as a window brought back from the Dock is: the view reads at once. */
+async function shownAgain(): Promise<void> {
+  await act(async () => {
+    document.dispatchEvent(new Event('visibilitychange'))
+    await Promise.resolve()
   })
 }
 
@@ -91,79 +104,50 @@ async function made(held: HeldReads, count: number): Promise<void> {
 
 const REFUSED = {
   code: 'RESOURCE_UNAVAILABLE',
-  message: 'The host did not give the document.',
+  message: 'The host did not give the history.',
   user_action: 'retry'
 }
 
-describe('the conversation reads its document once it is listening (KR-REQ-13.02)', () => {
-  it('shows a node the host added while its listener registered, after the document', async () => {
-    const { port, controls } = fakeHost()
-    const complete = controls.holdRegistrations()
+describe('the conversation reads the agent from its worker (KR-REQ-13.02, 11.03)', () => {
+  it("shows the agent's history in the order its worker gives it", async () => {
+    const { port } = fakeHost()
     openConversation(port)
 
-    act(() => {
-      controls.appendNode(message('n-7', '1', 'Added while the view registered.'))
-    })
-    await act(async () => {
-      complete()
-      await Promise.resolve()
-    })
-
     await waitFor(() => {
-      expect(shown()).toEqual([...DOCUMENT, 'n-7'])
+      expect(shown()).toEqual(HISTORY)
     })
+    expect(said(entry(2))).toContain('Find why the reconnect test is flaky.')
+    expect(screen.queryByTestId('conversation-unread')).toBeNull()
   })
 
-  it('puts a node streamed while the document is read after the document', async () => {
+  it('reads only what follows the last entry it holds', async () => {
     const { port, controls } = fakeHost()
-    const held = controls.hold('agentSnapshot')
-    openConversation(port)
+    const froms: (string | null)[] = []
+    openConversation({
+      ...port,
+      agentSnapshot: (params) => {
+        froms.push(params.from_node)
+        return port.agentSnapshot(params)
+      }
+    })
     await waitFor(() => {
-      expect(held.count).toBe(1)
+      expect(shown()).toEqual(HISTORY)
     })
 
-    act(() => {
-      controls.appendNode(message('n-7', '1', 'Streamed while the document was read.'))
-    })
-    await nextFrame()
-    await act(async () => {
-      held.release()
-      await Promise.resolve()
-    })
+    controls.records.appendEntry(SESSION_MAIN, 'message', 'Added after the first read.')
+    await shownAgain()
 
     await waitFor(() => {
-      expect(shown()).toEqual([...DOCUMENT, 'n-7'])
+      expect(shown()).toEqual([...HISTORY, entry(6)])
     })
+    expect(said(entry(6))).toContain('Added after the first read.')
+    // The first read starts at the beginning; every later one after the newest entry it holds.
+    expect(froms[0]).toBeNull()
+    expect(froms).toContain('6')
+    expect(froms.slice(1).every((from) => from !== null)).toBe(true)
   })
 
-  it('takes a streamed node in place of the document’s copy only when it is newer', async () => {
-    const { port, controls } = fakeHost()
-    const held = controls.hold('agentSnapshot')
-    openConversation(port)
-    await waitFor(() => {
-      expect(held.count).toBe(1)
-    })
-
-    // The document holds n-3 at revision 2 and n-2 at revision 1.
-    act(() => {
-      controls.emit(streamed(message('n-3', '3', 'The newer n-3.'), '7'))
-      controls.emit(streamed(message('n-2', '0', 'An older n-2.'), '8'))
-    })
-    await nextFrame()
-    await act(async () => {
-      held.release()
-      await Promise.resolve()
-    })
-
-    await waitFor(() => {
-      expect(shown()).toEqual(DOCUMENT)
-    })
-    expect(said('n-3')).toContain('The newer n-3.')
-    expect(said('n-2')).not.toContain('An older n-2.')
-    expect(said('n-2')).toContain('The test waits on a')
-  })
-
-  it('shows the host’s refusal to read the document', async () => {
+  it('shows the host’s refusal to read the conversation', async () => {
     const { port, controls } = fakeHost()
     controls.setConnected(false)
     openConversation(port)
@@ -205,7 +189,7 @@ describe('the conversation reads its document once it is listening (KR-REQ-13.02
     expect(refusal.textContent).toContain('Something went wrong.')
   })
 
-  it('reads the document again once the host is back, and the refusal goes', async () => {
+  it('reads again once the host is back, and the refusal goes', async () => {
     const { port, controls } = fakeHost()
     controls.setConnected(false)
     openConversation(port)
@@ -216,60 +200,35 @@ describe('the conversation reads its document once it is listening (KR-REQ-13.02
     })
 
     await waitFor(() => {
-      expect(shown()).toEqual(DOCUMENT)
+      expect(shown()).toEqual(HISTORY)
     })
     expect(screen.queryByTestId('conversation-unread')).toBeNull()
   })
 
-  it('installs only the newest of two reads, with every node streamed across both', async () => {
+  it('has one read on its way at a time, and a read asked for meanwhile follows it', async () => {
     const { port, controls } = fakeHost()
     const held = controls.hold('agentSnapshot')
     openConversation(port)
     await made(held, 1)
 
-    // A connection change that says the host is there reads the document again.
+    // A connection change that says the host is there asks for a read while one is on its way.
     act(() => {
       controls.setConnected(true)
     })
-    await made(held, 2)
-    act(() => {
-      controls.appendNode(message('n-7', '1', 'Streamed while both reads were out.'))
+    await act(async () => {
+      await new Promise((resolve) => {
+        setTimeout(resolve, 20)
+      })
     })
-    await nextFrame()
+    expect(held.count).toBe(1)
 
     await answer(held, 0)
-    expect(shown()).toEqual([])
-    await answer(held, 1)
-    expect(shown()).toEqual([...DOCUMENT, 'n-7'])
+    expect(shown()).toEqual(HISTORY)
+    await made(held, 2)
+    held.release()
   })
 
-  it('keeps a node that arrived before a later read ahead of one that arrived during it', async () => {
-    const { port, controls } = fakeHost()
-    let reads = 0
-    openConversation({
-      ...port,
-      agentSnapshot: (params) => {
-        reads += 1
-        return reads === 1 ? port.agentSnapshot(params) : Promise.reject(REFUSED)
-      }
-    })
-    await waitFor(() => {
-      expect(shown()).toEqual(DOCUMENT)
-    })
-
-    // n-7 is waiting for its frame when the host is heard to be back; the read that starts then is
-    // refused, and n-8 arrives while it is on its way.
-    act(() => {
-      controls.appendNode(message('n-7', '1', 'Before the second read.'))
-      controls.setConnected(true)
-      controls.emit(streamed(message('n-8', '1', 'During the second read.'), '9'))
-    })
-    await screen.findByTestId('conversation-unread')
-    await nextFrame()
-    expect(shown()).toEqual([...DOCUMENT, 'n-7', 'n-8'])
-  })
-
-  it('says why when it cannot follow the stream, and reads nothing', async () => {
+  it('says why when it cannot follow the stream, and still shows the history', async () => {
     const { port } = fakeHost()
     openConversation({
       ...port,
@@ -281,9 +240,12 @@ describe('the conversation reads its document once it is listening (KR-REQ-13.02
         })
     })
 
-    const refusal = await screen.findByTestId('conversation-unread')
-    expect(within(refusal).getByText('The event stream could not be opened.')).toBeInTheDocument()
-    expect(shown()).toEqual([])
+    const refusal = await screen.findByTestId('conversation-unfollowed')
+    expect(refusal.textContent).toContain('The event stream could not be opened.')
+    await waitFor(() => {
+      expect(shown()).toEqual(HISTORY)
+    })
+    expect(screen.queryByTestId('conversation-unread')).toBeNull()
   })
 
   it('shows no refusal from before on a return to a session, until it has read it again', async () => {
@@ -294,8 +256,8 @@ describe('the conversation reads its document once it is listening (KR-REQ-13.02
       <AppProvider
         port={{
           ...port,
-          agentSnapshot: (params) =>
-            refusing && (params as { session_id?: string }).session_id === SESSION_MAIN
+          agentSnapshot: (params: AgentSnapshotParams) =>
+            refusing && params.subject.session_id === SESSION_MAIN
               ? Promise.reject(REFUSED)
               : port.agentSnapshot(params)
         }}
@@ -319,17 +281,104 @@ describe('the conversation reads its document once it is listening (KR-REQ-13.02
     expect(screen.queryByTestId('conversation-unread')).toBeNull()
 
     await answer(held, 1)
-    expect(shown()).toEqual(DOCUMENT)
+    expect(shown()).toEqual(HISTORY)
     expect(screen.queryByTestId('conversation-unread')).toBeNull()
+    held.release()
   })
+})
 
-  it('shows the document it read when nothing streamed meanwhile', async () => {
-    const { port } = fakeHost()
+describe('what the conversation says it does not show (KR-REQ-13.15, 25.25)', () => {
+  it('counts what the host withheld once, however often it reads', async () => {
+    const { port, controls } = fakeHost()
+    controls.records.withhold(SESSION_MAIN, 2)
     openConversation(port)
 
     await waitFor(() => {
-      expect(shown()).toEqual(DOCUMENT)
+      expect(shown()).toEqual(HISTORY.slice(2))
     })
-    expect(screen.queryByTestId('conversation-unread')).toBeNull()
+    expect(screen.getByTestId('withheld').textContent).toContain(
+      '2 entries are outside what this device may see.'
+    )
+
+    await shownAgain()
+    controls.records.appendEntry(SESSION_MAIN, 'message', 'Seen by this device.')
+    await shownAgain()
+    await waitFor(() => {
+      expect(shown()).toEqual([...HISTORY.slice(2), entry(6)])
+    })
+    await shownAgain()
+    expect(screen.getByTestId('withheld').textContent).toContain(
+      '2 entries are outside what this device may see.'
+    )
+  })
+
+  it('says how much of an entry was not carried', async () => {
+    const { port, controls } = fakeHost()
+    controls.records.appendEntry(SESSION_MAIN, 'message', 'The start of a long answer', 5_000)
+    openConversation(port)
+
+    await waitFor(() => {
+      expect(shown()).toEqual([...HISTORY, entry(6)])
+    })
+    const cut = within(
+      document.querySelector(`[data-node-id="${entry(6)}"]`) as HTMLElement
+    ).getByTestId('entry-cut')
+    expect(cut.textContent).toContain('5,000 more bytes of this entry were not carried.')
+  })
+
+  it('says so when entries it had not read were no longer kept', async () => {
+    const { port, controls } = fakeHost()
+    openConversation(port)
+    await waitFor(() => {
+      expect(shown()).toEqual(HISTORY)
+    })
+
+    for (const text of ['six', 'seven', 'eight']) {
+      controls.records.appendEntry(SESSION_MAIN, 'message', text)
+    }
+    controls.records.forget(SESSION_MAIN, 7)
+    await shownAgain()
+
+    await waitFor(() => {
+      expect(shown()).toEqual([...HISTORY, entry(8)])
+    })
+    expect(screen.getByTestId('history-notes').textContent).toContain(
+      'Some of this agent’s earlier entries were no longer kept when this device read them.'
+    )
+  })
+})
+
+describe('what packages show arrives on the stream (KR-REQ-11.48)', () => {
+  it('shows a node streamed for this session after what it holds, and none for another', async () => {
+    const { port, controls } = fakeHost()
+    openConversation(port)
+    await waitFor(() => {
+      expect(shown()).toEqual(HISTORY)
+    })
+
+    act(() => {
+      controls.appendNode(message('n-7', '1', 'Streamed for this session.'))
+      controls.emit(streamed(message('n-8', '1', 'Streamed for another.'), '9', SESSION_BUILD))
+    })
+    await nextFrame()
+
+    expect(shown()).toEqual([...HISTORY, 'n-7'])
+  })
+
+  it('takes a streamed node in place of the copy it holds only when it is newer', async () => {
+    const { port, controls } = fakeHost()
+    openConversation(port)
+    await waitFor(() => {
+      expect(shown()).toEqual(HISTORY)
+    })
+
+    act(() => {
+      controls.emit(streamed(message('n-7', '2', 'The newer n-7.'), '7'))
+      controls.emit(streamed(message('n-7', '1', 'An older n-7.'), '8'))
+    })
+    await nextFrame()
+
+    expect(shown()).toEqual([...HISTORY, 'n-7'])
+    expect(said('n-7')).toContain('The newer n-7.')
   })
 })

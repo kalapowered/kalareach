@@ -14,6 +14,8 @@ import { describe, expect, it } from 'vitest'
 import { act, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 
+import type { AttentionItem } from '@kalareach/protocol'
+
 import { AppProvider } from '../../src/app/state'
 import { fakeHost, type FakeHostControls } from '../../src/host/fake'
 import type { HostPort } from '../../src/host/port'
@@ -22,6 +24,8 @@ import { MobileApp, type MobileBuild } from '../../src/mobile/MobileApp'
 import { Inbox } from '../../src/mobile/views/Inbox'
 import { PURCHASE_WORDS } from '../../src/model/account'
 import { TOUCH_TARGET, type MobilePlatform } from '../../src/mobile/platform'
+
+const MAIN_SESSION = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
 
 function start(
   surface: MobilePlatform,
@@ -48,6 +52,9 @@ function wrap(surface: MobilePlatform, storage: Storage) {
 }
 
 /** The declared minimum of one control, in both dimensions. */
+/** A rule that raises attention items. */
+type AttentionRule = AttentionItem['rule']
+
 function declaredTarget(element: HTMLElement): { inline: number; block: number } {
   const style = element.style
   return {
@@ -60,7 +67,11 @@ describe('the inbox is the primary mobile surface (KR-REQ-13.01, 13.02)', () => 
   it('opens on the inbox with the four kinds apart', async () => {
     start('ios')
     await waitFor(() => {
-      expect(screen.getByRole('button', { name: /Waiting for you\. Run the release script/ })).toBeInTheDocument()
+      expect(
+        screen.getByRole('button', {
+          name: /Waiting for you\. Codex asks to run scripts\/release\.sh --publish\./
+        })
+      ).toBeInTheDocument()
     })
     for (const kind of ['pending_decision', 'failed_action', 'awaiting_review', 'disconnected']) {
       expect(document.querySelector(`[data-kind="${kind}"]`)).not.toBeNull()
@@ -83,25 +94,29 @@ describe('the inbox is the primary mobile surface (KR-REQ-13.01, 13.02)', () => 
   it('counts only what a person can act on in the tab badge', async () => {
     start('ios')
     const tab = await screen.findByRole('button', { name: /^Attention/ })
+    // Two decisions and one failure; the lost host, the review and the notice are not counted.
     await waitFor(() => {
-      expect(within(tab).getByText('2')).toBeInTheDocument()
+      expect(within(tab).getByText('3')).toBeInTheDocument()
     })
-    expect(tab.textContent).toContain('2 waiting for you')
+    expect(tab.textContent).toContain('3 waiting for you')
   })
 
   // KR-REQ-13.07: on a phone too, an approval is decided on the release, never on the press.
   it('decides an approval on a completed action and not on the press', async () => {
     const person = userEvent.setup()
-    start('ios')
-    const row = await screen.findByRole('button', { name: /Waiting for you\. Run the release script/ })
+    const { controls } = start('ios')
+    const row = await screen.findByRole('button', {
+      name: /Waiting for you\. Codex asks to run scripts\/release\.sh --publish/
+    })
     await person.click(row)
-    const allow = await screen.findByRole('button', { name: 'Allow' })
+    const allow = await screen.findByRole('button', { name: 'Allow once' })
+    const state = () => controls.records.agentOf(MAIN_SESSION).resources[0]?.state
 
     await person.pointer({ keys: '[MouseLeft>]', target: allow })
-    expect(screen.queryByText(/^Allowed\.$/)).toBeNull()
+    expect(state()).toBe('pending')
     await person.pointer({ keys: '[/MouseLeft]', target: allow })
     await waitFor(() => {
-      expect(screen.getByText(/^Allowed\.$/)).toBeInTheDocument()
+      expect(state()).toBe('resolved')
     })
   })
 })
@@ -137,7 +152,7 @@ describe('touch targets and accessible names (KR-REQ-13.06, 13.19, KR-ACC-020)',
   it('reads a row as its kind, its title, where it is and what it says', async () => {
     start('ios')
     const row = await screen.findByRole('button', {
-      name: /Action failed\. Upload did not finish\. studio · Session 2 · Claude Code\./
+      name: /Did not finish\. pnpm build ended with status 1\. A command ended with a failure\. Session 2\./
     })
     expect(row).toBeInTheDocument()
   })
@@ -448,25 +463,34 @@ describe('the shell and the inbox read once they are listening (KR-REQ-13.02)', 
   /** What the bar along the top says about the connection. */
   const topBar = () => document.querySelector('.m-connection')?.textContent ?? ''
 
-  /** Whether the inbox shows the entry `id`. */
-  const shows = (id: string) => document.querySelector(`[data-attention="${id}"]`) !== null
+  /** The key of the item `rule` raised, as the host holds it. */
+  const keyOf = (controls: FakeHostControls, rule: AttentionRule) =>
+    controls.records.attentionItem(rule).key
+
+  /** Whether the inbox shows the item `rule` raised. */
+  const shows = (controls: FakeHostControls, rule: AttentionRule) =>
+    document.querySelector(`[data-attention="${keyOf(controls, rule)}"]`) !== null
 
   /** Waits for the inbox to show what a read answered. */
-  async function inboxRead(): Promise<void> {
+  async function inboxRead(controls: FakeHostControls): Promise<void> {
     await waitFor(() => {
-      expect(shows('a-2')).toBe(true)
+      expect(shows(controls, 'attention.command_failed')).toBe(true)
     })
   }
 
-  /** Another device answers `id`: the host drops it from the inbox and says the inbox changed. */
-  async function answeredElsewhere(
-    port: HostPort,
-    controls: FakeHostControls,
-    id: string
-  ): Promise<void> {
+  /** Another device answers the approval: it marks the item seen, at the revision it is at. */
+  async function answeredElsewhere(port: HostPort, controls: FakeHostControls): Promise<void> {
+    const item = controls.records.attentionItem('attention.pending_approval')
     await act(async () => {
-      await port.attentionAcknowledge({ attention_id: id }, {})
-      controls.emit({ stream_id: 'attention', sequence: id, body: { kind: 'attention' } })
+      await port.attentionAcknowledge({ items: [{ key: item.key, revision: item.revision }] })
+    })
+  }
+
+  /** The page is shown again, as a phone app brought back to the front is. */
+  async function shownAgain(): Promise<void> {
+    await act(async () => {
+      document.dispatchEvent(new Event('visibilitychange'))
+      await Promise.resolve()
     })
   }
 
@@ -546,22 +570,22 @@ describe('the shell and the inbox read once they are listening (KR-REQ-13.02)', 
     expect(topBar()).toBe('In contact with this host')
   })
 
-  it('shows an inbox change made while its listeners register', async () => {
+  it('shows an inbox change made while its listener registers', async () => {
     const { port, controls } = fakeHost()
     const complete = controls.holdRegistrations()
     openPhone(port)
 
-    await answeredElsewhere(port, controls, 'a-1')
+    await answeredElsewhere(port, controls)
     await act(async () => {
       complete()
       await Promise.resolve()
     })
 
-    await inboxRead()
-    expect(shows('a-1')).toBe(false)
+    await inboxRead(controls)
+    expect(shows(controls, 'attention.pending_approval')).toBe(false)
   })
 
-  it('shows no inbox read that a change it heard has overtaken', async () => {
+  it('has one read on its way at a time, and reads again when it is shown again', async () => {
     const { port, controls } = fakeHost()
     const held = controls.hold('attentionRead')
     openPhone(port)
@@ -569,55 +593,53 @@ describe('the shell and the inbox read once they are listening (KR-REQ-13.02)', 
       expect(held.count).toBe(1)
     })
 
-    await answeredElsewhere(port, controls, 'a-1')
-    await waitFor(() => {
-      expect(held.count).toBe(2)
-    })
-    // The first read was made before the change, and answers first.
+    await answeredElsewhere(port, controls)
+    await shownAgain()
+    expect(held.count).toBe(1)
+
+    // The first read was made before the change, so it shows the approval; the read the phone
+    // asked for when it was shown again follows it, and shows the change.
     await act(async () => {
       held.answer(0)
       await Promise.resolve()
     })
-    expect(shows('a-1')).toBe(false)
-
+    await inboxRead(controls)
+    expect(shows(controls, 'attention.pending_approval')).toBe(true)
+    await waitFor(() => {
+      expect(held.count).toBe(2)
+    })
     await act(async () => {
       held.answer(1)
       await Promise.resolve()
     })
-    await inboxRead()
-    expect(shows('a-1')).toBe(false)
+    await waitFor(() => {
+      expect(shows(controls, 'attention.pending_approval')).toBe(false)
+    })
   })
 
-  it('leaves the newer inbox when two reads answer in reverse order', async () => {
+  it('reads the inbox again when the connection comes back', async () => {
     const { port, controls } = fakeHost()
-    const held = controls.hold('attentionRead')
     openPhone(port)
-    await waitFor(() => {
-      expect(held.count).toBe(1)
+    await inboxRead(controls)
+
+    await answeredElsewhere(port, controls)
+    act(() => {
+      controls.setConnected(false)
+    })
+    expect(await screen.findByText('The inbox could not be read')).toBeInTheDocument()
+    act(() => {
+      controls.setConnected(true)
     })
 
-    await answeredElsewhere(port, controls, 'a-1')
     await waitFor(() => {
-      expect(held.count).toBe(2)
+      expect(shows(controls, 'attention.pending_approval')).toBe(false)
     })
-    await act(async () => {
-      held.answer(1)
-      await Promise.resolve()
-    })
-    await inboxRead()
-    expect(shows('a-1')).toBe(false)
-
-    await act(async () => {
-      held.answer(0)
-      await Promise.resolve()
-    })
-    expect(shows('a-1')).toBe(false)
-    expect(shows('a-2')).toBe(true)
+    expect(screen.queryByText('The inbox could not be read')).toBeNull()
   })
 
-  // One listener is registered and the other is not: a change the first hears starts no read, and
-  // when the second cannot be registered, nothing read afterwards clears what the inbox says.
-  it('reads nothing until both listeners are registered, and keeps a registration failure', async () => {
+  // The listener is not registered yet: nothing is read, and when it cannot be registered, nothing
+  // read afterwards clears what the inbox says.
+  it('reads nothing until its listener is registered, and keeps a registration failure', async () => {
     const { port, controls } = fakeHost()
     const held = controls.hold('attentionRead')
     let refuse: (reason: unknown) => void = () => {}
@@ -638,7 +660,7 @@ describe('the shell and the inbox read once they are listening (KR-REQ-13.02)', 
       await Promise.resolve()
     })
 
-    await answeredElsewhere(port, controls, 'a-1')
+    await shownAgain()
     expect(held.count).toBe(0)
 
     await act(async () => {
@@ -656,7 +678,7 @@ describe('the shell and the inbox read once they are listening (KR-REQ-13.02)', 
       await Promise.resolve()
     })
     expect(screen.getByText('The inbox could not be read')).toBeInTheDocument()
-    expect(shows('a-2')).toBe(false)
+    expect(shows(controls, 'attention.command_failed')).toBe(false)
   })
 
   it('shows the inbox it read when nothing changed in between', async () => {
@@ -671,8 +693,16 @@ describe('the shell and the inbox read once they are listening (KR-REQ-13.02)', 
       held.answer(0)
       await Promise.resolve()
     })
-    await inboxRead()
-    for (const id of ['a-1', 'a-2', 'a-3', 'a-4']) expect(shows(id)).toBe(true)
+    await inboxRead(controls)
+    const rules: AttentionRule[] = [
+      'attention.pending_approval',
+      'attention.command_failed',
+      'attention.review_ready',
+      'attention.host_contact_lost',
+      'attention.application_notice',
+      'attention.pending_input'
+    ]
+    for (const rule of rules) expect(shows(controls, rule)).toBe(true)
   })
 })
 

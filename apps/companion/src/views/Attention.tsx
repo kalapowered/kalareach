@@ -1,72 +1,83 @@
 /**
  * The attention inbox.
  *
- * Four states, kept apart on purpose. A pending decision is something waiting for the person. A
- * failed action is something that finished badly and says why. Completed work awaiting review is
- * finished and fine. A disconnected host is none of those: it is the absence of contact, and the
- * one thing this screen must never do is turn silence into a claim that an agent is stuck.
+ * Four states, kept apart on purpose, and one more beside them. A pending decision is something
+ * waiting for the person, and an approval among them is answered here, from what the agent's own
+ * worker says it offered. A failed action is something that finished badly and says why. Completed
+ * work awaiting review is finished and fine. A disconnected host is none of those: it is the absence
+ * of contact, and the one thing this screen must never do is turn silence into a claim that an agent
+ * is stuck. A notice an application printed is shown for what it is: not the host's, and never a
+ * decision.
  */
 
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 
-import { Badge, Banner, Button, Card, CommitButton } from '../components/ui'
+import type { AttentionReadResult } from '@kalareach/protocol'
+
+import { Badge, Banner, Button, Card } from '../components/ui'
+import { readOnCadence } from '../app/cadence'
 import { useApp } from '../app/state'
 import { failureMessage, watch, type Watch } from '../host/port'
 import { ask } from '../mobile/model/call'
-import { outcomeMessage, receiptTone } from './Conversation'
+import {
+  ATTENTION_READ_CADENCE_MS,
+  emptyMessage,
+  filter as filtered,
+  inboxNotes,
+  order,
+  type AttentionFilter,
+  type AttentionRow
+} from '../model/attention'
+import { outcomeMessage, outcomeTone } from '../model/receipts'
 import { Confirmations } from '../pairing/Confirmations'
-import type { AttentionEntry, AttentionInbox, AttentionKind } from '../model/pending'
+import { ApprovalRequests } from './Approvals'
 
-const FILTERS: readonly { readonly value: AttentionKind | 'all'; readonly label: string }[] = [
+const FILTERS: readonly { readonly value: AttentionFilter; readonly label: string }[] = [
   { value: 'all', label: 'Everything' },
   { value: 'pending_decision', label: 'Decisions' },
   { value: 'failed_action', label: 'Failures' },
   { value: 'awaiting_review', label: 'To review' },
-  { value: 'disconnected', label: 'Out of contact' }
+  { value: 'disconnected', label: 'Out of contact' },
+  { value: 'notice', label: 'Notices' }
 ]
 
-/** What each kind is called and how it is coloured. */
-export function describeKind(kind: AttentionKind): {
-  readonly label: string
-  readonly tone: 'warning' | 'danger' | 'success' | 'neutral'
-} {
-  switch (kind) {
-    case 'pending_decision':
-      return { label: 'Waiting for you', tone: 'warning' }
-    case 'failed_action':
-      return { label: 'Did not finish', tone: 'danger' }
-    case 'awaiting_review':
-      return { label: 'Ready to review', tone: 'success' }
-    case 'disconnected':
-      return { label: 'Out of contact', tone: 'neutral' }
-  }
-}
+/** How a row's tone reads as a badge. */
+const BADGE_TONE = {
+  warning: 'warning',
+  danger: 'danger',
+  success: 'success',
+  muted: 'neutral'
+} as const
 
-/** How long ago, in the words a person uses. */
-export function ago(ms: number): string {
-  const minutes = Math.round(ms / 60_000)
-  if (minutes < 1) return 'just now'
-  if (minutes < 60) return `${minutes} min ago`
-  const hours = Math.round(minutes / 60)
-  if (hours < 24) return `${hours} h ago`
-  return `${Math.round(hours / 24)} d ago`
-}
+/** The largest page of the inbox one read asks for. */
+const PAGE_ITEMS = '200'
 
 /** The inbox. */
 export function Attention(): ReactNode {
   const { port, go, say } = useApp()
-  const [inbox, setInbox] = useState<AttentionInbox | null>(null)
-  const [failure, setFailure] = useState<string | null>(null)
-  const [filter, setFilter] = useState<AttentionKind | 'all'>('all')
+  const [inbox, setInbox] = useState<AttentionReadResult | null>(null)
   const [readAtMs, setReadAtMs] = useState(0)
-  // Every read of the inbox, on opening, after a decision and on a retry, is made under one watch
-  // with no listeners, so only the newest read's answer is shown, and none once the screen closes.
+  const [failure, setFailure] = useState<string | null>(null)
+  const [chosen, setChosen] = useState<AttentionFilter>('all')
+  // Each session's display number, by its identifier, as the host listed them.
+  const [numbers, setNumbers] = useState<ReadonlyMap<string, string>>(new Map())
+  // Every read of the inbox, on opening, on the cadence, after an answer and on a retry, goes
+  // through one cadence under one watch with no listeners: one read at a time, only the newest
+  // read's answer shown, and none once the screen closes.
   const reads = useRef<Watch | null>(null)
+  const again = useRef<() => void>(() => undefined)
 
-  const load = useCallback(() => {
+  const load = useCallback((): Promise<void> => {
     const current = reads.current?.read() ?? null
-    if (current === null) return
-    ask(() => port.attentionRead({}))
+    if (current === null) return Promise.resolve()
+    const inboxRead = ask(() =>
+      port.attentionRead({
+        session_id: null,
+        include_acknowledged: false,
+        max_items: PAGE_ITEMS,
+        after: null
+      })
+    )
       .then((result) => {
         if (!current()) return
         setInbox(result)
@@ -77,42 +88,57 @@ export function Attention(): ReactNode {
         if (!current()) return
         setFailure(failureMessage(error))
       })
+    // Only for the words: an inbox read without them names a session by nothing but the item.
+    const numbersRead = ask(() => port.sessionList({ environment_id: null, include_closed: false }))
+      .then((list) => {
+        if (!current()) return
+        setNumbers(new Map(list.sessions.map((session) => [session.session_id, session.display_number])))
+      })
+      .catch(() => undefined)
+    return Promise.all([inboxRead, numbersRead]).then(() => undefined)
   }, [port])
 
   useEffect(() => {
-    const reading = watch([], load)
+    const cadence = readOnCadence(load, ATTENTION_READ_CADENCE_MS)
+    const reading = watch([], cadence.now)
     reads.current = reading
+    again.current = cadence.now
     return () => {
+      cadence.stop()
       reading.stop()
       if (reads.current === reading) reads.current = null
+      again.current = () => undefined
     }
   }, [load])
 
-  const decide = (entry: AttentionEntry, decision: 'allow' | 'deny') => {
-    port
-      .approvalRespond(
-        { approval_request_id: entry.approval_request_id, decision },
-        entry.session_id && entry.session_epoch
-          ? { sessionId: entry.session_id, sessionEpoch: entry.session_epoch }
-          : {}
-      )
+  const readAgain = useCallback(() => {
+    again.current()
+  }, [])
+
+  const acknowledge = (row: AttentionRow) => {
+    ask(() =>
+      port.attentionAcknowledge({ items: [{ key: row.item.key, revision: row.item.revision }] })
+    )
       .then((settled) => {
-        // The completion feedback waits for the receipt: the host said what happened, not the
-        // network.
+        const stale = settled.value?.stale.includes(row.item.key) ?? false
         say(
-          outcomeMessage(decision === 'allow' ? 'Allowed' : 'Denied', settled.receipt),
-          receiptTone(settled.receipt)
+          stale
+            ? 'That changed since you saw it, so it was not marked. It is shown as it is now.'
+            : outcomeMessage('Marked as seen', settled),
+          stale ? 'pending' : outcomeTone(settled)
         )
-        load()
+        readAgain()
       })
       .catch((error: unknown) => {
         say(failureMessage(error), 'danger')
       })
   }
 
-  const entries = (inbox?.entries ?? []).filter(
-    (entry) => filter === 'all' || entry.kind === filter
-  )
+  const rows = inbox ? filtered(order(inbox, readAtMs), chosen) : []
+  const notes = inbox ? inboxNotes(inbox) : []
+  // A session's approvals are listed once, under its first approval item, whatever number of items
+  // the host raised for them.
+  const approvalsShown = new Set<string>()
 
   return (
     <>
@@ -131,8 +157,18 @@ export function Attention(): ReactNode {
           tone="warning"
           title="This list could not be read"
           detail={failure}
-          action={<Button onClick={load}>Try again</Button>}
+          action={<Button onClick={readAgain}>Try again</Button>}
         />
+      ) : null}
+
+      {notes.length > 0 ? (
+        <ul className="inbox-notes" data-testid="inbox-notes">
+          {notes.map((note) => (
+            <li key={note} className="small muted">
+              {note}
+            </li>
+          ))}
+        </ul>
       ) : null}
 
       <div className="toolbar">
@@ -142,9 +178,9 @@ export function Attention(): ReactNode {
               key={option.value}
               type="button"
               className="filter"
-              aria-pressed={filter === option.value}
+              aria-pressed={chosen === option.value}
               onClick={() => {
-                setFilter(option.value)
+                setChosen(option.value)
               }}
             >
               {option.label}
@@ -153,97 +189,90 @@ export function Attention(): ReactNode {
         </div>
       </div>
 
-      {entries.length === 0 ? (
+      {rows.length === 0 ? (
         <div className="empty-state">
-          <h2>Nothing is waiting</h2>
+          <h2>{inbox ? emptyMessage(chosen) : 'Reading the inbox…'}</h2>
           <p>Work that needs a decision or a review will appear here.</p>
         </div>
       ) : (
         <ul className="attention-list" data-testid="attention-list">
-          {entries.map((entry) => (
-            <li key={entry.attention_id}>
-              <Card data-kind={entry.kind} data-testid={`attention-${entry.kind}`}>
-                <div className="attention-top">
-                  <span className="row">
-                    <Badge tone={describeKind(entry.kind).tone}>{describeKind(entry.kind).label}</Badge>
-                    <span className="small faint">
-                      {entry.host_label}
-                      {entry.session_display_number ? ` · session ${entry.session_display_number}` : ''}
-                      {entry.application ? ` · ${entry.application}` : ''}
+          {rows.map((row) => {
+            const sessionId = row.item.session_id
+            const number = sessionId === null ? undefined : numbers.get(sessionId)
+            const approvals =
+              row.actionable && sessionId !== null && !approvalsShown.has(sessionId)
+            if (approvals) approvalsShown.add(sessionId)
+            return (
+              <li key={row.item.key}>
+                <Card
+                  data-kind={row.kind}
+                  data-testid={`attention-${row.kind}`}
+                  data-level={row.item.level}
+                >
+                  <div className="attention-top">
+                    <span className="row">
+                      <Badge tone={BADGE_TONE[row.tone]}>{row.label}</Badge>
+                      <span className="small faint">
+                        {sessionId === null
+                          ? 'This host'
+                          : number === undefined
+                            ? 'A session'
+                            : `Session ${number}`}
+                      </span>
                     </span>
-                  </span>
-                  <span className="small faint">{ago(readAtMs - entry.raised_at_ms)}</span>
-                </div>
-                <div className="attention-body">
-                  <h2>{entry.title}</h2>
-                  <p>{entry.detail}</p>
-                  {entry.command_preview ? (
-                    <p className="command-preview">
-                      <code>{entry.command_preview}</code>
+                    {row.item.level === 'urgent' ? <Badge tone="danger">Urgent</Badge> : null}
+                  </div>
+                  <div className="attention-body">
+                    <h2>{row.title}</h2>
+                    <p data-testid={row.kind === 'disconnected' ? 'disconnected-note' : undefined}>
+                      {row.detail}
                     </p>
-                  ) : null}
-                  {entry.error_code ? (
-                    <p className="small faint">Host reported {entry.error_code}.</p>
-                  ) : null}
-                  {entry.kind === 'disconnected' ? (
-                    <p className="small faint" data-testid="disconnected-note">
-                      Out of contact for {ago(entry.out_of_contact_ms ?? 0)}. Elapsed time does not
-                      say what its processes are doing.
-                    </p>
-                  ) : null}
-                </div>
-                <div className="card-footer">
-                  <span className="small faint">
-                    {entry.kind === 'pending_decision'
-                      ? 'This runs on your host if you allow it.'
-                      : entry.kind === 'disconnected'
+                    {approvals ? (
+                      <ApprovalRequests sessionId={sessionId} onAnswered={readAgain} />
+                    ) : null}
+                  </div>
+                  <div className="card-footer">
+                    <span className="small faint">
+                      {row.kind === 'disconnected'
                         ? 'Nothing here is a failure.'
-                        : ''}
-                  </span>
-                  <span className="row">
-                    {entry.kind === 'pending_decision' ? (
-                      <>
-                        <CommitButton
-                          tone="danger"
-                          onCommit={() => {
-                            decide(entry, 'deny')
+                        : row.kind === 'notice'
+                          ? 'Nothing here needs a decision.'
+                          : ''}
+                    </span>
+                    <span className="row">
+                      {sessionId !== null ? (
+                        <Button
+                          onClick={() => {
+                            go({ view: 'session', sessionId, pane: 'semantic' })
                           }}
                         >
-                          Deny
-                        </CommitButton>
-                        <CommitButton
-                          tone="sage"
-                          onCommit={() => {
-                            decide(entry, 'allow')
+                          Open session
+                        </Button>
+                      ) : null}
+                      {row.kind === 'awaiting_review' ? (
+                        <Button
+                          onClick={() => {
+                            go({ view: 'changesets' })
                           }}
                         >
-                          Allow
-                        </CommitButton>
-                      </>
-                    ) : null}
-                    {entry.session_id ? (
+                          Review changes
+                        </Button>
+                      ) : null}
                       <Button
+                        tone="quiet"
+                        data-testid="acknowledge"
                         onClick={() => {
-                          go({ view: 'session', sessionId: entry.session_id!, pane: 'semantic' })
+                          acknowledge(row)
                         }}
                       >
-                        Open session
+                        Mark as seen
                       </Button>
-                    ) : null}
-                    {entry.kind === 'awaiting_review' ? (
-                      <Button
-                        onClick={() => {
-                          go({ view: 'changesets' })
-                        }}
-                      >
-                        Review changes
-                      </Button>
-                    ) : null}
-                  </span>
-                </div>
-              </Card>
-            </li>
-          ))}
+                    </span>
+                  </div>
+                </Card>
+              </li>
+            )
+          })}
         </ul>
       )}
     </>

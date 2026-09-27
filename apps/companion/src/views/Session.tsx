@@ -9,13 +9,16 @@
 
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 
-import type { SessionReadResult } from '@kalareach/protocol'
+import type { ActionRight, SessionReadResult } from '@kalareach/protocol'
 
 import { Badge, Banner, Button, Card, CommitButton, Segmented, Sheet, Switch, ThemeChooser } from '../components/ui'
 import { useApp } from '../app/state'
 import { failureMessage, watch, type HostPort, type SessionSubject, type Watch } from '../host/port'
 import type { LaunchSurface } from '../model/pending'
-import { Conversation, outcomeMessage, receiptTone } from './Conversation'
+import { answeredState, outcomeMessage, outcomeTone } from '../model/receipts'
+import { readSemanticArchive } from '../model/exports'
+import { Conversation } from './Conversation'
+import { Sharing } from './Sharing'
 import { RawTerminal } from '../terminal/RawTerminal'
 import { ask } from '../mobile/model/call'
 import { describeApplicationState, sessionDescription } from './Sessions'
@@ -60,6 +63,8 @@ export function Session({
   const [reading, setReading] = useState<SessionReading | null>(null)
   const [launch, setLaunch] = useState<Launch | null>(null)
   const [connected, setConnected] = useState(true)
+  // What this connection may do, as native code said with its newest state, or null until then.
+  const [rights, setRights] = useState<readonly ActionRight[] | null>(null)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [closing, setClosing] = useState(false)
   // "Try again" registers the listeners again, and reads only once they are.
@@ -91,6 +96,11 @@ export function Session({
         .catch(() => {
           if (current() && connectionChanges === connectionAt) setConnected(false)
         })
+      ask(() => port.connectionState())
+        .then((state) => {
+          if (current() && connectionChanges === connectionAt) setRights(state.rights)
+        })
+        .catch(() => undefined)
       ask(() => port.launchSurface({ session_id: sessionId }))
         .then((surface) => {
           if (!current() || watching === null) return
@@ -121,6 +131,7 @@ export function Session({
         port.onConnection((state) => {
           connectionChanges += 1
           setConnected(state.connected)
+          setRights(state.rights)
         }),
         port.subscribe((event) => {
           const body = event.body as { kind?: string; prompt_generation?: string }
@@ -276,6 +287,7 @@ export function Session({
           sessionId={sessionId}
           subject={subject}
           connected={connected}
+          rights={rights}
           launch={
             offered
               ? { surface: offered.surface, promptGeneration: offered.promptGeneration }
@@ -295,6 +307,7 @@ export function Session({
       <SessionSettings
         open={settingsOpen}
         sessionId={sessionId}
+        session={summary ?? null}
         subject={subject}
         onClose={() => {
           setSettingsOpen(false)
@@ -313,10 +326,10 @@ export function Session({
             .then((result) => {
               setClosing(false)
               say(
-                outcomeMessage('The session is closed, and its history is kept', result.receipt),
-                receiptTone(result.receipt)
+                outcomeMessage('The session is closed, and its history is kept', result),
+                outcomeTone(result)
               )
-              if (result.receipt?.state === 'applied') go({ view: 'sessions' })
+              if (answeredState(result) === 'applied') go({ view: 'sessions' })
             })
             .catch((error: unknown) => {
               setClosing(false)
@@ -393,18 +406,19 @@ function CloseConsequence({
 function SessionSettings({
   open,
   sessionId,
+  session,
   subject,
   onClose
 }: {
   readonly open: boolean
   readonly sessionId: string
+  /** The session as the host reported it, or null before it has. */
+  readonly session: SessionReadResult['session'] | null
   readonly subject: SessionSubject
   readonly onClose: () => void
 }): ReactNode {
-  const { port, say } = useApp()
   const [tab, setTab] = useState<'appearance' | 'session' | 'sharing' | 'export'>('appearance')
   const [followOutput, setFollowOutput] = useState(true)
-  const [explained, setExplained] = useState(false)
 
   return (
     <Sheet open={open} title="Settings" description="The session behind this keeps running." onClose={onClose}>
@@ -463,56 +477,9 @@ function SessionSettings({
             </>
           ) : null}
 
-          {tab === 'sharing' ? (
-            <>
-              <h2>Sharing</h2>
-              <p className="muted">
-                A viewer sees the live screen. A reviewer also sees diffs and files.
-              </p>
-              <div className="settings-row">
-                <div>
-                  <h3>Let them answer the agent&apos;s questions</h3>
-                  <p data-testid="answering-explanation">
-                    Any answer, including free text, is input the agent may act on under your host&apos;s
-                    permissions. A form does not reduce that. This is the same authority as an
-                    unrestricted prompt or terminal control.
-                  </p>
-                </div>
-                <Switch
-                  checked={explained}
-                  label="Let a viewer or reviewer answer questions"
-                  onChange={setExplained}
-                />
-              </div>
-              <Button
-                data-testid="invite-viewer"
-                onClick={() => {
-                  port
-                    .grantCreate(
-                      {
-                        session_id: sessionId,
-                        role: 'viewer',
-                        rights: explained
-                          ? ['session.view', 'question.respond']
-                          : ['session.view'],
-                        answering_explained: explained
-                      },
-                      subject
-                    )
-                    .then((result) => {
-                      say(outcomeMessage('Invitation issued', result.receipt), receiptTone(result.receipt))
-                    })
-                    .catch((error: unknown) => {
-                      say(failureMessage(error), 'danger')
-                    })
-                }}
-              >
-                Invite a viewer
-              </Button>
-            </>
-          ) : null}
+          {tab === 'sharing' ? <Sharing sessionId={sessionId} subject={subject} /> : null}
 
-          {tab === 'export' ? <ExportPanel sessionId={sessionId} /> : null}
+          {tab === 'export' ? <ExportPanel sessionId={sessionId} session={session} /> : null}
         </div>
       </div>
     </Sheet>
@@ -520,31 +487,42 @@ function SessionSettings({
 }
 
 /** Two exports, both to a file the person picks. */
-function ExportPanel({ sessionId }: { readonly sessionId: string }): ReactNode {
+function ExportPanel({
+  sessionId,
+  session
+}: {
+  readonly sessionId: string
+  readonly session: SessionReadResult['session'] | null
+}): ReactNode {
   const { port, say } = useApp()
+  // The session's own size, as the host reported it: an export states the dimensions it was made
+  // at, and a size this page invented would be a claim about a terminal nobody measured.
+  const dimensions =
+    session === null
+      ? null
+      : { columns: Number(session.dimensions.columns), rows: Number(session.dimensions.rows) }
 
   const exportSemantic = () => {
+    if (dimensions === null) return
     void port.chooseExportPath(`session-${sessionId}.json`).then((path) => {
       if (!path) return
-      port
-        .agentSnapshot({ session_id: sessionId })
-        .then((snapshot) =>
+      readSemanticArchive(port, sessionId)
+        .then((archive) =>
           port.exportSemanticJson({
             path,
             sessionId,
             exportedAtMs: Date.now(),
-            dimensions: { columns: 120, rows: 40 },
-            nodes: snapshot.nodes.map((node) => ({
-              id: node.id,
-              revision: node.revision,
-              body: node.body,
-              at_ms: Date.now()
-            })),
-            omissions: []
+            dimensions,
+            nodes: archive.nodes,
+            omissions: archive.omissions
           })
         )
         .then((written) => {
-          say(`Written to ${written.path}.`)
+          say(
+            written.omissions.length > 0
+              ? `Written to ${written.path}, with ${written.omissions.length} declared omission${written.omissions.length === 1 ? '' : 's'}.`
+              : `Written to ${written.path}.`
+          )
         })
         .catch((error: unknown) => {
           say(failureMessage(error), 'danger')
@@ -593,7 +571,7 @@ function ExportPanel({ sessionId }: { readonly sessionId: string }): ReactNode {
                 archive does not carry.
               </p>
             </div>
-            <Button data-testid="export-json" onClick={exportSemantic}>
+            <Button data-testid="export-json" disabled={dimensions === null} onClick={exportSemantic}>
               Export JSON
             </Button>
           </div>

@@ -174,9 +174,9 @@ export function VoiceRoute({ surface }: { readonly surface: Surface }): ReactNod
     }
   }, [prepare])
 
-  // No host answer names the turn an agent is on, so this screen holds none. Cancelling a turn
-  // needs its current identifier from the host; one remembered from an address would go stale the
-  // moment the agent moved on.
+  // This screen reads no agent, so it holds no turn. Cancelling one needs the turn the session's
+  // worker reports now, with the instance and binding it was read at; one remembered from an
+  // address would go stale the moment the agent moved on.
   const currentTurn = null
 
   // The call as the screen is holding it, so an action that runs later acts on the call that is
@@ -399,9 +399,15 @@ export function VoiceRoute({ surface }: { readonly surface: Surface }): ReactNod
           })
       },
 
-      cancelTask: (sessionId: string, turnId: string) => {
+      cancelTask: (turn) => {
         void ask(() =>
-          port.composerInterrupt({ session_id: sessionId, turn_id: turnId }, { sessionId })
+          port.composerInterrupt({
+            target: {
+              subject: { session_id: turn.sessionId, application_instance_id: turn.instanceId },
+              binding_revision: turn.bindingRevision
+            },
+            turn_id: turn.turnId
+          })
         )
           .then(() => {
             setNotice('The host was asked to cancel that turn. The voice keeps talking.')

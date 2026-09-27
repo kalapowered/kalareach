@@ -10,6 +10,28 @@
 
 import type { DocumentNode } from '@kalareach/plugin-sdk'
 
+import type { AgentEntry } from './agent'
+
+/** What the conversation holds: something with a stable identity and a revision. */
+export interface Identified {
+  readonly id: string
+  readonly revision: string
+}
+
+/**
+ * One item of the conversation: an entry of the agent's own history, as its worker's snapshot
+ * carries it, or a node of a package's declarative presentation, as a presentation event carries
+ * one. Both keep the identity their source gave them.
+ */
+export type ConversationItem =
+  | ({ readonly source: 'entry' } & AgentEntry)
+  | { readonly source: 'node'; readonly id: string; readonly revision: string; readonly node: DocumentNode }
+
+/** A presentation node, as the conversation holds it. */
+export function nodeItem(node: DocumentNode): ConversationItem {
+  return { source: 'node', id: node.id, revision: node.revision, node }
+}
+
 /** How many nodes are rendered at once. */
 export const WINDOW_SIZE = 120
 
@@ -25,9 +47,9 @@ export interface Anchor {
 }
 
 /** The conversation's state. */
-export interface ConversationState {
-  /** Every node, in order, keyed by identity. */
-  readonly nodes: readonly DocumentNode[]
+export interface ConversationState<T extends Identified = ConversationItem> {
+  /** Every item, in order, keyed by identity. */
+  readonly nodes: readonly T[]
   /** True while the view is at the live end and should follow new output. */
   readonly following: boolean
   /** Where the reader is, while they are not following. */
@@ -37,7 +59,7 @@ export interface ConversationState {
 }
 
 /** An empty conversation, following the live end. */
-export function emptyConversation(): ConversationState {
+export function emptyConversation<T extends Identified = ConversationItem>(): ConversationState<T> {
   return { nodes: [], following: true, anchor: null, windowStart: 0 }
 }
 
@@ -47,7 +69,10 @@ export function emptyConversation(): ConversationState {
  * A revision that is not newer is ignored: an out-of-order delivery must not take the view
  * backwards.
  */
-export function applyNode(state: ConversationState, node: DocumentNode): ConversationState {
+export function applyNode<T extends Identified>(
+  state: ConversationState<T>,
+  node: T
+): ConversationState<T> {
   const index = state.nodes.findIndex((existing) => existing.id === node.id)
   if (index === -1) {
     const nodes = [...state.nodes, node]
@@ -61,11 +86,11 @@ export function applyNode(state: ConversationState, node: DocumentNode): Convers
 }
 
 /** Folds a batch in as one change, which is what one animation frame publishes. */
-export function applyNodes(
-  state: ConversationState,
-  batch: readonly DocumentNode[]
-): ConversationState {
-  return batch.reduce(applyNode, state)
+export function applyNodes<T extends Identified>(
+  state: ConversationState<T>,
+  batch: readonly T[]
+): ConversationState<T> {
+  return batch.reduce((current, node) => applyNode(current, node), state)
 }
 
 /**
@@ -82,11 +107,11 @@ export function applyNodes(
  * - Nodes the conversation already held keep their places, so a document read again under a
  *   person reading it does not move what they are reading. The same revision rule applies to them.
  */
-export function installSnapshot(
-  state: ConversationState,
-  snapshot: readonly DocumentNode[],
-  held: readonly DocumentNode[]
-): ConversationState {
+export function installSnapshot<T extends Identified>(
+  state: ConversationState<T>,
+  snapshot: readonly T[],
+  held: readonly T[]
+): ConversationState<T> {
   return applyNodes(applyNodes(state, snapshot), held)
 }
 
@@ -96,10 +121,10 @@ export function installSnapshot(
  * The window moves by exactly the number of nodes that were added, so the node the person was
  * looking at is still at the same place in the rendered window.
  */
-export function prependHistory(
-  state: ConversationState,
-  older: readonly DocumentNode[]
-): ConversationState {
+export function prependHistory<T extends Identified>(
+  state: ConversationState<T>,
+  older: readonly T[]
+): ConversationState<T> {
   if (older.length === 0) return state
   const known = new Set(state.nodes.map((node) => node.id))
   const added = older.filter((node) => !known.has(node.id))
@@ -113,7 +138,10 @@ export function prependHistory(
 }
 
 /** Records that the view reached the live end, or left it. */
-export function setFollowing(state: ConversationState, following: boolean): ConversationState {
+export function setFollowing<T extends Identified>(
+  state: ConversationState<T>,
+  following: boolean
+): ConversationState<T> {
   if (state.following === following) return state
   return following
     ? follow({ ...state, following: true, anchor: null })
@@ -121,31 +149,37 @@ export function setFollowing(state: ConversationState, following: boolean): Conv
 }
 
 /** Records where the reader is, so a page of history can keep it. */
-export function setAnchor(state: ConversationState, anchor: Anchor | null): ConversationState {
+export function setAnchor<T extends Identified>(
+  state: ConversationState<T>,
+  anchor: Anchor | null
+): ConversationState<T> {
   return { ...state, anchor }
 }
 
 /** Moves the window, for a view that scrolled away from the end. */
-export function setWindowStart(state: ConversationState, start: number): ConversationState {
+export function setWindowStart<T extends Identified>(
+  state: ConversationState<T>,
+  start: number
+): ConversationState<T> {
   const clamped = Math.max(0, Math.min(start, Math.max(0, state.nodes.length - WINDOW_SIZE)))
   if (clamped === state.windowStart) return state
   return { ...state, windowStart: clamped, following: false }
 }
 
 /** The nodes the view actually renders. */
-export function visibleNodes(state: ConversationState): readonly DocumentNode[] {
+export function visibleNodes<T extends Identified>(state: ConversationState<T>): readonly T[] {
   const start = Math.max(0, state.windowStart - WINDOW_OVERSCAN)
   const end = Math.min(state.nodes.length, state.windowStart + WINDOW_SIZE + WINDOW_OVERSCAN)
   return state.nodes.slice(start, end)
 }
 
 /** How many nodes are above the rendered window, which is the space a scrollbar needs. */
-export function nodesAbove(state: ConversationState): number {
+export function nodesAbove<T extends Identified>(state: ConversationState<T>): number {
   return Math.max(0, state.windowStart - WINDOW_OVERSCAN)
 }
 
 /** How many nodes are below it. */
-export function nodesBelow(state: ConversationState): number {
+export function nodesBelow<T extends Identified>(state: ConversationState<T>): number {
   return Math.max(
     0,
     state.nodes.length - (state.windowStart + WINDOW_SIZE + WINDOW_OVERSCAN)
@@ -153,7 +187,7 @@ export function nodesBelow(state: ConversationState): number {
 }
 
 /** Puts the window at the live end, where a following view keeps it. */
-function follow(state: ConversationState): ConversationState {
+function follow<T extends Identified>(state: ConversationState<T>): ConversationState<T> {
   if (!state.following) return state
   return { ...state, windowStart: Math.max(0, state.nodes.length - WINDOW_SIZE) }
 }

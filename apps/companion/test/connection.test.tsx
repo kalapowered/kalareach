@@ -2,7 +2,7 @@ import { act, render, waitFor, within } from '@testing-library/react'
 import { describe, expect, it } from 'vitest'
 
 import { App } from '../src/App'
-import { AppProvider } from '../src/app/state'
+import { AppProvider, type Place } from '../src/app/state'
 import { fakeHost } from '../src/host/fake'
 
 /** What the connection indicator in the top bar says. */
@@ -11,6 +11,9 @@ function indicator(container: HTMLElement): string | null | undefined {
 }
 
 const UNREACHABLE = 'this host cannot be contacted right now'
+
+/** A place that reads nothing about the connection itself, so every connection read is the shell's. */
+const NEUTRAL: Place = { view: 'changesets' }
 
 function shell() {
   const { port, controls } = fakeHost()
@@ -21,7 +24,7 @@ describe('the connection indicator', () => {
   it('follows the connection, with the reason native code gives', async () => {
     const { port, controls } = shell()
     const { container } = render(
-      <AppProvider port={port} initialPlace={{ view: 'plugins' }}>
+      <AppProvider port={port} initialPlace={NEUTRAL}>
         <App />
       </AppProvider>
     )
@@ -42,7 +45,7 @@ describe('the connection indicator', () => {
     const { port, controls } = shell()
     const complete = controls.holdRegistrations()
     const { container } = render(
-      <AppProvider port={port} initialPlace={{ view: 'plugins' }}>
+      <AppProvider port={port} initialPlace={NEUTRAL}>
         <App />
       </AppProvider>
     )
@@ -62,7 +65,7 @@ describe('the connection indicator', () => {
     const { port, controls } = shell()
     const held = controls.hold('connectionState')
     const { container } = render(
-      <AppProvider port={port} initialPlace={{ view: 'plugins' }}>
+      <AppProvider port={port} initialPlace={NEUTRAL}>
         <App />
       </AppProvider>
     )
@@ -91,7 +94,7 @@ describe('nothing is claimed about the connection before a first answer (KR-REQ-
     const { port, controls } = shell()
     const held = controls.hold('connectionState')
     const { container } = render(
-      <AppProvider port={port} initialPlace={{ view: 'plugins' }}>
+      <AppProvider port={port} initialPlace={NEUTRAL}>
         <App />
       </AppProvider>
     )
@@ -124,7 +127,7 @@ describe('nothing is claimed about the connection before a first answer (KR-REQ-
               user_action: 'retry'
             })
         }}
-        initialPlace={{ view: 'plugins' }}
+        initialPlace={NEUTRAL}
       >
         <App />
       </AppProvider>
@@ -163,7 +166,7 @@ describe('nothing is claimed about the connection before a first answer (KR-REQ-
   it('shows the connection it read when nothing was held', async () => {
     const { port } = shell()
     const { container } = render(
-      <AppProvider port={port} initialPlace={{ view: 'plugins' }}>
+      <AppProvider port={port} initialPlace={NEUTRAL}>
         <App />
       </AppProvider>
     )

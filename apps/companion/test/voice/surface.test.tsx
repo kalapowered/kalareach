@@ -2,7 +2,11 @@ import { render, screen, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { describe, expect, it, vi } from 'vitest'
 
-import { VoiceSurface, type VoiceSurfaceActions } from '../../src/voice/VoiceSurface'
+import {
+  VoiceSurface,
+  type CurrentTurn,
+  type VoiceSurfaceActions
+} from '../../src/voice/VoiceSurface'
 import { CONTEXT_OUTCOMES, type ProviderChoice, type RunningCall } from '../../src/voice/model'
 
 /** What the host says an append acknowledgement does not establish. */
@@ -76,6 +80,11 @@ function call(over: Partial<RunningCall> = {}): RunningCall {
     admissionMeans: ADMISSION_MEANS,
     ...over
   }
+}
+
+/** A turn of session s-1's agent, at binding revision 3 unless a test says otherwise. */
+function turn(turnId: string, bindingRevision = '3'): CurrentTurn {
+  return { sessionId: 's-1', instanceId: 'i-1', bindingRevision, turnId }
 }
 
 function actions(): VoiceSurfaceActions {
@@ -307,7 +316,7 @@ describe('while a call is running', () => {
       <VoiceSurface
         choice={choice()}
         call={call()}
-        currentTurn={{ sessionId: 's-1', turnId: 't-9' }}
+        currentTurn={turn('t-9')}
         busy={false}
         notice={null}
         actions={acted}
@@ -326,7 +335,7 @@ describe('while a call is running', () => {
       <VoiceSurface
         choice={choice()}
         call={call()}
-        currentTurn={{ sessionId: 's-1', turnId: 't-9' }}
+        currentTurn={turn('t-9')}
         busy={false}
         notice={null}
         actions={acted}
@@ -336,7 +345,7 @@ describe('while a call is running', () => {
     expect(acted.cancelTask).not.toHaveBeenCalled()
 
     await person.click(screen.getByRole('button', { name: 'Cancel this turn' }))
-    expect(acted.cancelTask).toHaveBeenCalledWith('s-1', 't-9')
+    expect(acted.cancelTask).toHaveBeenCalledWith(turn('t-9'))
     expect(acted.stopPlayback).not.toHaveBeenCalled()
   })
 
@@ -348,7 +357,7 @@ describe('while a call is running', () => {
       <VoiceSurface
         choice={choice()}
         call={call({ brokerReachable: false })}
-        currentTurn={{ sessionId: 's-1', turnId: 't-9' }}
+        currentTurn={turn('t-9')}
         busy={false}
         notice={null}
         actions={acted}
@@ -372,7 +381,7 @@ describe('while a call is running', () => {
       <VoiceSurface
         choice={choice()}
         call={call({ hostReachable: false })}
-        currentTurn={{ sessionId: 's-1', turnId: 't-9' }}
+        currentTurn={turn('t-9')}
         busy={false}
         notice={null}
         actions={actions()}
@@ -392,7 +401,7 @@ describe('while a call is running', () => {
       <VoiceSurface
         choice={choice()}
         call={call()}
-        currentTurn={{ sessionId: 's-1', turnId: 't-9' }}
+        currentTurn={turn('t-9')}
         busy={false}
         notice={null}
         actions={acted}
@@ -405,7 +414,7 @@ describe('while a call is running', () => {
       <VoiceSurface
         choice={choice()}
         call={call()}
-        currentTurn={{ sessionId: 's-1', turnId: 't-10' }}
+        currentTurn={turn('t-10')}
         busy={false}
         notice={null}
         actions={acted}
@@ -418,22 +427,23 @@ describe('while a call is running', () => {
   // KR-REQ-15.22: a question the host moved past is thrown away, not hidden. Returning to the
   // same turn must not bring back an answer nobody gave.
   it.each([
-    ['another turn', { sessionId: 's-1', turnId: 't-10' }],
+    ['another turn', turn('t-10')],
+    ['the same turn at a newer binding', turn('t-9', '4')],
     ['no turn at all', null]
   ])('does not revive a confirmation after the host moves to %s', async (_name, moved) => {
     const acted = actions()
     const person = userEvent.setup()
-    const view = (turn: { sessionId: string; turnId: string } | null) => (
-      <VoiceSurface choice={choice()} call={call()} currentTurn={turn} busy={false}
+    const view = (shown: CurrentTurn | null) => (
+      <VoiceSurface choice={choice()} call={call()} currentTurn={shown} busy={false}
         notice={null}
         actions={acted} />
     )
-    const { rerender } = render(view({ sessionId: 's-1', turnId: 't-9' }))
+    const { rerender } = render(view(turn('t-9')))
     await person.click(screen.getByRole('button', { name: 'Cancel the current turn' }))
     expect(screen.getByRole('button', { name: 'Cancel this turn' })).toBeInTheDocument()
 
     rerender(view(moved))
-    rerender(view({ sessionId: 's-1', turnId: 't-9' }))
+    rerender(view(turn('t-9')))
 
     expect(screen.queryByRole('button', { name: 'Cancel this turn' })).not.toBeInTheDocument()
     expect(acted.cancelTask).not.toHaveBeenCalled()
@@ -444,12 +454,12 @@ describe('while a call is running', () => {
   it('refuses to send a confirmed cancellation once the host has gone', async () => {
     const acted = actions()
     const person = userEvent.setup()
-    const turn = { sessionId: 's-1', turnId: 't-9' }
+    const running = turn('t-9')
     const view = (reachable: boolean) => (
       <VoiceSurface
         choice={choice()}
         call={call({ hostReachable: reachable })}
-        currentTurn={turn}
+        currentTurn={running}
         busy={false}
         notice={null}
         actions={acted}
@@ -472,7 +482,7 @@ describe('while a call is running', () => {
       <VoiceSurface
         choice={choice()}
         call={call()}
-        currentTurn={{ sessionId: 's-1', turnId: 't-9' }}
+        currentTurn={turn('t-9')}
         busy={false}
         notice={null}
         actions={actions()}

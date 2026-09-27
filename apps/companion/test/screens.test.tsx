@@ -42,46 +42,64 @@ function gesture(type: string, clientY: number, timeStamp: number): PointerEvent
 }
 
 describe('the attention inbox', () => {
-  it('keeps its four states apart', async () => {
+  it('keeps its four states apart, and a notice apart from all of them', async () => {
     start()
     await waitFor(() => {
       expect(screen.getByTestId('attention-list')).toBeInTheDocument()
     })
-    expect(screen.getByTestId('attention-pending_decision')).toBeInTheDocument()
+    expect(screen.getAllByTestId('attention-pending_decision').length).toBeGreaterThan(0)
     expect(screen.getByTestId('attention-failed_action')).toBeInTheDocument()
     expect(screen.getByTestId('attention-awaiting_review')).toBeInTheDocument()
     expect(screen.getByTestId('attention-disconnected')).toBeInTheDocument()
+    const notice = screen.getByTestId('attention-notice')
+    expect(notice.textContent).toContain('It is not a request from the host.')
+    expect(within(notice).queryByTestId('approvals')).toBeNull()
   })
 
   it('never calls a lost connection a failure', async () => {
     start()
     const entry = await screen.findByTestId('attention-disconnected')
     expect(within(entry).getByTestId('disconnected-note').textContent).toMatch(
-      /does not\s+say what its processes are doing/
+      /may still be running; nothing here says they are not/
     )
     expect(entry.textContent).not.toMatch(/failed|stuck|crashed/i)
   })
 
-  it('shows the command a decision would run before it is allowed', async () => {
+  it('shows what a decision is about, and what the agent sent, before it is allowed', async () => {
     start()
-    const entry = await screen.findByTestId('attention-pending_decision')
-    expect(within(entry).getByText('scripts/release.sh --publish')).toBeInTheDocument()
+    const approval = await screen.findByTestId('approval')
+    expect(
+      within(approval).getByRole('heading', {
+        name: 'Run scripts/release.sh --publish in /Users/rs/work/kalareach'
+      })
+    ).toBeInTheDocument()
+    expect(within(approval).getByTestId('approval-source').textContent).toContain(
+      '"command":["scripts/release.sh","--publish"]'
+    )
+    expect(within(approval).getByText(/Read by openai\.codex from openai/)).toBeInTheDocument()
+    expect(within(approval).getByTestId('approval-authority').textContent).toContain(
+      'with its own permissions'
+    )
   })
 
   // KR-REQ-13.07: an approval is decided on a completed press, never on pointer-down.
-  it('answers an approval only on a completed press, and reports the receipt', async () => {
-    start()
-    const entry = await screen.findByTestId('attention-pending_decision')
-    const allow = within(entry).getByRole('button', { name: 'Allow' })
+  it('answers an approval only on a completed press, and reports the host’s answer', async () => {
+    const { controls } = start()
+    const approval = await screen.findByTestId('approval')
+    const allow = within(approval).getByRole('button', { name: 'Allow once' })
     const person = userEvent.setup()
 
     // Pointer-down alone is feedback, not a decision.
     await person.pointer({ keys: '[MouseLeft>]', target: allow })
-    expect(screen.queryByText('Allowed.')).toBeNull()
+    expect(controls.records.agentOf(SESSION_MAIN).resources[0]?.state).toBe('pending')
 
     // The release completes the press.
     await person.pointer({ keys: '[/MouseLeft]', target: allow })
-    expect(await screen.findByText('Allowed.')).toBeInTheDocument()
+    expect(await screen.findByText('You chose “Allow once”.')).toBeInTheDocument()
+    expect(controls.records.agentOf(SESSION_MAIN).resources[0]?.state).toBe('resolved')
+    await waitFor(() => {
+      expect(screen.queryByTestId('approval')).toBeNull()
+    })
   })
 })
 
@@ -131,11 +149,77 @@ describe('the semantic view', () => {
     })
   })
 
-  it('offers slash commands when the draft starts with a slash', async () => {
+  it('offers the commands the agent advertises when the draft starts with a slash', async () => {
     start({ view: 'session', sessionId: SESSION_MAIN, pane: 'semantic' })
     const input = await screen.findByTestId('composer-input')
+    await waitFor(() => {
+      expect(input).toHaveAttribute('placeholder', 'Ask for something, or press / for a command')
+    })
     await userEvent.type(input, '/com')
-    expect(await screen.findByTestId('slash-commands')).toBeInTheDocument()
+    const commands = await screen.findByTestId('slash-commands')
+    expect(commands.textContent).toContain('/compact')
+    expect(commands.textContent).toContain('Shorten the conversation so far')
+    expect(commands.textContent).not.toContain('/model')
+
+    await userEvent.click(within(commands).getByRole('button', { name: /compact/ }))
+    expect(screen.getByTestId('composer-input')).toHaveValue('/compact ')
+  })
+
+  // KR-REQ-13.12: queue, steer and interrupt appear only where the binding's capabilities allow.
+  it('offers queueing, steering and interrupting only where the agent can do them now', async () => {
+    const { controls } = start({ view: 'session', sessionId: SESSION_MAIN, pane: 'semantic' })
+    // The main session's agent is running a turn and its upstream offers all three.
+    expect(await screen.findByTestId('composer-queue')).toBeInTheDocument()
+    expect(screen.getByTestId('composer-steer')).toBeInTheDocument()
+    expect(screen.getByTestId('composer-interrupt')).toBeInTheDocument()
+
+    // The turn ends: there is nothing to steer or interrupt.
+    act(() => {
+      controls.records.endTurn(SESSION_MAIN)
+    })
+    await act(async () => {
+      document.dispatchEvent(new Event('visibilitychange'))
+      await Promise.resolve()
+    })
+    await waitFor(() => {
+      expect(screen.queryByTestId('composer-steer')).toBeNull()
+    })
+    expect(screen.queryByTestId('composer-interrupt')).toBeNull()
+    expect(screen.getByTestId('composer-queue')).toBeInTheDocument()
+  })
+
+  it('offers neither a queue nor steering where the upstream offers neither', async () => {
+    start({ view: 'session', sessionId: '8a7b6c50-22bb-4c3d-8e4f-000000000102', pane: 'semantic' })
+    const send = await screen.findByTestId('composer-send')
+    await waitFor(() => {
+      expect(screen.getByTestId('composer-input')).toHaveAttribute(
+        'placeholder',
+        'Ask for something, or press / for a command'
+      )
+    })
+    expect(send).toBeInTheDocument()
+    expect(screen.queryByTestId('composer-queue')).toBeNull()
+    expect(screen.queryByTestId('composer-steer')).toBeNull()
+  })
+
+  it('sends nothing while the binding is unverified, and says why in the host’s words', async () => {
+    const { controls } = start({ view: 'session', sessionId: SESSION_MAIN, pane: 'semantic' })
+    await screen.findByTestId('composer-queue')
+    act(() => {
+      controls.records.suspend(SESSION_MAIN, 'The conversation changed outside this host.')
+    })
+    await act(async () => {
+      document.dispatchEvent(new Event('visibilitychange'))
+      await Promise.resolve()
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId('composer-reason')).toHaveTextContent(
+        'The conversation changed outside this host.'
+      )
+    })
+    await userEvent.type(screen.getByTestId('composer-input'), 'go on')
+    expect(screen.getByTestId('composer-send')).toBeDisabled()
+    expect(screen.queryByTestId('composer-queue')).toBeNull()
   })
 
   it('keeps the draft when the host goes out of contact, and says the draft is kept', async () => {
@@ -168,7 +252,16 @@ describe('the semantic view', () => {
   })
 
   it('shows a reconnect banner that never implies an action succeeded', async () => {
-    const { controls } = start({ view: 'session', sessionId: SESSION_MAIN, pane: 'semantic' })
+    const { port, controls } = fakeHost()
+    // The host has not answered the queued prompt when contact is lost.
+    render(
+      <AppProvider
+        port={{ ...port, composerQueue: () => new Promise(() => undefined) }}
+        initialPlace={{ view: 'session', sessionId: SESSION_MAIN, pane: 'semantic' }}
+      >
+        <App />
+      </AppProvider>
+    )
     const conversation = await screen.findByTestId('conversation')
     const input = screen.getByTestId('composer-input')
     await userEvent.type(input, 'run the tests')
@@ -785,41 +878,108 @@ describe('the sheet', () => {
     expect(explanation.textContent).toMatch(/A form does not reduce that/)
   })
 
-  it('refuses to give a viewer the answering right without that explanation', async () => {
-    start({ view: 'session', sessionId: SESSION_MAIN, pane: 'semantic' })
-    await userEvent.click(await screen.findByTestId('open-settings'))
-    await userEvent.click(await screen.findByRole('button', { name: 'Sharing' }))
-    await userEvent.click(await screen.findByTestId('invite-viewer'))
-    expect(await screen.findByText('Invitation issued.')).toBeInTheDocument()
+  it('shows what an invitation carries before it exists, and issues exactly that', async () => {
+    const { controls } = start({ view: 'session', sessionId: SESSION_MAIN, pane: 'semantic' })
+    const person = userEvent.setup()
+    await person.click(await screen.findByTestId('open-settings'))
+    await person.click(await screen.findByRole('button', { name: 'Sharing' }))
+
+    const carries = await screen.findByTestId('invitation-carries')
+    await waitFor(() => {
+      expect(carries.textContent).toContain('See the live screen and what follows it')
+    })
+    expect(carries.querySelector('[data-notice]')).toBeNull()
+
+    // Letting a viewer answer questions is the authority the explanation names, and the host's own
+    // sentence for it is shown before anything is issued.
+    await person.click(screen.getByRole('switch', { name: 'Let a viewer or reviewer answer questions' }))
+    await waitFor(() => {
+      expect(carries.querySelector('[data-notice="agent_permissions"]')).not.toBeNull()
+    })
+    expect(carries.textContent).toContain('Answer the agent’s questions')
+
+    // A device paired with this host is chosen, and a retired one is not offered.
+    expect(screen.queryByRole('radio', { name: /Old phone/ })).toBeNull()
+    await person.click(screen.getByRole('radio', { name: /Sam’s iPhone|Sam's iPhone/ }))
+    await person.click(screen.getByTestId('invite'))
+
+    expect(await screen.findByText(/Invitation issued to Sam's iPhone\. It is used once/)).toBeInTheDocument()
+    const issued = await screen.findByTestId('issued-grants')
+    expect(issued.textContent).toContain('Answer the agent’s questions')
+    expect(within(issued).getByText('Waiting to be used')).toBeInTheDocument()
+    expect(controls.records.agentOf(SESSION_MAIN).binding.binding_revision).toBe('4')
   })
 })
 
 describe('packages', () => {
-  it('searches the catalogue without a network, and says so', async () => {
+  it('searches what the host holds without a network, and says so', async () => {
     start({ view: 'plugins' })
     expect(await screen.findByTestId('offline-search-note')).toBeInTheDocument()
+    const installed = await screen.findByTestId('installed-list')
+    await waitFor(() => {
+      expect(within(installed).getByText('openai.codex')).toBeInTheDocument()
+    })
+
+    const search = screen.getByTestId('catalogue-search')
+    await userEvent.type(search, 'tmux')
+    expect(within(installed).getByText('community.tmux-status')).toBeInTheDocument()
+    expect(within(installed).queryByText('openai.codex')).toBeNull()
 
     await userEvent.click(screen.getByRole('tab', { name: 'Catalogue' }))
-    const search = await screen.findByTestId('catalogue-search')
-    await userEvent.type(search, 'gemini')
-
-    const list = screen.getByTestId('catalogue-list')
-    expect(within(list).getByText('Gemini presentation')).toBeInTheDocument()
-    expect(within(list).queryByText('tmux status')).toBeNull()
+    await userEvent.clear(search)
+    await userEvent.type(search, 'mirror')
+    const catalogues = screen.getByTestId('catalogue-list')
+    expect(within(catalogues).getByText('community-mirror')).toBeInTheDocument()
+    expect(within(catalogues).queryByText('official')).toBeNull()
   })
 
-  it('says when a package payload is not on this host rather than showing it as available', async () => {
+  it('says why new sessions leave a package out, and keeps a release still in use listed', async () => {
     start({ view: 'plugins' })
-    await userEvent.click(await screen.findByRole('tab', { name: 'Catalogue' }))
-    expect(await screen.findByTestId('payload-offline')).toBeInTheDocument()
+    const leftOut = await screen.findByTestId('left-out')
+    expect(leftOut.textContent).toContain('community.tmux-status is disabled here')
+    const live = await screen.findByTestId('live-releases')
+    expect(live.textContent).toContain('openai.codex')
+    expect(live.textContent).toContain('1.3.2')
+    expect(within(live).getByText('Ending')).toBeInTheDocument()
   })
 
-  it('shows repositories with their kind, generation and expiry', async () => {
+  it('shows repositories with their address, trust root, synchronisation and pin', async () => {
     start({ view: 'plugins' })
     await userEvent.click(await screen.findByRole('tab', { name: 'Repositories' }))
     const list = await screen.findByTestId('repository-list')
-    expect(within(list).getByText('KalaReach official')).toBeInTheDocument()
-    expect(within(list).getByText(/Metadata expired/)).toBeInTheDocument()
+    await waitFor(() => {
+      expect(within(list).getByText('https://packages.kala.to/metadata')).toBeInTheDocument()
+    })
+    expect(within(list).getByText('Pinned at 42')).toBeInTheDocument()
+    expect(within(list).getByText(/not synchronised/)).toBeInTheDocument()
+  })
+})
+
+describe('change sets', () => {
+  it('shows what a change set holds and what it left out, and every version beside it', async () => {
+    start({ view: 'changesets' })
+    const shown = await screen.findByTestId('change-set')
+    await waitFor(() => {
+      expect(within(shown).getByRole('heading', { name: 'Wait on the subscription rather than a timer' })).toBeInTheDocument()
+    })
+    expect(shown.textContent).toContain('Version 2 of 2')
+    expect(shown.textContent).toContain('Read while the workspace was held still.')
+    expect(shown.textContent).toContain('tests/reconnect.rs')
+    expect(shown.querySelector('[data-change="deleted"]')?.textContent).toContain('Deleted')
+    expect(shown.textContent).toContain('Covered by a secret rule, so never read')
+    expect(shown.textContent).toContain('Identical source does not reproduce')
+  })
+
+  it('marks the version it shows reviewed, and says that approves nothing', async () => {
+    start({ view: 'changesets' })
+    const mark = await screen.findByTestId('mark-reviewed')
+    expect(mark).toHaveTextContent('Mark version 2 reviewed')
+    expect(screen.getByTestId('change-set').textContent).toContain('It approves nothing')
+    await userEvent.click(mark)
+    expect(await screen.findByText('Marked as reviewed.')).toBeInTheDocument()
+    await waitFor(() => {
+      expect(screen.queryByTestId('mark-reviewed')).toBeNull()
+    })
   })
 })
 
@@ -1136,13 +1296,27 @@ describe('one session at a time', () => {
 describe('a refusal keeps what was written', () => {
   it('gives the text back when a later receipt refuses the submission', async () => {
     const { port, controls } = fakeHost()
-    const pending = {
+    const action = '00000000-0000-4000-8000-00000000abcd'
+    const pending: HostPort = {
       ...port,
-      composerSubmit: (params: unknown, subject: Parameters<typeof port.composerSubmit>[1]) =>
-        port.composerSubmit(params, subject).then((settled) => ({
-          ...settled,
+      composerSubmit: (params) =>
+        port.composerSubmit(params).then(() => ({
           // The host took the request and has not said what became of it yet.
-          receipt: settled.receipt ? { ...settled.receipt, state: 'accepted' as const } : null
+          receipt: {
+            action_id: action,
+            actor_id: 'owner:local',
+            error: null,
+            method: 'agent.prompt.submit',
+            method_version: 1,
+            payload_digest: '0'.repeat(64),
+            reason: null,
+            revision: '1',
+            state: 'accepted' as const,
+            updated_at_ms: '0',
+            accepted_deadline_ms: null
+          },
+          value: null,
+          action_id: action
         }))
     }
     render(
@@ -1161,7 +1335,6 @@ describe('a refusal keeps what was written', () => {
       expect(screen.getByTestId('composer-input')).toHaveValue('')
     })
     await screen.findByTestId('pending-actions')
-    const actionId = controls.actions[controls.actions.length - 1]
 
     controls.emit({
       stream_id: `receipts:${SESSION_MAIN}`,
@@ -1169,7 +1342,7 @@ describe('a refusal keeps what was written', () => {
       body: {
         kind: 'receipt',
         receipt: {
-          action_id: actionId,
+          action_id: action,
           state: 'refused',
           error: { code: 'UPSTREAM_UNAVAILABLE', message: 'the agent is not reachable' }
         }
