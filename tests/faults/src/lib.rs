@@ -20,8 +20,11 @@
 //!   session's own screen.
 //! * [`trace`]: an ordering race kept as the steps that reproduce it, replayed on simulated time
 //!   against a session whose peers are scripted, and minimised when it fails.
+//! * [`journal`]: a worker's receipt journal kept as SQL, made into a store with its fault, a
+//!   damaged page or a log cut inside a commit, applied as the file is made.
 
 pub mod corpus;
+pub mod journal;
 pub mod restore;
 pub mod screen;
 pub mod session;

@@ -4613,8 +4613,10 @@ dependencies = [
  "kr-term",
  "kr-transport",
  "kr-worker",
+ "rusqlite",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 

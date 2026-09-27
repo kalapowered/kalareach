@@ -21,6 +21,11 @@ kr-ipc.workspace = true
 kr-protocol.workspace = true
 # The model of a physical terminal, and the reference the canonical screen is read against.
 kr-term.workspace = true
+# A journal fixture is made from its SQL, and a store written back as SQL, with the library and
+# the build of SQLite the worker's journal uses.
+rusqlite = { workspace = true, features = ["bundled"] }
+# The directory a journal fixture's writer runs in.
+tempfile.workspace = true
 # Simulated time hands the transport its continuous clock.
 kr-transport.workspace = true
 # The session under test, driven through its own read-loop entry and subscribed the way the
