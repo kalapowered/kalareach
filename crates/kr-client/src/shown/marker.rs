@@ -1092,10 +1092,12 @@ mod cases {
                 key: crate::encoder::Key::Char('k'),
                 base: Some('k'),
                 modifiers: crate::encoder::Modifiers::default(),
+                locks: crate::encoder::Locks::default(),
                 kind: crate::encoder::KeyEventKind::Press,
             },
             "KeyEvent{key:Char(..),base:Some(\"..\"),modifiers:Modifiers{shift:false,\
-             alt:false,control:false,superkey:false},kind:Press}",
+             alt:false,control:false,superkey:false},locks:Locks{caps_lock:false,\
+             num_lock:false},kind:Press}",
         );
     }
 
