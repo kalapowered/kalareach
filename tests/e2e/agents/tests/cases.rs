@@ -2624,11 +2624,13 @@ fn image_input(account: &Account, file: &Path) -> String {
     }
 }
 
-/// The lines of the files under `roots` that hold both `needle` and `marker`, by file. A file still
-/// as `before` found it before the agent started, with the same length, modification time and
-/// inode, cannot hold the part's mark, which a needle carries, and is not read: an agent's
-/// directory of the day can hold hundreds of megabytes of the person's own conversations, and
-/// reading them all at every look would take seconds. Every other file is read, whatever its time.
+/// The lines of the files under `roots` that hold both `needle` and `marker`, by file. A file whose
+/// length, modification time and inode are still those `before` found before the agent started is
+/// taken to hold nothing of the part and is not read: an agent's directory of the day can hold
+/// hundreds of megabytes of the person's own conversations, and reading them all at every look
+/// would take seconds. That rests on the agents writing a conversation as a new file or appending
+/// to one, either of which changes its length or time; a rewrite of the same length that kept the
+/// old time and inode would go unread. Every other file is read, whatever its time.
 fn conversation_lines(
     roots: &[PathBuf],
     needle: &str,
