@@ -328,9 +328,11 @@ pub async fn discover(
 /// Kills a helper this host started, and waits no longer than `limit` for it to go.
 ///
 /// Section 7's supervision is the rule: what this host ended it may report as ended, and what it
-/// could not end it names rather than claims. Past the bound the helper's handle is dropped, which
-/// asks for the kill once more, and the runtime collects the process if it ever ends; nothing here
-/// holds it, its streams or the caller any longer.
+/// could not end it names rather than claims. Past the bound the helper's handle is dropped, and
+/// nothing here holds it, its streams or the caller any longer: on Unix the runtime reaps the
+/// process if it ever ends, and on Windows closing the handle is all that is left to do. Dropping
+/// the handle asks for the kill again only where the first request failed, because the runtime
+/// stops asking once one has been sent.
 async fn end(
     mut child: tokio::process::Child,
     program: &str,
