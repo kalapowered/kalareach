@@ -165,9 +165,10 @@ pub const FORWARDED_UTC_DEADLINE: &str = "forwarded.utc-deadline/1";
 ///
 /// A worker survives an upgrade of the daemon, the forwarded frames are closed schemas, and a
 /// worker ends the connection a frame it cannot read arrived on, so a worker of an earlier build is
-/// sent no scope at all. It refuses the reads a scope narrows by itself, as it always did. The
-/// version is the second: a scope names approvals by the broker's resource identity, and a worker
-/// that states only the first read them as an upstream's text, so it is sent none either.
+/// sent no scope at all. It refuses the agent reads a scope narrows by itself, as it always did.
+/// The version is the second: a scope names approvals by the broker's resource identity, and a
+/// worker that states only the first read them as an upstream's text, so it is sent none either. A
+/// question read is decided by [`FORWARDED_QUESTION_SCOPE`] as well.
 pub const FORWARDED_HISTORY_SCOPE: &str = "forwarded.history-scope/2";
 
 /// Returns true when a worker's statement says it reads a forwarded read's history scope
@@ -177,6 +178,26 @@ pub fn reads_history_scopes(capabilities: &CanonicalSet<CapabilityId>) -> bool {
     capabilities
         .iter()
         .any(|capability| capability.as_str() == FORWARDED_HISTORY_SCOPE)
+}
+
+/// The capability a worker states when it holds a forwarded `question.read` to the history scope
+/// the read carries, and a control daemon reads before it sends a question read with a scope.
+///
+/// A worker of an earlier build reads a scope ([`FORWARDED_HISTORY_SCOPE`]) and still answers a
+/// question read with every question it holds, because the daemon of its build narrowed a paired
+/// device's answer itself. The narrowing is the worker's now, so a daemon sends a question read
+/// that carries a scope only to a worker that states this, and refuses it for any other rather
+/// than pass on what nothing narrowed. It stands beside [`FORWARDED_HISTORY_SCOPE`], which keeps
+/// its meaning: a worker that states only that is still sent its scope with every other read.
+pub const FORWARDED_QUESTION_SCOPE: &str = "forwarded.question-scope/1";
+
+/// Returns true when a worker's statement says it holds a forwarded question read to the read's
+/// history scope ([`FORWARDED_QUESTION_SCOPE`]).
+#[must_use]
+pub fn holds_question_reads_to_scopes(capabilities: &CanonicalSet<CapabilityId>) -> bool {
+    capabilities
+        .iter()
+        .any(|capability| capability.as_str() == FORWARDED_QUESTION_SCOPE)
 }
 
 /// What a worker's statement of the clock floor it maps starts with. The rest is the floor's
@@ -410,15 +431,16 @@ pub struct ForwardedRequest {
     /// The history scope of the grant the host decided this read under.
     ///
     /// Section 10 narrows a grant's history in one place, the shared host-side filter, and the
-    /// worker applies that filter to what it retains: an agent's semantic history and an
-    /// approval's record. The worker holds no grants, so the scope travels with the read. It is
-    /// absent for a caller acting under no grant. Absence never widens what a caller reads: a
-    /// worker serves retained history without a scope only to a caller it can see is the local
-    /// owner, and refuses anybody else.
+    /// worker applies that filter to what it retains: an agent's semantic history, an approval's
+    /// record and the session's questions. The worker holds no grants, so the scope travels with
+    /// the read. It is absent for a caller acting under no grant. Absence never widens what a
+    /// caller reads: a worker serves retained history without a scope only to a caller it can see
+    /// is the local owner, and refuses anybody else.
     ///
     /// It is absent from the wire when it is absent, so a read without one is byte for byte what a
     /// worker built before scopes travelled reads. A daemon sends one only to a worker that states
-    /// [`FORWARDED_HISTORY_SCOPE`].
+    /// [`FORWARDED_HISTORY_SCOPE`], and a question read with one only to a worker that also states
+    /// [`FORWARDED_QUESTION_SCOPE`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history: Option<crate::grant::HistoryScope>,
 }
@@ -647,6 +669,38 @@ mod tests {
         assert!(super::reads_history_scopes(&statement(
             "forwarded.history-scope/2"
         )));
+    }
+
+    #[test]
+    fn a_worker_states_that_it_holds_a_question_read_to_its_scope() {
+        use crate::ids::CapabilityId;
+        use crate::scalars::CanonicalSet;
+
+        let statement = |capabilities: &[&str]| -> CanonicalSet<CapabilityId> {
+            capabilities
+                .iter()
+                .map(|capability| CapabilityId::new(*capability).expect("a capability identifier"))
+                .collect()
+        };
+        assert_eq!(
+            super::FORWARDED_QUESTION_SCOPE,
+            "forwarded.question-scope/1"
+        );
+        assert!(super::holds_question_reads_to_scopes(&statement(&[
+            super::FORWARDED_HISTORY_SCOPE,
+            super::FORWARDED_QUESTION_SCOPE,
+        ])));
+        // A worker that reads a scope and says nothing of its question reads answers them with
+        // every question it holds, and a worker that states nothing at all is the same.
+        assert!(!super::holds_question_reads_to_scopes(&statement(&[
+            super::FORWARDED_HISTORY_SCOPE
+        ])));
+        assert!(!super::holds_question_reads_to_scopes(&CanonicalSet::new()));
+        // The two statements are read apart: the new one alone says nothing about the scope's
+        // other reads.
+        assert!(!super::reads_history_scopes(&statement(&[
+            super::FORWARDED_QUESTION_SCOPE
+        ])));
     }
 
     #[test]
