@@ -95,8 +95,9 @@ impl Asked {
     ///
     /// Nothing is said of a location but those parts, so user information, a query and a fragment
     /// are never kept: text written as a URL that the parser does not read, and SCP-style text
-    /// whose host is not a host name or whose path holds an `@`, a `?` or a `#`, which is how a URL
-    /// read the wrong way would look, are said as their class and their length.
+    /// whose host is neither a host name nor an IPv6 address in brackets, or whose path holds an
+    /// `@`, a `?` or a `#`, which is how a URL read the wrong way would look, are said as their
+    /// class and their length.
     #[must_use]
     pub fn location(request: Request, location: &str) -> Self {
         use kr_protocol::hostinfo::export::{ContentClass, withheld};
@@ -108,7 +109,7 @@ impl Asked {
         } else if kr_client::shown::written_as_url(location) {
             withheld(ContentClass::Location, location)
         } else if let Some((host, path)) = scp(location) {
-            if crate::shown::host_name(host).is_some() && !path.contains(['@', '?', '#']) {
+            if names_a_host(host) && !path.contains(['@', '?', '#']) {
                 format!("{host}:{path}")
             } else {
                 withheld(ContentClass::Location, location)
@@ -126,15 +127,38 @@ impl Asked {
     }
 }
 
-/// The host and the path of an SCP-style location, `[user@]host:path`: a colon before any slash,
-/// and a host longer than one letter, which would be a drive.
+/// The host and the path of an SCP-style location, `[user@]host:path`: a user, when there is one,
+/// before any colon or slash; a host that is a name or an IPv6 address in brackets, whose own
+/// colons are not the one before the path; and a colon after it. A single letter with no user in
+/// front of it is a drive, not a host.
 fn scp(location: &str) -> Option<(&str, &str)> {
-    let (front, path) = location.split_once(':')?;
-    if front.contains(['/', '\\']) {
-        return None;
-    }
-    let host = front.rsplit_once('@').map_or(front, |(_, host)| host);
-    (host.chars().count() > 1).then_some((host, path))
+    let (user, rest) = match location.split_once('@') {
+        Some((user, rest)) if !user.contains([':', '/', '\\']) => (Some(user), rest),
+        _ => (None, location),
+    };
+    let (host, path) = if rest.starts_with('[') {
+        let close = rest.find(']')?;
+        let (host, after) = rest.split_at(close + 1);
+        (host, after.strip_prefix(':')?)
+    } else {
+        let (host, path) = rest.split_once(':')?;
+        if host.contains(['/', '\\']) {
+            return None;
+        }
+        (host, path)
+    };
+    let drive =
+        user.is_none() && host.len() == 1 && host.bytes().all(|byte| byte.is_ascii_alphabetic());
+    (!drive).then_some((host, path))
+}
+
+/// Whether an SCP-style location's host is one: a host name, or an IPv6 address in brackets.
+fn names_a_host(host: &str) -> bool {
+    crate::shown::host_name(host).is_some()
+        || host
+            .strip_prefix('[')
+            .and_then(|inner| inner.strip_suffix(']'))
+            .is_some_and(|inner| inner.parse::<std::net::Ipv6Addr>().is_ok())
 }
 
 /// A value of this host's configuration as `kr doctor` shows it, by the class it is made of: a term
@@ -863,10 +887,22 @@ mod tests {
                 format!("{MARKER} x:team/repository.git"),
                 withheld(&format!("{MARKER} x:team/repository.git")),
             ),
-            // Nothing to leave out: the text as it was written.
+            // Nothing to leave out: the text as it was written, or its host and its path.
             (
                 "https://example.com:443/repo.git".to_owned(),
                 "https://example.com:443/repo.git".to_owned(),
+            ),
+            (
+                "[2001:db8::1]:team/repository.git".to_owned(),
+                "[2001:db8::1]:team/repository.git".to_owned(),
+            ),
+            (
+                format!("{MARKER}@[2001:db8::1]:team/repository.git"),
+                "[2001:db8::1]:team/repository.git".to_owned(),
+            ),
+            (
+                format!("{MARKER}@x:repository.git"),
+                "x:repository.git".to_owned(),
             ),
         ] {
             let asked = Asked::location(Request::Plugins, &location);
