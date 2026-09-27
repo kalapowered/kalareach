@@ -184,9 +184,12 @@ is judged at the revision in force, and the change settles after it.
 
 A session is superseded at most once in a row. While the job after a superseded one runs, the
 session's changes wait for it, and they settle as one revision the moment it ends. In a long active
-turn that never stops changing, then, at least every other job publishes, what it publishes is at
+turn that never stops changing, then, at least every other job runs to its end rather than being
+refused for a change; what it publishes, when its output is valid and nothing else stops it, is at
 most one job behind the session, and the revision catches up as soon as it lands. Without that, a
-host whose jobs take longer than the debounce would refuse every job the turn produced.
+host whose jobs take longer than the debounce would refuse every job the turn produced. A job whose
+session closes, or opens again, before it ends leaves no such mark on the session that is there
+then.
 
 The input is bounded directory and repository metadata plus recent authorised semantic events.
 Raw keystrokes, hidden input, environment values, file bodies and whole histories are excluded, and

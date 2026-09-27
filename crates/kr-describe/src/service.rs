@@ -460,6 +460,9 @@ struct Dispatched {
     cancellation: Cancellation,
     stopping: Option<Stop>,
     requeued_before: bool,
+    /// Whether its session closed, or was opened again, while it ran: what it comes to then leaves
+    /// no mark on the session that is there now.
+    outlived: bool,
 }
 
 /// Restarts after failures: when the next load may happen, and whether the service is paused
@@ -829,6 +832,11 @@ impl DescriptionService {
         self.bindings.insert(session_id, binding);
         self.epochs.insert(session_id, session_epoch);
         self.live_sessions.insert(session_id);
+        // A session opened afresh starts with a context of its own, and owes nothing to what an
+        // earlier job of the same identifier went through, even one still in the process.
+        self.outlive_job_of(&session_id);
+        self.superseded.remove(&session_id);
+        self.waiting.remove(&session_id);
         self.no_sessions_since_ms = None;
     }
 
@@ -862,6 +870,7 @@ impl DescriptionService {
         self.events.remove(session_id);
         self.generations.remove(session_id);
         self.live_sessions.remove(session_id);
+        self.outlive_job_of(session_id);
         self.superseded.remove(session_id);
         self.waiting.remove(session_id);
         // The fence and the debt go only when the cleanup they describe has actually finished.
@@ -1180,6 +1189,7 @@ impl DescriptionService {
                 .take()
                 .unwrap_or_else(|| unreachable!("the job was just found"));
             let (session_id, stop) = (dispatched.job.session_id, dispatched.stopping);
+            let outlived = dispatched.outlived;
             let outcome = self.finish_job(dispatched, answer, now);
             let superseded = stop == Some(Stop::Superseded)
                 || matches!(
@@ -1190,7 +1200,7 @@ impl DescriptionService {
                     })
                 );
             let requeued = matches!(outcome, Ok(Outcome::Requeued { .. }));
-            self.after_job(&session_id, superseded, requeued, now);
+            self.after_job(&session_id, outlived, superseded, requeued, now);
             return outcome;
         }
         self.counts.dropped_answers = self.counts.dropped_answers.saturating_add(1);
@@ -1210,9 +1220,11 @@ impl DescriptionService {
         let mut outcomes = Vec::new();
         if let Some(dispatched) = self.job.take() {
             let (session_id, stop) = (dispatched.job.session_id, dispatched.stopping);
+            let outlived = dispatched.outlived;
             let outcome = self.job_ended_with_process(dispatched, why, now);
             let requeued = matches!(outcome, Outcome::Requeued { .. });
-            self.after_job(&session_id, stop == Some(Stop::Superseded), requeued, now);
+            let superseded = stop == Some(Stop::Superseded);
+            self.after_job(&session_id, outlived, superseded, requeued, now);
             outcomes.push(outcome);
         }
         if let Model::Loading { cancel_sent, .. } = &self.model {
@@ -1246,14 +1258,19 @@ impl DescriptionService {
     /// job after a superseded one, now that it has ended.
     ///
     /// A job queued again keeps its session's standing, so the attempt that runs it next is still
-    /// the one after a superseded job.
+    /// the one after a superseded job. A job whose session closed, or was opened again, while it
+    /// ran leaves no mark on the session that is there now.
     fn after_job(
         &mut self,
         session_id: &SessionId,
+        outlived: bool,
         superseded: bool,
         requeued: bool,
         now: Reading,
     ) {
+        if outlived {
+            return;
+        }
         if superseded {
             self.superseded.insert(*session_id);
         } else if !requeued {
@@ -1261,6 +1278,16 @@ impl DescriptionService {
         }
         if let Some(priority) = self.waiting.remove(session_id) {
             let _ = self.settle_with(session_id, priority, now, true);
+        }
+    }
+
+    /// Notes that the job in the process, when it is this session's, has outlived the session it
+    /// was admitted for.
+    fn outlive_job_of(&mut self, session_id: &SessionId) {
+        if let Some(dispatched) = self.job.as_mut()
+            && dispatched.job.session_id == *session_id
+        {
+            dispatched.outlived = true;
         }
     }
 
@@ -1444,6 +1471,7 @@ impl DescriptionService {
                 cancellation,
                 stopping: None,
                 requeued_before,
+                outlived: false,
             });
             return Instruction::Generate {
                 id,

@@ -1023,6 +1023,103 @@ fn a_caller_cancellation_outlasts_a_pause() {
     ));
 }
 
+/// A superseded job whose session closes, or opens again, before its answer arrives leaves no
+/// mark on the session there now, and a session opened again after it owes it nothing: the first
+/// job of the session there now is superseded by a change that settles under it, as any job is.
+/// The control is the same session left open, whose job after a superseded one runs to its end
+/// while the change waits for it.
+#[test]
+fn a_superseded_job_that_outlives_its_session_leaves_no_mark() {
+    let cooldown = Budgets::DEFAULTS.session_cooldown_ms;
+    for case in ["closed", "opened again", "replaced", "left open"] {
+        let mut service = service();
+        queue(&mut service, &session(1), "kalareach", at(0));
+        let Instruction::Generate { id, .. } = loaded(&mut service, at(3_000)) else {
+            panic!("the job is sent");
+        };
+        change(&mut service, &session(1), "crates", at(3_100));
+        assert!(
+            service
+                .settle(&session(1), Priority::Ordinary, at(5_100))
+                .is_some()
+        );
+        assert_eq!(
+            service.next(&roomy(), at(5_100)).expect("an instruction"),
+            Instruction::Cancel {
+                id,
+                work: Work::Job
+            },
+            "{case}"
+        );
+        if matches!(case, "closed" | "opened again") {
+            service.session_closed(&session(1), at(5_150));
+        }
+        if case == "opened again" {
+            queue(&mut service, &session(1), "docs", at(5_200));
+        }
+        service
+            .finished(
+                id,
+                Answered::Ended {
+                    why: JobEnd::Cancelled,
+                    detail: None,
+                },
+                at(7_300),
+            )
+            .expect("the answer");
+        match case {
+            "closed" => queue(&mut service, &session(1), "docs", at(7_400)),
+            "replaced" => {
+                service.session_opened(session(1), SessionEpoch::new(2), binding());
+                change(&mut service, &session(1), "docs", at(7_400));
+                assert!(
+                    service
+                        .settle(&session(1), Priority::Ordinary, at(9_400))
+                        .is_some()
+                );
+            }
+            _ => {}
+        }
+        // A closed session's queue position went with it; the others wait out the cooldown.
+        let next = if matches!(case, "closed" | "opened again") {
+            at(9_400)
+        } else {
+            at(3_000 + cooldown)
+        };
+        let Instruction::Generate { id, .. } = service.next(&roomy(), next).expect("a job") else {
+            panic!("{case}: the next job is sent");
+        };
+        change(&mut service, &session(1), "tests", next.after_ms(100));
+        let settled = service.settle(&session(1), Priority::Ordinary, next.after_ms(2_100));
+        let instruction = service
+            .next(&roomy(), next.after_ms(2_100))
+            .expect("an instruction");
+        if case == "left open" {
+            assert_eq!(
+                settled, None,
+                "{case}: the change waits for the job after a superseded one"
+            );
+            assert!(
+                matches!(instruction, Instruction::Wait { .. }),
+                "{case}: {instruction:?}"
+            );
+        } else {
+            assert!(
+                settled.is_some(),
+                "{case}: the session there now owes nothing to the old job"
+            );
+            assert_eq!(
+                instruction,
+                Instruction::Cancel {
+                    id,
+                    work: Work::Job
+                },
+                "{case}"
+            );
+        }
+    }
+}
+
 /// Builds a service over a store of the test's own.
 fn service_over(store: DescriptionStore) -> DescriptionService {
     DescriptionService::new(
