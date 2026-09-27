@@ -21,6 +21,9 @@ worker directly for what a session owns.
 | `kr host terminal` | — | Show the terminal applications this host has, and which one a new window opens in |
 | `kr host startup` | — | Show or choose how `kr new` starts this environment's control daemon when none is running |
 | `kr host import-journals` | — | Bring this environment's journals that are older than this build migrates forward, once, while its daemon is stopped |
+| `kr host install` | — | Put a first release into this user's store of releases and make it current |
+| `kr host update --archive <file>` | — | Update this host to a newer release: its control daemons are handed over, and every live session keeps the release it started from |
+| `kr host versions` | — | The releases this host keeps, and which one is current |
 | `kr bridge --stdio` | — | Serve this environment to a local process bridge on standard input and output |
 | `kr bridge [list/enrol/forget/refresh]` | — | The environments this host has enrolled, and what it last saw of them |
 | `kr pair [invite/confirm/cancel/status]` | `kr p` | Pair a device: issue an invitation, approve the device that answers it, withdraw one, or read one |
@@ -711,6 +714,7 @@ bound to the session this process is running in. Outside a session every tool an
 | 6 | The command needed a terminal, or the terminal could not be changed |
 | 7 | No terminal application could be opened |
 | 8 | The host refused the request |
+| 9 | An update of this host waits: a live session runs at a level the new release does not retain, something does not answer, or another update is running. Nothing was replaced, and whatever the update stopped runs again |
 
 `kr attach`, and `kr new` when it attaches, exit 0 when the session closed cleanly, 1 when it closed
 any other way, and 3 when the connection ended before a whole closure record arrived. [When the
@@ -1293,6 +1297,36 @@ it again to bring an older registry, or one whose log holds writes, up to date. 
 worker whose end is confirmed is removed first, its endpoint before its descriptor, and a journal is
 not opened while any of it is still there. A journal the importer cannot read is refused by name and
 left exactly as it was, and the command then exits with a failure.
+
+## `kr host install`, `kr host update` and `kr host versions`
+
+A host installed with `kr host install` keeps its releases side by side in a store of this user's
+own, and `kr host update` moves it to a newer one without touching a live session:
+
+```sh
+kalareach-<target>-<release>/bin/kr host install   # run as the unpacked release's own kr
+kr host update --archive kalareach-<target>-<release>.tar.gz
+kr host update --archive <archive> --check          # checks, and changes nothing
+kr host versions
+```
+
+Only the current release's `kr` updates the host, and a `kr` of another release, or one outside a
+store, says so and exits with 3. An update checks the release, hands each control daemon over,
+switches the store's `current` in one step, and starts each daemon again from the new release; every
+live session goes on running the release it started from. When a live session runs at a
+compatibility level the new release's daemon does not speak, or anything else holds the update, it
+waits, starts again whatever it stopped, and exits with 9, naming what holds it:
+
+```text
+kr: the update to 0.3.0+9f1c2b3a4d5e waits: session 7 runs kr-worker/0.2.0+4254aa6e62e5 with protocol 0.45.0, which the control daemon of 0.3.0+9f1c2b3a4d5e does not speak; run kr host update again once that has changed
+```
+
+With `--json`, `kr host update` answers with `source`, `target`, whether it only checked
+(`checked_only`), the environments whose daemons it started again (`restarted`) and the releases it
+removed (`removed`), and `kr host versions` with one
+object per release: `release`, `sequence`, and whether it is `current`, `previous`, `staged` or
+`held` by a running program. `docs/host/updates.md` has the store, how a release is checked, the
+handover and what happens when an update stops part way.
 
 ## `--json` shapes
 
