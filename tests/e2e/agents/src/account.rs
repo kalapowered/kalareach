@@ -435,6 +435,46 @@ pub fn keychain_item_modified(home: &Path, service: &str) -> Option<String> {
         .and_then(|line| line.split('"').nth(3).map(str::to_owned))
 }
 
+/// Removes from the line file `path` every line that holds `mark`, and returns how many it removed:
+/// under an exclusive lock on the file, which the agent's own writers take too where they lock it,
+/// the file is read, and only when a line holds the mark is it written again, in place, with the
+/// rest as they were. A file that does not exist has no lines to remove.
+///
+/// # Errors
+///
+/// Returns why the file could not be read, locked or written.
+pub fn remove_marked_lines(path: &Path, mark: &str) -> Result<usize, String> {
+    use std::io::Seek;
+    let mut file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(format!("{}: {error}", path.display())),
+    };
+    rustix::fs::flock(&file, rustix::fs::FlockOperation::LockExclusive)
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    let mut text = String::new();
+    file.read_to_string(&mut text)
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    let kept: Vec<&str> = text
+        .split_inclusive('\n')
+        .filter(|line| !line.contains(mark))
+        .collect();
+    let removed = text.split_inclusive('\n').count() - kept.len();
+    if removed > 0 {
+        let rest = kept.concat();
+        file.seek(std::io::SeekFrom::Start(0))
+            .and_then(|_| file.write_all(rest.as_bytes()))
+            .and_then(|()| file.set_len(u64::try_from(rest.len()).unwrap_or(u64::MAX)))
+            .map_err(|error| format!("{}: {error}", path.display()))?;
+    }
+    let _ = rustix::fs::flock(&file, rustix::fs::FlockOperation::Unlock);
+    Ok(removed)
+}
+
 /// The variable naming the file descriptor the harness passes a login's value on: a pipe, so the
 /// value is in no file and in no process's environment until the agent's session is given it.
 pub const KEY_DESCRIPTOR_VARIABLE: &str = "KR_AGENTS_KEY_FD";
@@ -553,6 +593,8 @@ struct Entry {
 #[derive(Clone, Debug, Default)]
 pub struct Snapshot {
     roots: Vec<PathBuf>,
+    /// The roots listed for the files directly in them only.
+    shallow: Vec<PathBuf>,
     files: BTreeMap<PathBuf, Entry>,
     directories: std::collections::BTreeSet<PathBuf>,
     hash_limit: u64,
@@ -576,20 +618,29 @@ impl Snapshot {
 }
 
 /// Reads every file under each of `directories`, relative to `home`: size, modification time and
-/// inode for all, and the SHA-256 of each no larger than `hash_limit` bytes. A root that does not
-/// exist, and an entry gone between its directory's listing and its own read, are not there; any
-/// other entry that cannot be read, a file that cannot be hashed whole included, is recorded, and
-/// the snapshot is then not whole.
+/// inode for all, and the SHA-256 of each no larger than `hash_limit` bytes. A directory named with
+/// a trailing `/*` is read for the files directly in it, and the directories in it are recorded as
+/// there but not read. A root that does not exist, and an entry gone between its directory's
+/// listing and its own read, are not there; any other entry that cannot be read, a file that cannot
+/// be hashed whole included, is recorded, and the snapshot is then not whole.
 #[must_use]
 pub fn snapshot(home: &Path, directories: &[String], hash_limit: u64) -> Snapshot {
     let mut files = BTreeMap::new();
     let mut seen_directories = std::collections::BTreeSet::new();
     let mut unread = Vec::new();
-    let roots: Vec<PathBuf> = directories
-        .iter()
-        .map(|relative| home.join(relative))
-        .collect();
+    let mut roots = Vec::new();
+    let mut shallow = Vec::new();
+    for relative in directories {
+        match relative.strip_suffix("/*") {
+            Some(directory) => {
+                roots.push(home.join(directory));
+                shallow.push(home.join(directory));
+            }
+            None => roots.push(home.join(relative)),
+        }
+    }
     for top in &roots {
+        let only_its_files = shallow.contains(top);
         let mut pending = vec![top.clone()];
         while let Some(path) = pending.pop() {
             let metadata = match std::fs::symlink_metadata(&path) {
@@ -601,6 +652,10 @@ pub fn snapshot(home: &Path, directories: &[String], hash_limit: u64) -> Snapsho
                 }
             };
             if metadata.is_dir() {
+                if only_its_files && &path != top {
+                    seen_directories.insert(path);
+                    continue;
+                }
                 match std::fs::read_dir(&path) {
                     Ok(entries) => {
                         for entry in entries {
@@ -645,6 +700,7 @@ pub fn snapshot(home: &Path, directories: &[String], hash_limit: u64) -> Snapsho
     }
     Snapshot {
         roots,
+        shallow,
         files,
         directories: seen_directories,
         hash_limit,
@@ -720,6 +776,8 @@ pub fn changes(before: &Snapshot, after: &Snapshot) -> Changes {
 /// directory), and then each directory the part created there that is left empty; returns what it
 /// removed and what it left. Nothing that existed before the part, a file or a directory, is
 /// touched, and nothing at all when `before` is not whole, since what it missed may have existed.
+/// A directory is removed only inside a root that was read whole: in one read for its own files
+/// alone, a directory's earlier contents were not seen.
 #[must_use]
 pub fn remove_created(
     before: &Snapshot,
@@ -730,6 +788,13 @@ pub fn remove_created(
         return (Vec::new(), changes.created.clone());
     }
     let inside = |path: &Path| before.roots.iter().any(|root| path.starts_with(root));
+    let inside_a_whole_root = |path: &Path| {
+        before
+            .roots
+            .iter()
+            .filter(|root| !before.shallow.contains(root))
+            .any(|root| path.starts_with(root))
+    };
     let mut removed = Vec::new();
     let mut left = Vec::new();
     for path in &changes.created {
@@ -758,7 +823,9 @@ pub fn remove_created(
                 .map(Path::to_path_buf)
                 .collect::<Vec<_>>()
         })
-        .filter(|directory| inside(directory) && !before.directories.contains(directory))
+        .filter(|directory| {
+            inside_a_whole_root(directory) && !before.directories.contains(directory)
+        })
         .collect();
     directories.sort();
     directories.dedup();
@@ -769,6 +836,58 @@ pub fn remove_created(
         }
     }
     (removed, left)
+}
+
+/// Which of `paths` hold one of `needles`, read a piece at a time so a file of any size can be
+/// searched; and each that could not be read, with why. A file that is gone is not listed.
+#[must_use]
+pub fn which_hold(paths: &[PathBuf], needles: &[&str]) -> (Vec<PathBuf>, Vec<String>) {
+    const PIECE: usize = 1 << 20;
+    let needles: Vec<&[u8]> = needles
+        .iter()
+        .filter(|needle| !needle.is_empty())
+        .map(|needle| needle.as_bytes())
+        .collect();
+    let overlap = needles.iter().map(|needle| needle.len()).max().unwrap_or(1) - 1;
+    let mut holding = Vec::new();
+    let mut unread = Vec::new();
+    for path in paths {
+        let mut file = match std::fs::File::open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                unread.push(format!("{}: {error}", path.display()));
+                continue;
+            }
+        };
+        let mut window: Vec<u8> = Vec::with_capacity(PIECE + overlap);
+        let mut piece = vec![0; PIECE];
+        let found = loop {
+            match file.read(&mut piece) {
+                Ok(0) => break Ok(false),
+                Ok(read) => {
+                    window.extend_from_slice(&piece[..read]);
+                    if needles.iter().any(|needle| {
+                        window
+                            .windows(needle.len())
+                            .any(|candidate| candidate == *needle)
+                    }) {
+                        break Ok(true);
+                    }
+                    let keep = window.len().min(overlap);
+                    window.drain(..window.len() - keep);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => break Err(error),
+            }
+        };
+        match found {
+            Ok(true) => holding.push(path.clone()),
+            Ok(false) => {}
+            Err(error) => unread.push(format!("{}: {error}", path.display())),
+        }
+    }
+    (holding, unread)
 }
 
 /// The identifier of the conversation a file holds: the last identifier shaped like a UUID in its
@@ -977,6 +1096,118 @@ mod tests {
         );
         assert_eq!(left.len(), found.created.len());
         assert!(closed.join("history").exists() && agent.join("ours").exists());
+    }
+
+    #[test]
+    fn a_directory_read_for_its_own_files_lists_them_and_prunes_nothing_beneath_it() {
+        let scratch = Scratch::new("shallow");
+        let home = &scratch.0;
+        let agent = home.join(".agent");
+        let day = agent.join("sessions").join("2026").join("09").join("27");
+        std::fs::create_dir_all(&day).expect("a day's directory");
+        std::fs::write(agent.join("history.jsonl"), "old\n").expect("a history");
+        std::fs::write(day.join("old.jsonl"), "old").expect("an old conversation");
+        let earlier = agent.join("sessions").join("2026").join("09").join("26");
+        std::fs::create_dir_all(&earlier).expect("an earlier day's directory");
+        std::fs::write(earlier.join("older.jsonl"), "older").expect("an older conversation");
+        let directories = vec![
+            ".agent/*".to_owned(),
+            ".agent/sessions/2026/09/27".to_owned(),
+            ".agent/sessions/2026/09/28".to_owned(),
+        ];
+        let before = snapshot(home, &directories, 1 << 20);
+        assert!(before.whole());
+        assert!(
+            before.files.contains_key(&agent.join("history.jsonl"))
+                && before.files.contains_key(&day.join("old.jsonl"))
+                && !before.files.contains_key(&earlier.join("older.jsonl")),
+            "a directory read for its own files lists them and not what lies beneath it, which a root \
+             of its own lists"
+        );
+        let next = agent.join("sessions").join("2026").join("09").join("28");
+        std::fs::create_dir_all(&next).expect("the next day's directory");
+        std::fs::write(next.join("ours.jsonl"), "prompt kr0123").expect("ours after midnight");
+        std::fs::write(day.join("ours.jsonl"), "prompt kr0123").expect("ours");
+        std::fs::write(agent.join("state.sqlite"), "kr0123 and theirs").expect("a new database");
+        std::fs::write(agent.join("history.jsonl"), "old\nkr0123\n").expect("an appended line");
+        let beneath = agent.join("cache").join("fresh");
+        std::fs::create_dir_all(&beneath).expect("a directory the listing does not read");
+        std::fs::write(beneath.join("x"), "kr0123").expect("a file it does not see");
+        let after = snapshot(home, &directories, 1 << 20);
+        let found = changes(&before, &after);
+        assert_eq!(found.appended, vec![agent.join("history.jsonl")]);
+        let (removed, left) = remove_created(&before, &found, &["kr0123"]);
+        assert!(!day.join("ours.jsonl").exists() && day.join("old.jsonl").exists());
+        assert!(
+            !next.exists(),
+            "the next day's directory, which the part made, goes once empty"
+        );
+        assert!(
+            agent.join("sessions").join("2026").join("09").is_dir(),
+            "a directory beneath the one read for its own files stays"
+        );
+        assert!(
+            removed.contains(&agent.join("state.sqlite")),
+            "a file the part made directly in it goes when it holds the mark"
+        );
+        assert!(left.is_empty(), "{left:?}");
+        assert!(
+            beneath.join("x").exists(),
+            "what the listing did not see is not touched"
+        );
+    }
+
+    #[test]
+    fn marked_lines_are_removed_in_place_and_a_file_without_them_is_left_as_it_was() {
+        let scratch = Scratch::new("lines");
+        let path = scratch.0.join("history.jsonl");
+        std::fs::write(&path, "one\nkr0123 two\nthree\nkr0123 four").expect("a line file");
+        let inode = std::fs::metadata(&path).expect("its metadata").ino();
+        assert_eq!(remove_marked_lines(&path, "kr0123"), Ok(2));
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("the file"),
+            "one\nthree\n"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).expect("its metadata").ino(),
+            inode,
+            "the file is written in place"
+        );
+        let modified = std::fs::metadata(&path)
+            .expect("its metadata")
+            .modified()
+            .ok();
+        assert_eq!(remove_marked_lines(&path, "kr0123"), Ok(0));
+        assert_eq!(
+            std::fs::metadata(&path)
+                .expect("its metadata")
+                .modified()
+                .ok(),
+            modified,
+            "a file without the mark is not written"
+        );
+        assert_eq!(
+            remove_marked_lines(&scratch.0.join("none"), "kr0123"),
+            Ok(0)
+        );
+    }
+
+    #[test]
+    fn a_search_in_pieces_finds_a_needle_across_a_piece_boundary() {
+        let scratch = Scratch::new("hold");
+        let across = scratch.0.join("across");
+        let mut bytes = vec![b'x'; (1 << 20) - 3];
+        bytes.extend_from_slice(b"kr0123");
+        bytes.extend_from_slice(&[b'y'; 10]);
+        std::fs::write(&across, &bytes).expect("a large file");
+        let without = scratch.0.join("without");
+        std::fs::write(&without, vec![b'z'; 3 << 20]).expect("a file without it");
+        let (holding, unread) = which_hold(
+            &[across.clone(), without, scratch.0.join("gone")],
+            &["kr0123", "/run/root"],
+        );
+        assert_eq!(holding, vec![across]);
+        assert!(unread.is_empty(), "{unread:?}");
     }
 
     #[test]
