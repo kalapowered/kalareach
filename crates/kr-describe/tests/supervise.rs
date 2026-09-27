@@ -606,6 +606,11 @@ fn a_cancellation_reaches_the_process_during_a_load_and_a_decode() {
         "{reports:?}"
     );
     let pid = rig.driver.pid();
+    // The process has started and said hello before its load is cancelled, so what is timed is
+    // the cancellation rather than the start of a process.
+    rig.until(&roomy(), at(3_050), "the handshake", |_, driver| {
+        driver.background().is_some()
+    });
     rig.service().set_enabled(false);
     let asked = Instant::now();
     let reports = rig.until(&roomy(), at(3_100), "the cancelled load", |reports, _| {
