@@ -22,7 +22,7 @@ use kr_client::cursors::StreamCursors;
 use kr_e2e_agents::account::{
     AppendOnly, Guarded, Ledger, append_only_files, appended_since, borrow_login_keychain, changes,
     conversation_id, files_holding, guarded_files, holds_any, key_from_descriptor,
-    keychain_item_modified, now_ms, read_if_there, record_guarded, record_key_scan,
+    keychain_item_modified, line_identity, now_ms, read_if_there, record_guarded, record_key_scan,
     remove_appended_lines, remove_created, snapshot, which_hold,
 };
 use kr_e2e_agents::build::{
@@ -886,9 +886,9 @@ fn staged(
                     _ => None,
                 };
                 // The lines appended to the files only appended to: every earlier line must still be
-                // there. The part's own, those that hold its mark or the run's directory or whose
-                // "id" names a conversation the part created, are listed with that id; the others,
-                // someone else's, are only counted.
+                // there. The part's own, those that hold its mark or the run's directory or that name
+                // a conversation the part created, are listed with the conversation they name, their
+                // time and which of those they hold; the others, someone else's, are only counted.
                 let needles = [mark.as_str(), root_text.as_str()];
                 let own_conversations: &[String] = home
                     .as_ref()
@@ -901,23 +901,17 @@ fn staged(
                             appended_since(file.before.as_deref(), now.as_deref())
                         }) {
                             Ok(Some(added)) => {
-                                let id_of = |line: &[u8]| {
-                                    serde_json::from_slice::<serde_json::Value>(line)
-                                        .ok()
-                                        .and_then(|value| {
-                                            value.get("id").and_then(|id| id.as_str().map(str::to_owned))
-                                        })
-                                };
                                 let own: Vec<serde_json::Value> = added
                                     .iter()
                                     .filter_map(|line| {
-                                        let id = id_of(line);
-                                        let marked = holds_any(line, &needles);
+                                        let (id, time) = line_identity(line);
+                                        let marked = holds_any(line, &[mark.as_str()]);
+                                        let names_run = holds_any(line, &[root_text.as_str()]);
                                         let created = id
                                             .as_ref()
                                             .is_some_and(|id| own_conversations.contains(id));
-                                        (marked || created).then(|| {
-                                            json!({ "id": id, "holds_the_part": marked, "names_a_conversation_it_created": created })
+                                        (marked || names_run || created).then(|| {
+                                            json!({ "id": id, "time": time, "holds_the_mark": marked, "names_the_run_directory": names_run, "names_a_conversation_it_created": created })
                                         })
                                     })
                                     .collect();
