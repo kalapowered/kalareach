@@ -98,6 +98,9 @@ struct Stage<'a, 'r> {
     /// Text only this part's own prompts and files carry, chosen before the part starts, by which
     /// what the part left in the person's agent directories is told from what anything else left.
     mark: &'a str,
+    /// Set once the agent has shown, in this part, what only its model could have answered: its
+    /// vendor accepted the login.
+    held: &'a std::sync::atomic::AtomicBool,
 }
 
 /// The person's login as a part that needs it holds it: how the agent runs with it, the budget its
@@ -232,6 +235,7 @@ fn staged(
     let root = run.root().to_path_buf();
     let provenance = Provenance::new(&inputs.build, &run, &shell, part);
     let closed = std::sync::atomic::AtomicBool::new(false);
+    let held = std::sync::atomic::AtomicBool::new(false);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         run_part(
             part,
@@ -242,10 +246,11 @@ fn staged(
             &runtime,
             &run,
             &provenance,
-            &closed,
+            (&closed, &held),
             body,
         )
     }));
+    let login_held = held.load(std::sync::atomic::Ordering::SeqCst);
     // What the part left is read only once nothing it started still runs: after the closing
     // check, or, after a part that stopped part way, once the run has ended everything and found
     // nothing left. The run's directory is still there then.
@@ -334,6 +339,7 @@ fn staged(
                 }
                 let mut evidence = serde_json::Map::new();
                 evidence.insert("provenance".to_owned(), provenance.evidence());
+                evidence.insert("login_held".to_owned(), json!(login_held));
                 if let Some((report, _, _)) = &home {
                     evidence.insert("person_home".to_owned(), report.clone());
                 }
@@ -364,6 +370,9 @@ fn staged(
         }
     };
     if let Some(evidence) = outcome.evidence.as_object_mut() {
+        if needs_login {
+            evidence.insert("login_held".to_owned(), json!(login_held));
+        }
         if let Some((report, _, _)) = &home {
             evidence.insert("person_home".to_owned(), report.clone());
         }
@@ -459,7 +468,10 @@ fn run_part(
     runtime: &tokio::runtime::Runtime,
     run: &Run,
     provenance: &Provenance,
-    closed: &std::sync::atomic::AtomicBool,
+    (closed, held): (
+        &std::sync::atomic::AtomicBool,
+        &std::sync::atomic::AtomicBool,
+    ),
     body: impl FnOnce(&mut Stage<'_, '_>) -> Ending,
 ) -> Outcome {
     // Before anything starts in the run's home: a keychain of its own, its default there, or, for
@@ -505,6 +517,7 @@ fn run_part(
                 provenance,
                 login,
                 mark,
+                held,
             };
             body(&mut stage)
         };
@@ -968,6 +981,14 @@ impl Logged {
         self.type_text(stage, &login.account.submit);
     }
 
+    /// Waits until the device's view shows `needle`, text only the agent's model could have
+    /// answered, and takes it as the vendor having accepted the login in this part.
+    fn answered(&mut self, stage: &Stage<'_, '_>, needle: &str, why: &str) -> Vec<String> {
+        let rows = self.wait_for(stage, needle, why);
+        stage.held.store(true, std::sync::atomic::Ordering::SeqCst);
+        rows
+    }
+
     /// Waits until the device's view shows `needle`. When it does not, and the screen shows one
     /// of the texts the agent shows when it is signed out, the part says the login is not
     /// established.
@@ -1182,6 +1203,15 @@ impl Watch {
     fn close(self, stage: &Stage<'_, '_>) {
         let _ = stage.runtime.block_on(self.view.detach(&self.remote));
         self.remote.close();
+    }
+
+    /// Applies the next event the device is sent, waiting at most `within` for it, and says
+    /// whether there was one.
+    fn pump_one(&mut self, stage: &Stage<'_, '_>, within: Duration) -> bool {
+        stage
+            .runtime
+            .block_on(self.view.pump_one(&self.remote, within))
+            .unwrap_or_else(|why| panic!("{why}"))
     }
 
     /// Applies what has arrived, waiting at most `within` for the first of it.
@@ -2560,7 +2590,7 @@ fn a_device_prompts_the_agent_and_adds_an_image_and_the_local_terminal_shows_the
         // A prompt from the device, answered.
         let (question, sum) = sum_question();
         logged.submit(stage, &question, "a prompt from the device");
-        let _ = logged.wait_for(stage, &sum, "the agent answers the device's prompt");
+        let _ = logged.answered(stage, &sum, "the agent answers the device's prompt");
         // The image, by the agent's own syntax, with a question only the image answers.
         let mark = stage.mark.to_owned();
         let file = stage.run.work().join(format!("{mark}.png"));
@@ -2832,7 +2862,7 @@ fn slash_commands_interrupts_queued_prompts_and_steering_each_work_from_a_device
                 first_prompt,
                 &queued_done,
             );
-        let _ = logged.wait_for(stage, &queued_sum, "the queued prompt is answered");
+        let _ = logged.answered(stage, &queued_sum, "the queued prompt is answered");
         let _ = logged.wait_for(
             stage,
             &account.composer,
@@ -2902,7 +2932,7 @@ fn slash_commands_interrupts_queued_prompts_and_steering_each_work_from_a_device
                     steered_prompt,
                     &steered_done,
                 );
-            let _ = logged.wait_for(stage, &steer_sum, "the steered turn answers");
+            let _ = logged.answered(stage, &steer_sum, "the steered turn answers");
             let _ = logged.wait_for(
                 stage,
                 &account.composer,
@@ -3074,7 +3104,8 @@ fn a_local_and_a_remote_answer_raced_to_one_approval_resolve_it_once() {
             &format!("Use your shell tool to run exactly this command and nothing else: echo {mark} >> approved.log"),
             "an approval-gated command",
         );
-        let _ = logged.wait_for(
+        // Only the model asks for a tool, so the dialog says the vendor answered.
+        let _ = logged.answered(
             stage,
             &account.approval.shows,
             "the agent asks for approval",
@@ -3254,10 +3285,11 @@ fn once(prompts: usize, replies: usize) -> Result<(), String> {
 
 /// KR-REQ-12.32, case 4, part 4: with the person's login, the device sends a prompt that asks for a
 /// reply beginning and ending with markers. The moment the agent's own conversation records the
-/// prompt, and while no screen the device was sent since the submission showed anything of a reply
-/// (the agent's reply mark, or four characters of the code in upper case), the device drops both its
-/// connections; the part stops there, before another turn, if one had, or if the device fell behind
-/// and was sent a fresh screen, which could have skipped one. The
+/// prompt, and while nothing the device was sent since the submission, each event's screen and
+/// every byte of output, showed anything of a reply (the agent's reply mark, or four characters of
+/// the code in upper case), the device drops both its connections; the part stops there, before
+/// another turn, if something had, or if the device was sent or asked for a fresh screen in that
+/// time, which could have skipped some. The
 /// reply finishes while the device is away. A new connection is drawn the reply; the old
 /// attachment's next input is refused; and the conversation that holds the prompt holds it once
 /// with one finished reply, counted again after reconnecting. The identities the device reconciles
@@ -3282,10 +3314,12 @@ fn a_disconnection_after_the_agent_took_a_prompt_leaves_one_reply_and_no_duplica
              from 1 to 60, one number per line, then write the same code in upper case followed by \
              -END, and nothing else."
         );
-        // Every screen the device is sent from the submission until it goes is looked at: a reply
+        // Every event the device is sent from the submission until it goes is applied on its own
+        // and the screen looked at after it, and every byte of output it is sent is read: a reply
         // shows the agent's reply mark, and this one begins with the code in upper case, of which
-        // four characters are enough. A screen the device fell behind on and was sent afresh may
-        // have skipped some, so it counts as reached.
+        // four characters are enough. A screen the device fell behind on and was sent afresh, or
+        // one it asked for afresh after an update it could not apply, may have skipped some, so
+        // either counts as reached.
         logged.screen.pump(stage, Duration::from_millis(50));
         let marks = |rows: &[String]| {
             rows.iter()
@@ -3303,16 +3337,20 @@ fn a_disconnection_after_the_agent_took_a_prompt_leaves_one_reply_and_no_duplica
                 .count()
         };
         let resyncs_before = resyncs(&logged);
+        let fresh_before = logged.screen.view.fresh_screens();
+        let sent_from = logged.screen.view.output().len();
         let code_start: String = upper.chars().take(4).collect();
         let mut reached = false;
+        let mut code_seen = false;
         logged.submit(stage, &prompt, "a prompt with a slow reply");
         // The agent's own record of the prompt is its admission.
         let admitted_at = std::time::Instant::now();
         let conversation = loop {
-            logged.screen.pump(stage, Duration::from_millis(10));
-            let rows = logged.screen.view.rows();
-            reached |=
-                marks(&rows) > marks_before || rows.iter().any(|row| row.contains(&code_start));
+            while logged.screen.pump_one(stage, Duration::from_millis(5)) {
+                let rows = logged.screen.view.rows();
+                code_seen |= rows.iter().any(|row| row.contains(&code_start));
+                reached |= code_seen || marks(&rows) > marks_before;
+            }
             if let Some(file) = conversation_of(&conversations, &mark, &account.prompt_line) {
                 break file;
             }
@@ -3323,11 +3361,24 @@ fn a_disconnection_after_the_agent_took_a_prompt_leaves_one_reply_and_no_duplica
             );
         };
         // One more look at what the device has been sent, and then it goes.
-        logged.screen.pump(stage, Duration::from_millis(1));
-        let rows = logged.screen.view.rows();
-        reached |= marks(&rows) > marks_before
-            || rows.iter().any(|row| row.contains(&code_start))
-            || resyncs(&logged) > resyncs_before;
+        while logged.screen.pump_one(stage, Duration::from_millis(1)) {
+            let rows = logged.screen.view.rows();
+            code_seen |= rows.iter().any(|row| row.contains(&code_start));
+            reached |= code_seen || marks(&rows) > marks_before;
+        }
+        let sent = &logged.screen.view.output()[sent_from..];
+        let holds = |needle: &[u8]| {
+            !needle.is_empty() && sent.windows(needle.len()).any(|window| window == needle)
+        };
+        code_seen |= holds(code_start.as_bytes());
+        reached |= code_seen
+            || holds(account.reply_mark.as_bytes())
+            || resyncs(&logged) > resyncs_before
+            || logged.screen.view.fresh_screens() > fresh_before;
+        if code_seen {
+            // Only the model writes the code in upper case: the vendor answered.
+            stage.held.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
         let old = (
             logged.keyboard.attachment_id(),
             logged.keyboard.epoch(),
@@ -3348,10 +3399,20 @@ fn a_disconnection_after_the_agent_took_a_prompt_leaves_one_reply_and_no_duplica
             (prompts, replies)
         };
         if reached {
+            // The part stops here, before another turn; the reply it did not use still says
+            // whether the vendor answered, once the agent has recorded it.
+            let replied_at = std::time::Instant::now();
+            while count(&conversation).1 == 0 && replied_at.elapsed() < LIVENESS {
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            if count(&conversation).1 > 0 {
+                stage.held.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
             let evidence = json!({
                 "account": account_evidence(stage, logged.turns),
                 "conversation": conversation_id(&conversation),
-                "boundary": "a screen the device was sent between the submission and the agent's record of the prompt showed the reply, or the device fell behind and was sent a fresh screen",
+                "boundary": "an event or output byte the device was sent between the submission and the agent's record of the prompt showed the reply, or the device was sent or asked for a fresh screen in that time",
+                "code_seen": code_seen,
             });
             return Ending::new(
                 Outcome::not_run(
@@ -3363,7 +3424,8 @@ fn a_disconnection_after_the_agent_took_a_prompt_leaves_one_reply_and_no_duplica
                 logged.agent.sessions(),
             );
         }
-        // The reply finishes while the device is away.
+        // The reply finishes while the device is away; its end marker, in the agent's own record of
+        // its reply, is what only the model writes.
         let replied_at = std::time::Instant::now();
         while count(&conversation).1 == 0 {
             assert!(
@@ -3372,13 +3434,14 @@ fn a_disconnection_after_the_agent_took_a_prompt_leaves_one_reply_and_no_duplica
             );
             std::thread::sleep(Duration::from_millis(200));
         }
+        stage.held.store(true, std::sync::atomic::Ordering::SeqCst);
         logged
             .agent
             .session
             .reconnect(stage.owner, stage.runtime)
             .unwrap_or_else(|why| panic!("the device reconnects: {why}"));
         logged.screen = Watch::open(stage, &logged.agent.session);
-        let redrawn = logged.wait_for(stage, &end, "the new connection is drawn the reply");
+        let redrawn = logged.answered(stage, &end, "the new connection is drawn the reply");
         let (prompts, replies) = count(&conversation);
         once(prompts, replies)
             .unwrap_or_else(|why| panic!("no duplicate work after reconnecting: {why}"));
@@ -3459,7 +3522,7 @@ fn a_second_process_on_the_same_saved_conversation_is_another_execution_not_merg
             &format!("Remember the code {mark}. {question}"),
             "a conversation to resume",
         );
-        let _ = first.wait_for(stage, &sum, "session A is answered");
+        let _ = first.answered(stage, &sum, "session A is answered");
         let _ = first.wait_for(
             stage,
             &account.composer,
@@ -3493,7 +3556,7 @@ fn a_second_process_on_the_same_saved_conversation_is_another_execution_not_merg
             "the resumed conversation's question",
         );
         let upper = mark.to_uppercase();
-        let _ = second.wait_for(
+        let _ = second.answered(
             stage,
             &upper,
             "session B answers from the saved conversation",
