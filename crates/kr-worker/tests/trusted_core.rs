@@ -251,8 +251,8 @@ fn the_worker_links_no_plugin_runtime_wasm_engine_or_model() {
 
 /// KR-REQ-05.08: neither process that serves a shell - its worker, and the control daemon that
 /// created it - links a Wasm engine or a model runtime, so neither can create a Wasm instance or a
-/// model for a shell, idle or not. The plugin runtime and the description service, which do link
-/// them, are programs of their own.
+/// model for a shell, idle or not. The plugin runtime and the description model
+/// (`kr-describe-model`), which do link them, are crates no process serving a shell depends on.
 #[test]
 fn neither_process_serving_a_shell_links_a_wasm_engine_or_a_model_runtime() {
     let packages = locked();
