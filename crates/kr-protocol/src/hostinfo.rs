@@ -1267,6 +1267,12 @@ impl ComposedBundle {
 /// the product default, and the allowlisted overrides are read from the *host's* own environment.
 /// That is what keeps a variable a person happened to export in one terminal from changing how the
 /// host behaves for everybody.
+///
+/// [`FILE_NAME`]: configuration::FILE_NAME
+/// [`NetworkSelection`]: configuration::NetworkSelection
+/// [`VoiceSelection`]: configuration::VoiceSelection
+/// [`resolve`]: configuration::resolve
+/// [`ALLOWLIST`]: configuration::ALLOWLIST
 pub mod configuration {
     use std::collections::BTreeMap;
 
@@ -4285,6 +4291,11 @@ pub mod configuration {
 /// cannot come to carry a library's error message by somebody interpolating it. The type
 /// establishes a lifetime rather than an origin, as [`Stated`] says: it stops the mistake, not a
 /// caller that leaks a string on purpose.
+///
+/// [`EXPORTED`]: export::EXPORTED
+/// [`ContentClass`]: export::ContentClass
+/// [`Sentence`]: export::Sentence
+/// [`Stated`]: export::Stated
 pub mod export {
     use schemars::JsonSchema;
     use serde::{Deserialize, Serialize};

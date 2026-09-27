@@ -543,7 +543,7 @@ pub const MAILBOX_CLAIM_LIFETIME_MS: u64 = 5 * 60 * 1000;
 /// meaning anything anywhere else.
 ///
 /// The agreement is a secret for as long as the challenge can be answered, so the bytes that are
-/// hashed are one buffer that is wiped once the digest is taken: [`claim_input`] builds it by
+/// hashed are one buffer that is wiped once the digest is taken, and that buffer is built by
 /// hand. A value tree would hold copies of the agreement of its own, and dropping the tree would
 /// release them without wiping them. The hash function's own working state is outside this crate.
 #[must_use]

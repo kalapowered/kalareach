@@ -92,12 +92,13 @@ pub struct EventsSubscribeResult {
     /// It is taken with the subscription rather than fetched beside it, and that is what makes it
     /// usable: the queue this call returns begins at the same moment, so a resolution is either in
     /// the state described here or in the events that follow, never in neither. A view applies the
-    /// events whose position is above [`AgentResourceSnapshot::cursor`] and ignores the rest.
+    /// events whose position is above [`crate::projection::AgentResourceSnapshot::cursor`] and
+    /// ignores the rest.
     ///
     /// One answer carries one bounded page of it, because a host that arbitrates a large number
     /// of resources would otherwise answer with a frame no peer can receive. When
-    /// [`AgentResourceSnapshot::continue_after`] is present the rest is read with `events.snapshot`
-    /// before the events are applied.
+    /// [`crate::projection::AgentResourceSnapshot::continue_after`] is present the rest is read
+    /// with `events.snapshot` before the events are applied.
     pub agent_resources: crate::projection::AgentResourceSnapshot,
     /// The session's live agent instances, read under the same lock that starts the queue.
     ///

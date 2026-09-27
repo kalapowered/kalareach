@@ -334,7 +334,7 @@ impl InclusionPolicy {
 ///
 /// The first four say where a path came from and a path has exactly one of them.
 /// [`Self::BinaryFile`] is the exception: it cuts across the others, so it appears in the counts
-/// and in [`PreviewEntry::binary`] rather than as a path's own class.
+/// and in [`PreviewEntry::content`] rather than as a path's own class.
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
 )]

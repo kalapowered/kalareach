@@ -13064,7 +13064,7 @@
         },
         "agent_resources": {
           "$ref": "#/$defs/AgentResourceSnapshot",
-          "description": "The first page of the agent resources this subscription starts from.\n\nIt is taken with the subscription rather than fetched beside it, and that is what makes it\nusable: the queue this call returns begins at the same moment, so a resolution is either in\nthe state described here or in the events that follow, never in neither. A view applies the\nevents whose position is above [`AgentResourceSnapshot::cursor`] and ignores the rest.\n\nOne answer carries one bounded page of it, because a host that arbitrates a large number\nof resources would otherwise answer with a frame no peer can receive. When\n[`AgentResourceSnapshot::continue_after`] is present the rest is read with `events.snapshot`\nbefore the events are applied."
+          "description": "The first page of the agent resources this subscription starts from.\n\nIt is taken with the subscription rather than fetched beside it, and that is what makes it\nusable: the queue this call returns begins at the same moment, so a resolution is either in\nthe state described here or in the events that follow, never in neither. A view applies the\nevents whose position is above [`crate::projection::AgentResourceSnapshot::cursor`] and\nignores the rest.\n\nOne answer carries one bounded page of it, because a host that arbitrates a large number\nof resources would otherwise answer with a frame no peer can receive. When\n[`crate::projection::AgentResourceSnapshot::continue_after`] is present the rest is read\nwith `events.snapshot` before the events are applied."
         },
         "from_cursor": {
           "$ref": "#/$defs/U64",
@@ -14913,7 +14913,7 @@
       ]
     },
     "InclusionClass": {
-      "description": "Which class of the working tree one previewed entry belongs to.\n\nThe first four say where a path came from and a path has exactly one of them.\n[`Self::BinaryFile`] is the exception: it cuts across the others, so it appears in the counts\nand in [`PreviewEntry::binary`] rather than as a path's own class.",
+      "description": "Which class of the working tree one previewed entry belongs to.\n\nThe first four say where a path came from and a path has exactly one of them.\n[`Self::BinaryFile`] is the exception: it cuts across the others, so it appears in the counts\nand in [`PreviewEntry::content`] rather than as a path's own class.",
       "oneOf": [
         {
           "const": "dirty_file",

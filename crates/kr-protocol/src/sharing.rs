@@ -3,7 +3,7 @@
 //! Section 25 fixes the shape of this module. Roles are a *composition* aid: viewer, reviewer,
 //! controller and owner each name a set of actions, and issuing under a role writes those actions
 //! into the grant. Nothing here ever reaches an authorisation decision, because the host never
-//! authorises from a role label: [`Grant`](crate::grant::Grant) carries no role, and a request is
+//! authorises from a role label: [`Grant`] carries no role, and a request is
 //! decided against the actions it carries and nothing else.
 //!
 //! Three things a role does not decide on its own, because section 25 makes each an explicit
