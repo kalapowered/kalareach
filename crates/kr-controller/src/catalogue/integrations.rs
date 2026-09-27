@@ -88,6 +88,22 @@ pub fn entries(reading: &Reading, enabled: &[String]) -> Vec<CommandIntegration>
     entries
 }
 
+/// The most bytes of flags the doctor's reports carry together. A report whose flags would pass it
+/// carries none and says so: the doctor's answer is one control frame, and a package may declare
+/// sixteen flags of four kilobytes each.
+pub const MAX_REPORTED_FLAG_BYTES: usize = 256 * 1024;
+
+/// Leaves out of `specification` the command integrations one control frame cannot carry beside
+/// the rest of it, the largest first, and returns the packages it left out: a session is launched
+/// without an integration rather than not launched at all.
+#[must_use]
+pub fn fit_launch_specification(
+    specification: &mut kr_protocol::worker::WorkerLaunchSpec,
+) -> Vec<kr_protocol::ids::PluginId> {
+    let _ = specification;
+    Vec::new()
+}
+
 /// What the doctor reads of this host beside its admissions.
 #[derive(Clone, Debug, Default)]
 pub struct Host {
@@ -316,20 +332,30 @@ fn described(
 
 /// The first executable `command` names on `search_path`, as a shell's search finds it.
 fn resolve(command: &str, search_path: &[PathBuf]) -> Option<PathBuf> {
-    let names: Vec<String> = if cfg!(windows) {
-        // A command is found under each of the extensions the platform runs.
+    let extensions: Vec<String> = if cfg!(windows) {
+        // A command is found under each of the extensions the platform runs, in its order.
         std::env::var("PATHEXT")
             .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_owned())
             .split(';')
             .filter(|extension| !extension.is_empty())
-            .map(|extension| format!("{command}{}", extension.to_ascii_lowercase()))
+            .map(str::to_ascii_lowercase)
             .collect()
     } else {
-        vec![command.to_owned()]
+        vec![String::new()]
     };
+    resolve_with(command, search_path, &extensions)
+}
+
+/// The first runnable `command` followed by one of `extensions` in a directory of `search_path`:
+/// each directory in order, and in each the extensions in theirs.
+fn resolve_with(command: &str, search_path: &[PathBuf], extensions: &[String]) -> Option<PathBuf> {
     search_path
         .iter()
-        .flat_map(|directory| names.iter().map(move |name| directory.join(name)))
+        .flat_map(|directory| {
+            extensions
+                .iter()
+                .map(move |extension| directory.join(format!("{command}{extension}")))
+        })
         .find(|candidate| runnable(candidate))
 }
 

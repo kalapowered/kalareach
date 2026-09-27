@@ -454,6 +454,9 @@ pub enum CommandIntegrationState {
     Conflict,
     /// The configuration names it and it is not installed in this environment.
     NotInstalled,
+    /// The configuration names it, and the admissions in force could not be read, so what a new
+    /// session gets of it is not known.
+    Unknown,
 }
 
 impl CommandIntegrationState {
@@ -469,6 +472,7 @@ impl CommandIntegrationState {
             Self::Unreadable => "unreadable",
             Self::Conflict => "conflict",
             Self::NotInstalled => "not_installed",
+            Self::Unknown => "unknown",
         }
     }
 }
@@ -8416,6 +8420,12 @@ mod tests {
             named(&["kalareach/claude-code/extra"]),
             named(&["/claude-code"]),
             named(&[""]),
+            named(&["../gemini-cli"]),
+            named(&["kalareach/-agent"]),
+            named(&["kalareach/agent-"]),
+            named(&["kalareach/a..b"]),
+            named(&["kalareach/a.-b"]),
+            named(&[".kalareach/agent"]),
             named(&["kalareach/claude-code", "kalareach/claude-code"]),
             (0..=configuration::MAX_COMMAND_INTEGRATIONS)
                 .map(|index| format!("kalareach/p{index}"))
@@ -8495,5 +8505,38 @@ mod tests {
         ] {
             assert!(exported.contains(word), "{word} in {exported}");
         }
+    }
+
+    /// KR-REQ-12.07: a disable edit keeps the host's list sorted, as an enable edit does, whatever
+    /// order a document written by hand put it in.
+    #[test]
+    fn a_disable_edit_keeps_the_list_sorted() {
+        let mut document = ConfigurationDocument::empty();
+        document.preferences.command_integrations = Nullable::some(
+            [
+                "kalareach/qoder-cli",
+                "kalareach/claude-code",
+                "kalareach/gemini-cli",
+            ]
+            .iter()
+            .map(|plugin| (*plugin).to_owned())
+            .collect(),
+        );
+        let loaded = configuration::load(Some(configuration::contents(&document).as_bytes()));
+        let edited = configuration::edit(
+            &loaded,
+            &configuration::Change::CommandIntegration {
+                plugin_id: "kalareach/gemini-cli".to_owned(),
+                enabled: false,
+            },
+        )
+        .expect("a valid edit");
+        assert_eq!(
+            edited.document.preferences.command_integrations.0,
+            Some(vec![
+                "kalareach/claude-code".to_owned(),
+                "kalareach/qoder-cli".to_owned()
+            ])
+        );
     }
 }

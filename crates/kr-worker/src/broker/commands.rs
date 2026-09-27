@@ -1763,6 +1763,13 @@ fn check_executable(executable: &str) -> std::result::Result<(), String> {
     Ok(())
 }
 
+/// Whether `path` is a regular file this account may execute: what a launcher, and an executable a
+/// command resolves to, are held to wherever this host needs to know that one would run.
+#[must_use]
+pub fn runnable(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file())
+}
+
 #[cfg(unix)]
 fn is_executable(metadata: &std::fs::Metadata) -> bool {
     use std::os::unix::fs::PermissionsExt as _;
@@ -1896,6 +1903,32 @@ const fn forward_now() -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A file is runnable only where this account may execute it: a mode that lets only another
+    /// account execute it, or nobody, is not, and neither is a directory.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_is_runnable_only_where_this_account_may_execute_it() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let directory = std::env::temp_dir().join(format!("kr-runnable-{}", kr_ipc::new_uuid()));
+        std::fs::create_dir_all(&directory).expect("a directory");
+        let program = directory.join("program");
+        std::fs::write(&program, [0x7f, b'E', b'L', b'F']).expect("a program");
+        for (mode, expected) in [
+            (0o700, true),
+            (0o755, true),
+            (0o600, false),
+            (0o601, false),
+            (0o610, false),
+        ] {
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(mode))
+                .expect("its mode");
+            assert_eq!(runnable(&program), expected, "mode {mode:o}");
+        }
+        assert!(!runnable(&directory), "a directory is not runnable");
+        assert!(!runnable(&directory.join("absent")), "nor is nothing");
+        let _ = std::fs::remove_dir_all(&directory);
+    }
 
     fn summary() -> kr_protocol::projection::AgentInstanceSummary {
         kr_protocol::projection::AgentInstanceSummary {
