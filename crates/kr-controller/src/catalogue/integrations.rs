@@ -589,8 +589,8 @@ pub fn check(reported: &Reported, enabled: &[String]) -> DoctorCheck {
         },
         detail,
         (blocked > 0).then_some(
-            "kr doctor --verbose names each integration and why a new session cannot use it; kr \
-             plugin integration disable takes one out of this host's list.",
+            "kr doctor --verbose names each integration it lists and why a new session cannot use \
+             it; kr plugin integration disable takes one out of this host's list.",
         ),
     )
 }
