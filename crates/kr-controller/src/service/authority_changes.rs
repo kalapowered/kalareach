@@ -1,9 +1,22 @@
 //! The grant and device mutations, each under a durable claim, and the grant and device lists.
 
+use std::collections::BTreeMap;
+
+use kr_ipc::client::LocalClient;
+use kr_protocol::agent::{AgentApprovalInspectParams, AgentApprovalInspectResult, AgentSubject};
+use kr_protocol::broker::{DecoderLedgerEntry, MAX_PROJECTION_SUMMARY_LEN};
 use kr_protocol::envelope::{ControlFrame, MutationRequest, ParamsValue};
 use kr_protocol::error::{ErrorCode, ProtocolError};
-use kr_protocol::ids::ActorId;
+use kr_protocol::gateway::{PendingKind, PendingResource};
+use kr_protocol::ids::{ActorId, PendingResourceId, SessionId};
 use kr_protocol::method::Method;
+use kr_protocol::projection::AgentResourceSnapshotContinuation;
+use kr_protocol::question::{QuestionReadParams, QuestionReadResult};
+use kr_protocol::recovery::{EventsSnapshotParams, EventsSnapshotResult};
+use kr_protocol::scalars::{CanonicalSet, Nullable};
+use kr_protocol::sharing::{
+    MAX_NAMED_RESOURCES, NamedApprovalPreview, NamedQuestionPreview, RoleSelection,
+};
 
 use crate::error::{ControllerError, Result};
 
@@ -522,6 +535,9 @@ impl Controller {
     }
 
     /// Shares a session: compiles the role, previews it, and writes the grant and its invitation.
+    ///
+    /// The questions and approvals the share names are previewed as the session's worker holds
+    /// them now ([`Self::named_previews`]), before anything is written.
     async fn grant_create(
         &self,
         mutation: &MutationRequest,
@@ -547,6 +563,9 @@ impl Controller {
                     .to_owned(),
             ));
         }
+        let named = self
+            .named_previews(params.session_id, &params.selection)
+            .await?;
         // The identities are derived from the action the caller named, not minted fresh. An attempt
         // that ended before it recorded its answer therefore left a grant and an invitation this
         // host can find by the action alone, and a retry is answered from them.
@@ -566,8 +585,8 @@ impl Controller {
             lifetime_ms: params.lifetime_ms.as_ref().map(|lifetime| lifetime.get()),
             accepted_notices: params.accepted_notices.clone(),
             live_screen: None,
-            named_questions: Vec::new(),
-            named_approvals: Vec::new(),
+            named_questions: named.questions,
+            named_approvals: named.approvals,
             authority_revision: self.policy().authority_revision(),
             owner_confirmed: false,
             // The moment the claim was written, which is when this host accepted the action: the
@@ -593,6 +612,82 @@ impl Controller {
         drop(registry);
         self.settle_floor();
         encode(&result?)
+    }
+
+    /// What the issuer of a share is shown of the current questions and approvals it names, as the
+    /// session's worker holds them now.
+    ///
+    /// Section 10 lets an invitation name active questions and approval resources, previewed to
+    /// the issuer even when they were created before the history cutoff. The session's worker holds
+    /// them, so it is asked, on this daemon's own link to it, whose reads are the local owner's: a
+    /// question by `question.read`, previewed while it is open, and an approval by the resource
+    /// snapshot, which says which instance holds it and whether a decoder interpreted it, and then
+    /// by its record under that instance, previewed while it can still be decided, pending or
+    /// claimed ([`read_previews`]). A share naming nothing asks nothing.
+    ///
+    /// The link is taken out of its slot for the exchange and put back only once the exchange is
+    /// whole, and the whole of it, the wait for the link included, is bounded by
+    /// [`super::workers::WORKER_EXCHANGE`]: a link given back part way through a request would be
+    /// read by the next caller as its own answer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::InvalidArgument`] for a share naming more than
+    /// [`MAX_NAMED_RESOURCES`] questions and approvals together, before anything is asked, for one
+    /// naming what the worker holds no current record of, and for an approval whose request no
+    /// preview can show; [`ControllerError::UnknownSession`] for a session this host knows no
+    /// worker for; `RESOURCE_UNAVAILABLE` when the worker cannot be reached, answers with something
+    /// else or does not answer in time; and any other refusal as the worker gave it.
+    async fn named_previews(
+        &self,
+        session_id: SessionId,
+        selection: &RoleSelection,
+    ) -> Result<NamedPreviews> {
+        let named = selection.named_questions.len() + selection.named_approvals.len();
+        if named == 0 {
+            return Ok(NamedPreviews::default());
+        }
+        if named > MAX_NAMED_RESOURCES {
+            return Err(ControllerError::InvalidArgument(format!(
+                "an invitation names at most {MAX_NAMED_RESOURCES} questions and approvals \
+                 together, and this one names {named}"
+            )));
+        }
+        let exchange = async {
+            let mut held =
+                self.worker_client_of(session_id)
+                    .await
+                    .map_err(|error| match error {
+                        ControllerError::UnknownSession { .. } => error,
+                        other => unreachable_worker(other),
+                    })?;
+            let mut client = held.take().expect("the connection is open");
+            match read_previews(&mut client, session_id, selection).await {
+                Ok(previews) => {
+                    *held = Some(client);
+                    Ok(previews)
+                }
+                Err(PreviewFailure::Refused(error)) => {
+                    *held = Some(client);
+                    Err(error)
+                }
+                // A link that failed part way is not given back: the next caller opens a new one,
+                // and presents the generation again, and renewal stops with the path.
+                Err(PreviewFailure::Link(error)) => {
+                    self.lost_control_path(session_id);
+                    Err(unreachable_worker(error))
+                }
+            }
+        };
+        tokio::time::timeout(super::workers::WORKER_EXCHANGE, exchange)
+            .await
+            .unwrap_or_else(|_| {
+                Err(ControllerError::Refused {
+                    code: ErrorCode::ResourceUnavailable,
+                    detail: "the session's worker did not say in time what this invitation names"
+                        .to_owned(),
+                })
+            })
     }
 
     /// Revokes a grant, its descendants, and everything they were being used for.
@@ -866,6 +961,243 @@ fn unfinished_and_unknown() -> ControllerError {
                  host's records do not show it; it is not performed again, so read what it \
                  concerns before asking under a new action"
             .to_owned(),
+    }
+}
+
+/// What the issuer of a share is shown of the questions and approvals it names.
+#[derive(Default)]
+struct NamedPreviews {
+    questions: Vec<NamedQuestionPreview>,
+    approvals: Vec<NamedApprovalPreview>,
+}
+
+/// Why the session's worker could not say what a share names.
+enum PreviewFailure {
+    /// The link to the worker failed, and nothing is known about the share.
+    Link(kr_ipc::IpcError),
+    /// The worker answered, and its answer decides the share.
+    Refused(ControllerError),
+}
+
+/// The refusal of a share whose worker could not be asked, or answered with something else: it says
+/// nothing about the share, so it is transient and is not kept as the action's answer.
+fn unreachable_worker(error: impl std::fmt::Display) -> ControllerError {
+    ControllerError::Refused {
+        code: ErrorCode::ResourceUnavailable,
+        detail: format!(
+            "the session's worker could not be asked what this invitation names: {error}"
+        ),
+    }
+}
+
+/// The refusal of a share naming a question the session's worker holds no open record of.
+///
+/// One text for a question it does not hold, another session's and one already answered,
+/// cancelled or expired: which of them it was is nothing the issuer needs to share it.
+fn no_open_question() -> PreviewFailure {
+    PreviewFailure::Refused(ControllerError::InvalidArgument(
+        "this invitation names a question this session holds no open record of, so its issuer \
+         cannot be shown it"
+            .to_owned(),
+    ))
+}
+
+/// The refusal of a share naming an approval the session's worker holds no current record of:
+/// one it does not hold, a resource that is not an approval a decoder interpreted, and one that has
+/// ended, with one text.
+fn no_current_approval() -> PreviewFailure {
+    PreviewFailure::Refused(ControllerError::InvalidArgument(
+        "this invitation names an approval this session holds no current record of, one still \
+         pending or claimed, so its issuer cannot be shown it"
+            .to_owned(),
+    ))
+}
+
+/// A refusal the worker gave that is not one of the answers read as "no current record".
+fn as_the_worker_gave_it(error: ProtocolError) -> PreviewFailure {
+    PreviewFailure::Refused(ControllerError::Refused {
+        code: error.code,
+        detail: error.message,
+    })
+}
+
+/// Reads an answer of the worker as `T`, or refuses the share as unreachable: a worker that answers
+/// a read with something else has said nothing about it.
+fn answered_as<T: kr_protocol::wire::WireMessage>(
+    value: &ParamsValue,
+) -> std::result::Result<T, PreviewFailure> {
+    value
+        .to_typed()
+        .map_err(|error| PreviewFailure::Refused(unreachable_worker(error)))
+}
+
+/// Reads, on one link to the session's worker, what it holds of each question and approval
+/// `selection` names, and builds what the issuer is shown of each.
+///
+/// A question is shown while it is open: its text, the revision it is at and when it was asked. An
+/// approval is shown while it can still be decided: what it asks ([`what_it_asks`]) and when the
+/// broker recorded it. The state and the moment are the record's own, read after the snapshot that
+/// found it, so an approval that ended in between is not shown.
+async fn read_previews(
+    client: &mut LocalClient,
+    session_id: SessionId,
+    selection: &RoleSelection,
+) -> std::result::Result<NamedPreviews, PreviewFailure> {
+    let mut previews = NamedPreviews::default();
+    for question_id in &selection.named_questions {
+        let answered = client
+            .request(
+                Method::QuestionRead,
+                &QuestionReadParams {
+                    session_id,
+                    question_id: Nullable::some(*question_id),
+                    include_resolved: true,
+                },
+            )
+            .await
+            .map_err(PreviewFailure::Link)?;
+        let read: QuestionReadResult = match answered {
+            Ok(value) => answered_as(&value)?,
+            // The worker refuses a question it does not hold without saying whether it exists.
+            Err(error) if error.code == ErrorCode::PermissionDenied => {
+                return Err(no_open_question());
+            }
+            Err(error) => return Err(as_the_worker_gave_it(error)),
+        };
+        let Some(question) = read.questions.into_iter().find(|question| {
+            question.question_id == *question_id
+                && question.session_id == session_id
+                && !question.state.is_resolved()
+        }) else {
+            return Err(no_open_question());
+        };
+        previews.questions.push(NamedQuestionPreview {
+            question_id: question.question_id,
+            revision: question.revision,
+            question: question.question,
+            created_at_ms: question.created_at_ms,
+        });
+    }
+    if selection.named_approvals.is_empty() {
+        return Ok(previews);
+    }
+    let held = holding(client, session_id, &selection.named_approvals).await?;
+    for resource_id in &selection.named_approvals {
+        let Some(resource) = held.get(resource_id).filter(|resource| {
+            resource.kind == PendingKind::Approval && resource.interpretation_verified
+        }) else {
+            return Err(no_current_approval());
+        };
+        let answered = client
+            .request(
+                Method::AgentApprovalInspect,
+                &AgentApprovalInspectParams {
+                    subject: AgentSubject {
+                        session_id,
+                        application_instance_id: resource.application_instance_id,
+                    },
+                    resource_id: *resource_id,
+                },
+            )
+            .await
+            .map_err(PreviewFailure::Link)?;
+        let record: AgentApprovalInspectResult = match answered {
+            Ok(value) => answered_as(&value)?,
+            // The worker answers a record it does not hold, or no longer holds under that
+            // instance, as an unknown subject, with one text for every such case.
+            Err(error) if error.code == ErrorCode::StaleSession => {
+                return Err(no_current_approval());
+            }
+            Err(error) => return Err(as_the_worker_gave_it(error)),
+        };
+        if record.resource_id != *resource_id || record.state.is_terminal() {
+            return Err(no_current_approval());
+        }
+        previews.approvals.push(NamedApprovalPreview {
+            resource_id: *resource_id,
+            summary: what_it_asks(&record.decoding).map_err(PreviewFailure::Refused)?,
+            created_at_ms: record.recorded_at,
+        });
+    }
+    Ok(previews)
+}
+
+/// The resources of `named` the session's broker holds, by identity, as one whole snapshot of its
+/// resources says, read to its end.
+///
+/// The snapshot says which instance holds each one, which is what its record is read under. It is
+/// read to its last page, so the worker keeps no copy of it for this link, and a snapshot that
+/// ended before its last page was read is read again from its first, within the exchange's bound:
+/// a part of one snapshot says nothing of what the rest of it held.
+async fn holding(
+    client: &mut LocalClient,
+    session_id: SessionId,
+    named: &CanonicalSet<PendingResourceId>,
+) -> std::result::Result<BTreeMap<PendingResourceId, PendingResource>, PreviewFailure> {
+    'snapshot: loop {
+        let mut held = BTreeMap::new();
+        let mut from = None;
+        loop {
+            let answered = client
+                .request(
+                    Method::EventsSnapshot,
+                    &EventsSnapshotParams {
+                        session_id,
+                        agent_resources_from: Nullable(from.take()),
+                    },
+                )
+                .await
+                .map_err(PreviewFailure::Link)?;
+            let page: EventsSnapshotResult = match answered {
+                Ok(value) => answered_as(&value)?,
+                Err(error) if error.code == ErrorCode::ResyncRequired => continue 'snapshot,
+                Err(error) => return Err(as_the_worker_gave_it(error)),
+            };
+            let snapshot = page.agent_resources;
+            held.extend(
+                snapshot
+                    .resources
+                    .into_iter()
+                    .filter(|resource| named.contains(&resource.resource_id))
+                    .map(|resource| (resource.resource_id, resource)),
+            );
+            match snapshot.continue_after.0 {
+                Some(after_resource_id) => {
+                    from = Some(AgentResourceSnapshotContinuation {
+                        snapshot_id: snapshot.snapshot_id,
+                        after_resource_id,
+                    });
+                }
+                None => return Ok(held),
+            }
+        }
+    }
+}
+
+/// What the issuer is shown an approval asks: its decoder's summary, or where the decoder gave
+/// none, the request as the upstream wrote it, whole, when that is text no longer than a summary
+/// may be.
+///
+/// A connector's table can give an approval its decisions and no summary, as the Claude Code
+/// channel's does, and then what a view shows is the request itself. A preview cut short would say
+/// less than the recipient will read, and bytes that are not text say nothing to a person, so
+/// neither is shown and the approval cannot be named.
+///
+/// # Errors
+///
+/// Returns [`ControllerError::InvalidArgument`] when the decoder gave no summary and the request is
+/// not text of at most [`MAX_PROJECTION_SUMMARY_LEN`] bytes.
+fn what_it_asks(decoding: &DecoderLedgerEntry) -> Result<String> {
+    if !decoding.projection.summary.trim().is_empty() {
+        return Ok(decoding.projection.summary.clone());
+    }
+    match std::str::from_utf8(decoding.source_bytes.as_slice()) {
+        Ok(request) if request.len() <= MAX_PROJECTION_SUMMARY_LEN => Ok(request.to_owned()),
+        _ => Err(ControllerError::InvalidArgument(format!(
+            "this invitation names an approval whose decoder gave no summary and whose request is \
+             not text of at most {MAX_PROJECTION_SUMMARY_LEN} bytes, so no preview can show its \
+             issuer what it asks"
+        ))),
     }
 }
 
