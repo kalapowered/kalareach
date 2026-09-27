@@ -1447,8 +1447,9 @@ A direct invitation has `"mode": "direct"` and no `code` or `rendezvous_origin`.
 host's answer in the shape it sent it, with `ok` beside it: each value of the protocol's own
 vocabulary, each identifier and each number as the protocol encodes it; what the command was asked
 for, such as a repository's path, a change's paths or a device's name, as it arrived, and a
-location as it was written without a user name, a password, a query or a fragment; a Git revision
-or a file mode only when it is one; and any other text the host wrote as its class and its length. `kr project list --json` is
+location as its scheme, host, port and path, never a user name, a password, a query or a fragment;
+a Git revision or a file mode only when it is one; and any other text the host wrote as its class
+and its length. `kr project list --json` is
 `{ "ok": true, "projects": [ ... ] }`, and `kr workspace create --json` carries `workspace`, which
 is null for a preview, beside `preview` and `unapplied`. Identifiers are strings, and so are 64-bit
 counts, which the host writes as decimal text.

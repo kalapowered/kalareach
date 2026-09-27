@@ -165,7 +165,7 @@ types above, a formatted panic, an `unwrap` or `expect` in either call form, an 
 prints what it compares, a log line, standard error written outside the reporter, standard output
 written or opened outside the command line's writer, serde_json's value API named or a tool result
 made outside it, a raw handle on standard output named anywhere but in the three commands that own
-one, and source it cannot follow: a renamed import, a macro, a derive it does not know, an
+one, a glob of the writer's module or of serde_json there, and source it cannot follow: a renamed import, a macro, a derive it does not know, an
 attribute under `cfg_attr` that it reads, a `#[path]` or an `include!`. It holds every
 `Debug` of the two crates as well: a derived one only over fields whose own `Debug` prints nothing
 that arrived, found across every crate of the workspace, and one written by hand only formatting
@@ -184,9 +184,11 @@ built from those, numbers, switches, lists and other documents; nothing converts
 value into one. `Asked` is content that arrived and that the command was asked for, such as a
 question's text, a repository's path or the name a paired device gave itself, and it names the
 request that asked for it. It has no `Display` and no `Debug` and never becomes a `Shown`, so it
-cannot reach standard error, a failure or a `Debug`. An asked location is kept as it was written up
-to the end of its path, without user information, a query or a fragment, and text written as a URL
-that does not read as one is said as its class and its length.
+cannot reach standard error, a failure or a `Debug`. An asked location says only its scheme, host,
+port and path, as they were written where that text reads back as the same place and as the URL
+parser reads them otherwise, or an SCP host and path that hold nothing a URL would carry; text
+written as a URL that does not parse, and anything else that is not one of those, is said as its
+class and its length.
 
 The rest of what a command prints is decided by what it is:
 
