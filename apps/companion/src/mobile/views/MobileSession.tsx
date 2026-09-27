@@ -152,6 +152,7 @@ export function MobileSession({
   const [statusOpen, setStatusOpen] = useState(false)
   const statusId = useId()
   const modeButtonId = useId()
+  const sendId = useId()
   // Whether a software keyboard hides part of the session.
   const [keyboardUp, setKeyboardUp] = useState(false)
   // Whether the session is too short for the conversation's floor under the whole composer.
@@ -441,6 +442,18 @@ export function MobileSession({
       {hint}
     </p>
   ) : null
+  // Send changes place when the composer changes form, and focus that was on it goes with it: a
+  // control taken away from under the focus would leave a keyboard nowhere.
+  const wasLine = useRef(asLine)
+  useLayoutEffect(() => {
+    if (wasLine.current !== asLine) {
+      const active = document.activeElement
+      if ((active === null || active === document.body) && lastFocused.current?.id === sendId) {
+        document.getElementById(sendId)?.focus()
+      }
+    }
+    wasLine.current = asLine
+  }, [asLine, sendId])
   const terminalWarnings = frame === null ? [] : warningsOf(frame, leftBlankOnPhone(frame))
 
   const field = (
@@ -468,6 +481,7 @@ export function MobileSession({
   )
   const sendButton = (
     <Button
+      id={sendId}
       tone="primary"
       disabled={!submittable(draft) || busy || waiting.length > 0}
       style={{ minBlockSize: target }}

@@ -1162,4 +1162,48 @@ describe("the phone's composer on a short session (KR-REQ-13.19)", () => {
       root.style.removeProperty('font-size')
     }
   })
+
+  it('keeps the focus on Send as it moves beside the field and back', async () => {
+    const { port } = fakeHost()
+    const person = userEvent.setup()
+    const root = document.documentElement
+    root.style.fontSize = '16px'
+    let lines = 40
+    const heights = vi.spyOn(Element.prototype, 'clientHeight', 'get').mockImplementation(function (
+      this: Element
+    ) {
+      return this.classList.contains('m-session') ? lines * 16 : 0
+    })
+    const resized = (to: number) => {
+      lines = to
+      act(() => {
+        window.dispatchEvent(new Event('resize'))
+      })
+    }
+    try {
+      render(
+        <AppProvider port={port}>
+          <OnSession sessionId={SESSION_MAIN} />
+        </AppProvider>
+      )
+      await person.type(screen.getByLabelText('Message this session'), 'hello')
+      const before = screen.getByRole('button', { name: 'Send' })
+      act(() => {
+        before.focus()
+      })
+      resized(20)
+      await waitFor(() => {
+        expect(screen.getByRole('button', { name: 'Send' }).closest('.m-composer-line')).not.toBeNull()
+      })
+      expect(screen.getByRole('button', { name: 'Send' })).toHaveFocus()
+      resized(40)
+      await waitFor(() => {
+        expect(screen.getByRole('button', { name: 'Send' }).closest('.m-composer-line')).toBeNull()
+      })
+      expect(screen.getByRole('button', { name: 'Send' })).toHaveFocus()
+    } finally {
+      heights.mockRestore()
+      root.style.removeProperty('font-size')
+    }
+  })
 })
