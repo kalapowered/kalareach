@@ -351,20 +351,7 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
         return Err(error.message.into());
     }
 
-    let ready = {
-        let session = runtime.session();
-        WorkerReady {
-            session_id,
-            endpoint: endpoint.as_text(),
-            root_process: session
-                .root_identity()
-                .ok_or("the root shell has no process identity")?,
-            // The executable this session actually launched, which for a managed session is the
-            // package's binary rather than whatever the request named.
-            shell_path: session.config().shell.program.clone(),
-            dimensions: session.geometry().dimensions,
-        }
-    };
+    let ready = ready_report(session_id, &endpoint, &runtime.session())?;
     // A ready report that does not arrive must not end the session. The shell is running, the
     // endpoint is bound, and the controller recovers by verifying this worker with a challenge
     // rather than by starting a second one.
@@ -387,6 +374,29 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
     let _record = runtime.wait_closed().await;
     finish(&runtime, serving, bridge_server).await;
     Ok(())
+}
+
+/// What this worker reports to the daemon that started it once its root shell is running.
+///
+/// # Errors
+///
+/// Returns why not when the root shell has no process identity to report.
+fn ready_report(
+    session_id: SessionId,
+    endpoint: &Endpoint,
+    session: &kr_worker::session::Session,
+) -> Result<WorkerReady, &'static str> {
+    Ok(WorkerReady {
+        session_id,
+        endpoint: endpoint.as_text(),
+        root_process: session
+            .root_identity()
+            .ok_or("the root shell has no process identity")?,
+        // The executable this session actually launched, which for a managed session is the
+        // package's binary rather than whatever the request named.
+        shell_path: session.config().shell.program.clone(),
+        dimensions: session.geometry().dimensions,
+    })
 }
 
 /// Ends the work of a worker whose session has closed.
