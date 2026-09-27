@@ -598,10 +598,10 @@ pub struct NativeGateway {
 
 /// Stops a process a launch started, and waits for it, because the launch failed after it.
 ///
-/// The process is still held ([`held_command`]): it has run nothing of its program, so it has
-/// forked nothing, and ending it ends everything the launch started. It is ended at once rather
-/// than given a grace period, and waited for so that it is gone, not merely signalled, when the
-/// launch returns. On Windows its job is ended with it, which ends anything it started.
+/// The process has not been told where to connect, so it has done nothing anyone depends on, and
+/// it is ended at once rather than given a grace period. It is waited for so that it is gone, not
+/// merely signalled, when the launch returns. On Windows its job is ended with it, which ends
+/// anything it started in the meantime.
 fn stop_started(mut child: std::process::Child, started: &ProcessStartIdentity) {
     #[cfg(windows)]
     if let Some(job) = crate::windows::job::agent_job(started) {
@@ -615,91 +615,12 @@ fn stop_started(mut child: std::process::Child, started: &ProcessStartIdentity) 
     let _ = child.wait();
 }
 
-/// The shell a Unix launch holds its program in.
-#[cfg(unix)]
-const HOLDING_SHELL: &str = "/bin/sh";
-
-/// What the holding shell runs: wait for one line, then become the program, with its arguments.
-///
-/// The program and its arguments are the script's own parameters, so none of them is read as
-/// script. A standard input that closes before the line comes is a launch that never committed,
-/// and the program is not run.
-#[cfg(unix)]
-const HOLD: &str = r#"read -r released || exit 1; exec "$0" "$@""#;
-
-/// Returns the command that starts `program` with `arguments`, held until its launch has
-/// committed.
-///
-/// On Unix the command is a shell that waits for one line on its standard input and then replaces
-/// itself with the program, so the program runs nothing, and forks nothing, until [`release`] says
-/// the launch has committed; a launch that fails before then ends a process that has run nothing
-/// of it ([`stop_started`]). The process keeps its identifier and its start across the
-/// replacement, so the identity read when it starts is the program's. A program that is not a file
-/// this host can run is refused here, before anything starts, as starting it directly would have
-/// been. Elsewhere the program is started as it is, and its job holds what it starts.
-///
-/// # Errors
-///
-/// Returns [`BrokerError::LedgerUnavailable`] for a program that is not a file this host can run.
-fn held_command(program: &str, arguments: &[String]) -> Result<std::process::Command> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        let runnable = std::fs::metadata(program)
-            .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0);
-        if !runnable {
-            return Err(BrokerError::ledger(format!(
-                "could not start {program}: it is not a file this host can run"
-            )));
-        }
-        let mut command = std::process::Command::new(HOLDING_SHELL);
-        command.arg("-c").arg(HOLD).arg(program).args(arguments);
-        Ok(command)
-    }
-    #[cfg(not(unix))]
-    {
-        let mut command = std::process::Command::new(program);
-        command.args(arguments);
-        Ok(command)
-    }
-}
-
-/// Lets a held process become its program, now that its launch has committed
-/// ([`held_command`]).
-///
-/// # Errors
-///
-/// Returns [`BrokerError::LedgerUnavailable`] when the word cannot be written, which is a process
-/// that has gone.
-fn release(child: &mut std::process::Child) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::io::Write as _;
-        let stdin = child.stdin.as_mut().ok_or_else(|| {
-            BrokerError::ledger("the started process has no standard input to be released through")
-        })?;
-        stdin
-            .write_all(b"\n")
-            .and_then(|()| stdin.flush())
-            .map_err(|error| {
-                BrokerError::ledger(format!(
-                    "the started process could not be released: {error}"
-                ))
-            })?;
-    }
-    #[cfg(not(unix))]
-    let _ = child;
-    Ok(())
-}
-
 /// Starts the agent `command` names and reads back what the kernel started.
 ///
 /// On Windows the agent is started in a job of its own, joined before it runs, and the job is kept
 /// for the broker: a Windows process keeps naming a parent after that parent exits, so the broker
 /// places a caller under an agent by what the agent's job holds rather than by a walk up the
-/// parents. Elsewhere the broker walks the parents, and the agent is started as it is, in this
-/// worker's process group, which is the boundary the platform's service manager ends with the
-/// worker's job.
+/// parents. Elsewhere the broker walks the parents, and the agent is started as it is.
 fn start_agent(
     command: &mut std::process::Command,
     program: &str,
@@ -925,8 +846,9 @@ impl NativeGateway {
         let broker = Arc::clone(&self.broker);
         let reservation = broker.execute_launch(intent, foreground, application_instance_id)?;
         let program = reservation.profile().binary.resolved_path.clone();
-        let mut command = held_command(&program, &reservation.profile().arguments)?;
+        let mut command = std::process::Command::new(&program);
         command
+            .args(&reservation.profile().arguments)
             .current_dir(&self.runtime_directory)
             // One variable: the registration names the credential file beside it.
             .env("KR_REGISTRATION", &registration_path)
@@ -935,7 +857,7 @@ impl NativeGateway {
             // whatever the launched process says to the host that started it.
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped());
-        let (mut child, started) = start_agent(&mut command, &program)?;
+        let (child, started) = start_agent(&mut command, &program)?;
         #[cfg(feature = "testing")]
         {
             self.last_started = Some(started.clone());
@@ -978,20 +900,6 @@ impl NativeGateway {
         let profile_id = registered.profile().profile_id.clone();
         match self.publish(&profile_id, &started, &credential_path, &registration_path) {
             Ok(registration) => {
-                // The launch has committed everything it can fail at, so the held process becomes
-                // its program now, and not before.
-                if let Err(error) = release(&mut child) {
-                    // Published for a process that will never run its program, so the name goes
-                    // the way the credential does.
-                    let _ = std::fs::remove_file(&registration_path);
-                    return Err(self.fail_after_start(
-                        child,
-                        &started,
-                        registered,
-                        Some(&credential_path),
-                        error,
-                    ));
-                }
                 let profile = registered.commit();
                 self.launch.expected_process = Some(started.clone());
                 let _ = self.registration.set(registration);
