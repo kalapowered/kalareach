@@ -1,0 +1,688 @@
+//! What the parts that need the person's vendor login add to a part: the budget their turns are
+//! charged to, where a key a part carried in its session's environment was found, the person's
+//! login keychain a run's own home searches, and what a part changed in the person's own agent
+//! directories.
+//!
+//! None of it reads a credential into this process except the one variable a login is, which is
+//! taken from this process's environment, given to the agent's session only, and never written or
+//! printed here: where it ended up is found by searching the run's own files for its bytes, and
+//! only the paths are recorded.
+
+use std::collections::BTreeMap;
+use std::io::{Read, Write};
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use kr_e2e_m1b::LIVENESS;
+use kr_e2e_m1b::run::output_within;
+use serde::Serialize;
+use serde_json::{Value, json};
+
+/// The variable naming the ledger file the harness keeps across runs.
+pub const TURNS_VARIABLE: &str = "KR_AGENTS_TURNS";
+
+/// The variable naming the file where a part records where a key it carried was found.
+pub const KEY_SCAN_VARIABLE: &str = "KR_AGENTS_KEY_SCAN";
+
+/// How long a part waits for the ledger's lock.
+const LOCK_WAIT: Duration = Duration::from_secs(20);
+
+/// The turns charged to one budget, kept in a file across runs, so retries, controls and runs that
+/// stopped part way all count. Parts run one at a time; a lock file keeps two charges apart all
+/// the same.
+#[derive(Clone, Debug)]
+pub struct Ledger {
+    path: PathBuf,
+    budget: String,
+    limit: u64,
+}
+
+impl Ledger {
+    /// The ledger the harness named, for `budget`, which allows `limit` turns.
+    ///
+    /// # Panics
+    ///
+    /// Panics when [`TURNS_VARIABLE`] names no file: a part that spends turns does not run without a
+    /// ledger to charge them to.
+    #[must_use]
+    pub fn from_environment(budget: &str, limit: u64) -> Self {
+        let path = std::env::var_os(TURNS_VARIABLE)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                panic!("{TURNS_VARIABLE} names no ledger, and a part that spends turns needs one")
+            });
+        Self {
+            path,
+            budget: budget.to_owned(),
+            limit,
+        }
+    }
+
+    /// The turns charged to the budget so far.
+    #[must_use]
+    pub fn spent(&self) -> u64 {
+        u64::try_from(self.entries().len()).unwrap_or(u64::MAX)
+    }
+
+    /// The most turns the budget allows.
+    #[must_use]
+    pub const fn limit(&self) -> u64 {
+        self.limit
+    }
+
+    /// Charges one turn, before the submission that makes the agent call its model, and returns
+    /// the budget's total.
+    ///
+    /// # Errors
+    ///
+    /// Returns why nothing may be submitted: the budget would pass its limit, or the ledger could
+    /// not be written.
+    pub fn charge(&self, part: &str, what: &str) -> Result<u64, String> {
+        let _lock = LedgerLock::take(&self.path)?;
+        let mut ledger = read_ledger(&self.path)?;
+        let entries = ledger["budgets"][&self.budget]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let spent = u64::try_from(entries.len()).unwrap_or(u64::MAX);
+        if spent >= self.limit {
+            return Err(format!(
+                "the {} budget has {spent} of its {} turns spent, so part {part} submits nothing \
+                 more",
+                self.budget, self.limit
+            ));
+        }
+        let mut entries = entries;
+        entries.push(json!({ "at_ms": now_ms(), "part": part, "what": what }));
+        ledger["budgets"][&self.budget] = Value::Array(entries);
+        let next = self.path.with_extension("next");
+        std::fs::write(
+            &next,
+            serde_json::to_vec_pretty(&ledger).expect("the ledger is JSON"),
+        )
+        .and_then(|()| std::fs::rename(&next, &self.path))
+        .map_err(|error| format!("the ledger {}: {error}", self.path.display()))?;
+        Ok(spent + 1)
+    }
+
+    fn entries(&self) -> Vec<Value> {
+        read_ledger(&self.path)
+            .ok()
+            .and_then(|ledger| ledger["budgets"][&self.budget].as_array().cloned())
+            .unwrap_or_default()
+    }
+}
+
+/// Reads the ledger, or an empty one where there is no file yet.
+fn read_ledger(path: &Path) -> Result<Value, String> {
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map_err(|error| format!("the ledger {}: {error}", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(json!({ "budgets": {} })),
+        Err(error) => Err(format!("the ledger {}: {error}", path.display())),
+    }
+}
+
+/// The ledger's lock: a file created exclusively beside it, removed when this is dropped.
+struct LedgerLock(PathBuf);
+
+impl LedgerLock {
+    fn take(ledger: &Path) -> Result<Self, String> {
+        let path = ledger.with_extension("lock");
+        let started = std::time::Instant::now();
+        loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(_) => return Ok(Self(path)),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if started.elapsed() >= LOCK_WAIT {
+                        return Err(format!(
+                            "the ledger's lock {} is held after {LOCK_WAIT:?}",
+                            path.display()
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(error) => return Err(format!("{}: {error}", path.display())),
+            }
+        }
+    }
+}
+
+impl Drop for LedgerLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Milliseconds since the epoch, now.
+#[must_use]
+pub fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
+/// Milliseconds since the epoch of a file time, where the system gives one.
+fn ms_of(time: std::io::Result<SystemTime>) -> Option<u64> {
+    time.ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+}
+
+/// One file of a run that held a key's bytes.
+#[derive(Clone, Debug, Serialize)]
+pub struct KeyHolder {
+    /// The file, relative to the run's directory.
+    pub path: String,
+    /// Its size when it was read.
+    pub bytes: u64,
+    /// When it was created, where the file system says.
+    pub created_ms: Option<u64>,
+    /// When it was last written.
+    pub modified_ms: Option<u64>,
+}
+
+/// Every regular file under `root` that holds `value`, by path relative to `root`. Nothing of the
+/// value is returned or printed.
+///
+/// # Panics
+///
+/// Panics when `value` is shorter than eight bytes, which would find anything, or the directory
+/// cannot be walked, which would leave a copy unfound.
+#[must_use]
+pub fn files_holding(root: &Path, value: &[u8]) -> Vec<KeyHolder> {
+    assert!(
+        value.len() >= 8,
+        "a key shorter than eight bytes cannot be searched for"
+    );
+    let mut found = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            let path = entry.path();
+            if kind.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            if !kind.is_file() {
+                continue;
+            }
+            let Ok(mut file) = std::fs::File::open(&path) else {
+                continue;
+            };
+            let mut bytes = Vec::new();
+            if file.read_to_end(&mut bytes).is_err() {
+                continue;
+            }
+            if bytes.windows(value.len()).any(|window| window == value) {
+                let metadata = entry.metadata().ok();
+                found.push(KeyHolder {
+                    path: path
+                        .strip_prefix(root)
+                        .unwrap_or(&path)
+                        .display()
+                        .to_string(),
+                    bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+                    created_ms: metadata.as_ref().and_then(|meta| ms_of(meta.created())),
+                    modified_ms: metadata.as_ref().and_then(|meta| ms_of(meta.modified())),
+                });
+            }
+        }
+    }
+    found.sort_by(|left, right| left.path.cmp(&right.path));
+    found
+}
+
+/// Appends one line to the key-scan file the harness named: the part, the variable by its name,
+/// every file of the run that held its value, when the run's directory was removed, and whether it
+/// is gone. Nothing of the value is written.
+///
+/// # Panics
+///
+/// Panics when the harness named a file that cannot be written.
+pub fn record_key_scan(
+    part: &str,
+    variable: &str,
+    holders: &[KeyHolder],
+    removed_ms: u64,
+    gone: bool,
+) {
+    let Some(path) = std::env::var_os(KEY_SCAN_VARIABLE)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+    else {
+        return;
+    };
+    let mut line = serde_json::to_vec(&json!({
+        "part": part,
+        "variable": variable,
+        "held_by": holders,
+        "run_removed_ms": removed_ms,
+        "run_gone": gone,
+    }))
+    .expect("a scan is JSON");
+    line.push(b'\n');
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .and_then(|mut file| file.write_all(&line))
+        .unwrap_or_else(|error| panic!("the key-scan file {}: {error}", path.display()));
+}
+
+/// Makes a run's home search the person's login keychain and name it its default: the same list
+/// and default the person's own home has, which [`person_keychains`] reads first. No keychain is
+/// created or deleted; the run's home only names this one, and its preferences go with the run.
+///
+/// # Errors
+///
+/// Returns what did not hold: the person's list is not the login keychain alone, a step failed,
+/// or the run's home names anything else afterwards.
+pub fn borrow_login_keychain(run_home: &Path, person_home: &Path) -> Result<(), String> {
+    let login = person_home
+        .join("Library")
+        .join("Keychains")
+        .join("login.keychain-db");
+    let (list, default) = person_keychains(person_home)?;
+    let wanted = login.display().to_string();
+    if list != [wanted.clone()] || default != wanted {
+        return Err(format!(
+            "the person's home searches {list:?} with {default} as its default, not the login \
+             keychain alone, so a run's home cannot be given the same"
+        ));
+    }
+    let preferences = run_home.join("Library").join("Preferences");
+    std::fs::create_dir_all(&preferences)
+        .map_err(|error| format!("{}: {error}", preferences.display()))?;
+    security(run_home, &["list-keychains", "-d", "user", "-s", &wanted])?;
+    security(run_home, &["default-keychain", "-d", "user", "-s", &wanted])?;
+    let (run_list, run_default) = person_keychains(run_home)?;
+    if run_list != [wanted.clone()] || run_default != wanted {
+        return Err(format!(
+            "the run's home searches {run_list:?} with {run_default} as its default after it was \
+             given the login keychain"
+        ));
+    }
+    Ok(())
+}
+
+/// The keychains a home searches, and its default, as `security` reads them with that home.
+///
+/// # Errors
+///
+/// Returns why `security` could not say.
+pub fn person_keychains(home: &Path) -> Result<(Vec<String>, String), String> {
+    let list = security(home, &["list-keychains", "-d", "user"])?;
+    let default = security(home, &["default-keychain", "-d", "user"])?;
+    let unquote = |line: &str| line.trim().trim_matches('"').to_owned();
+    Ok((
+        list.lines()
+            .map(unquote)
+            .filter(|line| !line.is_empty())
+            .collect(),
+        unquote(&default),
+    ))
+}
+
+/// Runs one `security` step with `home` as the only home it names.
+fn security(home: &Path, arguments: &[&str]) -> Result<String, String> {
+    let mut command = Command::new("/usr/bin/security");
+    command
+        .args(arguments)
+        .env_clear()
+        .env("HOME", home)
+        .env("PATH", "/usr/bin:/bin");
+    let output = output_within(command, LIVENESS).map_err(|why| format!("security {why}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "security {}: {}",
+            arguments.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// One file of the person's agent directories: its size, its modification time and inode, and the
+/// SHA-256 of its bytes where it is small enough to read at each look.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Entry {
+    bytes: u64,
+    modified_ns: i128,
+    inode: u64,
+    digest: Option<[u8; 32]>,
+}
+
+/// The person's agent directories at one moment.
+#[derive(Clone, Debug, Default)]
+pub struct Snapshot {
+    roots: Vec<PathBuf>,
+    files: BTreeMap<PathBuf, Entry>,
+    hash_limit: u64,
+}
+
+/// Reads every file under each of `directories`, relative to `home`: size, modification time and
+/// inode for all, and the SHA-256 of each no larger than `hash_limit` bytes.
+#[must_use]
+pub fn snapshot(home: &Path, directories: &[String], hash_limit: u64) -> Snapshot {
+    let mut files = BTreeMap::new();
+    let roots: Vec<PathBuf> = directories
+        .iter()
+        .map(|relative| home.join(relative))
+        .collect();
+    for top in &roots {
+        let mut pending = vec![top.clone()];
+        while let Some(path) = pending.pop() {
+            let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if metadata.is_dir() {
+                if let Ok(entries) = std::fs::read_dir(&path) {
+                    pending.extend(entries.flatten().map(|entry| entry.path()));
+                }
+                continue;
+            }
+            if !metadata.is_file() {
+                continue;
+            }
+            let digest = (metadata.len() <= hash_limit)
+                .then(|| digest_of(&path, metadata.len()))
+                .flatten();
+            files.insert(
+                path,
+                Entry {
+                    bytes: metadata.len(),
+                    modified_ns: i128::from(metadata.mtime()) * 1_000_000_000
+                        + i128::from(metadata.mtime_nsec()),
+                    inode: metadata.ino(),
+                    digest,
+                },
+            );
+        }
+    }
+    Snapshot {
+        roots,
+        files,
+        hash_limit,
+    }
+}
+
+/// The SHA-256 of a file's first `length` bytes, where it has them.
+fn digest_of(path: &Path, length: u64) -> Option<[u8; 32]> {
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(length)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    (u64::try_from(bytes.len()).ok()? == length).then(|| kr_cbor::sha256(&bytes))
+}
+
+/// What changed in the person's agent directories between two snapshots.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct Changes {
+    /// Files that are new.
+    pub created: Vec<PathBuf>,
+    /// Files that are gone.
+    pub removed: Vec<PathBuf>,
+    /// Files whose earlier bytes are unchanged and that grew.
+    pub appended: Vec<PathBuf>,
+    /// Files whose earlier bytes changed, or that were replaced.
+    pub rewritten: Vec<PathBuf>,
+    /// Files that changed and were too large to compare.
+    pub changed_uncompared: Vec<PathBuf>,
+}
+
+/// What changed from `before` to `after`.
+#[must_use]
+pub fn changes(before: &Snapshot, after: &Snapshot) -> Changes {
+    let mut changes = Changes::default();
+    for (path, entry) in &after.files {
+        match before.files.get(path) {
+            None => changes.created.push(path.clone()),
+            Some(earlier) if earlier == entry => {}
+            Some(earlier)
+                if earlier.bytes == entry.bytes
+                    && earlier.digest.is_some()
+                    && earlier.digest == entry.digest
+                    && earlier.inode == entry.inode => {}
+            Some(earlier) => match earlier.digest {
+                Some(old) if entry.bytes > earlier.bytes && earlier.inode == entry.inode => {
+                    if digest_of(path, earlier.bytes) == Some(old) {
+                        changes.appended.push(path.clone());
+                    } else {
+                        changes.rewritten.push(path.clone());
+                    }
+                }
+                Some(_) => changes.rewritten.push(path.clone()),
+                None if earlier.bytes > before.hash_limit => {
+                    changes.changed_uncompared.push(path.clone());
+                }
+                None => changes.rewritten.push(path.clone()),
+            },
+        }
+    }
+    for path in before.files.keys() {
+        if !after.files.contains_key(path) {
+            changes.removed.push(path.clone());
+        }
+    }
+    changes
+}
+
+/// Removes each file the part created that holds one of `marks` (the part's own prompt marker, or
+/// the run's own directory, which the agent writes as the working directory), and then each
+/// directory the part created that is left empty; returns what it removed and what it left.
+/// Nothing that existed before the part is touched.
+#[must_use]
+pub fn remove_created(
+    before: &Snapshot,
+    changes: &Changes,
+    marks: &[&str],
+) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let mut removed = Vec::new();
+    let mut left = Vec::new();
+    for path in &changes.created {
+        let ours = std::fs::read(path).is_ok_and(|bytes| {
+            marks.iter().any(|mark| {
+                bytes
+                    .windows(mark.len())
+                    .any(|window| window == mark.as_bytes())
+            })
+        });
+        if ours && std::fs::remove_file(path).is_ok() {
+            removed.push(path.clone());
+        } else {
+            left.push(path.clone());
+        }
+    }
+    // A directory the part created is removed only when nothing is left in it, deepest first.
+    let mut directories: Vec<PathBuf> = removed
+        .iter()
+        .flat_map(|path| {
+            path.ancestors()
+                .skip(1)
+                .map(Path::to_path_buf)
+                .collect::<Vec<_>>()
+        })
+        .filter(|directory| before.roots.iter().any(|root| directory.starts_with(root)))
+        .filter(|directory| !before.files.keys().any(|file| file.starts_with(directory)))
+        .collect();
+    directories.sort();
+    directories.dedup();
+    directories.sort_by_key(|directory| std::cmp::Reverse(directory.components().count()));
+    for directory in directories {
+        if std::fs::remove_dir(&directory).is_ok() {
+            removed.push(directory);
+        }
+    }
+    (removed, left)
+}
+
+/// The identifier of the conversation a file holds: the last identifier shaped like a UUID in its
+/// name, or the name without its extension.
+#[must_use]
+pub fn conversation_id(file: &Path) -> String {
+    let stem = file
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let shaped = |candidate: &str| {
+        candidate.len() == 36
+            && candidate.char_indices().all(|(index, character)| {
+                if [8, 13, 18, 23].contains(&index) {
+                    character == '-'
+                } else {
+                    character.is_ascii_hexdigit()
+                }
+            })
+    };
+    (0..stem.len().saturating_sub(35))
+        .rev()
+        .filter_map(|start| stem.get(start..start + 36))
+        .find(|candidate| shaped(candidate))
+        .map_or(stem.clone(), str::to_owned)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A directory of this test's own, removed when dropped.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            let path =
+                std::env::temp_dir().join(format!("kr-account-{name}-{}", kr_ipc::new_uuid()));
+            std::fs::create_dir_all(&path).expect("a scratch directory");
+            Self(path)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn a_ledger_charges_up_to_its_limit_across_instances_and_refuses_the_next() {
+        let scratch = Scratch::new("ledger");
+        let path = scratch.0.join("turns.json");
+        let ledger = Ledger {
+            path: path.clone(),
+            budget: "agent".to_owned(),
+            limit: 2,
+        };
+        assert_eq!(ledger.charge("1", "first"), Ok(1));
+        let again = Ledger {
+            path,
+            budget: "agent".to_owned(),
+            limit: 2,
+        };
+        assert_eq!(again.charge("1", "second"), Ok(2));
+        assert!(
+            again.charge("1", "third").is_err(),
+            "the third passes the limit"
+        );
+        assert_eq!(again.spent(), 2, "a refused charge is not recorded");
+        let other = Ledger {
+            budget: "another".to_owned(),
+            ..again
+        };
+        assert_eq!(other.charge("2a", "its own budget"), Ok(1));
+    }
+
+    #[test]
+    fn changes_tell_a_created_an_appended_a_rewritten_and_an_uncompared_file_apart() {
+        let scratch = Scratch::new("changes");
+        let home = &scratch.0;
+        let agent = home.join(".agent");
+        std::fs::create_dir_all(&agent).expect("the agent's directory");
+        std::fs::write(agent.join("history"), "one\n").expect("a history");
+        std::fs::write(agent.join("settings"), "a").expect("settings");
+        std::fs::write(agent.join("large"), vec![0_u8; 32]).expect("a large file");
+        let directories = vec![".agent".to_owned()];
+        let before = snapshot(home, &directories, 16);
+        std::fs::write(agent.join("history"), "one\ntwo\n").expect("an append");
+        std::fs::write(agent.join("settings"), "b").expect("a rewrite");
+        std::fs::write(agent.join("large"), vec![1_u8; 33]).expect("a large change");
+        std::fs::write(agent.join("new"), "made").expect("a new file");
+        let after = snapshot(home, &directories, 16);
+        let found = changes(&before, &after);
+        assert_eq!(found.created, vec![agent.join("new")]);
+        assert_eq!(found.appended, vec![agent.join("history")]);
+        assert_eq!(found.rewritten, vec![agent.join("settings")]);
+        assert_eq!(found.changed_uncompared, vec![agent.join("large")]);
+        assert!(found.removed.is_empty());
+    }
+
+    #[test]
+    fn only_created_files_that_hold_a_mark_are_removed_with_the_directories_they_emptied() {
+        let scratch = Scratch::new("remove");
+        let home = &scratch.0;
+        let agent = home.join(".agent");
+        std::fs::create_dir_all(agent.join("kept")).expect("the agent's directory");
+        std::fs::write(agent.join("kept").join("old"), "the person's").expect("an old file");
+        let directories = vec![".agent".to_owned()];
+        let before = snapshot(home, &directories, 1 << 20);
+        let ours = agent.join("sessions").join("day");
+        std::fs::create_dir_all(&ours).expect("a new directory");
+        std::fs::write(ours.join("ours.jsonl"), "prompt kr0123").expect("our conversation");
+        std::fs::write(agent.join("kept").join("theirs"), "someone else's").expect("another file");
+        let after = snapshot(home, &directories, 1 << 20);
+        let found = changes(&before, &after);
+        let (removed, left) = remove_created(&before, &found, &["kr0123"]);
+        assert!(
+            !ours.join("ours.jsonl").exists(),
+            "the marked file is removed"
+        );
+        assert!(
+            !agent.join("sessions").exists(),
+            "the directories it emptied go with it"
+        );
+        assert!(
+            agent.join("kept").join("theirs").exists(),
+            "an unmarked file stays"
+        );
+        assert!(agent.join("kept").join("old").exists(), "an old file stays");
+        assert!(agent.exists(), "the agent's own directory stays");
+        assert_eq!(left, vec![agent.join("kept").join("theirs")]);
+        assert!(removed.contains(&ours.join("ours.jsonl")));
+    }
+
+    #[test]
+    fn a_conversation_is_named_by_the_last_uuid_in_its_file_name_or_by_the_name() {
+        let uuid = "0b6e283a-e886-42b0-a27e-8ef85a608ab7";
+        assert_eq!(
+            conversation_id(Path::new(&format!("/p/{uuid}.jsonl"))),
+            uuid
+        );
+        assert_eq!(
+            conversation_id(Path::new(&format!(
+                "/p/rollout-2026-09-27T10-00-00-{uuid}.jsonl"
+            ))),
+            uuid
+        );
+        assert_eq!(
+            conversation_id(Path::new("/p/session-42.json")),
+            "session-42"
+        );
+    }
+}

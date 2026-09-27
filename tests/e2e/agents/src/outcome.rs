@@ -2,7 +2,9 @@
 //!
 //! A part that ran to its end appends `passed`, or `not_run` with its reason when the build gives it
 //! nothing to run against, such as an agent that shows no composer without an account. A part that
-//! failed appends nothing: its test panicked, and the harness reads the failure from the test's own
+//! measured a failure it can describe, such as a launch the host did not detect, appends `failed`
+//! with its reason and what it observed, and its test then fails. A part whose check failed on the
+//! way appends nothing: its test panicked, and the harness reads the failure from the test's own
 //! output and exit status. What the line carries as evidence is what the part observed, its
 //! control included, so the record says what was checked as well as how it came out.
 
@@ -18,7 +20,7 @@ pub struct Outcome {
     pub part: String,
     /// The test that is the part.
     pub test: String,
-    /// `passed` or `not_run`.
+    /// `passed`, `failed` or `not_run`.
     pub outcome: String,
     /// Why the part did not run, when it did not.
     pub reason: Option<String>,
@@ -35,6 +37,18 @@ impl Outcome {
             test: test.to_owned(),
             outcome: "passed".to_owned(),
             reason: None,
+            evidence,
+        }
+    }
+
+    /// A part that measured a failure it can describe, with what it observed.
+    #[must_use]
+    pub fn failed(part: &str, test: &str, reason: &str, evidence: serde_json::Value) -> Self {
+        Self {
+            part: part.to_owned(),
+            test: test.to_owned(),
+            outcome: "failed".to_owned(),
+            reason: Some(reason.to_owned()),
             evidence,
         }
     }

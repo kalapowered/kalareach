@@ -797,10 +797,26 @@ pub fn launch(
         .check_path(command)
         .unwrap_or_else(|why| panic!("{why}"));
     provenance.watch(session.root_shell.clone());
+    let typed_at = session.window.mark();
     session.window.type_text(format!("{line}\r").as_bytes());
-    let _ = session
-        .window
-        .wait_for_screen(ready, "the agent draws its first screen");
+    let drawn = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        session
+            .window
+            .wait_for_screen(ready, "the agent draws its first screen")
+    }));
+    if let Err(panic) = drawn {
+        // What the program wrote since its command was typed says why it did not draw, where
+        // the screen it left no longer does.
+        let since = session.window.collected().since(typed_at);
+        let head = &since[..since.len().min(16384)];
+        let tail = &since[since.len().saturating_sub(1024).max(head.len())..];
+        eprintln!(
+            "the terminal was sent, since `{line}` was typed, first: {}\nand last: {}",
+            String::from_utf8_lossy(head).escape_debug(),
+            String::from_utf8_lossy(tail).escape_debug()
+        );
+        std::panic::resume_unwind(panic);
+    }
     let started = Instant::now();
     let shell = u32::try_from(session.root_shell.pid.get()).expect("a process number");
     loop {
@@ -930,6 +946,35 @@ pub fn text_image(pid: u32) -> Result<(PathBuf, u64), String> {
         }
     }
     Err(format!("lsof named no text file for process {pid}: {text}"))
+}
+
+/// Every file a process maps as text, the executable first, each with its inode.
+///
+/// # Errors
+///
+/// Returns why the mappings could not be read.
+pub fn mapped_files(pid: u32) -> Result<Vec<(PathBuf, u64)>, String> {
+    let mut lsof = Command::new("/usr/sbin/lsof");
+    lsof.args(["-a", "-p", &pid.to_string(), "-d", "txt", "-Fin"])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin:/usr/sbin");
+    let output = output_within(lsof, LIVENESS).map_err(|why| format!("lsof {why}"))?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut found = Vec::new();
+    let mut inode = None;
+    for line in text.lines() {
+        if let Some(value) = line.strip_prefix('i') {
+            inode = value.parse::<u64>().ok();
+        } else if let Some(name) = line.strip_prefix('n')
+            && let Some(inode) = inode.take()
+        {
+            found.push((PathBuf::from(name), inode));
+        }
+    }
+    if found.is_empty() {
+        return Err(format!("lsof named no text file for process {pid}: {text}"));
+    }
+    Ok(found)
 }
 
 /// A file's inode, following links.
@@ -1147,6 +1192,24 @@ impl Keyboard {
             epoch: kr_protocol::ids::InputLeaseEpoch::new(0),
             next: 0,
         })
+    }
+
+    /// The attachment this keyboard types through.
+    #[must_use]
+    pub const fn attachment_id(&self) -> kr_protocol::ids::AttachmentId {
+        self.attachment_id
+    }
+
+    /// The lease epoch it holds.
+    #[must_use]
+    pub const fn epoch(&self) -> kr_protocol::ids::InputLeaseEpoch {
+        self.epoch
+    }
+
+    /// The sequence its next input carries.
+    #[must_use]
+    pub const fn next_sequence(&self) -> u64 {
+        self.next
     }
 
     /// Takes the input lease for this attachment.

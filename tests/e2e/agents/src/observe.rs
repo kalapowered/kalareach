@@ -32,6 +32,7 @@ use kr_protocol::transfer::{
 };
 use serde_json::json;
 
+use crate::build::Action;
 use crate::stage::events_snapshot;
 
 /// The text every refused typed prompt carries, which the agent's screen must never show.
@@ -173,7 +174,9 @@ impl Answer {
     }
 }
 
-fn answer<R>(call: String, outcome: Result<R, kr_e2e_m1b::device::RequestError>) -> Answer {
+/// What the host answered one call with, as an [`Answer`].
+#[must_use]
+pub fn answer<R>(call: String, outcome: Result<R, kr_e2e_m1b::device::RequestError>) -> Answer {
     match outcome {
         Ok(_) => Answer {
             call,
@@ -192,9 +195,73 @@ fn answer<R>(call: String, outcome: Result<R, kr_e2e_m1b::device::RequestError>)
     }
 }
 
-/// Sends every typed agent action, and each of the package's actions, for `session_id`, naming an
-/// application instance and a binding revision the host never announced, and reads the agent's
-/// capabilities and commands the same way. Returns what the host answered each with.
+/// Invokes one of the package's actions for `target`, with parameters its declaration accepts, and
+/// returns what the host answered. Each call is a new action with an identifier of its own. The
+/// parameters are a JSON object, the one encoding the host carries to an upstream.
+#[must_use]
+pub fn invoke(
+    remote: &Remote,
+    runtime: &tokio::runtime::Runtime,
+    envelope: &ActionTarget,
+    target: AgentMutationTarget,
+    plugin_id: &PluginId,
+    action: &Action,
+) -> Answer {
+    let parameters =
+        serde_json::to_vec(&action.well_formed(TYPED_PROMPT)).expect("parameters encode");
+    let sent = runtime.block_on(remote.mutate::<_, PluginActionInvokeResult>(
+        Method::PluginActionInvoke,
+        envelope.clone(),
+        &PluginActionInvokeParams {
+            target,
+            plugin_id: plugin_id.clone(),
+            action: ActionName::new(action.id.clone()).expect("an action name"),
+            draft_id: Nullable::null(),
+            resource_id: Nullable::null(),
+            parameters: Bytes::new(parameters),
+        },
+    ));
+    answer(
+        format!("{} {}", Method::PluginActionInvoke.as_str(), action.id),
+        sent,
+    )
+}
+
+/// The target and envelope a typed call for `instance` at `revision` in `session_id` carries.
+#[must_use]
+pub fn target_of(
+    remote: &Remote,
+    session_id: SessionId,
+    instance: ApplicationInstanceId,
+    revision: AgentBindingRevision,
+) -> (AgentMutationTarget, ActionTarget) {
+    let subject = AgentSubject {
+        session_id,
+        application_instance_id: instance,
+    };
+    (
+        AgentMutationTarget {
+            subject,
+            binding_revision: revision,
+        },
+        ActionTarget {
+            environment_id: remote.environment_id(),
+            session_id: Nullable::some(session_id),
+            session_epoch: Nullable::some(SessionEpoch::V1),
+            application_instance_id: Nullable::some(instance),
+            agent_binding_revision: Nullable::some(revision),
+        },
+    )
+}
+
+/// The reads among the calls [`typed_actions`] makes: a device is served them under its grant.
+pub const AGENT_READS: [&str; 2] = ["agent.capabilities", "agent.commands"];
+
+/// Sends every typed agent action, and each of the package's actions, for `session_id`, and reads
+/// the agent's capabilities and commands the same way. Returns what the host answered each with.
+///
+/// Each names `instance` at its binding revision, the one the host announced for the agent, or,
+/// where it announced none, an application instance and a revision it never announced.
 ///
 /// The attachment request names a draft and an upload that are well formed and exist nowhere: a
 /// paired device's connection carries no draft or upload request to the service that keeps them,
@@ -205,25 +272,17 @@ pub fn typed_actions(
     runtime: &tokio::runtime::Runtime,
     session_id: SessionId,
     plugin_id: &PluginId,
-    actions: &[String],
+    actions: &[Action],
+    instance: Option<(ApplicationInstanceId, AgentBindingRevision)>,
 ) -> Vec<Answer> {
-    let instance = ApplicationInstanceId::new(kr_ipc::new_uuid());
-    let revision = AgentBindingRevision::new(1);
-    let subject = AgentSubject {
-        session_id,
-        application_instance_id: instance,
-    };
-    let target = AgentMutationTarget {
-        subject,
-        binding_revision: revision,
-    };
-    let envelope = ActionTarget {
-        environment_id: remote.environment_id(),
-        session_id: Nullable::some(session_id),
-        session_epoch: Nullable::some(SessionEpoch::V1),
-        application_instance_id: Nullable::some(instance),
-        agent_binding_revision: Nullable::some(revision),
-    };
+    let (instance, revision) = instance.unwrap_or_else(|| {
+        (
+            ApplicationInstanceId::new(kr_ipc::new_uuid()),
+            AgentBindingRevision::new(1),
+        )
+    });
+    let (target, envelope) = target_of(remote, session_id, instance, revision);
+    let subject = target.subject;
     let text = PromptText::new(TYPED_PROMPT).expect("a prompt");
     let turn = AgentTurnId::new("turn-1").expect("a turn identifier");
     let mut answers = Vec::new();
@@ -293,23 +352,9 @@ pub fn typed_actions(
         Method::AgentDraftAddAttachment.as_str().to_owned(),
         sent,
     ));
-    let parameters = kr_cbor::to_canonical_vec(&json!({})).expect("empty parameters");
     for action in actions {
-        let sent = runtime.block_on(remote.mutate::<_, PluginActionInvokeResult>(
-            Method::PluginActionInvoke,
-            envelope.clone(),
-            &PluginActionInvokeParams {
-                target,
-                plugin_id: plugin_id.clone(),
-                action: ActionName::new(action.clone()).expect("an action name"),
-                draft_id: Nullable::null(),
-                resource_id: Nullable::null(),
-                parameters: Bytes::new(parameters.clone()),
-            },
-        ));
-        answers.push(answer(
-            format!("{} {action}", Method::PluginActionInvoke.as_str()),
-            sent,
+        answers.push(invoke(
+            remote, runtime, &envelope, target, plugin_id, action,
         ));
     }
     let read = runtime.block_on(remote.read::<_, AgentCapabilitiesResult>(
