@@ -28,7 +28,7 @@
 //! duplicate-delivery uncertainty otherwise.* A destination that deduplicates by an identifier the
 //! host chooses is retried after an unknown outcome, because a repeat is not a second message. One
 //! that does not is **not** retried: the record settles as
-//! [`DeliveryState::DuplicateUncertain`](crate::journal::DeliveryState::DuplicateUncertain), which
+//! [`DeliveryState::DuplicateUncertain`], which
 //! says the message may have arrived and may have arrived twice, and a person is told that rather
 //! than a guess.
 

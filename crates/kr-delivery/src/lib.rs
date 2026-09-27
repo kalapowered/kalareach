@@ -14,7 +14,7 @@
 //! | [`external`] | Webhook, Slack, email, Discord and Telegram delivery, and the uncertainty a destination without idempotency leaves |
 //! | [`producer`] | Taking from attention and from the worker outbox, and producing notifications from what was taken |
 //! | [`privacy`] | The content-bearing outbox privacy mode fences, cancels and reconciles |
-//! | [`error`] | The failures above |
+//! | [`DeliveryError`] | The failures above |
 //!
 //! # Four rules the whole crate rests on
 //!
