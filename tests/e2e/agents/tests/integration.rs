@@ -224,7 +224,7 @@ fn a_session_created_with_the_integrations_on_launches_through_them_and_one_crea
         }
     };
     let runtime = runtime();
-    let run = Run::start("the command integration");
+    let run = Run::start("command integration");
     // Before anything starts in the run's home: a keychain of its own, its default there.
     let keychain = RunKeychain::create(&run.home());
     place_forwarder(&run);
