@@ -5675,8 +5675,10 @@ fn a_session_started_with_a_persons_own_home_keeps_their_login_keychain_as_its_d
     .append(&result);
 }
 
-/// Processes a test started, killed when it ends however it ends: its child and every process it
-/// named, so a failed assertion leaves nothing stopped behind.
+/// Processes a test started, in a process group of their own, killed when it ends however it ends:
+/// every process it named, then the whole group while its leader is still unreaped, so its number
+/// still names that group, and only then the leader is reaped; a failed assertion leaves nothing
+/// running or stopped behind.
 struct TestTree {
     child: std::process::Child,
     named: Vec<ProcessStartIdentity>,
@@ -5687,7 +5689,12 @@ impl Drop for TestTree {
         for identity in &self.named {
             signal(identity, rustix::process::Signal::KILL);
         }
-        let _ = self.child.kill();
+        if let Some(group) = i32::try_from(self.child.id())
+            .ok()
+            .and_then(rustix::process::Pid::from_raw)
+        {
+            let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+        }
         let _ = self.child.wait();
     }
 }
@@ -5695,8 +5702,10 @@ impl Drop for TestTree {
 /// Starts `/bin/sh -c script` for a test, and returns it with its start identity, once it has
 /// `children` children or five seconds have passed.
 fn test_tree(script: &str, children: usize) -> (TestTree, ProcessStartIdentity) {
+    use std::os::unix::process::CommandExt;
     let child = std::process::Command::new("/bin/sh")
         .args(["-c", script])
+        .process_group(0)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -5800,12 +5809,18 @@ fn a_tree_whose_descendant_keeps_starting_children_is_caught_whole() {
     let caught: Vec<u32> = frozen
         .stopped
         .iter()
-        .chain(&frozen.unconfirmed)
         .filter_map(|identity| u32::try_from(identity.pid.get()).ok())
         .collect();
     assert!(
         before.iter().all(|pid| caught.contains(pid)),
         "every child the frozen tree had is stopped with it: {before:?} against {caught:?}"
+    );
+    assert!(
+        frozen
+            .stopped
+            .iter()
+            .all(|identity| kr_e2e_m1b::run::stopped(identity) == Some(true)),
+        "each is seen stopped before anything is killed"
     );
     assert!(kill_and_wait(&tree.named), "the tree ended");
     let after = marked(&kr_e2e_m1b::run::process_table().expect("the process table"));
