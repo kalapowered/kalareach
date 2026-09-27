@@ -505,19 +505,37 @@ pub fn appended_since<'a>(before: Option<&[u8]>, now: Option<&'a [u8]>) -> Optio
 
 /// What a line appended to a file only appended to says of itself, where it is a JSON object: the
 /// conversation it names (its `id`, or its `session_id` as an agent's history line names it) and
-/// its time (its `updated_at`, or its `ts`), each as the line has it. Nothing else of the line is
-/// read.
+/// its time (its `updated_at`, or its `ts`), the first of each pair the line has. Each is kept only
+/// in the shape an identifier or a time has, so no other text of the line can come through: an
+/// identifier of at most 64 letters, digits and `.`, `_`, `:` or `-`; a time that is a number, or
+/// text of at most 40 letters, digits and `.`, `:`, `+` or `-`. Nothing else of the line is read.
 #[must_use]
 pub fn line_identity(line: &[u8]) -> (Option<String>, Option<Value>) {
     let Ok(Value::Object(fields)) = serde_json::from_slice::<Value>(line) else {
         return (None, None);
     };
+    let shaped = |text: &str, longest: usize, marks: &[char]| {
+        !text.is_empty()
+            && text.len() <= longest
+            && text
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || marks.contains(&character))
+    };
     let id = ["id", "session_id"]
         .iter()
-        .find_map(|key| fields.get(*key).and_then(Value::as_str).map(str::to_owned));
+        .find_map(|key| fields.get(*key))
+        .and_then(Value::as_str)
+        .filter(|id| shaped(id, 64, &['.', '_', ':', '-']))
+        .map(str::to_owned);
     let time = ["updated_at", "ts"]
         .iter()
-        .find_map(|key| fields.get(*key).cloned());
+        .find_map(|key| fields.get(*key))
+        .filter(|time| match time {
+            Value::Number(_) => true,
+            Value::String(text) => shaped(text, 40, &['.', ':', '+', '-']),
+            _ => false,
+        })
+        .cloned();
     (id, time)
 }
 
@@ -1341,6 +1359,25 @@ mod tests {
         );
         assert_eq!(line_identity(b"not json\n"), (None, None));
         assert_eq!(line_identity(b"[1,2]\n"), (None, None));
+        assert_eq!(
+            line_identity(
+                br#"{"id":"c1","updated_at":{"text":"something private"},"ts":["more"]}"#
+            ),
+            (Some("c1".to_owned()), None),
+            "a time that is an object or a list is not kept, nor a later key in its place"
+        );
+        assert_eq!(
+            line_identity(
+                br#"{"id":"private words here","updated_at":"2026-09-27 and more words"}"#
+            ),
+            (None, None),
+            "text in the place of an identifier or a time that is not shaped as one is not kept"
+        );
+        assert_eq!(
+            line_identity(br#"{"id":{"a":1},"session_id":"s2","ts":1.5}"#),
+            (None, Some(json!(1.5))),
+            "an identifier that is not text is not kept, nor a later key in its place"
+        );
     }
 
     #[test]
