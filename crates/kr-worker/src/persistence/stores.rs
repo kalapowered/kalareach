@@ -113,6 +113,13 @@ impl ContentClass {
 pub enum Cleanup {
     /// The worker's own maintenance tick.
     WorkerMaintenance,
+    /// The worker's own maintenance tick while the session lives, and the archive service's
+    /// collection of the same bounds once it has closed.
+    ///
+    /// A store kept for a period has to be collected whether or not its worker is still there:
+    /// a closed session has no maintenance tick of its own, and its output and receipts would
+    /// otherwise outlive section 20's seven and thirty days for as long as the files did.
+    WorkerThenArchive,
     /// The controller's archive service, after closure or crash.
     ArchiveService,
     /// The controller's transfer sweep.
@@ -188,7 +195,7 @@ pub static STORES: &[StoreDescriptor] = &[
         // and never a provider key, which is what section 24 forbids.
         content: ContentClass::AuthoredContent,
         protection: Protection::OwnerOnlyDirectory,
-        cleanup: Cleanup::WorkerMaintenance,
+        cleanup: Cleanup::WorkerThenArchive,
         reconciliation: Reconciliation::UnfinishedDispatchesResolved,
         evictable_under_history_cap: false,
         served_by_archive: true,
@@ -202,7 +209,7 @@ pub static STORES: &[StoreDescriptor] = &[
         // request that produced it.
         content: ContentClass::AuthoredContent,
         protection: Protection::OwnerOnlyDirectory,
-        cleanup: Cleanup::WorkerMaintenance,
+        cleanup: Cleanup::WorkerThenArchive,
         reconciliation: Reconciliation::ReadBack,
         evictable_under_history_cap: false,
         served_by_archive: true,
@@ -214,7 +221,7 @@ pub static STORES: &[StoreDescriptor] = &[
         retention: Retention::Period(RECEIPT_RETENTION),
         content: ContentClass::Metadata,
         protection: Protection::OwnerOnlyDirectory,
-        cleanup: Cleanup::WorkerMaintenance,
+        cleanup: Cleanup::WorkerThenArchive,
         reconciliation: Reconciliation::ReadBack,
         evictable_under_history_cap: false,
         served_by_archive: true,
@@ -226,7 +233,7 @@ pub static STORES: &[StoreDescriptor] = &[
         retention: Retention::UntilDeliveredThenPeriod(RECEIPT_RETENTION),
         content: ContentClass::Metadata,
         protection: Protection::OwnerOnlyDirectory,
-        cleanup: Cleanup::WorkerMaintenance,
+        cleanup: Cleanup::WorkerThenArchive,
         reconciliation: Reconciliation::ReadBack,
         evictable_under_history_cap: false,
         served_by_archive: false,
@@ -250,7 +257,7 @@ pub static STORES: &[StoreDescriptor] = &[
         retention: Retention::Period(RECEIPT_RETENTION),
         content: ContentClass::Metadata,
         protection: Protection::OwnerOnlyDirectory,
-        cleanup: Cleanup::WorkerMaintenance,
+        cleanup: Cleanup::WorkerThenArchive,
         reconciliation: Reconciliation::ReadBack,
         evictable_under_history_cap: false,
         served_by_archive: true,
@@ -383,7 +390,7 @@ pub static STORES: &[StoreDescriptor] = &[
         retention: Retention::PeriodOrByteCap(crate::persistence::retention::OUTPUT_RETENTION),
         content: ContentClass::TerminalContent,
         protection: Protection::OwnerOnlyDirectory,
-        cleanup: Cleanup::WorkerMaintenance,
+        cleanup: Cleanup::WorkerThenArchive,
         reconciliation: Reconciliation::RebuiltWithGaps,
         evictable_under_history_cap: true,
         served_by_archive: true,

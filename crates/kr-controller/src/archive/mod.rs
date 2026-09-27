@@ -35,6 +35,12 @@
 //!   or Job identity before the session identity is released - is open, so KR-REQ-07.66 and 24.25
 //!   are open with it.
 //!
+//! Retention reaches a closed session as well. A session with no worker has no maintenance tick,
+//! so [`ArchiveService::collect`] applies the bounds that belong to it under recovery ownership:
+//! output past seven days and receipts past thirty, each on its own budget, only on a clock the
+//! caller can prove, after section 9's recovery rules have settled what the worker left
+//! unfinished.
+//!
 //! The transfer service's one retention question is answered here too. Section 14 gives a
 //! submitted attachment its session's retention rather than the seven-day unused window, and the
 //! archive is what knows a closed session's retention: it holds the closure record and the
@@ -221,6 +227,29 @@ pub struct Recovered {
     pub left_unknown: u64,
     /// Accepted intents with no marker, rejected because their freshness cannot be revalidated.
     pub rejected: u64,
+}
+
+/// What collecting a closed session removed, and what it could not.
+///
+/// The two stores are reported apart, because section 20 budgets them apart and either can fail
+/// on its own: output past seven days, and receipts past thirty days.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Collected {
+    /// Whether this pass collected by age at all.
+    ///
+    /// It is the caller's clock answer: removing what is old is expiry-based collection, which
+    /// section 9 stops while the wall clock cannot be proved.
+    pub age_permitted: bool,
+    /// Bytes of retained output that went.
+    pub output_bytes: u64,
+    /// Why output past its retention is still there, when some is.
+    pub output_left_behind: Option<String>,
+    /// What the recovery rules settled before any receipt was collected.
+    pub recovered: Recovered,
+    /// Receipts past their retention that went.
+    pub receipts: u64,
+    /// Why receipts past their retention are still there, when some are.
+    pub receipts_left_behind: Option<String>,
 }
 
 /// What fencing a crashed session's owned processes did.
@@ -528,7 +557,7 @@ impl ArchiveService {
         }
     }
 
-    /// Recovers a crashed session's journal, under ownership, without creating one.    /// Recovers a crashed session's journal, under ownership, without creating one.
+    /// Recovers a crashed session's journal, under ownership, without creating one.
     ///
     /// Section 9's two recovery rules are the worker's, and a worker that crashed never ran them.
     /// The archive runs them once instead: a dispatch marker with no authoritative outcome
@@ -554,20 +583,119 @@ impl ArchiveService {
         // store that would read as a session which kept nothing.
         let mut journal = Journal::open_existing(&path)
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
-        let now = kr_ipc::now_ms();
-        let unknown = journal
-            .resolve_unfinished_dispatches(now)
-            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
-        let rejected = journal
-            .reject_unrevalidated_intents(now)
-            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
-        Ok(Recovered {
-            left_unknown: unknown as u64,
-            rejected: rejected as u64,
-        })
+        recover_open(&mut journal)
+            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
     }
 
-    /// Reads what one session left behind.    /// Reads what one session left behind.
+    /// Applies section 20's retention to a session with no worker, under recovery ownership.
+    ///
+    /// A closed session has no maintenance tick of its own, so without this its output would stay
+    /// past section 20's seven days and its receipts past their thirty for as long as this host
+    /// kept the files. The archive runs the collections the worker runs, on the same budgets and
+    /// apart: output past seven days, and receipts past thirty. Section 9's recovery rules run over
+    /// the journal first, so no receipt goes while its action has no ending.
+    ///
+    /// `age_permitted` is the caller's clock answer, as it is for the worker: removing what is old
+    /// on a clock this host cannot prove is how a rollback deletes what had not expired, so
+    /// neither store is collected by age without it. The recovery rules run either way, and the
+    /// session's own byte cap is applied either way. The host-wide cap is not applied here: it is
+    /// decided across the whole environment rather than one session at a time.
+    ///
+    /// Each store's failure is reported in its own field rather than failing the other, and a
+    /// segment that could not be removed is still counted and still served until a later pass
+    /// removes it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::InvalidArgument`] when a worker may still own the session, and
+    /// nothing is collected then.
+    pub fn collect(
+        &self,
+        ownership: &RecoveryOwnership,
+        now_ms: TimestampMs,
+        age_permitted: bool,
+    ) -> Result<Collected> {
+        let session_id = ownership.session_id;
+        // A collection is a write. The ownership taken says the worker it names has ended; the
+        // published descriptor is asked as well, because a worker that is still serving is the
+        // one thing that must never have its stores collected under it.
+        if self.a_worker_may_still_own(session_id) {
+            return Err(ControllerError::InvalidArgument(format!(
+                "session {session_id} has a published worker this host has not seen end, so a \
+                 worker may still own its stores and nothing of them is collected"
+            )));
+        }
+        let mut collected = Collected {
+            age_permitted,
+            ..Collected::default()
+        };
+        self.collect_receipts(session_id, now_ms, &mut collected);
+        self.collect_output(session_id, now_ms, &mut collected);
+        Ok(collected)
+    }
+
+    /// Settles the journal's unfinished actions, then removes the receipts past their period.
+    fn collect_receipts(&self, session_id: SessionId, now_ms: TimestampMs, into: &mut Collected) {
+        let path = self.paths.journal_database(session_id);
+        if !path.exists() {
+            return;
+        }
+        let mut journal = match Journal::open_existing(&path) {
+            Ok(journal) => journal,
+            Err(error) => {
+                into.receipts_left_behind = Some(error.to_string());
+                return;
+            }
+        };
+        match recover_open(&mut journal) {
+            Ok(recovered) => into.recovered = recovered,
+            Err(error) => {
+                // A receipt whose action has no ending is not one to collect, so a pass whose
+                // recovery failed collects none.
+                into.receipts_left_behind = Some(error.to_string());
+                return;
+            }
+        }
+        if !into.age_permitted {
+            return;
+        }
+        match journal.prune(now_ms) {
+            Ok(removed) => into.receipts = removed as u64,
+            Err(error) => into.receipts_left_behind = Some(error.to_string()),
+        }
+    }
+
+    /// Applies the output bounds that belong to the session: its age and its own cap.
+    fn collect_output(&self, session_id: SessionId, now_ms: TimestampMs, into: &mut Collected) {
+        let directory = self.paths.session_spool(session_id);
+        if !directory.exists() {
+            return;
+        }
+        let mut history = match kr_worker::history::OutputHistory::with_spool(
+            0,
+            &directory,
+            kr_worker::history::SpoolLayout::DEFAULT,
+        ) {
+            Ok(history) => history,
+            Err(error) => {
+                into.output_left_behind = Some(error.to_string());
+                return;
+            }
+        };
+        // The session's own figure stands for the host's, so the host cap is not what this pass
+        // applies.
+        let held = history.retained_bytes();
+        let taken = history.apply_retention(
+            kr_worker::persistence::retention::OutputRetention::DEFAULT,
+            held,
+            now_ms,
+            into.age_permitted,
+        );
+        into.output_bytes = taken.iter().map(|eviction| eviction.bytes).sum();
+        into.output_left_behind = history.left_behind().map(str::to_owned);
+    }
+
+    /// Reads what one session left behind.
     ///
     /// A journal that is missing, or that is there and cannot be read, produces an archive that
     /// says so rather than an error or an empty success. That is section 24's explicit incomplete
@@ -891,6 +1019,21 @@ impl ArchiveService {
             reference: format!("{session_id}"),
         });
     }
+}
+
+/// Runs section 9's two recovery rules over a journal the archive has open under ownership.
+///
+/// A dispatch marker with no authoritative outcome becomes `unknown` and is never dispatched
+/// again; an accepted intent with no marker is rejected, because the freshness it was admitted
+/// under cannot be revalidated after the process that issued it has gone.
+fn recover_open(journal: &mut Journal) -> std::result::Result<Recovered, kr_worker::WorkerError> {
+    let now = kr_ipc::now_ms();
+    let unknown = journal.resolve_unfinished_dispatches(now)?;
+    let rejected = journal.reject_unrevalidated_intents(now)?;
+    Ok(Recovered {
+        left_unknown: unknown as u64,
+        rejected: rejected as u64,
+    })
 }
 
 fn durability_lost(gap: &RecoveryGap) -> Incompleteness {

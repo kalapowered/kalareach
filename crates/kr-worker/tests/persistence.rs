@@ -1195,6 +1195,24 @@ fn the_retention_figures_are_the_ones_section_twenty_states() {
     assert_eq!(stores::RECEIPT_RETENTION.as_millis() as u64, RETENTION_MS);
 }
 
+#[test]
+fn the_stores_kept_for_a_period_name_the_archive_as_their_collector_once_the_session_closes() {
+    // KR-REQ-20.21. A closed session has no maintenance tick of its own, so what it keeps for a
+    // period - its output for seven days, its receipts and what goes with them for thirty - is
+    // collected by the archive once it has closed, and each declaration says so.
+    for name in [
+        "receipts",
+        "results",
+        "receipt_events",
+        "outbox",
+        "observations",
+        "output spool",
+    ] {
+        let store = stores::store(name).expect("a declaration");
+        assert_eq!(store.cleanup, stores::Cleanup::WorkerThenArchive, "{name}");
+    }
+}
+
 #[tokio::test]
 async fn a_live_session_applies_output_retention_and_leaves_a_gap_a_reader_is_told_about() {
     // KR-REQ-20.20 and 20.21 through the session, rather than through the history alone: the

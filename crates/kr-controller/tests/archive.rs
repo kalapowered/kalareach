@@ -392,6 +392,213 @@ fn a_hole_inside_a_closed_sessions_retained_output_is_part_of_what_the_archive_r
 }
 
 // ---------------------------------------------------------------------------------------------
+// KR-REQ-20.20, 20.21: a closed session's retention, applied with no worker
+// ---------------------------------------------------------------------------------------------
+
+const DAY_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// A closed session with two receipts and sixteen bytes of output. With `aged`, the first receipt
+/// was written thirty-one days ago in an earlier boot.
+fn closed_session_with_history(archive: &ArchiveService, aged: bool) -> SessionId {
+    let session_id = session();
+    {
+        let mut journal = journal_for(archive, session_id);
+        journal
+            .record_session(&summary(session_id))
+            .expect("records the summary");
+        journal
+            .record_closure(&closure(session_id, ClosureReason::CloseRequested))
+            .expect("records the closure");
+        journal.accept(&submission(1)).expect("a first receipt");
+        journal.accept(&submission(2)).expect("a second one");
+    }
+    if aged {
+        let connection = rusqlite::Connection::open(archive.paths().journal_database(session_id))
+            .expect("opens the store");
+        connection
+            .execute(
+                "UPDATE receipts SET created_at_ms = ?1, created_boot = 'an-earlier-boot'
+                 WHERE action_id = ?2",
+                rusqlite::params![
+                    i64::try_from(kr_ipc::now_ms().get() - 31 * DAY_MS).expect("a time"),
+                    kr_worker::journal::action_id_from([1; 16])
+                        .get()
+                        .as_bytes()
+                        .as_slice(),
+                ],
+            )
+            .expect("ages the first receipt");
+    }
+    let mut history = kr_worker::history::OutputHistory::with_spool(
+        8,
+        archive.paths().session_spool(session_id),
+        kr_worker::history::SpoolLayout::new(8, 1 << 20),
+    )
+    .expect("a spool");
+    history.append(b"0123456789abcdef");
+    session_id
+}
+
+/// Eight days from now: output written now is past seven days, a receipt written now is not past
+/// thirty, and one written thirty-one days ago is.
+fn eight_days_on() -> TimestampMs {
+    TimestampMs::new(kr_ipc::now_ms().get() + 8 * DAY_MS)
+}
+
+#[test]
+fn a_closed_sessions_output_past_seven_days_and_receipts_past_thirty_are_collected() {
+    // KR-REQ-20.21 and 20.20's seven days, for a session with no worker to apply them. The
+    // archive applies both under recovery ownership, each on its own budget, and runs section 9's
+    // recovery rules first so no receipt goes while its action has no ending.
+    let (_temp, archive) = host();
+    let session_id = closed_session_with_history(&archive, true);
+    let ended = kr_ipc::identity::ended_process_identity(1);
+    let ownership = archive
+        .take_ownership(session_id, DisplayNumber::new(1), &ended)
+        .expect("ownership");
+    let collected = archive
+        .collect(&ownership, eight_days_on(), true)
+        .expect("collects");
+    assert!(collected.age_permitted);
+    assert_eq!(collected.output_bytes, 16, "{collected:?}");
+    assert_eq!(collected.output_left_behind, None);
+    assert_eq!(
+        collected.recovered.rejected, 2,
+        "the recovery rules ran before anything went"
+    );
+    assert_eq!(collected.receipts, 1, "{collected:?}");
+    assert_eq!(collected.receipts_left_behind, None);
+
+    let read = archive.archive(session_id).expect("reads the archive");
+    assert_eq!(
+        read.receipts, 1,
+        "the receipt inside its thirty days is kept"
+    );
+    assert_eq!(
+        read.next_cursor, 16,
+        "the boundary still says where it reached"
+    );
+    assert_eq!(read.oldest_retained_cursor, 16, "the output went");
+    assert!(
+        read.incompleteness.contains(&Incompleteness::HistoryLost {
+            from_cursor: 0,
+            to_cursor: 16
+        }),
+        "{:?}",
+        read.incompleteness
+    );
+    assert!(
+        !read
+            .incompleteness
+            .iter()
+            .any(|missing| matches!(missing, Incompleteness::RecoveryUnfinished { .. })),
+        "{:?}",
+        read.incompleteness
+    );
+}
+
+#[test]
+fn a_closed_session_inside_its_retention_keeps_everything() {
+    // The control for the test above: nothing is past either period, so nothing goes.
+    let (_temp, archive) = host();
+    let session_id = closed_session_with_history(&archive, false);
+    let ended = kr_ipc::identity::ended_process_identity(1);
+    let ownership = archive
+        .take_ownership(session_id, DisplayNumber::new(1), &ended)
+        .expect("ownership");
+    let collected = archive
+        .collect(&ownership, kr_ipc::now_ms(), true)
+        .expect("collects");
+    assert_eq!(collected.output_bytes, 0);
+    assert_eq!(collected.receipts, 0);
+    let read = archive.archive(session_id).expect("reads the archive");
+    assert_eq!(read.receipts, 2);
+    assert_eq!(read.oldest_retained_cursor, 0);
+    assert_eq!(read.next_cursor, 16);
+}
+
+#[test]
+fn a_clock_this_host_cannot_prove_collects_nothing_by_age_from_a_closed_session() {
+    // Section 9's rule for expiry-based collection holds for the archive as for the worker:
+    // removing what is old on a clock this host cannot prove is how a rollback deletes what had
+    // not expired.
+    let (_temp, archive) = host();
+    let session_id = closed_session_with_history(&archive, true);
+    let ended = kr_ipc::identity::ended_process_identity(1);
+    let ownership = archive
+        .take_ownership(session_id, DisplayNumber::new(1), &ended)
+        .expect("ownership");
+    let much_later = TimestampMs::new(kr_ipc::now_ms().get() + 40 * DAY_MS);
+    let collected = archive
+        .collect(&ownership, much_later, false)
+        .expect("collects");
+    assert!(!collected.age_permitted);
+    assert_eq!(collected.output_bytes, 0);
+    assert_eq!(collected.receipts, 0);
+    let read = archive.archive(session_id).expect("reads the archive");
+    assert_eq!(read.receipts, 2);
+    assert_eq!(read.oldest_retained_cursor, 0);
+}
+
+#[test]
+fn a_session_a_worker_may_still_own_is_not_collected() {
+    // Collection is a write, so it asks the question every write of the archive asks: a
+    // descriptor naming a process the kernel has not said ended belongs to a worker that may
+    // still own these stores.
+    let (_temp, archive) = host();
+    let session_id = closed_session_with_history(&archive, true);
+    let ended = kr_ipc::identity::ended_process_identity(1);
+    let ownership = archive
+        .take_ownership(session_id, DisplayNumber::new(1), &ended)
+        .expect("ownership");
+    let alive = kr_ipc::identity::current_process_start_identity().expect("an identity");
+    publish_descriptor(&archive, session_id, &alive);
+    let refused = archive
+        .collect(&ownership, eight_days_on(), true)
+        .expect_err("a store a worker may still own is not collected");
+    assert!(refused.to_string().contains("may still"), "{refused}");
+    let connection = rusqlite::Connection::open(archive.paths().journal_database(session_id))
+        .expect("opens the store");
+    let held: i64 = connection
+        .query_row("SELECT COUNT(*) FROM receipts", [], |row| row.get(0))
+        .expect("counts");
+    assert_eq!(held, 2, "nothing was taken");
+}
+
+#[test]
+fn a_segment_the_collection_cannot_remove_is_reported_rather_than_counted_as_gone() {
+    let (_temp, archive) = host();
+    let session_id = closed_session_with_history(&archive, true);
+    // A directory stands where the oldest segment's file was, so no platform removes it as one.
+    let oldest = archive
+        .paths()
+        .session_spool(session_id)
+        .join(format!("{:020}.out", 0));
+    std::fs::remove_file(&oldest).expect("removes the oldest segment's file");
+    std::fs::create_dir(&oldest).expect("puts a directory in its place");
+    std::fs::write(oldest.join("in-the-way"), b"x").expect("and something in it");
+    let ended = kr_ipc::identity::ended_process_identity(1);
+    let ownership = archive
+        .take_ownership(session_id, DisplayNumber::new(1), &ended)
+        .expect("ownership");
+    let collected = archive
+        .collect(&ownership, eight_days_on(), true)
+        .expect("collects");
+    assert_eq!(collected.output_bytes, 0, "{collected:?}");
+    assert!(
+        collected
+            .output_left_behind
+            .as_deref()
+            .is_some_and(|why| why.contains("could not be removed")),
+        "{collected:?}"
+    );
+    assert_eq!(
+        collected.receipts, 1,
+        "the receipts are collected on their own account"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
 // KR-REQ-24.18: exclusive recovery ownership, after fencing and death validation
 // ---------------------------------------------------------------------------------------------
 
