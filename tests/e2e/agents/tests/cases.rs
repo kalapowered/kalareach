@@ -20,9 +20,10 @@ use std::time::Duration;
 
 use kr_client::cursors::StreamCursors;
 use kr_e2e_agents::account::{
-    Guarded, Ledger, borrow_login_keychain, changes, conversation_id, files_holding, guarded_files,
-    key_from_descriptor, keychain_item_modified, now_ms, record_guarded, record_key_scan,
-    remove_created, remove_marked_lines, snapshot, which_hold,
+    AppendOnly, Guarded, Ledger, append_only_files, appended_since, borrow_login_keychain, changes,
+    conversation_id, files_holding, guarded_files, holds_any, key_from_descriptor,
+    keychain_item_modified, now_ms, read_if_there, record_guarded, record_key_scan,
+    remove_appended_lines, remove_created, snapshot, which_hold,
 };
 use kr_e2e_agents::build::{
     Account, AccountHome, Action, Build, Inputs, Launch, quote, with_dates,
@@ -156,6 +157,9 @@ struct Guards {
     before: Vec<Guarded>,
     guarded: Vec<String>,
     shared: Vec<String>,
+    /// The files the agent and the person's other programs only append lines to, as the part found
+    /// them: a line that was there changing or going is a change the part stops on.
+    append_only: Vec<AppendOnly>,
     /// When the files were last read.
     read_at: std::sync::Mutex<Option<std::time::Instant>>,
     /// What changed, once a look found a change: the part stops on it.
@@ -182,15 +186,40 @@ struct Registry {
 
 impl Guards {
     /// What changed since the part started, where anything did: a file of the person's that no
-    /// part may change, or one the person's own programs also write that now holds `needles` (the
-    /// part's mark or the run's directory), or a file that cannot be read.
+    /// part may change, one the person's own programs also write that now holds `needles` (the
+    /// part's mark or the run's directory), a line that was there in a file only appended to, or
+    /// a file that cannot be read.
     fn change(&self, needles: &[&str]) -> Option<String> {
         let now = match guarded_files(&self.home, &self.files, needles) {
             Ok(now) => now,
             Err(why) => return Some(why),
         };
+        let lines = self
+            .append_only
+            .iter()
+            .map(|file| {
+                read_if_there(&self.home.join(&file.relative))
+                    .map(|now| appended_since(file.before.as_deref(), now.as_deref()).is_some())
+                    .map_err(|error| format!("~/{}: {error}", file.relative))
+            })
+            .collect::<Result<Vec<bool>, String>>();
         if let Ok(mut read_at) = self.read_at.lock() {
             *read_at = Some(std::time::Instant::now());
+        }
+        let intact = match lines {
+            Ok(intact) => intact,
+            Err(why) => return Some(why),
+        };
+        if let Some((file, _)) = self
+            .append_only
+            .iter()
+            .zip(&intact)
+            .find(|(_, intact)| !**intact)
+        {
+            return Some(format!(
+                "~/{}: a line that was there before the part changed or went while it ran",
+                file.relative
+            ));
         }
         self.before.iter().zip(&now).find_map(|(first, second)| {
             let changed = first.sha256 != second.sha256;
@@ -673,17 +702,30 @@ fn staged(
             .keychain_item
             .as_ref()
             .map(|service| keychain_item_modified(&login.person_home, service));
-        (files, before, item)
+        // The files only appended to, the line files among them, whole: each later look compares
+        // their earlier bytes.
+        let appended_to: Vec<String> = login
+            .account
+            .append_only
+            .iter()
+            .chain(&login.account.line_files)
+            .cloned()
+            .collect();
+        let lines = append_only_files(&login.person_home, &appended_to).unwrap_or_else(|why| {
+            panic!("part {part}: a file of the person's only appended to cannot be read: {why}")
+        });
+        (files, before, item, lines)
     });
     let guards = login
         .as_ref()
         .zip(watched.as_ref())
-        .map(|(login, (files, before, _))| Guards {
+        .map(|(login, (files, before, _, lines))| Guards {
             home: login.person_home.clone(),
             files: files.clone(),
             before: before.clone(),
             guarded: login.account.guarded.clone(),
             shared: login.account.shared.clone(),
+            append_only: lines.clone(),
             read_at: std::sync::Mutex::new(None),
             changed: std::sync::Mutex::new(None),
             watching: std::sync::atomic::AtomicBool::new(false),
@@ -813,7 +855,7 @@ fn staged(
     // changed and naming the run's directory or the part's mark, stops the agent.
     let mut watched_evidence = None;
     let mut watched_stop = Vec::new();
-    if let (Some(login), Some((files, before, item))) = (login.as_ref(), watched.as_ref()) {
+    if let (Some(login), Some((files, before, item, lines))) = (login.as_ref(), watched.as_ref()) {
         let root_text = root.display().to_string();
         match guarded_files(
             &login.person_home,
@@ -843,15 +885,80 @@ fn staged(
                     (Some(Some(first)), Some(Some(second))) => Some(first != second),
                     _ => None,
                 };
-                // The lines the part added to the agent's own line files, holding its mark, go, once
-                // nothing the part started still writes.
+                // The lines appended to the files only appended to: every earlier line must still be
+                // there. The part's own, those that hold its mark or the run's directory or whose
+                // "id" names a conversation the part created, are listed with that id; the others,
+                // someone else's, are only counted.
+                let needles = [mark.as_str(), root_text.as_str()];
+                let own_conversations: &[String] = home
+                    .as_ref()
+                    .map_or(&[], |(_, _, _, conversations)| conversations);
+                let appended: Vec<serde_json::Value> = lines
+                    .iter()
+                    .map(|file| {
+                        let now = read_if_there(&login.person_home.join(&file.relative));
+                        match now.as_ref().map(|now| {
+                            appended_since(file.before.as_deref(), now.as_deref())
+                        }) {
+                            Ok(Some(added)) => {
+                                let id_of = |line: &[u8]| {
+                                    serde_json::from_slice::<serde_json::Value>(line)
+                                        .ok()
+                                        .and_then(|value| {
+                                            value.get("id").and_then(|id| id.as_str().map(str::to_owned))
+                                        })
+                                };
+                                let own: Vec<serde_json::Value> = added
+                                    .iter()
+                                    .filter_map(|line| {
+                                        let id = id_of(line);
+                                        let marked = holds_any(line, &needles);
+                                        let created = id
+                                            .as_ref()
+                                            .is_some_and(|id| own_conversations.contains(id));
+                                        (marked || created).then(|| {
+                                            json!({ "id": id, "holds_the_part": marked, "names_a_conversation_it_created": created })
+                                        })
+                                    })
+                                    .collect();
+                                json!({
+                                    "file": format!("~/{}", file.relative),
+                                    "earlier_lines_intact": true,
+                                    "appended": added.len(),
+                                    "own": own,
+                                    "others": added.len() - own.len(),
+                                })
+                            }
+                            Ok(None) => {
+                                watched_stop.push(format!(
+                                    "~/{}: a line that was there before the part changed or went",
+                                    file.relative
+                                ));
+                                json!({ "file": format!("~/{}", file.relative), "earlier_lines_intact": false })
+                            }
+                            Err(error) => {
+                                watched_stop.push(format!(
+                                    "~/{} cannot be read after the part: {error}",
+                                    file.relative
+                                ));
+                                json!({ "file": format!("~/{}", file.relative), "error": error.to_string() })
+                            }
+                        }
+                    })
+                    .collect();
+                // The part's own lines in the line files, whose every writer locks the file for
+                // each line, go under that lock, once nothing the part started still writes.
                 let lines_removed: Vec<serde_json::Value> = if writers.is_ok() {
-                    login
-                        .account
-                        .line_files
+                    lines
                         .iter()
-                        .map(|relative| {
-                            match remove_marked_lines(&login.person_home.join(relative), &mark) {
+                        .filter(|file| login.account.line_files.contains(&file.relative))
+                        .map(|file| {
+                            let relative = &file.relative;
+                            match remove_appended_lines(
+                                &login.person_home.join(relative),
+                                file.before.as_deref(),
+                                &needles,
+                            ) {
                                 Ok(count) => json!({ "file": format!("~/{relative}"), "removed": count }),
                                 Err(why) => {
                                     watched_stop.push(format!(
@@ -867,6 +974,7 @@ fn staged(
                 };
                 watched_evidence = Some(json!({
                     "files": entries,
+                    "appended": appended,
                     "lines_removed": lines_removed,
                     "searched_for": { "mark": mark, "run_directory": root_text },
                     "keychain_item_rewritten": rewritten,
@@ -903,7 +1011,7 @@ fn staged(
              left is not final: {left}"
         ));
     }
-    if let Some((_, rewrites, whole)) = &home {
+    if let Some((_, rewrites, whole, _)) = &home {
         if !whole {
             stop.push(
                 "the person's agent directories could not be read whole after the part, so \
@@ -959,7 +1067,7 @@ fn staged(
                 if let Some(watched) = &watched_evidence {
                     evidence.insert("person_files".to_owned(), watched.clone());
                 }
-                if let Some((report, _, _)) = &home {
+                if let Some((report, _, _, _)) = &home {
                     evidence.insert("person_home".to_owned(), report.clone());
                 }
                 if let Some(keys) = &key_evidence {
@@ -995,7 +1103,7 @@ fn staged(
         if let Some(watched) = &watched_evidence {
             evidence.insert("person_files".to_owned(), watched.clone());
         }
-        if let Some((report, _, _)) = &home {
+        if let Some((report, _, _, _)) = &home {
             evidence.insert("person_home".to_owned(), report.clone());
         }
         if let Some(keys) = &key_evidence {
@@ -1055,7 +1163,7 @@ fn person_home_report(
     mark: &str,
     root: &Path,
     settled: bool,
-) -> (serde_json::Value, Vec<String>, bool) {
+) -> (serde_json::Value, Vec<String>, bool, Vec<String>) {
     let after = snapshot(&login.person_home, directories, HASH_LIMIT);
     let found = changes(before, &after);
     let root = root.display().to_string();
@@ -1104,6 +1212,7 @@ fn person_home_report(
         }),
         rewrites,
         after.whole(),
+        removed.iter().map(|file| conversation_id(file)).collect(),
     )
 }
 

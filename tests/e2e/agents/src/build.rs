@@ -437,10 +437,19 @@ pub struct Account {
     /// whether each changed is recorded, and nothing stops on it.
     #[serde(default)]
     pub recorded: Vec<String>,
-    /// Files of the person's home the agent appends lines to, from which the lines holding the
-    /// part's mark are removed after it, and listed.
+    /// Files of the person's home, relative to it, that the agent and the person's other programs
+    /// only append lines to, and that the part watches as it watches [`Account::append_only`], whose
+    /// every writer also locks the file for each line: after the part, under that lock, the lines
+    /// appended since it started that hold its mark or the run's directory, the part's own, are
+    /// removed, and counted.
     #[serde(default)]
     pub line_files: Vec<String>,
+    /// Files of the person's home, relative to it, that the agent and the person's other programs
+    /// only append lines to: a line that was there before the part changing or going stops the
+    /// agent; the lines appended since are recorded, each with whether it holds the part's mark or
+    /// the run's directory, and left as they are.
+    #[serde(default)]
+    pub append_only: Vec<String>,
     /// The key that queues a prompt behind a running turn, where it is not the submit key.
     #[serde(default)]
     pub queue_key: Option<String>,

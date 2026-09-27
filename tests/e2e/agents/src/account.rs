@@ -353,12 +353,7 @@ pub fn guarded_files(
                 Ok(bytes) => Ok(Guarded {
                     relative: relative.clone(),
                     sha256: Some(kr_cbor::sha256(&bytes)),
-                    holds: needles.iter().any(|needle| {
-                        !needle.is_empty()
-                            && bytes
-                                .windows(needle.len())
-                                .any(|window| window == needle.as_bytes())
-                    }),
+                    holds: holds_any(&bytes, needles),
                 }),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Guarded {
                     relative: relative.clone(),
@@ -435,15 +430,107 @@ pub fn keychain_item_modified(home: &Path, service: &str) -> Option<String> {
         .and_then(|line| line.split('"').nth(3).map(str::to_owned))
 }
 
-/// Removes from the line file `path` every line that holds `mark`, and returns how many it removed:
-/// under an exclusive lock on the file, which the agent's own writers take too where they lock it,
-/// the file is read, and only when a line holds the mark is it written again, in place, with the
-/// rest as they were. A file that does not exist has no lines to remove.
+/// A file of the person's home that the agent and the person's other programs only append lines
+/// to, as a part found it before it started: its path relative to the home, and its bytes, none
+/// where it did not exist.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AppendOnly {
+    /// The path relative to the person's home.
+    pub relative: String,
+    /// The file's bytes, where it existed.
+    pub before: Option<Vec<u8>>,
+}
+
+/// Reads each of `files`, relative to `home`, whole, for [`AppendOnly`]. A file that cannot be read,
+/// other than one that does not exist, is an error, since nothing about it could be compared.
 ///
 /// # Errors
 ///
-/// Returns why the file could not be read, locked or written.
-pub fn remove_marked_lines(path: &Path, mark: &str) -> Result<usize, String> {
+/// Returns the file that could not be read, and why.
+pub fn append_only_files(home: &Path, files: &[String]) -> Result<Vec<AppendOnly>, String> {
+    files
+        .iter()
+        .map(|relative| {
+            Ok(AppendOnly {
+                relative: relative.clone(),
+                before: read_if_there(&home.join(relative))
+                    .map_err(|error| format!("~/{relative}: {error}"))?,
+            })
+        })
+        .collect()
+}
+
+/// A file's bytes, or `None` where it does not exist.
+///
+/// # Errors
+///
+/// Returns why a file that exists could not be read.
+pub fn read_if_there(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// The lines appended to a file since its bytes were `before`, where its bytes `now` still begin
+/// with every earlier byte, in place: whole lines, from the first line boundary at or after the
+/// earlier end, so a line the earlier bytes ended part way through stays an earlier line; the last
+/// may still lack its line end. `None` when an earlier byte changed or went, or the file went.
+#[must_use]
+pub fn appended_since<'a>(before: Option<&[u8]>, now: Option<&'a [u8]>) -> Option<Vec<&'a [u8]>> {
+    let now = match (before, now) {
+        (Some(_), None) => return None,
+        (None, None) => return Some(Vec::new()),
+        (_, Some(now)) => now,
+    };
+    let earlier = before.unwrap_or_default();
+    if !now.starts_with(earlier) {
+        return None;
+    }
+    let start = if earlier.is_empty() || earlier.ends_with(b"\n") {
+        earlier.len()
+    } else {
+        now[earlier.len()..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(now.len(), |at| earlier.len() + at + 1)
+    };
+    Some(
+        now[start..]
+            .split_inclusive(|byte| *byte == b'\n')
+            .collect(),
+    )
+}
+
+/// Whether `bytes` hold one of `needles`.
+#[must_use]
+pub fn holds_any(bytes: &[u8], needles: &[&str]) -> bool {
+    needles.iter().any(|needle| {
+        !needle.is_empty()
+            && bytes
+                .windows(needle.len())
+                .any(|window| window == needle.as_bytes())
+    })
+}
+
+/// Removes from the line file `path`, whose bytes were `before` when the part started, each line
+/// appended since that holds one of `needles` (the part's mark or the run's directory: the part's
+/// own), and returns how many it removed: under an exclusive lock on the file, which every writer
+/// of such a file takes for each line, the file is read, every earlier byte must still be there in
+/// place, and only when an appended line is the part's is the file written again, in place, with
+/// the earlier bytes and the other appended lines as they were. A file that is not there, and was
+/// not, has no lines to remove.
+///
+/// # Errors
+///
+/// Returns why the file could not be read, locked or written, or that an earlier line changed or
+/// went.
+pub fn remove_appended_lines(
+    path: &Path,
+    before: Option<&[u8]>,
+    needles: &[&str],
+) -> Result<usize, String> {
     use std::io::Seek;
     let mut file = match std::fs::OpenOptions::new()
         .read(true)
@@ -451,28 +538,42 @@ pub fn remove_marked_lines(path: &Path, mark: &str) -> Result<usize, String> {
         .open(path)
     {
         Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && before.is_none() => {
+            return Ok(0);
+        }
         Err(error) => return Err(format!("{}: {error}", path.display())),
     };
     rustix::fs::flock(&file, rustix::fs::FlockOperation::LockExclusive)
         .map_err(|error| format!("{}: {error}", path.display()))?;
-    let mut text = String::new();
-    file.read_to_string(&mut text)
-        .map_err(|error| format!("{}: {error}", path.display()))?;
-    let kept: Vec<&str> = text
-        .split_inclusive('\n')
-        .filter(|line| !line.contains(mark))
-        .collect();
-    let removed = text.split_inclusive('\n').count() - kept.len();
-    if removed > 0 {
-        let rest = kept.concat();
-        file.seek(std::io::SeekFrom::Start(0))
-            .and_then(|_| file.write_all(rest.as_bytes()))
-            .and_then(|()| file.set_len(u64::try_from(rest.len()).unwrap_or(u64::MAX)))
+    let result = (|| {
+        let mut now = Vec::new();
+        file.read_to_end(&mut now)
             .map_err(|error| format!("{}: {error}", path.display()))?;
-    }
+        let appended = appended_since(before, Some(&now)).ok_or_else(|| {
+            format!(
+                "{}: a line that was there before the part changed or went",
+                path.display()
+            )
+        })?;
+        let start = now.len() - appended.iter().map(|line| line.len()).sum::<usize>();
+        let kept: Vec<&[u8]> = appended
+            .iter()
+            .copied()
+            .filter(|line| !holds_any(line, needles))
+            .collect();
+        let removed = appended.len() - kept.len();
+        if removed > 0 {
+            let mut rest = now[..start].to_vec();
+            rest.extend(kept.concat());
+            file.seek(std::io::SeekFrom::Start(0))
+                .and_then(|_| file.write_all(&rest))
+                .and_then(|()| file.set_len(u64::try_from(rest.len()).unwrap_or(u64::MAX)))
+                .map_err(|error| format!("{}: {error}", path.display()))?;
+        }
+        Ok(removed)
+    })();
     let _ = rustix::fs::flock(&file, rustix::fs::FlockOperation::Unlock);
-    Ok(removed)
+    result
 }
 
 /// The variable naming the file descriptor the harness passes a login's value on: a pipe, so the
@@ -1165,15 +1266,65 @@ mod tests {
     }
 
     #[test]
-    fn marked_lines_are_removed_in_place_and_a_file_without_them_is_left_as_it_was() {
+    fn appended_lines_are_those_after_every_earlier_byte_and_none_where_one_changed_or_went() {
+        let lines = |before: Option<&str>, now: Option<&str>| {
+            appended_since(before.map(str::as_bytes), now.map(str::as_bytes)).map(|lines| {
+                lines
+                    .iter()
+                    .map(|line| String::from_utf8_lossy(line).into_owned())
+                    .collect::<Vec<_>>()
+            })
+        };
+        assert_eq!(lines(None, None), Some(vec![]));
+        assert_eq!(
+            lines(None, Some("a\nb\n")),
+            Some(vec!["a\n".to_owned(), "b\n".to_owned()]),
+            "a file that was not there holds only appended lines"
+        );
+        assert_eq!(lines(Some("a\n"), None), None, "a file that went");
+        assert_eq!(lines(Some("a\nb\n"), Some("a\nb\n")), Some(vec![]));
+        assert_eq!(
+            lines(Some("a\nb\n"), Some("a\nb\nc\nd")),
+            Some(vec!["c\n".to_owned(), "d".to_owned()]),
+            "the last appended line may still lack its end"
+        );
+        assert_eq!(
+            lines(Some("a\nb"), Some("a\nb more\nc\n")),
+            Some(vec!["c\n".to_owned()]),
+            "a line the earlier bytes ended part way through stays an earlier line"
+        );
+        assert_eq!(
+            lines(Some("a\nb\n"), Some("a\nB\nc\n")),
+            None,
+            "an earlier line changed"
+        );
+        assert_eq!(
+            lines(Some("a\nb\n"), Some("b\nc\n")),
+            None,
+            "an earlier line went"
+        );
+        assert_eq!(lines(Some("a\nb\n"), Some("a\n")), None, "the file shrank");
+    }
+
+    #[test]
+    fn only_the_part_s_own_appended_lines_are_removed_in_place_and_earlier_lines_must_hold() {
         let scratch = Scratch::new("lines");
         let path = scratch.0.join("history.jsonl");
-        std::fs::write(&path, "one\nkr0123 two\nthree\nkr0123 four").expect("a line file");
+        let before = "one kr0123\ntwo\n";
+        std::fs::write(
+            &path,
+            format!("{before}kr0123 three\nfour\n/run/x five\nkr0123 six"),
+        )
+        .expect("a line file");
         let inode = std::fs::metadata(&path).expect("its metadata").ino();
-        assert_eq!(remove_marked_lines(&path, "kr0123"), Ok(2));
+        assert_eq!(
+            remove_appended_lines(&path, Some(before.as_bytes()), &["kr0123", "/run/x"]),
+            Ok(3)
+        );
         assert_eq!(
             std::fs::read_to_string(&path).expect("the file"),
-            "one\nthree\n"
+            "one kr0123\ntwo\nfour\n",
+            "an earlier line stays even where it holds the mark, and someone else's appended line stays"
         );
         assert_eq!(
             std::fs::metadata(&path).expect("its metadata").ino(),
@@ -1184,18 +1335,29 @@ mod tests {
             .expect("its metadata")
             .modified()
             .ok();
-        assert_eq!(remove_marked_lines(&path, "kr0123"), Ok(0));
+        let now = std::fs::read(&path).expect("the file");
+        assert_eq!(remove_appended_lines(&path, Some(&now), &["kr0123"]), Ok(0));
         assert_eq!(
             std::fs::metadata(&path)
                 .expect("its metadata")
                 .modified()
                 .ok(),
             modified,
-            "a file without the mark is not written"
+            "a file without the part's lines is not written"
         );
+        assert!(
+            remove_appended_lines(&path, Some(b"one kr0123\nTWO\n"), &["kr0123"])
+                .is_err_and(|why| why.contains("changed or went")),
+            "an earlier line that changed is an error, and nothing is written"
+        );
+        assert_eq!(std::fs::read(&path).expect("the file"), now);
         assert_eq!(
-            remove_marked_lines(&scratch.0.join("none"), "kr0123"),
+            remove_appended_lines(&scratch.0.join("none"), None, &["kr0123"]),
             Ok(0)
+        );
+        assert!(
+            remove_appended_lines(&scratch.0.join("none"), Some(b"x\n"), &["kr0123"]).is_err(),
+            "a file that went is an error"
         );
     }
 
