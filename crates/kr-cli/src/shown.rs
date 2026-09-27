@@ -9,7 +9,8 @@
 //! * [`Usage`], a usage failure as the command's own declarations and clap's classification say it,
 //!   with every value the person typed taken out;
 //! * [`tool_server`], a failure of the tool server by its kind;
-//! * [`VerificationValue`], a pairing's verification value as both devices show it.
+//! * [`VerificationValue`], a pairing's verification value as both devices show it;
+//! * [`BuildName`], a build identifier that is a program's name and its release.
 //!
 //! Each type here is made only by the function beside it, so a value of it is always what that
 //! function decided may be said.
@@ -174,6 +175,47 @@ impl fmt::Display for VerificationValue {
 }
 
 impl Plain for VerificationValue {}
+
+/// A build identifier, as a refusal names it.
+pub struct BuildName(String);
+
+/// The longest build identifier a refusal names.
+const BUILD_NAME_LIMIT: usize = 64;
+
+/// Returns what a build identifier says: the identifier when it is a program's name and a release,
+/// such as `kr-worker/0.1.0`, and that it is not one otherwise. A worker states its own, so any
+/// other text is replaced rather than repeated.
+///
+/// The name is lower-case letters, digits and dashes, starting with a letter; the release is
+/// numbers separated by dots; the whole is at most [`BUILD_NAME_LIMIT`] bytes.
+#[must_use]
+pub fn build_name(build_id: &kr_protocol::ids::BuildId) -> BuildName {
+    let text = build_id.as_str();
+    let named = text.len() <= BUILD_NAME_LIMIT
+        && text.split_once('/').is_some_and(|(name, release)| {
+            name.starts_with(|first: char| first.is_ascii_lowercase())
+                && name.chars().all(|character| {
+                    character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-'
+                })
+                && release.split('.').all(|number| {
+                    !number.is_empty() && number.chars().all(|digit| digit.is_ascii_digit())
+                })
+        });
+    BuildName(if named {
+        text.to_owned()
+    } else {
+        "[a build this kr does not name]".to_owned()
+    })
+}
+
+impl fmt::Display for BuildName {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+// A program's name and its release, from the fixed alphabet above, or this program's own words.
+impl Plain for BuildName {}
 
 /// What a device's platform says: the protocol's own name for it.
 #[must_use]

@@ -1073,6 +1073,19 @@ pub async fn run(
     guard.learn_modes(&modes);
 
     let mut client = crate::resolve::open_worker(descriptor, crate::build_id()).await?;
+    // A worker outlives an upgrade, so it can be of a build whose screens this one cannot read.
+    // Its answer to the hello says which, and that is settled before the session is asked for
+    // anything: nothing is attached, no size is claimed and no lease is taken. Nothing has begun
+    // forwarding either, so the terminal's modes are put back, as they are when the probe fails,
+    // and the refusal is said once the terminal is the person's again.
+    if let Err(refusal) = crate::attach::check_build(
+        client.acknowledgement().build.as_ref(),
+        descriptor.display_number,
+    ) {
+        let _ = terminal.restore(&saved, None, &modes);
+        guard.release();
+        return Err(refusal);
+    }
     // A terminal attachment claims the session's size. Section 8 makes that the default: a
     // terminal that did not claim it would be shown a projection of somebody else's size, which is
     // exactly what a lone attachment does not need. `--take-geometry` goes further and takes the

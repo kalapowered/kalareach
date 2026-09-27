@@ -19,12 +19,15 @@ use kr_protocol::attachment::{
     AttachMode, AttachmentCapability, SessionAttachParams, SessionAttachResult, SessionDetachParams,
 };
 use kr_protocol::envelope::ActionTarget;
+use kr_protocol::error::ErrorCode;
+use kr_protocol::hello::{PACKAGE_VERSION, PackageVersion};
 use kr_protocol::ids::{ActionId, AttachmentId, SessionEpoch, SessionId};
 use kr_protocol::input::{InputAcquireParams, InputAcquireResult};
+use kr_protocol::local::LocalBuild;
 use kr_protocol::method::Method;
 use kr_protocol::recovery::{EventStream, EventsSubscribeParams};
 use kr_protocol::scalars::{CanonicalSet, Nullable};
-use kr_protocol::session::Dimensions;
+use kr_protocol::session::{Dimensions, DisplayNumber};
 use kr_protocol::worker::WorkerDescriptor;
 
 use crate::error::{CliError, Result};
@@ -434,6 +437,56 @@ pub async fn attach(
     })
 }
 
+/// Refuses a worker whose screens this build cannot be sure to read, before the session is asked
+/// for anything.
+///
+/// A worker outlives an upgrade, so this command can meet a worker of an earlier build, or of a
+/// later one. It reads a worker's screens when the worker states, in its answer to the hello, a
+/// build whose protocol version shares this build's compatibility level
+/// ([`PackageVersion::shares_frames_with`]). A worker that states no build is of a build before
+/// that statement. Attaching to either of the others would claim the session's size and its input
+/// lease, and then wait on screens this command cannot draw.
+///
+/// # Errors
+///
+/// Returns `UNSUPPORTED_SCHEMA`, a refused request, naming both builds, both protocol versions and
+/// what to do.
+pub fn check_build(stated: Option<&LocalBuild>, display: DisplayNumber) -> Result<()> {
+    let worker = match stated {
+        Some(build) if build.protocol_version.shares_frames_with(PACKAGE_VERSION) => {
+            return Ok(());
+        }
+        Some(build) => shown!(
+            "session {} runs on {} with protocol {}",
+            display.get(),
+            crate::shown::build_name(&build.build_id),
+            version(build.protocol_version)
+        ),
+        None => shown!(
+            "session {} runs on a worker of an earlier build, which does not state its build or \
+             its protocol version",
+            display.get()
+        ),
+    };
+    Err(CliError::Refused(kr_client::error::refusal(
+        ErrorCode::UnsupportedSchema,
+        shown!(
+            "{}, and this is {} with protocol {}: this kr cannot show a session whose worker \
+             speaks another protocol version. Close the session with `kr close {}`, or attach \
+             with a kr of the worker's build",
+            worker,
+            crate::shown::build_name(&crate::build_id()),
+            version(PACKAGE_VERSION),
+            display.get()
+        ),
+    )))
+}
+
+/// A protocol package version, as a refusal says it.
+fn version(version: PackageVersion) -> Shown {
+    shown!("{}.{}.{}", version.major, version.minor, version.patch)
+}
+
 /// Takes the session's size ownership for this attachment.
 ///
 /// # Errors
@@ -647,6 +700,127 @@ mod tests {
         assert!(
             refusal.contains("exit status"),
             "with how the guard left: {refusal}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod a_worker_of_another_build {
+    use super::check_build;
+    use crate::CliError;
+    use kr_protocol::error::ErrorCode;
+    use kr_protocol::hello::{PACKAGE_VERSION, PackageVersion};
+    use kr_protocol::ids::BuildId;
+    use kr_protocol::local::LocalBuild;
+    use kr_protocol::session::DisplayNumber;
+
+    fn stated(build_id: &str, protocol_version: PackageVersion) -> LocalBuild {
+        LocalBuild {
+            build_id: BuildId::new(build_id).expect("a build identifier"),
+            protocol_version,
+        }
+    }
+
+    /// A version of another compatibility level than this build's.
+    fn another_level() -> PackageVersion {
+        if PACKAGE_VERSION.major == 0 {
+            PackageVersion::new(0, PACKAGE_VERSION.minor + 1, 0)
+        } else {
+            PackageVersion::new(PACKAGE_VERSION.major + 1, 0, 0)
+        }
+    }
+
+    /// What a refusal says, with its code and its exit status, which are the refused request's.
+    fn refused(stated: Option<&LocalBuild>) -> String {
+        let refusal = check_build(stated, DisplayNumber::new(3)).expect_err("refused");
+        assert!(
+            matches!(&refusal, CliError::Refused(error) if error.code == ErrorCode::UnsupportedSchema),
+            "{refusal}"
+        );
+        assert_eq!(refusal.code(), "UNSUPPORTED_SCHEMA");
+        assert_eq!(refusal.exit_code(), 8);
+        refusal.to_string()
+    }
+
+    /// A worker of this build's protocol version is attached to, and so is one whose version is a
+    /// patch number apart: a change that takes only the next patch number changes no type.
+    #[test]
+    fn a_worker_of_this_protocol_version_or_a_patch_number_apart_is_attached_to() {
+        let this = LocalBuild::this(BuildId::new("kr-worker/0.1.0").expect("a build identifier"));
+        assert!(check_build(Some(&this), DisplayNumber::new(3)).is_ok());
+        let patched = stated(
+            "kr-worker/0.1.0",
+            PackageVersion::new(
+                PACKAGE_VERSION.major,
+                PACKAGE_VERSION.minor,
+                PACKAGE_VERSION.patch + 1,
+            ),
+        );
+        assert!(check_build(Some(&patched), DisplayNumber::new(3)).is_ok());
+    }
+
+    /// A worker of another compatibility level is refused, and the refusal names both builds,
+    /// both versions and what to do.
+    #[test]
+    fn a_worker_of_another_protocol_version_is_refused_naming_both_builds() {
+        let theirs = another_level();
+        assert_eq!(
+            refused(Some(&stated("kr-worker/0.1.0", theirs))),
+            format!(
+                "UNSUPPORTED_SCHEMA: session 3 runs on kr-worker/0.1.0 with protocol {theirs}, and \
+                 this is {} with protocol {PACKAGE_VERSION}: this kr cannot show a session whose \
+                 worker speaks another protocol version. Close the session with `kr close 3`, or \
+                 attach with a kr of the worker's build",
+                crate::build_id().as_str()
+            )
+        );
+    }
+
+    /// A worker that states no build is of a build before the statement, and is refused as one.
+    #[test]
+    fn a_worker_that_states_no_build_is_refused_as_an_earlier_build() {
+        assert_eq!(
+            refused(None),
+            format!(
+                "UNSUPPORTED_SCHEMA: session 3 runs on a worker of an earlier build, which does \
+                 not state its build or its protocol version, and this is {} with protocol \
+                 {PACKAGE_VERSION}: this kr cannot show a session whose worker speaks another \
+                 protocol version. Close the session with `kr close 3`, or attach with a kr of the \
+                 worker's build",
+                crate::build_id().as_str()
+            )
+        );
+    }
+
+    /// The refusal is a `Shown`: a build identifier is said when it is a program's name and a
+    /// release, and any other text a worker states is replaced rather than repeated. The negative
+    /// control is the identifier of the test above, which is said.
+    #[test]
+    fn a_build_identifier_that_is_not_a_name_and_a_release_is_not_repeated() {
+        let long = format!("kr-worker/{}1", "1.".repeat(40));
+        for text in [
+            "kr-worker/0.1.0\u{202e}",
+            "kr-worker/0.1.0 with protocol 9.9.9",
+            "../kr-worker/0.1.0",
+            "Kr-Worker/0.1.0",
+            "kr-worker/0.1.0-rc.1",
+            "kr-worker/",
+            "kr-worker/0..1",
+            "1kr/0.1.0",
+            "kr-worker",
+            long.as_str(),
+        ] {
+            let said = refused(Some(&stated(text, another_level())));
+            assert!(!said.contains(text), "{text:?} is not repeated: {said}");
+            assert!(
+                said.contains("runs on [a build this kr does not name] with protocol"),
+                "{said}"
+            );
+        }
+        let said = refused(Some(&stated("kr-worker/0.1.0", another_level())));
+        assert!(
+            said.contains("runs on kr-worker/0.1.0 with protocol"),
+            "{said}"
         );
     }
 }
