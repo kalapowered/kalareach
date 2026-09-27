@@ -627,6 +627,7 @@ async fn run(cli: Cli) -> Result<Completion> {
         }
         Command::Diff(command) => kr_cli::diff::run(&paths, command, cli.json).await,
         Command::Device(command) => kr_cli::device::run(&paths, command, cli.json).await,
+        Command::Privacy(command) => kr_cli::privacy::run(&paths, command, cli.json).await,
         Command::Plugin(command) => {
             kr_cli::plugin::run(&paths, command, cli.json).await?;
             Ok(Completion::Done)

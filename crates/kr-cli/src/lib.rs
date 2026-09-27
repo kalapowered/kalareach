@@ -55,6 +55,7 @@ pub mod output;
 pub mod pair;
 pub mod platform;
 pub mod plugin;
+pub mod privacy;
 pub mod project;
 pub mod question;
 pub mod render;

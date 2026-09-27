@@ -64,6 +64,9 @@ pub enum Request {
     /// What the service manager applies to the control daemon's definition besides it: the
     /// drop-ins `kr host startup --set service` names.
     Startup,
+    /// Privacy mode's report: what is still owed and why, what is kept and what had already left:
+    /// `kr privacy`.
+    Privacy,
 }
 
 /// Content the person asked to read.
@@ -598,6 +601,7 @@ impl claim::Claimed for kr_protocol::ids::AuthorityRevision {}
 impl claim::Claimed for kr_protocol::ids::DeviceId {}
 impl claim::Claimed for kr_protocol::ids::GrantId {}
 impl claim::Claimed for kr_protocol::ids::SessionId {}
+impl claim::Claimed for kr_protocol::privacy::PrivacyDisabled {}
 impl claim::Claimed for kr_protocol::action::BarrierState {}
 impl claim::Claimed for kr_protocol::receipt::ReceiptState {}
 impl claim::Claimed for kr_protocol::pairing::DevicePublicKeys {}
@@ -1363,6 +1367,7 @@ mod tests {
         assert_closed::<kr_protocol::project::WorkspaceState>();
         assert_closed::<kr_protocol::error::RetryCategory>();
         assert_closed::<kr_protocol::identity::ProcessStartSource>();
+        assert_closed::<kr_protocol::privacy::PrivacyDisabled>();
     }
 
     /// Every type this file claims closed is one the planted test above checks: the claims and the

@@ -93,6 +93,9 @@ pub enum Command {
     /// Manage plugin packages, their capabilities and the repositories they come from.
     #[command(subcommand)]
     Plugin(PluginCommand),
+    /// Turn this environment's privacy mode on or off, or show where it stands.
+    #[command(subcommand)]
+    Privacy(PrivacyCommand),
 }
 
 /// The environment one command acts in.
@@ -494,6 +497,26 @@ pub struct DeviceListArguments {
 pub struct DeviceRevokeArguments {
     /// The device, by identifier.
     pub device: String,
+    /// The environment.
+    #[command(flatten)]
+    pub selector: EnvironmentSelector,
+}
+
+/// One `kr privacy` operation.
+#[derive(Subcommand)]
+pub enum PrivacyCommand {
+    /// Turn privacy mode on: retention stops, and what this host kept is cleaned up.
+    On(PrivacyArguments),
+    /// Turn privacy mode off, once its cleanup is complete. Nothing it removed comes back.
+    Off(PrivacyArguments),
+    /// Show where privacy mode stands: its generation, what is still owed, what is kept and what
+    /// had already left this host.
+    Status(PrivacyArguments),
+}
+
+/// `kr privacy on`, `off` and `status`.
+#[derive(Args)]
+pub struct PrivacyArguments {
     /// The environment.
     #[command(flatten)]
     pub selector: EnvironmentSelector,
