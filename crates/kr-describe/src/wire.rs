@@ -264,7 +264,7 @@ pub enum JobEnd {
     MemoryCeiling,
     /// No model was loaded.
     NotLoaded,
-    /// The process would not run it: work sent while other work was running.
+    /// The process would not run it: more work was waiting than it holds.
     Refused,
     /// The runtime failed.
     Failed,

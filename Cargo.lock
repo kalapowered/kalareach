@@ -4521,9 +4521,12 @@ version = "0.1.0"
 dependencies = [
  "kr-cbor",
  "kr-crypto",
+ "kr-describe",
+ "kr-ipc",
  "kr-protocol",
  "kr-worker",
  "rusqlite",
+ "rustix",
  "schemars 1.2.2",
  "serde",
  "serde_json",

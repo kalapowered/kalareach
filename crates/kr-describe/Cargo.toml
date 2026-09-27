@@ -8,11 +8,24 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[features]
+# What the tests of this crate and of kr-describe-model drive: a model that answers from the prompt,
+# and the stub executable that serves it over real pipes.
+testing = []
+
+[[bin]]
+name = "kr-describe-stub"
+path = "src/bin/kr-describe-stub.rs"
+required-features = ["testing"]
+
 [dependencies]
 # The profile's identity is signed over a canonical encoding, not over a JSON rendering, so the
 # transcript is built the same way every other signature in this product is built.
 kr-cbor.workspace = true
 kr-crypto.workspace = true
+# The description process reports its own start identity when it says it is ready, so the daemon
+# can end that process and no other.
+kr-ipc.workspace = true
 kr-protocol.workspace = true
 # Privacy mode's contract. Section 24 gives every subsystem one trait, and this crate implements
 # it over its own stores rather than restating the rule.
@@ -33,7 +46,15 @@ thiserror.workspace = true
 # on each platform. What it cannot apply, it reports as unqualified rather than assuming.
 thread-priority.workspace = true
 
+# The description process's environment lock: an exclusive advisory lock the operating system
+# releases when the process ends, as the daemon's own singleton lock is.
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true, features = ["fs"] }
+
 [dev-dependencies]
+kr-describe = { path = ".", features = ["testing"] }
+# Places the stub executable on the internal disk before a test starts it.
+kr-ipc = { workspace = true, features = ["testing"] }
 tempfile.workspace = true
 
 [lints.rust]

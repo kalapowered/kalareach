@@ -24,6 +24,7 @@
 //! | [`store`] | Names, pins and generated-description provenance, which outlive the session |
 //! | [`privacy`] | Privacy mode's four calls over this crate's own stores |
 //! | [`runtime`] | The inference seam, and the deterministic runtime the tests drive |
+//! | [`serve`] | The description process's side: its control and model threads, its watchdog and its lock |
 //! | [`service`] | The whole of it: admit, dispatch, validate, publish, unload |
 //! | [`wire`] | The frames between the control daemon and the description process |
 //! | [`qualification`] | The matrix section 22 ends with, and what has and has not been run |
@@ -91,8 +92,11 @@ pub mod qualification;
 pub mod queue;
 pub mod resource;
 pub mod runtime;
+pub mod serve;
 pub mod service;
 pub mod store;
+#[cfg(feature = "testing")]
+pub mod testing;
 pub mod time;
 pub mod wire;
 

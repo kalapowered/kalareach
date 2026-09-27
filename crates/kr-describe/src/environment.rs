@@ -28,6 +28,28 @@ use crate::profile::{ModelProfile, ProfileRevision};
 /// How many unload records this map keeps.
 const MAX_UNLOAD_RECORDS: usize = 32;
 
+/// Returns the target triple this build was compiled for, which a profile has to list.
+#[must_use]
+pub const fn build_target() -> &'static str {
+    if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        "aarch64-apple-darwin"
+    } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+        "x86_64-apple-darwin"
+    } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+        "aarch64-unknown-linux-gnu"
+    } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        "x86_64-unknown-linux-gnu"
+    } else if cfg!(all(windows, target_arch = "aarch64")) {
+        "aarch64-pc-windows-msvc"
+    } else if cfg!(all(windows, target_arch = "x86_64", target_env = "gnu")) {
+        "x86_64-pc-windows-gnu"
+    } else if cfg!(all(windows, target_arch = "x86_64")) {
+        "x86_64-pc-windows-msvc"
+    } else {
+        "unknown"
+    }
+}
+
 /// What kind of execution environment this is.
 ///
 /// The distinction that matters here is not the operating system but whether a model may be
