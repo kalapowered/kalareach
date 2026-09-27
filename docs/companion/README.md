@@ -21,9 +21,20 @@ it.
   the window                      the backend                    the host
   ────────────────────   invoke   ──────────────────   kr-client  ────────
   session_list        ──────────▶ Method::SessionList ──────────▶ session.list
-  composer_submit     ──────────▶ …one method each, named in this crate
+  agent_prompt_submit ──────────▶ Method::AgentPromptSubmit ────▶ the session's own worker
   open_external       ──────────▶ the scheme policy, then the platform opener
 ```
+
+The agent's methods are each session's own. Native code reaches a session's worker over that
+session's own link, the one the terminal view's input already takes, and checks that the process at
+the other end is the session's worker before it sends anything; the worker checks this device's
+rights itself. A read of the agent names the session and the instance, and a mutation also names
+the binding revision the person saw, so an action prepared against a conversation that has since
+moved is refused rather than applied to the new one. The attention inbox, review and change sets,
+sharing and packages are the daemon's, through the host's local door, and a session's retained
+output is read from its worker while it runs and from the daemon's archive once it has ended. An
+operation whose parameters or result the protocol does not publish has no command, and the page
+refuses it with `UNSUPPORTED_SCHEMA`.
 
 Native code tells the page about changes through listeners: the connection's state, the host's
 events, where the account stands, pairing, owner confirmations and dropped files. The shell
@@ -33,9 +44,13 @@ that, so no change can fall between the two. Nor does a screen show an answer on
 have stopped, or when they could not be registered. A change that arrives before the read's answer
 is at least as new as that answer, and the screen keeps it. A screen that reads again, on a change,
 a retry, a refresh or an action, shows only its newest read's answer, and the raw terminal view shows
-nothing it read for a session it has left. The conversation reads its document once its stream
-listener is registered, and again when the host is heard to be back: the nodes the stream delivers
-meanwhile follow the document in the order they arrived, and a node the document already holds is
+nothing it read for a session it has left. The host announces no new entry in an agent's history,
+no change to the attention inbox and no new request an agent is waiting on, so a screen that shows
+one reads it again while the page is shown: on a cadence, and at once when the page is shown again
+or the host is heard to be back. It has one read on its way at a time, and a read asked for
+meanwhile, as after an action, follows it. The conversation reads each agent's history from the
+entry after the last one it holds, and counts what the host withheld from this device once however
+often it reads. What a package shows arrives on the event stream, and a node already held is
 replaced only by a newer revision of it. In a session, when the launch surface was read at an older
 prompt generation than the view has heard since, its buttons start disabled.
 

@@ -24,6 +24,11 @@ else, so request correlation, action identifiers, receipts, cursors and the acti
 identically whichever way a client connected. The command line is a local client; a paired device on
 the far side of a relay runs the same code above the transport.
 
+`IpcTransport::connect` opens a local connection and completes its handshake. `IpcTransport::over`
+carries a session over a connection the caller opened and checked itself: the desktop application
+reaches a session's own worker that way, once it has confirmed that the process answering is that
+session's worker, and runs the same session above it.
+
 ## What a failure means
 
 `retry` is one table over every error code section 23 requires. Each code has a step, which is what
