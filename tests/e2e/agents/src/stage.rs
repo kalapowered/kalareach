@@ -941,13 +941,17 @@ pub fn beneath(run: &Run, ancestor: &ProcessStartIdentity, what: &str) -> Vec<Ag
                     };
                     run.note_system_program(entry.pid, &path);
                     if let Some(child) = table.iter().find(|child| child.parent == entry.pid) {
-                        panic!(
+                        // Kept with the run, as its own search keeps what it could not finish, so
+                        // the close fails too.
+                        let why = format!(
                             "the system program {} (process {}) beneath {what} started process \
                              {}, which cannot be followed back to it",
                             path.display(),
                             entry.pid,
                             child.pid
-                        )
+                        );
+                        run.undiscovered(&why);
+                        panic!("{why}")
                     }
                     continue;
                 }

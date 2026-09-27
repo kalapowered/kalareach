@@ -291,6 +291,9 @@ fn staged(
         for (pid, path) in provenance.system_programs() {
             run.note_system_program(pid, &path);
         }
+        for (pid, path) in run.system_programs() {
+            provenance.note_system_program(pid, &path);
+        }
         run.end_everything();
         run.remove_loaded_jobs();
         run.nothing_running().map(|_| ())
@@ -647,8 +650,13 @@ fn run_part(
         }
         ending.outcome
     });
+    // Every search's system programs, the provenance sampler's and the run's own, go to both: the
+    // close requires each ended, and the evidence names each.
     for (pid, path) in provenance.system_programs() {
         run.note_system_program(pid, &path);
+    }
+    for (pid, path) in run.system_programs() {
+        provenance.note_system_program(pid, &path);
     }
     let checked = run
         .closing_check()
@@ -1321,8 +1329,8 @@ fn login_holds(stage: &Stage<'_, '_>, variables: &[(String, String)]) {
 }
 
 /// The files the build list says must not exist before the agent starts, with `{config}` and
-/// `{work}` made the run's configuration and working directories and `{user}` the person's account
-/// name.
+/// `{work}` made the run's configuration and working directories and `{user}` the account name the
+/// system has for the person, as `id -un` says it.
 fn absent_paths(stage: &Stage<'_, '_>) -> Vec<PathBuf> {
     let account = stage.login.expect("a part with a login").account();
     let config = stage
@@ -1332,7 +1340,17 @@ fn absent_paths(stage: &Stage<'_, '_>) -> Vec<PathBuf> {
         .display()
         .to_string();
     let work = stage.run.work().display().to_string();
-    let user = std::env::var("USER").unwrap_or_default();
+    // The account name as the system has it, as the agent itself reads it, not the environment's.
+    let user = std::process::Command::new("/usr/bin/id")
+        .arg("-un")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| {
+            panic!("{ISOLATION_UNPROVEN} the account name the system has cannot be read")
+        });
     account
         .absent
         .iter()
