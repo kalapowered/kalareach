@@ -1084,6 +1084,26 @@ describe("the phone's raw terminal view (KR-REQ-08.02, 13.18)", () => {
     }
   })
 
+  it('owes no focus to a view the person left: coming back to the terminal leaves the focus where it is', async () => {
+    const { port, controls } = fakeHost()
+    const person = await onTerminal(port)
+    await waitFor(() => {
+      expect(screen.getAllByTestId('mobile-terminal-line').length).toBeGreaterThan(0)
+    })
+    await takeControl(person, controls)
+    programKeyboard()?.focus()
+    // A tap on a phone moves no focus to the button it taps: the view closes under the field.
+    fireEvent.click(screen.getByRole('tab', { name: 'Conversation' }))
+    await waitFor(() => {
+      expect(programKeyboard()).toBeNull()
+    })
+    fireEvent.click(screen.getByRole('tab', { name: 'Terminal' }))
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Take control' })).toBeEnabled()
+    })
+    expect(screen.getByRole('button', { name: 'Take control' })).not.toHaveFocus()
+  })
+
   it('moves on from the draft field with Control-Tab and back with Control-Shift-Tab, and leaves it Tab', async () => {
     const { port, controls } = fakeHost()
     controls.holdTerminalControl()

@@ -7,8 +7,8 @@
  * control again, or, once the view has ended, to Attach again. The destination may not take the
  * focus at once: a disabled button takes none, and on a phone the bar holding the mode button is
  * hidden while a software keyboard is up, which the keyboard's own field going makes it leave. So the
- * move is owed until the destination can take it, and focus the person puts anywhere else first
- * settles it.
+ * move is owed until the destination can take it. Focus the person puts anywhere else first settles
+ * it, and so does the destination leaving the page with its view.
  */
 
 import { useLayoutEffect, useRef, type FocusEvent } from 'react'
@@ -51,7 +51,13 @@ export function useFocusWhenControlEnds({
       return
     }
     const target = destination()
-    if (target !== null && takesFocus(target)) {
+    // A destination that is not in the page is a view that has gone, as when the phone shows the
+    // conversation instead: nothing is owed to one that comes later.
+    if (target === null) {
+      owed.current = false
+      return
+    }
+    if (takesFocus(target)) {
       target.focus()
       owed.current = false
     }
