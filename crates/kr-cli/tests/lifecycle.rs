@@ -3173,6 +3173,31 @@ enum Stated {
     /// Nothing, as a worker of a build before the statement says: its answer to the hello names no
     /// build, and every screen it sends opens with the reset that build wrote.
     Nothing,
+    /// A build. The worker sends that build's screens: this build's when the two protocol
+    /// versions share a compatibility level, and otherwise the reset an earlier build wrote.
+    Build(kr_protocol::local::LocalBuild),
+}
+
+impl Stated {
+    /// Whether a `kr` of this build can read the screens this worker sends.
+    fn readable(&self) -> bool {
+        match self {
+            Self::Nothing => false,
+            Self::Build(build) => build
+                .protocol_version
+                .shares_frames_with(kr_protocol::hello::PACKAGE_VERSION),
+        }
+    }
+}
+
+/// The build identifier a worker of another build states.
+fn another_worker_build(
+    protocol_version: kr_protocol::hello::PackageVersion,
+) -> kr_protocol::local::LocalBuild {
+    kr_protocol::local::LocalBuild {
+        build_id: BuildId::new("kr-worker/0.1.0").expect("a build identifier"),
+        protocol_version,
+    }
 }
 
 /// The reset that opens a screen, as a worker of an earlier build writes it: before a screen named
@@ -3331,9 +3356,11 @@ async fn serve_as_another_build(
         },
         capabilities: CanonicalSet::new(),
         max_receive: hello.max_receive,
-        build: None,
+        build: match &stated {
+            Stated::Nothing => None,
+            Stated::Build(build) => Some(build.clone()),
+        },
     };
-    let Stated::Nothing = stated;
     if writer
         .write_message(&ControlFrame::HelloAck(Box::new(acknowledgement)))
         .await
@@ -3466,52 +3493,195 @@ async fn serve_as_another_build(
             // worker answers at once; this one waits a moment first, so the exchange a test is
             // watching cannot fill the machine.
             tokio::time::sleep(Duration::from_millis(100)).await;
-            let reset = Notification {
-                stream_id: StreamId::new(kr_worker::service::OUTPUT_STREAM).expect("a stream name"),
-                sequence: EventSequence::new(0),
-                event_type: EventType::new(kr_protocol::projection::PROJECTION_RESET_EVENT)
-                    .expect("an event type"),
-                payload: ParamsValue::from_typed(&EarlierReset {
-                    projection_generation: U64::new(1),
-                    cursor: U64::ZERO,
-                    reason: kr_protocol::projection::ProjectionResetReason::Attached,
-                })
-                .expect("encodes"),
+            let events = if stated.readable() {
+                a_screen_of_this_build()
+            } else {
+                vec![(
+                    kr_protocol::projection::PROJECTION_RESET_EVENT,
+                    ParamsValue::from_typed(&EarlierReset {
+                        projection_generation: U64::new(1),
+                        cursor: U64::ZERO,
+                        reason: kr_protocol::projection::ProjectionResetReason::Attached,
+                    })
+                    .expect("encodes"),
+                )]
             };
-            if writer
-                .write_message(&ControlFrame::Notification(reset))
-                .await
-                .is_err()
-            {
-                return;
+            for (sequence, (event_type, payload)) in (0_u64..).zip(events) {
+                let event = Notification {
+                    stream_id: StreamId::new(kr_worker::service::OUTPUT_STREAM)
+                        .expect("a stream name"),
+                    sequence: EventSequence::new(sequence),
+                    event_type: EventType::new(event_type).expect("an event type"),
+                    payload,
+                };
+                if writer
+                    .write_message(&ControlFrame::Notification(event))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
             }
         }
     }
 }
 
-/// Opens a window that attaches to the session of a worker of another build, and returns the
-/// status `kr attach` ended with and what the terminal was sent, or fails with what it had been
-/// sent when `kr` was still attached at [`OTHER_BUILD_BOUND`].
-fn attach_to_another_build(host: &Host, worker: &AnotherBuild) -> (Window, i32, String) {
-    const FINISHED: &str = "attach-finished-";
-    let window = Window::open(
+/// The line on the one screen a worker of a build this build reads sends.
+const ANOTHER_BUILD_SCREEN: &str = "the screen of a worker a patch number apart";
+
+/// A subscription's opening screen as a worker of a build this build reads sends it: its reset,
+/// its header and one page of rows, the first of which says [`ANOTHER_BUILD_SCREEN`].
+fn a_screen_of_this_build() -> Vec<(&'static str, kr_protocol::envelope::ParamsValue)> {
+    use kr_protocol::envelope::ParamsValue;
+    use kr_protocol::projection::{
+        CellRendition, CellRun, CharsetState, KittyKeyboardState, MarginState, PaletteProvenance,
+        PaletteState, ProjectedBuffer, ProjectedCursor, ProjectedKeyboard, ProjectedRow,
+        ProjectedTitle, ProjectedViewport, ProjectionReset, ProjectionResetReason,
+        ProjectionRowPage, ProjectionSnapshot, Rgb,
+    };
+    use kr_protocol::scalars::U64;
+    use kr_protocol::session::Dimensions;
+
+    const COLUMNS: u64 = 80;
+    const ROWS: u64 = 24;
+    let colour = |red, green, blue| Rgb { red, green, blue };
+    let reset = ProjectionReset {
+        projection_generation: U64::new(1),
+        cursor: U64::ZERO,
+        reason: ProjectionResetReason::Attached,
+        window_revision: U64::ZERO,
+    };
+    let header = ProjectionSnapshot {
+        projection_generation: U64::new(1),
+        output_cursor: U64::ZERO,
+        window_revision: U64::ZERO,
+        active_buffer: ProjectedBuffer::Primary,
+        dimensions: Dimensions::new(COLUMNS, ROWS),
+        viewport: ProjectedViewport {
+            top_row: U64::ZERO,
+            screen_top_row: U64::ZERO,
+            rows: U64::new(ROWS),
+            left_column: U64::ZERO,
+            columns: U64::new(COLUMNS),
+        },
+        cursor: ProjectedCursor {
+            column: U64::ZERO,
+            row: U64::new(1),
+            visible: true,
+            style: U64::new(1),
+            pending_wrap: false,
+        },
+        saved_cursors: Vec::new(),
+        margins: MarginState {
+            top: U64::ZERO,
+            bottom: U64::new(ROWS - 1),
+            left: U64::ZERO,
+            right: U64::new(COLUMNS - 1),
+        },
+        rendition: CellRendition::PLAIN,
+        tab_stops: Vec::new(),
+        charsets: CharsetState {
+            g0: "Ascii".to_owned(),
+            g1: "Ascii".to_owned(),
+            shift_out: false,
+        },
+        modes: Vec::new(),
+        keypad_application: false,
+        keyboard: ProjectedKeyboard {
+            modify_other_keys: U64::ZERO,
+            primary: KittyKeyboardState {
+                flags: Nullable::null(),
+                stack: Vec::new(),
+            },
+            alternate: KittyKeyboardState {
+                flags: Nullable::null(),
+                stack: Vec::new(),
+            },
+        },
+        title: ProjectedTitle::default(),
+        title_stack: Vec::new(),
+        hyperlink: Nullable::null(),
+        palette: PaletteState {
+            source: PaletteProvenance::DarkPreset,
+            foreground: colour(0xdc, 0xdc, 0xda),
+            background: colour(0x07, 0x12, 0x17),
+            cursor: colour(0xdc, 0xdc, 0xda),
+            pointer_foreground: colour(0xdc, 0xdc, 0xda),
+            pointer_background: colour(0x07, 0x12, 0x17),
+            selection_background: colour(0x31, 0x5e, 0x4a),
+            selection_foreground: colour(0xff, 0xff, 0xff),
+            overrides: Vec::new(),
+        },
+        oldest_retained_row: U64::ZERO,
+        evicted: false,
+        degraded: false,
+    };
+    let rows = ProjectionRowPage {
+        projection_generation: U64::new(1),
+        output_cursor: U64::ZERO,
+        buffer: ProjectedBuffer::Primary,
+        rows: vec![ProjectedRow {
+            row: U64::ZERO,
+            soft_wrapped: false,
+            truncated: false,
+            runs: vec![CellRun {
+                column: U64::ZERO,
+                cells: U64::new(u64::try_from(ANOTHER_BUILD_SCREEN.len()).expect("a short line")),
+                text: ANOTHER_BUILD_SCREEN.to_owned(),
+                rendition: CellRendition::PLAIN,
+                hyperlink: Nullable::null(),
+            }],
+        }],
+        oldest_retained_row: U64::ZERO,
+        evicted: false,
+        more: false,
+    };
+    vec![
+        (
+            kr_protocol::projection::PROJECTION_RESET_EVENT,
+            ParamsValue::from_typed(&reset).expect("encodes"),
+        ),
+        (
+            kr_protocol::projection::PROJECTION_SNAPSHOT_EVENT,
+            ParamsValue::from_typed(&header).expect("encodes"),
+        ),
+        (
+            kr_protocol::projection::PROJECTION_ROWS_EVENT,
+            ParamsValue::from_typed(&rows).expect("encodes"),
+        ),
+    ]
+}
+
+/// What the shell of a window [`attach_window`] opens prints before the status `kr attach` ended
+/// with.
+const ATTACH_FINISHED: &str = "attach-finished-";
+
+/// Opens a window whose shell attaches to the session of a worker of another build, and then
+/// prints how `kr attach` ended.
+fn attach_window(host: &Host) -> Window {
+    Window::open(
         host,
         &format!(
-            "{kr} attach --no-probe {OTHER_BUILD_DISPLAY}; printf '\\n{FINISHED}%s\\n' \"$?\"; \
+            "{kr} attach --no-probe {OTHER_BUILD_DISPLAY}; printf '\\n{ATTACH_FINISHED}%s\\n' \"$?\"; \
              IFS= read -r _",
             kr = quoted(&kr()),
         ),
-    );
+    )
+}
+
+/// Waits for the `kr attach` in `window` to end, and returns the status it ended with and what the
+/// terminal was sent. Fails with what the terminal had been sent, and what `kr` had asked of the
+/// worker, when `kr` is still attached at [`OTHER_BUILD_BOUND`].
+fn attach_ended(window: &Window, asked: &Mutex<Vec<String>>) -> (i32, String) {
     let started = Instant::now();
     loop {
         let shown = String::from_utf8_lossy(&window.screen.since(0)).into_owned();
-        if let Some(at) = shown.find(FINISHED) {
-            let rest = &shown[at + FINISHED.len()..];
+        if let Some(at) = shown.find(ATTACH_FINISHED) {
+            let rest = &shown[at + ATTACH_FINISHED.len()..];
             let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
             // Only once the line is whole: a status is followed by the end of its line.
             if rest[digits.len()..].starts_with(['\r', '\n']) {
-                let status = digits.parse().expect("a status");
-                return (window, status, shown);
+                return (digits.parse().expect("a status"), shown);
             }
         }
         assert!(
@@ -3520,10 +3690,21 @@ fn attach_to_another_build(host: &Host, worker: &AnotherBuild) -> (Window, i32, 
              about why it showed no screen; it asked the worker for {:?}, and the terminal was \
              sent: {}",
             started.elapsed(),
-            worker.asked(),
+            asked.lock().unwrap_or_else(PoisonError::into_inner),
             shown.escape_debug()
         );
         std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Requires `shown` to say each of `said`.
+fn says_each(shown: &str, said: &[&str]) {
+    for said in said {
+        assert!(
+            shown.contains(said),
+            "kr says {said:?}: {}",
+            shown.escape_debug()
+        );
     }
 }
 
@@ -3536,25 +3717,94 @@ fn attach_to_another_build(host: &Host, worker: &AnotherBuild) -> (Window, i32, 
 fn kr_names_a_worker_of_an_earlier_build_and_stops_rather_than_waiting_on_its_screens() {
     let host = Host::start();
     let worker = AnotherBuild::start(&host, Stated::Nothing);
-    let (window, status, shown) = attach_to_another_build(&host, &worker);
+    let window = attach_window(&host);
+    let (status, shown) = attach_ended(&window, &worker.asked);
     assert_eq!(status, 8, "the status of a refused request: {shown}");
-    for said in [
-        "UNSUPPORTED_SCHEMA",
-        "session 900",
-        "an earlier build",
-        "kr close 900",
-        "a kr of the worker's build",
-    ] {
-        assert!(
-            shown.contains(said),
-            "kr says {said:?}: {}",
-            shown.escape_debug()
-        );
-    }
+    says_each(
+        &shown,
+        &[
+            "UNSUPPORTED_SCHEMA",
+            "session 900",
+            "an earlier build",
+            "kr close 900",
+            "a kr of the worker's build",
+        ],
+    );
     let asked = worker.asked();
     assert!(
         asked.is_empty(),
         "nothing of the session is asked for before the refusal: {asked:?}"
+    );
+    window.wait_until_put_back("the terminal to be back as kr found it");
+}
+
+/// A worker that states a protocol version of another compatibility level, another minor number
+/// below 1.0.0, is refused the same way, and the refusal names both builds and both versions.
+#[test]
+fn kr_names_a_worker_of_another_protocol_version_and_both_builds_and_stops() {
+    let ours = kr_protocol::hello::PACKAGE_VERSION;
+    let theirs = if ours.major == 0 {
+        kr_protocol::hello::PackageVersion::new(0, ours.minor.checked_sub(1).unwrap_or(1), 4)
+    } else {
+        kr_protocol::hello::PackageVersion::new(ours.major - 1, 9, 4)
+    };
+    assert!(!theirs.shares_frames_with(ours), "{theirs} and {ours}");
+    let host = Host::start();
+    let worker = AnotherBuild::start(&host, Stated::Build(another_worker_build(theirs)));
+    let window = attach_window(&host);
+    let (status, shown) = attach_ended(&window, &worker.asked);
+    assert_eq!(status, 8, "the status of a refused request: {shown}");
+    says_each(
+        &shown,
+        &[
+            "UNSUPPORTED_SCHEMA",
+            &format!("session 900 runs on kr-worker/0.1.0 with protocol {theirs}"),
+            &format!(
+                "this is {} with protocol {ours}",
+                kr_cli::build_id().as_str()
+            ),
+            "kr close 900",
+            "a kr of the worker's build",
+        ],
+    );
+    let asked = worker.asked();
+    assert!(
+        asked.is_empty(),
+        "nothing of the session is asked for before the refusal: {asked:?}"
+    );
+    window.wait_until_put_back("the terminal to be back as kr found it");
+}
+
+/// The control: a worker whose protocol version differs from this build's in the patch number
+/// alone is attached to as before, and its screen is drawn.
+#[test]
+fn a_worker_a_patch_number_apart_is_attached_to_and_drawn() {
+    let ours = kr_protocol::hello::PACKAGE_VERSION;
+    let theirs = kr_protocol::hello::PackageVersion::new(ours.major, ours.minor, ours.patch + 1);
+    let host = Host::start();
+    let worker = AnotherBuild::start(&host, Stated::Build(another_worker_build(theirs)));
+    let window = attach_window(&host);
+    window.wait_for(
+        0,
+        ANOTHER_BUILD_SCREEN.as_bytes(),
+        "kr drew the screen of the worker a patch number apart",
+    );
+    let asked = worker.asked();
+    for method in ["session.attach", "input.acquire", "events.subscribe"] {
+        assert!(
+            asked.iter().any(|asked| asked == method),
+            "kr asked for {method}: {asked:?}"
+        );
+    }
+    // The worker goes, and the attachment ends as any does whose connection ended.
+    let recorded = Arc::clone(&worker.asked);
+    drop(worker);
+    let (status, shown) = attach_ended(&window, &recorded);
+    assert_eq!(status, CONNECTION_LOST, "{}", shown.escape_debug());
+    assert!(
+        contains(shown.as_bytes(), CONNECTION_ENDED),
+        "{}",
+        shown.escape_debug()
     );
     window.wait_until_put_back("the terminal to be back as kr found it");
 }
