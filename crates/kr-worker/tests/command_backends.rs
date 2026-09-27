@@ -8,7 +8,7 @@
 //!
 //! | Row | What proves it |
 //! | --- | --- |
-//! | KR-REQ-12.07 | a backend's endpoint, credential and launch record exist before the answer; a bypass creates nothing; one line runs one integrated invocation; each session has a root of its own; a declared package establishes with its flags and variables; a session entry whose flags are not the package's, a run that splits the flags and an executable no match rule recognises establish nothing; a bypassed invocation exports nothing |
+//! | KR-REQ-12.07 | a backend's endpoint, credential and launch record exist before the answer; a bypass creates nothing; one line runs one integrated invocation; each session has a root of its own; a declared package establishes with its flags, and its variables in the launch record rather than the answer; a session entry whose flags are not the package's, a run that splits the flags and an executable no match rule recognises establish nothing; a bypassed invocation exports nothing |
 
 #![cfg(unix)]
 
@@ -484,10 +484,35 @@ async fn kr_req_12_07_each_session_has_a_root_of_its_own() {
     let _ = neighbour.close();
 }
 
-/// KR-REQ-12.07: a package that declares flags and a variable establishes with both: the flags
-/// stand where the shell added them, and the answer exports the variable beside the registration,
-/// in the order the package declares. Gemini CLI's own declaration adds no flag and exports its
-/// variable all the same.
+/// The variables a backend's launch record names, in order, for the launcher to set once the launch
+/// is committed.
+fn recorded_variables(answer: &kr_protocol::root::CommandBackend) -> Vec<(String, String)> {
+    let directory = PathBuf::from(&answer.environment[0].value)
+        .parent()
+        .expect("the backend's directory")
+        .to_path_buf();
+    let record: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(directory.join("launch")).expect("the launch record"),
+    )
+    .expect("the launch record is JSON");
+    record["variables"]
+        .as_array()
+        .expect("the record names the variables")
+        .iter()
+        .map(|variable| {
+            (
+                variable["name"].as_str().expect("a name").to_owned(),
+                variable["value"].as_str().expect("a value").to_owned(),
+            )
+        })
+        .collect()
+}
+
+/// KR-REQ-12.07, KR-REQ-12.20: a package that declares flags and a variable establishes with both:
+/// the flags stand where the shell added them, the answer exports the registration alone, and the
+/// launch record names the variable, in the order the package declares, for the launcher to set
+/// once the launch is committed. Gemini CLI's own declaration adds no flag and records its variable
+/// all the same.
 #[tokio::test]
 async fn kr_req_12_07_a_declared_package_establishes_with_its_flags_and_variables() {
     let setup = Setup::shaped(
@@ -501,14 +526,16 @@ async fn kr_req_12_07_a_declared_package_establishes_with_its_flags_and_variable
         .backends
         .establish(&request(&setup, &resumed, &integration, 3))
         .expect("a backend is established");
-    let exported: Vec<(&str, &str)> = answer
+    let exported: Vec<&str> = answer
         .environment
         .iter()
-        .map(|variable| (variable.name.as_str(), variable.value.as_str()))
+        .map(|variable| variable.name.as_str())
         .collect();
-    assert_eq!(exported.len(), 2, "{exported:?}");
-    assert_eq!(exported[0].0, "KR_REGISTRATION");
-    assert_eq!(exported[1], ("GEMINI_CLI_NO_RELAUNCH", "true"));
+    assert_eq!(exported, ["KR_REGISTRATION"], "the shell exports the registration alone");
+    assert_eq!(
+        recorded_variables(&answer),
+        [("GEMINI_CLI_NO_RELAUNCH".to_owned(), "true".to_owned())]
+    );
     assert_eq!(registration_name(&answer), "registration.2.1");
 
     let only = Setup::shaped(
@@ -526,8 +553,25 @@ async fn kr_req_12_07_a_declared_package_establishes_with_its_flags_and_variable
         .iter()
         .map(|variable| variable.name.as_str())
         .collect();
-    assert_eq!(names, ["KR_REGISTRATION", "GEMINI_CLI_NO_RELAUNCH"]);
+    assert_eq!(names, ["KR_REGISTRATION"]);
+    assert_eq!(
+        recorded_variables(&answer),
+        [("GEMINI_CLI_NO_RELAUNCH".to_owned(), "true".to_owned())]
+    );
     assert_eq!(registration_name(&answer), "registration.0.0");
+
+    // A package that declares no variable records none.
+    let claude = Setup::new();
+    let answer = claude
+        .backends
+        .establish(&request(
+            &claude,
+            &invocation(&["claude"]),
+            &Setup::integration(),
+            1,
+        ))
+        .expect("a backend is established");
+    assert!(recorded_variables(&answer).is_empty());
 }
 
 /// KR-REQ-12.07: the session's entry is checked against the package the installation verified:
@@ -620,11 +664,9 @@ async fn kr_req_12_07_a_bypassed_invocation_exports_nothing() {
             1,
         ))
         .expect("a backend is established");
-    assert!(
-        established
-            .environment
-            .iter()
-            .any(|variable| variable.name == "GEMINI_CLI_NO_RELAUNCH")
+    assert_eq!(
+        recorded_variables(&established),
+        [("GEMINI_CLI_NO_RELAUNCH".to_owned(), "true".to_owned())]
     );
     let managed = InvocationContext {
         managed_root_shell: true,

@@ -15,6 +15,7 @@
 //! | KR-REQ-05.09 | a launch is admitted by the kernel's account of its process, its parent and its start, and the backend's credential; the program's bridges only when it executes what was hashed |
 //! | KR-REQ-11.34 | the launched program's hooks are admitted against the registration the launch published |
 //! | KR-REQ-11.13 | a launched instance is bound, at its admission, to the connector its command resolved; a launch rolled back takes its binding with it, and an instance's end takes its own |
+//! | KR-REQ-12.20 | the variable Gemini CLI's integration declares is set by the launcher once the launch is committed; a launch that runs as typed keeps the person's own value of it, or its absence |
 
 #![cfg(unix)]
 
@@ -49,6 +50,7 @@ const SCRIPT: &str = r#"report="$REPORT"
     echo "registered=no"
   fi
   echo "variable=${KR_REGISTRATION:-none}"
+  echo "relaunch=${GEMINI_CLI_NO_RELAUNCH-unset}"
   echo "args=$0|$*"
 } > "$report.part" && mv "$report.part" "$report"
 if [ -n "$HOOK" ]; then
@@ -207,10 +209,41 @@ impl Shell {
         Self::with_source(|source| source, true)
     }
 
+    /// A shell whose connector is the released Gemini CLI package's: it adds no flag and declares
+    /// one variable.
+    fn gemini() -> Self {
+        Self::with_package(
+            "gemini",
+            |store, forwarder| {
+                fixture::package(store, forwarder, &fixture::Shape::gemini_cli(&[]))
+                    .expect("the package is written")
+            },
+            false,
+        )
+    }
+
     fn with_source(
         installed: impl FnOnce(
             kr_worker::broker::connectors::ConnectorSource,
         ) -> kr_worker::broker::connectors::ConnectorSource,
+        viewed: bool,
+    ) -> Self {
+        Self::with_package(
+            fixture::COMMAND,
+            |store, forwarder| {
+                installed(
+                    fixture::claude_code_package(store, forwarder)
+                        .expect("the package is written"),
+                )
+            },
+            viewed,
+        )
+    }
+
+    /// A shell whose `command` is the program, integrated by the package `package` writes.
+    fn with_package(
+        command: &str,
+        package: impl FnOnce(&Path, &Path) -> kr_worker::broker::connectors::ConnectorSource,
         viewed: bool,
     ) -> Self {
         let placed = Placed::new();
@@ -220,7 +253,7 @@ impl Shell {
             .build()
             .expect("a runtime");
         let bin = placed.host.root().join("bin");
-        let executable = bin.join("claude");
+        let executable = bin.join(command);
         let other = bin.join("other");
         let (program, another) = shells();
         std::os::unix::fs::symlink(program, &executable).expect("the program stands in");
@@ -228,10 +261,7 @@ impl Shell {
         let store = placed.host.root().join("store");
         std::fs::create_dir_all(&store).expect("a store");
         let sources = Arc::new(ConnectorSources::new());
-        let source = installed(
-            fixture::claude_code_package(&store, &placed.forwarder)
-                .expect("the package is written"),
-        );
+        let source = package(&store, &placed.forwarder);
         let broker = Arc::new(
             Broker::open(None, session(), JournalHealth::shared()).expect("the broker opens"),
         );
@@ -244,7 +274,7 @@ impl Shell {
             vec![kr_worker::broker::catalogue::testing::admitted(&source)],
             1,
         );
-        assert!(sources.for_command(fixture::COMMAND).is_some());
+        assert!(sources.for_command(command).is_some());
         // The host tree itself, so a backend's socket path stays inside the bound it has on macOS.
         let runtime_dir = placed.host.root().to_path_buf();
         let mut backends = CommandBackends::new(
@@ -368,21 +398,39 @@ impl Shell {
     }
 
     fn establish_where(&self, executable: &Path, typed: &[String], cwd: &Path) -> CommandBackend {
+        let answered = Self::answered_for(typed);
+        self.establish_exactly(
+            &Self::integration(),
+            executable,
+            typed,
+            &answered,
+            &words(&fixture::FLAGS),
+            cwd,
+        )
+    }
+
+    /// Establishes a backend for the next line: `typed` as `integration` resolved it to
+    /// `answered`, which adds `added`.
+    fn establish_exactly(
+        &self,
+        integration: &CommandIntegration,
+        executable: &Path,
+        typed: &[String],
+        answered: &[String],
+        added: &[String],
+        cwd: &Path,
+    ) -> CommandBackend {
         let generation = self
             .generation
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let integration = Self::integration();
-        let typed = typed.to_vec();
-        let answered = Self::answered_for(&typed);
-        let added = words(&fixture::FLAGS);
         let _entered = self.runtime.enter();
         self.backends
             .establish(&EstablishRequest {
                 prompt_generation: PromptGeneration::new(generation),
-                typed: &typed,
-                arguments: &answered,
-                added: &added,
-                integration: &integration,
+                typed,
+                arguments: answered,
+                added,
+                integration,
                 executable: executable.to_str().expect("a text path"),
                 cwd: cwd.to_str().expect("a text path"),
                 cwd_revision: CwdRevision::new(1),
@@ -390,6 +438,38 @@ impl Shell {
                     .expect("this process"),
             })
             .expect("a backend is established")
+    }
+
+    /// Establishes a backend for `gemini` typed with the script, which its integration answers
+    /// with nothing added.
+    fn establish_gemini(&self) -> CommandBackend {
+        let typed = gemini_typed();
+        self.establish_exactly(
+            &gemini_integration(),
+            &self.executable,
+            &typed,
+            &typed,
+            &[],
+            self.placed.host.root(),
+        )
+    }
+
+    /// Starts the launcher for `vector` in the environment the shell gives it: the person's own
+    /// variables, `own`, with the answer's variables in place of any of the same name, as the
+    /// shell's executor merges them.
+    fn launch_as_the_shell_does(
+        &self,
+        answer: &CommandBackend,
+        vector: &[String],
+        name: &str,
+        own: &[(&str, &str)],
+    ) -> std::process::Child {
+        let mut command = self.launcher(&self.executable, vector, None);
+        self.prepare(&mut command, None, name, own);
+        for variable in &answer.environment {
+            command.env(&variable.name, &variable.value);
+        }
+        command.spawn().expect("the launcher starts")
     }
 
     /// The launcher's command line for an answer: `launch -- <executable> <vector>`.
@@ -867,6 +947,110 @@ fn kr_req_12_07_a_backend_that_does_not_answer_leaves_the_invocation_as_typed() 
     drop(listener);
 }
 
+/// Gemini CLI's integration as a session carries it: the command, and no flag.
+fn gemini_integration() -> CommandIntegration {
+    CommandIntegration {
+        command: "gemini".to_owned(),
+        flags: Vec::new(),
+        enabled: true,
+    }
+}
+
+/// The vector every Gemini CLI case types, which its integration answers unchanged.
+fn gemini_typed() -> Vec<String> {
+    vec!["gemini".to_owned(), "-c".to_owned(), SCRIPT.to_owned()]
+}
+
+/// KR-REQ-12.20: an integrated launch runs with the variable its package declares. The shell
+/// exports only the registration; the launcher sets the declared value once the launch is
+/// committed, in place of whatever the person's own environment held. Control: the registration is
+/// handled as before, exported by the shell and there when the program runs.
+#[test]
+fn kr_req_12_20_an_integrated_launch_runs_with_the_declared_variable() {
+    let shell = Shell::gemini();
+    for (own, name) in [(None, "absent"), (Some("false"), "false")] {
+        let answer = shell.establish_gemini();
+        let exported: Vec<&str> = answer
+            .environment
+            .iter()
+            .map(|variable| variable.name.as_str())
+            .collect();
+        assert_eq!(exported, ["KR_REGISTRATION"], "the shell exports the registration alone");
+        let own: Vec<(&str, &str)> = own
+            .map(|value| ("GEMINI_CLI_NO_RELAUNCH", value))
+            .into_iter()
+            .collect();
+        let child = shell.launch_as_the_shell_does(&answer, &gemini_typed(), name, &own);
+        let report = shell.report(name);
+        assert_eq!(report["registered"], "yes", "{name}: the launch was committed");
+        assert_eq!(report["variable"], answer.environment[0].value, "{name}");
+        assert_eq!(
+            report["relaunch"], "true",
+            "{name}: the program runs with the declared value"
+        );
+        let (status, said) = finish(child);
+        assert!(status.success(), "{name}: {said}");
+    }
+}
+
+/// KR-REQ-12.20: a launch that runs as typed keeps the person's own environment exactly: their own
+/// value of the variable the integration declares, or its absence, whether the backend refused the
+/// launch or never answered it. Control: the registration is taken out as before.
+#[test]
+fn kr_req_12_20_an_as_typed_run_keeps_the_person_s_own_variable() {
+    let shell = Shell::gemini();
+    for (own, name, expected) in [
+        (Some("false"), "refused-own", "false"),
+        (None, "refused-absent", "unset"),
+    ] {
+        // Another credential: the backend refuses the launch.
+        let answer = shell.establish_gemini();
+        std::fs::write(
+            Shell::directory(&answer).join("credential"),
+            "05".repeat(32),
+        )
+        .expect("the credential is replaced");
+        let own: Vec<(&str, &str)> = own
+            .map(|value| ("GEMINI_CLI_NO_RELAUNCH", value))
+            .into_iter()
+            .collect();
+        let _ = finish(shell.launch_as_the_shell_does(&answer, &gemini_typed(), name, &own));
+        let report = shell.report(name);
+        assert_eq!(report["registered"], "no", "{name}");
+        assert_eq!(report["variable"], "none", "{name}");
+        assert_eq!(report["relaunch"], expected, "{name}: the person's own environment");
+    }
+
+    // A backend that never answers: the launcher runs as typed after its deadline.
+    let quiet = private(&shell, "q");
+    let endpoint = quiet.join("e.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&endpoint).expect("a quiet endpoint");
+    let answer = hand_made_backend_declaring(
+        &shell,
+        &quiet,
+        &endpoint,
+        0,
+        0,
+        &[("GEMINI_CLI_NO_RELAUNCH", "true")],
+    );
+    let started = Instant::now();
+    let (_, said) = finish(shell.launch_as_the_shell_does(
+        &answer,
+        &gemini_typed(),
+        "quiet",
+        &[("GEMINI_CLI_NO_RELAUNCH", "false")],
+    ));
+    assert!(
+        started.elapsed() >= kr_hook::launch::ADMISSION_DEADLINE,
+        "it waited for its deadline: {said}"
+    );
+    let report = shell.report("quiet");
+    assert_eq!(report["registered"], "no");
+    assert_eq!(report["variable"], "none");
+    assert_eq!(report["relaunch"], "false", "the person's own value");
+    drop(listener);
+}
+
 /// KR-REQ-12.07: a launcher that goes away after its admission and before it says it is going
 /// leaves nothing: the registration is taken back and the instance given back, and a retry of the
 /// same invocation is admitted.
@@ -1084,6 +1268,19 @@ fn hand_made_backend_at(
     endpoint: &Path,
     typed: usize,
 ) -> CommandBackend {
+    hand_made_backend_declaring(shell, directory, endpoint, typed, 2, &[])
+}
+
+/// The same, for a typed vector of `typed` arguments to which `added` flags were added, whose
+/// record names `variables` for the launcher to set once the launch is committed.
+fn hand_made_backend_declaring(
+    shell: &Shell,
+    directory: &Path,
+    endpoint: &Path,
+    typed: usize,
+    added: usize,
+    variables: &[(&str, &str)],
+) -> CommandBackend {
     kr_ipc::paths::create_new_owner_only_file(
         &directory.join("credential"),
         "09".repeat(32).as_bytes(),
@@ -1092,6 +1289,10 @@ fn hand_made_backend_at(
     let record = serde_json::json!({
         "endpoint": endpoint.display().to_string(),
         "credential": directory.join("credential").display().to_string(),
+        "variables": variables
+            .iter()
+            .map(|(name, value)| serde_json::json!({ "name": name, "value": value }))
+            .collect::<Vec<_>>(),
     });
     kr_ipc::paths::write_owner_only_file(&directory.join("launch"), record.to_string().as_bytes())
         .expect("a launch record");
@@ -1101,7 +1302,7 @@ fn hand_made_backend_at(
         environment: vec![EnvironmentVariable {
             name: "KR_REGISTRATION".to_owned(),
             value: directory
-                .join(format!("registration.{typed}.2"))
+                .join(format!("registration.{typed}.{added}"))
                 .display()
                 .to_string(),
         }],
