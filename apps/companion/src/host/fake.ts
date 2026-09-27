@@ -2256,8 +2256,10 @@ function asDecoded(value: number): { readonly integer: bigint } | { readonly flo
 }
 
 /**
- * A floating point number as native code's decoder writes one in its words: every digit, without an
- * exponent, and with a decimal point.
+ * A floating point number in the form native code's decoder writes one: every digit, without an
+ * exponent, and with a decimal point. The digits are JavaScript's shortest form for the number; for
+ * one with more significant digits than a double holds, or one halfway between two shortest forms,
+ * the decoder's own digits can differ in the last place.
  */
 function asFloatWords(value: number): string {
   const text = String(value)
@@ -2277,7 +2279,11 @@ function asFloatWords(value: number): string {
   return written.includes('.') ? written : `${written}.0`
 }
 
-/** How native code's decoder names a value it did not expect, in its words. */
+/**
+ * How native code's decoder names a value it did not expect, in its words for every kind of value,
+ * with the digits of a floating point number as `asFloatWords` gives them and a string escaped as
+ * JSON escapes it, where the decoder escapes a control character in its own way.
+ */
 function unexpected(value: unknown): string {
   if (typeof value === 'boolean') return `boolean \`${value}\``
   if (typeof value === 'string') return `string ${JSON.stringify(value)}`
