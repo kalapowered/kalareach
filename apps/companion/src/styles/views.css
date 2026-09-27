@@ -498,20 +498,6 @@
 }
 
 /*
- * The bundled terminal stylesheet fades the scrollbar in over 100 ms and out over 800 ms. Here it
- * shows and hides at once, with reduced motion or without, like the rest of the terminal. Each rule
- * repeats one of that stylesheet's selectors exactly, so it reaches every element the fade does,
- * and it is important because that stylesheet may come later in the bundle than this one.
- */
-.xterm .xterm-scrollable-element > .visible {
-  transition: none !important;
-}
-
-.xterm .xterm-scrollable-element > .invisible.fade {
-  transition: none !important;
-}
-
-/*
  * The heading's second row holds the badges. In a narrow window they wrap onto more lines, and a
  * badge longer than the terminal is wide wraps its own words, so none runs under the terminal's
  * edge. The footer's controls wrap the same way: the two sizes together, then the way back.
