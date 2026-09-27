@@ -530,24 +530,15 @@ impl EnvironmentPrivacy {
     /// is finished. With it off, each release still owed is attempted again.
     pub fn tick(&self, now_ms: TimestampMs) -> Report {
         let mut inner = self.inner();
-        // An obligation held here whose write failed is written again, whatever else is owed.
+        // An obligation held here whose write failed is written again, whatever else is owed. One
+        // that fails again stays owed with the store's new reason, which the report carries.
         let unrecorded: Vec<SessionId> = inner.unrecorded.keys().copied().collect();
         for session_id in unrecorded {
             let Some(generation) = inner.obligations.get(&session_id).copied() else {
                 inner.unrecorded.remove(&session_id);
                 continue;
             };
-            match inner.record.oblige(session_id, generation, now_ms) {
-                Ok(()) => {
-                    inner.unrecorded.remove(&session_id);
-                }
-                Err(error) => {
-                    inner.unrecorded.insert(
-                        session_id,
-                        Unavailable::new(format!("its obligation could not be recorded: {error}")),
-                    );
-                }
-            }
+            let _kept_owed = write_obligation(&mut inner, session_id, generation, now_ms);
         }
         if inner.mode.is_enabled() {
             let due: Vec<Subsystem> = inner
@@ -583,10 +574,14 @@ impl EnvironmentPrivacy {
     /// until its worker says the generation in force is applied and its cleanup complete: nothing
     /// is known about what it retained before it was told.
     ///
+    /// Success says the session owes nothing or its obligation is on the disk, so a session created
+    /// while privacy mode is on is launched only once this has succeeded.
+    ///
     /// # Errors
     ///
-    /// Returns [`ControllerError::RegistryUnavailable`] when its obligation cannot be written. It
-    /// is still told the generation, and privacy mode is not turned off while it has not answered.
+    /// Returns [`ControllerError::RegistryUnavailable`] when its obligation cannot be written, by
+    /// this call or by an earlier one whose write failed and which this call tries again. It is
+    /// still told the generation, and privacy mode is not turned off while it has not answered.
     pub fn note_session_live(&self, session_id: SessionId, now_ms: TimestampMs) -> Result<()> {
         let mut inner = self.inner();
         let generation = inner.mode.generation();
@@ -598,15 +593,16 @@ impl EnvironmentPrivacy {
         });
         if enabled && !settled && !inner.obligations.contains_key(&session_id) {
             // Held here first, so a write that fails still keeps the session owed: it counts
-            // against completion and disabling, with the store's reason, until a retry writes it.
+            // against completion and disabling, with the store's reason, until a write lands.
             inner.obligations.insert(session_id, generation);
-            if let Err(error) = inner.record.oblige(session_id, generation, now_ms) {
-                inner.unrecorded.insert(
-                    session_id,
-                    Unavailable::new(format!("its obligation could not be recorded: {error}")),
-                );
-                return Err(error);
-            }
+            return write_obligation(&mut inner, session_id, generation, now_ms);
+        }
+        // One held here from an earlier call whose write failed is written now: this call does not
+        // say the session is recorded while it is not.
+        if inner.unrecorded.contains_key(&session_id)
+            && let Some(owed) = inner.obligations.get(&session_id).copied()
+        {
+            return write_obligation(&mut inner, session_id, owed, now_ms);
         }
         Ok(())
     }
@@ -1167,6 +1163,31 @@ impl EnvironmentPrivacy {
             )),
         }
         (kept, exported, unlisted)
+    }
+}
+
+/// Writes the obligation `session_id` holds here at `generation`.
+///
+/// A write that lands ends its place among the unrecorded; one that fails keeps it there with the
+/// store's reason, and the store's error is returned.
+fn write_obligation(
+    inner: &mut Inner,
+    session_id: SessionId,
+    generation: PrivacyGeneration,
+    now_ms: TimestampMs,
+) -> Result<()> {
+    match inner.record.oblige(session_id, generation, now_ms) {
+        Ok(()) => {
+            inner.unrecorded.remove(&session_id);
+            Ok(())
+        }
+        Err(error) => {
+            inner.unrecorded.insert(
+                session_id,
+                Unavailable::new(format!("its obligation could not be recorded: {error}")),
+            );
+            Err(error)
+        }
     }
 }
 
@@ -2947,6 +2968,64 @@ mod tests {
             })
             .expect("a count");
         assert_eq!(written, 1, "the retry wrote it down");
+    }
+
+    /// A session noted live again after its obligation's write failed is not said to be recorded
+    /// until the write lands, whether or not its worker ended in between. Once a note has said so,
+    /// the obligation outlasts the worker and a restart.
+    #[test]
+    fn a_repeated_live_note_says_the_obligation_is_recorded_only_once_it_is() {
+        let host = Host::open();
+        host.privacy
+            .enable(&[], at(0))
+            .expect("privacy mode is enabled");
+        let record = Connection::open(host.root.path().join(PRIVACY_RECORD)).expect("the record");
+        record
+            .execute_batch(
+                "CREATE TRIGGER refuse_the_obligation BEFORE INSERT ON privacy_obligations
+                 BEGIN SELECT RAISE(ABORT, 'this store refused the obligation'); END;",
+            )
+            .expect("the store will refuse the obligation");
+        host.privacy
+            .note_session_live(session(5), at(10))
+            .expect_err("the obligation could not be written");
+        let again = host
+            .privacy
+            .note_session_live(session(5), at(20))
+            .expect_err("a repeat does not say it is recorded");
+        assert!(
+            again.to_string().contains("refused the obligation"),
+            "{again}"
+        );
+        host.privacy.note_session_ended(session(5));
+        host.privacy
+            .note_session_live(session(5), at(30))
+            .expect_err("nor does one after its worker ended");
+
+        record
+            .execute_batch("DROP TRIGGER refuse_the_obligation")
+            .expect("the store accepts the obligation");
+        host.privacy
+            .note_session_live(session(5), at(40))
+            .expect("the repeat writes it, and says so");
+        let report = host.privacy.report_now(at(50));
+        assert!(
+            unavailable(&report, "sessions")
+                .iter()
+                .all(|reason| !reason.contains("refused the obligation")),
+            "{:?}",
+            report.completion
+        );
+        drop(record);
+
+        // Its worker ends and the daemon restarts before the worker has answered.
+        host.privacy.note_session_ended(session(5));
+        let host = host.restarted();
+        host.privacy.resume(at(60));
+        let report = host.privacy.report_now(at(70));
+        assert_eq!(report.obligations.len(), 1);
+        assert_eq!(report.obligations[0].session_id, session(5));
+        assert!(!report.completion.is_complete());
     }
 
     /// The record and the backup fence are one step for backup production. With the record's
