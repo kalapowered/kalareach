@@ -67,7 +67,10 @@
 //! and the managers' own fixed vocabularies of load states, start types and settings. It never
 //! repeats what a manager printed, a file a manager names, a drop-in's name or what it holds, or a
 //! path read back from the record. It says which of these differs instead, and the command that
-//! shows it: `launchctl print` for a job, `systemctl --user cat` for a unit and its drop-ins.
+//! shows it: `launchctl print` for a job, `systemctl --user cat` for a unit and its drop-ins. The
+//! setup's own report is not a failure: it names each drop-in the user manager applies besides the
+//! definition by its path, as content the person asked for, on standard output alone
+//! ([`crate::output`]).
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -79,6 +82,7 @@ use kr_protocol::ids::EnvironmentId;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{CliError, Result};
+use crate::output::Line;
 
 /// The file in an environment's state directory that records the definition `kr host startup`
 /// wrote.
@@ -791,7 +795,32 @@ pub fn inspect(
 /// What `kr host startup --set service` did.
 pub struct Installed {
     /// What a person should know about what the manager holds.
-    pub notes: Vec<Shown>,
+    pub notes: Vec<Line>,
+}
+
+/// Notes in this program's own words, as lines for the person.
+fn told(notes: Vec<Shown>) -> impl Iterator<Item = Line> {
+    notes
+        .into_iter()
+        .map(|note| crate::stdout_line!("{}", note))
+}
+
+/// What the setup tells a person when the user manager applies drop-ins to the definition, which
+/// it names `said`, besides it: each drop-in by its path, as the manager listed it. The setup is
+/// asked to name them, so they are content the person asked for, which no failure repeats.
+#[cfg(any(target_os = "linux", test))]
+fn applied_drop_ins(said: Shown, drop_ins: &[PathBuf]) -> Line {
+    let paths = drop_ins
+        .iter()
+        .map(|drop_in| kr_client::shown::spelled(drop_in))
+        .collect::<Vec<_>>()
+        .join(", ");
+    crate::stdout_line!(
+        "the user manager runs {} as kr wrote it, and applies what else these drop-ins set for \
+         it: {}",
+        said,
+        crate::output::Asked::text(crate::output::Request::Startup, &paths)
+    )
 }
 
 /// Writes the definition of an environment's daemon, records it, and has the manager take it.
@@ -878,7 +907,7 @@ pub fn install(environment: &EnvironmentPaths, _held: &Lock) -> Result<Installed
     if let Some(record) = &record
         && record.target() != expected.target()
     {
-        notes.extend(platform::release(record));
+        notes.extend(told(platform::release(record)));
     }
     Record::write(environment, &expected)?;
     notes.extend(platform::take(&expected)?);
@@ -906,7 +935,7 @@ pub struct Removal {
     /// Every file left where it was, and why.
     pub left: Vec<(PathBuf, Shown)>,
     /// What a person should know about what the manager still holds.
-    pub notes: Vec<Shown>,
+    pub notes: Vec<Line>,
 }
 
 /// Removes exactly what `kr host startup --set service` wrote for an environment, and its record,
@@ -946,12 +975,12 @@ pub fn remove(environment: &EnvironmentPaths, _held: &Lock) -> Result<Removal> {
                 .push((aside, shown!("{}; {}", changed, where_it_is))),
         },
     }
-    removal.notes.extend(platform::release(&record));
+    removal.notes.extend(told(platform::release(&record)));
     let record_file = Record::path(environment);
     std::fs::remove_file(&record_file)
         .map_err(|error| CliError::Ipc(kr_ipc::IpcError::io("remove", &record_file, error)))?;
     removal.removed.push(record_file);
-    removal.notes.extend(platform::forget(&record));
+    removal.notes.extend(told(platform::forget(&record)));
     Ok(removal)
 }
 
@@ -1183,7 +1212,7 @@ mod platform {
     use kr_protocol::identity::WorkerProfile;
 
     use super::{
-        Asked, Definition, Manager, Record, Refusal, SETUP_ACTION, domain_said, label_said,
+        Asked, Definition, Line, Manager, Record, Refusal, SETUP_ACTION, domain_said, label_said,
         refused, run, same_file, text,
     };
     use crate::error::{CliError, Result};
@@ -1518,7 +1547,7 @@ mod platform {
     /// Has launchd hold the definition just written, with the environment's service lock held: it is
     /// loaded where launchd holds nothing under its label. Anything else launchd holds there is
     /// named with its remedy, and the definition stays written and recorded.
-    pub(super) fn take(definition: &Definition) -> Result<Vec<Shown>> {
+    pub(super) fn take(definition: &Definition) -> Result<Vec<Line>> {
         let domain = definition.domain.as_deref().unwrap_or_default();
         let target = definition.target();
         let said = definition.target_said();
@@ -1651,8 +1680,8 @@ mod platform {
     use kr_ipc::paths::EnvironmentPaths;
 
     use super::{
-        Asked, Definition, Manager, READ_LIMIT, Record, Refusal, SETUP_ACTION, refused, run,
-        same_file, text,
+        Asked, Definition, Line, Manager, READ_LIMIT, Record, Refusal, SETUP_ACTION,
+        applied_drop_ins, refused, run, same_file, text,
     };
     use crate::error::{CliError, Result};
 
@@ -2319,27 +2348,14 @@ mod platform {
     /// Has the user manager read the definition just written, and checks that it would run it as
     /// kr wrote it. What it holds otherwise is named with where the drop-ins it reads are shown,
     /// and the definition stays written and recorded. Drop-ins it applies besides are named too.
-    pub(super) fn take(definition: &Definition) -> Result<Vec<Shown>> {
+    pub(super) fn take(definition: &Definition) -> Result<Vec<Line>> {
         let failed = CliError::HostUnavailable;
         reload().map_err(failed)?;
         let said = definition.target_said();
         let found = unit(&definition.target(), &said).map_err(failed)?;
         match found.difference(definition) {
             None if found.drop_ins.is_empty() => Ok(Vec::new()),
-            // A drop-in is a file somebody put beside the unit, named by the listing that found it,
-            // so it is said as this installation's paths are.
-            None => Ok(vec![shown!(
-                "the user manager runs {} as kr wrote it, and applies what else these drop-ins set \
-                 for it: {}",
-                said,
-                Shown::joined(
-                    found
-                        .drop_ins
-                        .iter()
-                        .map(|drop_in| Shown::host_path(drop_in)),
-                    ", "
-                )
-            )]),
+            None => Ok(vec![applied_drop_ins(said, &found.drop_ins)]),
             Some(why) => Err(CliError::HostUnavailable(shown!(
                 "{}; then run kr host startup --set service again. The definition is written and \
                  recorded, and kr host startup --clear removes it",
@@ -2422,7 +2438,7 @@ mod platform {
     use kr_client::shown::Shown;
     use kr_ipc::paths::EnvironmentPaths;
 
-    use super::{Asked, Definition, Manager, Record, Refusal};
+    use super::{Asked, Definition, Line, Manager, Record, Refusal};
     use crate::error::{CliError, Result};
 
     pub(super) const MANAGER: Option<Manager> = None;
@@ -2458,7 +2474,7 @@ mod platform {
         Err(unsupported())
     }
 
-    pub(super) fn take(_definition: &Definition) -> Result<Vec<Shown>> {
+    pub(super) fn take(_definition: &Definition) -> Result<Vec<Line>> {
         Err(unsupported())
     }
 
@@ -3707,5 +3723,49 @@ mod tests {
         let moved = Moved::Aside(std::path::PathBuf::from("kr-marker-7c1e"));
         assert_eq!(format!("{moved:?}"), "Aside(..)");
         assert_eq!(format!("{:?}", Moved::NotRegular), "NotRegular");
+    }
+
+    /// KR-REQ-07.12: the setup names each drop-in the user manager applies besides the definition
+    /// by its path, whatever its names hold, in its lines and in its document; the paths are the
+    /// content the person asked for, and nothing else in the note is.
+    #[test]
+    fn the_setup_names_each_drop_in_the_manager_applies_by_its_path() {
+        use crate::output::planted::{only_asked, only_asked_lines};
+
+        let drop_ins = [
+            PathBuf::from(format!("/etc/systemd/user/service.d/10-{MARKER}.conf")),
+            PathBuf::from(format!(
+                "/home/someone/.config/systemd/user/{LABEL}.service.d/{MARKER} policy.conf"
+            )),
+        ];
+        let said = || Shown::said("kr-controller-0d15ea5e-0000-4000-8000-000000000001.service");
+        let note = applied_drop_ins(said(), &drop_ins);
+        assert_eq!(
+            note.text(),
+            format!(
+                "the user manager runs {} as kr wrote it, and applies what else these drop-ins \
+                 set for it: {}, {}",
+                said().as_str(),
+                kr_client::shown::spelled(&drop_ins[0]),
+                kr_client::shown::spelled(&drop_ins[1])
+            )
+        );
+        only_asked_lines(
+            "the drop-ins the manager applies",
+            std::slice::from_ref(&note),
+        );
+
+        let document = crate::output::Document::new().with("notes", vec![note]);
+        assert_eq!(
+            only_asked("the drop-ins the manager applies", &document),
+            std::iter::once("notes[]".to_owned()).collect()
+        );
+        let notes = document.json()["notes"].clone();
+        assert!(
+            drop_ins.iter().all(|drop_in| notes[0]
+                .as_str()
+                .is_some_and(|note| note.contains(&drop_in.display().to_string()))),
+            "{notes}"
+        );
     }
 }

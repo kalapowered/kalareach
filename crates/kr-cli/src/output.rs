@@ -10,7 +10,8 @@
 //! * [`line`](fn@line) writes one [`Line`], composed ([`stdout_line!`](crate::stdout_line)) from a
 //!   template of this program's own and parts that are each `Plain` or [`Asked`].
 //! * [`document`] writes one `--json` [`Document`], built from `Shown`, numbers, switches, `Asked`,
-//!   documents and lists of them. There is no conversion into one from a string or a JSON value.
+//!   `Line`s, documents and lists of them. There is no conversion into one from a string or a JSON
+//!   value.
 //!
 //! [`Asked`] is content the person asked to read: a question's text, a repository's path, the name
 //! a paired device gave itself. Each names the [`Request`] that asked for it. It never becomes a
@@ -60,6 +61,9 @@ pub enum Request {
     /// What `kr doctor` was asked to diagnose: a capability's resolved executable, this host's
     /// configuration and state locations, and each effective configuration value.
     Diagnostics,
+    /// What the service manager applies to the control daemon's definition besides it: the
+    /// drop-ins `kr host startup --set service` names.
+    Startup,
 }
 
 /// Content the person asked to read.
@@ -221,8 +225,9 @@ pub fn configured_field(type_name: &str, field: &str, value: &str) -> Asked {
     )
 }
 
-/// One line of standard output: a template of this program's own, filled with `Plain` values and
-/// content the person asked to read. It never becomes a [`Shown`] or a `Plain` value.
+/// One line of standard output, or one string of a document: a template of this program's own,
+/// filled with `Plain` values and content the person asked to read. It never becomes a [`Shown`]
+/// or a `Plain` value.
 pub struct Line {
     text: String,
     /// The asked content the line holds, which a test compares its text against.
@@ -436,6 +441,25 @@ impl From<Asked> for Held {
             value: serde_json::Value::String(asked.text),
             #[cfg(test)]
             asked: std::iter::once(String::new()).collect(),
+        }
+    }
+}
+
+impl From<Line> for Held {
+    fn from(line: Line) -> Self {
+        // A line in a document is asked content where it stands when it holds some and the text a
+        // test plants shows nowhere else in it, the check a line on its own is held to; a line
+        // that shows it elsewhere is not, so the document's check names the place.
+        #[cfg(test)]
+        let asked = if !line.asked.is_empty() && line.unasked(crate::shown::marker::MARKER) == 0 {
+            std::iter::once(String::new()).collect()
+        } else {
+            std::collections::BTreeSet::new()
+        };
+        Self {
+            value: serde_json::Value::String(line.text),
+            #[cfg(test)]
+            asked,
         }
     }
 }
@@ -1146,6 +1170,46 @@ mod tests {
                 Shown::said(MARKER)
             )],
         );
+    }
+
+    /// A composed line in a document is its text, and asked content where it stands when it holds
+    /// some; a line of this program's words alone asks for nothing.
+    #[test]
+    fn a_line_in_a_document_is_asked_content_only_where_it_holds_some() {
+        let document = Document::new().with(
+            "notes",
+            vec![
+                crate::stdout_line!("applies {}", Asked::text(Request::Startup, MARKER)),
+                crate::stdout_line!("process {} keeps serving", 7_u32),
+            ],
+        );
+        assert_eq!(
+            document.json(),
+            serde_json::json!({
+                "notes": [format!("applies {MARKER}"), "process 7 keeps serving"],
+            })
+        );
+        assert_eq!(
+            planted::only_asked("a line in a document", &document),
+            std::iter::once("notes[]".to_owned()).collect()
+        );
+        assert_eq!(document.asked().iter().collect::<Vec<_>>(), ["notes[0]"]);
+    }
+
+    /// The negative control for a line in a document: asked content in the line does not let the
+    /// marker show in its other parts.
+    #[test]
+    #[should_panic(expected = "holds no asked content")]
+    fn the_marker_outside_a_lines_asked_content_fails_the_document_check() {
+        let document = Document::new().with(
+            "notes",
+            vec![crate::stdout_line!(
+                "{} {}",
+                Asked::text(Request::Startup, MARKER),
+                Shown::said(MARKER)
+            )],
+        );
+        let _ = planted::only_asked("a planted leak in a line", &document);
     }
 
     /// The negative control for lists: asked content in one element does not let the marker show

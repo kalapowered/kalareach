@@ -276,9 +276,7 @@ pub fn run(paths: &HostPaths, arguments: &StartupArguments, json: bool) -> Resul
         for (path, why) in &removal.left {
             crate::output::say(&shown!("left {}: {}", Shown::root(path), why.clone()));
         }
-        for note in &notes {
-            crate::output::say(note);
-        }
+        crate::output::lines(&notes);
     }
     Ok(())
 }
@@ -287,7 +285,7 @@ pub fn run(paths: &HostPaths, arguments: &StartupArguments, json: bool) -> Resul
 #[derive(Default)]
 struct Changed {
     /// What a person should know about what the service manager holds.
-    notes: Vec<Shown>,
+    notes: Vec<crate::output::Line>,
     /// What removing the service start's definition did.
     removal: service_manager::Removal,
     /// What happened to the environment's scheduled task.
