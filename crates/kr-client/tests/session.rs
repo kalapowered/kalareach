@@ -2025,6 +2025,10 @@ fn kr_cli_build_id() -> BuildId {
     BuildId::new("kr/0.1.0+test").expect("a build identity")
 }
 
+/// KR-REQ-17.14: the local product needs no managed service, and replacing every service client
+/// changes nothing it does. A session's read and mutation, a draft and a control decide the same
+/// with nothing configured and with all five service clients replaced; availability is explained
+/// service by service, and nothing consulted it before doing that work.
 #[tokio::test]
 async fn a_session_a_draft_and_a_control_need_no_managed_service_and_do_not_change_with_one() {
     let host = side(1, true).await;
@@ -2178,6 +2182,290 @@ async fn a_session_a_draft_and_a_control_need_no_managed_service_and_do_not_chan
     assert_eq!(first.4, second.4, "the control decision differed");
     // The one thing that does differ is whether anything is configured, which is the point.
     assert!(first.5 && !second.5);
+}
+
+/// A fork's own client for every managed service, as a fork would write one against its own
+/// infrastructure: each call is recorded and answered with what the fork's service decides, which
+/// here is that the account's allowance is spent.
+#[derive(Debug, Default)]
+struct ForkServices {
+    calls: std::sync::Mutex<Vec<&'static str>>,
+}
+
+impl ForkServices {
+    /// The fork's service refusing `call`, once it has recorded it.
+    fn refuses<T: Send + 'static>(
+        &self,
+        call: &'static str,
+    ) -> kr_client::services::ServiceFuture<'static, T> {
+        self.calls.lock().expect("the record").push(call);
+        Box::pin(async {
+            Err(ClientError::refusal(
+                ErrorCode::QuotaExceeded,
+                kr_client::shown::Shown::said(
+                    "the fork's service says this account has no allowance left",
+                ),
+            ))
+        })
+    }
+
+    fn calls(&self) -> Vec<&'static str> {
+        self.calls.lock().expect("the record").clone()
+    }
+}
+
+impl kr_client::services::AccountService for ForkServices {
+    fn exchange<'a>(
+        &'a self,
+        _grant: &'a kr_client::services::account::AuthorisationGrant,
+    ) -> kr_client::services::ServiceFuture<'a, kr_client::services::account::Exchanged> {
+        self.refuses("account.exchange")
+    }
+
+    fn refresh<'a>(
+        &'a self,
+        _stored: &'a kr_client::services::account::StoredGrant,
+    ) -> kr_client::services::ServiceFuture<'a, kr_client::services::account::Refreshed> {
+        self.refuses("account.refresh")
+    }
+
+    fn revoke<'a>(
+        &'a self,
+        _refresh: &'a kr_client::services::account::RefreshToken,
+    ) -> kr_client::services::ServiceFuture<'a, ()> {
+        self.refuses("account.revoke")
+    }
+
+    fn identity<'a>(
+        &'a self,
+        _access: &'a kr_client::services::AccountToken,
+    ) -> kr_client::services::ServiceFuture<'a, kr_client::services::account::AccountIdentity> {
+        self.refuses("account.identity")
+    }
+
+    fn usage<'a>(
+        &'a self,
+        _access: &'a kr_client::services::AccountToken,
+    ) -> kr_client::services::ServiceFuture<'a, kr_client::services::account::AccountUsage> {
+        self.refuses("account.usage")
+    }
+}
+
+impl RelayLeaseService for ForkServices {
+    fn issue<'a>(
+        &'a self,
+        _request: &'a kr_client::services::LeaseRequest,
+    ) -> kr_client::services::ServiceFuture<'a, kr_client::services::RelayLeaseAnswer> {
+        self.refuses("relay.issue")
+    }
+
+    fn revoke<'a>(
+        &'a self,
+        _lease_id: kr_protocol::ids::RelayLeaseId,
+        _reason: kr_client::services::LeaseEndReason,
+    ) -> kr_client::services::ServiceFuture<'a, kr_client::services::RelayLeaseEnding> {
+        self.refuses("relay.revoke")
+    }
+}
+
+impl kr_client::services::PushService for ForkServices {
+    fn register<'a>(
+        &'a self,
+        _token: &'a str,
+    ) -> kr_client::services::ServiceFuture<'a, kr_client::services::PushRegistration> {
+        self.refuses("push.register")
+    }
+
+    fn revoke<'a>(
+        &'a self,
+        _installation_id: kr_protocol::ids::InstallationId,
+    ) -> kr_client::services::ServiceFuture<'a, ()> {
+        self.refuses("push.revoke")
+    }
+}
+
+impl SyncBackupService for ForkServices {
+    fn compare_exchange<'a>(
+        &'a self,
+        _collection: &'a str,
+        _request_id: Uuid,
+        _signed_at_ms: u64,
+        _expected: Option<SyncPosition>,
+        _ciphertext: &'a [u8],
+    ) -> kr_client::services::ServiceFuture<'a, SyncExchanged> {
+        self.refuses("sync.compare_exchange")
+    }
+
+    fn request_status<'a>(
+        &'a self,
+        _collection: &'a str,
+        _request_id: Uuid,
+    ) -> kr_client::services::ServiceFuture<'a, SyncRequestStatus> {
+        self.refuses("sync.request_status")
+    }
+
+    fn fence_request<'a>(
+        &'a self,
+        _collection: &'a str,
+        _request_id: Uuid,
+        _first_signed_at_ms: u64,
+        _last_signed_at_ms: u64,
+    ) -> kr_client::services::ServiceFuture<'a, SyncRequestFence> {
+        self.refuses("sync.fence_request")
+    }
+
+    fn fetch<'a>(
+        &'a self,
+        _collection: &'a str,
+    ) -> kr_client::services::ServiceFuture<'a, SyncFetched> {
+        self.refuses("sync.fetch")
+    }
+
+    fn resolve<'a>(
+        &'a self,
+        _collection: &'a str,
+        _retained: SyncConflictId,
+    ) -> kr_client::services::ServiceFuture<'a, bool> {
+        self.refuses("sync.resolve")
+    }
+}
+
+impl kr_client::services::ManagedVoiceService for ForkServices {
+    fn metadata(
+        &self,
+    ) -> kr_client::services::ServiceFuture<'_, Option<kr_client::services::voice::VoiceMetadata>>
+    {
+        self.refuses("voice.metadata")
+    }
+
+    fn provider(&self) -> String {
+        "the fork's own".to_owned()
+    }
+
+    fn start<'a>(
+        &'a self,
+        _request: &'a kr_client::services::VoiceSessionRequest,
+    ) -> kr_client::services::ServiceFuture<'a, kr_client::services::VoiceStart> {
+        self.refuses("voice.start")
+    }
+
+    fn close<'a>(
+        &'a self,
+        _call_id: &'a str,
+    ) -> kr_client::services::ServiceFuture<'a, kr_client::services::VoiceClosure> {
+        self.refuses("voice.close")
+    }
+}
+
+/// KR-REQ-17.14: every managed service a client uses is a replaceable client, and what a client
+/// knows of its services explains availability and protects nothing. A fork puts its own client
+/// in each of the five places: account login, relay leases, push, sync and backup, and managed
+/// inference. Each call made through those places reaches the fork's client, and what the fork's
+/// service decides, here that the allowance is spent, is what the caller is told, with nothing
+/// of this library's own between them. Availability says each service is configured and claims no
+/// entitlement, and a refusal from the service leaves it as it was: it explains, and the service
+/// enforces.
+#[tokio::test]
+async fn a_fork_replaces_every_service_client_and_availability_only_explains_it() {
+    let fork = Arc::new(ForkServices::default());
+    let clients = ServiceClients {
+        account: Some(Arc::clone(&fork) as _),
+        relay_leases: Some(Arc::clone(&fork) as _),
+        push: Some(Arc::clone(&fork) as _),
+        sync_backup: Some(Arc::clone(&fork) as _),
+        managed_inference: Some(Arc::clone(&fork) as _),
+    };
+    let before = clients.availability();
+    assert_eq!(before.len(), ManagedService::ALL.len());
+    for report in &before {
+        assert!(report.configured, "{report:?}");
+        assert_eq!(
+            report.explanation,
+            format!("A {} service is configured.", report.service.as_str())
+        );
+    }
+
+    let lease = kr_client::services::LeaseRequest {
+        source: EndpointKey::from_bytes([1; 32]),
+        destination: EndpointKey::from_bytes([2; 32]),
+        direction: kr_client::services::RelayDirection::Bidirectional,
+        byte_ceiling: 8 * 1024 * 1024,
+        duration_seconds: 300,
+        region_preference: None,
+        payer: None,
+        lease_id: None,
+    };
+    let refusals = [
+        clients
+            .account
+            .as_ref()
+            .expect("the fork's account client")
+            .revoke(
+                &kr_client::services::account::RefreshToken::new("a-refresh-token")
+                    .expect("a token"),
+            )
+            .await
+            .err(),
+        clients
+            .relay_leases
+            .as_ref()
+            .expect("the fork's relay client")
+            .issue(&lease)
+            .await
+            .err(),
+        clients
+            .push
+            .as_ref()
+            .expect("the fork's push client")
+            .register("a-push-token")
+            .await
+            .err(),
+        clients
+            .sync_backup
+            .as_ref()
+            .expect("the fork's sync client")
+            .fetch("settings/00000000-0000-4000-8000-000000000001")
+            .await
+            .err(),
+        clients
+            .managed_inference
+            .as_ref()
+            .expect("the fork's inference client")
+            .metadata()
+            .await
+            .err(),
+    ];
+    assert_eq!(
+        fork.calls(),
+        [
+            "account.revoke",
+            "relay.issue",
+            "push.register",
+            "sync.fetch",
+            "voice.metadata"
+        ],
+        "each call reached the fork's own client"
+    );
+    for refusal in refusals {
+        let refusal = refusal.expect("the fork's service decided");
+        assert_eq!(refusal.code(), ErrorCode::QuotaExceeded);
+        assert!(
+            refusal.to_string().contains("the fork's service says"),
+            "{refusal}"
+        );
+    }
+    assert_eq!(
+        clients
+            .managed_inference
+            .as_ref()
+            .expect("the fork's inference client")
+            .provider(),
+        "the fork's own"
+    );
+    assert!(
+        clients.availability() == before,
+        "a refusal from the service changes nothing the client explains"
+    );
 }
 
 // KR-PERF-006's measurement ends in the painter's bytes for the restored screen, and the painter
