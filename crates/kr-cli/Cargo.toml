@@ -50,7 +50,9 @@ kr-flush = { workspace = true, features = ["testing"] }
 kr-controller = { workspace = true, features = ["testing"] }
 # The attach tests host a real session and run `kr` against it on a real pseudo-terminal.
 kr-ipc = { workspace = true, features = ["testing"] }
-kr-worker.workspace = true
+# The contact tests read what the session's worker was sent, so they can count the bounded waits
+# one long poll renews and the subscriptions it holds.
+kr-worker = { workspace = true, features = ["testing"] }
 portable-pty.workspace = true
 # The contact tests drive `kr agent-tools --stdio` the way an installed agent does: as a child
 # process speaking the Model Context Protocol over its standard streams. They also feed the

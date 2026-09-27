@@ -223,6 +223,16 @@ pub struct WorkerService {
     /// away in every shipped build.
     #[cfg(feature = "testing")]
     replacement_pause: Mutex<Option<ArmedReplacement>>,
+    /// The method and parameters of every request and mutation this service has been sent, in
+    /// the order they arrived, which this host's own tests read to count what a client asked for.
+    /// A helper renewing one long poll sends requests that nothing outside the worker sees. It is
+    /// compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    received: Mutex<Vec<(kr_protocol::method::MethodName, ParamsValue)>>,
+    /// How many question subscriptions the long polls this service is serving hold at this moment,
+    /// for this host's own tests. It is compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    subscriptions_held: std::sync::atomic::AtomicUsize,
 }
 
 impl WorkerService {
@@ -419,6 +429,10 @@ impl WorkerService {
             admission_pause: Mutex::new(None),
             #[cfg(feature = "testing")]
             replacement_pause: Mutex::new(None),
+            #[cfg(feature = "testing")]
+            received: Mutex::new(Vec::new()),
+            #[cfg(feature = "testing")]
+            subscriptions_held: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -706,6 +720,35 @@ impl WorkerService {
     #[must_use]
     pub fn attention_transition_raised(&self) -> bool {
         self.attention_fence.is_raised()
+    }
+
+    /// Returns the method and parameters of every request and mutation this service has been
+    /// sent, in the order they arrived, for this host's own tests.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn received(&self) -> Vec<(kr_protocol::method::MethodName, ParamsValue)> {
+        self.received
+            .lock()
+            .expect("the record is not poisoned")
+            .clone()
+    }
+
+    /// Returns how many question subscriptions long polls are holding at this moment, for this
+    /// host's own tests.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn subscriptions_held(&self) -> usize {
+        self.subscriptions_held
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Records one request or mutation as it arrives, for this host's own tests.
+    #[cfg(feature = "testing")]
+    fn record_received(&self, method: &kr_protocol::method::MethodName, params: &ParamsValue) {
+        self.received
+            .lock()
+            .expect("the record is not poisoned")
+            .push((method.clone(), params.clone()));
     }
 
     /// Stops the next connection that replaces a running delivery immediately before it does, for
@@ -1623,6 +1666,8 @@ impl WorkerService {
             }
             ControlFrame::PluginAdmissions(part) => self.plugin_admissions_part(state, *part).await,
             ControlFrame::Request(request) => {
+                #[cfg(feature = "testing")]
+                self.record_received(&request.method, &request.params);
                 // A source that asked to wait waits here: outside the session lock, outside the
                 // dispatch barrier and outside any transaction. Section 11 makes a long poll an
                 // asynchronous subscription, renewed in bounded steps, that returns the same
@@ -1632,6 +1677,8 @@ impl WorkerService {
                 Some(self.request(state, &request, &caller))
             }
             ControlFrame::Mutation(mutation) => {
+                #[cfg(feature = "testing")]
+                self.record_received(&mutation.method, &mutation.params);
                 let caller = Caller::local(state.actor_id.clone());
                 let reply = self
                     .mutation(
@@ -1723,6 +1770,8 @@ impl WorkerService {
             // leave a window in which an answer arrives between the read and the wait, and the
             // caller would sleep through its own answer until the next renewal.
             let waiting = self.questions.subscribe();
+            #[cfg(feature = "testing")]
+            let _held = SubscriptionHeld::count(&self.subscriptions_held);
             let _ = self.questions.sweep(self.question_clock());
             match self.questions.question(params.question_id) {
                 Ok(question) if question.state.is_resolved() => return,
@@ -6650,6 +6699,26 @@ struct ArmedReplacement {
     arrived: tokio::sync::oneshot::Sender<()>,
     go: tokio::sync::oneshot::Receiver<()>,
     replaced: tokio::sync::oneshot::Sender<()>,
+}
+
+/// One question subscription a long poll holds, counted in [`WorkerService::subscriptions_held`]
+/// for as long as it lasts, for this host's own tests.
+#[cfg(feature = "testing")]
+struct SubscriptionHeld<'a>(&'a std::sync::atomic::AtomicUsize);
+
+#[cfg(feature = "testing")]
+impl<'a> SubscriptionHeld<'a> {
+    fn count(held: &'a std::sync::atomic::AtomicUsize) -> Self {
+        held.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self(held)
+    }
+}
+
+#[cfg(feature = "testing")]
+impl Drop for SubscriptionHeld<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 /// One connection's registration in the worker's authority store.

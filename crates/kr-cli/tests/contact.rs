@@ -43,7 +43,7 @@ struct Hosted {
     journal: PathBuf,
     binary: PathBuf,
     client: RunningService<rmcp::RoleClient, ()>,
-    _service: Arc<WorkerService>,
+    service: Arc<WorkerService>,
     _pipes: Pipes,
 }
 
@@ -277,7 +277,7 @@ async fn session_in(
         descriptor,
         binary,
         client,
-        _service: service,
+        service,
         _pipes: Pipes { directory },
     }
 }
@@ -1368,9 +1368,9 @@ async fn ask_user_returns_a_durable_question_and_its_token_over_the_helpers_own_
 /// returns the answer as soon as a person gives it; while it is open, a truncating checkpoint from
 /// another connection completes, so no connection holds a transaction on the session's journal at
 /// that moment; and a wait that runs out returns the same question and neither recreates it nor
-/// records a second creation to notify anybody about. Whether the tool server renews bounded
-/// broker waits inside the call, and whether each wait holds only a subscription, cannot be seen
-/// from outside the worker, and this test claims neither.
+/// records a second creation to notify anybody about. The renewals of bounded broker waits inside
+/// the call, and the one subscription each holds, are counted in the worker by the test after this
+/// one.
 #[tokio::test(flavor = "multi_thread")]
 async fn one_long_wait_stays_open_and_returns_the_answer_when_it_comes() {
     // The installation declared a qualified client deadline of four minutes, so a long poll is not
@@ -1585,6 +1585,136 @@ async fn one_long_wait_stays_open_and_returns_the_answer_when_it_comes() {
         3,
         "the question and the two markers, and nothing recreated"
     );
+}
+
+/// KR-REQ-11.57: one `wait_for_answer` call renews bounded broker waits inside itself, holds one
+/// subscription at a time for them, and returns the same durable question when its wait runs out.
+/// Under an installed client's qualified deadline, a 25 second wait is two or more
+/// `question.read_own` requests to the session's worker from the one tool call: the first bounded
+/// to the host's renewal interval, none longer, together the length of the wait, each naming the
+/// same question with the same token. The call sends the worker nothing else, so nothing is
+/// recreated and nobody is notified again. While it waits the worker holds exactly one question
+/// subscription for it, and once it returns, none.
+#[tokio::test(flavor = "multi_thread")]
+async fn one_wait_renews_bounded_broker_waits_under_one_subscription_and_returns_the_same_question()
+{
+    use kr_protocol::method::Method;
+    use kr_protocol::question::{QuestionReadOwnParams, WAIT_RENEWAL};
+
+    let hosted = hosted_with(|binary| Root {
+        command: vec![
+            binary.display().to_string(),
+            "agent-tools".to_owned(),
+            "--stdio".to_owned(),
+        ],
+        environment: vec![("KR_TOOL_DEADLINE_MS".to_owned(), "240000".to_owned())],
+    })
+    .await;
+    let (created, _) = hosted
+        .call(
+            "ask_user",
+            json!({
+                "request_id": "renewed-wait",
+                "context": "",
+                "question": "shall I?",
+                "type": "confirm"
+            }),
+        )
+        .await;
+    assert_eq!(created["state"], "pending");
+    let question_id = created["question_id"]
+        .as_str()
+        .expect("an identifier")
+        .to_owned();
+    let sent_before = hosted.service.received().len();
+    assert_eq!(hosted.service.subscriptions_held(), 0);
+
+    let wait_seconds = 25;
+    let started = tokio::time::Instant::now();
+    let call = hosted.call(
+        "wait_for_answer",
+        json!({
+            "question_id": question_id,
+            "caller_token": created["caller_token"],
+            "wait_seconds": wait_seconds
+        }),
+    );
+    // The subscriptions held, read at moments inside the first renewal and inside the second,
+    // away from the boundary between them.
+    let watch = async {
+        let mut held = Vec::new();
+        for at in [5, 12, 23] {
+            tokio::time::sleep_until(started + Duration::from_secs(at)).await;
+            held.push(hosted.service.subscriptions_held());
+        }
+        held
+    };
+    let ((waited, failed), held) = tokio::join!(call, watch);
+    let elapsed = started.elapsed();
+
+    assert!(!failed, "{waited}");
+    assert_eq!(waited["question_id"], created["question_id"]);
+    assert_eq!(waited["state"], "pending");
+    assert_eq!(waited["revision"], created["revision"]);
+    assert!(
+        elapsed >= Duration::from_secs(wait_seconds),
+        "the call waited the length it asked for: {elapsed:?}"
+    );
+    assert_eq!(held, [1, 1, 1], "one subscription throughout the call");
+    assert_eq!(
+        hosted.service.subscriptions_held(),
+        0,
+        "and none once it returned"
+    );
+
+    // Everything the call sent the worker.
+    let sent = hosted.service.received().split_off(sent_before);
+    assert!(
+        sent.iter()
+            .all(|(method, _)| method.method() == Some(Method::QuestionReadOwn)),
+        "the call only read its own question: {:?}",
+        sent.iter()
+            .map(|(method, _)| method.as_str().to_owned())
+            .collect::<Vec<_>>()
+    );
+    let reads: Vec<QuestionReadOwnParams> = sent
+        .iter()
+        .map(|(_, params)| params.to_typed().expect("a read of the declared shape"))
+        .collect();
+    let waits: Vec<u64> = reads
+        .iter()
+        .map(|read| read.wait_ms.0.expect("each read waits").get())
+        .collect();
+    assert!(
+        waits.len() >= 2,
+        "the one call renewed its broker wait: {waits:?}"
+    );
+    assert_eq!(waits[0], WAIT_RENEWAL.get(), "{waits:?}");
+    assert!(
+        waits.iter().all(|wait| *wait <= WAIT_RENEWAL.get()),
+        "every broker wait is bounded to the renewal interval: {waits:?}"
+    );
+    let total: u64 = waits.iter().sum();
+    let asked = wait_seconds * 1000;
+    assert!(
+        total <= asked && total + 1000 >= asked,
+        "the renewals together are the wait the call asked for: {waits:?}"
+    );
+    assert!(
+        reads
+            .iter()
+            .all(|read| read.question_id.to_string() == question_id
+                && read.caller_token == reads[0].caller_token),
+        "every renewal names the same question with the same token"
+    );
+
+    let created_events = ledger(&hosted)
+        .events_since(0, 64)
+        .expect("the feed")
+        .into_iter()
+        .filter(|(_, event)| event.kind == kr_protocol::question::QuestionEventKind::Created)
+        .count();
+    assert_eq!(created_events, 1, "nothing was created twice");
 }
 
 /// The host's reading now, in the form the attention store takes.
@@ -2065,7 +2195,7 @@ async fn a_question_asked_for_a_launched_agent_ends_with_the_agents_instance() {
     // The broker launched this helper's agent. The helper's own process stands for the agent here:
     // a helper belongs to the nearest launched process at or above it.
     let instance = kr_protocol::ids::ApplicationInstanceId::new(kr_ipc::new_uuid());
-    let broker = hosted._service.broker();
+    let broker = hosted.service.broker();
     broker
         .register_instance(
             instance,
