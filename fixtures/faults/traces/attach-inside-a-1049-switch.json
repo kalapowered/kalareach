@@ -1,0 +1,26 @@
+{
+  "format": "kalareach.trace/1",
+  "name": "attach-inside-a-1049-switch",
+  "about": "clients arrive between the bytes of an application's switch into the alternate screen: until the switch completes they hold the shell's screen, then the application's screen with the shell's rows beneath it, and the shell's screen again when the application leaves",
+  "columns": 20,
+  "rows": 4,
+  "wall_ms": 1790000000000,
+  "steps": [
+    { "do": "output", "text": "$ vi notes\r\n" },
+    { "do": "output", "text": "\u001b[?10" },
+    { "do": "attach", "client": "a", "form": "direct" },
+    { "do": "acquire", "client": "a" },
+    { "do": "attach", "client": "p", "form": "projected" },
+    { "do": "screen", "active": "primary", "lines": ["$ vi notes"] },
+    { "do": "holds", "client": "a" },
+    { "do": "holds", "client": "p" },
+    { "do": "output", "text": "49h\u001b[H~ notes" },
+    { "do": "screen", "active": "alternate", "lines": ["~ notes"], "other": ["$ vi notes"] },
+    { "do": "holds", "client": "a" },
+    { "do": "holds", "client": "p" },
+    { "do": "output", "text": "\u001b[?1049l$ " },
+    { "do": "screen", "active": "primary", "lines": ["$ vi notes", "$"] },
+    { "do": "holds", "client": "a" },
+    { "do": "holds", "client": "p" }
+  ]
+}

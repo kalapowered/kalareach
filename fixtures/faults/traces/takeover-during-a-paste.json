@@ -1,0 +1,28 @@
+{
+  "format": "kalareach.trace/1",
+  "name": "takeover-during-a-paste",
+  "about": "a client takes the input lease while another is part way through a bracketed paste the writer has not taken yet: the takeover reports the paste closed and the unwritten bytes counted, the rest of the first client's paste is refused as a lost lease, and the second client's keys are queued under its own lease with no paste delimiter in them",
+  "columns": 20,
+  "rows": 3,
+  "wall_ms": 1790000000000,
+  "steps": [
+    { "do": "output", "text": "\u001b[?2004h$ " },
+    { "do": "attach", "client": "a", "form": "direct" },
+    { "do": "acquire", "client": "a", "expect": { "closed_open_paste": false, "discarded_bytes": 0 } },
+    { "do": "input", "client": "a", "text": "\u001b[200~first half " },
+    { "do": "attach", "client": "b", "form": "direct" },
+    { "do": "acquire", "client": "b", "expect": { "closed_open_paste": true, "discarded_bytes": 17 } },
+    { "do": "input", "client": "a", "text": "second half\u001b[201~", "refused": "LEASE_LOST" },
+    { "do": "input", "client": "b", "text": "ls\r" },
+    {
+      "do": "take_input",
+      "expect": [
+        { "batch": "lease_changed" },
+        { "batch": "input", "client": "a", "text": "\u001b[200~first half ", "paste": ["opens"] },
+        { "batch": "input", "client": "b", "text": "ls\r" }
+      ]
+    },
+    { "do": "holds", "client": "a" },
+    { "do": "holds", "client": "b" }
+  ]
+}

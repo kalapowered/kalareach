@@ -52,8 +52,9 @@ use kr_protocol::session::{Dimensions, DisplayNumber, ShellMode};
 use kr_term::budget::GridSize;
 use kr_term::engine::{Engine, EngineConfig};
 use kr_term::sideeffect::SideEffectKind;
+use kr_worker::action::time::TimeSources;
 use kr_worker::output::{OutputDelivery, OutputStream};
-use kr_worker::session::{Session, SessionConfig};
+use kr_worker::session::{InputBatch, Session, SessionConfig};
 
 use crate::corpus::Corpus;
 use crate::screen::{Parts, View};
@@ -178,7 +179,7 @@ enum Served {
 
 /// Which of the two clients.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Form {
+pub(crate) enum Form {
     /// A terminal of the session's size.
     Direct,
     /// A terminal of another size.
@@ -290,6 +291,10 @@ struct Client {
     ended: bool,
     /// Where the client left, once it has.
     left_at: Option<usize>,
+    /// The lease epoch it holds, once it has taken the lease.
+    epoch: Option<u64>,
+    /// The sequence number of its next input.
+    sequence: u64,
 }
 
 impl Client {
@@ -336,6 +341,61 @@ impl Client {
                 .map(|kind| Delivered { cursor, kind }),
         );
     }
+}
+
+/// Where a client differs from the session's screen, by what it holds: a projection holds the
+/// whole screen; a terminal being handed the stream holds all of it but the wrap marks; a painted
+/// terminal holds the rows it shows and the cursor, and then its projection is read as well.
+fn compare(client: &mut Client, expected: &View) -> Result<Vec<String>, String> {
+    let mut found = Vec::new();
+    match client.form {
+        Form::Projected => match client.projection.screen() {
+            Some(screen) => found.extend(
+                View::of(screen)
+                    .differences(expected, Parts::Whole)
+                    .into_iter()
+                    .map(|line| format!("its projection: {line}")),
+            ),
+            None => found.push("it holds no whole screen".to_owned()),
+        },
+        Form::Direct => {
+            let parts = match client.served {
+                Served::Stream => Parts::Terminal,
+                Served::Painted | Served::Nothing => Parts::Painted,
+            };
+            if let Some(got) = client.terminal_view()? {
+                let mut differences = got.differences(expected, parts);
+                // A painter cannot place a cursor that waits to wrap: no sequence moves one there.
+                // It says so, and the cursor is then not read from where it was left. The screen
+                // the client holds now decides that, never an earlier one, so a cursor misplaced
+                // later is still found.
+                let waiting_to_wrap = client
+                    .projection
+                    .screen()
+                    .is_some_and(|screen| screen.cursor.pending_wrap);
+                if parts == Parts::Painted && waiting_to_wrap {
+                    differences.retain(|line| !line.starts_with("cursor at"));
+                }
+                found.extend(
+                    differences
+                        .into_iter()
+                        .map(|line| format!("its terminal: {line}")),
+                );
+            }
+            if client.served == Served::Painted {
+                match client.projection.screen() {
+                    Some(screen) => found.extend(
+                        View::of(screen)
+                            .differences(expected, Parts::Whole)
+                            .into_iter()
+                            .map(|line| format!("its projection: {line}")),
+                    ),
+                    None => found.push("it holds no whole screen".to_owned()),
+                }
+            }
+        }
+    }
+    Ok(found)
 }
 
 /// What a terminal performed, as a person would name it.
@@ -425,9 +485,10 @@ fn session_engine(corpus: &Corpus) -> Result<Engine, String> {
     .map_err(|error| format!("a terminal engine of {}: {error}", corpus.name))
 }
 
-/// The session a corpus is fed to, and everything a run keeps about it.
-struct Stage<'a> {
-    corpus: &'a Corpus,
+/// The session a corpus or a trace is fed to, and everything a run keeps about it.
+pub(crate) struct Stage {
+    columns: u16,
+    rows: u16,
     strategy: Strategy,
     session: Session,
     session_id: SessionId,
@@ -475,11 +536,17 @@ pub fn run(corpus: &Corpus, strategy: Strategy) -> Result<Outcome, String> {
     let stride = stride(&until, PAIRS_AT_ONCE);
     let mut outcome = Outcome::default();
     for first in 0..stride {
-        let mut stage = Stage::open(corpus, strategy)?;
+        let mut stage = Stage::open(
+            corpus.columns,
+            corpus.rows,
+            corpus.bytes(),
+            strategy,
+            TimeSources::system(),
+        )?;
         for (point, leaves) in until.iter().copied().enumerate() {
             if point % stride == first {
-                stage.attach(Form::Direct, point, leaves)?;
-                stage.attach(Form::Projected, point, leaves)?;
+                stage.attach(Form::Direct, leaves, true)?;
+                stage.attach(Form::Projected, leaves, false)?;
                 stage.outcome.points += 1;
             }
             if point == total {
@@ -524,8 +591,16 @@ fn stride(until: &[usize], at_once: usize) -> usize {
         .unwrap_or(1)
 }
 
-impl<'a> Stage<'a> {
-    fn open(corpus: &'a Corpus, strategy: Strategy) -> Result<Self, String> {
+impl Stage {
+    /// Opens a session of `columns` by `rows` on the clocks `time`; `bytes` is what [`Stage::feed`]
+    /// reads from.
+    pub(crate) fn open(
+        columns: u16,
+        rows: u16,
+        bytes: Vec<u8>,
+        strategy: Strategy,
+        time: TimeSources,
+    ) -> Result<Self, String> {
         let session_id = SessionId::new(kr_ipc::new_uuid());
         let config = SessionConfig {
             session_id,
@@ -538,13 +613,13 @@ impl<'a> Stage<'a> {
             launch_profile: kr_protocol::session::LaunchProfile::default(),
             worker_profile: WorkerProfile::HeadlessUser,
             desktop: DesktopBinding::none(),
-            dimensions: Dimensions::new(u64::from(corpus.columns), u64::from(corpus.rows)),
+            dimensions: Dimensions::new(u64::from(columns), u64::from(rows)),
             journal_path: None,
             spool_directory: None,
             worker_endpoint: None,
             send_queue_bytes: SEND_QUEUE_BYTES,
             resident_bytes: 4 * 1024 * 1024,
-            time: kr_worker::action::time::TimeSources::system(),
+            time,
         };
         let mut session =
             Session::open(config).map_err(|error| format!("the session did not open: {error}"))?;
@@ -552,11 +627,12 @@ impl<'a> Stage<'a> {
             .launch()
             .map_err(|error| format!("the session's program did not start: {error}"))?;
         Ok(Self {
-            corpus,
+            columns,
+            rows,
             strategy,
             session,
             session_id,
-            bytes: corpus.bytes(),
+            bytes,
             fed: 0,
             clients: Vec::new(),
             holders: Vec::new(),
@@ -574,14 +650,19 @@ impl<'a> Stage<'a> {
         });
     }
 
-    /// Attaches one client at `point`, subscribes it and draws what it was given.
-    fn attach(&mut self, form: Form, point: usize, until: usize) -> Result<(), String> {
+    /// Attaches one client where the output has reached, taking the input lease for it when
+    /// `lease` says so, subscribes it and draws what it was given. It stays for the checks up to
+    /// `until`. Returns which client it is.
+    pub(crate) fn attach(
+        &mut self,
+        form: Form,
+        until: usize,
+        lease: bool,
+    ) -> Result<usize, String> {
+        let point = self.fed;
         let (columns, rows) = match form {
-            Form::Direct => (self.corpus.columns, self.corpus.rows),
-            Form::Projected => (
-                self.corpus.columns.saturating_sub(NARROWER_BY).max(1),
-                self.corpus.rows,
-            ),
+            Form::Direct => (self.columns, self.rows),
+            Form::Projected => (self.columns.saturating_sub(NARROWER_BY).max(1), self.rows),
         };
         let attachment = AttachmentId::new(kr_ipc::new_uuid());
         let mut requested = CanonicalSet::new();
@@ -600,10 +681,13 @@ impl<'a> Stage<'a> {
         self.session
             .attach(&params, requested, attachment)
             .map_err(|error| format!("a {} client did not attach: {error}", form.name()))?;
-        if form == Form::Direct {
-            self.session
+        let mut epoch = None;
+        if form == Form::Direct && lease {
+            let acquired = self
+                .session
                 .acquire_input(attachment, ConnectionId::new(kr_ipc::new_uuid()), None)
                 .map_err(|error| format!("the direct client did not take the lease: {error}"))?;
+            epoch = Some(acquired.lease.epoch.get());
             self.holders.push((point, attachment));
         }
         let mut client = Client {
@@ -624,11 +708,13 @@ impl<'a> Stage<'a> {
             resyncs_at: Vec::new(),
             ended: false,
             left_at: None,
+            epoch,
+            sequence: 0,
         };
         self.subscribe(&mut client)?;
         self.pump(&mut client)?;
         self.clients.push(client);
-        Ok(())
+        Ok(self.clients.len() - 1)
     }
 
     /// Subscribes a client as the worker's service subscribes one: its screen first, under the same
@@ -817,8 +903,8 @@ impl<'a> Stage<'a> {
             mode: AttachMode::Terminal,
             claim_geometry: false,
             dimensions: Nullable::some(Dimensions::new(
-                u64::from(self.corpus.columns),
-                u64::from(self.corpus.rows),
+                u64::from(self.columns),
+                u64::from(self.rows),
             )),
             // No terminal named, so the probe is shown a projection whatever the parser is doing.
             terminal_profile_id: Nullable::null(),
@@ -877,58 +963,8 @@ impl<'a> Stage<'a> {
             } else {
                 Property::Continuity
             };
-            let mut found = Vec::new();
-            match client.form {
-                Form::Projected => {
-                    self.outcome.comparisons += 1;
-                    match client.projection.screen() {
-                        Some(screen) => found.extend(
-                            View::of(screen)
-                                .differences(&expected, Parts::Whole)
-                                .into_iter()
-                                .map(|line| format!("its projection: {line}")),
-                        ),
-                        None => found.push("it holds no whole screen".to_owned()),
-                    }
-                }
-                Form::Direct => {
-                    self.outcome.comparisons += 1;
-                    let parts = match client.served {
-                        Served::Stream => Parts::Terminal,
-                        Served::Painted | Served::Nothing => Parts::Painted,
-                    };
-                    if let Some(got) = client.terminal_view()? {
-                        let mut differences = got.differences(&expected, parts);
-                        // A painter cannot place a cursor that waits to wrap: no sequence moves one
-                        // there. It says so, and the cursor is then not read from where it was
-                        // left. The screen the client holds now decides that, never an earlier one,
-                        // so a cursor misplaced later is still found.
-                        let waiting_to_wrap = client
-                            .projection
-                            .screen()
-                            .is_some_and(|screen| screen.cursor.pending_wrap);
-                        if parts == Parts::Painted && waiting_to_wrap {
-                            differences.retain(|line| !line.starts_with("cursor at"));
-                        }
-                        found.extend(
-                            differences
-                                .into_iter()
-                                .map(|line| format!("its terminal: {line}")),
-                        );
-                    }
-                    if client.served == Served::Painted {
-                        match client.projection.screen() {
-                            Some(screen) => found.extend(
-                                View::of(screen)
-                                    .differences(&expected, Parts::Whole)
-                                    .into_iter()
-                                    .map(|line| format!("its projection: {line}")),
-                            ),
-                            None => found.push("it holds no whole screen".to_owned()),
-                        }
-                    }
-                }
-            }
+            self.outcome.comparisons += 1;
+            let found = compare(client, &expected)?;
             if !found.is_empty() {
                 self.fail(property, client, at, found.join("; "));
             }
@@ -999,6 +1035,137 @@ impl<'a> Stage<'a> {
             .rev()
             .find(|(from, _)| (*from as u64) < offset)
             .map(|(_, attachment)| *attachment)
+    }
+
+    /// Reads `bytes` into the session as one read of the program's output, and hands every client
+    /// what it was given.
+    pub(crate) fn ingest(&mut self, bytes: &[u8]) -> Result<(), String> {
+        let _ = self.session.ingest_output(bytes);
+        self.fed += bytes.len();
+        self.pump_all()
+    }
+
+    fn pump_all(&mut self) -> Result<(), String> {
+        let mut clients = std::mem::take(&mut self.clients);
+        let mut pumped = Ok(());
+        for client in &mut clients {
+            pumped = pumped.and_then(|()| self.pump(client));
+        }
+        self.clients = clients;
+        pumped
+    }
+
+    /// Settles the session's screen, as the read loop does when the program pauses, and hands
+    /// every client what that released.
+    pub(crate) fn settle(&mut self) -> Result<(), String> {
+        let _ = self.session.quiesce_output();
+        self.pump_all()
+    }
+
+    /// Takes the input lease for client `index`, and returns what the session said.
+    pub(crate) fn acquire(
+        &mut self,
+        index: usize,
+    ) -> Result<kr_protocol::input::InputAcquireResult, String> {
+        let attachment = self.clients[index].attachment;
+        let acquired = self
+            .session
+            .acquire_input(attachment, ConnectionId::new(kr_ipc::new_uuid()), None)
+            .map_err(|error| format!("client {index} did not take the lease: {error}"))?;
+        // A lease numbers its writes from zero.
+        self.clients[index].epoch = Some(acquired.lease.epoch.get());
+        self.clients[index].sequence = 0;
+        self.holders.push((self.fed, attachment));
+        self.pump_all()?;
+        Ok(acquired)
+    }
+
+    /// Writes `bytes` as client `index`'s input at `now`, under the lease it took last, and returns
+    /// what the session answered. A client that never took the lease has nothing to write under.
+    pub(crate) fn input(
+        &mut self,
+        index: usize,
+        bytes: &[u8],
+        now: std::time::Instant,
+    ) -> Result<kr_worker::Result<kr_worker::session::InputAccepted>, String> {
+        let client = &mut self.clients[index];
+        let epoch = client
+            .epoch
+            .ok_or_else(|| format!("client {index} never took the lease"))?;
+        let sequence = client.sequence;
+        client.sequence += 1;
+        let attachment = client.attachment;
+        let answer = self
+            .session
+            .write_input(attachment, epoch, sequence, bytes, None, now);
+        self.pump_all()?;
+        Ok(answer)
+    }
+
+    /// Fires the paste recogniser's timer when its deadline is at or before `now`, as the
+    /// worker's timer does, and says whether it fired.
+    pub(crate) fn fire_paste_timer(&mut self, now: std::time::Instant) -> Result<bool, String> {
+        let due = self
+            .session
+            .paste_deadline()
+            .is_some_and(|deadline| deadline <= now);
+        if due {
+            let _ = self.session.expire_paste_prefix(now);
+            self.pump_all()?;
+        }
+        Ok(due)
+    }
+
+    /// Detaches client `index`; what it was given stays with it.
+    pub(crate) fn detach(&mut self, index: usize) -> Result<(), String> {
+        let client = &mut self.clients[index];
+        self.session
+            .detach(client.attachment)
+            .map_err(|error| format!("client {index} did not detach: {error}"))?;
+        client.stream = None;
+        client.ended = true;
+        client.left_at = Some(self.fed);
+        self.pump_all()
+    }
+
+    /// Everything queued for the program's input since the last call.
+    pub(crate) fn pending_input(&mut self) -> Vec<InputBatch> {
+        self.session.take_pending_input()
+    }
+
+    /// Where client `index` differs from the session's screen now; empty when it holds it.
+    pub(crate) fn differences(&mut self, index: usize) -> Result<Vec<String>, String> {
+        self.settle()?;
+        let expected = self.canonical()?;
+        compare(&mut self.clients[index], &expected)
+    }
+
+    /// The side effects client `index`'s terminal performed from the live stream.
+    pub(crate) fn live(&self, index: usize) -> &[Delivered] {
+        &self.clients[index].live
+    }
+
+    /// What client `index`'s terminal did while it was being drawn a screen since the last call,
+    /// which is nothing when all is well.
+    pub(crate) fn take_restoring(&mut self, index: usize) -> Vec<String> {
+        std::mem::take(&mut self.clients[index].restoring)
+    }
+
+    /// What the checks the stage makes on its own found since the last call: a restored screen
+    /// that was not the session's, and raw output handed to a terminal of another size.
+    pub(crate) fn take_failures(&mut self) -> Vec<Failure> {
+        std::mem::take(&mut self.outcome.failures)
+    }
+
+    /// The session's own screen once the application pauses.
+    pub(crate) fn screen(&mut self) -> Result<View, String> {
+        self.settle()?;
+        self.canonical()
+    }
+
+    /// The session itself.
+    pub(crate) const fn session(&mut self) -> &mut Session {
+        &mut self.session
     }
 }
 

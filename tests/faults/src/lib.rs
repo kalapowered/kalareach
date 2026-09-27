@@ -17,9 +17,12 @@
 //! * [`restore`]: a worker's session fed a corpus through its own read-loop entry, and the two
 //!   clients a person attaches with, attached at every point of it and checked against the
 //!   session's own screen.
+//! * [`trace`]: an ordering race kept as the steps that reproduce it, replayed on simulated time
+//!   against a session whose peers are scripted, and minimised when it fails.
 
 pub mod corpus;
 pub mod restore;
 pub mod screen;
 pub mod terminal;
 pub mod time;
+pub mod trace;

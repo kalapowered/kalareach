@@ -1,0 +1,29 @@
+{
+  "format": "kalareach.trace/1",
+  "name": "clipboard-before-and-after-an-attach",
+  "about": "an application copies to the clipboard and rings the bell before a client arrives and again after: the client's terminal performs only what came after it arrived, once each, and only while it holds the input lease; a second client arriving later performs nothing until it takes the lease",
+  "columns": 20,
+  "rows": 3,
+  "wall_ms": 1790000000000,
+  "steps": [
+    { "do": "output", "text": "$ copy\r\n\u001b]52;c;YmVmb3Jl\u001b\\" },
+    { "do": "output", "text": "\u0007" },
+    { "do": "attach", "client": "a", "form": "direct" },
+    { "do": "acquire", "client": "a" },
+    { "do": "holds", "client": "a" },
+    { "do": "effects", "client": "a", "expect": [] },
+    { "do": "output", "text": "\u001b]52;c;YWZ0ZXI=\u001b\\" },
+    { "do": "effects", "client": "a", "expect": ["clipboard write: after"] },
+    { "do": "attach", "client": "b", "form": "direct" },
+    { "do": "holds", "client": "b" },
+    { "do": "output", "text": "\u0007" },
+    { "do": "effects", "client": "a", "expect": ["clipboard write: after", "bell"] },
+    { "do": "effects", "client": "b", "expect": [] },
+    { "do": "acquire", "client": "b" },
+    { "do": "output", "text": "\u001b]52;c;dGhpcmQ=\u001b\\" },
+    { "do": "effects", "client": "a", "expect": ["clipboard write: after", "bell"] },
+    { "do": "effects", "client": "b", "expect": ["clipboard write: third"] },
+    { "do": "holds", "client": "a" },
+    { "do": "holds", "client": "b" }
+  ]
+}
