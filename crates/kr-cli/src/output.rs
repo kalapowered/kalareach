@@ -55,8 +55,8 @@ pub enum Request {
     ToolAnswer,
     /// The token an agent presented to the contact tools.
     ToolCaller,
-    /// What `kr doctor` was asked to diagnose: a capability's resolved executable and each
-    /// effective configuration value.
+    /// What `kr doctor` was asked to diagnose: a capability's resolved executable, this host's
+    /// configuration and state locations, and each effective configuration value.
     Diagnostics,
 }
 

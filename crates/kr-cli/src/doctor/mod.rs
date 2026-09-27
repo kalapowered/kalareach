@@ -492,24 +492,29 @@ pub fn integration_lines(
     lines
 }
 
+/// One of this host's own locations: its configuration document, its runtime and state directories
+/// and a document left at a location it no longer reads. Section 26 has `kr doctor` report them, so
+/// each is said whole, as content the person asked the diagnostics for; the host-path rule would
+/// replace the names of a document outside this installation's roots, which is where one belongs
+/// on Linux.
+fn location(path: &str) -> Asked {
+    Asked::path(Request::Diagnostics, path)
+}
+
 /// Renders this host's effective configuration.
 ///
-/// The host's own sentences are said as it wrote them; each other text field, and each value, by
-/// the class it is made of ([`configured`]).
+/// The host's own sentences are said as it wrote them; this host's own locations whole
+/// ([`location`]); each other text field, and each value, by the class it is made of
+/// ([`configured`]).
 #[must_use]
 pub fn configuration_report(effective: &EffectiveConfiguration) -> Document {
-    const REPORT: &str = "EffectiveConfiguration";
-
     Document::new()
         .with(
             "schema_version",
             crate::output::said(&effective.schema_version),
         )
         .with("revision", crate::output::said(&effective.revision))
-        .with(
-            "document",
-            configured_field(REPORT, "document", &effective.document),
-        )
+        .with("document", location(&effective.document))
         .with(
             "status",
             Document::new()
@@ -527,14 +532,8 @@ pub fn configuration_report(effective: &EffectiveConfiguration) -> Document {
             "fence_outstanding",
             effective.fence_outstanding.as_ref().map(host_text),
         )
-        .with(
-            "runtime_directory",
-            configured_field(REPORT, "runtime_directory", &effective.runtime_directory),
-        )
-        .with(
-            "state_directory",
-            configured_field(REPORT, "state_directory", &effective.state_directory),
-        )
+        .with("runtime_directory", location(&effective.runtime_directory))
+        .with("state_directory", location(&effective.state_directory))
         // Section 26's native OS-appropriate locations: where this host's files are, and the rule
         // this platform followed to put them there. Both, because a rule without the resolved path
         // does not say where anything is, and a path without the rule does not say where the next
@@ -666,7 +665,7 @@ pub fn configuration_report(effective: &EffectiveConfiguration) -> Document {
             effective
                 .stale_documents
                 .iter()
-                .map(|stale| configured_field(REPORT, "stale_documents", stale))
+                .map(|stale| location(stale))
                 .collect::<Vec<_>>(),
         )
 }
@@ -781,22 +780,20 @@ pub fn summary(result: &HostDoctorResult) -> Shown {
 /// constant a person has to go and look up.
 #[must_use]
 pub fn configurable_lines(effective: &EffectiveConfiguration) -> Vec<Line> {
-    const REPORT: &str = "EffectiveConfiguration";
-
     let mut lines = vec![stdout_line!(
         "configuration {} (schema version {}, revision {}): {}",
-        configured_field(REPORT, "document", &effective.document),
+        location(&effective.document),
         effective.schema_version,
         effective.revision,
         host_text(&effective.status.detail)
     )];
     lines.push(stdout_line!(
         "  runtime directory {}",
-        configured_field(REPORT, "runtime_directory", &effective.runtime_directory)
+        location(&effective.runtime_directory)
     ));
     lines.push(stdout_line!(
         "  state directory {}",
-        configured_field(REPORT, "state_directory", &effective.state_directory)
+        location(&effective.state_directory)
     ));
     // Section 26's native OS-appropriate locations: where this platform puts each of them, beside
     // the three paths above that say where this host's own are. The rule is what an owner needs in

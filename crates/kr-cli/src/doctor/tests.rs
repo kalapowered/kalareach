@@ -206,12 +206,11 @@ fn the_configurable_defaults_are_shown_with_their_value_and_source() {
         .iter()
         .map(|line| line.text().to_owned())
         .collect::<Vec<_>>();
-    // The document is a path, said as this installation's paths are: its configured roots whole,
-    // and below them the names its tree writes, the document's own among them.
-    let document = Shown::host_path(std::path::Path::new("/tmp/kalareach/config.json"));
-    assert!(document.as_str().ends_with("config.json"), "{document}");
+    // The document is one of this host's own locations, which the owner asked for and is told
+    // whole, spelled as every path is.
+    let document = kr_client::shown::spelled(std::path::Path::new("/tmp/kalareach/config.json"));
     assert!(
-        lines[0].contains(document.as_str()),
+        lines[0].contains(&document),
         "the owner is told which document this is: {lines:?}"
     );
     assert!(
@@ -226,6 +225,100 @@ fn the_configurable_defaults_are_shown_with_their_value_and_source() {
             && line.contains("applies immediately")),
         "{lines:?}"
     );
+}
+
+/// KR-REQ-23.25, KR-REQ-26.44: planted text in the diagnostics shows only where the person asked
+/// `kr doctor` for it, this host's own locations and each effective value by its class, and where
+/// the host's own export text is said through its door: a check's words and the configuration's
+/// own sentences.
+#[test]
+fn planted_text_in_the_diagnostics_shows_only_where_it_was_asked_for() {
+    use crate::output::planted::{only_asked_or_host_text, planted};
+    use crate::shown::marker::MARKER;
+
+    let door = |text: &dyn Fn() -> String| text().matches(MARKER).count();
+    let mut shown = std::collections::BTreeSet::new();
+    for result in planted::<HostDoctorResult>() {
+        only_asked_or_host_text(
+            "kr doctor",
+            &doctor(&result),
+            &[
+                "checks[].id",
+                "checks[].title",
+                "checks[].detail",
+                "checks[].remedy",
+            ],
+        );
+        // A check's lines are the host's words, through the door and nowhere else.
+        let said: usize = doctor_lines(&result, true)
+            .iter()
+            .map(|line| line.as_str().matches(MARKER).count())
+            .sum();
+        let words: usize = result
+            .checks
+            .iter()
+            .map(|check| {
+                door(&|| check.stated_title().as_str().to_owned())
+                    + door(&|| check.stated_detail().as_str().to_owned())
+                    + check
+                        .stated_remedy()
+                        .map_or(0, |remedy| door(&|| remedy.as_str().to_owned()))
+            })
+            .sum();
+        assert_eq!(said, words, "a check's lines say only its own words");
+
+        let configuration = &result.configuration;
+        shown.extend(only_asked_or_host_text(
+            "kr doctor",
+            &configuration_report(configuration),
+            &[
+                "status.detail",
+                "not_in_force",
+                "fence_outstanding",
+                "locations[].documented",
+                "precedence[]",
+                "overrides[].why",
+                "values[].about",
+                "ceilings[].configured",
+                "ceilings[].value",
+                "ceilings[].narrowed_by",
+            ],
+        ));
+        // The configuration's lines: asked content, and the host's sentences each line prints.
+        let unasked: usize = configurable_lines(configuration)
+            .iter()
+            .map(|line| line.unasked(MARKER))
+            .sum();
+        let sentences = door(&|| configuration.status.detail.as_str().to_owned())
+            + configuration
+                .locations
+                .iter()
+                .map(|location| door(&|| location.documented.as_str().to_owned()))
+                .sum::<usize>()
+            + configuration
+                .ceilings
+                .iter()
+                .map(|ceiling| {
+                    door(&|| ceiling.value.as_str().to_owned())
+                        + ceiling
+                            .narrowed_by
+                            .as_ref()
+                            .map_or(0, |why| door(&|| why.as_str().to_owned()))
+                })
+                .sum::<usize>();
+        assert_eq!(
+            unasked, sentences,
+            "the configuration's lines say nothing unasked but the host's own sentences"
+        );
+    }
+    for asked in [
+        "document",
+        "runtime_directory",
+        "state_directory",
+        "stale_documents[]",
+    ] {
+        assert!(shown.contains(asked), "{asked} shows what was asked for");
+    }
 }
 
 /// The marker this file plants in every text-bearing field of a reply.
