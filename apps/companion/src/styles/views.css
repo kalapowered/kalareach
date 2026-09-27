@@ -241,6 +241,15 @@
   overflow-wrap: anywhere;
 }
 
+/* A stock shell, named in the session's status with what it means for this session. */
+.session-shell {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+  margin-top: 6px;
+}
+
 .session-tabs {
   display: flex;
   gap: 6px;
@@ -860,6 +869,48 @@
   block-size: 18px;
   margin: 0;
   accent-color: var(--accent);
+}
+
+/*
+ * The two shells a new session can run, side by side before it exists. The chosen shell's column
+ * is marked by its background alone, so choosing moves nothing on the screen.
+ */
+.shell-difference {
+  margin-top: 8px;
+  overflow-x: auto;
+}
+
+.shell-difference table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.75rem;
+  line-height: 1.5;
+}
+
+.shell-difference th,
+.shell-difference td {
+  padding: 8px 10px;
+  border-top: 1px solid var(--line);
+  text-align: start;
+  vertical-align: top;
+}
+
+.shell-difference thead th,
+.shell-difference thead td {
+  border-top: 0;
+  font-weight: 600;
+}
+
+.shell-difference tbody th {
+  width: 28%;
+  font-weight: 500;
+  color: var(--muted);
+}
+
+.shell-difference[data-chosen='managed'] [data-mode='managed'],
+.shell-difference[data-chosen='native_compat'] [data-mode='native_compat'] {
+  background: var(--subtle);
+  color: var(--text);
 }
 
 /* What an invitation would carry, read for the choice as it stands, before anything is issued. */

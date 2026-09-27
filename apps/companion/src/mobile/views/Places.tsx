@@ -52,7 +52,11 @@ export function MobileSessions({
               id: session.session_id,
               title: `Session ${session.display_number}`,
               where: session.cwd,
-              detail: describeSessionState(session.state, session.attachment_count),
+              // A stock shell is labelled wherever the session is listed.
+              detail:
+                session.shell_mode === 'native_compat'
+                  ? `${describeSessionState(session.state, session.attachment_count)} · Stock shell`
+                  : describeSessionState(session.state, session.attachment_count),
               tone: session.state === 'live' ? 'success' : session.state === 'closed' ? 'muted' : 'warning'
             }))
           )

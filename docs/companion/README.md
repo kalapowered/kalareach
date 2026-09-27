@@ -75,6 +75,17 @@ screen is written as positions and colours, never as the bytes the session print
 keeps at most 2,000 screens and 8 MiB, and declares the earlier screens it let go and the screens
 drawn at another size. Before the terminal view has drawn, there is no recording to export.
 
+A session is created from the session list, in a directory the person names, with its shell chosen
+first. A managed shell is the host's qualified package: Ctrl-D at an empty prompt detaches the view,
+launch buttons start an agent at the prompt, and the host reads the shell's editor, so it knows
+when the prompt is empty. A stock shell is the system's own, for compatibility: Ctrl-D does what
+the shell does and can close the session, launch buttons show the command to type and start
+nothing, and the editor is not read. Attaching, detaching, closing, file transfer, agents and the
+terminal work in both. The creation sheet shows the two side by side before anything exists, and a
+stock shell is labelled in the session list, the session's header and settings, and the phone's
+list. A managed shell the host cannot qualify is refused with the host's reason; a stock shell is
+created only when the person chooses one.
+
 A draft keeps the conversation it was written for: the agent's instance and the binding revision the
 person wrote to. If the agent moves to another conversation while the draft is on screen, the draft
 is conflicted and nothing sends it on; the person chooses whether it goes to the new one. A draft

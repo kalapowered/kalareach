@@ -12,9 +12,11 @@ import type { EnvironmentListResult, HostInfoResult, SessionListResult } from '@
 
 import { Badge, Banner, Button, Card } from '../components/ui'
 import { useApp } from '../app/state'
+import { useConnectionRights } from '../app/rights'
 import { failureMessage, watch, type Watch } from '../host/port'
 import { ask } from '../mobile/model/call'
 import { accountName } from './account-name'
+import { NewSession } from './NewSession'
 
 type Session = SessionListResult['sessions'][number]
 
@@ -50,9 +52,11 @@ export function sessionDescription(session: Session): string {
 /** The list of sessions. */
 export function Sessions(): ReactNode {
   const { port, go } = useApp()
+  const rights = useConnectionRights()
   const [list, setList] = useState<SessionListResult | null>(null)
   const [failure, setFailure] = useState<string | null>(null)
   const [query, setQuery] = useState('')
+  const [creating, setCreating] = useState(false)
   // Every read, on opening and on a retry, is made under one watch with no listeners, so only the
   // newest read's answer is shown, and none once the screen closes.
   const reads = useRef<Watch | null>(null)
@@ -100,7 +104,26 @@ export function Sessions(): ReactNode {
           <h1>Sessions</h1>
           <p>Everything running on this host, and what each one is doing.</p>
         </div>
+        {rights?.includes('session.create') ? (
+          <div className="page-actions">
+            <Button
+              tone="primary"
+              onClick={() => {
+                setCreating(true)
+              }}
+            >
+              New session
+            </Button>
+          </div>
+        ) : null}
       </header>
+
+      <NewSession
+        open={creating}
+        onClose={() => {
+          setCreating(false)
+        }}
+      />
 
       {failure ? (
         <Banner
@@ -151,13 +174,19 @@ export function Sessions(): ReactNode {
                 <span>
                   <h3>{sessionDescription(session)}</h3>
                   <p className="faint mono">{session.shell_path}</p>
+                  {session.shell_mode === 'native_compat' ? (
+                    <Badge tone="neutral">Stock shell</Badge>
+                  ) : null}
                 </span>
               </span>
               <span className="host-column mono" role="cell">
                 {session.cwd}
               </span>
               <span className="agent-column" role="cell">
-                {session.application_state === null ? 'Shell' : 'Agent'}
+                {/* A root shell at its prompt is the shell in the foreground, not an agent. */}
+                {session.application_state === null || session.application_state === 'shell_ready'
+                  ? 'Shell'
+                  : 'Agent'}
               </span>
               <span className="agent-column" role="cell" data-testid="attachment-count">
                 {session.attachment_count}

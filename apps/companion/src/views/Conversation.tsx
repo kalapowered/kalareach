@@ -133,6 +133,7 @@ export function Conversation({
   subject,
   connected,
   launch,
+  shellMode = null,
   onLaunched
 }: {
   readonly sessionId: string
@@ -140,6 +141,8 @@ export function Conversation({
   readonly connected: boolean
   /** The launch surface as it was read, and the prompt's generation as the view knows it now. */
   readonly launch: { readonly surface: LaunchSurface; readonly promptGeneration: string } | null
+  /** The session's shell, as the host reported it, or null before it has. */
+  readonly shellMode?: 'managed' | 'native_compat' | null
   readonly onLaunched: () => void
 }): ReactNode {
   const { port, say } = useApp()
@@ -769,7 +772,11 @@ export function Conversation({
 
       <ApprovalRequests sessionId={sessionId} onAnswered={refresh} />
 
-      {launch?.surface.prompt_is_empty ? (
+      {launch !== null && shellMode === 'native_compat' ? (
+        // A stock shell's editor is not the host's to see or to type into, so its launch buttons
+        // show what to type, whatever the prompt holds.
+        <LaunchInstructions surface={launch.surface} />
+      ) : launch?.surface.prompt_is_empty ? (
         <LaunchSurfaceView
           surface={launch.surface}
           promptGeneration={launch.promptGeneration}
@@ -1355,6 +1362,60 @@ function LaunchSurfaceView({
       )}
     </section>
   )
+}
+
+/**
+ * The launch surface of a stock shell.
+ *
+ * The host cannot see a stock shell's editor, so nothing here types into it or starts anything: a
+ * button shows the command for the person to type at the prompt themselves.
+ */
+function LaunchInstructions({ surface }: { readonly surface: LaunchSurface }): ReactNode {
+  const [shown, setShown] = useState<LaunchSurface['profiles'][number] | null>(null)
+  return (
+    <section className="launch-surface" data-testid="launch-instructions">
+      <p className="eyebrow">Start something here</p>
+      <div className="row wrap">
+        {surface.profiles.map((profile) => (
+          <Button
+            key={profile.profile_id}
+            data-profile={profile.profile_id}
+            disabled={profile.executable === null}
+            aria-pressed={shown?.profile_id === profile.profile_id}
+            title={
+              profile.executable === null
+                ? `${profile.label} is not installed in this environment.`
+                : undefined
+            }
+            onClick={() => {
+              setShown(profile)
+            }}
+          >
+            {profile.label}
+            {profile.user_defined ? <span className="faint small"> · yours</span> : null}
+          </Button>
+        ))}
+      </div>
+      <p className="small faint" data-testid="launch-instruction">
+        {shown === null ? (
+          'This is a stock shell, so nothing is typed into it for you. Choose one to see what to type.'
+        ) : (
+          <>
+            Type this at the prompt: <code>{commandLine(shown.arguments)}</code>
+          </>
+        )}
+      </p>
+    </section>
+  )
+}
+
+/** An argument vector as a person types it at a shell's prompt. */
+function commandLine(argv: readonly string[]): string {
+  return argv
+    .map((argument) =>
+      /^[\w@%+=:,./-]+$/.test(argument) ? argument : `'${argument.replaceAll("'", `'\\''`)}'`
+    )
+    .join(' ')
 }
 
 /** The composer. */

@@ -242,6 +242,15 @@ export function Session({
           </p>
           <h1>{summary ? sessionDescription(summary) : 'Session'}</h1>
           <p className="session-meta mono">{summary?.cwd ?? ''}</p>
+          {summary?.shell_mode === 'native_compat' ? (
+            // A stock shell is labelled wherever the session is shown, with what that means here.
+            <p className="session-shell" data-testid="shell-mode">
+              <Badge tone="neutral">Stock shell</Badge>
+              <span className="small muted">
+                Ctrl-D can close this session, and launch buttons show the command for you to type.
+              </span>
+            </p>
+          ) : null}
         </div>
         <div className="page-actions">
           <Segmented
@@ -308,6 +317,7 @@ export function Session({
               ? { surface: offered.surface, promptGeneration: offered.promptGeneration }
               : null
           }
+          shellMode={summary?.shell_mode ?? null}
           onLaunched={readAgain}
         />
       ) : pane === 'output' ? (
@@ -483,6 +493,31 @@ function SessionSettings({
                   <p>While you are at the live end. Scrolling up stops it until you come back.</p>
                 </div>
                 <Switch checked={followOutput} label="Follow new output" onChange={setFollowOutput} />
+              </div>
+              <div className="settings-row" data-testid="session-shell">
+                <div>
+                  <h3>Shell</h3>
+                  {session === null ? (
+                    <p>The host has not reported this session’s shell yet.</p>
+                  ) : session.shell_mode === 'native_compat' ? (
+                    <>
+                      <p className="mono small">Stock shell, {session.shell_path}</p>
+                      <p>
+                        Ctrl-D does what the shell does, and can close this session. Launch
+                        buttons show the command for you to type, and the shell’s editor is not
+                        read. Detach is always there.
+                      </p>
+                    </>
+                  ) : (
+                    <>
+                      <p className="mono small">Managed shell, {session.shell_path}</p>
+                      <p>
+                        Ctrl-D at an empty prompt detaches this view, and the session keeps
+                        running. Launch buttons start the agent at the prompt for you.
+                      </p>
+                    </>
+                  )}
+                </div>
               </div>
               <div className="settings-row">
                 <div>

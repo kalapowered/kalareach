@@ -3217,3 +3217,48 @@ test.describe('input feedback with reduced motion', () => {
     await expect(sheet).toBeHidden({ timeout: PRESENTATION_DEADLINE })
   })
 })
+
+// KR-REQ-07.21: a stock shell is an explicit choice, and what it does not do is shown before the
+// session exists and in the session's status, wherever the session is shown.
+test.describe('a new session and its shell', () => {
+  test('shows the difference before creation, and a stock shell in the status once it exists', async ({
+    page
+  }) => {
+    const engine = test.info().project.name
+    await open(page)
+    await page.getByRole('button', { name: 'Sessions' }).click()
+    await page.getByRole('button', { name: 'New session' }).click()
+    const sheet = page.getByTestId('sheet')
+    await expect(sheet).toHaveAttribute('data-presentation', 'here', { timeout: PRESENTATION_DEADLINE })
+    const difference = sheet.getByTestId('shell-difference')
+    await expect(difference).toHaveAttribute('data-chosen', 'managed')
+
+    await sheet.getByRole('radio', { name: /Stock shell/ }).check()
+    await expect(difference).toHaveAttribute('data-chosen', 'native_compat')
+    await sheet.getByRole('textbox', { name: 'Directory' }).fill('/Users/rs/work/notes')
+    await expect(difference).toContainText('Does what the shell does, and can close the session')
+    await still(page, 'shell-difference-before-creation-07.21')
+
+    await sheet.getByRole('button', { name: 'Create session' }).click()
+    const status = page.getByTestId('shell-mode')
+    await expect(status).toContainText('Stock shell')
+    await expect(status).toContainText('Ctrl-D can close this session')
+    await expect(page.getByTestId('sheet')).toBeHidden({ timeout: PRESENTATION_DEADLINE })
+    await still(page, 'shell-status-session-07.21')
+
+    await page.getByTestId('open-settings').click()
+    await page.getByRole('button', { name: 'This session' }).click()
+    await expect(page.getByTestId('session-shell')).toContainText('Stock shell, /bin/zsh')
+    await expect(page.getByTestId('sheet')).toHaveAttribute('data-presentation', 'here', {
+      timeout: PRESENTATION_DEADLINE
+    })
+    await still(page, 'shell-status-settings-07.21')
+    await page.keyboard.press('Escape')
+
+    await page.getByRole('button', { name: 'Sessions' }).click()
+    await expect(page.getByTestId('session-row-4')).toContainText('Stock shell')
+    await expect(page.getByTestId('session-row-1')).not.toContainText('Stock shell')
+    await still(page, 'shell-status-list-07.21')
+    expect(engine).not.toBe('')
+  })
+})
