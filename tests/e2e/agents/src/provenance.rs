@@ -475,12 +475,20 @@ impl Provenance {
     pub fn evidence(&self) -> serde_json::Value {
         let seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
         let executed: Vec<&Executed> = seen.executed.values().collect();
+        // Every process number seen beneath the sessions, which is how the system's
+        // authentication and privacy services name the processes that call them.
+        let pids: std::collections::BTreeSet<u64> = seen
+            .processes
+            .keys()
+            .map(|identity| identity.pid.get())
+            .collect();
         json!({
             "session_path": *self.seen_path.lock().unwrap_or_else(PoisonError::into_inner),
             "sample_interval_ms": SAMPLE_INTERVAL.as_millis(),
             "samples": seen.samples,
             "launches": seen.launches,
             "executed": executed,
+            "pids": pids,
             "ended_before_read": seen.unread,
         })
     }

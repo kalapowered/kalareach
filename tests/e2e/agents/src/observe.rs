@@ -160,37 +160,53 @@ pub fn live_bindings(
 pub struct Answer {
     /// The method, and for a plugin action the action it names.
     pub call: String,
-    /// The code the host refused it with, or nothing when it did not refuse it.
+    /// The code the host refused it with, where the host answered with a refusal.
     pub refused: Option<String>,
+    /// What went wrong where no answer of the host's came back: the connection, or an answer that
+    /// could not be read. That is not a refusal.
+    pub error: Option<String>,
     /// What came back, in words.
     pub detail: String,
 }
 
 impl Answer {
+    /// Whether the host accepted the call.
+    #[must_use]
+    pub const fn accepted(&self) -> bool {
+        self.refused.is_none() && self.error.is_none()
+    }
+
     /// The answer as evidence.
     #[must_use]
     pub fn evidence(&self) -> serde_json::Value {
-        json!({ "call": self.call, "refused": self.refused, "detail": self.detail })
+        json!({ "call": self.call, "refused": self.refused, "error": self.error, "detail": self.detail })
     }
 }
 
-/// What the host answered one call with, as an [`Answer`].
+/// What the host answered one call with, as an [`Answer`]: a refusal only where the host refused
+/// the call with a code.
 #[must_use]
 pub fn answer<R>(call: String, outcome: Result<R, kr_e2e_m1b::device::RequestError>) -> Answer {
     match outcome {
         Ok(_) => Answer {
             call,
             refused: None,
+            error: None,
             detail: "accepted".to_owned(),
         },
-        Err(error) => Answer {
-            call,
-            refused: Some(
-                error
-                    .refusal()
-                    .map_or_else(|| "no code".to_owned(), |code| code.as_str().to_owned()),
-            ),
-            detail: error.to_string(),
+        Err(error) => match error.refusal() {
+            Some(code) => Answer {
+                call,
+                refused: Some(code.as_str().to_owned()),
+                error: None,
+                detail: error.to_string(),
+            },
+            None => Answer {
+                call,
+                refused: None,
+                error: Some(error.to_string()),
+                detail: error.to_string(),
+            },
         },
     }
 }
