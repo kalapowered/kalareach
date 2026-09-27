@@ -740,7 +740,7 @@ impl ChangeSetService {
     ///
     /// A review acknowledgement arrives here. It records that somebody acknowledged **this
     /// version** and does nothing else: no commit, no push, no revert, and no write to any working
-    /// tree. Promotion is [`Self::apply`] under an authority of its own.
+    /// tree. Promotion is [`apply`](crate::apply::apply) under an authority of its own.
     ///
     /// # Errors
     ///

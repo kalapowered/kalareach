@@ -35,9 +35,9 @@
 //!
 //! [`ApplyOutcomeClass::Applied`] is recorded once every planned path has been confirmed in the
 //! destination. A crash between a write and its record leaves the path `planned` and the apply
-//! undecided, and [`recover`] settles it as [`ApplyOutcomeClass::InterruptedApply`] with exactly
-//! the paths whose state is known. There is no path through this module that turns a crash after
-//! one file into an atomic-success receipt.
+//! undecided, and [`recover_before_serving`] settles it as [`ApplyOutcomeClass::InterruptedApply`]
+//! with exactly the paths whose state is known. There is no path through this module that turns a
+//! crash after one file into an atomic-success receipt.
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
