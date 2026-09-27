@@ -817,6 +817,15 @@
   accent-color: var(--accent);
 }
 
+/* What an invitation would carry, read for the choice as it stands, before anything is issued. */
+.invitation-carries {
+  margin-top: 16px;
+}
+
+.invitation-carries h3 {
+  margin-bottom: 8px;
+}
+
 /* The host's own sentence for what an invitation's actions mean, apart from the list above it. */
 .invitation-notice {
   margin-top: 12px;

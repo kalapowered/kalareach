@@ -246,25 +246,27 @@ export function Sharing({
         />
       </div>
 
-      <Card data-testid="invitation-carries">
-        <div className="card-body">
-          <h3>This invitation carries</h3>
-          <ul className="consequence-list">
-            {(shown?.actions ?? []).map((action) => (
-              <li key={action}>{ACTION_WORDS[action] ?? action}</li>
+      <div className="invitation-carries">
+        <Card data-testid="invitation-carries">
+          <div className="card-body">
+            <h3>This invitation carries</h3>
+            <ul className="consequence-list">
+              {(shown?.actions ?? []).map((action) => (
+                <li key={action}>{ACTION_WORDS[action] ?? action}</li>
+              ))}
+            </ul>
+            {(shown?.notices ?? []).map((each) => (
+              <p
+                className="small warning-text invitation-notice"
+                key={each.notice}
+                data-notice={each.notice}
+              >
+                {each.sentence}
+              </p>
             ))}
-          </ul>
-          {(shown?.notices ?? []).map((each) => (
-            <p
-              className="small warning-text invitation-notice"
-              key={each.notice}
-              data-notice={each.notice}
-            >
-              {each.sentence}
-            </p>
-          ))}
-        </div>
-      </Card>
+          </div>
+        </Card>
+      </div>
 
       <div className="sharing-invite">
         <CommitButton
