@@ -752,6 +752,31 @@ impl Snapshot {
     pub fn unread(&self) -> &[String] {
         &self.unread
     }
+
+    /// How many entries could not be read under each root, for each root that has any, in the
+    /// order of the roots: an entry counts under the longest root that is it or holds it. Unlike
+    /// [`Snapshot::unread`], it names no entry, so it can be said where the person's own file
+    /// names must not be.
+    #[must_use]
+    pub fn unread_by_root(&self) -> Vec<(PathBuf, usize)> {
+        let mut counts: Vec<(PathBuf, usize)> =
+            self.roots.iter().map(|root| (root.clone(), 0)).collect();
+        for entry in &self.unread {
+            let holder = counts
+                .iter_mut()
+                .filter(|(root, _)| {
+                    let root = root.display().to_string();
+                    entry.starts_with(&format!("{root}/"))
+                        || entry.starts_with(&format!("{root}: "))
+                })
+                .max_by_key(|(root, _)| root.as_os_str().len());
+            if let Some((_, count)) = holder {
+                *count += 1;
+            }
+        }
+        counts.retain(|(_, count)| *count > 0);
+        counts
+    }
 }
 
 /// Reads every file under each of `directories`, relative to `home`: size, modification time and
@@ -1221,6 +1246,11 @@ mod tests {
             1,
             "only that directory: {:?}",
             before.unread()
+        );
+        assert_eq!(
+            before.unread_by_root(),
+            vec![(agent.clone(), 1)],
+            "counted under the root that holds it, which names no entry"
         );
         std::fs::write(closed.join("history"), "the person's kr0123").expect("an edit");
         std::fs::write(agent.join("ours"), "kr0123").expect("a marked file");
