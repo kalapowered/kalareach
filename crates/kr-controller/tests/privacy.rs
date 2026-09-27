@@ -2027,7 +2027,7 @@ fn kr_req_24_27_a_send_on_the_wire_is_waited_for_before_the_change_is_recorded()
         move || {
             let report = subsystems
                 .privacy
-                .enable(&[], TimestampMs::new(NOW + 10), &|| Ok(()))
+                .enable(&[], TimestampMs::new(NOW + 10), &|write| write())
                 .expect("privacy mode is turned on");
             let _ = enabled.send(());
             report
@@ -2110,7 +2110,7 @@ fn kr_req_24_27_a_send_claimed_before_the_boundary_and_presented_after_it_is_tak
         if private {
             subsystems
                 .privacy
-                .enable(&[], TimestampMs::new(NOW + 10), &|| Ok(()))
+                .enable(&[], TimestampMs::new(NOW + 10), &|write| write())
                 .expect("privacy mode is turned on");
         }
         go.send(()).expect("the renewal is let go");

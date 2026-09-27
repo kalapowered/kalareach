@@ -76,6 +76,15 @@ const SCHEMA_VERSION: i64 = 1;
 /// The first wait before a refused step is tried again.
 const FIRST_RETRY_MS: u64 = 1_000;
 
+/// Runs one durable write under the admission of the action that asked for it.
+///
+/// It is called once every wait the write has is behind it, with the write itself: it checks the
+/// admission, a deadline and the authority it was given, and holds that authority standing until
+/// the write has committed, so a withdrawal is ordered wholly before the check or wholly after
+/// the commit. A refusal is returned without running the write. The daemon passes
+/// [`crate::service::Controller::under_registration`] over the admission a mutation carried.
+pub type Admitted<'a> = &'a dyn Fn(&mut dyn FnMut() -> Result<()>) -> Result<()>;
+
 /// The longest wait between two tries of a refused step.
 const LONGEST_RETRY_MS: u64 = 60_000;
 
@@ -512,9 +521,11 @@ impl EnvironmentPrivacy {
     /// anything else happens; the state is published as it commits; then every daemon subsystem
     /// is taken through its steps. Privacy mode already on is answered with where it stands.
     ///
-    /// `admitted` is asked immediately before the record is written, after every wait: an
-    /// admission that has lapsed by then, its deadline passed or its authority withdrawn, changes
-    /// nothing.
+    /// `admitted` runs the record's write under the admission the change was asked under: it is
+    /// called once the record's own transaction is held, after every wait, checks the admission and
+    /// holds it standing until the write has committed. An admission that has lapsed by then, its
+    /// deadline passed or its authority withdrawn, changes nothing, and one withdrawn afterwards is
+    /// ordered after the commit.
     ///
     /// # Errors
     ///
@@ -525,7 +536,7 @@ impl EnvironmentPrivacy {
         &self,
         sessions: &[SessionId],
         now_ms: TimestampMs,
-        admitted: &dyn Fn() -> Result<()>,
+        admitted: Admitted<'_>,
     ) -> Result<Report> {
         let mut inner = self.inner();
         if inner.mode.is_enabled() {
@@ -558,8 +569,7 @@ impl EnvironmentPrivacy {
         // withholding production, and the steps below try it again.
         let record = &mut inner.record;
         let _raised = self.backup.raise_fence_recorded(generation, now_ms, || {
-            admitted()?;
-            let recorded = record.enable(generation, &owing, now_ms);
+            let recorded = record.enable(generation, &owing, now_ms, admitted);
             #[cfg(test)]
             if recorded.is_ok() {
                 self.after_record.wait();
@@ -600,12 +610,9 @@ impl EnvironmentPrivacy {
     /// Returns [`ControllerError::Refused`], with
     /// [`kr_protocol::error::ErrorCode::ResourceUnavailable`], while cleanup is owed, naming what
     /// is owed, [`ControllerError::RegistryUnavailable`] when the record cannot be written, and
-    /// what `admitted` returns when it refuses, asked immediately before the record is written.
-    pub fn disable(
-        &self,
-        now_ms: TimestampMs,
-        admitted: &dyn Fn() -> Result<()>,
-    ) -> Result<Report> {
+    /// what `admitted` returns when it refuses; it runs the record's write as [`Self::enable`]'s
+    /// does.
+    pub fn disable(&self, now_ms: TimestampMs, admitted: Admitted<'_>) -> Result<Report> {
         let mut inner = self.inner();
         if !inner.mode.is_enabled() {
             return Ok(self.report(&inner, now_ms));
@@ -622,8 +629,7 @@ impl EnvironmentPrivacy {
         }
         let mut mode = inner.mode;
         let resumed = mode.disable(now_ms);
-        admitted()?;
-        inner.record.disable(resumed.generation, now_ms)?;
+        inner.record.disable(resumed.generation, now_ms, admitted)?;
         inner.mode = mode;
         inner.changed_at_ms = now_ms;
         self.state.publish(Published {
@@ -681,8 +687,8 @@ impl EnvironmentPrivacy {
     ///
     /// `sessions` are the sessions the environment holds content for, each of which owes its own
     /// cleanup when privacy mode is turned on ([`Self::enable`]); turning it off is refused while
-    /// cleanup is owed ([`Self::disable`]). `admitted` is asked immediately before the change is
-    /// written. Asking for the state already in force changes nothing.
+    /// cleanup is owed ([`Self::disable`]). `admitted` runs the change's write, as it does for
+    /// each of them. Asking for the state already in force changes nothing.
     ///
     /// # Errors
     ///
@@ -692,7 +698,7 @@ impl EnvironmentPrivacy {
         enabled: bool,
         sessions: &[SessionId],
         now_ms: TimestampMs,
-        admitted: &dyn Fn() -> Result<()>,
+        admitted: Admitted<'_>,
     ) -> Result<PrivacyReport> {
         let report = if enabled {
             self.enable(sessions, now_ms, admitted)?
@@ -1419,8 +1425,8 @@ impl crate::service::Controller {
         let report = tokio::task::spawn_blocking(move || {
             controller
                 .privacy
-                .set(params.enabled, &sessions, now_ms, &|| {
-                    controller.check_registration(&carried)
+                .set(params.enabled, &sessions, now_ms, &|write| {
+                    controller.under_registration(&carried, write)?
                 })
         })
         .await
@@ -1637,53 +1643,79 @@ impl Record {
     }
 
     /// Records that privacy mode is on at `generation`, with an obligation for each session, in
-    /// one transaction.
+    /// one transaction, written under `admitted` once the transaction is held.
     fn enable(
         &mut self,
         generation: PrivacyGeneration,
         sessions: &[SessionId],
         now_ms: TimestampMs,
+        admitted: Admitted<'_>,
     ) -> Result<()> {
-        let transaction = self
-            .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .map_err(ControllerError::registry)?;
-        transaction
-            .execute(
-                "UPDATE privacy_record SET generation = ?1, enabled = 1, changed_at_ms = ?2
-                  WHERE id = 0",
-                params![as_i64(generation.get()), as_i64(now_ms.get())],
-            )
-            .map_err(ControllerError::registry)?;
-        for session_id in sessions {
+        // Taking the transaction is the record's one wait: another writer holds it for up to the
+        // busy timeout. The admission is asked once it is held, and the transaction is rolled
+        // back unwritten when it refuses.
+        let mut transaction = Some(
+            self.connection
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(ControllerError::registry)?,
+        );
+        admitted(&mut || {
+            let transaction = transaction.take().ok_or_else(|| {
+                ControllerError::registry("the privacy record's transaction was already written")
+            })?;
             transaction
                 .execute(
-                    "INSERT INTO privacy_obligations (session_id, generation, recorded_at_ms)
-                     VALUES (?1, ?2, ?3)
-                     ON CONFLICT (session_id) DO UPDATE SET
-                         generation = excluded.generation,
-                         recorded_at_ms = excluded.recorded_at_ms",
-                    params![
-                        session_id.to_string(),
-                        as_i64(generation.get()),
-                        as_i64(now_ms.get())
-                    ],
+                    "UPDATE privacy_record SET generation = ?1, enabled = 1, changed_at_ms = ?2
+                      WHERE id = 0",
+                    params![as_i64(generation.get()), as_i64(now_ms.get())],
                 )
                 .map_err(ControllerError::registry)?;
-        }
-        transaction.commit().map_err(ControllerError::registry)
+            for session_id in sessions {
+                transaction
+                    .execute(
+                        "INSERT INTO privacy_obligations (session_id, generation, recorded_at_ms)
+                         VALUES (?1, ?2, ?3)
+                         ON CONFLICT (session_id) DO UPDATE SET
+                             generation = excluded.generation,
+                             recorded_at_ms = excluded.recorded_at_ms",
+                        params![
+                            session_id.to_string(),
+                            as_i64(generation.get()),
+                            as_i64(now_ms.get())
+                        ],
+                    )
+                    .map_err(ControllerError::registry)?;
+            }
+            transaction.commit().map_err(ControllerError::registry)
+        })
     }
 
-    /// Records that privacy mode is off from `generation`.
-    fn disable(&mut self, generation: PrivacyGeneration, now_ms: TimestampMs) -> Result<()> {
-        self.connection
-            .execute(
-                "UPDATE privacy_record SET generation = ?1, enabled = 0, changed_at_ms = ?2
-                  WHERE id = 0",
-                params![as_i64(generation.get()), as_i64(now_ms.get())],
-            )
-            .map_err(ControllerError::registry)?;
-        Ok(())
+    /// Records that privacy mode is off from `generation`, written under `admitted` once the
+    /// record's transaction is held.
+    fn disable(
+        &mut self,
+        generation: PrivacyGeneration,
+        now_ms: TimestampMs,
+        admitted: Admitted<'_>,
+    ) -> Result<()> {
+        let mut transaction = Some(
+            self.connection
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(ControllerError::registry)?,
+        );
+        admitted(&mut || {
+            let transaction = transaction.take().ok_or_else(|| {
+                ControllerError::registry("the privacy record's transaction was already written")
+            })?;
+            transaction
+                .execute(
+                    "UPDATE privacy_record SET generation = ?1, enabled = 0, changed_at_ms = ?2
+                      WHERE id = 0",
+                    params![as_i64(generation.get()), as_i64(now_ms.get())],
+                )
+                .map_err(ControllerError::registry)?;
+            transaction.commit().map_err(ControllerError::registry)
+        })
     }
 
     /// Records that one session owes its cleanup at `generation`.
@@ -2108,10 +2140,9 @@ mod tests {
         }
     }
 
-    /// An admission that stands, as the owner's own path does.
-    #[allow(clippy::unnecessary_wraps)]
-    fn standing() -> Result<()> {
-        Ok(())
+    /// An admission that stands, as the owner's own path does: the write runs.
+    fn standing(write: &mut dyn FnMut() -> Result<()>) -> Result<()> {
+        write()
     }
 
     /// A worker's answer to a notice, as it arrives.
@@ -3461,5 +3492,51 @@ mod tests {
             .expect("privacy mode is already off");
         assert!(!report.enabled);
         assert!(report.completion.is_complete(), "{:?}", report.completion);
+    }
+
+    /// The admission is asked once the record's own transaction is held, after its wait: an action
+    /// whose admission lapses while another writer holds the record changes nothing, neither the
+    /// record nor the published state nor the backup fence.
+    #[test]
+    fn an_admission_that_lapses_while_the_record_waits_changes_nothing() {
+        let host = Host::open();
+        let holder = rusqlite::Connection::open(host.root.path().join(PRIVACY_RECORD))
+            .expect("a second connection to the record");
+        holder
+            .execute_batch("BEGIN IMMEDIATE;")
+            .expect("the record's write lock is held");
+        let lapsed = std::sync::atomic::AtomicBool::new(false);
+        let admitted = |write: &mut dyn FnMut() -> Result<()>| {
+            if lapsed.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(ControllerError::WindowExpired {
+                    detail: "the action's deadline passed".to_owned(),
+                });
+            }
+            write()
+        };
+        std::thread::scope(|scope| {
+            let enabling = scope.spawn(|| host.privacy.enable(&[], at(10), &admitted));
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            assert!(!enabling.is_finished(), "the record's transaction waits");
+            lapsed.store(true, std::sync::atomic::Ordering::SeqCst);
+            holder
+                .execute_batch("ROLLBACK;")
+                .expect("the write lock is let go");
+            let refused = enabling.join().expect("the enabling finishes");
+            assert!(
+                matches!(refused, Err(ControllerError::WindowExpired { .. })),
+                "{refused:?}"
+            );
+        });
+        let stored = host
+            .privacy
+            .inner()
+            .record
+            .read()
+            .expect("the record reads");
+        assert_eq!(stored.generation, PrivacyGeneration::INITIAL);
+        assert!(!stored.enabled);
+        assert!(!host.privacy.state().is_private());
+        assert_eq!(host.backup.fenced_at().expect("a read"), None);
     }
 }
