@@ -1184,12 +1184,13 @@ impl AuthorisedDirectory {
     /// overwritten. Both names are one component for the same reason a rename's are.
     ///
     /// On Windows it is a rename that does not replace, between the paths the two handles report,
-    /// as every rename there is, and `name` no longer names the file once it succeeds. It is tried
-    /// again while another program holds the file, as [`kr_flush::retry_while_held`] says. A link
-    /// is not used there: a file given a name by a link can be held by the system, where a scanner
-    /// reads it, for a minute and more, and a later rename over it or removal of it is refused all
-    /// that time. Elsewhere it is a link relative to the two authorised handles, made once, and
-    /// `name` names the file as well until the caller removes it.
+    /// as every rename there is, and `name` no longer names the file once it succeeds; a directory
+    /// is given its name the same way there. It is tried again while another program holds the
+    /// file, or one inside the directory, as [`kr_flush::retry_while_held`] says. A link is not used
+    /// there: a file given a name by a link can be held by the system, where a scanner reads it,
+    /// for a minute and more, and a later rename over it or removal of it is refused all that time.
+    /// Elsewhere it is a link relative to the two authorised handles, made once, which names a file
+    /// and never a directory, and `name` names the file as well until the caller removes it.
     ///
     /// `unchanged` is the caller's own check of what the publication stands on, run before every
     /// attempt. One that breaks ends the publication with nothing given a name, and what it broke

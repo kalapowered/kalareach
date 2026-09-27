@@ -467,6 +467,39 @@ fn a_destination_edited_while_its_held_replacement_waits_is_not_replaced() {
     assert!(!staged.exists());
 }
 
+/// KR-REQ-14.05 on Windows: a first publication never replaces what holds the name, a file taken
+/// there after the caller's last check included, and gives a directory its name the same way when
+/// the name is free.
+#[cfg(windows)]
+#[test]
+fn a_first_publication_never_replaces_a_file_that_took_the_name() {
+    let root = tempfile::tempdir().expect("a temporary directory");
+    std::fs::create_dir_all(root.path().join("tree/objects")).expect("a staged tree");
+    std::fs::write(root.path().join("tree/objects/pack"), b"staged").expect("a file in it");
+    std::fs::write(root.path().join("published"), b"somebody's file").expect("the name is taken");
+    let authority =
+        AuthorisedDirectory::open_root(environment(), root.path()).expect("opens the authority");
+    let tree = RelativeName::parse("tree").expect("a valid relative name");
+    let published = RelativeName::parse("published").expect("a valid relative name");
+
+    // The caller's check found the name free a moment before it was taken.
+    authority
+        .publish_into(&tree, &authority, &published, nothing_changed)
+        .expect_err("the name is taken");
+    assert_eq!(
+        std::fs::read(root.path().join("published")).expect("somebody's file"),
+        b"somebody's file"
+    );
+    assert!(root.path().join("tree/objects/pack").is_file());
+
+    std::fs::remove_file(root.path().join("published")).expect("the name is free again");
+    authority
+        .publish_into(&tree, &authority, &published, nothing_changed)
+        .expect("the directory is given the free name");
+    assert!(root.path().join("published/objects/pack").is_file());
+    assert!(!root.path().join("tree").exists());
+}
+
 /// Reads one file through an authority, which is the only way a test is allowed to reach it.
 fn read_through(authority: &AuthorisedDirectory, name: &RelativeName) -> String {
     use std::io::Read as _;

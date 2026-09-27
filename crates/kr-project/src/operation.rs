@@ -716,13 +716,12 @@ pub fn publish(
 /// taken: `renameat2` with `RENAME_NOREPLACE` and `renameatx_np` with `RENAME_EXCL`. Nothing
 /// unexpected can be replaced however close the race is.
 ///
-/// On Windows the guarantee is the platform's own rather than a flag's: `MoveFileEx` reports an
-/// error when either name is a directory and the destination exists, and
-/// `MOVEFILE_REPLACE_EXISTING` does not apply to a directory. So renaming a staged repository onto
-/// a name that is taken fails there too. The occupancy check is the courtesy that gives a better
-/// diagnostic, made before every attempt, since the rename is tried again while another program
-/// holds a file inside the tree; [`publish`]'s identity comparison afterwards is the second check
-/// rather than the guarantee.
+/// On Windows it is a rename that does not replace, `MoveFileEx` without the flag that lets it
+/// replace, which fails when the destination name is taken, a file's as well as a directory's: a
+/// rename that may replace does replace a file there with the staged tree. The rename is tried
+/// again while another program holds a file inside the tree, and the occupancy check before every
+/// attempt is the courtesy that gives a better diagnostic; [`publish`]'s identity comparison
+/// afterwards is the second check rather than the guarantee.
 #[cfg(unix)]
 fn rename_no_replace(
     from: &AuthorisedDirectory,
@@ -782,9 +781,12 @@ fn rename_no_replace(
         Ok(true) => std::ops::ControlFlow::Break(taken()),
         Err(error) => std::ops::ControlFlow::Break(ProjectError::from(error)),
     };
-    match from.rename_into(from_name, to, to_name, unchanged)? {
-        std::ops::ControlFlow::Continue(()) => Ok(()),
-        std::ops::ControlFlow::Break(refused) => Err(refused),
+    match from.publish_into(from_name, to, to_name, unchanged) {
+        Ok(std::ops::ControlFlow::Continue(())) => Ok(()),
+        Ok(std::ops::ControlFlow::Break(refused)) => Err(refused),
+        // Taken in the instant between the last check and the rename, which refused it.
+        Err(_) if matches!(to.occupied(to_name), Ok(true)) => Err(taken()),
+        Err(error) => Err(ProjectError::from(error)),
     }
 }
 
