@@ -126,9 +126,17 @@ pub fn is_base58(character: char) -> bool {
 ///
 /// Returns an error when libsodium is unavailable.
 pub fn generate_code() -> Result<GeneratedCode> {
+    generate_code_from(&mut || Ok(kr_crypto::random_byte()?))
+}
+
+/// Generates a code whose characters are sampled from the bytes `next_byte` returns.
+///
+/// [`generate_code`] reads libsodium's random generator; the unit tests give chosen bytes, which
+/// is how they see which bytes the sampling discards.
+fn generate_code_from(next_byte: &mut dyn FnMut() -> Result<u8>) -> Result<GeneratedCode> {
     let mut characters = [0u8; CODE_LEN];
     for slot in &mut characters {
-        *slot = sample_character()?;
+        *slot = sample_character(next_byte)?;
     }
     let locator = Locator::new(
         core::str::from_utf8(&characters[..LOCATOR_LEN]).expect("alphabet characters are ASCII"),
@@ -144,11 +152,11 @@ pub fn generate_code() -> Result<GeneratedCode> {
 /// The largest byte that can be reduced without bias: the last whole multiple of 58 below 256.
 const REJECTION_BOUND: u8 = (256 / ALPHABET_LEN as u16 * ALPHABET_LEN as u16 - 1) as u8;
 
-/// Draws one uniform alphabet character.
-fn sample_character() -> Result<u8> {
+/// Draws one uniform alphabet character from the bytes `next_byte` returns.
+fn sample_character(next_byte: &mut dyn FnMut() -> Result<u8>) -> Result<u8> {
     let alphabet = BASE58_ALPHABET.as_bytes();
     loop {
-        let byte = kr_crypto::random_byte()?;
+        let byte = next_byte()?;
         if byte <= REJECTION_BOUND {
             return Ok(alphabet[usize::from(byte % ALPHABET_LEN)]);
         }
@@ -341,6 +349,55 @@ mod tests {
             (u16::from(REJECTION_BOUND) + 1) % u16::from(ALPHABET_LEN),
             0
         );
+    }
+
+    /// KR-REQ-10.11: a byte past the rejection bound is discarded and the next byte is drawn; it is
+    /// never folded onto the alphabet. With chosen bytes, each of 232 to 255 is passed over and the
+    /// character is the next byte's, each byte up to the bound gives the character of its own
+    /// residue, and a whole code is exactly the characters of its accepted bytes, however many
+    /// discarded ones come between them.
+    #[test]
+    fn a_byte_past_the_bound_is_discarded_and_never_folded() {
+        let alphabet = BASE58_ALPHABET.as_bytes();
+        let sampled = |bytes: &[u8]| {
+            let mut given = bytes.iter().copied();
+            let mut taken = 0;
+            let character = sample_character(&mut || {
+                taken += 1;
+                Ok(given.next().expect("a byte to sample"))
+            })
+            .expect("a character");
+            (character, taken)
+        };
+        for rejected in REJECTION_BOUND + 1..=u8::MAX {
+            assert_eq!(
+                sampled(&[rejected, 5]),
+                (alphabet[5], 2),
+                "byte {rejected} was used rather than discarded"
+            );
+        }
+        for accepted in 0..=REJECTION_BOUND {
+            assert_eq!(
+                sampled(&[accepted]),
+                (alphabet[usize::from(accepted % ALPHABET_LEN)], 1)
+            );
+        }
+
+        let mut bytes = Vec::new();
+        for index in 0..CODE_LEN {
+            bytes.extend_from_slice(&[u8::MAX, REJECTION_BOUND + 1]);
+            bytes.push(u8::try_from(index).expect("a byte"));
+        }
+        let mut given = bytes.into_iter();
+        let code = generate_code_from(&mut || Ok(given.next().expect("a byte to sample")))
+            .expect("a code");
+        let expected: String = alphabet[..CODE_LEN]
+            .iter()
+            .copied()
+            .map(char::from)
+            .collect();
+        assert_eq!(code.display_text().replace('-', ""), expected);
+        assert!(given.next().is_none(), "every byte was read, and no more");
     }
 
     /// KR-REQ-10.11: parsing removes spaces and hyphens and preserves case.

@@ -328,11 +328,26 @@ impl DeviceKeys {
     ///
     /// Returns an error when libsodium is unavailable or reports a failure.
     pub fn generate() -> Result<Self> {
+        Self::drawn(&mut Secret::random)
+    }
+
+    /// Builds the four keys from four calls of `draw`, one for each purpose, in the order the
+    /// fields are declared.
+    ///
+    /// Each purpose's seed is exactly what its own call returned, and no key is built from another
+    /// purpose's bytes. [`Self::generate`] draws from libsodium's random generator; the unit tests
+    /// draw chosen bytes, which is how they see what each key is built from.
+    fn drawn(draw: &mut dyn FnMut() -> Result<Secret<32>>) -> Result<Self> {
+        let transport = TransportIdentityKeyPair::from_seed(TransportSeed(draw()?))?;
+        let authorisation = AuthorisationKeyPair::from_seed(AuthorisationSeed(draw()?))?;
+        let stored_envelope = StoredEnvelopeKeyPair::from_seed(StoredEnvelopeSeed(draw()?))?;
+        let notification_preview =
+            NotificationPreviewKeyPair::from_seed(NotificationPreviewSeed(draw()?))?;
         Ok(Self {
-            transport: TransportIdentityKeyPair::generate()?,
-            authorisation: AuthorisationKeyPair::generate()?,
-            stored_envelope: StoredEnvelopeKeyPair::generate()?,
-            notification_preview: NotificationPreviewKeyPair::generate()?,
+            transport,
+            authorisation,
+            stored_envelope,
+            notification_preview,
         })
     }
 
@@ -395,6 +410,87 @@ mod tests {
         assert_ne!(public.authorisation, other.authorisation);
         assert_ne!(public.stored_envelope, other.stored_envelope);
         assert_ne!(public.notification_preview, other.notification_preview);
+    }
+
+    /// KR-REQ-10.03: the four keys come from four separate draws, one for each purpose. Built from
+    /// chosen draws, each purpose's seed is exactly its own draw and its key is that seed's key; a
+    /// different draw for one purpose changes that purpose's key and leaves the other three as they
+    /// were; and generation takes exactly four draws.
+    #[test]
+    fn each_key_is_built_from_a_draw_of_its_own() {
+        let drawn = |bytes: [[u8; 32]; 4]| {
+            let mut draws = bytes.into_iter();
+            let mut taken = 0;
+            let keys = DeviceKeys::drawn(&mut || {
+                taken += 1;
+                Ok(Secret::from_bytes(
+                    draws.next().expect("four draws at most"),
+                ))
+            })
+            .expect("four keys");
+            assert_eq!(taken, 4, "one draw for each purpose");
+            keys
+        };
+        let chosen = [[1; 32], [2; 32], [3; 32], [4; 32]];
+        let keys = drawn(chosen);
+        assert_eq!(keys.transport.seed().expose(), &chosen[0]);
+        assert_eq!(keys.authorisation.seed().expose(), &chosen[1]);
+        assert_eq!(keys.stored_envelope.seed().expose(), &chosen[2]);
+        assert_eq!(keys.notification_preview.seed().expose(), &chosen[3]);
+
+        // Each key is the key of its own seed and of nothing else.
+        let seed = |index: usize| &chosen[index];
+        assert_eq!(
+            keys.transport.public(),
+            TransportIdentityKeyPair::from_seed(
+                TransportSeed::from_stored_bytes(seed(0)).expect("32 bytes")
+            )
+            .expect("a keypair")
+            .public()
+        );
+        assert_eq!(
+            keys.authorisation.public(),
+            AuthorisationKeyPair::from_seed(
+                AuthorisationSeed::from_stored_bytes(seed(1)).expect("32 bytes")
+            )
+            .expect("a keypair")
+            .public()
+        );
+        assert_eq!(
+            keys.stored_envelope.public(),
+            StoredEnvelopeKeyPair::from_seed(
+                StoredEnvelopeSeed::from_stored_bytes(seed(2)).expect("32 bytes")
+            )
+            .expect("a keypair")
+            .public()
+        );
+        assert_eq!(
+            keys.notification_preview.public(),
+            NotificationPreviewKeyPair::from_seed(
+                NotificationPreviewSeed::from_stored_bytes(seed(3)).expect("32 bytes")
+            )
+            .expect("a keypair")
+            .public()
+        );
+
+        // Another draw for one purpose changes that purpose's key alone.
+        let base = keys.public_keys();
+        for purpose in 0..4 {
+            let mut changed = chosen;
+            changed[purpose] = [9; 32];
+            let other = drawn(changed).public_keys();
+            let differs = [
+                other.transport != base.transport,
+                other.authorisation != base.authorisation,
+                other.stored_envelope != base.stored_envelope,
+                other.notification_preview != base.notification_preview,
+            ];
+            assert_eq!(
+                differs,
+                std::array::from_fn(|index| index == purpose),
+                "a new draw for purpose {purpose} changed {differs:?}"
+            );
+        }
     }
 
     /// KR-REQ-10.03: a key identifier names its purpose, so one key cannot pass as another
