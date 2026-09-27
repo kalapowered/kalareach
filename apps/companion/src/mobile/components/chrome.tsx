@@ -11,6 +11,13 @@ import { useLayoutEffect, useRef, useState, type ReactNode } from 'react'
 
 import { minimumTarget, showsBackControl, type Surface } from '../platform'
 
+/**
+ * The room a label keeps on either side in the one-row bar, in multiples of the root text size: a
+ * tab's own inline padding in that form. The tabs take two rows once a label with this room either
+ * side is wider than a quarter of the bar.
+ */
+const LABEL_ROOM_REM = 0.25
+
 /** One destination in the tab bar. */
 export interface Destination {
   readonly id: string
@@ -34,9 +41,9 @@ export function TabBar({
 }): ReactNode {
   const target = minimumTarget(surface)
   const bar = useRef<HTMLElement | null>(null)
-  // Whether a label is wider than its share of one row, as the text it is set in measures it. Each
-  // label is one word, so its width is the same whatever form the bar takes, and the bar's form
-  // never changes what decides it.
+  // Whether a label, with its room either side, is wider than its share of one row, as the text it is
+  // set in measures it. Each label is one word, so its width is the same whatever form the bar takes,
+  // and nothing the bar's form changes decides it.
   const [crowded, setCrowded] = useState(false)
   useLayoutEffect(() => {
     const element = bar.current
@@ -47,12 +54,11 @@ export function TabBar({
       const share =
         (element.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight)) /
         Math.max(1, tabs.length)
+      const room = 2 * LABEL_ROOM_REM * (parseFloat(getComputedStyle(document.documentElement).fontSize) || 16)
       setCrowded(
         tabs.some((tab) => {
           const label = tab.querySelector<HTMLElement>('.m-tab-label')
-          if (label === null || label.scrollWidth === 0) return false
-          const inside = getComputedStyle(tab)
-          return label.scrollWidth + parseFloat(inside.paddingLeft) + parseFloat(inside.paddingRight) > share + 0.5
+          return label !== null && label.scrollWidth > 0 && label.scrollWidth + room > share + 0.5
         })
       )
     }
