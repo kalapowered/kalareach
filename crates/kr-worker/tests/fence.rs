@@ -4845,3 +4845,96 @@ async fn a_launch_answered_after_its_revocation_is_reported_and_recorded() {
     );
     wired.close().await;
 }
+
+// --------------------------------------------------------------------------------------------
+// KR-REQ-12.03: a launch the foreground has moved past.
+// --------------------------------------------------------------------------------------------
+
+/// KR-REQ-12.03: a launch offered at the idle prompt is refused once an application has taken the
+/// foreground, and it is never pasted into that application's input. The launch names the prompt
+/// it was offered at. The person runs a command and the reader leaves the prompt for it, so the
+/// launch is refused with the editor busy; once the application has ended and the shell prompts
+/// again, the same launch is refused as a conflict. The reader is asked to install nothing, and
+/// the terminal carries none of the command's bytes, while the keys the holder types reach it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_launch_is_refused_once_an_application_takes_the_foreground_and_is_never_pasted() {
+    let mut wired = wired().await;
+    let mut client = LocalClient::connect(&wired.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    let holder = holder_over(&mut client, &wired).await;
+    let offered = fenced(&mut wired, 1, 1).await;
+    let launch = ShellLaunchParams {
+        session_id: wired.session_id,
+        command: LaunchCommand::QuotedCommand("printf 'kala%s-launched\\n' reach".to_owned()),
+        expected_prompt_generation: offered.prompt_generation,
+        expected_buffer_revision: EditorBufferRevision::new(1),
+    };
+
+    // The person runs a command, and the application it starts has the terminal.
+    wired
+        .bridge
+        .send_event(BridgeEvent::EditorLeave(RootEditorLeaveParams {
+            session_id: wired.session_id,
+            prompt_generation: offered.prompt_generation,
+            reader_revision: ReaderRevision::new(1),
+            reason: kr_protocol::root::EditorLeaveReason::CommandAccepted,
+        }))
+        .await
+        .expect("leaves");
+    let waited = tokio::time::Instant::now() + SOON;
+    while wired.runtime.session().fence().expect("a driver").state() != FenceState::Outside {
+        assert!(
+            tokio::time::Instant::now() < waited,
+            "the reader left the prompt"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let refused = client
+        .mutate(
+            Method::ShellLaunch,
+            ActionId::new(kr_ipc::new_uuid()),
+            wired.target(),
+            &launch,
+        )
+        .await
+        .expect("reaches the worker")
+        .expect_err("a launch the foreground moved past is refused");
+    assert_eq!(refused.code, ErrorCode::EditorBusy, "{refused:?}");
+    type_keys(&wired, holder, 0, b"kr-typed-by-the-holder\n");
+    echoed(&wired.runtime, b"kr-typed-by-the-holder").await;
+
+    // The application ends and the shell prompts again, at a later prompt.
+    let _ = fenced(&mut wired, 2, 1).await;
+    let refused = client
+        .mutate(
+            Method::ShellLaunch,
+            ActionId::new(kr_ipc::new_uuid()),
+            wired.target(),
+            &launch,
+        )
+        .await
+        .expect("reaches the worker")
+        .expect_err("a launch offered at an earlier prompt is refused");
+    assert_eq!(refused.code, ErrorCode::DraftConflict, "{refused:?}");
+
+    // The reader was asked to install nothing, and the terminal holds none of the command.
+    while let Ok(Ok(frame)) =
+        tokio::time::timeout(Duration::from_millis(400), wired.bridge.recv()).await
+    {
+        if let ToBridge::Request { request, .. } = frame {
+            assert!(
+                !matches!(*request, WorkerRequest::Launch(_)),
+                "the reader was asked to install a launch the foreground moved past"
+            );
+        }
+    }
+    let seen = retained(&wired.runtime.session());
+    assert!(contains(&seen, b"kr-typed-by-the-holder"));
+    assert!(
+        !contains(&seen, b"-launched") && !contains(&seen, b"printf"),
+        "the launch reached the terminal: {}",
+        String::from_utf8_lossy(&seen)
+    );
+    wired.close().await;
+}

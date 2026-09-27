@@ -3049,3 +3049,131 @@ async fn kr_req_11_47_a_presentation_action_is_admitted_on_its_class_right_and_n
         "{refusal:?}"
     );
 }
+
+/// KR-REQ-11.64: an answered question never manufactures an upstream approval. With the
+/// connector's approval pending and an agent's question pending in the same session, a yes to the
+/// question on the worker's own socket resolves the question alone: the approval stays pending,
+/// nothing reaches the connector, and no resource appears or changes. The control:
+/// `agent.approval.respond` naming the approval's resource is the path that carries an answer to
+/// the connector.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_yes_to_a_question_leaves_the_connectors_approval_to_its_own_path() {
+    use kr_protocol::gateway::PendingState;
+    use kr_protocol::question::{
+        QuestionAnswer, QuestionAnswerParams, QuestionCreateParams, QuestionKind,
+        QuestionReadParams, QuestionState,
+    };
+
+    let host = host().await;
+    let upstream = Arc::new(CountingUpstream::default());
+    register(&host, None);
+    let resource_id = offer_approval(&host, Arc::clone(&upstream));
+    let broker = host.service.broker();
+    let before = broker.pending_resources();
+    assert_eq!(
+        broker
+            .pending(resource_id)
+            .expect("the connector's approval is held")
+            .state,
+        PendingState::Pending
+    );
+
+    // An agent in the same session asks, as a verified helper asks.
+    let now = kr_worker::questions::Now {
+        utc_ms: kr_ipc::now_ms(),
+        boot_ms: kr_ipc::clock::boot_elapsed_ms(),
+    };
+    let (asked, _) = host
+        .service
+        .questions()
+        .create(
+            &kr_worker::questions::VerifiedSource {
+                process: kr_ipc::identity::current_process_start_identity()
+                    .expect("a process identity"),
+                executable: Some("/bin/agent".to_owned()),
+                session_member: true,
+                ancestry: true,
+                launch_channel: true,
+                connection_id: kr_protocol::ids::ConnectionId::new(kr_ipc::new_uuid()),
+            },
+            &QuestionCreateParams {
+                session_id: host.session_id,
+                request_id: "write-the-file".to_owned(),
+                agent_name: Nullable::some("an agent".to_owned()),
+                context: "The tool is waiting to write the file.".to_owned(),
+                question: "May it write the file?".to_owned(),
+                kind: QuestionKind::Confirm,
+                choices: Vec::new(),
+                requested_expiry_ms: Nullable::null(),
+                wait_ms: Nullable::null(),
+            },
+            now,
+        )
+        .expect("a verified source asks");
+
+    // The person says yes to the question.
+    let mut client = cli(&host).await;
+    client
+        .mutate(
+            Method::QuestionAnswer,
+            ActionId::new(kr_ipc::new_uuid()),
+            action_target(&host),
+            &QuestionAnswerParams {
+                session_id: host.session_id,
+                question_id: asked.question.question_id,
+                expected_revision: asked.question.revision,
+                answer: QuestionAnswer::Decision { decided: true },
+            },
+        )
+        .await
+        .expect("reaches the worker")
+        .expect("the person answers yes");
+    let (read, _) = host
+        .service
+        .questions()
+        .read(
+            &QuestionReadParams {
+                session_id: host.session_id,
+                question_id: Nullable::some(asked.question.question_id),
+                include_resolved: true,
+            },
+            now,
+        )
+        .expect("the question reads");
+    assert_eq!(read.questions.len(), 1);
+    assert_eq!(read.questions[0].state, QuestionState::Answered);
+
+    // The approval is where it was, and the connector was sent nothing.
+    assert_eq!(
+        broker
+            .pending(resource_id)
+            .expect("the approval is still held")
+            .state,
+        PendingState::Pending,
+        "a yes to a question answered no approval"
+    );
+    assert_eq!(
+        upstream.carried.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "nothing reached the connector"
+    );
+    assert_eq!(
+        broker.pending_resources(),
+        before,
+        "no approval resource appeared or changed"
+    );
+
+    // The connector's approval is answered on its own resource and response path.
+    let mutation = approval_mutation(&client, &host, 31, resource_id);
+    let outcome = send(&mut client, mutation).await;
+    assert!(matches!(outcome, Outcome::Ok(_)), "{outcome:?}");
+    assert_eq!(
+        upstream.carried.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the approval's answer went to the connector"
+    );
+    assert_ne!(
+        broker.pending(resource_id).map(|resource| resource.state),
+        Some(PendingState::Pending)
+    );
+}

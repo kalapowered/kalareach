@@ -781,6 +781,10 @@ fn kr_req_11_24_the_three_grants_are_held_separately() {
 
 /// KR-REQ-11.25: decoding trust is explicit, belongs to one package, and a display-only component
 /// cannot create an approval whatever it reports.
+///
+/// KR-REQ-06.05: an approval request is raised only by an upstream binding authorised to interpret
+/// it: a display-only binding, one trusted for another method and one of another package raise
+/// none.
 #[test]
 fn kr_req_11_25_decoding_trust_is_explicit_and_display_only_creates_no_approval() {
     let display_only = broker_with(BrokerGrants::granted([BrokerGrant::Observation]), None);
@@ -837,6 +841,10 @@ fn kr_req_11_25_decoding_trust_is_explicit_and_display_only_creates_no_approval(
 
 /// KR-REQ-11.26: the broker checks decoder role, application binding, source generation, schema
 /// policy and non-reuse, and retains the ledger that says what it checked.
+///
+/// KR-REQ-06.05: the binding raises an approval request only for its own application's request, at
+/// the current source generation, once, and the request it raised is pending under its own
+/// identifier across a restart.
 #[test]
 fn kr_req_11_26_the_broker_checks_role_binding_generation_and_reuse_and_retains_its_ledger() {
     let directory = std::env::temp_dir().join(format!("kr-broker-{}", kr_ipc::new_uuid()));
@@ -1219,6 +1227,9 @@ fn kr_req_11_26_a_method_outside_the_trust_stays_recorded_and_is_answered_native
 /// KR-REQ-11.26: a request belongs to the package whose table recorded it. On a live declarative
 /// connection and on a live channel, a decoder of that package interprets it, and one of another
 /// package, or of the same package at other bytes, is refused, however it is trusted.
+///
+/// KR-REQ-06.05: only the binding of the package that recorded a request raises an approval from
+/// it.
 #[test]
 fn kr_req_11_26_on_a_live_connection_only_the_recording_packages_decoder_interprets() {
     // A declarative connection, reading with the tables pinned with the suite's package.
