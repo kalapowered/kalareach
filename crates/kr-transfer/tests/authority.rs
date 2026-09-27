@@ -2014,7 +2014,8 @@ fn a_tree_goes_through_the_handle_that_was_checked_and_nothing_it_links_to_goes(
 /// Three moments. Before it starts, a different directory at the name means nothing is removed at
 /// all. Part way, an entry it cannot take away stops it, and it reports the entry and how many
 /// went before it rather than putting anything back. And at the end the name has to hold the
-/// directory it emptied: a replacement is left whole.
+/// directory it emptied: a replacement is left whole, and a removal that answers Ok has left
+/// nothing of the directory it emptied.
 #[cfg(unix)]
 #[test]
 fn remove_tree_refuses_a_replacement_and_reports_partial() {
@@ -2156,7 +2157,11 @@ fn remove_tree_refuses_a_replacement_and_reports_partial() {
     // At the end: the directory it emptied is moved away and a replacement holding something is
     // put at its name. The replacement is built elsewhere and renamed in whole, so whenever the
     // name is looked at it holds either the checked directory or a directory with something in
-    // it. Whichever moment the swap lands in, the replacement is never emptied.
+    // it. Whichever moment the swap lands in, the replacement is never emptied, and Ok is never
+    // the answer while the directory the removal emptied is still there under the name it was
+    // moved to, not even when the platform answers the removal of the name as done while the
+    // rename is taking the directory elsewhere, as Apple's filesystem can. The test below makes
+    // the swap at each of those moments in turn.
     let mut outcomes = std::collections::BTreeMap::<&str, usize>::new();
     for round in 0..40 {
         let tree = root.path().join("tree");
@@ -2189,7 +2194,7 @@ fn remove_tree_refuses_a_replacement_and_reports_partial() {
         let label = match &outcome {
             Ok(()) => "removed before the swap",
             Err(Escape::IdentityChanged { .. }) => "refused before anything was removed",
-            Err(Escape::RemovalStopped { .. }) => "stopped at the replacement",
+            Err(Escape::RemovalStopped { .. }) => "stopped at the name",
             Err(other) => panic!("round {round}: an unexpected refusal: {other}"),
         };
         if outcome.is_ok() {
@@ -2201,6 +2206,188 @@ fn remove_tree_refuses_a_replacement_and_reports_partial() {
         *outcomes.entry(label).or_default() += 1;
     }
     println!("{outcomes:?}");
+}
+
+/// The removal cases of [`a_removal_answers_ok_only_once_the_directory_it_emptied_is_gone`], run
+/// on the filesystem `root` is on.
+#[cfg(unix)]
+fn removal_answers_ok_only_once_the_directory_it_emptied_is_gone_on(root: &std::path::Path) {
+    use kr_transfer::authority::testing::{RemovalStep, at_removal_step};
+
+    let authority =
+        AuthorisedDirectory::open_root(environment(), root).expect("the authority opens");
+    let name = RelativeName::parse("tree").expect("a name");
+    let tree = root.join("tree");
+    let moved = root.join("moved");
+    let theirs = root.join("theirs");
+    let cases = [
+        ("undisturbed", None, true),
+        ("after the emptying", Some(RemovalStep::Emptied), true),
+        (
+            "after the check, a replacement holding a file",
+            Some(RemovalStep::Checked),
+            true,
+        ),
+        ("after the name is gone", Some(RemovalStep::Removed), true),
+        (
+            "after the check, an empty replacement",
+            Some(RemovalStep::Checked),
+            false,
+        ),
+    ];
+    for (case, step, holding) in cases {
+        for leftover in [&tree, &moved, &theirs] {
+            let _ = std::fs::remove_dir_all(leftover);
+        }
+        std::fs::create_dir_all(tree.join("a/b")).expect("the tree");
+        std::fs::write(tree.join("a/b/staged"), b"staged\n").expect("its file");
+        std::fs::create_dir(&theirs).expect("their directory");
+        if holding {
+            std::fs::write(theirs.join("keep"), b"theirs\n").expect("their file");
+        }
+        let opened = authority.subdirectory(&name).expect("the tree opens");
+        let hook = {
+            let (tree, moved, theirs) = (tree.clone(), moved.clone(), theirs.clone());
+            at_removal_step(move |reached, directory| {
+                if Some(reached) == step && directory == "tree" {
+                    // Once the name is gone there is nothing at it to move.
+                    let _ = std::fs::rename(&tree, &moved);
+                    std::fs::rename(&theirs, &tree).expect("their directory takes the name");
+                }
+            })
+        };
+        let outcome = authority.remove_tree(&name, opened);
+        drop(hook);
+        if outcome.is_ok() {
+            assert!(
+                !moved.exists(),
+                "{case}: a removal that answers Ok has left nothing of the directory it emptied"
+            );
+        }
+        match step {
+            None => {
+                assert_eq!(outcome, Ok(()), "{case}: the whole tree goes");
+                assert!(!tree.exists(), "{case}: nothing is left at the tree's name");
+            }
+            Some(RemovalStep::Removed) => {
+                assert_eq!(outcome, Ok(()), "{case}: the whole tree went first");
+            }
+            Some(_) => {
+                let Err(Escape::RemovalStopped {
+                    stopped_at, reason, ..
+                }) = &outcome
+                else {
+                    panic!("{case}: the removal says it stopped: {outcome:?}");
+                };
+                assert_eq!(stopped_at, "tree", "{case}: at the tree's own name");
+                assert!(
+                    std::fs::read_dir(&moved).is_ok_and(|mut left| left.next().is_none()),
+                    "{case}: the directory it emptied is left where it was moved, and empty"
+                );
+                if holding {
+                    assert!(
+                        !matches!(**reason, Escape::NotFound { .. }),
+                        "{case}: the name held a directory: {reason}"
+                    );
+                } else {
+                    assert!(
+                        matches!(**reason, Escape::IdentityChanged { .. }),
+                        "{case}: the refusal says the directory it emptied is still there: {reason}"
+                    );
+                }
+            }
+        }
+        if holding && step.is_some() {
+            assert_eq!(
+                std::fs::read(tree.join("keep")).expect("their file is at the name"),
+                b"theirs\n",
+                "{case}: a replacement holding something is never emptied"
+            );
+        }
+    }
+}
+
+/// KR-REQ-14.05: a removal answers Ok only once the directory it emptied is gone.
+///
+/// The swap the test above races is made here at each step at the end of the removal, through the
+/// removal's own seam: the directory it emptied is moved away and somebody else's directory is put
+/// at its name. After the emptying, the name's check finds the replacement and nothing more goes.
+/// Between that check and the removal of the name, a replacement holding something is not an
+/// empty directory and is not removed, while an empty one goes in its place, as the method's
+/// documentation says a directory put there in that moment does; either way the directory the
+/// removal emptied is still there under the name it was moved to, and the removal says so rather
+/// than answering Ok. After the name is gone there is nothing left to move, and the removal answers
+/// Ok with nothing of the tree left.
+#[cfg(unix)]
+#[test]
+fn a_removal_answers_ok_only_once_the_directory_it_emptied_is_gone() {
+    let root = tempfile::tempdir().expect("a directory");
+    removal_answers_ok_only_once_the_directory_it_emptied_is_gone_on(root.path());
+}
+
+/// KR-REQ-14.05: the same cases on the other filesystems whose removed directory lists nothing,
+/// where what the directory lists is the whole answer: HFS+ and FAT, each on a disk image the
+/// platform's tool creates and attaches. A filesystem that went on listing a removed directory, as
+/// exFAT does, would refuse the undisturbed removal here. Where the tool will not create or attach
+/// an image this fails and says so.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_removal_is_decided_by_the_listing_on_hfs_and_fat_volumes() {
+    for (filesystem, size) in [("HFS+", "8m"), ("MS-DOS", "4m")] {
+        let root = tempfile::tempdir().expect("a directory");
+        let image = root.path().join("volume.dmg");
+        let volume = root.path().join("volume");
+        std::fs::create_dir(&volume).expect("a mount point");
+        let made = std::process::Command::new("/usr/bin/hdiutil")
+            .args([
+                "create", "-size", size, "-fs", filesystem, "-volname", "decided", "-quiet",
+            ])
+            .arg(&image)
+            .status();
+        assert!(
+            made.is_ok_and(|status| status.success()),
+            "this host's disk image tool would not create a {filesystem} image, so this check cannot run here"
+        );
+        let attached = std::process::Command::new("/usr/bin/hdiutil")
+            .args([
+                "attach",
+                "-nobrowse",
+                "-noverify",
+                "-noautoopen",
+                "-quiet",
+                "-mountpoint",
+            ])
+            .arg(&volume)
+            .arg(&image)
+            .status();
+        assert!(
+            attached.is_ok_and(|status| status.success()),
+            "this host would not attach a {filesystem} image, so this check cannot run here"
+        );
+        let attached = Attached {
+            image: image.clone(),
+            mount_point: volume.clone(),
+            detached: false,
+        };
+        // The cases below can only show that the listing decides if the volume is of a type the
+        // removal decides by its listing, so the type is read from the mounted volume.
+        let volume_type = rustix::fs::statfs(&volume).expect("the volume's type is read");
+        let name: Vec<u8> = volume_type
+            .f_fstypename
+            .iter()
+            .take_while(|character| **character != 0)
+            .map(|character| character.cast_unsigned())
+            .collect();
+        assert!(
+            matches!(name.as_slice(), b"hfs" | b"msdos"),
+            "a {filesystem} image is mounted as {}",
+            String::from_utf8_lossy(&name)
+        );
+        removal_answers_ok_only_once_the_directory_it_emptied_is_gone_on(&volume);
+        if let Err(report) = attached.detach() {
+            panic!("{report}");
+        }
+    }
 }
 
 /// A removal goes no deeper than its bound, and stops before removing anything beneath it.
@@ -2497,6 +2684,146 @@ fn a_removal_stops_before_a_disk_image_attached_inside_the_tree() {
         b"elsewhere\n",
         "nothing on the attached volume was reached"
     );
+    if let Err(report) = attached.detach() {
+        panic!("{report}");
+    }
+}
+
+/// KR-REQ-14.05: on a filesystem that goes on listing a removed directory's own entries, as the
+/// exFAT driver on macOS does, a removal answers Ok once the tree is gone and still refuses when
+/// the directory it emptied is left under another name.
+///
+/// Such a filesystem cannot say through the directory's handle that the directory went, so the
+/// removal asks whether the path the handle reports holds it now. Where the platform's disk image
+/// tool will not create or attach an exFAT image this fails and says so.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_removal_on_a_filesystem_that_lists_a_removed_directory_answers_by_where_it_is() {
+    use kr_transfer::authority::testing::{RemovalStep, at_removal_step};
+
+    let root = tempfile::tempdir().expect("a directory");
+    let image = root.path().join("exfat.dmg");
+    let volume = root.path().join("volume");
+    std::fs::create_dir(&volume).expect("a mount point");
+    let made = std::process::Command::new("/usr/bin/hdiutil")
+        .args([
+            "create", "-size", "4m", "-fs", "ExFAT", "-volname", "exfat", "-quiet",
+        ])
+        .arg(&image)
+        .status();
+    assert!(
+        made.is_ok_and(|status| status.success()),
+        "this host's disk image tool would not create an exFAT image, so this check cannot run here"
+    );
+    let attached = std::process::Command::new("/usr/bin/hdiutil")
+        .args([
+            "attach",
+            "-nobrowse",
+            "-noverify",
+            "-noautoopen",
+            "-quiet",
+            "-mountpoint",
+        ])
+        .arg(&volume)
+        .arg(&image)
+        .status();
+    assert!(
+        attached.is_ok_and(|status| status.success()),
+        "this host would not attach an exFAT image, so this check cannot run here"
+    );
+    let attached = Attached {
+        image: image.clone(),
+        mount_point: volume.clone(),
+        detached: false,
+    };
+
+    let authority =
+        AuthorisedDirectory::open_root(environment(), &volume).expect("the volume opens");
+    let name = RelativeName::parse("tree").expect("a name");
+    let tree = volume.join("tree");
+    let moved = volume.join("moved");
+    let theirs = volume.join("theirs");
+
+    // Undisturbed, every directory goes and the removal says so.
+    std::fs::create_dir_all(tree.join("a/b")).expect("the tree");
+    std::fs::write(tree.join("a/b/staged"), b"staged\n").expect("its file");
+    let opened = authority.subdirectory(&name).expect("the tree opens");
+    assert_eq!(
+        authority.remove_tree(&name, opened),
+        Ok(()),
+        "the whole tree goes"
+    );
+    assert!(!tree.exists(), "nothing is left at the tree's name");
+
+    // Three swaps. The directory it emptied is moved away between the check and the removal of its
+    // name and an empty directory put there goes in its place, alone and then with the moved
+    // directory moved again while its path is being read; and the swap comes after the name is
+    // gone, when there is nothing left at the name to move.
+    let moved_again = volume.join("moved-again");
+    for (case, step, again) in [
+        (
+            "after the check, an empty replacement",
+            RemovalStep::Checked,
+            false,
+        ),
+        (
+            "after the check, and moved again while its path is read",
+            RemovalStep::Checked,
+            true,
+        ),
+        ("after the name is gone", RemovalStep::Removed, false),
+    ] {
+        for leftover in [&tree, &moved, &moved_again, &theirs] {
+            let _ = std::fs::remove_dir_all(leftover);
+        }
+        std::fs::create_dir_all(tree.join("a/b")).expect("the tree");
+        std::fs::write(tree.join("a/b/staged"), b"staged\n").expect("its file");
+        std::fs::create_dir(&theirs).expect("their directory");
+        let opened = authority.subdirectory(&name).expect("the tree opens");
+        let hook = {
+            let (tree, moved, moved_again, theirs) = (
+                tree.clone(),
+                moved.clone(),
+                moved_again.clone(),
+                theirs.clone(),
+            );
+            at_removal_step(move |reached, directory| {
+                if reached == step && directory == "tree" {
+                    // Once the name is gone there is nothing at it to move.
+                    let _ = std::fs::rename(&tree, &moved);
+                    std::fs::rename(&theirs, &tree).expect("their directory takes the name");
+                } else if again && reached == RemovalStep::Located && directory == "tree" {
+                    std::fs::rename(&moved, &moved_again).expect("the directory is moved again");
+                }
+            })
+        };
+        let outcome = authority.remove_tree(&name, opened);
+        drop(hook);
+        if step == RemovalStep::Removed {
+            assert_eq!(outcome, Ok(()), "{case}: the whole tree went first");
+            assert!(
+                tree.is_dir() && !moved.exists(),
+                "{case}: their directory is at the name, and nothing of the tree is left"
+            );
+            continue;
+        }
+        let Err(Escape::RemovalStopped {
+            stopped_at, reason, ..
+        }) = &outcome
+        else {
+            panic!("{case}: the removal says it stopped: {outcome:?}");
+        };
+        assert_eq!(stopped_at, "tree", "{case}: at the tree's own name");
+        assert!(
+            matches!(**reason, Escape::IdentityChanged { .. }),
+            "{case}: because the directory it emptied is still there: {reason}"
+        );
+        let survivor = if again { &moved_again } else { &moved };
+        assert!(
+            survivor.is_dir(),
+            "{case}: the directory it emptied is where it was left"
+        );
+    }
     if let Err(report) = attached.detach() {
         panic!("{report}");
     }

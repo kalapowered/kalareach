@@ -37,9 +37,11 @@
 //! * **A tree is removed the way a name is resolved.** [`AuthorisedDirectory::remove_tree`] goes
 //!   through the handle the caller checked and through handles it opens itself, one directory at
 //!   a time and on the mount it started on. It follows nothing, takes a directory's name only
-//!   while that name still holds the directory it emptied, and a removal that stops says where
-//!   and keeps what it removed rather than pretending otherwise. What it leaves to whoever may
-//!   write in a directory is stated with the method.
+//!   while that name still holds the directory it emptied, answers Ok only once each directory
+//!   it emptied is gone (on Windows, once its name is gone: the platform cannot remove a
+//!   directory whose handle is open, so nothing is left to ask), and a removal that stops says
+//!   where and keeps what it removed rather than pretending otherwise. What it leaves to whoever
+//!   may write in a directory is stated with the method.
 //! * Each step is one directory-relative open: `openat2` with `RESOLVE_BENEATH` on Linux,
 //!   `openat` with `O_NOFOLLOW` on the other Unix systems, a relative `NtCreateFile` on Windows.
 //!   [`cap_std`] owns those three implementations, which is why this module is the policy and not
@@ -215,7 +217,9 @@ pub enum Escape {
     /// A recursive removal stopped before it finished.
     ///
     /// What it removed before it stopped stays removed and nothing is put back. What is left
-    /// includes the entry it stopped at, which is named.
+    /// includes the entry it stopped at, which is named. A directory whose name the removal took
+    /// away, and that is still there under another name because something moved it in that
+    /// moment, is left where it was moved, and the entry it stopped at is that directory's name.
     #[error(
         "the removal of {name} stopped at {stopped_at} after it had removed {removed} entries, and \
          what it removed is not put back: {reason}"
@@ -1298,6 +1302,22 @@ impl AuthorisedDirectory {
     ///   holds the directory this removal emptied.** A replacement at the old name stops the
     ///   removal and is never emptied, and an empty-directory removal refuses anything put into the
     ///   directory after it was emptied.
+    /// * **Ok means every directory this removal emptied is gone.** Once a directory's name has
+    ///   been removed, the directory is asked, through the handle the removal still holds, whether
+    ///   it went with the name, and one still there under another name stops the removal. The
+    ///   removal of a name is not the removal of the directory checked there when something else
+    ///   happened at the name in between, and a platform can answer it as done even then: Apple's
+    ///   filesystem does when a rename takes the directory elsewhere at the same moment. On
+    ///   Windows this is weaker, as the last paragraph says. On APFS, HFS+ and FAT volumes a
+    ///   removed directory lists nothing, so what the directory lists is the whole answer and no
+    ///   rename can change it. A volume whose driver goes on listing a removed directory, exFAT for
+    ///   one, cannot be asked that way: there the answer rests on where the handle says the
+    ///   directory is, read twice around a look at what is at that path. That catches a directory
+    ///   moved once. It is beaten by one moved away and back between the two reads, which it takes
+    ///   for a directory that was never moved, and by a network volume whose reported path does
+    ///   not follow a rename made by another client. On every Unix volume, a directory that lists
+    ///   no entry, not even `.` and `..`, is taken as gone, which is false of a filesystem that
+    ///   leaves them out for a directory that exists.
     /// * **A refusal is never retried as a removal with fewer checks.** A depth past
     ///   [`MAX_REMOVAL_DEPTH`], a directory met twice on the way down and every failure each stop
     ///   the removal.
@@ -1313,6 +1333,10 @@ impl AuthorisedDirectory {
     /// what it put there. A caller that needs that to be this account alone asks, through the
     /// handle, that `opened` is a directory only this account can change
     /// ([`Privacy::Exclusive`]); nothing beneath such a directory is reachable by anyone else.
+    /// When a directory goes in the place of one this removal emptied, the removal says so, as
+    /// above, and does not answer Ok. On Windows the handle has to be let go before the name can
+    /// be removed, so nothing is left to ask afterwards: there Ok means that the name went, and
+    /// that it held the directory this removal emptied until the handle was let go.
     ///
     /// # Errors
     ///
@@ -1320,7 +1344,7 @@ impl AuthorisedDirectory {
     /// environment, [`Escape::IdentityChanged`] when the name does not hold `opened` and nothing
     /// was removed, [`Escape::CrossedMount`] or [`Escape::Unopenable`] when the mount rule cannot
     /// be established and nothing was removed, and [`Escape::RemovalStopped`] naming where the
-    /// removal stopped once it had begun.
+    /// removal stopped once it had begun, a directory still there after its name went included.
     pub fn remove_tree(&self, name: &RelativeName, opened: Self) -> Result<(), Escape> {
         // One component, as for every other operation that changes what a directory holds.
         single_component(name)?;
@@ -1568,7 +1592,9 @@ impl Removal {
 /// Only while the name still holds that directory, and only while it is empty. A replacement at
 /// the name is refused rather than emptied, and an empty-directory removal refuses a directory
 /// anything was put into, so what somebody else put there stays. This is the one place a
-/// directory goes by name, and it goes only as the directory that was checked.
+/// directory goes by name, and it goes only as the directory that was checked. Where the handle
+/// can be held across the removal of the name, the directory is then asked whether it went with
+/// the name, and one that did not is refused rather than reported gone.
 fn remove_empty(
     holder: &Dir,
     entry: &OsStr,
@@ -1580,14 +1606,144 @@ fn remove_empty(
     same_object_at(holder, entry, emptied.identity, reported)?;
     // Windows removes a directory only by its name and only once no handle on it is open, because
     // the handles this host resolves names through are opened so that nothing can rename or
-    // delete a directory beneath them. Unix does not mind either way.
+    // delete a directory beneath them. Unix does not mind, so there the handle stays open across
+    // the removal, and is what shows afterwards whether the directory went with its name.
+    #[cfg(windows)]
     drop(emptied);
     #[cfg(feature = "testing")]
     testing::reached(testing::RemovalStep::Checked, reported);
     remove_empty_directory(holder, entry).map_err(|error| entry_failure(reported, &error))?;
     #[cfg(feature = "testing")]
     testing::reached(testing::RemovalStep::Removed, reported);
+    #[cfg(unix)]
+    gone(&emptied, reported)?;
     Ok(())
+}
+
+/// Establishes, through the handle the removal still holds, that a directory whose name it has
+/// just removed went with the name.
+///
+/// That the name went does not by itself mean the directory checked there did. A directory put at
+/// the name between the check and the removal goes in its place, and Apple's filesystem answers a
+/// removal of the name as done when a rename takes the directory to another name at the same
+/// moment, which leaves it there with nothing removed at all. So the directory itself is asked, by
+/// entering it again from the handle and listing it. A directory whose last name is gone cannot be
+/// entered, or cannot be listed, on Linux, and on Apple platforms lists no entry, not even its own
+/// `.` and `..`; every one of those is taken as gone. One that is still named somewhere can be
+/// entered and lists at least those two.
+///
+/// On APFS, HFS+ and FAT volumes that is the whole answer: a removed directory lists nothing, so
+/// one that lists something is one that is still named, and no rename can turn the one into the
+/// other. It also takes a live directory that lists no entry, not even `.` and `..`, as gone,
+/// which a filesystem that does not list them for a directory that exists would make a false
+/// answer; none of those named here is one.
+///
+/// A filesystem that goes on listing a removed directory's own entries, as the exFAT driver on
+/// Apple platforms does, cannot tell the two apart that way. There the directory counts as still
+/// there if the path its handle reports holds it, or if the handle reports another path a moment
+/// later, which is a directory that was moved meanwhile. That is evidence and not proof: a
+/// directory moved away and back between the two reads looks like one that was never moved.
+#[cfg(unix)]
+fn gone(emptied: &AuthorisedDirectory, reported: &str) -> Result<(), Escape> {
+    let unknown = |error: std::io::Error| Escape::Unopenable {
+        component: reported.to_owned(),
+        detail: format!(
+            "its name was removed, and whether the directory this removal emptied went with it \
+             could not be established: {error}"
+        ),
+    };
+    // Entered again from the handle, which may be one that lists nothing itself, and listed from
+    // the start.
+    let entered = match rustix::fs::openat(
+        &emptied.directory,
+        ".",
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    ) {
+        Ok(entered) => entered,
+        // The directory has no name left, so there is nothing to enter.
+        Err(rustix::io::Errno::NOENT | rustix::io::Errno::STALE) => return Ok(()),
+        Err(error) => return Err(unknown(error.into())),
+    };
+    let mut listing = rustix::fs::Dir::new(entered).map_err(|error| unknown(error.into()))?;
+    match listing.read() {
+        None | Some(Err(rustix::io::Errno::NOENT | rustix::io::Errno::STALE)) => return Ok(()),
+        Some(Err(error)) => return Err(unknown(error.into())),
+        Some(Ok(_)) => {}
+    }
+    #[cfg(target_os = "macos")]
+    if !listing_decides(&emptied.directory).map_err(unknown)?
+        && !at_its_reported_path(emptied, reported).map_err(unknown)?
+    {
+        return Ok(());
+    }
+    Err(Escape::IdentityChanged {
+        detail: format!(
+            "{reported} was the directory {}, which this removal emptied; its name was removed, \
+             and that directory is still there under another name",
+            emptied.identity
+        ),
+    })
+}
+
+/// Whether the volume a directory is on lists nothing for a directory that has been removed, so
+/// that a listing with an entry in it is the answer that the directory is still named.
+///
+/// APFS, HFS+ and FAT volumes do; a volume whose driver keeps listing a removed directory, or one
+/// this has no reading for, does not, and is asked by where its handle says the directory is.
+#[cfg(target_os = "macos")]
+fn listing_decides(directory: &Dir) -> std::io::Result<bool> {
+    let volume = rustix::fs::fstatfs(directory)?;
+    let name: Vec<u8> = volume
+        .f_fstypename
+        .iter()
+        .take_while(|character| **character != 0)
+        .map(|character| character.cast_unsigned())
+        .collect();
+    Ok(matches!(name.as_slice(), b"apfs" | b"hfs" | b"msdos"))
+}
+
+/// Whether the directory an open handle holds is still named: the path the handle reports holds
+/// it, or the handle reports another path once that has been looked at, which is a directory that
+/// moved in between. A handle that reports no path the second time is a directory that has been
+/// removed by someone else meanwhile, and that is gone.
+///
+/// Evidence, and nothing more: each path is looked at without following a link at its end, and
+/// nothing is opened or changed through it.
+#[cfg(target_os = "macos")]
+fn at_its_reported_path(directory: &AuthorisedDirectory, reported: &str) -> std::io::Result<bool> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let reads = |directory: &AuthorisedDirectory| match rustix::fs::getpath(&directory.directory) {
+        Ok(path) => Ok(Some(path)),
+        // A directory with no path left is at none.
+        Err(rustix::io::Errno::NOENT) => Ok(None),
+        Err(error) => Err(std::io::Error::from(error)),
+    };
+    let Some(first) = reads(directory)? else {
+        return Ok(false);
+    };
+    #[cfg(feature = "testing")]
+    testing::reached(testing::RemovalStep::Located, reported);
+    #[cfg(not(feature = "testing"))]
+    let _ = reported;
+    let holds = match std::fs::symlink_metadata(OsStr::from_bytes(first.as_bytes())) {
+        Ok(metadata) => {
+            metadata.is_dir()
+                && ObjectIdentity {
+                    device: metadata.dev(),
+                    file_id: metadata.ino(),
+                } == directory.identity
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error),
+    };
+    if holds {
+        return Ok(true);
+    }
+    // A path that held nothing of the directory's may be one it left in between, which the path
+    // it reports now shows, and a directory with no path now is one that is gone.
+    Ok(reads(directory)?.is_some_and(|second| second.as_c_str() != first.as_c_str()))
 }
 
 /// Reads every name one directory holds, closing the listing before returning.
@@ -1715,6 +1871,9 @@ pub mod testing {
         Checked,
         /// Its name has been removed.
         Removed,
+        /// On Apple platforms, where a removed directory's own path is being read to tell whether
+        /// it survived: the path has been read and is about to be looked at.
+        Located,
     }
 
     /// What a test does at a step: given the step and the directory, named as a removal's refusal
