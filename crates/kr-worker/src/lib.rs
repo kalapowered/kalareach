@@ -70,13 +70,18 @@ pub use crate::error::{Result, WorkerError};
 
 /// The build identifier a worker gives: its program name and its release.
 ///
-/// It goes in the worker's hello to the control daemon and in its answer to every hello.
+/// It goes in the worker's hello to the control daemon and in its answer to every hello. A worker
+/// of an installed release names that release, `kr-worker/0.2.0+4254aa6e62e5`, which is how a
+/// reader tells the release a session runs; any other names this crate's own version.
 ///
 /// # Panics
 ///
-/// Never: the text is a fixed name and this crate's own release.
+/// Never: the text is a fixed name and a release checked when it was read.
 #[must_use]
 pub fn build_id() -> kr_protocol::ids::BuildId {
-    kr_protocol::ids::BuildId::new(concat!("kr-worker/", env!("CARGO_PKG_VERSION")))
+    let release = kr_ipc::install::this_process().map_or(env!("CARGO_PKG_VERSION"), |running| {
+        running.stated_release(env!("CARGO_PKG_VERSION"))
+    });
+    kr_protocol::ids::BuildId::new(format!("kr-worker/{release}"))
         .expect("a fixed name and a release are a well-formed build identifier")
 }

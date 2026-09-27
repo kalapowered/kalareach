@@ -14,9 +14,11 @@ use std::process::ExitCode;
 use clap::{Parser, ValueEnum};
 use kr_crypto::store::StoreSelection;
 use kr_ipc::endpoint::Listener;
+use kr_ipc::install::Running;
 use kr_ipc::paths::HostPaths;
 use kr_ipc::verify::{CONTROLLER_SECRET_SERVICE, ControllerIdentity};
 use kr_protocol::ids::BuildId;
+use kr_shell_integration::host::package::PACKAGE_ROOT_VARIABLE;
 
 /// The release this build reports.
 const RELEASE: &str = env!("CARGO_PKG_VERSION");
@@ -81,9 +83,19 @@ impl From<SecretStoreChoice> for StoreSelection {
 }
 
 fn main() -> ExitCode {
+    // First, before anything is read or started: a daemon of an installed release holds that
+    // release for as long as it runs, which covers the workers it starts from it until each holds
+    // the release itself, and does not start at all once the release is being removed.
+    let running = match kr_ipc::install::this_process() {
+        Ok(running) => running,
+        Err(error) => {
+            eprintln!("kr-controller: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
     let arguments = Arguments::parse();
-    // First, before any thread exists: a session is the calling process's to leave, and nothing
-    // the terminal does may reach the daemon from here on.
+    // Before any thread exists: a session is the calling process's to leave, and nothing the
+    // terminal does may reach the daemon from here on.
     #[cfg(unix)]
     if arguments.own_session
         && let Err(error) = rustix::process::setsid()
@@ -104,7 +116,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match runtime.block_on(run(arguments)) {
+    match runtime.block_on(run(arguments, running)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("kr-controller: {error}");
@@ -113,7 +125,30 @@ fn main() -> ExitCode {
     }
 }
 
-async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
+async fn run(
+    arguments: Arguments,
+    running: &'static Running,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // A daemon of an installed release starts its own release's worker with its own release's
+    // shell packages, and nothing that names another program or other packages is taken: a session
+    // it launched with them would run a release the host's store does not hold for it.
+    if running.store().is_some() {
+        if arguments.worker.is_some() {
+            return Err(
+                "a daemon of an installed release starts its own release's worker, and \
+                        --worker names another program; start it without --worker"
+                    .into(),
+            );
+        }
+        if std::env::var_os(PACKAGE_ROOT_VARIABLE).is_some() {
+            return Err(format!(
+                "a daemon of an installed release starts sessions with its own release's shell \
+                 packages, and {PACKAGE_ROOT_VARIABLE} names others; start it with \
+                 {PACKAGE_ROOT_VARIABLE} unset"
+            )
+            .into());
+        }
+    }
     let paths = match (arguments.runtime_dir, arguments.state_dir) {
         (Some(runtime), Some(state)) => HostPaths::new(runtime, state)?,
         (runtime, state) => {
@@ -161,8 +196,13 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let worker_program = arguments.worker.unwrap_or_else(default_worker_program);
-    let build_id = BuildId::new(format!("kr-controller/{RELEASE}"))?;
-    let controller =
+    let release = running.stated_release(RELEASE);
+    let build_id = BuildId::new(format!("kr-controller/{release}"))?;
+    // Held until the daemon has taken its environment: an update that switches `current` from then
+    // on hands the environment over first.
+    let controller = {
+        #[cfg(unix)]
+        let _starting = hold_the_start(running, &paths)?;
         kr_controller::service::Controller::start(kr_controller::service::ControllerSetup {
             paths: environment.clone(),
             environment_id,
@@ -172,9 +212,10 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
             supervisor: kr_controller::supervision::detect(),
             worker_program,
             build_id,
-            release: RELEASE.to_owned(),
-            // The installation's own package directory, or whatever KR_SHELL_PACKAGES names.
-            shell_packages: None,
+            release: release.to_owned(),
+            // An installed release's own packages; otherwise the installation's own package
+            // directory, or whatever KR_SHELL_PACKAGES names.
+            shell_packages: running.shells(),
             // The daemon is this host's local presenter: a session created here or on a paired
             // device can ask for a local tab, and the daemon is the only party that can open one.
             terminal: Box::new(
@@ -183,7 +224,8 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
                 ),
             ),
         })
-        .await?;
+        .await?
+    };
     // Every delivery exchange goes to an origin it already knows: a notification, a status
     // question and a renewal to the gateway its credential names, and a webhook message to the
     // address its owner configured. Each goes through the managed transport of that origin, and
@@ -235,6 +277,44 @@ fn starter(_arguments: &Arguments) -> ExitCode {
          starts it"
     );
     ExitCode::FAILURE
+}
+
+/// Holds the store's start, where this is a daemon of an installed release, until the daemon has
+/// taken its environment, and records the roots it serves.
+///
+/// Held shared, as every starting daemon of the store holds it, and an update takes it exclusively
+/// while it switches `current`. So `current` cannot change between this daemon's look at it and its
+/// taking the environment: a daemon that finds another release current has been superseded, and
+/// exits rather than serving an environment the current release's daemon is about to serve.
+#[cfg(unix)]
+fn hold_the_start(
+    running: &Running,
+    paths: &HostPaths,
+) -> Result<Option<kr_ipc::install::StoreLock>, Box<dyn std::error::Error>> {
+    let (Some(store), Some(release)) = (running.store(), running.release()) else {
+        return Ok(None);
+    };
+    let held = store.lock_start()?;
+    match store.current()? {
+        Some(current) if current == *release => {}
+        Some(current) => {
+            return Err(format!(
+                "this daemon is of release {release}, and this host's current release is \
+                 {current}: that release's daemon serves this host, started through {}",
+                store.stable(kr_ipc::install::Program::Controller).display()
+            )
+            .into());
+        }
+        None => {
+            return Err(format!(
+                "this daemon is of release {release}, and the store at {} names no current release",
+                store.root().display()
+            )
+            .into());
+        }
+    }
+    store.record_roots(paths.runtime_root(), paths.state_root())?;
+    Ok(Some(held))
 }
 
 fn default_worker_program() -> PathBuf {
