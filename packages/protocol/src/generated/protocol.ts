@@ -423,6 +423,12 @@ export type ControlFrame =
   | {
       attention_barrier_acknowledged: AttentionBarrierAcknowledged
     }
+  | {
+      privacy_generation: PrivacyGenerationNotice
+    }
+  | {
+      privacy_generation_ack: PrivacyGenerationAck
+    }
 /**
  * A versioned capability name. Capabilities describe feasibility, never authority.
  */
@@ -1312,6 +1318,60 @@ export type PluginAdmission =
       state: 'left_out'
     }
 /**
+ * Whether privacy mode's last change has finished taking effect.
+ */
+export type PrivacyCompletion =
+  | {
+      state: 'complete'
+    }
+  | {
+      /**
+       * Each subsystem with work outstanding, and how much.
+       */
+      outstanding: PrivacyOutstanding[]
+      state: 'reconciling'
+    }
+  | {
+      /**
+       * Each subsystem with work outstanding, and how much.
+       */
+      outstanding: PrivacyOutstanding[]
+      state: 'unavailable'
+      /**
+       * Each subsystem that could not answer, with its reason.
+       */
+      unavailable: PrivacyUnavailable[]
+    }
+/**
+ * Something privacy mode stops while it is on.
+ */
+export type PrivacyDisabled =
+  'content_history_retention' | 'description_inference' | 'sync' | 'backup'
+/**
+ * Where one session's cleanup stands.
+ */
+export type PrivacySessionStanding =
+  | {
+      state: 'awaiting_worker'
+    }
+  | {
+      /**
+       * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+       */
+      outstanding: string
+      state: 'reconciling'
+    }
+  | {
+      /**
+       * What its worker said.
+       */
+      reason: string
+      state: 'unavailable'
+    }
+  | {
+      state: 'worker_ended'
+    }
+/**
  * One directory the owner authorised for repository work.
  */
 export type ProjectLocationId = string
@@ -2194,6 +2254,19 @@ export interface KalaReachProtocol {
   policy_authority?: PolicyAuthority
   prepared_effect?: PreparedEffect
   preview_entry?: PreviewEntry
+  privacy_completion?: PrivacyCompletion
+  privacy_disabled?: PrivacyDisabled
+  privacy_exported?: PrivacyExported
+  privacy_generation_ack?: PrivacyGenerationAck
+  privacy_generation_notice?: PrivacyGenerationNotice
+  privacy_kept?: PrivacyKept
+  privacy_outstanding?: PrivacyOutstanding
+  privacy_report?: PrivacyReport
+  privacy_session?: PrivacySession
+  privacy_session_standing?: PrivacySessionStanding
+  privacy_set_params?: PrivacySetParams
+  privacy_status_params?: PrivacyStatusParams
+  privacy_unavailable?: PrivacyUnavailable
   project_adopt_params?: ProjectAdoptParams
   project_adopt_result?: ProjectAdoptResult
   project_clone_params?: ProjectCloneParams
@@ -7809,6 +7882,96 @@ export interface Request1 {
    * Correlates the response. Unique for the lifetime of one connection.
    */
   request_id: string
+}
+/**
+ * The environment's privacy generation, as the control daemon tells one of its workers.
+ *
+ * Sent on the daemon's authority connection to the worker whenever the generation it holds for
+ * the session is not the one in force, and repeated until the worker answers that its cleanup is
+ * complete.
+ */
+export interface PrivacyGenerationNotice {
+  /**
+   * Whether privacy mode is on at that generation.
+   */
+  enabled: boolean
+  /**
+   * The environment the generation belongs to.
+   */
+  environment_id: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  generation: string
+}
+/**
+ * A worker's answer to a [`PrivacyGenerationNotice`]: the generation its session holds now, in
+ * which state, and where its own cleanup stands.
+ */
+export interface PrivacyGenerationAck {
+  /**
+   * Where the session's own cleanup stands.
+   */
+  completion:
+    | {
+        state: 'complete'
+      }
+    | {
+        /**
+         * Each subsystem with work outstanding, and how much.
+         */
+        outstanding: PrivacyOutstanding[]
+        state: 'reconciling'
+      }
+    | {
+        /**
+         * Each subsystem with work outstanding, and how much.
+         */
+        outstanding: PrivacyOutstanding[]
+        state: 'unavailable'
+        /**
+         * Each subsystem that could not answer, with its reason.
+         */
+        unavailable: PrivacyUnavailable[]
+      }
+  /**
+   * Whether privacy mode is on in the session at that generation.
+   */
+  enabled: boolean
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  generation: string
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+}
+/**
+ * One subsystem's outstanding work.
+ */
+export interface PrivacyOutstanding {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  count: string
+  /**
+   * The subsystem, by its stable name.
+   */
+  subsystem: string
+}
+/**
+ * One subsystem that could not answer, and why.
+ */
+export interface PrivacyUnavailable {
+  /**
+   * What its store said.
+   */
+  reason: string
+  /**
+   * The subsystem, by its stable name.
+   */
+  subsystem: string
 }
 /**
  * Everything one installation of one application can currently do.
@@ -14793,6 +14956,8 @@ export interface MethodEntry {
     | 'environment.inventory'
     | 'environment.refresh'
     | 'delivery.destination.secret.set'
+    | 'privacy.set'
+    | 'privacy.status'
     | 'pair.invite'
     | 'pair.redeem'
     | 'pair.finish'
@@ -17347,6 +17512,159 @@ export interface PreparedEffect {
    */
   operation: 'upstream_submit' | 'upstream_cancel' | 'upstream_attachment' | 'terminal_text'
 }
+/**
+ * A copy that had already left this host before privacy mode was turned on.
+ *
+ * It is not erased, and this host does not claim it could be: it is shown, and deleting it is an
+ * action of its own.
+ */
+export interface PrivacyExported {
+  /**
+   * Whether this host holds a reference it can ask for the copy's removal through. It says
+   * there is a way to ask, not that asking will succeed or that no other copy exists.
+   */
+  deletable: boolean
+  /**
+   * What kind of copy it is.
+   */
+  kind: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  left_at_ms: string
+  /**
+   * The opaque reference a person is shown, never a path on a client.
+   */
+  reference: string
+}
+/**
+ * Something this host keeps while privacy mode is on, named rather than kept quietly.
+ */
+export interface PrivacyKept {
+  /**
+   * What is kept.
+   */
+  what: string
+  /**
+   * Why a host that stopped keeping it could not do its job.
+   */
+  why: string
+}
+/**
+ * Where privacy mode stands for the environment: the answer to `privacy.set` and to
+ * `privacy.status`.
+ */
+export interface PrivacyReport {
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  changed_at_ms: string
+  /**
+   * Whether the last change has finished taking effect.
+   */
+  completion:
+    | {
+        state: 'complete'
+      }
+    | {
+        /**
+         * Each subsystem with work outstanding, and how much.
+         */
+        outstanding: PrivacyOutstanding[]
+        state: 'reconciling'
+      }
+    | {
+        /**
+         * Each subsystem with work outstanding, and how much.
+         */
+        outstanding: PrivacyOutstanding[]
+        state: 'unavailable'
+        /**
+         * Each subsystem that could not answer, with its reason.
+         */
+        unavailable: PrivacyUnavailable[]
+      }
+  /**
+   * What privacy mode stops while it is on.
+   */
+  disabled: PrivacyDisabled[]
+  /**
+   * Whether privacy mode is on.
+   */
+  enabled: boolean
+  /**
+   * What had already left this host before privacy mode was turned on.
+   */
+  exported: PrivacyExported[]
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  generation: string
+  /**
+   * What this host keeps while privacy mode is on, and why.
+   */
+  kept: PrivacyKept[]
+  /**
+   * Each session whose own cleanup is still owed, and where it stands.
+   */
+  sessions: PrivacySession[]
+  /**
+   * Each subsystem that could not list what had left, and its reason. The list above is then
+   * incomplete, and says so here rather than by being empty.
+   */
+  unlisted: PrivacyUnavailable[]
+}
+/**
+ * One session's own cleanup that privacy mode is still owed.
+ */
+export interface PrivacySession {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  generation: string
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+  /**
+   * Where it stands.
+   */
+  standing:
+    | {
+        state: 'awaiting_worker'
+      }
+    | {
+        /**
+         * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+         */
+        outstanding: string
+        state: 'reconciling'
+      }
+    | {
+        /**
+         * What its worker said.
+         */
+        reason: string
+        state: 'unavailable'
+      }
+    | {
+        state: 'worker_ended'
+      }
+}
+/**
+ * Parameters of `privacy.set`.
+ */
+export interface PrivacySetParams {
+  /**
+   * True turns privacy mode on, false turns it off. Each change advances the generation; asking
+   * for the state already in force changes nothing and answers where it stands.
+   */
+  enabled: boolean
+}
+/**
+ * Parameters of `privacy.status`. The environment is the one the connection reaches.
+ */
+export interface PrivacyStatusParams {}
 /**
  * Parameters of `project.adopt`.
  */
@@ -23014,6 +23332,8 @@ export interface ServiceRequestPayload {
     | 'environment.inventory'
     | 'environment.refresh'
     | 'delivery.destination.secret.set'
+    | 'privacy.set'
+    | 'privacy.status'
     | 'pair.invite'
     | 'pair.redeem'
     | 'pair.finish'

@@ -25,6 +25,8 @@ links to its document.
 | `environment.inventory` | read | `local_ipc` | The owner-approved cached inventory of enrolled environments. It reports what was last observed and starts nothing. |  |
 | `environment.refresh` | write | `local_ipc` | Observe one enrolled environment now, and start it when the request asks for that. |  |
 | `delivery.destination.secret.set` | write | `local_ipc` | Keep the credential an external notification destination sends with in this host's secret store, under the destination's identifier. It is never answered back, and it goes when the destination does. | [Delivery: Credentials](../delivery/README.md) |
+| `privacy.set` | write | `local_ipc`, `paired_device` | Turn privacy mode on or off for this environment. The change is recorded, and the generation advanced, before any subsystem is touched; the answer says where it stands. | [Host: Privacy mode](../host/README.md) |
+| `privacy.status` | read | `local_ipc`, `paired_device` | Where privacy mode stands: its generation, whether its last change has taken effect, what each session still owes, what is kept and what had already left this host. | [Host: Privacy mode](../host/README.md) |
 
 ## Pairing
 

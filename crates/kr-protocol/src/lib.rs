@@ -70,6 +70,7 @@
 //! | [`recovery`] | Subscriptions, snapshots, history pages and resynchronisation |
 //! | [`semantic`] | The semantic snapshot's bounds and the continuation that stands where they stop |
 //! | [`hostinfo`] | Host and environment reads, and read-only diagnostics |
+//! | [`privacy`] | Privacy mode: its switch, its report and the generation each worker is told |
 //! | [`worker`] | Worker descriptors, the startup rendezvous, the verify challenge and the generation token |
 //! | [`schema`] | Deterministic JSON Schema and method-table generation |
 //! | [`vectors`] | The cross-language vectors under `fixtures/service` and `fixtures/push` |
@@ -145,6 +146,7 @@ pub mod mailbox;
 pub mod method;
 pub mod pairing;
 pub mod preauth;
+pub mod privacy;
 pub mod project;
 pub mod projection;
 pub mod push;

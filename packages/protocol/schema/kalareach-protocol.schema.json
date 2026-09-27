@@ -8800,6 +8800,32 @@
             "attention_barrier_acknowledged"
           ],
           "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The environment's privacy generation, told to a worker on the control daemon's authority\nconnection to it.",
+          "properties": {
+            "privacy_generation": {
+              "$ref": "#/$defs/PrivacyGenerationNotice"
+            }
+          },
+          "required": [
+            "privacy_generation"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The worker's answer: the generation its session holds and where its cleanup stands.",
+          "properties": {
+            "privacy_generation_ack": {
+              "$ref": "#/$defs/PrivacyGenerationAck"
+            }
+          },
+          "required": [
+            "privacy_generation_ack"
+          ],
+          "type": "object"
         }
       ]
     },
@@ -17349,6 +17375,16 @@
           "type": "string"
         },
         {
+          "const": "privacy.set",
+          "description": "Turn privacy mode on or off for this environment. The change is recorded, and the generation advanced, before any subsystem is touched; the answer says where it stands.",
+          "type": "string"
+        },
+        {
+          "const": "privacy.status",
+          "description": "Where privacy mode stands: its generation, whether its last change has taken effect, what each session still owes, what is kept and what had already left this host.",
+          "type": "string"
+        },
+        {
           "const": "pair.invite",
           "description": "Issue a five-minute single-use pairing invitation in code or direct mode.",
           "type": "string"
@@ -22731,6 +22767,424 @@
           "type": "string"
         }
       ]
+    },
+    "PrivacyCompletion": {
+      "description": "Whether privacy mode's last change has finished taking effect.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "Every subsystem and every session has reconciled. The only state reported as complete.",
+          "properties": {
+            "state": {
+              "const": "complete",
+              "type": "string"
+            }
+          },
+          "required": [
+            "state"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Work is still settling, and these are why.",
+          "properties": {
+            "outstanding": {
+              "description": "Each subsystem with work outstanding, and how much.",
+              "items": {
+                "$ref": "#/$defs/PrivacyOutstanding"
+              },
+              "type": "array"
+            },
+            "state": {
+              "const": "reconciling",
+              "type": "string"
+            }
+          },
+          "required": [
+            "state",
+            "outstanding"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Something is in the way: a subsystem could not take a step or cannot say where its cleanup\nstands. Cleanup is not complete, and it is not merely waiting for work to settle.",
+          "properties": {
+            "outstanding": {
+              "description": "Each subsystem with work outstanding, and how much.",
+              "items": {
+                "$ref": "#/$defs/PrivacyOutstanding"
+              },
+              "type": "array"
+            },
+            "state": {
+              "const": "unavailable",
+              "type": "string"
+            },
+            "unavailable": {
+              "description": "Each subsystem that could not answer, with its reason.",
+              "items": {
+                "$ref": "#/$defs/PrivacyUnavailable"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "state",
+            "unavailable",
+            "outstanding"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "PrivacyDisabled": {
+      "description": "Something privacy mode stops while it is on.",
+      "oneOf": [
+        {
+          "const": "content_history_retention",
+          "description": "Keeping the content of a session's history.",
+          "type": "string"
+        },
+        {
+          "const": "description_inference",
+          "description": "Producing generated session descriptions.",
+          "type": "string"
+        },
+        {
+          "const": "sync",
+          "description": "Producing sync work.",
+          "type": "string"
+        },
+        {
+          "const": "backup",
+          "description": "Producing backup work.",
+          "type": "string"
+        }
+      ]
+    },
+    "PrivacyExported": {
+      "additionalProperties": false,
+      "description": "A copy that had already left this host before privacy mode was turned on.\n\nIt is not erased, and this host does not claim it could be: it is shown, and deleting it is an\naction of its own.",
+      "properties": {
+        "deletable": {
+          "description": "Whether this host holds a reference it can ask for the copy's removal through. It says\nthere is a way to ask, not that asking will succeed or that no other copy exists.",
+          "type": "boolean"
+        },
+        "kind": {
+          "description": "What kind of copy it is.",
+          "type": "string"
+        },
+        "left_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When it left."
+        },
+        "reference": {
+          "description": "The opaque reference a person is shown, never a path on a client.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "reference",
+        "left_at_ms",
+        "deletable"
+      ],
+      "type": "object"
+    },
+    "PrivacyGenerationAck": {
+      "additionalProperties": false,
+      "description": "A worker's answer to a [`PrivacyGenerationNotice`]: the generation its session holds now, in\nwhich state, and where its own cleanup stands.",
+      "properties": {
+        "completion": {
+          "$ref": "#/$defs/PrivacyCompletion",
+          "description": "Where the session's own cleanup stands."
+        },
+        "enabled": {
+          "description": "Whether privacy mode is on in the session at that generation.",
+          "type": "boolean"
+        },
+        "generation": {
+          "$ref": "#/$defs/U64",
+          "description": "The generation the session holds."
+        },
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session that answered."
+        }
+      },
+      "required": [
+        "session_id",
+        "generation",
+        "enabled",
+        "completion"
+      ],
+      "type": "object"
+    },
+    "PrivacyGenerationNotice": {
+      "additionalProperties": false,
+      "description": "The environment's privacy generation, as the control daemon tells one of its workers.\n\nSent on the daemon's authority connection to the worker whenever the generation it holds for\nthe session is not the one in force, and repeated until the worker answers that its cleanup is\ncomplete.",
+      "properties": {
+        "enabled": {
+          "description": "Whether privacy mode is on at that generation.",
+          "type": "boolean"
+        },
+        "environment_id": {
+          "$ref": "#/$defs/EnvironmentId",
+          "description": "The environment the generation belongs to."
+        },
+        "generation": {
+          "$ref": "#/$defs/U64",
+          "description": "The generation in force."
+        }
+      },
+      "required": [
+        "environment_id",
+        "generation",
+        "enabled"
+      ],
+      "type": "object"
+    },
+    "PrivacyKept": {
+      "additionalProperties": false,
+      "description": "Something this host keeps while privacy mode is on, named rather than kept quietly.",
+      "properties": {
+        "what": {
+          "description": "What is kept.",
+          "type": "string"
+        },
+        "why": {
+          "description": "Why a host that stopped keeping it could not do its job.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "what",
+        "why"
+      ],
+      "type": "object"
+    },
+    "PrivacyOutstanding": {
+      "additionalProperties": false,
+      "description": "One subsystem's outstanding work.",
+      "properties": {
+        "count": {
+          "$ref": "#/$defs/U64",
+          "description": "How many pieces of work it is still waiting on."
+        },
+        "subsystem": {
+          "description": "The subsystem, by its stable name.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "subsystem",
+        "count"
+      ],
+      "type": "object"
+    },
+    "PrivacyReport": {
+      "additionalProperties": false,
+      "description": "Where privacy mode stands for the environment: the answer to `privacy.set` and to\n`privacy.status`.",
+      "properties": {
+        "changed_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When it last changed."
+        },
+        "completion": {
+          "$ref": "#/$defs/PrivacyCompletion",
+          "description": "Whether the last change has finished taking effect."
+        },
+        "disabled": {
+          "description": "What privacy mode stops while it is on.",
+          "items": {
+            "$ref": "#/$defs/PrivacyDisabled"
+          },
+          "type": "array"
+        },
+        "enabled": {
+          "description": "Whether privacy mode is on.",
+          "type": "boolean"
+        },
+        "exported": {
+          "description": "What had already left this host before privacy mode was turned on.",
+          "items": {
+            "$ref": "#/$defs/PrivacyExported"
+          },
+          "type": "array"
+        },
+        "generation": {
+          "$ref": "#/$defs/U64",
+          "description": "The environment's privacy generation. Turning privacy mode on and turning it off each\nadvance it."
+        },
+        "kept": {
+          "description": "What this host keeps while privacy mode is on, and why.",
+          "items": {
+            "$ref": "#/$defs/PrivacyKept"
+          },
+          "type": "array"
+        },
+        "sessions": {
+          "description": "Each session whose own cleanup is still owed, and where it stands.",
+          "items": {
+            "$ref": "#/$defs/PrivacySession"
+          },
+          "type": "array"
+        },
+        "unlisted": {
+          "description": "Each subsystem that could not list what had left, and its reason. The list above is then\nincomplete, and says so here rather than by being empty.",
+          "items": {
+            "$ref": "#/$defs/PrivacyUnavailable"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "generation",
+        "enabled",
+        "changed_at_ms",
+        "completion",
+        "sessions",
+        "disabled",
+        "kept",
+        "exported",
+        "unlisted"
+      ],
+      "type": "object"
+    },
+    "PrivacySession": {
+      "additionalProperties": false,
+      "description": "One session's own cleanup that privacy mode is still owed.",
+      "properties": {
+        "generation": {
+          "$ref": "#/$defs/U64",
+          "description": "The generation whose cleanup it owes."
+        },
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session."
+        },
+        "standing": {
+          "$ref": "#/$defs/PrivacySessionStanding",
+          "description": "Where it stands."
+        }
+      },
+      "required": [
+        "session_id",
+        "generation",
+        "standing"
+      ],
+      "type": "object"
+    },
+    "PrivacySessionStanding": {
+      "description": "Where one session's cleanup stands.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "Its worker has not said yet.",
+          "properties": {
+            "state": {
+              "const": "awaiting_worker",
+              "type": "string"
+            }
+          },
+          "required": [
+            "state"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Its worker says its cleanup is still settling.",
+          "properties": {
+            "outstanding": {
+              "$ref": "#/$defs/U64",
+              "description": "How much its worker says is outstanding."
+            },
+            "state": {
+              "const": "reconciling",
+              "type": "string"
+            }
+          },
+          "required": [
+            "state",
+            "outstanding"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Its worker says something is in the way.",
+          "properties": {
+            "reason": {
+              "description": "What its worker said.",
+              "type": "string"
+            },
+            "state": {
+              "const": "unavailable",
+              "type": "string"
+            }
+          },
+          "required": [
+            "state",
+            "reason"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Its worker ended before it said its cleanup was complete. What it retained is the\narchive's, and the session stays owed until something shows it is gone.",
+          "properties": {
+            "state": {
+              "const": "worker_ended",
+              "type": "string"
+            }
+          },
+          "required": [
+            "state"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "PrivacySetParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `privacy.set`.",
+      "properties": {
+        "enabled": {
+          "description": "True turns privacy mode on, false turns it off. Each change advances the generation; asking\nfor the state already in force changes nothing and answers where it stands.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "enabled"
+      ],
+      "type": "object"
+    },
+    "PrivacyStatusParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `privacy.status`. The environment is the one the connection reaches.",
+      "type": "object"
+    },
+    "PrivacyUnavailable": {
+      "additionalProperties": false,
+      "description": "One subsystem that could not answer, and why.",
+      "properties": {
+        "reason": {
+          "description": "What its store said.",
+          "type": "string"
+        },
+        "subsystem": {
+          "description": "The subsystem, by its stable name.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "subsystem",
+        "reason"
+      ],
+      "type": "object"
     },
     "ProbedPalette": {
       "additionalProperties": false,
@@ -36851,6 +37305,45 @@
     },
     "preview_entry": {
       "$ref": "#/$defs/PreviewEntry"
+    },
+    "privacy_completion": {
+      "$ref": "#/$defs/PrivacyCompletion"
+    },
+    "privacy_disabled": {
+      "$ref": "#/$defs/PrivacyDisabled"
+    },
+    "privacy_exported": {
+      "$ref": "#/$defs/PrivacyExported"
+    },
+    "privacy_generation_ack": {
+      "$ref": "#/$defs/PrivacyGenerationAck"
+    },
+    "privacy_generation_notice": {
+      "$ref": "#/$defs/PrivacyGenerationNotice"
+    },
+    "privacy_kept": {
+      "$ref": "#/$defs/PrivacyKept"
+    },
+    "privacy_outstanding": {
+      "$ref": "#/$defs/PrivacyOutstanding"
+    },
+    "privacy_report": {
+      "$ref": "#/$defs/PrivacyReport"
+    },
+    "privacy_session": {
+      "$ref": "#/$defs/PrivacySession"
+    },
+    "privacy_session_standing": {
+      "$ref": "#/$defs/PrivacySessionStanding"
+    },
+    "privacy_set_params": {
+      "$ref": "#/$defs/PrivacySetParams"
+    },
+    "privacy_status_params": {
+      "$ref": "#/$defs/PrivacyStatusParams"
+    },
+    "privacy_unavailable": {
+      "$ref": "#/$defs/PrivacyUnavailable"
     },
     "project_adopt_params": {
       "$ref": "#/$defs/ProjectAdoptParams"

@@ -44,6 +44,10 @@ const PROTOCOL: Document = Document {
     path: "protocol/README.md",
     label: "Protocol",
 };
+const HOST: Document = Document {
+    path: "host/README.md",
+    label: "Host",
+};
 const PLATFORMS: Document = Document {
     path: "host/platforms.md",
     label: "Platforms",
@@ -101,6 +105,7 @@ pub(crate) const fn described_in(method: Method) -> Option<Section> {
         | Method::EnvironmentRefresh => None,
         Method::EnvironmentCapabilities => at(PLATFORMS, "What may be done on a desktop"),
         Method::DeliveryDestinationSecretSet => at(DELIVERY, "Credentials"),
+        Method::PrivacySet | Method::PrivacyStatus => at(HOST, "Privacy mode"),
 
         Method::PairInvite | Method::PairFinish | Method::PairConfirm => {
             at(PAIRING, "The exchange")

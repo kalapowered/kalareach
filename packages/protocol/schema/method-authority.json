@@ -1,6 +1,6 @@
 {
   "description": "One exhaustive authority entry per method. Anything not listed is denied. Generated from crates/kr-protocol; do not edit by hand.",
-  "method_count": 152,
+  "method_count": 154,
   "methods": [
     {
       "capability": "none",
@@ -225,6 +225,66 @@
         "environment"
       ],
       "summary": "Keep the credential an external notification destination sends with in this host's secret store, under the destination's identifier. It is never answered back, and it goes when the destination does.",
+      "version": 1
+    },
+    {
+      "capability": "none",
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "host_and_environment",
+      "history_filter": "not_applicable",
+      "idempotency": "action_deduplicated",
+      "ingress": [
+        "local_ipc",
+        "paired_device"
+      ],
+      "method": "privacy.set",
+      "name": "privacy.set",
+      "required_rights": [
+        {
+          "authority": {
+            "right": {
+              "right": "host.manage"
+            }
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "environment"
+      ],
+      "summary": "Turn privacy mode on or off for this environment. The change is recorded, and the generation advanced, before any subsystem is touched; the answer says where it stands.",
+      "version": 1
+    },
+    {
+      "capability": "none",
+      "confirmation": "none",
+      "effect": "read",
+      "freshness": "current_authority",
+      "group": "host_and_environment",
+      "history_filter": "not_applicable",
+      "idempotency": "idempotent_read",
+      "ingress": [
+        "local_ipc",
+        "paired_device"
+      ],
+      "method": "privacy.status",
+      "name": "privacy.status",
+      "required_rights": [
+        {
+          "authority": {
+            "right": {
+              "right": "host.manage"
+            }
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "environment"
+      ],
+      "summary": "Where privacy mode stands: its generation, whether its last change has taken effect, what each session still owes, what is kept and what had already left this host.",
       "version": 1
     },
     {

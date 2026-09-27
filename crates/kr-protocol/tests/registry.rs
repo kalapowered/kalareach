@@ -360,6 +360,35 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
         );
     }
 
+    // Section 24 turns privacy mode on and off for the whole environment, and section 23 names no
+    // method that does. This build adds a write and a read, both in the host-and-environment group:
+    // the switch changes what this host retains, so it asks for host management, and so does the
+    // read, which lists what the environment kept and what had already left it. Both are served on
+    // the local socket and to a paired device, whose grant must carry host management.
+    let privacy = [
+        ("privacy.set", EffectClass::Write),
+        ("privacy.status", EffectClass::Read),
+    ];
+    for (name, effect) in privacy {
+        let entry = lookup(name).unwrap_or_else(|| panic!("{name} is missing from the registry"));
+        assert_eq!(entry.effect, effect, "{name} carries its own effect class");
+        assert_eq!(
+            entry.group,
+            MethodGroup::HostAndEnvironment,
+            "{name} is a host and environment method"
+        );
+        assert_eq!(
+            entry.ingress,
+            &[ActorIngress::LocalIpc, ActorIngress::PairedDevice],
+            "{name} is served on the local socket and to a paired device"
+        );
+        assert_eq!(
+            entry.required_rights,
+            &[RequiredRight::right(ActionRight::HostManage)],
+            "{name} asks for host management and nothing else"
+        );
+    }
+
     // Section 15 ¶12 requires the provider and the selected context scope to be shown before voice
     // starts, and section 23's voice row names no read that can answer that: `voice.context` names
     // a voice session, and by the time `voice.start` answers, the metered provider session exists.
@@ -516,6 +545,7 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
             + attention.len()
             + environments.len()
             + delivery.len()
+            + privacy.len()
             + policy.len()
             + voice.len()
             + owner.len()

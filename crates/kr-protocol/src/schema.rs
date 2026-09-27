@@ -134,6 +134,11 @@ use crate::pairing::{
 use crate::preauth::{
     PairFinishResult, PairRedeemParams, PairRedeemResult, PairStatusParams, PairStatusResult,
 };
+use crate::privacy::{
+    PrivacyCompletion, PrivacyDisabled, PrivacyExported, PrivacyGenerationAck,
+    PrivacyGenerationNotice, PrivacyKept, PrivacyOutstanding, PrivacyReport, PrivacySession,
+    PrivacySessionStanding, PrivacySetParams, PrivacyStatusParams, PrivacyUnavailable,
+};
 use crate::project::{
     InclusionPreview, OperationRecord, PreviewEntry, ProjectAdoptParams, ProjectAdoptResult,
     ProjectCloneParams, ProjectCloneResult, ProjectInitParams, ProjectInitResult,
@@ -759,6 +764,21 @@ pub fn protocol_schema() -> Value {
         "destination_secret_kind" => DestinationSecretKind,
         "mail_account" => MailAccount,
         "mail_security" => MailSecurity,
+        // Privacy mode: its two methods, the report both answer, and the notice and answer a
+        // worker and its control daemon exchange. Appended for the same reason.
+        "privacy_completion" => PrivacyCompletion,
+        "privacy_disabled" => PrivacyDisabled,
+        "privacy_exported" => PrivacyExported,
+        "privacy_generation_ack" => PrivacyGenerationAck,
+        "privacy_generation_notice" => PrivacyGenerationNotice,
+        "privacy_kept" => PrivacyKept,
+        "privacy_outstanding" => PrivacyOutstanding,
+        "privacy_report" => PrivacyReport,
+        "privacy_session" => PrivacySession,
+        "privacy_session_standing" => PrivacySessionStanding,
+        "privacy_set_params" => PrivacySetParams,
+        "privacy_status_params" => PrivacyStatusParams,
+        "privacy_unavailable" => PrivacyUnavailable,
     }
     properties.insert(
         "identifiers".to_owned(),

@@ -1087,7 +1087,10 @@ async fn route(state: &Arc<SessionState>, frame: ControlFrame) -> bool {
         | ControlFrame::AttentionText(_)
         | ControlFrame::AttentionTextAnswer(_)
         | ControlFrame::AttentionBarrier(_)
-        | ControlFrame::AttentionBarrierAcknowledged(_) => return false,
+        | ControlFrame::AttentionBarrierAcknowledged(_)
+        // The control daemon's privacy notice to a worker and the worker's answer.
+        | ControlFrame::PrivacyGeneration(_)
+        | ControlFrame::PrivacyGenerationAck(_) => return false,
     }
     true
 }

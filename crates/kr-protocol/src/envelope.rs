@@ -539,4 +539,9 @@ pub enum ControlFrame {
     AttentionBarrier(crate::attention::AttentionBarrier),
     /// The control daemon's acknowledgement that it applied a statement.
     AttentionBarrierAcknowledged(crate::attention::AttentionBarrierAcknowledged),
+    /// The environment's privacy generation, told to a worker on the control daemon's authority
+    /// connection to it.
+    PrivacyGeneration(crate::privacy::PrivacyGenerationNotice),
+    /// The worker's answer: the generation its session holds and where its cleanup stands.
+    PrivacyGenerationAck(Box<crate::privacy::PrivacyGenerationAck>),
 }

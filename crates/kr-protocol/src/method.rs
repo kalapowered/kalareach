@@ -403,6 +403,22 @@ methods! {
           secret store, under the destination's identifier. It is never answered back, and it \
           goes when the destination does.";
 
+    PrivacySet = "privacy.set", HostAndEnvironment,
+    effect: Write, ingress: [LocalIpc, PairedDevice], rights: [req(HostManage)],
+    selectors: [Environment],
+    history: NotApplicable, capability: NO_CAPABILITY, freshness: ActionWindow,
+    confirmation: None, idempotency: ACTION,
+    doc: "Turn privacy mode on or off for this environment. The change is recorded, and the \
+          generation advanced, before any subsystem is touched; the answer says where it stands.";
+
+    PrivacyStatus = "privacy.status", HostAndEnvironment,
+    effect: Read, ingress: [LocalIpc, PairedDevice], rights: [req(HostManage)],
+    selectors: [Environment],
+    history: NotApplicable, capability: NO_CAPABILITY, freshness: CurrentAuthority,
+    confirmation: None, idempotency: READ,
+    doc: "Where privacy mode stands: its generation, whether its last change has taken effect, \
+          what each session still owes, what is kept and what had already left this host.";
+
     // ----- Pairing --------------------------------------------------------------------------
     PairInvite = "pair.invite", Pairing,
     effect: Write, ingress: [LocalIpc], rights: [req(HostManage)], selectors: [Host, Invitation],
@@ -1608,6 +1624,9 @@ mod tests {
             "delivery.destination.secret.set",
             &[ActionRight::HostManage],
         ),
+        // Privacy mode: switching this host's retention, and reading what it kept and what left.
+        ("privacy.set", &[ActionRight::HostManage]),
+        ("privacy.status", &[ActionRight::HostManage]),
         // Sharing.
         ("grant.create", &[ActionRight::SessionShare]),
         ("grant.revoke", &[ActionRight::SessionShare]),
