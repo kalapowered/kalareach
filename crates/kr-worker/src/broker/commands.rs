@@ -11,9 +11,10 @@
 //!
 //! 1. **Establish**, when the root shell asks to resolve an integrated invocation: an endpoint in a
 //!    fresh owner-only directory, a credential, and a launch record that says where to connect and
-//!    which flags the integration added. Nothing is reserved and no registration exists yet. The
-//!    answer names the registration's path, the variables the connector's verified manifest
-//!    declares, and the installation's launcher.
+//!    which variables the connector's verified manifest declares. Nothing is reserved and no
+//!    registration exists yet. The answer names the registration's path, whose file name says which
+//!    flags the integration added, and the installation's launcher. The shell exports the
+//!    registration's path alone.
 //! 2. **Present**: the shell runs the launcher in the child it forked for the invocation, and the
 //!    launcher presents itself, with the credential, the executable and the argument vector.
 //! 3. **Admit**: the process the kernel names is the root shell's own child, started after the
@@ -21,13 +22,15 @@
 //!    answered. The launch profile is recorded, the instance registered by its reservation, and the
 //!    registration published whole, naming that process. The launcher is told it is admitted.
 //! 4. **Commit**, when the launcher says it is going: the backend is committed and says so, and only
-//!    then does the launcher exec the program in place, keeping its process identity, so the
-//!    registration names the program before the program runs.
+//!    then does the launcher set the declared variables and exec the program in place, keeping its
+//!    process identity, so the registration names the program before the program runs.
 //!
 //! A launcher that is refused, runs out of time or cannot reach the endpoint runs the invocation as
-//! typed, without the flags and without the variable. The registration's file name says where the
-//! added flags stand in the vector, so what was typed is known from the variable alone, whatever has
-//! become of the backend.
+//! typed, without the flags and without the registration's variable. The declared variables were
+//! never exported, so the program runs in the person's own environment exactly, their own value of
+//! a declared variable included. The registration's file name says where the added flags stand in
+//! the vector, so what was typed is known from the variable alone, whatever has become of the
+//! backend.
 //!
 //! # What is served
 //!
@@ -765,25 +768,26 @@ impl CommandBackends {
         Ok(launcher)
     }
 
-    /// The answer the shell runs an established invocation from: the registration's path, then
-    /// the variables the connector's verified manifest declares, in its order.
+    /// The answer the shell runs an established invocation from: the registration's path, which is
+    /// the one variable the shell exports.
+    ///
+    /// The variables the connector's verified manifest declares are in the launch record, and the
+    /// launcher sets them once the launch is committed. A shell that exported them would replace the
+    /// person's own value of the same name before the launcher knew whether the launch would run,
+    /// and an invocation that then runs as typed could not have it back.
     fn answer(
         &self,
         backend: &Backend,
         prompt_generation: PromptGeneration,
         launcher: &Path,
     ) -> CommandBackend {
-        let mut environment = vec![EnvironmentVariable {
-            name: "KR_REGISTRATION".to_owned(),
-            value: backend.registration.display().to_string(),
-        }];
-        if let Some(integration) = backend.connector.integration() {
-            environment.extend(integration.variables.iter().cloned());
-        }
         CommandBackend {
             session_id: self.session_id,
             prompt_generation,
-            environment,
+            environment: vec![EnvironmentVariable {
+                name: "KR_REGISTRATION".to_owned(),
+                value: backend.registration.display().to_string(),
+            }],
             launcher: launcher.display().to_string(),
         }
     }
@@ -826,9 +830,15 @@ impl CommandBackends {
         let credential = Credential::generate()?;
         let credential_path = directory.join(crate::broker::attach::CREDENTIAL_FILE);
         credential.write_file(&credential_path)?;
+        // The variables the connector's verified manifest declares, in its order, which the
+        // launcher sets only once the launch is committed.
+        let variables: &[EnvironmentVariable] = connector
+            .integration()
+            .map_or(&[], |integration| integration.variables.as_slice());
         let record = serde_json::json!({
             "endpoint": gateway.address().for_diagnostics(),
             "credential": credential_path.display().to_string(),
+            "variables": variables,
         });
         kr_ipc::paths::write_owner_only_file(
             &directory.join(LAUNCH_RECORD_FILE),

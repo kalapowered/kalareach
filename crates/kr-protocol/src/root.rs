@@ -995,7 +995,9 @@ pub struct CommandBackend {
     /// The variables the shell exports for this one invocation.
     ///
     /// They name this session and the worker's own private endpoint. A bypassed invocation is
-    /// given none of them, which is what keeps its execution the one the person asked for.
+    /// given none of them, which is what keeps its execution the one the person asked for. The
+    /// variables an integration declares are not among them: the launcher sets those once the
+    /// launch is committed, so an invocation that runs as typed keeps the person's own environment.
     pub environment: Vec<crate::session::EnvironmentVariable>,
     /// The absolute path of the launcher the shell runs the invocation through: this
     /// installation's `kr-hook`, which presents the invocation to the backend before it becomes

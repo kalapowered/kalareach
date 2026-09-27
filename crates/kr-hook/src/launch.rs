@@ -11,14 +11,18 @@
 //! integration's flags added. The registration's file name, `registration.<at>.<count>`, says where
 //! those flags stand, so what was typed is known from the variable alone. The launcher presents
 //! itself to the backend and, once admitted, says it is going; once the backend says the launch is
-//! committed, it execs the program in place. It keeps its process identity when it does, so the
+//! committed, it sets the variables the integration declares, which the backend's launch record
+//! names, and execs the program in place. It keeps its process identity when it does, so the
 //! registration the backend published names the program before the program runs, and every hook and
 //! channel the program starts finds it.
 //!
 //! Whatever else happens (the backend refuses, does not answer within its deadline, does not
 //! commit, or cannot be reached), the invocation runs as typed: the registration variable is taken
-//! out of the environment and the typed vector is executed. An agent started with the integration's
-//! flags and no backend behind them is worse off than one started without them.
+//! out of the environment and the typed vector is executed. The declared variables are never set on
+//! that route, and the shell never exported them, so the program runs in the person's own
+//! environment exactly, with their own value of a declared variable where they have one. An agent
+//! started with the integration's flags and no backend behind them is worse off than one started
+//! without them.
 
 use std::ffi::OsString;
 #[cfg(unix)]
@@ -77,6 +81,60 @@ struct Record {
     endpoint: String,
     /// The backend's owner-only credential file, beside the record.
     credential: String,
+    /// The variables the integration declares, in its order, which a committed launch sets and
+    /// nothing else does.
+    variables: Vec<Variable>,
+}
+
+/// One variable an integration declares, as the launch record names it.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Variable {
+    /// Its name.
+    name: String,
+    /// Its value.
+    value: String,
+}
+
+impl Record {
+    /// Returns why a variable the record names is not one this launcher sets, where one is not.
+    ///
+    /// A name is letters, digits and underscores, not starting with a digit, and never one of the
+    /// `KR_` values, which only the worker's own answer carries; a value holds no NUL. The worker
+    /// writes only variables the package contract permits, so this refuses a record nothing on this
+    /// host wrote.
+    fn refusal(&self) -> Option<String> {
+        self.variables.iter().find_map(|variable| {
+            let name = variable.name.as_str();
+            let well_formed = name
+                .bytes()
+                .next()
+                .is_some_and(|first| first.is_ascii_alphabetic() || first == b'_')
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
+            if !well_formed || name.starts_with("KR_") {
+                return Some(format!(
+                    "the launch record names {name:?}, which is not a variable a launch sets"
+                ));
+            }
+            variable
+                .value
+                .contains('\0')
+                .then(|| format!("the launch record gives {name} a value no environment can hold"))
+        })
+    }
+}
+
+/// Which environment the program is executed with.
+#[derive(Clone, Copy, Debug)]
+enum Route<'a> {
+    /// Not a launch: exactly the environment the launcher was given.
+    AsGiven,
+    /// A committed launch: that environment, with the variables the integration declares set.
+    Committed(&'a [Variable]),
+    /// A launch that runs as typed: that environment, without the variables that name a backend.
+    AsTyped,
 }
 
 /// Runs one invocation: presented, admitted and committed, or as typed.
@@ -102,7 +160,7 @@ pub fn run(
     let vector: Vec<OsString> = vector.to_vec();
     let Some(registration) = std::env::var_os(REGISTRATION_VARIABLE) else {
         // Not a launch: nothing names a backend, so the program runs exactly as it was given.
-        return exec_after(hold_before_exec, &executable, &vector, false);
+        return exec_after(hold_before_exec, &executable, &vector, Route::AsGiven);
     };
     let registration = PathBuf::from(registration);
     let typed = match typed_vector(&registration, &vector) {
@@ -121,7 +179,7 @@ pub fn run(
             crate::report(&format!(
                 "the backend's launch record cannot be read ({why}), so the program runs as typed"
             ));
-            return exec_after(hold_before_exec, &executable, &typed, true);
+            return exec_after(hold_before_exec, &executable, &typed, Route::AsTyped);
         }
     };
     match present(&executable, &vector, &registration, &record, started) {
@@ -132,7 +190,12 @@ pub fn run(
             match go(&mut admitted) {
                 Ok(()) => {
                     close(admitted);
-                    exec_after(hold_before_exec, &executable, &vector, false)
+                    exec_after(
+                        hold_before_exec,
+                        &executable,
+                        &vector,
+                        Route::Committed(&record.variables),
+                    )
                 }
                 Err(why) => {
                     crate::report(&format!(
@@ -140,7 +203,7 @@ pub fn run(
                          typed"
                     ));
                     close(admitted);
-                    exec_after(hold_before_exec, &executable, &typed, true)
+                    exec_after(hold_before_exec, &executable, &typed, Route::AsTyped)
                 }
             }
         }
@@ -148,7 +211,7 @@ pub fn run(
             crate::report(&format!(
                 "the backend did not admit this launch ({why}), so the program runs as typed"
             ));
-            exec_after(hold_before_exec, &executable, &typed, true)
+            exec_after(hold_before_exec, &executable, &typed, Route::AsTyped)
         }
     }
 }
@@ -162,7 +225,7 @@ fn exec_after(
     barrier: Option<&Path>,
     executable: &Path,
     vector: &[OsString],
-    without_backend: bool,
+    route: Route<'_>,
 ) -> std::process::ExitCode {
     if let Some(barrier) = barrier {
         let started = Instant::now();
@@ -170,7 +233,24 @@ fn exec_after(
             std::thread::sleep(Duration::from_millis(10));
         }
     }
-    exec(executable, vector, without_backend)
+    exec(executable, vector, route)
+}
+
+/// Gives `command` the environment `route` says the program runs in.
+fn environment(command: &mut std::process::Command, route: Route<'_>) {
+    match route {
+        Route::AsGiven => {}
+        Route::Committed(variables) => {
+            for variable in variables {
+                command.env(&variable.name, &variable.value);
+            }
+        }
+        Route::AsTyped => {
+            for variable in LAUNCH_VARIABLES {
+                command.env_remove(variable);
+            }
+        }
+    }
 }
 
 /// The longest a launcher waits at a test's barrier before it goes on by itself.
@@ -210,8 +290,12 @@ fn read_record(registration: &Path) -> Result<Record, String> {
     let opened = cap_std::fs::Dir::open_ambient_dir(directory, cap_std::ambient_authority())
         .map_err(|error| format!("{}: {error}", directory.display()))?;
     let bytes = read_no_follow(&opened, Path::new(LAUNCH_RECORD_FILE), MAX_RECORD_BYTES)?;
-    serde_json::from_slice(&bytes)
-        .map_err(|error| format!("the launch record is malformed: {error}"))
+    let record: Record = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("the launch record is malformed: {error}"))?;
+    match record.refusal() {
+        Some(why) => Err(why),
+        None => Ok(record),
+    }
 }
 
 /// Reads one file in `directory`, refusing a link and anything past `limit` bytes, and returns its
@@ -552,7 +636,7 @@ fn read_credential(
 
 /// Runs the program in place of this process, and returns only when it could not be run.
 #[cfg(unix)]
-fn exec(executable: &Path, vector: &[OsString], without_backend: bool) -> std::process::ExitCode {
+fn exec(executable: &Path, vector: &[OsString], route: Route<'_>) -> std::process::ExitCode {
     use std::os::unix::process::CommandExt as _;
     let (name, arguments) = vector.split_first().map_or_else(
         || (executable.as_os_str().to_owned(), &[][..]),
@@ -560,11 +644,7 @@ fn exec(executable: &Path, vector: &[OsString], without_backend: bool) -> std::p
     );
     let mut command = std::process::Command::new(executable);
     command.arg0(name).args(arguments);
-    if without_backend {
-        for variable in LAUNCH_VARIABLES {
-            command.env_remove(variable);
-        }
-    }
+    environment(&mut command, route);
     let error = command.exec();
     crate::report(&format!("{} cannot be run: {error}", executable.display()));
     std::process::ExitCode::from(if error.kind() == std::io::ErrorKind::NotFound {
@@ -576,15 +656,11 @@ fn exec(executable: &Path, vector: &[OsString], without_backend: bool) -> std::p
 
 /// Runs the program and ends with its exit code, where a process cannot be replaced in place.
 #[cfg(not(unix))]
-fn exec(executable: &Path, vector: &[OsString], without_backend: bool) -> std::process::ExitCode {
+fn exec(executable: &Path, vector: &[OsString], route: Route<'_>) -> std::process::ExitCode {
     let arguments = vector.get(1..).unwrap_or_default();
     let mut command = std::process::Command::new(executable);
     command.args(arguments);
-    if without_backend {
-        for variable in LAUNCH_VARIABLES {
-            command.env_remove(variable);
-        }
-    }
+    environment(&mut command, route);
     match command.status() {
         Ok(status) => std::process::ExitCode::from(
             status
