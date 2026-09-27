@@ -773,14 +773,14 @@ fn rename_no_replace(
         )
         .into(),
     };
-    let unchanged = || {
-        #[cfg(test)]
-        tests::before_attempt();
-        match to.occupied(to_name) {
-            Ok(false) => std::ops::ControlFlow::Continue(()),
-            Ok(true) => std::ops::ControlFlow::Break(taken()),
-            Err(error) => std::ops::ControlFlow::Break(ProjectError::from(error)),
+    let unchanged = || match to.occupied(to_name) {
+        Ok(false) => {
+            #[cfg(test)]
+            tests::between_check_and_attempt();
+            std::ops::ControlFlow::Continue(())
         }
+        Ok(true) => std::ops::ControlFlow::Break(taken()),
+        Err(error) => std::ops::ControlFlow::Break(ProjectError::from(error)),
     };
     match from.rename_into(from_name, to, to_name, unchanged)? {
         std::ops::ControlFlow::Continue(()) => Ok(()),
@@ -1049,7 +1049,8 @@ fn random_suffix() -> String {
 mod tests {
     use super::*;
 
-    /// What a test does before an attempt at a publication's rename.
+    /// What a test does between the check before an attempt at a publication's rename and the
+    /// attempt.
     #[cfg(not(unix))]
     type AttemptHook = Box<dyn FnMut()>;
 
@@ -1060,9 +1061,10 @@ mod tests {
             const { std::cell::RefCell::new(None) };
     }
 
-    /// Runs what the test on this thread does before an attempt at a publication's rename.
+    /// Runs what the test on this thread does between the check before an attempt at a
+    /// publication's rename and the attempt.
     #[cfg(not(unix))]
-    pub(super) fn before_attempt() {
+    pub(super) fn between_check_and_attempt() {
         BEFORE_ATTEMPT.with(|hook| {
             if let Some(hook) = hook.borrow_mut().as_mut() {
                 hook();
@@ -1155,6 +1157,40 @@ mod tests {
         BEFORE_ATTEMPT.with(|hook| *hook.borrow_mut() = None);
         letting_go.join().expect("let go");
         let refused = published.expect_err("the name was taken meanwhile");
+        assert!(
+            refused
+                .to_string()
+                .contains("is taken, so nothing was replaced"),
+            "{refused}"
+        );
+        assert_eq!(
+            std::fs::read(root.path().join("parent/published")).expect("somebody's file"),
+            b"somebody's file"
+        );
+        assert!(root.path().join("staging/tree/objects/pack").is_file());
+    }
+
+    /// On Windows a file that takes the destination's name after the last check, in the instant
+    /// before the rename, is kept: the rename never replaces, and the publication says the name is
+    /// taken and leaves the staged tree where it was.
+    #[cfg(windows)]
+    #[test]
+    fn a_file_that_takes_the_name_after_the_last_check_is_kept() {
+        let (root, staging, parent, _file) = a_tree_to_publish();
+        let taken = root.path().join("parent/published");
+        let mut attempts = 0;
+        BEFORE_ATTEMPT.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                attempts += 1;
+                if attempts == 1 {
+                    std::fs::write(&taken, b"somebody's file")
+                        .expect("somebody takes the name after the check");
+                }
+            }));
+        });
+        let published = rename_no_replace(&staging, &name("tree"), &parent, &name("published"));
+        BEFORE_ATTEMPT.with(|hook| *hook.borrow_mut() = None);
+        let refused = published.expect_err("the name was taken after the check");
         assert!(
             refused
                 .to_string()
