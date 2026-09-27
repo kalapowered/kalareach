@@ -1297,7 +1297,7 @@ mod windows {
         /// Reads who can reach the file an open handle holds.
         ///
         /// The handle has to hold `READ_CONTROL` and `FILE_READ_ATTRIBUTES`. Every class
-        /// [`ACCESS_CLASSES`] names is asked for in one query, and a query that fails is a read that
+        /// `ACCESS_CLASSES` names is asked for in one query, and a query that fails is a read that
         /// failed, never a file that carries nothing.
         ///
         /// # Errors

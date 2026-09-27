@@ -12,10 +12,10 @@
 //!
 //! | Part | Who uses it |
 //! | --- | --- |
-//! | [`LaunchListener`]: one owner-only instance of the environment's launch pipe per launch, waited on until a deadline | the daemon, to hand one launch to one starter |
-//! | [`connect`]: reaching a waiting instance, refusing one served by another account | the starter |
-//! | [`PeerProcess`]: the process at the other end of the pipe, its image, its login session and whether it runs as this user | each side, to check the other |
-//! | [`start_child`]: a child created suspended and checked before it runs | the starter |
+//! | `LaunchListener`: one owner-only instance of the environment's launch pipe per launch, waited on until a deadline | the daemon, to hand one launch to one starter |
+//! | `connect`: reaching a waiting instance, refusing one served by another account | the starter |
+//! | `PeerProcess`: the process at the other end of the pipe, its image, its login session and whether it runs as this user | each side, to check the other |
+//! | `start_child`: a child created suspended and checked before it runs | the starter |
 //! | [`StartClaim`]: a request to start the daemon, left by a cold start and taken once | the starter |
 //! | [`record_session`]: the login session this environment's work runs in | the daemon |
 //!
@@ -270,7 +270,7 @@ const WITHDRAWN: &[u8] = b"withdrawn";
 /// the start, or once the run meant to take it failed.
 ///
 /// The command takes the claim itself, by creating its taken marker as a starter would, with
-/// [`WITHDRAWN`] in it. Only one creation of the marker succeeds, so either the command withdraws
+/// `WITHDRAWN` in it. Only one creation of the marker succeeds, so either the command withdraws
 /// the claim and no starter can take it afterwards, or a starter took it first and the command
 /// learns so. What the marker holds tells a withdrawal apart from a starter's taking, so a claim
 /// this command withdrew before, including by a creation that published the marker and then failed

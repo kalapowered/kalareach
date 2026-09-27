@@ -22,7 +22,7 @@
 //! | [`verify`] | The rendezvous, the challenge answer and the controller generation token |
 //! | [`error`] | The failures above, each mapped to one stable protocol error code |
 //!
-//! The `testing` feature adds [`testing::TempHost`], a disposable host tree the other host
+//! The `testing` feature adds `testing::TempHost`, a disposable host tree the other host
 //! crates build their tests on.
 //!
 //! # What authenticates what

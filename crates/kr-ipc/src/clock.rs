@@ -1,6 +1,6 @@
 //! The machine's own continuous clock, shared by every host process on one boot.
 //!
-//! [`kr_transport::clock`] is the authority for every deadline *inside* one process, and this is
+//! `kr_transport::clock` is the authority for every deadline *inside* one process, and this is
 //! not a second one. Its `ContinuousInstant` is anchored privately, which is exactly right for a
 //! deadline one process decides and keeps, and exactly what makes it useless for a deadline one
 //! process hands to another: two anchors are two origins, and neither means anything to the other.
