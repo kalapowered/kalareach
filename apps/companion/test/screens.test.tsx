@@ -1027,6 +1027,29 @@ describe('the sheet', () => {
     }
   })
 
+  it('goes back where it sits when the platform cancels a drag, and a later movement moves nothing', async () => {
+    start({ view: 'session', sessionId: SESSION_MAIN, pane: 'semantic' })
+    await userEvent.click(await screen.findByTestId('open-settings'))
+    const sheet = await screen.findByTestId('sheet')
+    await waitFor(() => {
+      expect(sheet).toHaveAttribute('data-presentation', 'here')
+    })
+    const grip = screen.getByTestId('sheet-grip')
+    grip.dispatchEvent(gesture('pointerdown', 200, 1_000))
+    grip.dispatchEvent(gesture('pointermove', 260, 1_016))
+    expect(sheet.style.transform).toBe('translate3d(0, 60px, 0)')
+    grip.dispatchEvent(gesture('pointercancel', 260, 1_032))
+    await waitFor(() => {
+      expect(sheet.style.transform).toBe('translate3d(0, 0px, 0)')
+    })
+    await waitFor(() => {
+      expect(sheet).toHaveAttribute('data-presentation', 'here')
+    })
+    // The drag is over: a movement after it belongs to no grab.
+    grip.dispatchEvent(gesture('pointermove', 400, 1_048))
+    expect(sheet.style.transform).toBe('translate3d(0, 0px, 0)')
+  })
+
   it('dismisses on a downward flick', async () => {
     start({ view: 'session', sessionId: SESSION_MAIN, pane: 'semantic' })
     await userEvent.click(await screen.findByTestId('open-settings'))

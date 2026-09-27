@@ -647,6 +647,36 @@ export function Sheet({
 
   const presentation: SheetPresentation = !open ? 'leaving' : atRest ? 'here' : 'arriving'
 
+  /**
+   * Ends a drag the platform took away, a cancelled touch or a lost capture, as a release that
+   * dismisses nothing: the surface goes back where it sits, and the grab is over.
+   */
+  const cancelDrag = () => {
+    const start = dragStart.current
+    dragStart.current = null
+    if (!start) return
+    if (reduced) {
+      place(0)
+      setAtRest(true)
+      return
+    }
+    animation.current?.stop()
+    presented.current.velocity = 0
+    animation.current = animateSpring({
+      from: presented.current.offset,
+      velocity: 0,
+      to: 0,
+      onFrame: (value) => {
+        presented.current.velocity = (value - presented.current.offset) * 60
+        place(value)
+      },
+      onDone: () => {
+        presented.current.velocity = 0
+        setAtRest(true)
+      }
+    })
+  }
+
   return (
     <>
       <div
@@ -740,6 +770,8 @@ export function Sheet({
               }
             })
           }}
+          onPointerCancel={cancelDrag}
+          onLostPointerCapture={cancelDrag}
         />
         <header className="dialog-header">
           <div>
