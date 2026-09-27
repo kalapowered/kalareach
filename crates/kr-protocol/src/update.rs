@@ -835,7 +835,8 @@ pub enum HandoverStep {
     /// Stop, having prepared. Refused when the gate is open, so a daemon whose preparation lapsed
     /// is never stopped with its gate open.
     Stop,
-    /// Open the gate again: the update is not going ahead now.
+    /// Open the gate again: the update is not going ahead now. Refused once the daemon has been
+    /// told to stop, so a daemon that resumes is one no stop of this handover ends.
     Resume,
 }
 

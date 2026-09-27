@@ -14404,7 +14404,7 @@
         },
         {
           "const": "resume",
-          "description": "Open the gate again: the update is not going ahead now.",
+          "description": "Open the gate again: the update is not going ahead now. Refused once the daemon has been\ntold to stop, so a daemon that resumes is one no stop of this handover ends.",
           "type": "string"
         }
       ]

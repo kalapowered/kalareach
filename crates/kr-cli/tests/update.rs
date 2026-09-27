@@ -1408,6 +1408,111 @@ async fn a_daemon_that_does_not_start_again_before_the_switch_keeps_the_update_f
     assert_eq!(record["previous"], one.name().as_str(), "{record}");
 }
 
+/// Sends one step of the handover to this host's daemon on `client`, targeting `target`.
+async fn handover_step(
+    host: &Host,
+    client: &mut LocalClient,
+    step: HandoverStep,
+    target: &ReleaseName,
+) -> Result<kr_protocol::envelope::ParamsValue, kr_protocol::error::ProtocolError> {
+    client
+        .mutate(
+            Method::HostUpdateHandover,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(host.tree.environment_id()),
+            &HostUpdateHandoverParams {
+                step,
+                target: target.clone(),
+            },
+        )
+        .await
+        .expect("the call reaches the daemon")
+}
+
+/// KR-REQ-26.09: a daemon an update prepared, and may have told to stop, is taken back for the
+/// environment's daemon only once it has resumed, so no stop of that handover still on its way can
+/// end it afterwards: the stop is refused, and the daemon goes on serving.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_daemon_an_update_prepared_is_taken_back_only_once_no_stop_of_it_can_end_it() {
+    let mut host = Host::bare();
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
+    let two = release("0.2.0+bbbbbbbbbbbb");
+    host.install(&one);
+    let started_through_current = host.store.stable(Program::Controller);
+    host.start_daemon(&started_through_current).await;
+    // What an update that stopped part way leaves while its stop to the daemon is still on its
+    // way: the daemon prepared, and the update recorded as handing over.
+    let endpoint = host
+        .tree
+        .environment()
+        .controller_endpoint()
+        .expect("an endpoint");
+    let mut client = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("reaches the daemon");
+    handover_step(&host, &mut client, HandoverStep::Prepare, &two)
+        .await
+        .expect("the daemon prepares");
+    let restart = serde_json::json!({
+        "environment": host.tree.environment_id(),
+        "runtime_root": host.tree.paths().runtime_root(),
+        "state_root": host.tree.paths().state_root(),
+        "start": {
+            "arguments": {
+                "arguments": host.daemon_arguments(),
+                "working_directory": host.tree.root(),
+            }
+        },
+    });
+    let record = serde_json::json!({
+        "format": 1,
+        "update": {
+            "source": one.name().as_str(),
+            "target": two.as_str(),
+            "state": "handing_over",
+            "restarts": [restart],
+        },
+    });
+    std::fs::write(host.store.record(), record.to_string()).expect("the record");
+
+    let scratch = host.scratch("archives");
+    let archive = scratch.join("one.tar.gz");
+    one.archive(&scratch, &archive);
+    let (output, said) = host.kr_json(&[
+        "host",
+        "update",
+        "--archive",
+        &archive.display().to_string(),
+        "--json",
+    ]);
+    assert!(
+        output.status.success(),
+        "kr host update: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(host.record()["update"].is_null(), "the update is settled");
+
+    // The stop still on its way arrives, and is refused: the daemon resumed before it was taken
+    // back.
+    let refused = handover_step(&host, &mut client, HandoverStep::Stop, &two)
+        .await
+        .expect_err("a daemon that resumed is not stopped");
+    assert_eq!(
+        refused.code,
+        kr_protocol::error::ErrorCode::ResourceUnavailable
+    );
+    assert_eq!(
+        host.daemon_build().await,
+        format!("kr-controller/{}", one.name())
+    );
+    assert!(
+        host.daemons
+            .iter_mut()
+            .all(|daemon| matches!(daemon.try_wait(), Ok(None))),
+        "the daemon this test started still serves the environment"
+    );
+}
+
 /// KR-REQ-26.09: an install stopped between putting its release in the store and making it
 /// current is finished by the next install of the same release, and no daemon of the release
 /// starts meanwhile; another release under the same name is refused, and an install waits while

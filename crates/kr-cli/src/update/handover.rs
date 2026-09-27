@@ -6,6 +6,10 @@
 //! when the update is not going ahead. Its answer to `prepare` says how it was started, and that
 //! is recorded before it is told to stop. The environment is known to be free once its singleton
 //! lock can be taken, which the kernel gives up only when the daemon's process has gone.
+//!
+//! A daemon found holding an environment whose daemon an update stopped is asked to resume before
+//! it is taken for the environment's daemon: one that resumes goes on serving, and no stop of the
+//! handover can end it after; one told to stop refuses, and is waited for until it has gone.
 
 use std::time::Duration;
 
@@ -13,7 +17,9 @@ use kr_client::shown;
 use kr_client::shown::Shown;
 use kr_controller::singleton::SingletonLock;
 use kr_ipc::client::LocalClient;
+use kr_ipc::install::Store;
 use kr_protocol::envelope::ActionTarget;
+use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::ActionId;
 use kr_protocol::local::LocalClientKind;
 use kr_protocol::method::Method;
@@ -113,6 +119,118 @@ pub async fn resume(mut prepared: Prepared, environment: &Environment, target: &
         DAEMON_ANSWER,
     )
     .await;
+}
+
+/// What the daemon holding an environment says when it is asked to resume.
+pub enum Resumed {
+    /// It resumed: it serves, and no stop of the handover ends it.
+    Serving,
+    /// It has been told to stop, and is going.
+    Stopping,
+    /// Nothing listens at its endpoint: it is still starting, or it is going and has stopped
+    /// listening.
+    NotListening,
+}
+
+/// Asks the daemon that holds an environment to resume.
+///
+/// # Errors
+///
+/// Returns a failure naming the environment when the daemon answers neither way.
+pub async fn resume_holder(environment: &Environment, target: &ReleaseName) -> Result<Resumed> {
+    let endpoint = environment.paths.controller_endpoint()?;
+    let connected = tokio::time::timeout(
+        DAEMON_ANSWER,
+        LocalClient::connect(&endpoint, LocalClientKind::Cli, crate::build_id()),
+    )
+    .await;
+    let failed = |said: Shown| {
+        CliError::Other(shown!(
+            "the control daemon of environment {} did not say whether it goes on serving: {}",
+            environment.environment_id,
+            said
+        ))
+    };
+    let mut client = match connected {
+        Ok(Ok(client)) => client,
+        Ok(Err(error)) if nothing_listening(&error) => return Ok(Resumed::NotListening),
+        Ok(Err(error)) => return Err(failed(Shown::ipc(&error))),
+        Err(_) => {
+            return Err(failed(shown!(
+                "it did not answer within {} seconds",
+                DAEMON_ANSWER.as_secs()
+            )));
+        }
+    };
+    let params = HostUpdateHandoverParams {
+        step: HandoverStep::Resume,
+        target: target.clone(),
+    };
+    let asked = tokio::time::timeout(
+        DAEMON_ANSWER,
+        client.mutate(
+            Method::HostUpdateHandover,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(environment.environment_id),
+            &params,
+        ),
+    )
+    .await;
+    match asked {
+        Ok(Ok(Ok(_))) => Ok(Resumed::Serving),
+        Ok(Ok(Err(error))) if error.code == ErrorCode::EnvironmentUnavailable => {
+            Ok(Resumed::Stopping)
+        }
+        Ok(Ok(Err(error))) => Err(failed(Shown::protocol(&error))),
+        Ok(Err(error)) => Err(failed(Shown::ipc(&error))),
+        Err(_) => Err(failed(shown!(
+            "it did not answer within {} seconds",
+            DAEMON_ANSWER.as_secs()
+        ))),
+    }
+}
+
+/// Whether a daemon holds an environment.
+///
+/// Asked under the store's install lock: a starting daemon holds that lock, shared, from its look
+/// at `current` until it has taken its environment, so no daemon is part way through taking it
+/// while this takes the environment's lock for a moment to see.
+///
+/// # Errors
+///
+/// Returns the failure to take either lock for any reason but a holder.
+pub fn held(store: &Store, environment: &Environment) -> Result<bool> {
+    let _install = store
+        .lock_install()
+        .map_err(|error| CliError::Other(super::said(&error)))?;
+    match SingletonLock::hold(
+        &environment.paths.singleton_lock(),
+        environment.environment_id,
+    ) {
+        Ok(_) => Ok(false),
+        Err(kr_controller::ControllerError::AlreadyRunning { .. }) => Ok(true),
+        Err(error) => Err(CliError::Other(shown!(
+            "environment {}'s lock could not be taken: {}",
+            environment.environment_id,
+            Shown::protocol(&error.to_protocol_error())
+        ))),
+    }
+}
+
+/// Waits up to [`DAEMON_STOP`] for the daemon holding an environment to have gone.
+///
+/// # Errors
+///
+/// Returns a failure naming the process the lock names when it has not gone by then.
+pub async fn gone(store: &Store, environment: &Environment) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + DAEMON_STOP;
+    while held(store, environment)? {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(CliError::Other(still_running(environment)));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    Ok(())
 }
 
 /// Takes one step of the handover on a daemon's connection, bounded by `within`.
@@ -229,12 +347,14 @@ pub fn still_running(environment: &Environment) -> Shown {
 ///
 /// `started` is the process this run started to be that daemon, where it started one: once it has
 /// ended and no other daemon holds the environment, nothing is going to answer, and the wait ends
-/// there.
+/// there. Whether another holds it is asked as [`held`] asks, so the look refuses no daemon that
+/// is starting.
 ///
 /// # Errors
 ///
 /// Returns a failure naming what answered instead, or that nothing did.
 pub async fn answers_as(
+    store: &Store,
     environment: &Environment,
     target: &ReleaseName,
     mut started: Option<&mut std::process::Child>,
@@ -273,12 +393,7 @@ pub async fn answers_as(
         if let Some(child) = started.as_deref_mut()
             && let Ok(Some(status)) = child.try_wait()
         {
-            if SingletonLock::hold(
-                &environment.paths.singleton_lock(),
-                environment.environment_id,
-            )
-            .is_ok()
-            {
+            if !held(store, environment)? {
                 let how = match (
                     status.code(),
                     std::os::unix::process::ExitStatusExt::signal(&status),
