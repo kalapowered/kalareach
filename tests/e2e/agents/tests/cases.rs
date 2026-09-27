@@ -4504,40 +4504,30 @@ fn slash_commands_interrupts_queued_prompts_and_steering_each_work_from_a_device
             "the agent says the turn stopped",
         );
         let _ = logged.wait_idle(stage, "the composer is back after the interrupt");
-        // A prompt entered while a turn runs, which waits for it. The turns entered into are long
-        // enough that a fast model is still writing when the second prompt arrives: at a low effort
-        // one model wrote a count to 400 in under two seconds.
+        // The part's conversation, found by the interrupted prompt, so that a prompt entered into a
+        // running turn goes in as soon as the agent shows the turn running: a fast model wrote a
+        // count to 400 in under two seconds, while a slow one took minutes over it.
+        let conversation = recorded(
+            stage,
+            &conversations,
+            &format!("{mark}-i"),
+            &account.prompt_line,
+        );
+        // A prompt entered while a turn runs, which waits for it.
         let (queued_question, queued_sum) = sum_question();
         let queued_done = format!("DONE-{upper}-Q");
         logged.submit(
             stage,
             &format!(
-                "Without using any tool or file, count from 1 to 1000 in your reply, one number \
-                 per line, then write {queued_done} on a line of its own, and nothing else. \
-                 ({mark}-q)"
+                "Without using any tool or file, count from 1 to 300 in your reply, one number per \
+                 line, then write {queued_done} on a line of its own, and nothing else. ({mark}-q)"
             ),
             "a turn to queue behind",
         );
         let _ = logged.wait_for(stage, &account.busy, "the first turn runs");
-        let conversation = recorded(
-            stage,
-            &conversations,
-            &format!("{mark}-q"),
-            &account.prompt_line,
-        );
-        let first_prompt = first_line_with(
-            &conversation,
-            None,
-            &[&format!("{mark}-q"), &account.prompt_line],
-        );
-        // The first turn runs just before the prompt is entered and still runs just after it.
-        let before_queue = turn_runs(
-            stage,
-            &mut logged,
-            &conversation,
-            first_prompt,
-            &queued_done,
-        );
+        // The first turn runs just before the prompt is entered and still runs just after it: its
+        // closing reply, which only the model writes, is not yet anywhere in the conversation.
+        let before_queue = turn_runs(stage, &mut logged, &conversation, None, &queued_done);
         let queue_key = account
             .queue_key
             .clone()
@@ -4548,12 +4538,21 @@ fn slash_commands_interrupts_queued_prompts_and_steering_each_work_from_a_device
             "a prompt entered during the turn",
             &queue_key,
         );
-        let after_queue = turn_runs(
-            stage,
-            &mut logged,
+        let after_queue = turn_runs(stage, &mut logged, &conversation, None, &queued_done);
+        assert_eq!(
+            recorded(
+                stage,
+                &conversations,
+                &format!("{mark}-q"),
+                &account.prompt_line,
+            ),
+            conversation,
+            "the turn to queue behind is in the part's conversation"
+        );
+        let first_prompt = first_line_with(
             &conversation,
-            first_prompt,
-            &queued_done,
+            None,
+            &[&format!("{mark}-q"), &account.prompt_line],
         );
         let _ = logged.answered(stage, &queued_sum, "the queued prompt is answered");
         let _ = logged.wait_idle(stage, "the composer is back after the queue");
@@ -4630,42 +4629,34 @@ fn slash_commands_interrupts_queued_prompts_and_steering_each_work_from_a_device
             logged.submit(
                 stage,
                 &format!(
-                    "Without using any tool or file, count from 1 to 2000 in your reply, one number \
+                    "Without using any tool or file, count from 1 to 300 in your reply, one number \
                      per line, then write {steered_done} on a line of its own, and nothing else. \
                      ({mark}-s)"
                 ),
                 "a turn to steer",
             );
             let _ = logged.wait_for(stage, &account.busy, "the turn to steer runs");
+            let before_steer = turn_runs(stage, &mut logged, &conversation, None, &steered_done);
+            logged.submit(
+                stage,
+                &format!("Stop counting. {steer_question} ({mark}-t)"),
+                "a steering prompt",
+            );
+            let after_steer = turn_runs(stage, &mut logged, &conversation, None, &steered_done);
             let steered_conversation = recorded(
                 stage,
                 &conversations,
                 &format!("{mark}-s"),
                 &account.prompt_line,
             );
+            assert_eq!(
+                steered_conversation, conversation,
+                "the turn to steer is in the part's conversation"
+            );
             let steered_prompt = first_line_with(
                 &steered_conversation,
                 None,
                 &[&format!("{mark}-s"), &account.prompt_line],
-            );
-            let before_steer = turn_runs(
-                stage,
-                &mut logged,
-                &steered_conversation,
-                steered_prompt,
-                &steered_done,
-            );
-            logged.submit(
-                stage,
-                &format!("Stop counting. {steer_question} ({mark}-t)"),
-                "a steering prompt",
-            );
-            let after_steer = turn_runs(
-                stage,
-                &mut logged,
-                &steered_conversation,
-                steered_prompt,
-                &steered_done,
             );
             let _ = logged.answered(stage, &steer_sum, "the steered turn answers");
             let _ = logged.wait_idle(stage, "the composer is back after steering");
