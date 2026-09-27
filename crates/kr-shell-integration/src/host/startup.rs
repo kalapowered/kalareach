@@ -532,7 +532,7 @@ const ENTRY_RECORD_LIMIT: u64 = 1024 * 1024;
 /// a name that is not text is kept exactly and names that file and no other.
 ///
 /// It is one owner-only file in the installation's state directory, replaced whole by every change,
-/// and changed only under the same locks as a startup file.
+/// and changed only while it is held for a whole install or removal ([`EntryRecord::hold`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EntryRecord {
     /// The owner-only directory the record is kept in.
@@ -587,7 +587,8 @@ impl EntryRecord {
         &self.path
     }
 
-    /// The files the record names for `kind`, in the order they were recorded.
+    /// The files the record names for `kind`, in the order they were recorded, as the record is
+    /// now: what a dry run reports from, since it writes nothing and holds nothing.
     ///
     /// # Errors
     ///
@@ -600,6 +601,57 @@ impl EntryRecord {
             .filter(|entry| entry.shell == kind)
             .map(|entry| decoded(&entry.path).ok_or(RecordError::NotARecord))
             .collect()
+    }
+
+    /// Holds the record for one whole install or removal, waiting while another holds it.
+    ///
+    /// An install records its files and writes its entries, and a removal reads the record,
+    /// removes the entries and forgets the files, all while the record is held; a second `kr`
+    /// waits for the first to let go. A removal can therefore never read the record between an
+    /// install's recording a file and its writing the entry there, find no entry and forget the
+    /// file, which would leave an entry the record does not name and no removal would take out.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RecordError::Store`] when the directory cannot be made this user's own, or when
+    /// another `kr` held the record for the whole of the wait.
+    pub fn hold(&self) -> Result<HeldRecord<'_>, RecordError> {
+        kr_ipc::paths::create_private_tree(&self.directory, &self.directory)?;
+        let lock = FileLock::take(&self.path)
+            .map_err(|error| kr_ipc::IpcError::io("lock", &self.path, error))?;
+        Ok(HeldRecord {
+            record: self,
+            _lock: lock,
+        })
+    }
+
+    /// Reads the record; there being none is a record that names nothing.
+    fn read(&self) -> Result<Recorded, RecordError> {
+        match kr_ipc::paths::read_owner_only_file(&self.path, ENTRY_RECORD_LIMIT)? {
+            None => Ok(Recorded::default()),
+            Some(bytes) => serde_json::from_slice(&bytes).map_err(|_| RecordError::NotARecord),
+        }
+    }
+}
+
+/// The record, held for one whole install or removal ([`EntryRecord::hold`]); it is let go when
+/// this is dropped.
+#[derive(Debug)]
+pub struct HeldRecord<'a> {
+    /// The record held.
+    record: &'a EntryRecord,
+    /// The lock that holds it, beside the record in the same directory. Dropping it lets go.
+    _lock: FileLock,
+}
+
+impl HeldRecord<'_> {
+    /// The files the record names for `kind`, in the order they were recorded.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`EntryRecord::files`] returns.
+    pub fn files(&self, kind: ShellKind) -> Result<Vec<PathBuf>, RecordError> {
+        self.record.files(kind)
     }
 
     /// Records `files` for `kind`, beside what the record names already.
@@ -635,25 +687,12 @@ impl EntryRecord {
         self.change(|entries| entries.retain(|entry| *entry != forgotten))
     }
 
-    /// Reads the record; there being none is a record that names nothing.
-    fn read(&self) -> Result<Recorded, RecordError> {
-        match kr_ipc::paths::read_owner_only_file(&self.path, ENTRY_RECORD_LIMIT)? {
-            None => Ok(Recorded::default()),
-            Some(bytes) => serde_json::from_slice(&bytes).map_err(|_| RecordError::NotARecord),
-        }
-    }
-
-    /// Reads the record, changes it and writes it back whole, under the locks a startup file is
-    /// written under, so two `kr` processes changing it at once both keep what they wrote.
+    /// Reads the record, changes it and writes it back whole.
     fn change(&self, edit: impl FnOnce(&mut Vec<RecordedEntry>)) -> Result<(), RecordError> {
-        kr_ipc::paths::create_private_tree(&self.directory, &self.directory)?;
-        let _writing = writing();
-        let _held = FileLock::take(&self.path)
-            .map_err(|error| kr_ipc::IpcError::io("lock", &self.path, error))?;
-        let mut recorded = self.read()?;
+        let mut recorded = self.record.read()?;
         edit(&mut recorded.entries);
         let bytes = serde_json::to_vec(&recorded).map_err(|_| RecordError::NotARecord)?;
-        kr_ipc::paths::write_owner_only_file(&self.path, &bytes)?;
+        kr_ipc::paths::write_owner_only_file(&self.record.path, &bytes)?;
         Ok(())
     }
 }
@@ -1788,14 +1827,12 @@ mod tests {
         let zshrc = PathBuf::from("/home/the person's home/.zshrc");
         let bashrc = PathBuf::from("/home/the person's home/.bashrc");
         let profile = PathBuf::from("/home/the person's home/.bash_profile");
-        record
-            .add(ShellKind::Zsh, std::slice::from_ref(&zshrc))
+        let held = record.hold().expect("holds");
+        held.add(ShellKind::Zsh, std::slice::from_ref(&zshrc))
             .expect("records");
-        record
-            .add(ShellKind::Bash, &[bashrc.clone(), profile.clone()])
+        held.add(ShellKind::Bash, &[bashrc.clone(), profile.clone()])
             .expect("records");
-        record
-            .add(ShellKind::Zsh, std::slice::from_ref(&zshrc))
+        held.add(ShellKind::Zsh, std::slice::from_ref(&zshrc))
             .expect("records");
         assert_eq!(
             record.files(ShellKind::Zsh).expect("reads"),
@@ -1806,7 +1843,8 @@ mod tests {
             vec![bashrc.clone(), profile.clone()]
         );
         assert!(record.files(ShellKind::Fish).expect("reads").is_empty());
-        record.forget(ShellKind::Bash, &bashrc).expect("forgets");
+        held.forget(ShellKind::Bash, &bashrc).expect("forgets");
+        drop(held);
         assert_eq!(record.files(ShellKind::Bash).expect("reads"), vec![profile]);
         assert_eq!(record.files(ShellKind::Zsh).expect("reads"), vec![zshrc]);
         #[cfg(unix)]
@@ -1832,6 +1870,8 @@ mod tests {
         let record = EntryRecord::in_state_directory(&root.path().join("state"));
         let name = PathBuf::from(std::ffi::OsStr::from_bytes(b"/home/h\xffme/.zshrc"));
         record
+            .hold()
+            .expect("holds")
             .add(ShellKind::Zsh, std::slice::from_ref(&name))
             .expect("records");
         let kept = record.files(ShellKind::Zsh).expect("reads");
@@ -1875,5 +1915,31 @@ mod tests {
                 Err(RecordError::Store(_))
             ));
         }
+    }
+
+    /// A second holder of the record waits until the first lets go, and gets it then.
+    #[test]
+    fn a_second_holder_of_the_record_waits_for_the_first_to_let_go() {
+        let root = tempfile::tempdir().expect("a directory");
+        let record = EntryRecord::in_state_directory(&root.path().join("state"));
+        let first = record.hold().expect("holds");
+        let (held, second) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let holding = record.hold().expect("holds once the first lets go");
+                held.send(()).expect("says so");
+                drop(holding);
+            });
+            assert!(
+                second
+                    .recv_timeout(std::time::Duration::from_millis(300))
+                    .is_err(),
+                "the second holder waits while the first holds the record"
+            );
+            drop(first);
+            second
+                .recv_timeout(LOCK_PATIENCE)
+                .expect("the second holder has it once the first lets go");
+        });
     }
 }

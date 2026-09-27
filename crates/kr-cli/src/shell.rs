@@ -187,16 +187,24 @@ pub fn install(
                 Shown::root(&refused.path)
             ))
         })?;
-    if !dry_run {
+    let mut reported = report(package, layout);
+    // Held from before the first file is recorded until the last entry is written, so a removal
+    // run at the same time waits for the whole install rather than reading the record part way
+    // through it. A dry run writes nothing and holds nothing.
+    let held = if dry_run {
+        None
+    } else {
+        let held = record
+            .hold()
+            .map_err(|error| record_failure(record, &error))?;
         let files = bodies
             .iter()
             .map(|(file, _)| file.clone())
             .collect::<Vec<_>>();
-        record
-            .add(package.kind(), &files)
+        held.add(package.kind(), &files)
             .map_err(|error| record_failure(record, &error))?;
-    }
-    let mut reported = report(package, layout);
+        Some(held)
+    };
     for entry in &mut reported.entries {
         let Some((_, body)) = bodies.iter().find(|(file, _)| *file == entry.file) else {
             continue;
@@ -224,6 +232,7 @@ pub fn install(
             true
         };
     }
+    drop(held);
     Ok(reported)
 }
 
@@ -265,7 +274,9 @@ const UNRECORDED: &str = "an entry kr shell install has no record of writing, wh
 /// It works from the record alone: from the files an install wrote, by their exact names, and not
 /// from where the entry would go now, which moves when a `ZDOTDIR` is set or unset or a login file
 /// is created. A file the record does not name is left as it is, and one that holds a marked entry
-/// all the same is reported as left. Each file is taken out of the record once its entry is gone.
+/// all the same is reported as left. Each file is taken out of the record once its entry is gone,
+/// and the record is held for the whole removal, so an install run at the same time waits for it.
+/// A dry run reads the record as it is and changes nothing.
 ///
 /// It takes the shell rather than the package, because removal needs neither the executable nor the
 /// manifest: the record says where to look and the markers say what to take out, and a person whose
@@ -280,30 +291,42 @@ pub fn remove(
     record: &EntryRecord,
     dry_run: bool,
 ) -> Result<ShellReport> {
-    let recorded = record
-        .files(kind)
-        .map_err(|error| record_failure(record, &error))?;
     let targets = layout.targets(kind);
+    let held = if dry_run {
+        None
+    } else {
+        Some(
+            record
+                .hold()
+                .map_err(|error| record_failure(record, &error))?,
+        )
+    };
+    let recorded = held
+        .as_ref()
+        .map_or_else(|| record.files(kind), |held| held.files(kind))
+        .map_err(|error| record_failure(record, &error))?;
     let mut entries = Vec::new();
     for file in recorded {
         let reason = targets
             .iter()
             .find(|target| target.path == file)
             .map_or(RECORDED, |target| target.reason);
-        let change = if dry_run {
-            if startup::installed(&file) {
-                Change::Removed
-            } else {
-                Change::Absent
+        let change = match &held {
+            None => {
+                if startup::installed(&file) {
+                    Change::Removed
+                } else {
+                    Change::Absent
+                }
             }
-        } else {
-            let change = startup::remove(&file).map_err(|error| {
-                CliError::Other(shown!("{}: {}", Shown::root(&file), Shown::io(&error)))
-            })?;
-            record
-                .forget(kind, &file)
-                .map_err(|error| record_failure(record, &error))?;
-            change
+            Some(held) => {
+                let change = startup::remove(&file).map_err(|error| {
+                    CliError::Other(shown!("{}: {}", Shown::root(&file), Shown::io(&error)))
+                })?;
+                held.forget(kind, &file)
+                    .map_err(|error| record_failure(record, &error))?;
+                change
+            }
         };
         entries.push(EntryReport {
             installed: dry_run && startup::installed(&file),
@@ -313,6 +336,7 @@ pub fn remove(
             change: Some(change),
         });
     }
+    drop(held);
     for target in targets {
         if !entries.iter().any(|entry| entry.file == target.path)
             && startup::installed(&target.path)
@@ -502,6 +526,8 @@ mod tests {
         );
         // The install that wrote it recorded the file.
         record
+            .hold()
+            .expect("holds")
             .add(ShellKind::Zsh, std::slice::from_ref(&zshrc))
             .expect("records");
 
