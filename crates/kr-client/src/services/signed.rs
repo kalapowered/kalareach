@@ -861,7 +861,7 @@ fn content_of(answer: ServiceHttpAnswer, repeat: Repeat) -> Result<Content> {
 
 /// Every refusal code this client's service contract names: the codes [`classify`] maps, which
 /// are also every code an adapter reads a refusal by. A refusal keeps the one it named, or none.
-const SERVICE_CODES: [&str; 19] = [
+const SERVICE_CODES: [&str; 20] = [
     "UNAUTHENTICATED",
     "REAUTHENTICATION_REQUIRED",
     "FORBIDDEN",
@@ -881,6 +881,7 @@ const SERVICE_CODES: [&str; 19] = [
     "SIGNED_BEFORE_CUTOFF",
     "COLLECTION_DELETED",
     "SERVICE_UNAVAILABLE",
+    "OUTCOME_UNKNOWN",
 ];
 
 /// The protocol code one service error code means, and what a person does about it.
@@ -931,6 +932,12 @@ const SERVICE_CODES: [&str; 19] = [
 /// a tenant being moved, or a part the isolate cannot hold yet. It is capacity rather than a
 /// fault, and it names the delay to wait.
 ///
+/// `OUTCOME_UNKNOWN` is section 23's own code, and the service says it only when nothing can settle
+/// whether a request took effect: an authority-feed change or a settings-sync exchange that names
+/// no request identity whose object threw or did not answer in time. It is never retried, whatever
+/// the request, so it is that outcome for every request, and what a person does is check whether
+/// the request went through before asking for it again.
+///
 /// An upload that spends an account's storage without the account's proof is answered
 /// `QUOTA_EXHAUSTED`, the same code an exhausted allowance is, with a message that says where
 /// backup storage comes from. The ledger's own `PAYMENT_REQUIRED` never reaches this client.
@@ -960,6 +967,7 @@ fn classify(code: Option<&str>, status: u16) -> (ErrorCode, UserAction) {
         Some("SIGNED_BEFORE_CUTOFF") => (ErrorCode::ClockUntrusted, UserAction::Wait),
         Some("COLLECTION_DELETED") => (ErrorCode::PermissionDenied, UserAction::FixConfiguration),
         Some("SERVICE_UNAVAILABLE") => (ErrorCode::ServiceCapacity, UserAction::Wait),
+        Some("OUTCOME_UNKNOWN") => (ErrorCode::OutcomeUnknown, UserAction::CheckTheOutcome),
         _ if status >= 500 => (ErrorCode::UpstreamUnavailable, UserAction::Wait),
         _ => (ErrorCode::InvalidArgument, UserAction::Update),
     }
