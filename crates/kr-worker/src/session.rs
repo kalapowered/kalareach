@@ -3914,36 +3914,37 @@ impl Session {
         self.retry_privacy_cleanup();
         let mut privacy = self.privacy;
         let (standing, resumed) = privacy.leave(generation, now);
-        match standing {
-            crate::privacy::Standing::Refused => {
-                return Err(WorkerError::PreconditionFailed {
-                    detail: format!(
-                        "privacy generation {} does not follow the generation {} this session \
-                         holds {}",
-                        generation.get(),
-                        self.privacy.generation().get(),
-                        if self.privacy.is_enabled() {
-                            "with privacy mode on"
-                        } else {
-                            "with privacy mode off"
-                        }
-                    ),
-                });
-            }
-            crate::privacy::Standing::Current => return Ok(None),
-            crate::privacy::Standing::Newer => {}
+        if standing == crate::privacy::Standing::Refused {
+            return Err(WorkerError::PreconditionFailed {
+                detail: format!(
+                    "privacy generation {} does not follow the generation {} this session \
+                     holds {}",
+                    generation.get(),
+                    self.privacy.generation().get(),
+                    if self.privacy.is_enabled() {
+                        "with privacy mode on"
+                    } else {
+                        "with privacy mode off"
+                    }
+                ),
+            });
         }
         // A cleanup this host still owes is content privacy mode was asked to remove and has not.
         // Turning privacy mode off over it would resume retention beside an unfinished purge:
         // output kept afterwards would join the history the purge is still owed, and a restart
         // would lose the obligation altogether. So the refusal stands until the cleanup finishes,
-        // and the maintenance tick is what finishes it.
+        // and the maintenance tick is what finishes it. The same change asked for again is
+        // refused on the same terms: a session that still owes cleanup does not answer that
+        // privacy mode is off and nothing is left to do.
         if let Some(owed) = self.privacy_cleanup.describe() {
             return Err(WorkerError::JournalUnavailable {
                 detail: format!(
                     "privacy mode is not turned off while its own cleanup is unfinished: {owed}"
                 ),
             });
+        }
+        if standing == crate::privacy::Standing::Current {
+            return Ok(None);
         }
         // Recorded before retention starts again, for the reason enabling records first: a
         // boundary this host could not write down is one a restart cannot see.

@@ -727,6 +727,10 @@ fn a_session_whose_privacy_state_cannot_be_read_retains_nothing_and_owes_its_cle
         session.disable_privacy(PrivacyGeneration::new(1)).is_err(),
         "privacy mode this host cannot see is not privacy mode it may turn off"
     );
+    assert!(
+        session.disable_privacy(PrivacyGeneration::INITIAL).is_err(),
+        "nor does the same state asked for again say nothing is owed"
+    );
 }
 
 /// A session whose store cannot be read says so: its cleanup is unavailable, with the reason,
