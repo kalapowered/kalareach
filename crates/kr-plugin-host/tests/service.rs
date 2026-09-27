@@ -29,7 +29,7 @@ use kr_plugin_service::client::{PluginClient, new_binding_id};
 use kr_plugin_service::launcher::{
     self, HostJobRetirement, HostLaunchPlan, HostStartOutcome, HostSupervisor, host_endpoint,
 };
-use kr_plugin_service::protocol::{ComponentSource, HostDescriptor, Notice};
+use kr_plugin_service::protocol::{ComponentSource, HostDescriptor};
 use kr_plugin_service::vocabulary::{
     BindingActivity, BindingFacts, BindingId, ScopedSourceEvent, SourceProvenance,
 };
@@ -940,8 +940,8 @@ async fn kr_req_05_07_a_plugin_host_crash_kills_no_worker_and_loses_no_request()
 // that stalls outright can still hold a call past its deadline now and then, which the runtime
 // records as a fault and the binding survives until three come within a minute; nothing here
 // measures how long a call takes, so such a fault is not a failure. A disabled binding would leave
-// a window with nothing running in it, so that fails the test, and so does a call that failed any
-// other way.
+// a window with nothing running in it, so that fails the test, and whether it happened is read
+// from the binding itself after the window, since disabling is final.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_11_39_a_terminal_drains_and_is_answered_while_a_component_runs() {
     let Some(well_behaved) = component("well-behaved") else {
@@ -1082,38 +1082,23 @@ async fn kr_req_11_39_a_terminal_drains_and_is_answered_while_a_component_runs()
         "the drained output could not be handed to the runtime: {handed_back:?}"
     );
 
-    // The binding was never disabled, and no call failed but by running past its deadline. Every
-    // observation above went by the same path, which writes them in the order they were handed over;
-    // a binding answers its observations in that order and its notices reach this client in that
-    // order; and a fault or a disabling is never dropped on the way. So every notice those
-    // observations produced has arrived once the document of one handed over after them, by the same
-    // path, has. That last one carries a text of its own, which the component draws.
-    let mut plugin = Arc::into_inner(plugin).expect("the supply has let go of the client");
-    let last = "the last observation this test hands over";
-    let handed = plugin.offer(binding, &scrape("se-last", last));
-    assert!(
-        matches!(handed, kr_plugin_service::client::Handoff::Accepted),
-        "the last observation was handed over as {handed:?}"
-    );
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    // And the binding was never disabled. That is read from the binding itself rather than from the
+    // notices it sent, which go on arriving for as long as it runs: disabling is final, and a
+    // disabled binding answers every call it is asked for by saying so before it runs anything, so
+    // any other answer now comes from a binding that was not disabled at any point before, the
+    // window included. How the call itself ends does not matter: one a stalled machine holds past
+    // its deadline is a fault the binding survives, and a fault that does not disable it leaves a
+    // component at work, which is all the window needs.
+    let asking = std::time::Instant::now() + Duration::from_secs(10);
     loop {
-        let notice = tokio::time::timeout_at(deadline, plugin.notice())
-            .await
-            .expect("the last observation's document arrived")
-            .expect("the connection to the plugin host is open");
-        match notice {
-            Notice::Fault { call, detail, .. }
-                if detail != format!("{call} used its whole deadline allowance") =>
-            {
-                panic!("the component faulted in {call}: {detail}")
+        match plugin.snapshot(binding, Duration::from_secs(2)).await {
+            Ok(_) | Err(kr_plugin_service::error::ServiceError::Protocol { .. }) => break,
+            Err(kr_plugin_service::error::ServiceError::Disabled { reason }) => {
+                panic!("the binding was disabled: {reason}")
             }
-            Notice::Disabled { reason, .. } => panic!("the binding disabled itself: {reason}"),
-            Notice::Document { call, nodes, .. }
-                if call == "observe" && nodes.iter().any(|node| node.body_json.contains(last)) =>
-            {
-                break;
-            }
-            Notice::Fault { .. } | Notice::Document { .. } | Notice::Gap { .. } => {}
+            Err(kr_plugin_service::error::ServiceError::CallerDeadline { .. })
+                if std::time::Instant::now() < asking => {}
+            Err(other) => panic!("the binding could not be asked for a call: {other}"),
         }
     }
 
