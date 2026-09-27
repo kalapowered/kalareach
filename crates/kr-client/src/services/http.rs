@@ -100,7 +100,8 @@ use crate::shown::Shown;
 /// How long a connection may take to establish.
 pub const DEFAULT_CONNECT_DEADLINE: Duration = Duration::from_secs(5);
 
-/// How long one read of an answer may take.
+/// How long the answer may take to begin, from the start of the request, and then each read of
+/// its body.
 pub const DEFAULT_READ_DEADLINE: Duration = Duration::from_secs(10);
 
 /// How long one exchange may take from first contact to the last byte of the answer.
@@ -201,7 +202,8 @@ pub trait ExchangeProgress: Send + Sync {
 pub struct HttpDeadlines {
     /// How long establishing the connection may take.
     pub connect: Duration,
-    /// How long one read of the answer may take.
+    /// How long the answer may take to begin, counted from the start of the request with the
+    /// connection included, and then how long each read of its body may take.
     pub read: Duration,
     /// How long the whole exchange may take, body included.
     pub total: Duration,
@@ -543,11 +545,12 @@ impl ServiceHttp for HttpService {
     ) -> ServiceFuture<'a, ServiceHttpAnswer> {
         Box::pin(async move {
             // The three deadlines are the transport's own and they are enforced where the bytes
-            // are: the connect one inside the connector, the read one on each read of the answer,
-            // and the total one across the connection, the request and every byte of the body. So
-            // a failure arrives from the phase it happened in and says which phase that was,
-            // rather than from a watchdog wrapped round the whole thing that could only say that
-            // something somewhere took too long.
+            // are: the connect one inside the connector, the read one from the request's start to
+            // the answer's head and then on each read of the body, and the total one across the
+            // connection, the request and every byte of the body. So a failure arrives from the
+            // phase it happened in and says which phase that was, rather than from a watchdog
+            // wrapped round the whole thing that could only say that something somewhere took too
+            // long.
             let target = self.target(url)?;
             self.exchange(
                 reqwest::Method::POST,

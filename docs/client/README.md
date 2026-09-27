@@ -859,13 +859,25 @@ rotated the token therefore ends the sign-in: the device still holds the spent t
 refresh presents it, the service revokes the family, and the person signs in again. Nothing short of
 that recovers, because the new token was only in the lost answer. A voice start may have started a
 call, and a relay lease request may have issued and installed a lease. Of what `services::signed`
-carries, a storage deletion and every authority feed request may have run and are not safe to send
-again: the service keeps a deletion's first target only for the signature that asked for it, and a
-delegation has nothing to tell a repeat from a later change. Everything else it carries is safe to
-send again, because its method is an idempotent read or the service answers a repeat of each of its
-operations without a second effect: a delivery by its envelope identifier, a settings-sync request
-by its identity, a manifest by its generation, an upload part by its number. So are a revocation,
-the identity and usage reads, the voice terms and closing a voice call.
+carries, which it decides for each request from its method and the body its signature covers, a
+storage deletion, an authority-feed change and a settings-sync exchange that names no request
+identity may have run and are not safe to send again: the service keeps a deletion's first target
+only for the signature that asked for it, a delegation has nothing to tell a repeat from a later
+change, and an exchange no receipt can settle would be a second write. Everything else it carries is
+safe to send again, because it is a read, an authority-feed read included, or the service answers a
+repeat of each of its operations without a second effect: a delivery by its envelope identifier, a
+settings-sync request by its identity, a manifest by its generation, an upload part by its number.
+So are a revocation, the identity and usage reads, the voice terms and closing a voice call.
+
+A request that is safe to send again goes once more when the service asks for it. The service
+answers `SERVICE_UNAVAILABLE`, which this client reports as `SERVICE_CAPACITY`, with a delay, when it
+did not carry a request out or did not finish answering it in time, and either way the same request
+may come again. When that delay is at most `retry::MAX_AUTOMATIC_DELAY`, `services::signed` waits it
+and sends the request once more, signed afresh with a nonce of its own, at the same instant when the
+caller stated one. The second answer is the answer, whatever it is: its data, a refusal, or a second
+`SERVICE_CAPACITY` with its own delay for the caller to act on. There is never a third send, a
+request that is not safe to send again is never sent again, and every other refusal is the answer
+at once.
 
 A caller of `services::relay` finds out what became of a lease request whose outcome is unknown
 before it asks for anything else. Three answers leave it unknown: one that went missing, a success
@@ -899,7 +911,9 @@ bucket rather than the length of the plaintext padded into it.
 it compares as a parsed scheme, host and port before it makes contact, and refuses an address that
 carries credentials or that uses plain HTTP anywhere but loopback. Certificate and hostname
 verification stay on. Connect, read and total deadlines are finite and the total one covers reading
-the answer, so a call either has an answer or a failure. An answer is read under the bound its
+the answer, so a call either has an answer or a failure. The read deadline runs from the start of
+the request, connection included, until the answer's head arrives, and then over each read of the
+body. An answer is read under the bound its
 operation states, measured as the bytes arrive rather than from the length the sender claimed, and
 an answer past it is refused rather than truncated. It follows no redirect, keeps no cookie and asks
 for no compression. It goes through the proxy its caller names, or directly, and never through one
@@ -928,7 +942,11 @@ its receipt simple. The transport never sends again a request that may have reac
 several service clients over one gateway are one set of connections rather than one each, and a
 pooled connection can be taken away between one request and the next; the HTTP library may open a
 new connection for a request of which it has written no byte, which is not the request arriving
-twice, because it never arrived.
+twice, because it never arrived. For the same reason a connection that could not be established,
+because the connect deadline ran out or the connection was refused, reset or closed while it was
+being established, is tried once more on a new one, within what is left of the total deadline. A
+certificate or TLS protocol failure and a name that does not resolve would be the same the second
+time, so they are not tried again.
 
 A failure the connector itself reported — an address that could not be resolved, a connection
 refused, a handshake that failed, an establishment that ran past its deadline — says the request
@@ -1526,7 +1544,7 @@ made again as the next generation, under new keys.
 | KR-PERF-006 | The client's own share of a reconnect: it holds no work of its own between a host's answer and a screen a terminal can draw. What the attach and the host spend is theirs |
 | KR-REQ-17.14 | A session, a draft and a control need no managed service, and none of them changes when one is configured |
 | KR-REQ-17.40 | The report of an exhausted relay: a new connection that a relay on its route turned this device away from fails as that refusal, with the relay's kind of refusal, its words and what may still work, while established and direct connections carry on (`an_exhausted_relay_is_the_reported_reason_a_new_connection_fails` in `crates/kr-controller/tests/network.rs`; each kind, the route and the direct paths in `crates/kr-transport/tests/relay_refusal.rs`) |
-| KR-REQ-23.57 | The retry rules: which classes of request may be retried automatically, and what a person is offered for the rest. A gateway's 502 or 504 on a request that may have run is an unknown outcome and is never sent again: `kr_req_23_57_a_gateway_that_lost_an_exchange_or_a_refresh_leaves_its_outcome_unknown` for the account service's code exchange and refresh, `kr_req_23_57_a_gateway_that_lost_a_starts_answer_leaves_the_creation_unknown` for a voice start, and `kr_req_23_57_a_gateway_that_lost_a_deletion_or_an_authority_request_leaves_its_outcome_unknown` for the signed calls that are not safe to send again, each with the service's own refusal on a 502 and the calls that are safe to send again as its controls |
+| KR-REQ-23.57 | The retry rules: which classes of request may be retried automatically, and what a person is offered for the rest. A gateway's 502 or 504 on a request that may have run is an unknown outcome and is never sent again: `kr_req_23_57_a_gateway_that_lost_an_exchange_or_a_refresh_leaves_its_outcome_unknown` for the account service's code exchange and refresh, `kr_req_23_57_a_gateway_that_lost_a_starts_answer_leaves_the_creation_unknown` for a voice start, and `kr_req_23_57_a_gateway_that_lost_a_deletion_or_an_authority_request_leaves_its_outcome_unknown` for the signed calls that are not safe to send again, each with the service's own refusal on a 502 and the calls that are safe to send again as its controls. A request safe to send again goes once more when the service answers `SERVICE_UNAVAILABLE` with a delay it waits: `kr_req_23_57_a_request_safe_to_repeat_goes_once_more_after_the_delay_the_service_stated`, `kr_req_23_57_a_second_answer_that_the_service_is_unavailable_is_the_answer` and `kr_req_23_57_a_request_sent_once_more_keeps_the_instant_its_caller_stated`, with `kr_req_23_57_a_request_not_safe_to_repeat_is_never_sent_again`, `kr_req_23_57_an_answer_that_is_not_the_services_request_to_send_again_is_the_answer` and `kr_req_23_57_a_lost_answer_means_what_the_request_allows` as its controls, and against a deployment `kr_req_23_57_a_delivery_the_mailbox_finished_late_goes_once_more_and_is_stored_once` and `kr_req_23_57_a_delivery_the_mailbox_finished_late_twice_comes_back_as_that_answer` in `tests/integration/sync` |
 | KR-REQ-23.21 | A chunk never shares the control connection: it travels on its transfer's attachment-chunk lane at the attachment bound, under that connection's own window (`a_full_chunk_travels_on_the_lane_under_the_window_the_host_renewed` and `a_lane_refuses_another_transfers_chunk_before_sending_it` in `crates/kr-client/tests/chunks.rs`) |
 | KR-REQ-14.12 | An upload whose lane drops resumes from `upload.status` under its identifier and sends only what the host is missing (`the_driver_resumes_from_the_status_bitmap_after_its_lane_drops`); a plan that holds a transfer starts from status and publishes nothing twice (`a_plan_that_holds_a_transfer_starts_from_status`); a reservation without a definite answer is never made again, whether its reply was lost, the host could not report it, a receipt alone settled it or the call was abandoned (`an_uncertain_reservation_is_never_reserved_again` and the tests beside it), all in `crates/kr-client/tests/chunks.rs`. Against the controller itself: `an_upload_resumes_from_status_after_its_chunk_connection_drops` in `apps/companion/src-tauri/tests/transfers.rs` |
 | KR-REQ-14.16 | The client's check of each downloaded chunk: bytes that do not match their descriptor, and a descriptor other than the one `download.begin` gave, are refused (`a_downloaded_chunk_that_is_not_the_one_described_is_refused` in `crates/kr-client/tests/chunks.rs`) |
