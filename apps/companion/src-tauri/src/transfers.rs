@@ -10,6 +10,10 @@
 //! asks and publishes on the session and sends every chunk on the environment's attachment-chunk
 //! lane. What is here is the part that is this application's: reading the file, naming the host
 //! it goes to, and handing back the verified handle.
+//!
+//! A file pasted onto the window, or picked on a phone, is different in one way: the platform gave
+//! it to the page rather than giving this process a path, so the page hands its bytes over and
+//! they go through the same sequence. Those are bounded by [`MAX_HANDED_BYTES`].
 
 use std::io::{Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -17,7 +21,7 @@ use std::sync::Mutex;
 
 use kr_client::Session;
 use kr_client::chunks::ChunkRoute;
-use kr_client::uploads::{Content, Subject, Upload};
+use kr_client::uploads::{Content, Held, Subject, Upload};
 use kr_ipc::paths::EnvironmentPaths;
 use kr_protocol::envelope::ActionTarget;
 use kr_protocol::scalars::Digest256;
@@ -30,6 +34,83 @@ use crate::error::{CommandError, Result};
 /// The host applies its own environment budget; this is the bound on what one window will hold
 /// open and hash before it has asked the host for anything at all.
 pub const MAX_DROPPED_BYTES: u64 = 512 * 1024 * 1024;
+
+/// The largest file the page may hand over as bytes, pasted onto the window or picked on a phone.
+///
+/// The bytes cross the page's own channel to this process in one piece, so they are held here in
+/// full before the first chunk goes; a dropped file, which this process reads from its path in
+/// chunks, may be larger.
+pub const MAX_HANDED_BYTES: usize = 64 * 1024 * 1024;
+
+/// The most bytes of a handed file's name that are kept.
+const MAX_NAME_BYTES: usize = 255;
+
+/// A file the page handed over: its bytes, and the name it came with as metadata.
+#[derive(Debug)]
+pub struct HandedFile {
+    content: Held,
+    name: String,
+    media_type: String,
+}
+
+impl HandedFile {
+    /// Takes the bytes the page handed over and the name the platform gave the file.
+    ///
+    /// The name is metadata and nothing else: only its last component is kept, without control
+    /// characters, and the media type is declared from it as a dropped file's is.
+    ///
+    /// # Errors
+    ///
+    /// Returns `QUOTA_EXCEEDED` when the file is larger than [`MAX_HANDED_BYTES`].
+    pub fn new(bytes: Vec<u8>, name: &str) -> Result<Self> {
+        if bytes.len() > MAX_HANDED_BYTES {
+            return Err(CommandError::too_large(format!(
+                "a pasted or picked file is at most {MAX_HANDED_BYTES} bytes; drop a larger one on the window"
+            )));
+        }
+        let name = handed_name(name);
+        let media_type = media_type_of(Path::new(&name));
+        Ok(Self {
+            content: Held::new(bytes),
+            name,
+            media_type,
+        })
+    }
+
+    /// The filename, as metadata.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The media type this client believes it is sending.
+    #[must_use]
+    pub fn media_type(&self) -> &str {
+        &self.media_type
+    }
+}
+
+/// A handed file's name as metadata: its last component, printable, bounded, never empty.
+fn handed_name(raw: &str) -> String {
+    let last = raw.rsplit(['/', '\\']).next().unwrap_or_default();
+    let printable: String = last
+        .chars()
+        .filter(|character| !character.is_control())
+        .collect();
+    let trimmed = printable.trim();
+    let mut kept = String::new();
+    for character in trimmed.chars() {
+        if kept.len() + character.len_utf8() > MAX_NAME_BYTES {
+            break;
+        }
+        kept.push(character);
+    }
+    if kept.is_empty() || kept == "." || kept == ".." {
+        "attachment".to_owned()
+    } else {
+        kept
+    }
+}
 
 /// A file on this machine, read in the chunks the protocol's layout asks for.
 #[derive(Debug)]
@@ -208,15 +289,95 @@ pub async fn upload_to(
 
     // The name and the media type are the file's own, read here rather than taken from the page:
     // what the handle records is what this client actually opened.
+    let name = content.name().to_owned();
+    let media_type = content.media_type().to_owned();
+    send(
+        session,
+        environment,
+        target,
+        session_id,
+        Box::new(content),
+        name,
+        media_type,
+    )
+    .await
+}
+
+/// Sends one file the page handed over to the host on this machine, and returns the verified
+/// handle.
+///
+/// # Errors
+///
+/// Returns `RESOURCE_UNAVAILABLE` when the host's paths cannot be read, and whatever
+/// [`upload_handed_to`] returns.
+pub async fn upload_handed(
+    session: &Session,
+    target: ActionTarget,
+    environment_id: kr_protocol::ids::EnvironmentId,
+    session_id: Option<kr_protocol::ids::SessionId>,
+    file: HandedFile,
+) -> Result<AttachmentHandle> {
+    let paths = kr_ipc::paths::HostPaths::discover()
+        .map_err(|error| CommandError::unavailable(format!("no host on this machine: {error}")))?;
+    upload_handed_to(
+        session,
+        &paths.environment(environment_id),
+        target,
+        session_id,
+        file,
+    )
+    .await
+}
+
+/// Sends one file the page handed over to `environment`, whose controller `session` is connected
+/// to, and returns the verified handle.
+///
+/// # Errors
+///
+/// Returns the host's refusal.
+pub async fn upload_handed_to(
+    session: &Session,
+    environment: &EnvironmentPaths,
+    target: ActionTarget,
+    session_id: Option<kr_protocol::ids::SessionId>,
+    file: HandedFile,
+) -> Result<AttachmentHandle> {
+    let HandedFile {
+        content,
+        name,
+        media_type,
+    } = file;
+    send(
+        session,
+        environment,
+        target,
+        session_id,
+        Box::new(content),
+        name,
+        media_type,
+    )
+    .await
+}
+
+/// Declares, sends and publishes one file's content, under the name and media type it carries.
+async fn send(
+    session: &Session,
+    environment: &EnvironmentPaths,
+    target: ActionTarget,
+    session_id: Option<kr_protocol::ids::SessionId>,
+    content: Box<dyn Content>,
+    name: String,
+    media_type: String,
+) -> Result<AttachmentHandle> {
     let subject = Subject {
         environment_id: environment.environment_id(),
         session_id,
         device_id: None,
-        declared_media_type: content.media_type().to_owned(),
-        original_file_name: content.name().to_owned(),
+        declared_media_type: media_type,
+        original_file_name: name,
     };
     let route = ChunkRoute::local(environment, crate::connection::build_id()?)?;
-    let mut plan = Upload::new(subject, Box::new(content));
+    let mut plan = Upload::new(subject, content);
     Ok(kr_client::uploads::send(
         session,
         &route,
@@ -269,6 +430,33 @@ mod tests {
             media_type_of(Path::new("no-extension")),
             "application/octet-stream"
         );
+    }
+
+    #[test]
+    fn a_handed_name_is_its_last_component_printable_and_bounded() {
+        assert_eq!(
+            handed_name("Screenshot 2026-09-27.png"),
+            "Screenshot 2026-09-27.png"
+        );
+        assert_eq!(handed_name("../../etc/passwd"), "passwd");
+        assert_eq!(handed_name("C:\\Users\\me\\notes.txt"), "notes.txt");
+        assert_eq!(handed_name("bell\u{7}.txt"), "bell.txt");
+        assert_eq!(handed_name(".."), "attachment");
+        assert_eq!(handed_name("   "), "attachment");
+        let long = "é".repeat(200);
+        assert!(handed_name(&long).len() <= MAX_NAME_BYTES);
+        assert!(handed_name(&long).chars().all(|character| character == 'é'));
+    }
+
+    #[test]
+    fn a_handed_file_declares_its_type_from_its_name_and_is_bounded() {
+        let file = HandedFile::new(b"hello".to_vec(), "diagram.PNG").expect("a small file");
+        assert_eq!(file.name(), "diagram.PNG");
+        assert_eq!(file.media_type(), "image/png");
+        assert_eq!(file.content.byte_len(), 5);
+        let error = HandedFile::new(vec![0; MAX_HANDED_BYTES + 1], "big.bin")
+            .expect_err("a file past the bound is refused");
+        assert_eq!(error.code, kr_protocol::error::ErrorCode::QuotaExceeded);
     }
 
     #[test]

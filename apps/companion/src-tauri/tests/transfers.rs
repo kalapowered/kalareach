@@ -345,6 +345,34 @@ async fn a_file_smaller_than_one_chunk_reaches_a_handle() {
     assert_eq!(handle.declared_media_type, "text/plain");
 }
 
+/// KR-REQ-13.16, 13.17: a file the page hands over as bytes, pasted onto the window or picked on a
+/// phone, goes through the same upload a dropped one does and reaches a verified handle, under the
+/// last component of the name it came with and the media type that name declares.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_handed_file_goes_through_the_same_upload_as_a_dropped_one() {
+    let daemon = Daemon::start().await;
+    let session = daemon.session().await;
+    let bytes: Vec<u8> = (0..(UPLOAD_CHUNK_LEN + 4096))
+        .map(|index| u8::try_from(index % 253).unwrap_or(0))
+        .collect();
+    let file = companion_tauri::transfers::HandedFile::new(bytes.clone(), "Pictures/café.png")
+        .expect("a handed file inside the bound");
+
+    let handle = companion_tauri::transfers::upload_handed_to(
+        &session,
+        &daemon.tree.environment(),
+        ActionTarget::environment(daemon.environment_id()),
+        None,
+        file,
+    )
+    .await
+    .expect("the handed file reaches a handle");
+    verified(&session, &handle, &bytes).await;
+    assert_eq!(handle.original_file_name, "café.png");
+    assert_eq!(handle.declared_media_type, "image/png");
+    assert_eq!(read_back(&daemon, &session, &handle).await, bytes);
+}
+
 /// What one relayed connection carried from the client to the host.
 #[derive(Clone, Debug, Default)]
 struct Leg {

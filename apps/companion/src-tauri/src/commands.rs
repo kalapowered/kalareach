@@ -66,6 +66,7 @@ pub const NAMED_COMMANDS: &[(&str, Option<Method>)] = &[
         Some(Method::AgentDraftAddAttachment),
     ),
     ("attachment_upload", Some(Method::UploadBegin)),
+    ("attachment_upload_bytes", Some(Method::UploadBegin)),
     ("attachment_upload_status", Some(Method::UploadStatus)),
     ("attachment_image", Some(Method::DownloadBegin)),
     ("attachment_image_chunk", Some(Method::DownloadChunk)),
@@ -230,6 +231,7 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static
         draft_update,
         draft_add_attachment,
         attachment_upload,
+        attachment_upload_bytes,
         attachment_upload_status,
         attachment_image,
         attachment_image_chunk,
@@ -1125,6 +1127,87 @@ pub async fn attachment_upload(
     encode(&handle)
 }
 
+/// The header a handed file's name comes in, percent-encoded, because a header carries no other
+/// text.
+pub const HANDED_NAME_HEADER: &str = "kr-file-name";
+
+/// The header the subject of a handed file's upload comes in, as the JSON a subject takes.
+pub const HANDED_SUBJECT_HEADER: &str = "kr-subject";
+
+/// Sends one file the page handed over as bytes, pasted onto the window or picked on a phone, and
+/// answers with the verified attachment handle.
+///
+/// The platform gave the file to the page rather than a path to this process, so the page hands
+/// over the bytes, raw, as the call's body; the file's name and what the upload is about come in
+/// two headers. The bytes go through the same upload a dropped file does, bounded by
+/// [`crate::transfers::MAX_HANDED_BYTES`].
+#[tauri::command]
+pub async fn attachment_upload_bytes(
+    state: State<'_, AppState>,
+    request: tauri::ipc::Request<'_>,
+) -> Result<Value> {
+    let tauri::ipc::InvokeBody::Raw(bytes) = request.body() else {
+        return Err(CommandError::invalid(
+            "a pasted or picked file is handed over as raw bytes",
+        ));
+    };
+    let name = match request.headers().get(HANDED_NAME_HEADER) {
+        None => String::new(),
+        Some(value) => percent_decoded(
+            value
+                .to_str()
+                .map_err(|_| CommandError::invalid("the file's name is not header text"))?,
+        )?,
+    };
+    let subject: Subject = match request.headers().get(HANDED_SUBJECT_HEADER) {
+        None => Subject::default(),
+        Some(value) => serde_json::from_str(
+            value
+                .to_str()
+                .map_err(|_| CommandError::invalid("the subject is not header text"))?,
+        )
+        .map_err(|error| CommandError::invalid(format!("that is not a subject: {error}")))?,
+    };
+    let file = crate::transfers::HandedFile::new(bytes.clone(), &name)?;
+    let environment_id = state.environment_id()?;
+    let target = subject.target(environment_id)?;
+    let session_id = match subject.session_id.as_deref() {
+        None => None,
+        Some(value) => Some(
+            value
+                .parse()
+                .map_err(|_| CommandError::invalid("that is not a session identifier"))?,
+        ),
+    };
+    let session = state.session()?;
+    let handle =
+        crate::transfers::upload_handed(&session, target, environment_id, session_id, file).await?;
+    encode(&handle)
+}
+
+/// Decodes a percent-encoded header value into the UTF-8 text it carries.
+fn percent_decoded(value: &str) -> Result<String> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte == b'%' {
+            let pair = bytes
+                .get(index + 1..index + 3)
+                .and_then(|pair| std::str::from_utf8(pair).ok())
+                .and_then(|pair| u8::from_str_radix(pair, 16).ok())
+                .ok_or_else(|| CommandError::invalid("the file's name is not percent-encoded"))?;
+            decoded.push(pair);
+            index += 3;
+        } else {
+            decoded.push(byte);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).map_err(|_| CommandError::invalid("the file's name is not UTF-8"))
+}
+
 /// Changes the origin, before an attempt starts.
 #[tauri::command]
 pub fn pairing_set_origin(
@@ -1960,6 +2043,7 @@ mod tests {
             draft_update,
             draft_add_attachment,
             attachment_upload,
+            attachment_upload_bytes,
             attachment_upload_status,
             attachment_image,
             attachment_image_chunk,
@@ -2088,6 +2172,71 @@ mod tests {
         assert!(
             crate::audio::holding_a_call(),
             "and the refused starts left that call running"
+        );
+    }
+
+    /// KR-REQ-13.16: a file the page hands over as bytes is read from the call's raw body with its
+    /// name and subject from their headers, bounded, and reaches the upload only then; a body that
+    /// is not raw bytes, a name that is not percent-encoded UTF-8 and a subject that is not one are
+    /// each refused before anything is sent.
+    #[test]
+    fn a_handed_file_is_read_from_raw_bytes_and_two_headers() {
+        let (_app, window) = page_with(tauri::generate_handler![attachment_upload_bytes]);
+        let call = |body: tauri::ipc::InvokeBody, headers: &[(&'static str, &str)]| {
+            let mut map = tauri::http::HeaderMap::new();
+            for (name, value) in headers {
+                map.insert(*name, value.parse().expect("header text"));
+            }
+            tauri::test::get_ipc_response(
+                &window,
+                tauri::webview::InvokeRequest {
+                    cmd: "attachment_upload_bytes".into(),
+                    callback: tauri::ipc::CallbackFn(0),
+                    error: tauri::ipc::CallbackFn(1),
+                    url: BUNDLE.parse().expect("the bundle's address"),
+                    body,
+                    headers: map,
+                    invoke_key: tauri::test::INVOKE_KEY.to_owned(),
+                },
+            )
+            .err()
+            .map(|error| error["code"].as_str().unwrap_or_default().to_owned())
+        };
+        let raw = || tauri::ipc::InvokeBody::Raw(b"hello".to_vec());
+        assert_eq!(
+            call(tauri::ipc::InvokeBody::Json(serde_json::json!({})), &[]).as_deref(),
+            Some("INVALID_ARGUMENT"),
+            "a file is handed over as raw bytes"
+        );
+        assert_eq!(
+            call(raw(), &[(HANDED_NAME_HEADER, "caf%C3")]).as_deref(),
+            Some("INVALID_ARGUMENT"),
+            "a name cut inside a character is not UTF-8"
+        );
+        assert_eq!(
+            call(raw(), &[(HANDED_SUBJECT_HEADER, "{\"sessionId\":1}")]).as_deref(),
+            Some("INVALID_ARGUMENT"),
+            "a subject is the JSON a subject takes"
+        );
+        // Everything read, the next step needs a host this test does not run.
+        assert_eq!(
+            call(
+                raw(),
+                &[
+                    (HANDED_NAME_HEADER, "caf%C3%A9.png"),
+                    (
+                        HANDED_SUBJECT_HEADER,
+                        "{\"sessionId\":\"44444444-4444-4444-8444-444444444444\"}"
+                    )
+                ]
+            )
+            .as_deref(),
+            Some("HOST_NOT_CONFIGURED"),
+            "a well-formed handed file reaches the upload"
+        );
+        assert_eq!(
+            percent_decoded("caf%C3%A9.png").expect("decodes"),
+            "café.png"
         );
     }
 
