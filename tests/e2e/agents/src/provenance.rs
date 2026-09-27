@@ -153,6 +153,10 @@ struct Seen {
     other_users: Vec<(u32, PathBuf)>,
     /// Why a look did not find every process beneath the sessions, once for each reason.
     untracked: Vec<String>,
+    /// Every process a look found beneath the sessions and took as theirs, by its start identity,
+    /// with its command line, whatever became of reading its image: the run's close requires each
+    /// ended.
+    identified: BTreeMap<ProcessStartIdentity, String>,
 }
 
 /// What a stage's sessions ran, checked as they ran it.
@@ -475,6 +479,19 @@ impl Provenance {
         }
     }
 
+    /// Every process a look found beneath the sessions and took as theirs, with its command line,
+    /// for the run's closing check to find ended.
+    #[must_use]
+    pub fn identified(&self) -> Vec<(ProcessStartIdentity, String)> {
+        self.seen
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .identified
+            .iter()
+            .map(|(identity, command)| (identity.clone(), command.clone()))
+            .collect()
+    }
+
     /// Why a look did not find every process beneath the sessions, for the run's closing check to
     /// fail on as well.
     #[must_use]
@@ -637,6 +654,9 @@ impl Provenance {
                             }
                         }
                     }
+                    seen.identified
+                        .entry(identity.clone())
+                        .or_insert_with(|| entry.command.clone());
                     found.push((identity.clone(), entry.command.clone()));
                     under.push(identity);
                 }
