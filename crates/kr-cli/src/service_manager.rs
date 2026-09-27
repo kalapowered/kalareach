@@ -632,8 +632,10 @@ fn move_aside(place: &Place<'_>) -> std::result::Result<Moved, Shown> {
 /// Puts a file moved aside back where it was, unless something has taken its place since, and
 /// says where it is otherwise.
 ///
-/// It goes back by a link, which is refused when the name is taken, so a file written there
-/// meanwhile is never replaced. What was moved is left where it is when it is no longer a regular
+/// It goes back by a publication that never replaces, so a file written there meanwhile is never
+/// replaced: a link elsewhere, and on Windows a rename that does not replace, tried again while
+/// another program holds the file, since a file given its name by a link there can be held by the
+/// system for a minute and more. What was moved is left where it is when it is no longer a regular
 /// file, which is what something replacing it in the moment before it was moved leaves.
 fn put_back(aside: &Path, place: &Place<'_>) -> std::result::Result<(), Shown> {
     if !std::fs::symlink_metadata(aside).is_ok_and(|about| about.file_type().is_file()) {
@@ -642,8 +644,12 @@ fn put_back(aside: &Path, place: &Place<'_>) -> std::result::Result<(), Shown> {
             place.aside(aside)
         ));
     }
-    std::fs::hard_link(aside, place.path())
-        .and_then(|()| std::fs::remove_file(aside))
+    kr_flush::retry_while_held(|| kr_flush::publish_without_replacing(aside, place.path()))
+        .and_then(|()| match std::fs::remove_file(aside) {
+            // On Windows the publication took the name it was moved to already.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            removed => removed,
+        })
         .map_err(|error| {
             shown!(
                 "it is at {}, because it could not be put back at {}: {}",

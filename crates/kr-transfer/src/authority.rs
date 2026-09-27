@@ -77,6 +77,7 @@
 //!   says it is there.
 
 use std::ffi::{OsStr, OsString};
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 
 use cap_fs_ext::{DirExt as _, FollowSymlinks, MetadataExt as _, OpenOptionsFollowExt as _};
@@ -1143,37 +1144,91 @@ impl AuthorisedDirectory {
             })
     }
 
-    /// Links a descendant of this directory to a name in `destination` that must not exist.
+    /// Gives a descendant of this directory a name in `destination` that must not exist: a first
+    /// publication, which never replaces what is there.
     ///
-    /// The one portable atomic no-replace publish. A link fails when the destination name is
-    /// taken, on every platform, so a file that appeared between a check and a publish is never
+    /// The one portable atomic no-replace publish. It fails when the destination name is taken, on
+    /// every platform, so a file that appeared between a check and the publication is never
     /// overwritten. Both names are one component for the same reason a rename's are.
+    ///
+    /// On Windows it is a rename that does not replace, between the paths the two handles report,
+    /// as every rename there is, and `name` no longer names the file once it succeeds. It is tried
+    /// again while another program holds the file, as [`kr_flush::retry_while_held`] says. A link
+    /// is not used there: a file given a name by a link can be held by the system, where a scanner
+    /// reads it, for a minute and more, and a later rename over it or removal of it is refused all
+    /// that time. Elsewhere it is a link relative to the two authorised handles, made once, and
+    /// `name` names the file as well until the caller removes it.
+    ///
+    /// `unchanged` is the caller's own check of what the publication stands on, run before every
+    /// attempt. One that breaks ends the publication with nothing given a name, and what it broke
+    /// with is the answer.
     ///
     /// # Errors
     ///
     /// Returns [`Escape::WrongEnvironment`] for two environments, the first rule either name
-    /// breaks, or the link failure, which includes the destination already existing.
-    pub fn link_into(
+    /// breaks, or the publication's failure, which includes the destination already existing.
+    pub fn publish_into<R>(
         &self,
         name: &RelativeName,
         destination: &Self,
         destination_name: &RelativeName,
-    ) -> Result<(), Escape> {
+        mut unchanged: impl FnMut() -> ControlFlow<R>,
+    ) -> Result<ControlFlow<R>, Escape> {
         destination.check_environment(self.environment_id)?;
         single_component(name)?;
         single_component(destination_name)?;
         check_component(name.as_str())?;
         check_component(destination_name.as_str())?;
-        self.directory
-            .hard_link(
-                name.as_str(),
-                &destination.directory,
-                destination_name.as_str(),
-            )
+        let mut refused = None;
+        let published = kr_flush::retry_while_held(|| {
+            if let ControlFlow::Break(refusal) = unchanged() {
+                refused = Some(refusal);
+                return Ok(());
+            }
+            self.name_without_replacing(name, destination, destination_name)
+        });
+        if let Some(refusal) = refused {
+            return Ok(ControlFlow::Break(refusal));
+        }
+        published
+            .map(|()| ControlFlow::Continue(()))
             .map_err(|error| Escape::Unopenable {
                 component: destination_name.as_str().to_owned(),
                 detail: error.to_string(),
             })
+    }
+
+    /// Gives `name`'s file the name `destination_name` in `destination` unless that is taken: a
+    /// link relative to the two handles.
+    #[cfg(not(windows))]
+    fn name_without_replacing(
+        &self,
+        name: &RelativeName,
+        destination: &Self,
+        destination_name: &RelativeName,
+    ) -> std::io::Result<()> {
+        self.directory.hard_link(
+            name.as_str(),
+            &destination.directory,
+            destination_name.as_str(),
+        )
+    }
+
+    /// Gives `name`'s file the name `destination_name` in `destination` unless that is taken: a
+    /// rename that does not replace, between the paths the two handles report.
+    #[cfg(windows)]
+    fn name_without_replacing(
+        &self,
+        name: &RelativeName,
+        destination: &Self,
+        destination_name: &RelativeName,
+    ) -> std::io::Result<()> {
+        use std::os::windows::io::AsHandle as _;
+
+        let from = crate::windows::final_path(self.directory.as_handle())?.join(name.as_str());
+        let to = crate::windows::final_path(destination.directory.as_handle())?
+            .join(destination_name.as_str());
+        kr_flush::publish_without_replacing(&from, &to)
     }
 
     /// Removes a descendant, whether it is a file or a link.

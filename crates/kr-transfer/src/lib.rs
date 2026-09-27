@@ -78,18 +78,19 @@ pub mod store;
 )]
 mod apple;
 
-/// What an open Windows file's access-control list says, how one is written back, and removal of
-/// a file through its own handle.
+/// What an open Windows file's access-control list says, how one is written back, removal of a
+/// file through its own handle, and the path an open directory's handle reports.
 ///
 /// Every file on this platform carries a list, reachable only through the platform's own
-/// interface, and removing a file through its handle is two calls into `kernel32`, which is why
-/// this module is allowed to leave safe Rust and nothing else on this platform is.
+/// interface; removing a file through its handle is two calls into `kernel32`, and reading the
+/// path a handle holds is one more. That is why this module is allowed to leave safe Rust and
+/// nothing else on this platform is.
 #[cfg(windows)]
 #[expect(
     unsafe_code,
-    reason = "reading and writing an opened object's access-control list, and removing a file \
-              through its own handle, are calls into the platform's own interface, which has no \
-              safe binding; the calls are made here and nowhere else"
+    reason = "reading and writing an opened object's access-control list, removing a file through \
+              its own handle, and reading the path a handle holds, are calls into the platform's \
+              own interface, which has no safe binding; the calls are made here and nowhere else"
 )]
 mod windows;
 

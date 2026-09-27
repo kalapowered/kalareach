@@ -10,7 +10,9 @@
 //! rather than a rename over it: a link fails when the name is taken, on every platform, so a blob
 //! that is already there is never replaced by one a concurrent capture was still writing.
 
+use std::convert::Infallible;
 use std::io::{Read as _, Write as _};
+use std::ops::ControlFlow;
 
 use kr_protocol::ids::EnvironmentId;
 use kr_protocol::scalars::Digest256;
@@ -143,16 +145,23 @@ impl ObjectStore {
                 })?;
             handle.sync_all().map_err(ChangeSetError::storage)?;
         }
-        // A link refuses an occupied name on every platform, so a concurrent capture that got
-        // there first keeps its blob and this one removes its own temporary. **Nothing is removed
-        // to make room here**: a valid blob another writer published between the check above and
-        // this link is the content, and unlinking it would take an object a recorded version
-        // names.
+        // A first publication refuses an occupied name on every platform, so a concurrent capture
+        // that got there first keeps its blob and this one removes its own temporary. **Nothing is
+        // removed to make room here**: a valid blob another writer published between the check
+        // above and this publication is the content, and unlinking it would take an object a
+        // recorded version names. Nothing is checked again before an attempt either: the name is
+        // the content's digest, so whatever another writer publishes there meanwhile is these
+        // bytes.
         let published = if repair {
             shelf.rename_into(&temporary, &shelf, &final_name)
         } else {
-            shelf.link_into(&temporary, &shelf, &final_name)
+            shelf
+                .publish_into(&temporary, &shelf, &final_name, || {
+                    ControlFlow::<Infallible>::Continue(())
+                })
+                .map(|_| ())
         };
+        // On Windows a first publication took the temporary name already, and this finds nothing.
         let _ = shelf.remove(&temporary);
         match published {
             Ok(()) => {

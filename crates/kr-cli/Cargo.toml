@@ -23,6 +23,8 @@ kr-client = { workspace = true, features = ["terminal"] }
 kr-controller = { workspace = true }
 # The key a first owner's confirmation is signed with at this terminal.
 kr-crypto.workspace = true
+# A service definition moved aside for a check is put back as the machine store publishes a record.
+kr-flush.workspace = true
 kr-ipc.workspace = true
 # The owner-confirmation proof and the grants an invitation proposes.
 kr-pairing.workspace = true

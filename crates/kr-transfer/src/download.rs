@@ -18,6 +18,7 @@
 //! exact destination.
 
 use std::io::Write as _;
+use std::ops::ControlFlow;
 
 use kr_flush::NameKind;
 use kr_protocol::ids::{ActorId, GrantId, TransferId};
@@ -1090,17 +1091,20 @@ impl<'destination> DownloadWriter<'destination> {
         // name. What publishes is the *name*, so the name has to be shown to still hold the
         // object that was verified before it is published: something that took the temporary name
         // in between would otherwise be what the destination ends up holding.
-        let staged = self
-            .destination
-            .open_read(&temporary, ObjectPolicy::ReadableFile)?;
-        if staged.identity() != verified {
-            return Err(TransferError::integrity(format!(
+        let destination = self.destination;
+        let still_verified = || match destination.open_read(&temporary, ObjectPolicy::ReadableFile)
+        {
+            Ok(staged) if staged.identity() == verified => ControlFlow::Continue(()),
+            Ok(_) => ControlFlow::Break(TransferError::integrity(format!(
                 "{} no longer holds the object this download verified",
                 temporary.as_str()
-            )));
-        }
-        drop(staged);
+            ))),
+            Err(error) => ControlFlow::Break(TransferError::from(error)),
+        };
         if self.placement.allow_overwrite {
+            if let ControlFlow::Break(refusal) = still_verified() {
+                return Err(refusal);
+            }
             // The user asked for this destination to be replaced. A rename replaces atomically, so
             // there is no moment when the name holds nothing. The handle is closed first, because
             // Windows refuses to replace a name a handle still holds open.
@@ -1113,14 +1117,20 @@ impl<'destination> DownloadWriter<'destination> {
             self.destination
                 .rename_into(&temporary, self.destination, &self.final_name)?;
         } else {
-            // A link is the one portable atomic no-replace publish: it fails when the name is
-            // taken, so a file that appeared while the download ran is never overwritten. There is
-            // no check-then-act window to lose.
-            match self
-                .destination
-                .link_into(&temporary, self.destination, &self.final_name)
-            {
-                Ok(()) => {}
+            // The one portable atomic no-replace publish: it fails when the name is taken, so a
+            // file that appeared while the download ran is never overwritten, and the check that
+            // the temporary name holds what was verified is made again before every attempt. The
+            // handle is closed first, as for a replacement: on Windows the publication renames
+            // the name it holds.
+            self.file = None;
+            match self.destination.publish_into(
+                &temporary,
+                self.destination,
+                &self.final_name,
+                still_verified,
+            ) {
+                Ok(ControlFlow::Continue(())) => {}
+                Ok(ControlFlow::Break(refusal)) => return Err(refusal),
                 Err(error) => {
                     return Err(match self.destination.occupied(&self.final_name) {
                         Ok(true) => TransferError::PermissionDenied {
@@ -1134,11 +1144,11 @@ impl<'destination> DownloadWriter<'destination> {
                     });
                 }
             }
-            // The link named the object this call verified, because the name it copied was
-            // checked immediately above. So a destination that now holds something else is one
-            // something else replaced *after* this download published, and that file is not this
-            // call's to remove: it belongs to whoever wrote it. The refusal says what happened
-            // and leaves the destination as it found it.
+            // The publication named the object this call verified, because the temporary name was
+            // checked before the attempt that made it. So a destination that now holds something
+            // else is one something else replaced *after* this download published, and that file
+            // is not this call's to remove: it belongs to whoever wrote it. The refusal says what
+            // happened and leaves the destination as it found it.
             let published = self
                 .destination
                 .open_read(&self.final_name, ObjectPolicy::ReadableFile)?;
@@ -1150,12 +1160,12 @@ impl<'destination> DownloadWriter<'destination> {
                 )));
             }
             drop(published);
-            // The temporary name goes only once the published one holds the file.
-            self.file = None;
+            // The temporary name goes only once the published one holds the file. On Windows the
+            // publication took it already, and its removal finds nothing.
             self.destination.remove(&temporary)?;
         }
-        // The name now has to hold the object that was verified. A rename and a link both preserve
-        // it, so anything else means something took the name in between.
+        // The name now has to hold the object that was verified. A rename and a publication both
+        // preserve it, so anything else means something took the name in between.
         let published = self
             .destination
             .open_read(&self.final_name, ObjectPolicy::ReadableFile)?;

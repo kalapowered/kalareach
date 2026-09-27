@@ -21,7 +21,8 @@
 //!
 //! A recursive removal comes here for one more thing: a file in a tree goes through its own
 //! handle, reopened for deletion and marked, rather than by its name. Reopening a handle and
-//! marking an object for deletion are two calls into `kernel32`.
+//! marking an object for deletion are two calls into `kernel32`. A publication comes here for the
+//! path an open directory's handle reports, which is one more.
 
 use std::os::windows::io::{AsRawHandle as _, BorrowedHandle};
 
@@ -692,6 +693,53 @@ pub(crate) fn dispose_of(file: &cap_std::fs::File) -> std::io::Result<()> {
         return Err(std::io::Error::last_os_error());
     }
     Ok(())
+}
+
+/// The longest path the platform reports for a handle, in UTF-16 units with its NUL.
+const LONGEST_PATH: usize = 32_768;
+
+/// Returns the path by which the directory an open handle holds is reached now, with the prefix
+/// that lifts the old length limit.
+///
+/// A rename that never replaces has no form relative to a handle this host can hold, so a
+/// publication names both directories by the paths their handles report, as `cap-std` does for
+/// every rename and link it makes on this platform.
+///
+/// # Errors
+///
+/// Returns the operating system's error when the handle's path cannot be read.
+pub(crate) fn final_path(handle: BorrowedHandle<'_>) -> std::io::Result<std::path::PathBuf> {
+    use std::os::windows::ffi::OsStringExt as _;
+
+    use windows_sys::Win32::Storage::FileSystem::GetFinalPathNameByHandleW;
+
+    let mut buffer = vec![0_u16; 512];
+    loop {
+        let capacity = u32::try_from(buffer.len()).unwrap_or(u32::MAX);
+        // SAFETY: the handle is borrowed for the whole call, and the buffer is this function's own
+        // with its length given, so the call writes inside it.
+        let reported = unsafe {
+            GetFinalPathNameByHandleW(handle.as_raw_handle(), buffer.as_mut_ptr(), capacity, 0)
+        };
+        let reported = usize::try_from(reported).unwrap_or(usize::MAX);
+        if reported == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // A path that fits is reported by its length without the NUL; one that does not, by the
+        // length it needs with the NUL.
+        if reported < buffer.len() {
+            buffer.truncate(reported);
+            return Ok(std::path::PathBuf::from(std::ffi::OsString::from_wide(
+                &buffer,
+            )));
+        }
+        if reported > LONGEST_PATH {
+            return Err(std::io::Error::other(
+                "the platform reported a path longer than any it gives",
+            ));
+        }
+        buffer.resize(reported, 0);
+    }
 }
 
 #[cfg(test)]

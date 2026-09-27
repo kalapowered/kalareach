@@ -380,7 +380,9 @@ fn a_file_held_while_it_is_published_ends_with_its_one_name() {
     let published = RelativeName::parse("published.bin").expect("a valid relative name");
 
     let letting_go = held_for_a_moment(&root.path().join("staged.part"));
-    let publication = authority.link_into(&staged, &authority, &published);
+    let publication = authority.publish_into(&staged, &authority, &published, || {
+        std::ops::ControlFlow::<std::convert::Infallible>::Continue(())
+    });
     let removal = authority.remove(&staged);
     letting_go.join().expect("let go");
     publication.expect("published once it is let go");

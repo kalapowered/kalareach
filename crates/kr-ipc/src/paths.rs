@@ -2416,7 +2416,12 @@ pub fn write_owner_only_file(path: &Path, contents: &[u8]) -> Result<()> {
 /// Writes a file owner-only, failing when it already exists.
 ///
 /// This is the publication a racing caller must lose rather than win. `rename` always replaces, so
-/// it cannot answer "who got there first"; an exclusive create can.
+/// it cannot answer "who got there first"; a publication that never replaces can.
+///
+/// On Windows the file is given its name by a rename that does not replace, tried again while
+/// another program holds it, as [`kr_flush::retry_while_held`] says; elsewhere by a link. A file
+/// given its name by a link there can be held by the system, where a scanner reads it, for a minute
+/// and more, and whoever later replaces or removes it is refused all that time.
 ///
 /// # Errors
 ///
@@ -2430,8 +2435,8 @@ pub fn create_new_owner_only_file(path: &Path, contents: &[u8]) -> Result<()> {
     // would leave an empty file behind after a crash: for the environment identity that is the
     // difference between reading an identity and reading nothing at all.
     //
-    // A hard link publishes it. Unlike a rename it refuses to replace an existing name, so it
-    // answers "who got there first" as well as making the publication atomic.
+    // A publication that never replaces gives it the name, so it answers "who got there first" as
+    // well as making the publication atomic.
     let directory = path.parent().unwrap_or_else(|| Path::new("."));
     let temporary = directory.join(format!(".{}.tmp", crate::new_uuid()));
     let mut options = std::fs::OpenOptions::new();
@@ -2459,10 +2464,12 @@ pub fn create_new_owner_only_file(path: &Path, contents: &[u8]) -> Result<()> {
             hook(&temporary);
         }
     });
-    let linked =
-        std::fs::hard_link(&temporary, path).map_err(|error| IpcError::io("publish", path, error));
+    let published =
+        kr_flush::retry_while_held(|| kr_flush::publish_without_replacing(&temporary, path))
+            .map_err(|error| IpcError::io("publish", path, error));
+    // Where the name was given by a link, or not at all, the temporary name goes.
     let _ = std::fs::remove_file(&temporary);
-    linked?;
+    published?;
     sync_directory(directory)
 }
 
