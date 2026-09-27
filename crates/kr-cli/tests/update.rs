@@ -1457,6 +1457,16 @@ fn a_manifest_is_taken_only_as_the_root_s_targets_keys_signed_it() {
     let mut changed: Value = serde_json::from_str(&document).expect("JSON");
     changed["signed"]["stores"] = serde_json::json!([]);
     assert!(root.verify(changed.to_string().as_bytes()).is_err());
+    // And one that names a member twice with the same value, which leaves the canonical form and
+    // the signature as they were: refused by the updater, as by every program of the release.
+    let repeated = document.replacen(
+        "\"signed\":{",
+        &format!("\"signed\":{{\"release\":\"{}\",", manifest.release),
+        1,
+    );
+    assert_ne!(repeated, document, "the member is repeated");
+    assert!(root.verify(repeated.as_bytes()).is_err());
+    assert!(ReleaseManifest::read_document(repeated.as_bytes()).is_err());
 }
 
 /// A release carries the host's root or the one that follows it, signed by the host's root keys and

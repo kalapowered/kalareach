@@ -599,10 +599,10 @@ pub enum ManifestError {
     },
 }
 
-/// The part of `release.json` this crate reads: the manifest, whatever signs it.
+/// The part of `release.json` this crate reads: the manifest's members, whatever signs them.
 #[derive(Deserialize)]
 struct Envelope {
-    signed: ReleaseManifest,
+    signed: SignedMembers,
 }
 
 /// A manifest's members held exactly as they were read: what the release keys signed, members
@@ -610,9 +610,99 @@ struct Envelope {
 /// wrote rather than over this build's reading of it.
 ///
 /// Serialised, it is those members again; a checker computes their canonical form from this.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+///
+/// Read strictly: an object that names one member twice, at any depth, is refused. A reading that
+/// kept one of the two would check a signature over a document other than the one a program of the
+/// release reads when it starts, and the two readings of one release must agree. Every reading of
+/// a manifest, the updater's and each program's own, goes through this one.
+#[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(transparent)]
 pub struct SignedMembers(serde_json::Value);
+
+impl<'de> Deserialize<'de> for SignedMembers {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(Strict).map(Self)
+    }
+}
+
+/// Reads any JSON value, refusing an object that names one member twice, at any depth.
+struct Strict;
+
+impl<'de> serde::de::DeserializeSeed<'de> for Strict {
+    type Value = serde_json::Value;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for Strict {
+    type Value = serde_json::Value;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a JSON value whose objects name each member once")
+    }
+
+    fn visit_bool<E: serde::de::Error>(self, value: bool) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::Bool(value))
+    }
+
+    fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::Number(value.into()))
+    }
+
+    fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::Number(value.into()))
+    }
+
+    fn visit_f64<E: serde::de::Error>(self, value: f64) -> Result<Self::Value, E> {
+        serde_json::Number::from_f64(value)
+            .map(serde_json::Value::Number)
+            .ok_or_else(|| E::custom("a number JSON cannot hold"))
+    }
+
+    fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::String(value.to_owned()))
+    }
+
+    fn visit_string<E: serde::de::Error>(self, value: String) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::String(value))
+    }
+
+    fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::Null)
+    }
+
+    fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::Null)
+    }
+
+    fn visit_some<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_any(self)
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        let mut values = Vec::new();
+        while let Some(value) = seq.next_element_seed(Strict)? {
+            values.push(value);
+        }
+        Ok(serde_json::Value::Array(values))
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        let mut members = serde_json::Map::new();
+        while let Some(name) = map.next_key::<String>()? {
+            if members.contains_key(&name) {
+                return Err(serde::de::Error::custom(
+                    "an object names one of its members twice",
+                ));
+            }
+            let value = map.next_value_seed(Strict)?;
+            members.insert(name, value);
+        }
+        Ok(serde_json::Value::Object(members))
+    }
+}
 
 impl SignedMembers {
     /// The members a manifest serialises to, which is what a signer signs.
@@ -658,8 +748,7 @@ impl ReleaseManifest {
     pub fn read_document(bytes: &[u8]) -> Result<Self, ManifestError> {
         let envelope: Envelope = serde_json::from_slice(bytes)
             .map_err(|error| ManifestError::Malformed(error.to_string()))?;
-        envelope.signed.check()?;
-        Ok(envelope.signed)
+        envelope.signed.manifest()
     }
 
     /// Checks what a host must know before it installs anything a manifest lists: that no two of
@@ -983,6 +1072,30 @@ mod tests {
         let mut outside = document;
         outside["signed"]["files"][0]["path"] = serde_json::json!("bin/../../escape");
         assert!(ReleaseManifest::read_document(outside.to_string().as_bytes()).is_err());
+    }
+
+    /// A document that names a member twice is refused by every reading of it, the same value
+    /// twice included, at any depth; the same document without the repetition is read.
+    #[test]
+    fn a_member_named_twice_is_refused_by_every_reading() {
+        let written = manifest(vec![file("bin/kr")]);
+        let members = serde_json::to_string(&written).expect("encodes");
+        let release = format!("\"release\":\"{}\",", written.release);
+        let document = |signed: &str| format!("{{\"signed\":{signed},\"signatures\":[]}}");
+        // The control: once, it is read.
+        assert!(ReleaseManifest::read_document(document(&members).as_bytes()).is_ok());
+        let twice_at_the_top = members.replacen('{', &format!("{{{release}"), 1);
+        let file_twice = members.replacen("\"mode\":", "\"mode\":\"regular\",\"mode\":", 1);
+        for signed in [twice_at_the_top, file_twice] {
+            assert!(
+                ReleaseManifest::read_document(document(&signed).as_bytes()).is_err(),
+                "{signed}"
+            );
+            assert!(
+                serde_json::from_str::<SignedMembers>(&signed).is_err(),
+                "{signed}"
+            );
+        }
     }
 
     /// Signed members are what the signer wrote: read back, a member this build does not know is
