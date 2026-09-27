@@ -94,7 +94,20 @@ const TABLE: &[Row] = &[
     Row {
         command: &["plugin"],
         short: None,
-        operations: &["list", "install", "remove", "pin", "enable", "disable"],
+        operations: &[
+            "list",
+            "install",
+            "remove",
+            "pin",
+            "enable",
+            "disable",
+            "integration",
+        ],
+    },
+    Row {
+        command: &["plugin", "integration"],
+        short: None,
+        operations: &["enable", "disable"],
     },
     Row {
         command: &["plugin", "repo"],
@@ -167,6 +180,8 @@ const LINES: &[&[&str]] = &[
     &["plugin", "pin", "kalareach/example-declarative"],
     &["plugin", "enable", "kalareach/example-declarative"],
     &["plugin", "disable", "kalareach/example-declarative"],
+    &["plugin", "integration", "enable", "kalareach/claude-code"],
+    &["plugin", "integration", "disable", "kalareach/claude-code"],
     &["plugin", "repo", "list"],
     &[
         "plugin",
