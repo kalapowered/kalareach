@@ -503,11 +503,16 @@ impl Plain for Withheld {}
 /// Returns the word a value of a closed set goes by on the wire: the name this build's own source
 /// gives the variant.
 ///
-/// A value that can be copied and lives for the whole program holds no text that arrived: no owned
-/// string, and no reference but to this program's own words. A value that does not serialise to one
-/// word is named as such.
+/// The value is one the writer claims [`Closed`](crate::output::Closed), a claim a test holds to
+/// every leaf of the type, so what it serialises to is a word of that set. A value that does not
+/// serialise to one word is named as such. Text is never one, however it is held:
+///
+/// ```compile_fail
+/// let arrived = "kr-marker-7c1e";
+/// let _ = kr_cli::shown::wire_word(arrived.chars().next().unwrap_or(' '));
+/// ```
 #[must_use]
-pub fn wire_word<T: serde::Serialize + Copy + 'static>(value: T) -> Shown {
+pub fn wire_word<T: crate::output::Closed>(value: T) -> Shown {
     match serde_json::to_value(value) {
         Ok(serde_json::Value::String(word)) => shown!("{}", Withheld(word)),
         _ => Shown::said("[a value this build does not name]"),
@@ -647,10 +652,10 @@ pub fn closed_text(value: &impl crate::output::Closed) -> Shown {
 /// Returns the name a value of a closed set has in this build's source, as its derived `Debug`
 /// writes it.
 ///
-/// A value that can be copied and lives for the whole program holds no text that arrived, so what
-/// its `Debug` writes is a variant's name, a number or this program's own words.
+/// The value is one the writer claims [`Closed`](crate::output::Closed), so what its `Debug`
+/// writes is a variant's name or a number.
 #[must_use]
-pub fn variant_name<T: fmt::Debug + Copy + 'static>(value: T) -> Shown {
+pub fn variant_name<T: crate::output::Closed + fmt::Debug>(value: T) -> Shown {
     shown!("{}", Withheld(format!("{value:?}")))
 }
 

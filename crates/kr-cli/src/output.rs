@@ -483,9 +483,24 @@ impl<T: Into<Held>> From<Vec<T>> for Held {
 /// set, an identifier or a digest by its type, and every other leaf a number or a switch.
 ///
 /// Such a value is written as the protocol encodes it, which keeps a document's shape what a
-/// script reading the protocol expects. Every claim is in this file, and a test plants text in
-/// every leaf of each claimed type's schema that could hold it and finds none.
-pub trait Closed: serde::Serialize {}
+/// script reading the protocol expects. A type is claimed closed only in this file, because the
+/// claim is [`claim::Claimed`], which nothing outside it can name; a test plants text in every leaf
+/// of each claimed type's schema that could hold it and finds none, and another holds that test to
+/// every claim written here. A type that holds text cannot be written as one:
+///
+/// ```compile_fail
+/// let arrived = String::from("kr-marker-7c1e");
+/// let _ = kr_cli::output::closed(&arrived);
+/// ```
+pub trait Closed: serde::Serialize + claim::Claimed {}
+
+impl<T: serde::Serialize + claim::Claimed> Closed for T {}
+
+/// The claim a type is [`Closed`], which only this file can make.
+mod claim {
+    /// A type this file claims closed.
+    pub trait Claimed {}
+}
 
 /// A closed value, as the protocol encodes it.
 #[must_use]
@@ -499,77 +514,79 @@ pub fn closed_word(value: &impl Closed) -> Shown {
     crate::shown::closed_text(value)
 }
 
-impl<T: Closed> Closed for kr_protocol::scalars::Nullable<T> {}
-impl<T: Closed> Closed for Vec<T> {}
-impl<T: Closed + Ord> Closed for kr_protocol::scalars::CanonicalSet<T> {}
-impl Closed for kr_protocol::scalars::U64 {}
-impl Closed for kr_protocol::scalars::TimestampMs {}
-impl Closed for kr_protocol::scalars::Digest256 {}
-impl Closed for kr_protocol::ids::ActionId {}
-impl Closed for kr_protocol::ids::AuthorityRevision {}
-impl Closed for kr_protocol::ids::DeviceId {}
-impl Closed for kr_protocol::ids::GrantId {}
-impl Closed for kr_protocol::ids::SessionId {}
-impl Closed for kr_protocol::action::BarrierState {}
-impl Closed for kr_protocol::receipt::ReceiptState {}
-impl Closed for kr_protocol::pairing::DevicePublicKeys {}
-impl Closed for kr_protocol::pairing::ProposedGrant {}
-impl Closed for kr_protocol::invitation::PairingApproval {}
-impl Closed for kr_protocol::ids::AttemptId {}
-impl Closed for kr_protocol::ids::ConfirmationId {}
-impl Closed for kr_protocol::ids::InvitationId {}
-impl Closed for kr_protocol::scalars::KeyId {}
-impl Closed for kr_protocol::ids::PairingEventSequence {}
-impl Closed for kr_protocol::invitation::InviteGrantKind {}
-impl Closed for kr_protocol::invitation::InviteModeKind {}
-impl Closed for kr_protocol::pairing::ConfirmationChannel {}
-impl Closed for kr_protocol::pairing::DevicePlatform {}
-impl Closed for kr_protocol::pairing::PairingConsumedReason {}
-impl Closed for kr_protocol::identity::EnvironmentAccess {}
-impl Closed for kr_protocol::identity::EnvironmentPresence {}
-impl Closed for kr_protocol::identity::ObservationSource {}
-impl Closed for kr_protocol::local::LocalRole {}
-impl Closed for kr_protocol::hello::ProtocolVersion {}
-impl Closed for kr_protocol::catalogue::CatalogueBudgets {}
-impl Closed for kr_protocol::catalogue::CatalogueKind {}
-impl Closed for kr_protocol::catalogue::PluginGrantRequirement {}
-impl Closed for kr_protocol::catalogue::PluginLeftOutReason {}
-impl Closed for kr_protocol::changeset::ApplyOutcomeClass {}
-impl Closed for kr_protocol::changeset::CaptureCount {}
-impl Closed for kr_protocol::changeset::ContentOrigin {}
-impl Closed for kr_protocol::changeset::DestinationClass {}
-impl Closed for kr_protocol::changeset::EvidenceKind {}
-impl Closed for kr_protocol::changeset::ExclusionReason {}
-impl Closed for kr_protocol::changeset::MaterialisationPurpose {}
-impl Closed for kr_protocol::changeset::PathClass {}
-impl Closed for kr_protocol::changeset::PathProgressState {}
-impl Closed for kr_protocol::changeset::SourceConsistency {}
-impl Closed for kr_protocol::changeset::TestedSource {}
-impl Closed for kr_protocol::changeset::TreeSummary {}
-impl Closed for kr_protocol::changeset::VersionRef {}
-impl Closed for kr_protocol::project::ContentClass {}
-impl Closed for kr_protocol::ids::ChangeSetId {}
-impl Closed for kr_protocol::ids::ChangeSetVersion {}
-impl Closed for kr_protocol::ids::EnvironmentId {}
-impl Closed for kr_protocol::ids::MaterialisationId {}
-impl Closed for kr_protocol::ids::ProjectRepositoryId {}
-impl Closed for kr_protocol::ids::RepositoryGeneration {}
-impl Closed for kr_protocol::ids::WorkflowRunId {}
-impl Closed for kr_protocol::ids::WorkspaceId {}
-impl Closed for kr_protocol::project::ChangeKind {}
-impl Closed for kr_protocol::project::DestinationState {}
-impl Closed for kr_protocol::project::FilesystemIdentity {}
-impl Closed for kr_protocol::project::InclusionClass {}
-impl Closed for kr_protocol::project::InclusionPolicy {}
-impl Closed for kr_protocol::project::IsolationMechanism {}
-impl Closed for kr_protocol::project::OperationState {}
-impl Closed for kr_protocol::project::PreviewCount {}
-impl Closed for kr_protocol::project::ProjectOrigin {}
-impl Closed for kr_protocol::project::ProjectState {}
-impl Closed for kr_protocol::project::RemoteTransport {}
-impl Closed for kr_protocol::project::RetainedKind {}
-impl Closed for kr_protocol::project::WorkspaceKind {}
-impl Closed for kr_protocol::project::WorkspaceState {}
+impl<T: claim::Claimed> claim::Claimed for kr_protocol::scalars::Nullable<T> {}
+impl<T: claim::Claimed> claim::Claimed for Vec<T> {}
+impl<T: claim::Claimed + Ord> claim::Claimed for kr_protocol::scalars::CanonicalSet<T> {}
+impl claim::Claimed for kr_protocol::scalars::U64 {}
+impl claim::Claimed for kr_protocol::scalars::TimestampMs {}
+impl claim::Claimed for kr_protocol::scalars::Digest256 {}
+impl claim::Claimed for kr_protocol::ids::ActionId {}
+impl claim::Claimed for kr_protocol::ids::AuthorityRevision {}
+impl claim::Claimed for kr_protocol::ids::DeviceId {}
+impl claim::Claimed for kr_protocol::ids::GrantId {}
+impl claim::Claimed for kr_protocol::ids::SessionId {}
+impl claim::Claimed for kr_protocol::action::BarrierState {}
+impl claim::Claimed for kr_protocol::receipt::ReceiptState {}
+impl claim::Claimed for kr_protocol::pairing::DevicePublicKeys {}
+impl claim::Claimed for kr_protocol::pairing::ProposedGrant {}
+impl claim::Claimed for kr_protocol::invitation::PairingApproval {}
+impl claim::Claimed for kr_protocol::ids::AttemptId {}
+impl claim::Claimed for kr_protocol::ids::ConfirmationId {}
+impl claim::Claimed for kr_protocol::ids::InvitationId {}
+impl claim::Claimed for kr_protocol::scalars::KeyId {}
+impl claim::Claimed for kr_protocol::ids::PairingEventSequence {}
+impl claim::Claimed for kr_protocol::invitation::InviteGrantKind {}
+impl claim::Claimed for kr_protocol::invitation::InviteModeKind {}
+impl claim::Claimed for kr_protocol::pairing::ConfirmationChannel {}
+impl claim::Claimed for kr_protocol::pairing::DevicePlatform {}
+impl claim::Claimed for kr_protocol::pairing::PairingConsumedReason {}
+impl claim::Claimed for kr_protocol::identity::EnvironmentAccess {}
+impl claim::Claimed for kr_protocol::identity::EnvironmentPresence {}
+impl claim::Claimed for kr_protocol::identity::ObservationSource {}
+impl claim::Claimed for kr_protocol::local::LocalRole {}
+impl claim::Claimed for kr_protocol::hello::ProtocolVersion {}
+impl claim::Claimed for kr_protocol::catalogue::CatalogueBudgets {}
+impl claim::Claimed for kr_protocol::catalogue::CatalogueKind {}
+impl claim::Claimed for kr_protocol::catalogue::PluginGrantRequirement {}
+impl claim::Claimed for kr_protocol::catalogue::PluginLeftOutReason {}
+impl claim::Claimed for kr_protocol::changeset::ApplyOutcomeClass {}
+impl claim::Claimed for kr_protocol::changeset::CaptureCount {}
+impl claim::Claimed for kr_protocol::changeset::ContentOrigin {}
+impl claim::Claimed for kr_protocol::changeset::DestinationClass {}
+impl claim::Claimed for kr_protocol::changeset::EvidenceKind {}
+impl claim::Claimed for kr_protocol::changeset::ExclusionReason {}
+impl claim::Claimed for kr_protocol::changeset::MaterialisationPurpose {}
+impl claim::Claimed for kr_protocol::changeset::PathClass {}
+impl claim::Claimed for kr_protocol::changeset::PathProgressState {}
+impl claim::Claimed for kr_protocol::changeset::SourceConsistency {}
+impl claim::Claimed for kr_protocol::changeset::TestedSource {}
+impl claim::Claimed for kr_protocol::changeset::TreeSummary {}
+impl claim::Claimed for kr_protocol::changeset::VersionRef {}
+impl claim::Claimed for kr_protocol::project::ContentClass {}
+impl claim::Claimed for kr_protocol::ids::ChangeSetId {}
+impl claim::Claimed for kr_protocol::ids::ChangeSetVersion {}
+impl claim::Claimed for kr_protocol::ids::EnvironmentId {}
+impl claim::Claimed for kr_protocol::ids::MaterialisationId {}
+impl claim::Claimed for kr_protocol::ids::ProjectRepositoryId {}
+impl claim::Claimed for kr_protocol::ids::RepositoryGeneration {}
+impl claim::Claimed for kr_protocol::ids::WorkflowRunId {}
+impl claim::Claimed for kr_protocol::ids::WorkspaceId {}
+impl claim::Claimed for kr_protocol::project::ChangeKind {}
+impl claim::Claimed for kr_protocol::project::DestinationState {}
+impl claim::Claimed for kr_protocol::project::FilesystemIdentity {}
+impl claim::Claimed for kr_protocol::project::InclusionClass {}
+impl claim::Claimed for kr_protocol::project::InclusionPolicy {}
+impl claim::Claimed for kr_protocol::project::IsolationMechanism {}
+impl claim::Claimed for kr_protocol::project::OperationState {}
+impl claim::Claimed for kr_protocol::project::PreviewCount {}
+impl claim::Claimed for kr_protocol::project::ProjectOrigin {}
+impl claim::Claimed for kr_protocol::project::ProjectState {}
+impl claim::Claimed for kr_protocol::project::RemoteTransport {}
+impl claim::Claimed for kr_protocol::project::RetainedKind {}
+impl claim::Claimed for kr_protocol::project::WorkspaceKind {}
+impl claim::Claimed for kr_protocol::project::WorkspaceState {}
+impl claim::Claimed for kr_protocol::error::RetryCategory {}
+impl claim::Claimed for kr_protocol::identity::ProcessStartSource {}
 
 /// One `--json` document: keys of this program's own, each holding a [`Held`] value.
 #[derive(Default)]
@@ -1111,6 +1128,29 @@ mod tests {
         assert_closed::<kr_protocol::project::RetainedKind>();
         assert_closed::<kr_protocol::project::WorkspaceKind>();
         assert_closed::<kr_protocol::project::WorkspaceState>();
+        assert_closed::<kr_protocol::error::RetryCategory>();
+        assert_closed::<kr_protocol::identity::ProcessStartSource>();
+    }
+
+    /// Every type this file claims closed is one the planted test above checks: the claims and the
+    /// checks are read out of this file's own text and must name the same types.
+    #[test]
+    fn every_claim_is_checked() {
+        let source = include_str!("output.rs");
+        let named = |prefix: &str, suffix: &str| {
+            source
+                .lines()
+                .filter_map(|line| line.trim().strip_prefix(prefix)?.strip_suffix(suffix))
+                .map(str::to_owned)
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        let claimed = named("impl claim::Claimed for ", " {}");
+        let checked = named("assert_closed::<", ">();");
+        assert!(claimed.len() > 60, "{claimed:?}");
+        assert_eq!(
+            claimed, checked,
+            "a claim with no check, or a check with no claim"
+        );
     }
 
     /// The negative control: a type with a leaf of free text fails the claim's check.
