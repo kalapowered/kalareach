@@ -734,6 +734,20 @@ fn reads_scopes() -> CanonicalSet<kr_protocol::ids::CapabilityId> {
     .collect()
 }
 
+/// What a worker of this build states in its answer to a hello about a forwarded read's scope: it
+/// reads one, and it holds a question read to it.
+fn holds_question_reads() -> CanonicalSet<kr_protocol::ids::CapabilityId> {
+    [
+        kr_protocol::local::FORWARDED_HISTORY_SCOPE,
+        kr_protocol::local::FORWARDED_QUESTION_SCOPE,
+    ]
+    .into_iter()
+    .map(|capability| {
+        kr_protocol::ids::CapabilityId::new(capability).expect("a capability identifier")
+    })
+    .collect()
+}
+
 /// The reads a worker was forwarded, in the order they arrived.
 fn forwarded_reads(
     recorded: &crate::service::a_close_a_worker_never_answers::Recorded,
@@ -829,13 +843,11 @@ fn asked(session_id: SessionId, byte: u8, created_at_ms: u64) -> kr_protocol::qu
     }
 }
 
-/// `question.read` from a paired device is answered by the worker of the session it names,
-/// which is asked under the device's own envelope. What comes back is narrowed to the grant's
-/// history scope: a question the grant names explicitly, and any asked at or after the moment
-/// the grant reaches back to. A question the device names that the scope does not reach is
-/// refused rather than answered empty, and a grant that retains no history and names no
-/// question reads none. A device whose grant does not admit the session is refused before
-/// anything reaches the worker.
+/// `question.read` from a paired device is answered by the worker of the session it names, which
+/// is asked under the device's own envelope and with its grant's history scope. The worker holds
+/// its answer to that scope through section 10's shared filter, so what it answers is what the
+/// device is told: this daemon keeps no filter of its own to disagree with it. A device whose grant
+/// does not admit the session is refused before anything reaches the worker.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_device_reads_the_questions_its_grant_reaches_from_the_sessions_worker() {
     use std::sync::Arc;
@@ -847,8 +859,8 @@ async fn a_device_reads_the_questions_its_grant_reaches_from_the_sessions_worker
 
     use crate::service::a_close_a_worker_never_answers as fake;
 
-    // Three questions the session's worker holds: two asked before the moment the grant
-    // reaches back to, one of which the grant names, and one asked after it.
+    // The questions the session's worker answers with, whatever the read's scope: the worker
+    // decides what a scope admits, and this worker's answer stands for that decision.
     const EARLIER: u8 = 0x21;
     const NAMED: u8 = 0x22;
     const LATER: u8 = 0x23;
@@ -876,7 +888,7 @@ async fn a_device_reads_the_questions_its_grant_reaches_from_the_sessions_worker
             ParamsValue::from_typed(&QuestionReadResult { questions }).ok()
         }),
         Arc::clone(&recorded),
-        reads_scopes(),
+        holds_question_reads(),
     )
     .await;
     let controller = &world.controller;
@@ -900,7 +912,8 @@ async fn a_device_reads_the_questions_its_grant_reaches_from_the_sessions_worker
             .collect::<Vec<_>>()
     };
 
-    // A device that sees this session, reaching back to 2 000 and naming one earlier question.
+    // A device that sees this session, reaching back to 2 000 and naming one earlier question, is
+    // told what the worker answered, all of it.
     let reaching = paired(controller, 10, |grant| {
         grant.history.lower_bound_ms =
             Nullable::some(kr_protocol::scalars::TimestampMs::new(2_000));
@@ -909,32 +922,25 @@ async fn a_device_reads_the_questions_its_grant_reaches_from_the_sessions_worker
     let connection = super::RemoteConnection::for_test(controller, reaching.clone());
     assert_eq!(
         shown(connection.read(&read(1, None)).await),
-        vec![question(NAMED), question(LATER)],
-        "the question the grant names and the one asked after its lower bound, and not the one \
-         asked before it"
+        vec![question(EARLIER), question(NAMED), question(LATER)],
+        "the worker's answer, as the worker gave it"
     );
     assert_eq!(
-        shown(connection.read(&read(2, Some(question(NAMED)))).await),
-        vec![question(NAMED)]
+        shown(connection.read(&read(2, Some(question(EARLIER)))).await),
+        vec![question(EARLIER)]
     );
-    let hidden = refusal(connection.read(&read(3, Some(question(EARLIER)))).await);
-    assert_eq!(hidden.code, ErrorCode::PermissionDenied, "{hidden:?}");
 
-    // Each read reached the worker, and under this device's own envelope.
+    // Each read reached the worker under this device's own envelope, with its grant's history
+    // scope for the worker to hold the answer to.
     let forwarded = forwarded_reads(&recorded);
-    assert_eq!(forwarded.len(), 3, "{forwarded:?}");
+    assert_eq!(forwarded.len(), 2, "{forwarded:?}");
     for read in &forwarded {
         assert_eq!(read.request.method, Method::QuestionRead.into());
         assert_eq!(read.actor.ingress, ActorIngress::PairedDevice);
         assert_eq!(read.actor.device_id, Nullable::some(reaching.device_id));
         assert_eq!(read.actor.grant_id, Nullable::some(reaching.grant.grant_id));
+        assert_eq!(read.history.as_ref(), Some(&reaching.grant.history));
     }
-
-    // A grant that retains no history and names no question reads none of them.
-    let current_only = paired(controller, 11, |_| {});
-    let connection = super::RemoteConnection::for_test(controller, current_only);
-    assert!(shown(connection.read(&read(4, None)).await).is_empty());
-    assert_eq!(forwarded_reads(&recorded).len(), 4);
 
     // A device whose grant sees another session is refused, and nothing reaches the worker.
     let elsewhere = paired(controller, 12, |grant| {
@@ -943,11 +949,11 @@ async fn a_device_reads_the_questions_its_grant_reaches_from_the_sessions_worker
         };
     });
     let connection = super::RemoteConnection::for_test(controller, elsewhere);
-    let outside = refusal(connection.read(&read(5, None)).await);
+    let outside = refusal(connection.read(&read(3, None)).await);
     assert_eq!(outside.code, ErrorCode::PermissionDenied, "{outside:?}");
     assert_eq!(
         forwarded_reads(&recorded).len(),
-        4,
+        2,
         "a read the grant does not admit reaches no worker"
     );
     world.serving.abort();

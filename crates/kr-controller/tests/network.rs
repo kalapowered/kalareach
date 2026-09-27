@@ -4513,3 +4513,173 @@ async fn one_responder_answers_a_query_with_a_local_and_a_remote_client_attached
     close_session(&mut local, &host, session_id).await;
     daemon.stop().await;
 }
+
+/// The questions a read was answered with, by identity, in the order it gave them.
+fn asked_ids(
+    read: &kr_protocol::question::QuestionReadResult,
+) -> Vec<kr_protocol::ids::QuestionId> {
+    read.questions
+        .iter()
+        .map(|question| question.question_id)
+        .collect()
+}
+
+/// KR-REQ-10.51 over the real network path: the local owner shares a session with a paired device,
+/// naming a question an application inside the session asked before the history bound the share
+/// sets. The owner is shown the question as the session's own worker holds it. A device holding
+/// the grant the invitation carries reads that question from the worker while it is open, and not
+/// once it has been answered, and a device whose grant reaches back to the same moment and names
+/// nothing never reads it. A device's connection is decided under the grant its record holds, so
+/// the test redeems the invitation and gives the device's record the grant it carries.
+#[ignore = "launches a worker process; run through scripts/end-to-end.sh"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_10_51_a_device_reads_the_question_its_grant_names_while_it_is_open() {
+    let host = Host::create();
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let daemon = host.start(loopback(), &owner).await;
+    let mut local = host.client().await;
+    let Asked {
+        created,
+        target,
+        question: asked,
+        terminal,
+        mut reader,
+    } = asked_in_a_new_session(&host, &mut local).await;
+    let session_id = created.session.session_id;
+    let bound = asked.created_at_ms.get() + 1;
+    let only_this_session = || SessionSelector::These {
+        session_ids: [session_id].into_iter().collect(),
+    };
+
+    // The device the owner shares with, paired to see this session.
+    let named = Device::create(&loopback()).await;
+    let named_record = pair_with(
+        &daemon,
+        &named,
+        &owner,
+        proposing(&[ActionRight::SessionView], only_this_session()),
+    )
+    .await;
+
+    // The owner shares the session with it, reaching back to just after the question and naming
+    // it, and is shown the question as the worker holds it.
+    let selection = kr_protocol::sharing::RoleSelection {
+        history_from_cursor_ms: Nullable::some(kr_protocol::scalars::TimestampMs::new(bound)),
+        named_questions: [asked.question_id].into_iter().collect(),
+        ..kr_protocol::sharing::RoleSelection::plain(kr_protocol::sharing::SessionRole::Viewer)
+    };
+    let share = kr_protocol::sharing::GrantCreateParams {
+        session_id,
+        recipient_device_id: named_record.device_id,
+        parent_grant_id: Nullable::null(),
+        accepted_notices: kr_protocol::sharing::AuthorityNotice::for_actions(&selection.actions()),
+        selection,
+        lifetime_ms: Nullable::null(),
+        owner_confirmation: Nullable::null(),
+    };
+    let issued: kr_protocol::sharing::GrantCreateResult = local
+        .mutate(
+            Method::GrantCreate,
+            ActionId::new(kr_ipc::new_uuid()),
+            target.clone(),
+            &share,
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .expect("the share is written")
+        .to_typed()
+        .expect("decodes");
+    assert_eq!(
+        issued.preview.named_questions,
+        vec![kr_protocol::sharing::NamedQuestionPreview {
+            question_id: asked.question_id,
+            revision: asked.revision,
+            question: asked.question.clone(),
+            created_at_ms: asked.created_at_ms,
+        }]
+    );
+
+    // The device holds the grant the invitation carries.
+    let redeemed = daemon
+        .controller
+        .sharing()
+        .redeem(
+            issued.preview.invitation_id,
+            named_record.device_id,
+            kr_ipc::now_ms().get(),
+        )
+        .expect("the invitation is redeemed");
+    let named_record = DeviceRecord {
+        grant: redeemed,
+        ..named_record
+    };
+    daemon
+        .network
+        .devices()
+        .commit(&named_record)
+        .expect("the device holds the grant");
+    let questions = kr_protocol::question::QuestionReadParams {
+        session_id,
+        question_id: Nullable::null(),
+        include_resolved: true,
+    };
+    let session = connect(&daemon, &named, &named_record).await;
+    let read: kr_protocol::question::QuestionReadResult = session
+        .read(Method::QuestionRead, &questions)
+        .await
+        .expect("the named device reads the questions");
+    assert_eq!(asked_ids(&read), vec![asked.question_id]);
+    session.close();
+
+    // A device whose grant reaches back to the same moment and names nothing reads none of it.
+    let unnamed = Device::create(&loopback()).await;
+    let mut reaching = proposing(&[ActionRight::SessionView], only_this_session());
+    reaching.history.lower_bound_ms = Nullable::some(kr_protocol::scalars::TimestampMs::new(bound));
+    let unnamed_record = pair_with(&daemon, &unnamed, &owner, reaching).await;
+    let unnamed_session = connect(&daemon, &unnamed, &unnamed_record).await;
+    let read: kr_protocol::question::QuestionReadResult = unnamed_session
+        .read(Method::QuestionRead, &questions)
+        .await
+        .expect("the read is answered");
+    assert!(asked_ids(&read).is_empty(), "{read:?}");
+    unnamed_session.close();
+
+    // The owner answers the question; the named device no longer reads it, and the owner does.
+    let _: kr_protocol::question::QuestionResolveResult = reader
+        .mutate(
+            Method::QuestionAnswer,
+            ActionId::new(kr_ipc::new_uuid()),
+            target.clone(),
+            &kr_protocol::question::QuestionAnswerParams {
+                session_id,
+                question_id: asked.question_id,
+                expected_revision: asked.revision,
+                answer: kr_protocol::question::QuestionAnswer::Decision { decided: true },
+            },
+        )
+        .await
+        .expect("the call reaches the worker")
+        .expect("the owner answers")
+        .to_typed()
+        .expect("decodes");
+    let session = connect(&daemon, &named, &named_record).await;
+    let read: kr_protocol::question::QuestionReadResult = session
+        .read(Method::QuestionRead, &questions)
+        .await
+        .expect("the named device reads the questions");
+    assert!(asked_ids(&read).is_empty(), "{read:?}");
+    session.close();
+    let owners: kr_protocol::question::QuestionReadResult = reader
+        .request(Method::QuestionRead, &questions)
+        .await
+        .expect("the call reaches the worker")
+        .expect("the owner reads the questions")
+        .to_typed()
+        .expect("decodes");
+    assert_eq!(asked_ids(&owners), vec![asked.question_id]);
+
+    drop(reader);
+    drop(terminal);
+    close_session(&mut local, &host, session_id).await;
+    daemon.stop().await;
+}

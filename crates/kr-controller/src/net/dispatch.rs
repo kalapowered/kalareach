@@ -332,3 +332,6 @@ mod tests;
 
 #[cfg(test)]
 mod write_boundary;
+
+#[cfg(test)]
+mod a_share_that_names_a_current_decision;

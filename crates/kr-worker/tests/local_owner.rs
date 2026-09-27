@@ -50,11 +50,16 @@ use kr_protocol::hello::PROTOCOL_VERSION;
 use kr_protocol::identity::{DesktopBinding, WorkerProfile};
 use kr_protocol::ids::{
     ActionId, ActionWindowId, ActorId, AttachmentId, AuthorityRevision, BuildId, ConnectionId,
-    ControllerGeneration, DeviceId, GrantId, InputLeaseEpoch, RequestId, SessionEpoch, SessionId,
+    ControllerGeneration, DeviceId, GrantId, InputLeaseEpoch, QuestionId, RequestId, SessionEpoch,
+    SessionId,
 };
 use kr_protocol::input::InputAcquireParams;
 use kr_protocol::local::{ControllerConnectionRole, ForwardedRequest, LocalClientKind};
 use kr_protocol::method::{Method, MethodVersion};
+use kr_protocol::question::{
+    Question, QuestionAnswer, QuestionAnswerParams, QuestionCreateParams, QuestionKind,
+    QuestionReadParams, QuestionReadResult,
+};
 use kr_protocol::receipt::{ActionCancelParams, Receipt, ReceiptState, RejectionReason};
 use kr_protocol::recovery::{
     EventStream, EventsSubscribeParams, HistoryPageParams, HistoryPageResult, OutputEvent,
@@ -273,6 +278,17 @@ fn forwarded_read(
         actor: actor.clone(),
         history,
     }))
+}
+
+/// The questions a question read was answered with, in the order it gave them.
+fn asked(answered: ParamsValue) -> Vec<QuestionId> {
+    answered
+        .to_typed::<QuestionReadResult>()
+        .expect("a question read")
+        .questions
+        .into_iter()
+        .map(|question| question.question_id)
+        .collect()
 }
 
 /// A grant's history scope that reaches back to `lower_bound_ms`, or that retains no history, and
@@ -653,6 +669,105 @@ impl Wired {
             .expect("the session is read")
             .to_typed()
             .expect("a session read")
+    }
+
+    /// Has an application inside the session ask a question, `asked_ms_ago` milliseconds ago, and
+    /// returns it as the worker holds it.
+    ///
+    /// It is asked through the session's own question ledger, as the worker records one a verified
+    /// source asked, so it can be dated before a grant's history bound.
+    fn ask(&self, request: &str, asked_ms_ago: u64) -> Question {
+        let source = kr_worker::questions::binding::VerifiedSource {
+            process: kr_ipc::identity::current_process_start_identity()
+                .expect("a process identity"),
+            executable: Some("kr-test-agent".to_owned()),
+            session_member: true,
+            ancestry: true,
+            launch_channel: true,
+            connection_id: ConnectionId::new(Uuid::from_bytes([7; 16])),
+        };
+        let params = QuestionCreateParams {
+            session_id: self.session_id,
+            request_id: request.to_owned(),
+            agent_name: Nullable::some("kr-test-agent".to_owned()),
+            context: "The build finished with two failing tests.".to_owned(),
+            question: format!("Push the branch anyway? ({request})"),
+            kind: QuestionKind::Confirm,
+            choices: Vec::new(),
+            requested_expiry_ms: Nullable::some(kr_protocol::scalars::DurationMs::new(3_600_000)),
+            wait_ms: Nullable::null(),
+        };
+        let asked_at = kr_worker::questions::Now {
+            utc_ms: TimestampMs::new(kr_ipc::now_ms().get() - asked_ms_ago),
+            boot_ms: kr_ipc::clock::boot_elapsed_ms() - asked_ms_ago,
+        };
+        self.service
+            .questions()
+            .create(&source, &params, asked_at)
+            .expect("the question is asked")
+            .0
+            .question
+    }
+
+    /// Has the owner answer `question` now, which resolves it.
+    fn resolve(&self, question: &Question) {
+        self.service
+            .questions()
+            .answer(
+                &ActorId::new("local:the-owner").expect("an actor"),
+                None,
+                &QuestionAnswerParams {
+                    session_id: self.session_id,
+                    question_id: question.question_id,
+                    expected_revision: question.revision,
+                    answer: QuestionAnswer::Decision { decided: true },
+                },
+                kr_worker::questions::Now {
+                    utc_ms: kr_ipc::now_ms(),
+                    boot_ms: kr_ipc::clock::boot_elapsed_ms(),
+                },
+            )
+            .expect("the question is answered");
+    }
+
+    /// A read of the session's questions, resolved ones included, or of the one it names.
+    fn question_read(&self, request_id: RequestId, question_id: Option<QuestionId>) -> Request {
+        Request {
+            request_id,
+            method: Method::QuestionRead.into(),
+            method_version: MethodVersion::V1,
+            params: ParamsValue::from_typed(&QuestionReadParams {
+                session_id: self.session_id,
+                question_id: Nullable(question_id),
+                include_resolved: true,
+            })
+            .expect("encodes"),
+        }
+    }
+
+    /// Forwards a question read for `actor`, with the history scope the daemon decided it under
+    /// when one travels with it, and returns the questions it is answered with.
+    async fn questions_for(
+        &self,
+        daemon: &mut LocalClient,
+        actor: &ActorEnvelope,
+        history: Option<HistoryScope>,
+        question_id: Option<QuestionId>,
+    ) -> Result<Vec<QuestionId>, ProtocolError> {
+        let request_id = next_request();
+        let frame = forwarded_read(actor, self.question_read(request_id, question_id), history);
+        answer(daemon, frame, request_id).await.map(asked)
+    }
+
+    /// Reads the session's questions in one of the owner's windows.
+    async fn questions_in(&self, window: &mut LocalClient) -> Vec<QuestionId> {
+        let request_id = next_request();
+        let frame = ControlFrame::Request(self.question_read(request_id, None));
+        asked(
+            answer(window, frame, request_id)
+                .await
+                .expect("the questions are read"),
+        )
     }
 
     /// Reads the session in one of the owner's windows.
@@ -1319,6 +1434,125 @@ async fn the_local_owner_reads_the_last_command_on_either_socket() {
     assert_eq!(
         read.last_command_block.0.map(|block| block.command),
         Some("cargo test".to_owned())
+    );
+
+    drop((window, proxy));
+    wired.close();
+}
+
+// ---------------------------------------------------------------------------------------------
+// KR-REQ-10.51: the questions a caller reads
+// ---------------------------------------------------------------------------------------------
+
+/// KR-REQ-10.51: a caller the daemon heard on its local socket, acting under a grant, reads the
+/// questions its grant's history scope admits and no others, and so does a paired device.
+///
+/// A question is session content: what an application asked and, once it is answered, the answer.
+/// One asked at or after the moment the scope reaches back to is read in any state. One the grant
+/// names is read however early it was asked, but only while it is open: the grant permits that
+/// current decision, not the record it leaves once decided. Everything else is withheld. A read
+/// naming a question outside the scope is refused, and a read whose scope did not come with it is
+/// refused with the reason rather than answered with everything.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_local_caller_under_a_grant_reads_only_the_questions_its_scope_admits() {
+    let wired = wired("sleep 120").await;
+    // Three questions asked a minute ago, and two asked now; one of each pair is answered.
+    let unnamed = wired.ask("unnamed", 60_000);
+    let named = wired.ask("named", 60_000);
+    let named_answered = wired.ask("named-answered", 60_000);
+    let bound = kr_ipc::now_ms().get() - 30_000;
+    let later = wired.ask("later", 0);
+    let later_answered = wired.ask("later-answered", 0);
+    wired.resolve(&named_answered);
+    wired.resolve(&later_answered);
+    let scope = HistoryScope {
+        named_questions: [named.question_id, named_answered.question_id]
+            .into_iter()
+            .collect(),
+        ..reaching(Some(bound))
+    };
+    let admitted = vec![
+        named.question_id,
+        later.question_id,
+        later_answered.question_id,
+    ];
+
+    for caller in [local_under_a_grant(1), device(1)] {
+        let mut proxy = wired.daemon(ControllerConnectionRole::Proxy).await;
+        assert_eq!(
+            wired
+                .questions_for(&mut proxy, &caller, Some(scope.clone()), None)
+                .await
+                .expect("the questions are read"),
+            admitted,
+            "the named open question and those asked after the bound, and nothing else, for \
+             {:?}",
+            caller.ingress
+        );
+        // Named one at a time: the open one it names is read, and the one it names that has been
+        // answered, and the one it never named, are refused as outside the scope.
+        assert_eq!(
+            wired
+                .questions_for(
+                    &mut proxy,
+                    &caller,
+                    Some(scope.clone()),
+                    Some(named.question_id)
+                )
+                .await
+                .expect("the named open question is read"),
+            vec![named.question_id]
+        );
+        for outside in [&named_answered, &unnamed] {
+            let refused = wired
+                .questions_for(
+                    &mut proxy,
+                    &caller,
+                    Some(scope.clone()),
+                    Some(outside.question_id),
+                )
+                .await
+                .expect_err("a question outside the scope is not read");
+            assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
+        }
+        // No scope came with the read: nothing here can hold it to the grant, so it is refused.
+        let refused = wired
+            .questions_for(&mut proxy, &caller, None, None)
+            .await
+            .expect_err("a read under a grant whose scope did not come is refused");
+        assert_eq!(
+            refused.code,
+            ErrorCode::UnsupportedCapability,
+            "{refused:?}"
+        );
+        drop(proxy);
+    }
+    wired.close();
+}
+
+/// KR-REQ-10.51: the local owner reads every question, answered ones included, on either socket,
+/// as it always did.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_local_owner_reads_every_question_on_either_socket() {
+    let wired = wired("sleep 120").await;
+    let earlier = wired.ask("earlier", 60_000);
+    let answered = wired.ask("answered", 60_000);
+    let later = wired.ask("later", 0);
+    wired.resolve(&answered);
+    let every = vec![earlier.question_id, answered.question_id, later.question_id];
+
+    // In one of its own windows.
+    let mut window = wired.window().await;
+    assert_eq!(wired.questions_in(&mut window).await, every);
+
+    // And as the daemon forwards it, with no scope, since it acts under no grant.
+    let mut proxy = wired.daemon(ControllerConnectionRole::Proxy).await;
+    assert_eq!(
+        wired
+            .questions_for(&mut proxy, &the_owner_forwarded(), None, None)
+            .await
+            .expect("the owner reads the questions"),
+        every
     );
 
     drop((window, proxy));
