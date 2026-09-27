@@ -1594,7 +1594,8 @@ async fn the_voice_grant_seam_writes_only_under_the_admission_every_service_asks
             .records_for_device(device_id)
             .expect("the store answers")
     };
-    let admission = |carried| super::VoiceAdmission::new(Arc::clone(&controller), carried);
+    let admission =
+        |carried| super::voice_actions::VoiceAdmission::new(Arc::clone(&controller), carried);
     let not_this = || ControllerError::InvalidArgument("not the refusal".to_owned());
 
     // A fence owed after the admission: nothing is written, and the fence is what the caller
@@ -1685,7 +1686,8 @@ async fn a_voice_grants_withdrawal_through_the_seam_fences_nothing() {
         controller.sharing.host_device_id(),
         Arc::downgrade(&controller),
     );
-    let admission = |carried| super::VoiceAdmission::new(Arc::clone(&controller), carried);
+    let admission =
+        |carried| super::voice_actions::VoiceAdmission::new(Arc::clone(&controller), carried);
     let revision = || {
         let controller = Arc::clone(&controller);
         async move {
@@ -1807,7 +1809,7 @@ async fn a_voice_grants_withdrawal_through_the_seam_fences_nothing() {
 /// store itself.
 #[derive(Debug)]
 struct AskedUnderTheStoreLock {
-    admission: super::VoiceAdmission,
+    admission: super::voice_actions::VoiceAdmission,
     database: std::path::PathBuf,
     held: Mutex<Vec<bool>>,
 }
@@ -1855,7 +1857,7 @@ async fn the_voice_grant_seam_asks_its_admission_while_the_store_holds_its_write
         Arc::downgrade(&controller),
     );
     let probe = |carried| AskedUnderTheStoreLock {
-        admission: super::VoiceAdmission::new(Arc::clone(&controller), carried),
+        admission: super::voice_actions::VoiceAdmission::new(Arc::clone(&controller), carried),
         database: controller.paths.registry_database(),
         held: Mutex::new(Vec::new()),
     };

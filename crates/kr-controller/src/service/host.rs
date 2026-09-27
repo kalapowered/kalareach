@@ -1,0 +1,590 @@
+//! The host's own reads and records: host information, the environments, the doctor, agent tools.
+
+use std::path::Path;
+use std::sync::Arc;
+
+use kr_protocol::envelope::{MutationRequest, ParamsValue};
+use kr_protocol::hello::PROTOCOL_VERSION;
+use kr_protocol::hostinfo::export::{ContentClass, Sentence};
+use kr_protocol::hostinfo::{
+    DoctorCheck, DoctorStatus, EnvironmentListResult, EnvironmentSummary, HostDoctorResult,
+    HostInfoResult,
+};
+use kr_protocol::identity::WorkerProfile;
+use kr_protocol::ids::ActorId;
+use kr_protocol::method::Method;
+use kr_protocol::scalars::{Nullable, U64};
+
+use crate::error::{ControllerError, Result};
+
+use super::{Controller, encode, parse, wall_clock_ms};
+
+/// How long the doctor gives the reading of the installed packages and of the executables their
+/// commands name: an agent's executable can be a large file.
+const DOCTOR_READS: std::time::Duration = std::time::Duration::from_secs(30);
+
+impl Controller {
+    /// Reports what is installed for one agent.
+    pub(super) fn agent_tools_status(&self, params: &ParamsValue) -> Result<ParamsValue> {
+        let params: kr_protocol::skill::AgentToolsParams = parse(params)?;
+        encode(&self.installer()?.status(&params)?)
+    }
+
+    /// Installs or removes the contact skill for one agent.
+    ///
+    /// An installation changes files, so it runs under section 9's receipt contract: the same
+    /// action retried returns what it produced the first time rather than repeating the change,
+    /// the same identifier with a different payload is `ID_CONFLICT`, and a marker written before
+    /// the change with no outcome after it is `unknown` rather than something to do again. What
+    /// can be refused without touching anything is refused before the marker.
+    ///
+    /// `carried` is the admission the change was accepted under, asked at the marker.
+    pub(super) async fn agent_tools_change(
+        &self,
+        actor_id: &ActorId,
+        mutation: &MutationRequest,
+        method: Method,
+        carried: crate::authority::AdmittedMutation,
+    ) -> Result<ParamsValue> {
+        let params: kr_protocol::skill::AgentToolsParams = parse(&mutation.params)?;
+        let installer = self.installer()?;
+        let digest = kr_protocol::digest::mutation_digest(mutation, actor_id)
+            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+        // From here to the recorded outcome is one sequence. Two callers cannot both find no
+        // record and both change the same files.
+        let _admission = self.agent_tools.lock().await;
+        // Waiting for that lock takes time, and what happens next is either a read of somebody's
+        // completed action or a change to their files. Both need current authority, so it is
+        // checked here rather than before the wait.
+        self.authorised(carried.connection_id)?;
+        if let Some(retained) = installer.retained(actor_id, mutation.action_id, &digest)? {
+            return Ok(retained);
+        }
+        // What either change can refuse without touching anything, refused here: the platform, the
+        // scope, a file or entry this host did not write, a record it cannot read, a document whose
+        // protection it cannot keep. A refusal after the marker below would be reported as a change
+        // whose outcome nobody knows, for a change that never began.
+        match method {
+            Method::AgentToolsInstall => installer.check(&params)?,
+            Method::AgentToolsRemove => installer.check_removal(&params)?,
+            _ => {
+                return Err(ControllerError::InvalidArgument(format!(
+                    "{} is not an installation this daemon serves",
+                    method.as_str()
+                )));
+            }
+        }
+        // A change carrying no freshness at all is refused. This path answers its own retained
+        // actions above, so anything still travelling is a first admission, and a first admission
+        // needs a deadline it was admitted under.
+        if carried.deadline.is_none() {
+            return Err(ControllerError::WindowExpired {
+                detail: "this installation carries no freshness, so it may be answered from what \
+                         this host holds and may not change anything"
+                    .to_owned(),
+            });
+        }
+        // Everything above can wait: for this task to be scheduled, for the lock, for the checks
+        // to read the agent's tree. The admission this change was accepted under is asked after
+        // those waits, and the dispatch marker is written while this daemon's connection table is
+        // held, so a revocation cannot complete between the answer and the marker: withdrawing a
+        // registration takes the same lock. The answer is the check every service asks from
+        // inside its work: a fence this host owes and could not raise, the connection's
+        // registration under the revision it was admitted at, then the deadline.
+        let registrations = self.admitted_table();
+        self.check_registration_in(&registrations, &carried)?;
+        installer.mark_dispatching(actor_id, mutation.action_id, &digest)?;
+        drop(registrations);
+        let result = match method {
+            Method::AgentToolsInstall => encode(&installer.install(&params)?)?,
+            Method::AgentToolsRemove => encode(&installer.remove(&params)?)?,
+            _ => {
+                return Err(ControllerError::InvalidArgument(format!(
+                    "{} is not an installation this daemon serves",
+                    method.as_str()
+                )));
+            }
+        };
+        installer.settle(actor_id, mutation.action_id, &digest, &result)?;
+        Ok(result)
+    }
+
+    /// Returns the installer, which keeps this host's record of what it wrote.
+    pub(super) fn installer(&self) -> Result<crate::agent_tools::Installer> {
+        crate::agent_tools::Installer::discover(self.paths.state_dir())
+    }
+
+    pub(super) async fn host_info(self: &Arc<Self>) -> Result<HostInfoResult> {
+        // Asking what this host is configured as is what puts its configuration into force, the
+        // same way asking for its diagnostics is. Reading the numbers without accepting the
+        // document first is how this answer comes to name a session ceiling or a sleep policy a
+        // later reading has already replaced.
+        drop(self.accept_configuration().await);
+        let registry = self.registry.lock().await;
+        let live = registry.occupancy()?;
+        let limit = registry.session_limit()?;
+        drop(registry);
+        Ok(HostInfoResult {
+            build_id: self.build_id.clone(),
+            protocol_version: PROTOCOL_VERSION,
+            environment_id: self.paths.environment_id(),
+            generation: self.generation,
+            boot_identity: self.boot_identity.clone(),
+            started_at_ms: self.started_at_ms,
+            live_sessions: U64::new(live),
+            session_limit: U64::new(limit),
+            default_worker_profile: self.default_profile().await,
+            power: self.power_state().await,
+        })
+    }
+
+    pub(super) async fn environment_list(&self) -> Result<EnvironmentListResult> {
+        let registry = self.registry.lock().await;
+        let live = registry.occupancy()?;
+        drop(registry);
+        Ok(EnvironmentListResult {
+            environments: vec![EnvironmentSummary {
+                environment_id: self.paths.environment_id(),
+                label: format!("{} on {}", whoami(), std::env::consts::OS),
+                os: std::env::consts::OS.to_owned(),
+                arch: std::env::consts::ARCH.to_owned(),
+                os_user: whoami(),
+                runtime_directory: self.paths.runtime_dir().display().to_string(),
+                state_directory: self.paths.state_dir().display().to_string(),
+                live_sessions: U64::new(live),
+            }],
+        })
+    }
+
+    /// Answers `environment.inventory` from this host's cache.
+    ///
+    /// Section 3: a listing reports what was last observed and starts nothing. Nothing here takes
+    /// an observer, so nothing here could ask the platform even by mistake.
+    pub(super) async fn environment_inventory(&self, params: &ParamsValue) -> Result<ParamsValue> {
+        let params: kr_protocol::identity::EnvironmentInventoryParams = parse(params)?;
+        let state_dir = self.paths.state_dir().to_path_buf();
+        let now_ms = wall_clock_ms();
+        let access = params.access.as_ref().copied();
+        let rows = tokio::task::spawn_blocking(move || {
+            crate::bridge::store::Store::with_locked(&state_dir, |store| {
+                Ok(store.list(access, now_ms))
+            })
+        })
+        .await
+        .map_err(|error| ControllerError::supervision(error.to_string()))??;
+        encode(&kr_protocol::identity::EnvironmentInventoryResult { rows })
+    }
+
+    /// Answers the three mutations that change this host's enrolled environments.
+    ///
+    /// Only a refresh reaches the platform, and only when the request asked it to start the
+    /// environment it selected. Enrolling and forgetting change the record and nothing else.
+    pub(super) async fn environment_record(
+        &self,
+        actor: &kr_protocol::actor::ActorEnvelope,
+        mutation: &MutationRequest,
+        method: Method,
+    ) -> Result<ParamsValue> {
+        use kr_protocol::identity::{
+            EnvironmentEnrolParams, EnvironmentEnrolResult, EnvironmentForgetParams,
+            EnvironmentForgetResult, EnvironmentRefreshParams, EnvironmentRefreshResult,
+        };
+
+        let state_dir = self.paths.state_dir().to_path_buf();
+        let now_ms = wall_clock_ms();
+        match method {
+            Method::EnvironmentEnrol => {
+                let params: EnvironmentEnrolParams = parse(&mutation.params)?;
+                let row = tokio::task::spawn_blocking(move || {
+                    crate::bridge::store::Store::with_locked(&state_dir, |store| {
+                        store.enrol(params.enrolment, now_ms)
+                    })
+                })
+                .await
+                .map_err(|error| ControllerError::supervision(error.to_string()))??;
+                encode(&EnvironmentEnrolResult { row })
+            }
+            Method::EnvironmentForget => {
+                let params: EnvironmentForgetParams = parse(&mutation.params)?;
+                let forgotten = tokio::task::spawn_blocking(move || {
+                    crate::bridge::store::Store::with_locked(&state_dir, |store| {
+                        store.forget(params.environment_id)
+                    })
+                })
+                .await
+                .map_err(|error| ControllerError::supervision(error.to_string()))??;
+                encode(&EnvironmentForgetResult { forgotten })
+            }
+            Method::EnvironmentRefresh => {
+                let params: EnvironmentRefreshParams = parse(&mutation.params)?;
+                let environment_id = params.environment_id;
+
+                // An access class that is not a process bridge is answered from the record alone.
+                // Asking the platform first would fail for it, because there is no launcher to ask
+                // with, and the answer a person needs is that this environment is reached another
+                // way rather than that a command was missing.
+                let reading = state_dir.clone();
+                let cached = tokio::task::spawn_blocking(move || {
+                    crate::bridge::store::Store::with_locked(&reading, |store| {
+                        store.row_of(environment_id, now_ms).ok_or_else(|| {
+                            ControllerError::InvalidArgument(format!(
+                                "this host has no enrolled environment {environment_id}"
+                            ))
+                        })
+                    })
+                })
+                .await
+                .map_err(|error| ControllerError::supervision(error.to_string()))??;
+                if !cached.enrolment.access.is_process_bridge() {
+                    let connection = format!(
+                        "{} is not reached by a process bridge, so none was opened",
+                        cached.enrolment.access.as_str()
+                    );
+                    return encode(&EnvironmentRefreshResult {
+                        row: cached,
+                        started: false,
+                        verification: Nullable::null(),
+                        connection,
+                    });
+                }
+
+                let observing = state_dir.clone();
+                // The platform command is a blocking one, and it is run on a blocking thread so a
+                // distribution that takes seconds to start does not hold this runtime.
+                let refreshed = tokio::task::spawn_blocking(move || {
+                    crate::bridge::store::Store::with_locked(&observing, |store| {
+                        store.refresh(
+                            params.environment_id,
+                            params.start,
+                            &crate::bridge::platform::PlatformObserver,
+                            now_ms,
+                        )
+                    })
+                })
+                .await
+                .map_err(|error| ControllerError::supervision(error.to_string()))??;
+                let crate::bridge::store::Refreshed {
+                    mut row,
+                    started,
+                    instance,
+                } = refreshed;
+
+                // Only a running environment is worth opening a bridge to, and only a process
+                // bridge has one to open. Everything else says so rather than starting anything:
+                // section 3 leaves starting to the caller that asked for it.
+                let (verification, connection) = if row.status
+                    != kr_protocol::identity::EnvironmentPresence::Running
+                {
+                    (
+                        Nullable::null(),
+                        "no bridge was opened, because this environment is not running; refresh \
+                         with --start to start it"
+                            .to_owned(),
+                    )
+                } else {
+                    let opened_for = row.enrolment.clone();
+                    match crate::bridge::verify::through_bridge(
+                        actor,
+                        &opened_for,
+                        self.paths.environment_id(),
+                        self.build_id.clone(),
+                    )
+                    .await
+                    {
+                        Ok(verification) => {
+                            // The destination answered on its own local channel, inside its own
+                            // environment. That is section 25's scoped channel, established rather
+                            // than assumed, so the record keeps it — against the approved record
+                            // the bridge was opened for, which another caller may have replaced
+                            // since.
+                            let outcome = record_outcome(
+                                &state_dir,
+                                environment_id,
+                                instance,
+                                crate::bridge::store::BridgeAnswer::Answered,
+                                now_ms,
+                            )
+                            .await?;
+                            // The record decides, including when it has gone: the readiness that
+                            // comes back is read from it after the result was written.
+                            row.readiness = outcome.readiness;
+                            let detail = if outcome.established {
+                                format!(
+                                    "environment {} answered as {} over its own local channel",
+                                    verification.environment_id, verification.os_user
+                                )
+                            } else {
+                                "this environment's record changed while the bridge was open, so \
+                                 what answered says nothing about what is recorded now"
+                                    .to_owned()
+                            };
+                            (Nullable::some(verification), detail)
+                        }
+                        Err(refusal) => {
+                            // Nothing answered. What an earlier bridge established for this record
+                            // is not evidence about it any more, so it is taken back rather than
+                            // left standing beside a failure.
+                            let outcome = record_outcome(
+                                &state_dir,
+                                environment_id,
+                                instance,
+                                crate::bridge::store::BridgeAnswer::Refused,
+                                now_ms,
+                            )
+                            .await?;
+                            row.readiness = outcome.readiness;
+                            (Nullable::null(), refusal.to_string())
+                        }
+                    }
+                };
+                encode(&EnvironmentRefreshResult {
+                    row,
+                    started,
+                    verification,
+                    connection,
+                })
+            }
+            other => Err(ControllerError::InvalidArgument(format!(
+                "{} is not an environment record this daemon changes",
+                other.as_str()
+            ))),
+        }
+    }
+
+    pub(super) async fn host_doctor(self: &Arc<Self>) -> Result<HostDoctorResult> {
+        let mut checks = Vec::new();
+        checks.push(DoctorCheck::new(
+            "runtime-directory",
+            "The runtime directory is owner-only",
+            DoctorStatus::Ok,
+            Sentence::new()
+                .stated("created with owner-only permissions and verified on every open: ")
+                .withheld(
+                    ContentClass::Path,
+                    &self.paths.runtime_dir().display().to_string(),
+                ),
+            None,
+        ));
+        checks.push(DoctorCheck::new(
+            "supervisor",
+            "Workers outlive this daemon",
+            DoctorStatus::Ok,
+            Sentence::new().stated(self.supervisor.describe()),
+            None,
+        ));
+        let directory = self.directory.lock().await;
+        let quarantined = directory.quarantined.len();
+        let verified = directory.verified.len();
+        drop(directory);
+        checks.push(DoctorCheck::new(
+            "workers",
+            "Every published descriptor answered its challenge",
+            if quarantined == 0 {
+                DoctorStatus::Ok
+            } else {
+                DoctorStatus::Warning
+            },
+            Sentence::new()
+                .number(verified as u64)
+                .stated(" verified, ")
+                .number(quarantined as u64)
+                .stated(" quarantined"),
+            (quarantined > 0).then_some(
+                "A quarantined descriptor is never used. Remove it once its session is known to \
+                 be gone.",
+            ),
+        ));
+        // One acceptance, one reading, and every configuration line below comes from it. The
+        // sleep policy asking the document a second time is how a check and the report it sits
+        // beside come to disagree about the same file.
+        let accepted = self.accept_configuration().await;
+        let power = self.power_state().await;
+        let resolved = accepted.resolver.sleep_inhibition(None);
+        let enabled = accepted.resolver.command_integrations().value;
+        checks.push(DoctorCheck::new(
+            "sleep-setting",
+            "This host's sleep policy is the owner's choice",
+            DoctorStatus::Ok,
+            Self::sleep_setting_detail(&power, &resolved),
+            (power.setting == kr_protocol::desktop::SleepInhibitionSetting::Off).then_some(
+                "kr host power --set mains_only keeps this host awake for work it has admitted, \
+                 while it is on mains power.",
+            ),
+        ));
+        for entry in crate::desktop::persistence(self.supervisor.describe()) {
+            checks.push(DoctorCheck::new(
+                match entry.profile {
+                    WorkerProfile::DesktopBound => "logout-desktop_bound",
+                    WorkerProfile::HeadlessUser => "logout-headless_user",
+                },
+                match entry.profile {
+                    WorkerProfile::DesktopBound => "What a logout does to a desktop-bound session",
+                    WorkerProfile::HeadlessUser => "What a logout does to a headless session",
+                },
+                DoctorStatus::Ok,
+                Sentence::new()
+                    .stated(entry.persistence.as_str())
+                    .stated(" through ")
+                    .stated_value(entry.mechanism())
+                    .stated(": ")
+                    .stated_value(entry.detail()),
+                None,
+            ));
+        }
+        let pending = self.revision_pending().await?;
+        checks.push(DoctorCheck::new(
+            "authority-revision",
+            "Every worker holds this environment's authority revision",
+            if pending.is_empty() {
+                DoctorStatus::Ok
+            } else {
+                DoctorStatus::Warning
+            },
+            Sentence::new()
+                .number(pending.len() as u64)
+                .stated(" of ")
+                .number(verified as u64)
+                .stated(" pending"),
+            (!pending.is_empty()).then_some(
+                "A revocation is complete for a worker once it acknowledges the revision or is \
+                 confirmed ended.",
+            ),
+        ));
+        // The configuration, its precedence, its overrides and its ceilings. After the checks
+        // above because those are about whether this host is working; these are about what it is
+        // working from.
+        // The budgets the catalogue acts on, which the acceptance above put in force.
+        let budgets = accepted.budgets.value;
+        let effective = self.report_configuration(&accepted).await;
+        // What the running network and voice services are doing, read from them, against what
+        // the same reading of the document selects, so an edit that applies at the next start
+        // says so.
+        let network = crate::config::network_check(
+            &self.started,
+            accepted.resolver.loaded().document.as_ref(),
+            crate::config::Running {
+                network: self.network_guard().map(|guard| {
+                    crate::config::RunningNetwork::of(guard.endpoint(), guard.bound_sockets().len())
+                }),
+                names_a_broker: !self.voice().broker_origin().is_empty(),
+            },
+        );
+        drop(accepted);
+        checks.extend(crate::config::checks(&effective));
+        checks.push(network);
+        checks.push(DoctorCheck::new(
+            "configuration-secrets",
+            "Secrets are named references, never configuration exports",
+            DoctorStatus::Ok,
+            crate::config::secret_line(&effective),
+            None,
+        ));
+        // The shared section 11 capability evidence the catalogue contributes, read now.
+        // `NotApplicable` with the reason stated while nothing is enrolled, rather than a claim
+        // about a catalogue this host does not have.
+        let evidence = self.catalogue_evidence().await;
+        checks.push(crate::config::catalogue::check(Some(&evidence), budgets));
+        // Section 7: the resolved executable, flags, version and integration mode of each command
+        // integration, from the admissions in force and the configuration this reading accepted.
+        let (integrations_check, integrations) = self.command_integration_report(enabled).await;
+        checks.push(integrations_check);
+        Ok(HostDoctorResult::new(checks, effective).with_command_integrations(integrations))
+    }
+
+    /// Every command integration an admitted release declares, and every package the configuration
+    /// names, with the doctor's check of them, read from the admissions in force by a worker's own
+    /// rules.
+    ///
+    /// The executable is looked for on this daemon's own search path, the one the native bridge
+    /// reads, and read to find the version a signed record names for it. Where the admissions
+    /// cannot be computed or their packages read, each package the configuration names is reported
+    /// unknown, and the check says why.
+    async fn command_integration_report(
+        &self,
+        enabled: Vec<String>,
+    ) -> (
+        kr_protocol::hostinfo::DoctorCheck,
+        Vec<kr_protocol::hostinfo::CommandIntegrationReport>,
+    ) {
+        let snapshot = self.current_snapshot(tokio::time::Instant::now()).await;
+        let unread = snapshot.is_none();
+        let host = crate::catalogue::integrations::Host {
+            search_path: std::env::var_os("PATH")
+                .map(|path| std::env::split_paths(&path).collect())
+                .unwrap_or_default(),
+            backends: kr_worker::broker::process::ManagedProcess::publishes_credential_file(),
+            // A worker runs an integrated invocation through the launcher beside it, held to the
+            // rule the worker holds it to.
+            launcher: self.worker_program.parent().is_some_and(|directory| {
+                kr_worker::broker::commands::runnable(&directory.join(if cfg!(windows) {
+                    "kr-hook.exe"
+                } else {
+                    "kr-hook"
+                }))
+            }),
+        };
+        let integrations = Arc::clone(&self.integrations);
+        let reported = {
+            let enabled = enabled.clone();
+            tokio::task::spawn_blocking(move || {
+                let reading = snapshot
+                    .as_ref()
+                    .map(|snapshot| integrations.read(&snapshot.packages));
+                let left_out = snapshot
+                    .as_ref()
+                    .map_or(&[][..], |snapshot| snapshot.left_out.as_slice());
+                crate::catalogue::integrations::report(reading.as_ref(), left_out, &enabled, &host)
+            })
+        };
+        match tokio::time::timeout(DOCTOR_READS, reported).await {
+            // Admissions that could not be computed say nothing of what is installed.
+            Ok(Ok(reported)) if unread => (
+                crate::catalogue::integrations::unread_check(),
+                reported.reports,
+            ),
+            Ok(Ok(reported)) => (
+                crate::catalogue::integrations::check(&reported, &enabled),
+                reported.reports,
+            ),
+            // With nothing read there is nothing to resolve, so this does not block.
+            Ok(Err(_)) | Err(_) => (
+                crate::catalogue::integrations::unread_check(),
+                crate::catalogue::integrations::report(
+                    None,
+                    &[],
+                    &enabled,
+                    &crate::catalogue::integrations::Host::default(),
+                )
+                .reports,
+            ),
+        }
+    }
+}
+
+/// Writes what one opened bridge did to the enrolment record, and reads back what it says then.
+///
+/// The record is a file under a lock, so this runs on a blocking thread. Both of a refresh's
+/// branches come through here, which is why neither of them has a readiness of its own to assemble:
+/// what comes back is the record's own answer, taken after the result was written.
+async fn record_outcome(
+    state_dir: &Path,
+    environment_id: kr_protocol::ids::EnvironmentId,
+    opened_for: crate::bridge::store::EnrolmentInstance,
+    answer: crate::bridge::store::BridgeAnswer,
+    now_ms: u64,
+) -> Result<crate::bridge::store::BridgeOutcome> {
+    let state_dir = state_dir.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        crate::bridge::store::Store::with_locked(&state_dir, |store| {
+            store.record_bridge_outcome(environment_id, opened_for, answer, now_ms)
+        })
+    })
+    .await
+    .map_err(|error| ControllerError::supervision(error.to_string()))?
+}
+
+fn whoami() -> String {
+    std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_else(|_| format!("uid {}", kr_ipc::paths::current_uid()))
+}
