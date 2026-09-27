@@ -38,7 +38,7 @@ use kr_e2e_agents::observe::{
 use kr_e2e_agents::outcome::Outcome;
 use kr_e2e_agents::provenance::{Expected, NOT_PINNED, Provenance, StopSampling};
 use kr_e2e_agents::stage::{
-    AgentProcess, Installation, Installed, Keyboard, Owner, PROMPT, Replacement, Session,
+    AgentProcess, Context, Installation, Installed, Keyboard, Owner, PROMPT, Replacement, Session,
     closed_port, default_keychain_of_a_session, events_snapshot, free_port, inode_of, install,
     kill_daemon, launch, mapped_files, open_session, place_forwarder, prepare_home, runtime,
     session_variables, text_image,
@@ -379,6 +379,7 @@ fn staged(
                 };
                 watched_evidence = Some(json!({
                     "files": entries,
+                    "searched_for": { "mark": mark, "run_directory": root_text },
                     "keychain_item_rewritten": rewritten,
                     "config_directory_removed": config_gone,
                 }));
@@ -726,6 +727,19 @@ fn prepare(stage: &Stage<'_, '_>, prefix: &Path) -> (Installation, Vec<(String, 
     (installation, variables)
 }
 
+/// Where a part's sessions run: in the person's desktop for an agent whose login is a keychain
+/// item, and in the host's headless context otherwise.
+fn context_of(stage: &Stage<'_, '_>) -> Context {
+    if stage
+        .login
+        .is_some_and(|login| login.account.login_keychain)
+    {
+        Context::Desktop
+    } else {
+        Context::Headless
+    }
+}
+
 /// Starts the agent in a managed session of its own, and first its server where its terminal
 /// route has one.
 fn start_agent(stage: &Stage<'_, '_>, variables: &[(String, String)], what: &str) -> Agent {
@@ -750,6 +764,7 @@ fn start_agent_as(
             stage.shell,
             variables,
             &format!("{what}'s server"),
+            context_of(stage),
         );
         let mut words = vec![stage.build.command.clone()];
         words.extend(
@@ -784,6 +799,7 @@ fn start_agent_as(
         stage.shell,
         variables,
         what,
+        context_of(stage),
     );
     let mut line = stage.build.command_line(port);
     for word in extra {
@@ -1190,6 +1206,7 @@ fn keychain_readable_in_a_session(stage: &Stage<'_, '_>, variables: &[(String, S
         stage.shell,
         variables,
         "a session that reads its default keychain",
+        context_of(stage),
     );
     // What the session names its default keychain and its search list, for the record; then the
     // status, as 1000 more than itself, so the line that shows it is not the command's own echo.
@@ -2143,6 +2160,7 @@ fn a_running_agent_keeps_its_build_through_an_upgrade_and_the_newer_build_gets_t
             stage.shell,
             &variables,
             "the second session",
+            Context::Headless,
         );
         let second_processes = launch(
             stage.run,
@@ -2406,6 +2424,7 @@ fn forged_titles_transcripts_identifiers_and_hook_input_leave_the_host_unchanged
             stage.shell,
             &variables,
             "the forging session",
+            Context::Headless,
         );
         let forgeries = Forgeries::new(stage.run);
         std::fs::write(forgeries.path("probe.sh"), PROBE_SCRIPT).expect("the probe script");

@@ -646,8 +646,20 @@ impl std::fmt::Debug for Session {
     }
 }
 
-/// Opens a managed session with `kr new --attach` on a window of its own, with exactly
-/// `variables`, and waits for its shell to read.
+/// Where a session's processes run: the host's headless user context, bound to no desktop and
+/// given none of its handles, where nothing can show a dialog; or the person's desktop, as the
+/// sessions a person starts at their own terminal do, where a login kept as a keychain item can
+/// be read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Context {
+    /// `kr new --headless`.
+    Headless,
+    /// `kr new --desktop`.
+    Desktop,
+}
+
+/// Opens a managed session with `kr new --attach` on a window of its own, in `context`, with
+/// exactly `variables`, and waits for its shell to read.
 ///
 /// # Panics
 ///
@@ -660,6 +672,7 @@ pub fn open_session(
     shell: &ManagedShell,
     variables: &[(String, String)],
     what: &str,
+    context: Context,
 ) -> Session {
     let run = host.run();
     let before: Vec<String> = host
@@ -676,7 +689,10 @@ pub fn open_session(
         &[
             "new",
             "--attach",
-            "--headless",
+            match context {
+                Context::Headless => "--headless",
+                Context::Desktop => "--desktop",
+            },
             "--shell",
             &executable,
             "--shell-mode",

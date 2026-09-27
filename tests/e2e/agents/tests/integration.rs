@@ -41,7 +41,7 @@ use std::time::{Duration, Instant};
 
 use kr_e2e_agents::keychain::RunKeychain;
 use kr_e2e_agents::stage::{
-    Installation, Owner, PROMPT, Session, closed_port, enrol_generation, install_package,
+    Context, Installation, Owner, PROMPT, Session, closed_port, enrol_generation, install_package,
     open_session, place_forwarder, prepare_home, runtime, session_variables,
 };
 use kr_e2e_agents::{GENERATION_VARIABLE, REQUIRE_VARIABLE};
@@ -264,6 +264,7 @@ fn a_session_created_with_the_integrations_on_launches_through_them_and_one_crea
         &shell,
         &variables,
         "a session created before the integrations are on",
+        Context::Headless,
     );
     for (package, _) in PACKAGES {
         let _ = host.kr_json(&["plugin", "integration", "enable", package]);
@@ -275,6 +276,7 @@ fn a_session_created_with_the_integrations_on_launches_through_them_and_one_crea
         &shell,
         &variables,
         "a session created with the integrations on",
+        Context::Headless,
     );
 
     for (_, command) in PACKAGES {
