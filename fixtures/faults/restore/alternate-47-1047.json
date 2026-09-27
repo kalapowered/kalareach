@@ -1,0 +1,16 @@
+{
+  "format": "kalareach.restore-corpus/1",
+  "name": "alternate-47-1047",
+  "about": "the other buffer entered through modes 47 and 1047, a cursor saved around them with DECSC and DECRC, and one saved and restored through mode 1048",
+  "columns": 20,
+  "rows": 4,
+  "writes": [
+    { "text": "primary one\r\n" },
+    { "text": "\u001b7\u001b[?47h\u001b[Halt47 text" },
+    { "text": "\u001b[?47l\u001b8" },
+    { "text": " back\r\n" },
+    { "text": "\u001b[?1047hin 1047" },
+    { "text": "\u001b[?1047l" },
+    { "text": "\u001b[?1048h\u001b[3;5Hmoved\u001b[?1048l after" }
+  ]
+}

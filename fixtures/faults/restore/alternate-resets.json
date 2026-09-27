@@ -1,0 +1,17 @@
+{
+  "format": "kalareach.restore-corpus/1",
+  "name": "alternate-resets",
+  "about": "the alternate buffer entered twice over, a soft reset inside it, the way out, and a full reset that starts the screen again",
+  "columns": 20,
+  "rows": 4,
+  "writes": [
+    { "text": "shell line\r\n" },
+    { "text": "\u001b[?1049h\u001b[2Jfull screen" },
+    { "text": "\u001b[!p" },
+    { "text": " after soft" },
+    { "text": "\u001b[?1049h again" },
+    { "text": "\u001b[?1049l" },
+    { "text": "\u001bc" },
+    { "text": "fresh\r\n" }
+  ]
+}

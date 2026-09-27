@@ -1,0 +1,16 @@
+{
+  "format": "kalareach.restore-corpus/1",
+  "name": "alternate-1049",
+  "about": "a full-screen application entered and left through mode 1049, with its title pushed on entry and popped on exit, and the shell's lines kept beneath it",
+  "columns": 24,
+  "rows": 5,
+  "writes": [
+    { "text": "$ ls\r\nfile1  file2\r\n$ vi notes\r\n" },
+    { "text": "\u001b[?1049h\u001b[22;0;0t\u001b[H\u001b[2J" },
+    { "text": "\u001b[1;1H\u001b[7m notes \u001b[m\u001b[2;1Hline one\u001b[3;1Hline two" },
+    { "text": "\u001b[5;1H-- INSERT --\u001b[2;9H" },
+    { "text": " edited" },
+    { "text": "\u001b[?1049l\u001b[23;0;0t" },
+    { "text": "$ " }
+  ]
+}

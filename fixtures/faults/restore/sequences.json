@@ -1,0 +1,20 @@
+{
+  "format": "kalareach.restore-corpus/1",
+  "name": "sequences",
+  "about": "sequences long and short with a point inside each: titles ended by ST and by BEL, scalars of two to four bytes and a broken one, combining marks, the line-drawing set, a long link, direct colours, a status query and an erase",
+  "columns": 20,
+  "rows": 4,
+  "writes": [
+    { "text": "\u001b]2;a title\u001b\\" },
+    { "text": "\u001b]1;icon\u0007" },
+    { "text": "café 中文 " },
+    { "text": "👋🏽\r\n" },
+    { "hex": "e4b841" },
+    { "text": " é ä\r\n" },
+    { "text": "\u001b(0lqqk\u001b(B box\r\n" },
+    { "text": "\u001b]8;;https://example.invalid/a/long/path/that/keeps/going/on/and/on?query=1\u001b\\link\u001b]8;;\u001b\\\r\n" },
+    { "text": "\u001b[38;2;10;20;30;48;5;200mdirect\u001b[m \u001b[4:3mcurly\u001b[m" },
+    { "text": "\u001bP$qm\u001b\\" },
+    { "text": "\u001b[3;5H\u001b[1Kx" }
+  ]
+}

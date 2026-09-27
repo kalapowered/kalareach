@@ -1,0 +1,36 @@
+[package]
+name = "kr-faults"
+description = "The fault harness: a session's screen restored at every point of its output, simulated time, scripted peers, retained traces and journals, and processes killed at named points"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+# The client a person attaches with paints a projected screen through this, so the model of that
+# client's terminal paints through it too.
+kr-cli.workspace = true
+# The projection a client holds, and the painter a terminal of the session's size is drawn with.
+kr-client = { workspace = true, features = ["terminal"] }
+# Identifiers for the sessions and attachments the harness makes.
+kr-ipc.workspace = true
+kr-protocol.workspace = true
+# The model of a physical terminal, and the reference the canonical screen is read against.
+kr-term.workspace = true
+# The session under test, driven through its own read-loop entry and subscribed the way the
+# worker's service subscribes a client.
+kr-worker.workspace = true
+hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+# A session attached over the worker's own endpoint, with the product's client.
+kr-crypto.workspace = true
+kr-ipc = { workspace = true, features = ["testing"] }
+tokio.workspace = true
+
+[lints]
+workspace = true

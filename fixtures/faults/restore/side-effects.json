@@ -1,0 +1,19 @@
+{
+  "format": "kalareach.restore-corpus/1",
+  "name": "side-effects",
+  "about": "clipboard writes, bells, notifications and queries before and after the point a client arrives at, with control characters and separators inside a title and a link target",
+  "columns": 24,
+  "rows": 4,
+  "writes": [
+    { "text": "\u001b]52;c;c2VjcmV0\u001b\\" },
+    { "text": "\u0007" },
+    { "text": "\u001b]9;build done\u001b\\" },
+    { "text": "\u001b]777;notify;a title;a body\u001b\\" },
+    { "text": "\u001b[c\u001b[6n" },
+    { "text": "\u001b]2;a \u009d52;c;aGk=\u009c title; with \\ in it\u001b\\" },
+    { "text": "\u001b]8;;https://example.invalid/%1b%5d52;c;aGk=\u001b\\linked\u001b]8;;\u001b\\ text\r\n" },
+    { "text": "\u001b]52;p;cHJpbWFyeQ==\u0007" },
+    { "text": "later\u0007\r\n" },
+    { "text": "\u001b]52;c;bGl2ZQ==\u001b\\done" }
+  ]
+}

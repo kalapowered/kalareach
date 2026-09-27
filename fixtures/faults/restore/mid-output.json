@@ -1,0 +1,16 @@
+{
+  "format": "kalareach.restore-corpus/1",
+  "name": "mid-output",
+  "about": "a command's ordinary output: lines that scroll off the top, colours, a progress line redrawn in place and a prompt left waiting",
+  "columns": 24,
+  "rows": 5,
+  "writes": [
+    { "text": "$ cargo build\r\n" },
+    { "text": "\u001b[1;32m   Compiling\u001b[0m one\r\n" },
+    { "text": "\u001b[1;33mwarning\u001b[0m: unused\r\n" },
+    { "text": "\u001b[2K\rbuilding  10%" },
+    { "text": "\u001b[2K\rbuilding 100%\r\n" },
+    { "text": "\u001b[1;32m    Finished\u001b[0m in 1.2s\r\n" },
+    { "text": "$ " }
+  ]
+}
