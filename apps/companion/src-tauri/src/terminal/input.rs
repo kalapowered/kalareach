@@ -18,7 +18,8 @@
 //!
 //! The wheel reaches the program only as the program asked for it: as wheel events at a cell of the
 //! session's grid, while it reports the mouse, in the encoding it chose. A wheel never becomes arrow
-//! keys.
+//! keys. Keys, text and paste reach it through the client's shared encoder, in the encoding the
+//! program negotiated (`keys`); the page names keys and never spells a byte.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -28,19 +29,19 @@ use kr_protocol::envelope::ParamsValue;
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::ids::{InputLeaseEpoch, InputSequence, RequestId};
 use kr_protocol::input::InputAcquireResult;
-use kr_protocol::limits::MAX_INPUT_FRAME_LEN;
 use serde::Deserialize;
 
+use super::keys::{KeyAction, KeyName, KeypadCode, Pasted, Scalar, Text, TypedKey};
 use super::screen::{ControlState, TerminalControl, Wheel};
 
 /// The terminal profile a view declares when it attaches.
 ///
-/// It names this view rather than any terminal. The session takes a profile it has not measured to
-/// send the ordinary encoding of keys, which is what a view sends: the terminal keys as the page
-/// spells them, and mouse reports. It never hands a profile it has not qualified its live output, so
-/// a view is always drawn the session's screen as a projection. Declaring no profile at all would
-/// leave the session nothing to establish about the view's keys, and every takeover would be
-/// refused.
+/// It names this view rather than any terminal. The session's keyboard table gives it what the
+/// view's keys produce: the ordinary encoding, `modifyOtherKeys`, and the Kitty protocol's
+/// disambiguation and event types (`keys`). It never hands a profile it has not qualified its live
+/// output, so a view is always drawn the session's screen as a projection. Declaring no profile at
+/// all would leave the session nothing to establish about the view's keys, and every takeover would
+/// be refused.
 pub(super) const PROFILE: &str = "kalareach-companion";
 
 /// The most wheel turns one input carries.
@@ -54,6 +55,30 @@ const NOT_CONTROLLING: &str = "This view does not control the program.";
 
 /// What the command says when the view the page names has ended, or was never open.
 pub(super) const ENDED: &str = "This view has ended, and took nothing.";
+
+/// Why control ended when the program started reading keys in a form the view does not produce.
+const ENDED_BY_ENCODING: &str =
+    "Control ended: the program now reads keys in a form this view cannot send.";
+
+/// Why a view did not take an input.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Refused {
+    /// The view does not control the program under the take the input names, or it has ended.
+    NotControlling(String),
+    /// The view controls the program, and the input cannot reach it as the program reads keys now,
+    /// or before the view holds the session's screen. Nothing was written, and control is kept.
+    Unsent(String),
+}
+
+impl Refused {
+    /// The words the page is given.
+    #[must_use]
+    pub fn message(&self) -> &str {
+        match self {
+            Self::NotControlling(message) | Self::Unsent(message) => message,
+        }
+    }
+}
 
 /// What the page says to a view, in the shape the page sends it.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
@@ -86,13 +111,84 @@ pub enum Input {
         /// Whether Control was held.
         control: bool,
     },
-    /// Type these keys.
-    Keys {
-        /// The number of the take the keys were typed under.
+    /// A key went down, repeated, or came up.
+    Key {
+        /// The number of the take the key was made under.
         take: u64,
-        /// What the keys send.
-        keys: Keys,
+        /// What the key made, or its name.
+        key: KeyName,
+        /// The character it makes with nothing held, where the platform said.
+        base: Option<Scalar>,
+        /// The keypad key it is, if it is one.
+        keypad: Option<KeypadCode>,
+        /// Whether Shift was held.
+        shift: bool,
+        /// Whether Alt was held.
+        alt: bool,
+        /// Whether Control was held.
+        control: bool,
+        /// Whether Caps Lock was on.
+        caps_lock: bool,
+        /// Whether Num Lock was on.
+        num_lock: bool,
+        /// What happened to it.
+        event: KeyAction,
     },
+    /// Text that came with no key: what an input method, a software keyboard or dictation
+    /// committed.
+    Text {
+        /// The number of the take the text was made under.
+        take: u64,
+        /// The text.
+        text: Text,
+    },
+    /// Text the person pasted.
+    Paste {
+        /// The number of the take the paste was made under.
+        take: u64,
+        /// The text.
+        text: Pasted,
+    },
+}
+
+impl Input {
+    /// The key a key input names, and what happened to it.
+    #[must_use]
+    pub fn typed_key(&self) -> Option<(TypedKey, KeyAction)> {
+        let Self::Key {
+            key,
+            base,
+            keypad,
+            shift,
+            alt,
+            control,
+            caps_lock,
+            num_lock,
+            event,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        Some((
+            TypedKey {
+                key: key.clone(),
+                base: *base,
+                keypad: *keypad,
+                modifiers: Modifiers {
+                    shift: *shift,
+                    alt: *alt,
+                    control: *control,
+                    superkey: false,
+                },
+                locks: kr_client::encoder::Locks {
+                    caps_lock: *caps_lock,
+                    num_lock: *num_lock,
+                },
+            },
+            *event,
+        ))
+    }
 }
 
 /// How many times a wheel turns: towards the person when positive, never not at all, and at most
@@ -127,35 +223,6 @@ impl Turns {
     /// How many times it turns.
     fn count(self) -> usize {
         usize::try_from(self.0.unsigned_abs()).unwrap_or(usize::MAX)
-    }
-}
-
-/// What some keys send: never nothing, and no more than one input frame carries.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
-#[serde(try_from = "String")]
-pub struct Keys(String);
-
-impl TryFrom<String> for Keys {
-    type Error = String;
-
-    fn try_from(keys: String) -> Result<Self, String> {
-        if keys.is_empty() {
-            return Err("keys send something".to_owned());
-        }
-        if keys.len() > MAX_INPUT_FRAME_LEN {
-            return Err(format!(
-                "keys send at most {MAX_INPUT_FRAME_LEN} bytes at once, not {}",
-                keys.len()
-            ));
-        }
-        Ok(Self(keys))
-    }
-}
-
-impl Keys {
-    /// The bytes the keys send.
-    pub fn into_bytes(self) -> Vec<u8> {
-        self.0.into_bytes()
     }
 }
 
@@ -401,6 +468,20 @@ impl Lease {
         self.writes.insert(request, epoch);
     }
 
+    /// The program started reading keys in a form the view does not produce. Control ends at once:
+    /// the view stops wanting it, writes nothing more, and gives back the lease it holds, once.
+    /// Returns whether control changed; a lease that is not held changes nothing, and a take in
+    /// flight is left to the session's answer.
+    pub fn unsupported(&mut self) -> bool {
+        let Some(held) = self.held.take() else {
+            return false;
+        };
+        self.wanted = false;
+        self.owed.push_back(held.epoch);
+        self.ended = Some(ENDED_BY_ENCODING.to_owned());
+        true
+    }
+
     /// What the page is told of control.
     #[must_use]
     pub fn control(&self) -> TerminalControl {
@@ -444,6 +525,7 @@ fn ended_by(refusal: &ProtocolError) -> String {
 mod tests {
     use super::*;
     use kr_protocol::input::InputLeaseState;
+    use kr_protocol::limits::MAX_INPUT_FRAME_LEN;
     use kr_protocol::scalars::{Nullable, U64};
 
     fn acquired(epoch: u64) -> Result<ParamsValue, ProtocolError> {
@@ -502,11 +584,48 @@ mod tests {
         assert!(wheel(-1025).is_err());
         assert!(wheel(1024).is_ok());
         assert!(wheel(-1024).is_ok());
-        let keys =
-            |keys: String| read(serde_json::json!({"kind": "keys", "take": 1, "keys": keys}));
-        assert!(keys(String::new()).is_err());
-        assert!(keys("x".repeat(MAX_INPUT_FRAME_LEN + 1)).is_err());
-        assert!(keys("x".repeat(MAX_INPUT_FRAME_LEN)).is_ok());
+        // Bytes the page spells are no input at all.
+        assert!(read(serde_json::json!({"kind": "keys", "take": 1, "keys": "a"})).is_err());
+        let key = |key: &str, keypad: serde_json::Value, event: &str| {
+            read(serde_json::json!({
+                "kind": "key", "take": 1, "key": key, "base": null, "keypad": keypad,
+                "shift": false, "alt": false, "control": true, "caps_lock": false,
+                "num_lock": true, "event": event,
+            }))
+        };
+        let (typed, action) = key("c", serde_json::Value::Null, "press")
+            .expect("a key")
+            .typed_key()
+            .expect("a key input");
+        assert_eq!(action, KeyAction::Press);
+        assert!(typed.modifiers.control && typed.locks.num_lock);
+        assert!(key("End", serde_json::json!("Numpad1"), "release").is_ok());
+        assert!(
+            key("c", serde_json::Value::Null, "hold").is_err(),
+            "an unknown event"
+        );
+        assert!(
+            key("1", serde_json::json!("Numpad10"), "press").is_err(),
+            "an unknown code"
+        );
+        assert!(
+            key("\u{1b}", serde_json::Value::Null, "press").is_err(),
+            "a control character"
+        );
+        assert!(key("", serde_json::Value::Null, "press").is_err());
+        let text =
+            |text: String| read(serde_json::json!({"kind": "text", "take": 1, "text": text}));
+        assert!(text("日本語".to_owned()).is_ok());
+        assert!(text(String::new()).is_err());
+        assert!(text("ls\r".to_owned()).is_err(), "a key is sent as a key");
+        assert!(text("x".repeat(MAX_INPUT_FRAME_LEN + 1)).is_err());
+        let paste =
+            |text: String| read(serde_json::json!({"kind": "paste", "take": 1, "text": text}));
+        assert!(paste("line\nline".to_owned()).is_ok());
+        assert!(
+            paste("x".repeat(MAX_INPUT_FRAME_LEN)).is_err(),
+            "framed, it would not fit"
+        );
     }
 
     #[test]

@@ -28,8 +28,9 @@ use kr_protocol::projection::{
 use kr_protocol::recovery::{EventStream, EventsSubscribeParams};
 use kr_protocol::session::Dimensions;
 use scripted_worker::{
-    CallKind, Challenge, Frame, Link, Mouse, ScriptedWorker, WATCHDOG, WorkerLease, delta, frame,
-    frame_delta, mouse_delta, page as rows_page, reset, row, screen, snapshot,
+    CallKind, Challenge, Frame, Keys, Link, Mouse, Negotiated, ScriptedWorker, WATCHDOG,
+    WorkerLease, delta, frame, frame_delta, keys_delta, mouse_delta, page as rows_page, reset, row,
+    screen, snapshot,
 };
 use serde_json::{Value, json};
 use tauri::Manager as _;
@@ -1962,10 +1963,39 @@ impl Page {
         )
     }
 
-    /// Types `keys`, as made under the page's take `take`.
-    fn keys(&self, view: &str, take: u64, keys: &str) -> Result<Value, Value> {
-        self.input(view, json!({"kind": "keys", "take": take, "keys": keys}))
+    /// Sends `text` that came with no key, as made under the page's take `take`.
+    fn text(&self, view: &str, take: u64, text: &str) -> Result<Value, Value> {
+        self.input(view, json!({"kind": "text", "take": take, "text": text}))
     }
+
+    /// Pastes `text`, as made under the page's take `take`.
+    fn paste(&self, view: &str, take: u64, text: &str) -> Result<Value, Value> {
+        self.input(view, json!({"kind": "paste", "take": take, "text": text}))
+    }
+}
+
+/// A key input, made under the page's take `take`: `key` (a character or a key's name) with the
+/// modifiers and locks `held` names ("shift", "alt", "control", "caps_lock", "num_lock"), as `event`
+/// ("press", "repeat" or "release"), with no base character and no keypad key.
+fn key(take: u64, key: &str, held: &[&str], event: &str) -> Value {
+    json!({
+        "kind": "key", "take": take, "key": key, "base": null, "keypad": null,
+        "shift": held.contains(&"shift"), "alt": held.contains(&"alt"),
+        "control": held.contains(&"control"), "caps_lock": held.contains(&"caps_lock"),
+        "num_lock": held.contains(&"num_lock"), "event": event,
+    })
+}
+
+/// The same key input, naming the unshifted character `base`.
+fn based(mut input: Value, base: &str) -> Value {
+    input["base"] = json!(base);
+    input
+}
+
+/// The same key input, from the keypad key at `code`.
+fn on_keypad(mut input: Value, code: &str) -> Value {
+    input["keypad"] = json!(code);
+    input
 }
 
 /// Which control request a state answers, and what it says of control.
@@ -2271,7 +2301,7 @@ async fn a_lost_lease_ends_control_and_says_so() {
         "Control ended: another view took it, or the program changed how it reads keys."
     );
     let refused = page_view
-        .keys(&view, 1, "q")
+        .text(&view, 1, "q")
         .expect_err("the view no longer controls the program");
     assert_eq!(code(&refused), "LEASE_LOST");
     assert!(
@@ -2303,7 +2333,7 @@ async fn another_refusal_ends_control_and_gives_the_epoch_back() {
             &mut lease,
         )
         .await;
-        page_view.keys(&view, 1, "a").expect("the keys are taken");
+        page_view.text(&view, 1, "a").expect("the text is taken");
         let write = link.expect(Method::InputWrite).await;
         lease
             .refuse_write(
@@ -2332,7 +2362,7 @@ async fn another_refusal_ends_control_and_gives_the_epoch_back() {
         page_view
             .newest(3, |state| control(state) == (2, "controlling".to_owned()))
             .await;
-        page_view.keys(&view, 2, "b").expect("the keys are taken");
+        page_view.text(&view, 2, "b").expect("the text is taken");
         let write = link.expect(Method::InputWrite).await;
         lease.answer(&mut link, &write).await;
         assert_eq!(
@@ -2413,7 +2443,9 @@ async fn closing_a_controlling_view_detaches_and_writes_nothing_after() {
 async fn input_to_a_view_that_has_ended_or_was_never_open_is_refused() {
     let refused_as_ended = |page: &Page, view: &str| {
         for (what, answer) in [
-            ("keys", page.keys(view, 1, "q")),
+            ("text", page.text(view, 1, "q")),
+            ("a key", page.input(view, key(1, "q", &[], "press"))),
+            ("a paste", page.paste(view, 1, "q")),
             ("a wheel turn", page.wheel(view, 1, 1, 1, 1)),
             (
                 "a take",
@@ -2532,7 +2564,7 @@ async fn a_release_and_a_new_take_keep_their_epochs_apart() {
         &mut lease,
     )
     .await;
-    page_view.keys(&view, 1, "a").expect("the keys are taken");
+    page_view.text(&view, 1, "a").expect("the text is taken");
     let old_write = link.expect(Method::InputWrite).await;
     page_view.release(&view, 2);
     page_view.take(&view, 3);
@@ -2555,12 +2587,12 @@ async fn a_release_and_a_new_take_keep_their_epochs_apart() {
     assert_eq!(
         code(
             &page_view
-                .keys(&view, 1, "late")
+                .text(&view, 1, "late")
                 .expect_err("an input of the old take")
         ),
         "LEASE_LOST"
     );
-    page_view.keys(&view, 3, "b").expect("the keys are taken");
+    page_view.text(&view, 3, "b").expect("the text is taken");
     let write = link.expect(Method::InputWrite).await;
     let asked: InputWriteParams = write.params();
     assert_eq!((asked.epoch.get(), asked.sequence.get()), (7, 0));
@@ -2568,9 +2600,11 @@ async fn a_release_and_a_new_take_keep_their_epochs_apart() {
     assert_eq!(lease.written, vec![(7, 0, b"b".to_vec())]);
 }
 
-/// Section 8 ¶3: while the program reads keys in an encoding the view does not offer, the session
-/// refuses it control, and the page is told why. An encoding negotiated after the takeover ends the
-/// lease, which the view hears at its next write; back on the ordinary encoding a take succeeds.
+/// Section 8 ¶3: while the program reads keys in a form the view does not produce, the session
+/// refuses it control, and the page is told why: every key as an escape code, and alternate keys.
+/// An encoding negotiated after a takeover ends the lease on the host, which the view hears at its
+/// next write when its own screen has not yet told it; back on an encoding it produces, a take
+/// succeeds.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_program_reading_another_encoding_keeps_control_from_the_view() {
     let mut worker = ScriptedWorker::start(Challenge::Answered);
@@ -2584,31 +2618,37 @@ async fn a_program_reading_another_encoding_keeps_control_from_the_view() {
         &mut lease,
     )
     .await;
-    lease.enhance();
-    page_view.keys(&view, 1, "a").expect("the keys are taken");
+    lease.negotiate(Negotiated::Kitty(9));
+    page_view.text(&view, 1, "a").expect("the text is taken");
     let write = link.expect(Method::InputWrite).await;
     lease.answer(&mut link, &write).await;
     page_view
         .newest(3, |state| control(state) == (1, "watching".to_owned()))
         .await;
-    page_view.take(&view, 2);
-    let acquire = link.expect(Method::InputAcquire).await;
-    lease.answer(&mut link, &acquire).await;
-    let refused = page_view
-        .newest(3, |state| {
-            control(state) == (2, "watching".to_owned()) && !state["control"]["ended"].is_null()
-        })
-        .await;
-    assert_eq!(
-        refused["control"]["ended"],
-        "This view cannot take control: the program reads keys in a form the view does not send."
-    );
-    lease.ordinary();
-    page_view.take(&view, 3);
+    for (number, flags) in [(2, 9), (3, 5)] {
+        lease.negotiate(Negotiated::Kitty(flags));
+        page_view.take(&view, number);
+        let acquire = link.expect(Method::InputAcquire).await;
+        lease.answer(&mut link, &acquire).await;
+        let refused = page_view
+            .newest(3, |state| {
+                control(state) == (number, "watching".to_owned())
+                    && !state["control"]["ended"].is_null()
+            })
+            .await;
+        assert_eq!(
+            refused["control"]["ended"],
+            "This view cannot take control: the program reads keys in a form the view does not \
+             send.",
+            "flags {flags}"
+        );
+    }
+    lease.negotiate(Negotiated::Kitty(1));
+    page_view.take(&view, 4);
     let acquire = link.expect(Method::InputAcquire).await;
     lease.answer(&mut link, &acquire).await;
     let held = page_view
-        .newest(3, |state| control(state) == (3, "controlling".to_owned()))
+        .newest(3, |state| control(state) == (4, "controlling".to_owned()))
         .await;
     assert_eq!(held["control"]["ended"], Value::Null);
 }
@@ -2683,11 +2723,7 @@ async fn input_before_the_view_controls_the_program_is_refused_and_reaches_nothi
     let (view, mut link) = panned(&page_view, &mut worker, 3, &reporting(Mouse::Sgr)).await;
     for take in [0, 1] {
         assert_eq!(
-            code(
-                &page_view
-                    .keys(&view, take, "exit\r")
-                    .expect_err("no control")
-            ),
+            code(&page_view.text(&view, take, "exit").expect_err("no control")),
             "LEASE_LOST"
         );
         assert_eq!(
@@ -2704,7 +2740,7 @@ async fn input_before_the_view_controls_the_program_is_refused_and_reaches_nothi
     assert_eq!(
         code(
             &page_view
-                .keys(&view, 1, "x")
+                .input(&view, key(1, "Enter", &[], "press"))
                 .expect_err("still taking control")
         ),
         "LEASE_LOST"
@@ -2713,9 +2749,11 @@ async fn input_before_the_view_controls_the_program_is_refused_and_reaches_nothi
 }
 
 /// KR-REQ-10.01: what is not the view's input shape is refused before anything is sent: the page's
-/// old wheel and bytes requests, an unknown kind or field, no turn or more than an input carries, a
-/// cell below zero, and keys that are empty or longer than one input frame. The most turns one input
-/// carries still go.
+/// old wheel, bytes and spelled-keys requests, an unknown kind or field, no turn or more than an
+/// input carries, a cell below zero, a key that is a control character, empty or of no known event,
+/// an unknown keypad key or a base of two characters, text that is empty, holds a control character
+/// or is longer than one input frame, and a paste empty or too long to frame in one. The most turns
+/// one input carries still go.
 #[tokio::test(flavor = "multi_thread")]
 async fn inputs_that_are_not_the_views_shape_are_refused_before_anything_is_sent() {
     let mut worker = ScriptedWorker::start(Challenge::Answered);
@@ -2741,13 +2779,22 @@ async fn inputs_that_are_not_the_views_shape_are_refused_before_anything_is_sent
         json!({"session_id": session, "bytes": "\u{1b}[A"}),
         json!({"kind": "scroll", "take": 1}),
         json!({"kind": "take"}),
-        json!({"kind": "keys", "take": 1, "keys": "a", "session_id": session}),
+        json!({"kind": "keys", "take": 1, "keys": "a"}),
+        json!({"kind": "key", "take": 1, "key": "a", "session_id": session}),
         turning(0, 0),
         turning(1025, 0),
         turning(-1025, 0),
         turning(1, -1),
-        json!({"kind": "keys", "take": 1, "keys": ""}),
-        json!({"kind": "keys", "take": 1, "keys": "x".repeat(64 * 1024 + 1)}),
+        key(1, "\u{1b}", &[], "press"),
+        key(1, "", &[], "press"),
+        key(1, "a", &[], "hold"),
+        on_keypad(key(1, "1", &[], "press"), "Numpad10"),
+        based(key(1, "A", &["shift"], "press"), "ab"),
+        json!({"kind": "text", "take": 1, "text": ""}),
+        json!({"kind": "text", "take": 1, "text": "exit\r"}),
+        json!({"kind": "text", "take": 1, "text": "x".repeat(64 * 1024 + 1)}),
+        json!({"kind": "paste", "take": 1, "text": ""}),
+        json!({"kind": "paste", "take": 1, "text": "x".repeat(64 * 1024 - 11)}),
     ] {
         let refused = page_view.input(&view, shape.clone()).expect_err("refused");
         assert_eq!(code(&refused), "INVALID_ARGUMENT", "{shape}");
@@ -2780,4 +2827,636 @@ async fn a_control_request_not_above_the_newest_changes_nothing() {
         control(&newest_now(&page_view, 3)),
         (2, "watching".to_owned())
     );
+}
+
+// ---- The person's keys, text and paste -------------------------------------------------------
+
+/// The view's next write, answered as the worker answers it: its number and its bytes.
+async fn next_write(link: &mut Link, lease: &mut WorkerLease) -> (u64, Vec<u8>) {
+    let write = link.expect(Method::InputWrite).await;
+    assert_eq!(write.kind, CallKind::Request, "input is a request");
+    let asked: InputWriteParams = write.params();
+    lease.answer(link, &write).await;
+    (asked.sequence.get(), asked.bytes.as_slice().to_vec())
+}
+
+/// A view of a program that reads keys as `keys` says, whose control the page took as its request 1
+/// and the worker gave it.
+async fn controlling_keys(
+    page: &Page,
+    worker: &mut ScriptedWorker,
+    channel: u32,
+    keys: Keys,
+    lease: &mut WorkerLease,
+) -> (String, Link) {
+    lease.negotiate(keys.negotiated(false));
+    controlling(
+        page,
+        worker,
+        channel,
+        &reporting(Mouse::Sgr).keys(keys),
+        lease,
+    )
+    .await
+}
+
+/// Pushes `update` and returns once the view has published what it made of it.
+async fn applied(
+    page: &Page,
+    link: &mut Link,
+    channel: u32,
+    update: &kr_protocol::projection::ProjectionDelta,
+) {
+    let seen = page.states(channel).len();
+    link.push(PROJECTION_DELTA_EVENT, update).await;
+    tokio::time::timeout(WATCHDOG, async {
+        while page.states(channel).len() <= seen {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the view publishes the update within the watchdog");
+}
+
+/// Sends each input under take 1 and checks the bytes the view writes for it, one write each.
+async fn writes(
+    page: &Page,
+    view: &str,
+    link: &mut Link,
+    lease: &mut WorkerLease,
+    cases: Vec<(Value, &[u8])>,
+) {
+    for (input, expected) in cases {
+        page.input(view, input.clone())
+            .unwrap_or_else(|refused| panic!("{input}: {refused}"));
+        let (_, bytes) = next_write(link, lease).await;
+        assert_eq!(
+            bytes,
+            expected,
+            "{input}: {}",
+            String::from_utf8_lossy(&bytes).escape_debug()
+        );
+    }
+}
+
+/// KR-REQ-08.60, KR-REQ-13.18: a program in the Kitty protocol with flags 1 takes the view's
+/// takeover and gets each key in the protocol's own spelling, one write each at the stream's next
+/// number: Escape and a control chord as reports, text and Return as themselves, a locked arrow
+/// with the lock's bit, F13 and the keypad by the protocol's codes. Without event types a release
+/// writes nothing and takes no number.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_program_in_the_kitty_protocol_gets_the_views_keys_in_its_spelling() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page_view = Page::new(worker.paths());
+    let mut lease = WorkerLease::default();
+    let (view, mut link) =
+        controlling_keys(&page_view, &mut worker, 3, Keys::kitty(1), &mut lease).await;
+    writes(
+        &page_view,
+        &view,
+        &mut link,
+        &mut lease,
+        vec![
+            (key(1, "Escape", &[], "press"), b"\x1b[27u"),
+            (
+                based(key(1, "c", &["control"], "press"), "c"),
+                b"\x1b[99;5u",
+            ),
+            (key(1, "a", &[], "press"), b"a"),
+            (based(key(1, "A", &["shift"], "press"), "a"), b"A"),
+            (key(1, "Enter", &[], "press"), b"\r"),
+            (key(1, "Tab", &["shift"], "press"), b"\x1b[9;2u"),
+            (key(1, "ArrowUp", &[], "press"), b"\x1b[A"),
+            (key(1, "ArrowUp", &["num_lock"], "press"), b"\x1b[1;129A"),
+            (key(1, "F13", &[], "press"), b"\x1b[57376u"),
+            (
+                on_keypad(key(1, "End", &[], "press"), "Numpad1"),
+                b"\x1b[57424u",
+            ),
+            (
+                on_keypad(key(1, "1", &["num_lock"], "press"), "Numpad1"),
+                b"1",
+            ),
+        ],
+    )
+    .await;
+    page_view
+        .input(&view, based(key(1, "c", &[], "release"), "c"))
+        .expect("taken");
+    assert!(
+        link.quiet_for(QUIET).await,
+        "nothing to write for a release"
+    );
+    page_view.text(&view, 1, "z").expect("taken");
+    let (sequence, bytes) = next_write(&mut link, &mut lease).await;
+    assert_eq!(
+        (sequence, bytes.as_slice()),
+        (11, &b"z"[..]),
+        "and it took no number"
+    );
+}
+
+/// KR-REQ-08.59: the ordinary encoding and `modifyOtherKeys` spell the keys as xterm does: DEC mode
+/// 1's cursor and centre keys, X11's control characters, the back-tab, the menu key, locks left out;
+/// a change to `modifyOtherKeys` level 2 mid-lease reports the chords it asks for.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_ordinary_encoding_and_modify_other_keys_spell_keys_as_xterm_does() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page_view = Page::new(worker.paths());
+    let mut lease = WorkerLease::default();
+    let keys = Keys {
+        cursor_keys: true,
+        ..Keys::ordinary()
+    };
+    let (view, mut link) = controlling_keys(&page_view, &mut worker, 3, keys, &mut lease).await;
+    writes(
+        &page_view,
+        &view,
+        &mut link,
+        &mut lease,
+        vec![
+            (key(1, "ArrowUp", &[], "press"), b"\x1bOA"),
+            (key(1, "ArrowUp", &["control"], "press"), b"\x1b[1;5A"),
+            (key(1, "c", &["control"], "press"), b"\x03"),
+            (key(1, "3", &["control"], "press"), b"\x1b"),
+            (key(1, "Tab", &["shift"], "press"), b"\x1b[Z"),
+            (key(1, "Escape", &["caps_lock"], "press"), b"\x1b"),
+            (
+                on_keypad(key(1, "Clear", &[], "press"), "Numpad5"),
+                b"\x1bOE",
+            ),
+            (key(1, "ContextMenu", &[], "press"), b"\x1b[29~"),
+        ],
+    )
+    .await;
+    page_view
+        .input(&view, key(1, "c", &["control"], "release"))
+        .expect("taken");
+    assert!(link.quiet_for(QUIET).await, "no release in this encoding");
+
+    let at = reporting(Mouse::Sgr).keys(keys);
+    let level_two = Keys {
+        cursor_keys: true,
+        ..Keys::modify_other_keys(2)
+    };
+    lease.negotiate(level_two.negotiated(false));
+    applied(
+        &page_view,
+        &mut link,
+        3,
+        &keys_delta(&at, 40, 41, level_two),
+    )
+    .await;
+    writes(
+        &page_view,
+        &view,
+        &mut link,
+        &mut lease,
+        vec![
+            (key(1, "i", &["control"], "press"), b"\x1b[27;5;105~"),
+            (key(1, "Tab", &["shift"], "press"), b"\x1b[27;2;9~"),
+            (key(1, "ArrowUp", &[], "press"), b"\x1bOA"),
+        ],
+    )
+    .await;
+    assert_eq!(
+        control(&newest_now(&page_view, 3)),
+        (1, "controlling".to_owned())
+    );
+}
+
+/// KR-REQ-08.59, KR-REQ-08.61: with event types, a release is spelled from the press it ends, with
+/// the modifiers held as it comes up: Control-I released after Control is still the I key's
+/// release. A key sent as its text has none, a repeat of a report is reported as one, and a release
+/// the view wrote no press for is nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn event_types_report_a_release_from_the_press_it_ends() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page_view = Page::new(worker.paths());
+    let mut lease = WorkerLease::default();
+    let (view, mut link) =
+        controlling_keys(&page_view, &mut worker, 3, Keys::kitty(3), &mut lease).await;
+    writes(
+        &page_view,
+        &view,
+        &mut link,
+        &mut lease,
+        vec![
+            (
+                based(key(1, "i", &["control"], "press"), "i"),
+                b"\x1b[105;5u",
+            ),
+            (based(key(1, "i", &[], "release"), "i"), b"\x1b[105;1:3u"),
+            (key(1, "ArrowUp", &[], "press"), b"\x1b[A"),
+            (key(1, "ArrowUp", &[], "repeat"), b"\x1b[1;1:2A"),
+            (key(1, "ArrowUp", &["shift"], "release"), b"\x1b[1;2:3A"),
+            (key(1, "a", &[], "press"), b"a"),
+        ],
+    )
+    .await;
+    for nothing in [
+        key(1, "a", &[], "release"),
+        key(1, "b", &[], "release"),
+        key(1, "Escape", &[], "release"),
+    ] {
+        page_view.input(&view, nothing.clone()).expect("taken");
+        assert!(link.quiet_for(QUIET).await, "{nothing}: nothing to write");
+    }
+}
+
+/// KR-REQ-08.61: a program that changes between encodings the view produces keeps the view in
+/// control, and each key goes in the encoding of the screen the view holds at the time: Kitty 1 to
+/// the ordinary encoding and back, nothing asked of the session in between.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_encoding_follows_the_program_mid_lease_both_ways() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page_view = Page::new(worker.paths());
+    let mut lease = WorkerLease::default();
+    let (view, mut link) =
+        controlling_keys(&page_view, &mut worker, 3, Keys::kitty(1), &mut lease).await;
+    let at = reporting(Mouse::Sgr).keys(Keys::kitty(1));
+    let escape = || key(1, "Escape", &[], "press");
+    writes(
+        &page_view,
+        &view,
+        &mut link,
+        &mut lease,
+        vec![(escape(), b"\x1b[27u")],
+    )
+    .await;
+    lease.negotiate(Negotiated::Ordinary);
+    applied(
+        &page_view,
+        &mut link,
+        3,
+        &keys_delta(&at, 40, 41, Keys::ordinary()),
+    )
+    .await;
+    writes(
+        &page_view,
+        &view,
+        &mut link,
+        &mut lease,
+        vec![(escape(), b"\x1b")],
+    )
+    .await;
+    lease.negotiate(Negotiated::Kitty(1));
+    applied(
+        &page_view,
+        &mut link,
+        3,
+        &keys_delta(&at, 41, 42, Keys::kitty(1)),
+    )
+    .await;
+    writes(
+        &page_view,
+        &view,
+        &mut link,
+        &mut lease,
+        vec![(escape(), b"\x1b[27u")],
+    )
+    .await;
+    assert_eq!(
+        lease
+            .written
+            .iter()
+            .map(|(epoch, _, _)| *epoch)
+            .collect::<Vec<_>>(),
+        vec![1, 1, 1],
+        "one epoch throughout: the lease never moved"
+    );
+}
+
+/// KR-REQ-08.61: the moment the view's screen says the program reads keys in a form the view does
+/// not produce, control ends at once and says why: nothing more is written, the epoch goes back
+/// once, and a later screen changes nothing. A take is refused while the program reads it, and
+/// succeeds once it reads a form the view produces again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_program_asking_for_what_the_view_cannot_send_ends_control_at_once() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page_view = Page::new(worker.paths());
+    let mut lease = WorkerLease::default();
+    let (view, mut link) =
+        controlling_keys(&page_view, &mut worker, 3, Keys::kitty(1), &mut lease).await;
+    let at = reporting(Mouse::Sgr).keys(Keys::kitty(1));
+    lease.negotiate(Negotiated::Kitty(5));
+    applied(
+        &page_view,
+        &mut link,
+        3,
+        &keys_delta(&at, 40, 41, Keys::kitty(5)),
+    )
+    .await;
+    let ended = page_view
+        .newest(3, |state| control(state).1 == "watching")
+        .await;
+    assert_eq!(control(&ended), (1, "watching".to_owned()));
+    assert_eq!(
+        ended["control"]["ended"],
+        "Control ended: the program now reads keys in a form this view cannot send."
+    );
+    let release = link.expect(Method::InputRelease).await;
+    assert_eq!(release.params::<InputReleaseParams>().epoch.get(), 1);
+    lease.answer(&mut link, &release).await;
+    assert_eq!(
+        code(
+            &page_view
+                .input(&view, key(1, "Escape", &[], "press"))
+                .expect_err("control ended")
+        ),
+        "LEASE_LOST"
+    );
+    lease.negotiate(Negotiated::Kitty(9));
+    applied(
+        &page_view,
+        &mut link,
+        3,
+        &keys_delta(&at, 41, 42, Keys::kitty(9)),
+    )
+    .await;
+    assert!(
+        link.quiet_for(QUIET).await,
+        "a later screen releases nothing more and writes nothing"
+    );
+    assert!(lease.written.is_empty());
+
+    page_view.take(&view, 2);
+    let acquire = link.expect(Method::InputAcquire).await;
+    lease.answer(&mut link, &acquire).await;
+    let refused = page_view
+        .newest(3, |state| {
+            control(state) == (2, "watching".to_owned()) && !state["control"]["ended"].is_null()
+        })
+        .await;
+    assert_eq!(
+        refused["control"]["ended"],
+        "This view cannot take control: the program reads keys in a form the view does not send."
+    );
+    lease.negotiate(Negotiated::Kitty(1));
+    applied(
+        &page_view,
+        &mut link,
+        3,
+        &keys_delta(&at, 42, 43, Keys::kitty(1)),
+    )
+    .await;
+    page_view.take(&view, 3);
+    let acquire = link.expect(Method::InputAcquire).await;
+    lease.answer(&mut link, &acquire).await;
+    page_view
+        .newest(3, |state| control(state) == (3, "controlling".to_owned()))
+        .await;
+    writes(
+        &page_view,
+        &view,
+        &mut link,
+        &mut lease,
+        vec![(key(3, "Escape", &[], "press"), b"\x1b[27u")],
+    )
+    .await;
+}
+
+/// KR-REQ-08.59: the alternate buffer keeps its own Kitty flags, so a full-screen program's
+/// negotiation is read while its buffer shows, and the shell's once it is gone.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_alternate_buffers_negotiation_is_its_own() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page_view = Page::new(worker.paths());
+    let mut lease = WorkerLease::default();
+    let keys = Keys {
+        alternate: Some(1),
+        ..Keys::ordinary()
+    };
+    let mut at = reporting(Mouse::Sgr).keys(keys);
+    at.buffer = kr_protocol::projection::ProjectedBuffer::Alternate;
+    lease.negotiate(keys.negotiated(true));
+    let (view, mut link) = controlling(&page_view, &mut worker, 3, &at, &mut lease).await;
+    let escape = || key(1, "Escape", &[], "press");
+    writes(
+        &page_view,
+        &view,
+        &mut link,
+        &mut lease,
+        vec![(escape(), b"\x1b[27u")],
+    )
+    .await;
+    let mut primary = at;
+    primary.buffer = kr_protocol::projection::ProjectedBuffer::Primary;
+    primary.generation = 2;
+    lease.negotiate(keys.negotiated(false));
+    let seen = page_view.states(3).len();
+    frame(&mut link, &primary).await;
+    tokio::time::timeout(WATCHDOG, async {
+        loop {
+            let states = page_view.states(3);
+            let after = states.get(seen..).unwrap_or_default();
+            if after.iter().any(|state| state["state"] == "waiting")
+                && after
+                    .last()
+                    .is_some_and(|state| state["state"] == "showing")
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the primary buffer's screen is shown within the watchdog");
+    writes(
+        &page_view,
+        &view,
+        &mut link,
+        &mut lease,
+        vec![(escape(), b"\x1b")],
+    )
+    .await;
+}
+
+/// KR-REQ-08.59, KR-REQ-08.61: a key, text or a paste made while the view holds no screen of the
+/// session, before the first and between a reset and the snapshot that follows it, is refused with
+/// words and control kept: the program's keyboard is not known then. Nothing takes a number.
+#[tokio::test(flavor = "multi_thread")]
+async fn keys_text_and_paste_wait_for_the_sessions_screen() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page_view = Page::new(worker.paths());
+    let at = reporting(Mouse::Sgr);
+    let view = page_view.open(worker.session_id, at.window_columns, at.window_rows, 3);
+    let mut link = worker.link().await;
+    link.attach().await;
+    page_view
+        .newest(3, |state| state["state"] == "waiting")
+        .await;
+    page_view.take(&view, 1);
+    let acquire = link.expect(Method::InputAcquire).await;
+    let mut lease = WorkerLease::default();
+    lease.answer(&mut link, &acquire).await;
+    page_view
+        .newest(3, |state| control(state) == (1, "controlling".to_owned()))
+        .await;
+    let refused_while_waiting = |page: &Page| {
+        for (what, answer) in [
+            ("That key", page.input(&view, key(1, "a", &[], "press"))),
+            ("That text", page.text(&view, 1, "a")),
+            ("That paste", page.paste(&view, 1, "a")),
+        ] {
+            let refusal = answer.expect_err(what);
+            assert_eq!(code(&refusal), "INPUT_INCOMPATIBLE", "{what}");
+            assert_eq!(
+                refusal["message"],
+                format!(
+                    "{what} did not reach the program: the view is waiting for the session's \
+                     screen."
+                )
+            );
+        }
+    };
+    refused_while_waiting(&page_view);
+    frame(&mut link, &at).await;
+    page_view
+        .newest(3, |state| state["state"] == "showing")
+        .await;
+    page_view.text(&view, 1, "x").expect("taken");
+    let (sequence, _) = next_write(&mut link, &mut lease).await;
+    assert_eq!(sequence, 0, "nothing refused took a number");
+
+    link.push(
+        PROJECTION_RESET_EVENT,
+        &reset(2, 50, ProjectionResetReason::BufferSwitch, 0),
+    )
+    .await;
+    page_view
+        .newest(3, |state| state["state"] == "waiting")
+        .await;
+    refused_while_waiting(&page_view);
+    assert_eq!(
+        control(&newest_now(&page_view, 3)),
+        (1, "controlling".to_owned()),
+        "control is kept"
+    );
+    let mut switched = at;
+    switched.generation = 2;
+    switched.cursor = 50;
+    frame(&mut link, &switched).await;
+    page_view
+        .newest(3, |state| state["state"] == "showing")
+        .await;
+    page_view.text(&view, 1, "y").expect("taken");
+    let (sequence, bytes) = next_write(&mut link, &mut lease).await;
+    assert_eq!((sequence, bytes.as_slice()), (1, &b"y"[..]));
+}
+
+/// KR-REQ-08.59: a key the program's encoding cannot express is refused with the encoder's words,
+/// and nothing is written: Shift with Control on Tab in the ordinary encoding, a shifted chord whose
+/// unshifted character the platform did not report under the Kitty protocol, and a key with no
+/// spelling. Control is kept, and the next key takes the next number.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_key_the_encoding_cannot_express_is_refused_and_control_kept() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page_view = Page::new(worker.paths());
+    let mut lease = WorkerLease::default();
+    let (view, mut link) =
+        controlling_keys(&page_view, &mut worker, 3, Keys::ordinary(), &mut lease).await;
+    for (input, words) in [
+        (
+            key(1, "Tab", &["shift", "control"], "press"),
+            "That key did not reach the program: the negotiated encoding cannot express Shift \
+             together with another modifier on Tab, and this encoder does not invent one.",
+        ),
+        (
+            key(1, "PrintScreen", &[], "press"),
+            "That key did not reach the program: this encoder has no spelling for that key.",
+        ),
+        (
+            key(1, "BrightnessUp", &[], "press"),
+            "That key did not reach the program: this encoder has no spelling for that key.",
+        ),
+    ] {
+        let refusal = page_view.input(&view, input.clone()).expect_err("refused");
+        assert_eq!(code(&refusal), "INPUT_INCOMPATIBLE", "{input}");
+        assert_eq!(refusal["message"], words, "{input}");
+    }
+    assert!(link.quiet_for(QUIET).await, "nothing written");
+    assert_eq!(
+        control(&newest_now(&page_view, 3)),
+        (1, "controlling".to_owned())
+    );
+    writes(
+        &page_view,
+        &view,
+        &mut link,
+        &mut lease,
+        vec![(key(1, "Tab", &["shift"], "press"), b"\x1b[Z")],
+    )
+    .await;
+
+    let at = reporting(Mouse::Sgr);
+    lease.negotiate(Negotiated::Kitty(1));
+    applied(
+        &page_view,
+        &mut link,
+        3,
+        &keys_delta(&at, 40, 41, Keys::kitty(1)),
+    )
+    .await;
+    let refusal = page_view
+        .input(&view, key(1, "A", &["control", "shift"], "press"))
+        .expect_err("no unshifted character");
+    assert_eq!(code(&refusal), "INPUT_INCOMPATIBLE");
+    assert_eq!(
+        refusal["message"],
+        "That key did not reach the program: the negotiated encoding cannot express the unshifted \
+         key a shifted character was produced from, and this encoder does not invent one."
+    );
+    let (sequence, _) = {
+        page_view.text(&view, 1, "k").expect("taken");
+        next_write(&mut link, &mut lease).await
+    };
+    assert_eq!(sequence, 1);
+}
+
+/// KR-REQ-08.59: text is its UTF-8, and a paste is bracketed exactly when the program asked for it,
+/// with any delimiter inside it taken out; the longest paste fits one input frame once framed.
+#[tokio::test(flavor = "multi_thread")]
+async fn text_is_its_utf8_and_a_paste_is_bracketed_when_the_program_asks() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page_view = Page::new(worker.paths());
+    let mut lease = WorkerLease::default();
+    let (view, mut link) =
+        controlling_keys(&page_view, &mut worker, 3, Keys::ordinary(), &mut lease).await;
+    page_view.text(&view, 1, "日本語").expect("taken");
+    assert_eq!(
+        next_write(&mut link, &mut lease).await.1,
+        "日本語".as_bytes()
+    );
+    page_view.paste(&view, 1, "one\ntwo").expect("taken");
+    assert_eq!(next_write(&mut link, &mut lease).await.1, b"one\ntwo");
+
+    let at = reporting(Mouse::Sgr);
+    let bracketed = Keys {
+        bracketed_paste: true,
+        ..Keys::ordinary()
+    };
+    applied(
+        &page_view,
+        &mut link,
+        3,
+        &keys_delta(&at, 40, 41, bracketed),
+    )
+    .await;
+    page_view.paste(&view, 1, "one\ntwo").expect("taken");
+    assert_eq!(
+        next_write(&mut link, &mut lease).await.1,
+        b"\x1b[200~one\ntwo\x1b[201~"
+    );
+    page_view
+        .paste(&view, 1, "rm -rf /\u{1b}[201~\ninnocent")
+        .expect("taken");
+    assert_eq!(
+        next_write(&mut link, &mut lease).await.1,
+        b"\x1b[200~rm -rf /\ninnocent\x1b[201~",
+        "a paste cannot end itself"
+    );
+    let longest = "x".repeat(64 * 1024 - 12);
+    page_view.paste(&view, 1, &longest).expect("taken");
+    assert_eq!(next_write(&mut link, &mut lease).await.1.len(), 64 * 1024);
 }

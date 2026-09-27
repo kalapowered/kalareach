@@ -16,9 +16,11 @@
 //! | [`screen`] | The shape the page draws: a view's state, its screen, lines and pieces |
 //! | `view` | One view's task: the link, the attachment, the projection and the reports |
 //! | `window` | Where a view's window is, the moves the page makes and the reports they owe |
-//! | `input` | Control of the program, and the wheel turns and keys the view writes to it |
+//! | `input` | Control of the program, and the wheel turns, keys, text and pastes the view writes to it |
+//! | `keys` | The keys the page names, and the encoding the view spells them in |
 
 mod input;
+mod keys;
 pub mod screen;
 mod view;
 mod window;
@@ -31,7 +33,7 @@ use kr_ipc::paths::EnvironmentPaths;
 use kr_protocol::ids::SessionId;
 use kr_protocol::session::Dimensions;
 
-pub use input::Input;
+pub use input::{Input, Refused};
 pub use screen::TerminalViewState;
 pub use window::Move;
 
@@ -148,16 +150,17 @@ impl TerminalViews {
     }
 
     /// Hands a view the person's `input`, and answers once its task has taken it: a take or a
-    /// release at once, and a wheel turn or keys once they have their place in what the view sends
-    /// the session, ahead of anything it sends after them. The answer is the view's, not the
-    /// session's: what the session answers reaches the page as the view's state.
+    /// release at once, and a wheel turn, a key, text or a paste once it has its place in what the
+    /// view sends the session, ahead of anything it sends after them. The answer is the view's, not
+    /// the session's: what the session answers reaches the page as the view's state.
     ///
     /// # Errors
     ///
-    /// Returns why the view did not take the input: a wheel turn or keys made under a take the view
-    /// does not control the program with, or a view that has ended or was never open.
-    pub async fn input(&self, view: &str, input: Input) -> Result<(), String> {
-        let ended = || Err(input::ENDED.to_owned());
+    /// Returns why the view did not take the input: one made under a take the view does not control
+    /// the program with, or for a view that has ended or was never open; or one that cannot reach
+    /// the program as it reads keys now, or before the view holds the session's screen.
+    pub async fn input(&self, view: &str, input: Input) -> Result<(), Refused> {
+        let ended = || Err(Refused::NotControlling(input::ENDED.to_owned()));
         let Ok(id) = view.parse::<u64>() else {
             return ended();
         };
@@ -281,7 +284,10 @@ mod tests {
             }
         };
         let (answer, ()) = tokio::join!(asked, ending);
-        assert_eq!(answer, Err(input::ENDED.to_owned()));
+        assert_eq!(
+            answer,
+            Err(Refused::NotControlling(input::ENDED.to_owned()))
+        );
     }
 
     /// A view whose task has stopped taking commands, and one never opened, refuse the input.
@@ -289,11 +295,17 @@ mod tests {
     async fn an_input_for_a_task_that_takes_no_commands_or_for_no_view_is_refused() {
         let (views, receiver) = holding_one();
         drop(receiver);
-        assert_eq!(views.input("1", take()).await, Err(input::ENDED.to_owned()));
-        assert_eq!(views.input("2", take()).await, Err(input::ENDED.to_owned()));
+        assert_eq!(
+            views.input("1", take()).await,
+            Err(Refused::NotControlling(input::ENDED.to_owned()))
+        );
+        assert_eq!(
+            views.input("2", take()).await,
+            Err(Refused::NotControlling(input::ENDED.to_owned()))
+        );
         assert_eq!(
             views.input("not a view", take()).await,
-            Err(input::ENDED.to_owned())
+            Err(Refused::NotControlling(input::ENDED.to_owned()))
         );
     }
 

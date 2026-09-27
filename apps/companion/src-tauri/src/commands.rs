@@ -1226,13 +1226,16 @@ pub fn terminal_view_move(
 
 /// Hands an open view the person's input: a take or a release of control of the program, numbered
 /// by the page in the order it makes them, or a turn of the program's wheel at a cell of the
-/// session's grid or keys, each naming the take it was made under.
+/// session's grid, a key, text or a paste, each naming the take it was made under. A key is named,
+/// never spelled: the view spells it in the encoding the program reads.
 ///
 /// The input is read as the page sends it, and anything else is refused before the view is asked.
 /// It answers once the view has taken the input, not once the program has: what the session
-/// answers reaches the page as the view's state. A wheel turn or keys the view may not write, since
-/// it does not control the program under the take they name, are refused, and nothing is written;
-/// so is any input to a view that has ended.
+/// answers reaches the page as the view's state. An input the view may not write, since it does not
+/// control the program under the take it names, is refused `LEASE_LOST`, and nothing is written;
+/// so is any input to a view that has ended. One that cannot reach the program as it reads keys
+/// now, or before the view holds the session's screen, is refused `INPUT_INCOMPATIBLE` with words
+/// that say why, and the view keeps control.
 #[tauri::command]
 pub async fn terminal_view_input(
     views: State<'_, crate::terminal::TerminalViews>,
@@ -1240,10 +1243,13 @@ pub async fn terminal_view_input(
     input: Value,
 ) -> Result<()> {
     let input: crate::terminal::Input = decode(input)?;
-    views
-        .input(&view, input)
-        .await
-        .map_err(|refused| CommandError::new(kr_protocol::error::ErrorCode::LeaseLost, refused))
+    views.input(&view, input).await.map_err(|refused| {
+        let code = match refused {
+            crate::terminal::Refused::NotControlling(_) => kr_protocol::error::ErrorCode::LeaseLost,
+            crate::terminal::Refused::Unsent(_) => kr_protocol::error::ErrorCode::InputIncompatible,
+        };
+        CommandError::new(code, refused.message())
+    })
 }
 
 /// Closes a view: it detaches, closes its link and publishes nothing more.

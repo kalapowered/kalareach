@@ -755,6 +755,127 @@ pub struct Frame {
     pub buffer: ProjectedBuffer,
     /// How the program reports the mouse.
     pub mouse: Mouse,
+    /// How the program reads keys.
+    pub keys: Keys,
+}
+
+/// How a program reads keys, as a screen says: the keyboard negotiation of each buffer, and the
+/// modes that change what a key or a paste sends.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Keys {
+    /// The `modifyOtherKeys` level.
+    pub modify_other_keys: u64,
+    /// The primary buffer's Kitty flags, while the protocol is in use there.
+    pub primary: Option<u64>,
+    /// The alternate buffer's.
+    pub alternate: Option<u64>,
+    /// DEC mode 1, application cursor keys.
+    pub cursor_keys: bool,
+    /// DEC mode 2004, bracketed paste.
+    pub bracketed_paste: bool,
+}
+
+impl Keys {
+    /// A program that negotiated nothing.
+    pub fn ordinary() -> Self {
+        Self::default()
+    }
+
+    /// A program in the primary buffer that set the Kitty protocol's `flags`.
+    pub fn kitty(flags: u64) -> Self {
+        Self {
+            primary: Some(flags),
+            ..Self::default()
+        }
+    }
+
+    /// A program that set `modifyOtherKeys` at `level`.
+    pub fn modify_other_keys(level: u64) -> Self {
+        Self {
+            modify_other_keys: level,
+            ..Self::default()
+        }
+    }
+
+    /// The keyboard negotiation, as a header or an update carries it.
+    pub fn keyboard(&self) -> ProjectedKeyboard {
+        let state = |flags: Option<u64>| KittyKeyboardState {
+            flags: Nullable(flags.map(U64::new)),
+            stack: Vec::new(),
+        };
+        ProjectedKeyboard {
+            modify_other_keys: U64::new(self.modify_other_keys),
+            primary: state(self.primary),
+            alternate: state(self.alternate),
+        }
+    }
+
+    /// The modes that go with it, and the alternate buffer's three when `alternate` is showing.
+    pub fn modes(&self, alternate: bool) -> Vec<kr_protocol::projection::ProjectedMode> {
+        let dec = |mode: u64, enabled: bool| kr_protocol::projection::ProjectedMode {
+            kind: kr_protocol::projection::ProjectedModeKind::Dec,
+            mode: U64::new(mode),
+            enabled,
+        };
+        vec![
+            dec(1, self.cursor_keys),
+            dec(47, alternate),
+            dec(1047, alternate),
+            dec(1049, alternate),
+            dec(2004, self.bracketed_paste),
+        ]
+    }
+
+    /// The encoding the host reads off the canonical grid from this, with the alternate buffer
+    /// showing or not: the showing buffer's Kitty flags when any is set, else `modifyOtherKeys`,
+    /// else the ordinary encoding.
+    pub fn negotiated(&self, alternate: bool) -> Negotiated {
+        match if alternate {
+            self.alternate
+        } else {
+            self.primary
+        } {
+            Some(flags) if flags != 0 => Negotiated::Kitty(u8::try_from(flags).unwrap_or(u8::MAX)),
+            _ if self.modify_other_keys > 0 => {
+                Negotiated::ModifyOtherKeys(u8::try_from(self.modify_other_keys).unwrap_or(u8::MAX))
+            }
+            _ => Negotiated::Ordinary,
+        }
+    }
+}
+
+/// The encoding a program reads, as the host reads it off the canonical grid.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Negotiated {
+    /// The ordinary encoding.
+    #[default]
+    Ordinary,
+    /// `modifyOtherKeys` at a level.
+    ModifyOtherKeys(u8),
+    /// The Kitty protocol with a set of flags.
+    Kitty(u8),
+}
+
+impl Negotiated {
+    /// Whether a view can hold the keys under it: what the host's keyboard table gives the view's
+    /// profile, `modifyOtherKeys` up to level 2 and the Kitty protocol's disambiguation and event
+    /// types.
+    pub fn supplied(self) -> bool {
+        match self {
+            Self::Ordinary => true,
+            Self::ModifyOtherKeys(level) => level <= 2,
+            Self::Kitty(flags) => flags & !0b0000_0011 == 0,
+        }
+    }
+
+    /// The host's words for it.
+    pub fn describe(self) -> String {
+        match self {
+            Self::Ordinary => "the ordinary terminal encoding".to_owned(),
+            Self::ModifyOtherKeys(level) => format!("modifyOtherKeys level {level}"),
+            Self::Kitty(flags) => format!("the Kitty keyboard protocol with flags {flags}"),
+        }
+    }
 }
 
 /// How a program reports the mouse, as the DEC modes it has set say.
@@ -805,7 +926,13 @@ impl Frame {
             oldest: 0,
             buffer: ProjectedBuffer::Primary,
             mouse: Mouse::Off,
+            keys: Keys::ordinary(),
         }
+    }
+
+    /// The same window, of a program that reads keys as `keys` says.
+    pub fn keys(self, keys: Keys) -> Self {
+        Self { keys, ..self }
     }
 
     /// The same window, of a program that reports the mouse as `mouse` says.
@@ -886,6 +1013,10 @@ pub async fn frame(link: &mut Link, frame: &Frame) {
     header.active_buffer = frame.buffer;
     header.oldest_retained_row = U64::new(frame.oldest);
     header.modes = mouse_modes(frame.mouse);
+    header
+        .modes
+        .extend(frame.keys.modes(frame.buffer == ProjectedBuffer::Alternate));
+    header.keyboard = frame.keys.keyboard();
     link.push(kr_protocol::projection::PROJECTION_SNAPSHOT_EVENT, &header)
         .await;
     let mut rows = page(frame.generation, frame.cursor, frame.rows(), false);
@@ -920,20 +1051,29 @@ pub fn mouse_delta(frame: &Frame, base: u64, next: u64, mouse: Mouse) -> Project
     update
 }
 
+/// An update from `base` to `next` that leaves `frame`'s window and rows as they are and changes how
+/// the program reads keys to `keys`.
+pub fn keys_delta(frame: &Frame, base: u64, next: u64, keys: Keys) -> ProjectionDelta {
+    let mut update = frame_delta(frame, base, next);
+    update.modes = keys.modes(frame.buffer == ProjectedBuffer::Alternate);
+    update.keyboard = Nullable::some(keys.keyboard());
+    update
+}
+
 // ---- The input lease -------------------------------------------------------------------------
 
 /// The session's input lease, kept the way the worker keeps it, answering a view's acquire, release
 /// and write as the worker does: a takeover and a release each advance the epoch, a write is taken
 /// only from the holder at the current epoch and only at the next number of its ordered stream, and
-/// an acquire is refused while the program reads an encoding the view does not offer.
+/// an acquire is refused while the program reads an encoding the view's profile is not given.
 #[derive(Debug, Default)]
 pub struct WorkerLease {
     pub epoch: u64,
     pub holder: Option<AttachmentId>,
     /// The next number the holder's ordered input stream has to write.
     pub next: u64,
-    /// Whether the program has negotiated an encoding the view does not offer.
-    pub enhanced: bool,
+    /// The encoding the program reads, as the host reads it.
+    pub negotiated: Negotiated,
     /// Every batch the worker took, in order: its epoch, its number and its bytes.
     pub written: Vec<(u64, u64, Vec<u8>)>,
 }
@@ -968,14 +1108,14 @@ impl WorkerLease {
                     .await;
                 return;
             }
-            if self.enhanced {
-                link.refuse_with(
-                    call,
-                    ErrorCode::InputIncompatible,
-                    "the application reads the Kitty keyboard protocol with flags 1, and this \
-                     attachment offers the ordinary terminal encoding only",
-                )
-                .await;
+            if !self.negotiated.supplied() {
+                let refusal = format!(
+                    "the application reads {}, and this attachment offers modifyOtherKeys up to \
+                     level 2 and the Kitty keyboard protocol with flags 3",
+                    self.negotiated.describe()
+                );
+                link.refuse_with(call, ErrorCode::InputIncompatible, &refusal)
+                    .await;
                 return;
             }
             self.epoch += 1;
@@ -1069,18 +1209,14 @@ impl WorkerLease {
         self.next = 0;
     }
 
-    /// The program negotiates an encoding the view does not offer: the worker ends its lease.
-    pub fn enhance(&mut self) {
-        self.enhanced = true;
-        if self.holder.take().is_some() {
+    /// The program negotiates `negotiated`: a lease the view's profile cannot serve under it ends,
+    /// as the host's re-evaluation ends it on the change.
+    pub fn negotiate(&mut self, negotiated: Negotiated) {
+        self.negotiated = negotiated;
+        if !negotiated.supplied() && self.holder.take().is_some() {
             self.epoch += 1;
             self.next = 0;
         }
-    }
-
-    /// The program goes back to the ordinary encoding.
-    pub fn ordinary(&mut self) {
-        self.enhanced = false;
     }
 
     /// A detach, which releases a lease its attachment holds.

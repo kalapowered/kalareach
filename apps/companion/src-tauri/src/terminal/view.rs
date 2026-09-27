@@ -11,10 +11,13 @@
 //! [`WindowReports`]: each report is settled by the screen its answer names, and the page is told a
 //! move is settled only with a screen that holds it.
 //!
-//! It takes control of the program when the person asks, and writes the wheel turns and keys they
-//! make under the input lease, through [`Lease`]. A change of control is told to the page at once.
+//! It takes control of the program when the person asks, and writes the wheel turns, keys, text
+//! and pastes they make under the input lease, through [`Lease`]. Each key is spelled by the
+//! client's shared encoder in the encoding the screen it holds says the program reads (`keys`); a
+//! screen that says the program reads a form the view does not produce ends control at once. A
+//! change of control is told to the page at once.
 
-use kr_client::encoder::Modifiers;
+use kr_client::encoder::{self, KeyEventKind, Modifiers};
 use kr_client::projection::{Applied, Projection, decode, is_projection_event};
 use kr_client::shown::Shown;
 use kr_ipc::client::LocalClient;
@@ -36,7 +39,8 @@ use kr_protocol::session::{Dimensions, SESSION_CLOSED_EVENT};
 use kr_protocol::worker::WorkerDescriptor;
 use tokio::sync::mpsc::UnboundedReceiver;
 
-use super::input::{Input, Lease, Owed, PROFILE, wheel_reports};
+use super::input::{Input, Lease, Owed, PROFILE, Refused, wheel_reports};
+use super::keys::{self, KeyAction, Keyboard, Pressed, Presses, TypedKey};
 use super::screen::{TerminalViewState, state_of};
 use super::window::{Answer, WindowReports};
 use super::{Locate, Publish};
@@ -53,8 +57,8 @@ pub(super) enum Command {
     Close,
 }
 
-/// Where a view says whether it took an input: at once, or why it may not write it.
-pub(super) type Taken = tokio::sync::oneshot::Sender<Result<(), String>>;
+/// Where a view says whether it took an input: at once, or why it did not.
+pub(super) type Taken = tokio::sync::oneshot::Sender<Result<(), Refused>>;
 
 /// How many recoveries in a row may pass without a complete screen before the view ends.
 ///
@@ -114,8 +118,11 @@ pub(super) async fn run(
                                 lease.request(number, false);
                                 Ok(())
                             }
-                            Input::Wheel { take, .. } | Input::Keys { take, .. } => {
-                                lease.write(take).map(|_| ())
+                            Input::Wheel { take, .. }
+                            | Input::Key { take, .. }
+                            | Input::Text { take, .. }
+                            | Input::Paste { take, .. } => {
+                                lease.write(take).map(|_| ()).map_err(Refused::NotControlling)
                             }
                         });
                     }
@@ -143,6 +150,7 @@ pub(super) async fn run(
         next_request: LOOP_REQUESTS,
         window,
         lease,
+        presses: Presses::default(),
         resubscription: None,
         replaced_stream: false,
         recoveries: 0,
@@ -319,6 +327,8 @@ struct View {
     window: WindowReports,
     /// Whether the view controls the program, and what it owes the session for it.
     lease: Lease,
+    /// The presses written under the newest take, so each release finds the press it ends.
+    presses: Presses,
     /// The resubscription waiting for its answer.
     resubscription: Option<RequestId>,
     /// Whether the stream a resubscription replaced is still being dropped: until the new stream's
@@ -435,12 +445,14 @@ impl View {
                 if !self.held {
                     self.show();
                 }
+                self.follow_the_keyboard();
                 None
             }
             Applied::Updated(_) => {
                 if !self.held {
                     self.show();
                 }
+                self.follow_the_keyboard();
                 None
             }
             Applied::Refused(_) => self.recover().await,
@@ -617,7 +629,12 @@ impl View {
                 control,
             } => {
                 if !self.lease.controls(take) {
-                    let _ = taken.send(self.lease.write(take).map(|_| ()));
+                    let _ = taken.send(
+                        self.lease
+                            .write(take)
+                            .map(|_| ())
+                            .map_err(Refused::NotControlling),
+                    );
                     return None;
                 }
                 // Measured against the newest screen the view holds: the cell and the modes are the
@@ -638,7 +655,150 @@ impl View {
                 };
                 self.write_input(take, reports, taken).await
             }
-            Input::Keys { take, keys } => self.write_input(take, keys.into_bytes(), taken).await,
+            Input::Key { take, .. } => {
+                let (typed, action) = input.typed_key().expect("a key input names a key");
+                self.key(take, &typed, action, taken).await
+            }
+            Input::Text { take, text } => {
+                // Text is its UTF-8 in every encoding the view produces; the program's keyboard is
+                // read only to know the view may write at all.
+                if let Err(refused) = self.keyboard(take, "That text") {
+                    let _ = taken.send(Err(refused));
+                    return None;
+                }
+                self.write_or_nothing(take, text.into_bytes(), taken).await
+            }
+            Input::Paste { take, text } => {
+                let keyboard = match self.keyboard(take, "That paste") {
+                    Ok(keyboard) => keyboard,
+                    Err(refused) => {
+                        let _ = taken.send(Err(refused));
+                        return None;
+                    }
+                };
+                let bytes = encoder::paste(text.as_str(), keyboard.bracketed);
+                if bytes.len() > kr_protocol::limits::MAX_INPUT_FRAME_LEN {
+                    let _ = taken.send(Err(Refused::Unsent(keys::unsent(
+                        "That paste",
+                        "it is longer than one input can carry",
+                    ))));
+                    return None;
+                }
+                self.write_or_nothing(take, bytes, taken).await
+            }
+        }
+    }
+
+    /// Takes one of the person's keys: spelled in the encoding the program reads, and written only
+    /// while the view controls the program under the take it names. A release is spelled from the
+    /// press it ends, which the view recorded as it wrote it, and only where that press's encoding
+    /// reports releases.
+    async fn key(
+        &mut self,
+        take: u64,
+        typed: &TypedKey,
+        action: KeyAction,
+        taken: Taken,
+    ) -> Option<Ending> {
+        let keyboard = match self.keyboard(take, "That key") {
+            Ok(keyboard) => keyboard,
+            Err(refused) => {
+                let _ = taken.send(Err(refused));
+                return None;
+            }
+        };
+        let spelled = match action {
+            KeyAction::Press | KeyAction::Repeat => {
+                let kind = if action == KeyAction::Press {
+                    KeyEventKind::Press
+                } else {
+                    KeyEventKind::Repeat
+                };
+                typed.event(kind).and_then(|event| {
+                    let bytes = encoder::key(event, keyboard.encoding)?;
+                    if kind == KeyEventKind::Press {
+                        self.presses.record(
+                            take,
+                            typed.identity(),
+                            Pressed {
+                                event,
+                                reported: encoder::release_reported(event, keyboard.encoding),
+                            },
+                        );
+                    }
+                    Ok(bytes)
+                })
+            }
+            KeyAction::Release => match self.presses.released(take, &typed.identity()) {
+                Some(pressed) if pressed.reported => encoder::release(
+                    pressed.event,
+                    typed.modifiers,
+                    typed.locks,
+                    keyboard.encoding,
+                ),
+                // A release of a press that went as text, or that this view never wrote, is
+                // nothing.
+                _ => Ok(Vec::new()),
+            },
+        };
+        match spelled {
+            Ok(bytes) => self.write_or_nothing(take, bytes, taken).await,
+            Err(unsupported) => {
+                let _ = taken.send(Err(Refused::Unsent(keys::unsent("That key", unsupported))));
+                None
+            }
+        }
+    }
+
+    /// What the program reads keys in, for an input made under `take` that `what` names, or why
+    /// the input may not go: the view does not control the program under that take; it holds no
+    /// screen of the session to read the program's keyboard from, which keeps control; or the
+    /// screen says the program reads a form the view does not produce, which ends control.
+    fn keyboard(&mut self, take: u64, what: &str) -> Result<Keyboard, Refused> {
+        if !self.lease.controls(take) {
+            return Err(Refused::NotControlling(
+                self.lease.write(take).err().unwrap_or_default(),
+            ));
+        }
+        let Some(screen) = self.projection.screen() else {
+            return Err(Refused::Unsent(keys::unsent(what, keys::NO_SCREEN)));
+        };
+        let keyboard = Keyboard::of(screen);
+        if !keyboard.supplied() {
+            self.follow_the_keyboard();
+            return Err(Refused::NotControlling(
+                self.lease.control().ended.unwrap_or_default(),
+            ));
+        }
+        Ok(keyboard)
+    }
+
+    /// Writes `bytes` under the take `take`, or answers at once when there is nothing to write:
+    /// nothing takes a number in the view's input stream unless it is written.
+    async fn write_or_nothing(
+        &mut self,
+        take: u64,
+        bytes: Vec<u8>,
+        taken: Taken,
+    ) -> Option<Ending> {
+        if bytes.is_empty() {
+            let _ = taken.send(Ok(()));
+            return None;
+        }
+        self.write_input(take, bytes, taken).await
+    }
+
+    /// Ends control at once when the screen the view holds says the program reads keys in a form
+    /// the view does not produce: section 8's explicit end of an incompatible lease, rather than a
+    /// key written in an encoding the view only advertised. The session has ended the lease on its
+    /// side as the program changed; the view gives back the epoch it held, once.
+    fn follow_the_keyboard(&mut self) {
+        let supplied = self
+            .projection
+            .screen()
+            .is_none_or(|screen| Keyboard::of(screen).supplied());
+        if !supplied && self.lease.unsupported() {
+            self.control_changed();
         }
     }
 
@@ -650,7 +810,7 @@ impl View {
         let writing = match self.lease.write(take) {
             Ok(writing) => writing,
             Err(refusal) => {
-                let _ = taken.send(Err(refusal));
+                let _ = taken.send(Err(Refused::NotControlling(refusal)));
                 return None;
             }
         };
