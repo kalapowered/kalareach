@@ -122,6 +122,7 @@ export type CommandBypassReason =
   | 'not_interactive'
   | 'backend_unavailable'
   | 'session_closing'
+  | 'flags_conflict'
 /**
  * Prompt or steering text carried inline. The normative bound is 65536                             bytes of UTF-8; maxLength counts characters and is therefore a                             necessary rather than a sufficient condition.
  */
@@ -767,6 +768,10 @@ export type HelloReply =
   | {
       refused: ProtocolError
     }
+/**
+ * Why a session created now could not launch through a command integration on this host.
+ */
+export type CommandIntegrationUnavailable = 'platform' | 'no_launcher'
 /**
  * A managed account identifier minted by the service. It names the payer; it is not authority.
  */
@@ -6614,6 +6619,9 @@ export interface EnvironmentVariable {
 export interface LaunchProfile {
   /**
    * The opt-in command integrations this session applies to interactive invocations.
+   *
+   * A create request names none: the host fills them from the environment's configuration
+   * when the session is launched, and refuses a request that names one.
    */
   command_integrations: CommandIntegration[]
   /**
@@ -6635,6 +6643,11 @@ export interface LaunchProfile {
  * Section 12: where an agent needs integration flags, an explicitly enabled integration adds them
  * to interactive invocations inside a managed root shell. The command name and the argument
  * vector the person typed are preserved; the flags are added and nothing is removed or reordered.
+ *
+ * The host writes each entry when the session is launched, from the environment's configuration
+ * and the release installed then: the package, the command and the flags its verified manifest
+ * declares. A launch establishes a backend only while the package that integrates the command is
+ * still that package and declares those flags.
  */
 export interface CommandIntegration {
   /**
@@ -6649,6 +6662,10 @@ export interface CommandIntegration {
    * The flags the agent needs, added to an interactive invocation.
    */
   flags: string[]
+  /**
+   * A plugin identifier from its manifest.
+   */
+  plugin_id: string
 }
 /**
  * The default foreground and background a client's bounded probe established.
@@ -9794,6 +9811,17 @@ export interface NetworkSelection {
  */
 export interface PreferenceSet {
   /**
+   * The installed packages, each as `publisher/plugin`, whose command integration a session
+   * created from now on applies: the command, flags and variables that package's verified
+   * manifest declares, added to an interactive invocation of that command.
+   *
+   * Section 12's opt-in. Absent leaves the choice to the rung below; an empty list turns
+   * every integration off at this rung; a list replaces the one below it rather than adding
+   * to it. A package named here that this environment has not installed, does not admit, or
+   * has not granted `command_integration.launch` integrates nothing, and the doctor says why.
+   */
+  command_integrations?: string[] | null
+  /**
    * Whether this host keeps itself awake for work it has admitted, and on which power
    * source.
    */
@@ -9807,6 +9835,17 @@ export interface PreferenceSet {
  * The ordinary preferences, each absent unless this document chooses it.
  */
 export interface PreferenceSet1 {
+  /**
+   * The installed packages, each as `publisher/plugin`, whose command integration a session
+   * created from now on applies: the command, flags and variables that package's verified
+   * manifest declares, added to an interactive invocation of that command.
+   *
+   * Section 12's opt-in. Absent leaves the choice to the rung below; an empty list turns
+   * every integration off at this rung; a list replaces the one below it rather than adding
+   * to it. A package named here that this environment has not installed, does not admit, or
+   * has not granted `command_integration.launch` integrates nothing, and the doctor says why.
+   */
+  command_integrations?: string[] | null
   /**
    * Whether this host keeps itself awake for work it has admitted, and on which power
    * source.
@@ -13671,6 +13710,13 @@ export interface HostDoctorResult {
    * Every check, in the order they ran.
    */
   checks: DoctorCheck[]
+  /**
+   * Every command integration an installed release declares or the configuration names, and
+   * what a session created now gets of it.
+   *
+   * Section 7: diagnostics show the resolved executable, flags, version and integration mode.
+   */
+  command_integrations: CommandIntegrationReport[]
   configuration: EffectiveConfiguration1
   /**
    * True when no check failed.
@@ -13707,6 +13753,70 @@ export interface DoctorCheck {
    * What it examines.
    */
   title: string
+}
+/**
+ * One command integration as `kr doctor` reports it.
+ *
+ * Section 7: diagnostics show the resolved executable, flags, version and integration mode. The
+ * executable here is this host's reading of it: the first the command names on the daemon's own
+ * search path, with the version a signed qualification record names for its digest. A session
+ * whose own search path differs can find another, and each launch records the one it ran.
+ */
+export interface CommandIntegrationReport {
+  /**
+   * The command its release integrates, where the host read one.
+   */
+  command: string | null
+  /**
+   * The executable the command names first on the daemon's search path, where it names one.
+   */
+  executable: string | null
+  /**
+   * The version a signed qualification record names for that executable's digest, where one
+   * does.
+   */
+  executable_version: string | null
+  /**
+   * The flags an integrated invocation gets, each one argument element, in order.
+   */
+  flags: string[]
+  /**
+   * How an invocation of its command runs in a session created now.
+   */
+  mode: 'native_terminal' | 'gateway' | 'native_bridge'
+  /**
+   * The package, as `publisher/plugin`.
+   */
+  plugin_id: string
+  /**
+   * What else the host knows of why the state is what it is: why an installation is left out
+   * of the admissions, or why a package could not be read.
+   */
+  reason: string | null
+  /**
+   * What a session created now gets of it.
+   */
+  state:
+    | 'on'
+    | 'off'
+    | 'not_granted'
+    | 'none_declared'
+    | 'not_admitted'
+    | 'unreadable'
+    | 'conflict'
+    | 'not_installed'
+  /**
+   * Why a session created now could not launch through it on this host, where one could not.
+   */
+  unavailable: CommandIntegrationUnavailable | null
+  /**
+   * The variables an integrated launch sets, in order.
+   */
+  variables: EnvironmentVariable[]
+  /**
+   * Its installed release, where one is installed.
+   */
+  version: string | null
 }
 /**
  * What this host's configuration currently resolves to.
@@ -22205,7 +22315,9 @@ export interface CommandBackend {
    * The variables the shell exports for this one invocation.
    *
    * They name this session and the worker's own private endpoint. A bypassed invocation is
-   * given none of them, which is what keeps its execution the one the person asked for.
+   * given none of them, which is what keeps its execution the one the person asked for. The
+   * variables an integration declares are not among them: the launcher sets those once the
+   * launch is committed, so an invocation that runs as typed keeps the person's own environment.
    */
   environment: EnvironmentVariable[]
   /**
@@ -23563,6 +23675,9 @@ export interface SessionReadResult {
 export interface LaunchProfile1 {
   /**
    * The opt-in command integrations this session applies to interactive invocations.
+   *
+   * A create request names none: the host fills them from the environment's configuration
+   * when the session is launched, and refuses a request that names one.
    */
   command_integrations: CommandIntegration[]
   /**
@@ -24341,6 +24456,13 @@ export interface HostDoctorResult1 {
    * Every check, in the order they ran.
    */
   checks: DoctorCheck[]
+  /**
+   * Every command integration an installed release declares or the configuration names, and
+   * what a session created now gets of it.
+   *
+   * Section 7: diagnostics show the resolved executable, flags, version and integration mode.
+   */
+  command_integrations: CommandIntegrationReport[]
   configuration: EffectiveConfiguration1
   /**
    * True when no check failed.

@@ -7234,7 +7234,7 @@
       "description": "The worker-owned backend an integrated invocation is given.\n\nSection 12 requires it to exist *before* the native program starts, which is why it is part of\nthe answer to the hook that runs in front of the command rather than something a detected agent\nasks for afterwards. There is no other route to one: an agent that is noticed after it started\nnever gets a gateway created for it retroactively.",
       "properties": {
         "environment": {
-          "description": "The variables the shell exports for this one invocation.\n\nThey name this session and the worker's own private endpoint. A bypassed invocation is\ngiven none of them, which is what keeps its execution the one the person asked for.",
+          "description": "The variables the shell exports for this one invocation.\n\nThey name this session and the worker's own private endpoint. A bypassed invocation is\ngiven none of them, which is what keeps its execution the one the person asked for. The\nvariables an integration declares are not among them: the launcher sets those once the\nlaunch is committed, so an invocation that runs as typed keeps the person's own environment.",
           "items": {
             "$ref": "#/$defs/EnvironmentVariable"
           },
@@ -7298,12 +7298,17 @@
           "const": "session_closing",
           "description": "The session is closing, so nothing new is started inside it.",
           "type": "string"
+        },
+        {
+          "const": "flags_conflict",
+          "description": "The invocation already uses the integration's flags other than as the one whole run the\nintegration declares: part of the run, the run out of its order, one of its options with a\nvalue attached, or the run and another use of one of its options.\n\nAn integration adds its flags as one run or not at all and never changes what was typed, so\nthe invocation runs exactly as it was typed.",
+          "type": "string"
         }
       ]
     },
     "CommandIntegration": {
       "additionalProperties": false,
-      "description": "One agent's opt-in command integration.\n\nSection 12: where an agent needs integration flags, an explicitly enabled integration adds them\nto interactive invocations inside a managed root shell. The command name and the argument\nvector the person typed are preserved; the flags are added and nothing is removed or reordered.",
+      "description": "One agent's opt-in command integration.\n\nSection 12: where an agent needs integration flags, an explicitly enabled integration adds them\nto interactive invocations inside a managed root shell. The command name and the argument\nvector the person typed are preserved; the flags are added and nothing is removed or reordered.\n\nThe host writes each entry when the session is launched, from the environment's configuration\nand the release installed then: the package, the command and the flags its verified manifest\ndeclares. A launch establishes a backend only while the package that integrates the command is\nstill that package and declares those flags.",
       "properties": {
         "command": {
           "description": "The command name this integration applies to, as typed.",
@@ -7319,14 +7324,191 @@
             "type": "string"
           },
           "type": "array"
+        },
+        "plugin_id": {
+          "$ref": "#/$defs/PluginId",
+          "description": "The installed package whose integration this is."
         }
       },
       "required": [
+        "plugin_id",
         "command",
         "flags",
         "enabled"
       ],
       "type": "object"
+    },
+    "CommandIntegrationReport": {
+      "additionalProperties": false,
+      "description": "One command integration as `kr doctor` reports it.\n\nSection 7: diagnostics show the resolved executable, flags, version and integration mode. The\nexecutable here is this host's reading of it: the first the command names on the daemon's own\nsearch path, with the version a signed qualification record names for its digest. A session\nwhose own search path differs can find another, and each launch records the one it ran.",
+      "properties": {
+        "command": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The command its release integrates, where the host read one."
+        },
+        "executable": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The executable the command names first on the daemon's search path, where it names one."
+        },
+        "executable_version": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The version a signed qualification record names for that executable's digest, where one\ndoes."
+        },
+        "flags": {
+          "description": "The flags an integrated invocation gets, each one argument element, in order.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "mode": {
+          "$ref": "#/$defs/IntegrationMode",
+          "description": "How an invocation of its command runs in a session created now."
+        },
+        "plugin_id": {
+          "description": "The package, as `publisher/plugin`.",
+          "type": "string"
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "What else the host knows of why the state is what it is: why an installation is left out\nof the admissions, or why a package could not be read."
+        },
+        "state": {
+          "$ref": "#/$defs/CommandIntegrationState",
+          "description": "What a session created now gets of it."
+        },
+        "unavailable": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CommandIntegrationUnavailable"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Why a session created now could not launch through it on this host, where one could not."
+        },
+        "variables": {
+          "description": "The variables an integrated launch sets, in order.",
+          "items": {
+            "$ref": "#/$defs/EnvironmentVariable"
+          },
+          "type": "array"
+        },
+        "version": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Its installed release, where one is installed."
+        }
+      },
+      "required": [
+        "plugin_id",
+        "version",
+        "command",
+        "flags",
+        "variables",
+        "state",
+        "unavailable",
+        "mode",
+        "executable",
+        "executable_version",
+        "reason"
+      ],
+      "type": "object"
+    },
+    "CommandIntegrationState": {
+      "description": "What a session created now gets of one command integration.",
+      "oneOf": [
+        {
+          "const": "on",
+          "description": "The configuration turns it on and the installed release's integration applies: an\ninvocation of its command gets its flags and variables behind a worker-owned backend.",
+          "type": "string"
+        },
+        {
+          "const": "off",
+          "description": "The installed release's integration applies and the configuration does not turn it on: an\ninvocation of its command runs as typed.",
+          "type": "string"
+        },
+        {
+          "const": "not_granted",
+          "description": "The release declares one, and its installation does not hold the owner-confirmed\n`command_integration.launch` grant.",
+          "type": "string"
+        },
+        {
+          "const": "none_declared",
+          "description": "The installed release declares none.",
+          "type": "string"
+        },
+        {
+          "const": "not_admitted",
+          "description": "Installed and left out of the admissions in force: disabled, revoked, not supported here,\nnot whole or past a limit.",
+          "type": "string"
+        },
+        {
+          "const": "unreadable",
+          "description": "Admitted, and its package could not be read.",
+          "type": "string"
+        },
+        {
+          "const": "conflict",
+          "description": "Another admitted package integrates the same command, so neither does.",
+          "type": "string"
+        },
+        {
+          "const": "not_installed",
+          "description": "The configuration names it and it is not installed in this environment.",
+          "type": "string"
+        }
+      ]
+    },
+    "CommandIntegrationUnavailable": {
+      "description": "Why a session created now could not launch through a command integration on this host.",
+      "oneOf": [
+        {
+          "const": "platform",
+          "description": "This platform establishes no command backend, since it cannot prove a credential file\nclosed to other accounts: every invocation runs as typed.",
+          "type": "string"
+        },
+        {
+          "const": "no_launcher",
+          "description": "No launcher, `kr-hook`, is installed beside this host's worker: every invocation runs as\ntyped.",
+          "type": "string"
+        }
+      ]
     },
     "ComponentReport": {
       "additionalProperties": false,
@@ -7477,6 +7659,7 @@
         "preferences": {
           "$ref": "#/$defs/PreferenceSet",
           "default": {
+            "command_integrations": null,
             "sleep_inhibition": null,
             "worker_profile": null
           },
@@ -14450,6 +14633,13 @@
           },
           "type": "array"
         },
+        "command_integrations": {
+          "description": "Every command integration an installed release declares or the configuration names, and\nwhat a session created now gets of it.\n\nSection 7: diagnostics show the resolved executable, flags, version and integration mode.",
+          "items": {
+            "$ref": "#/$defs/CommandIntegrationReport"
+          },
+          "type": "array"
+        },
         "configuration": {
           "$ref": "#/$defs/EffectiveConfiguration",
           "description": "What this host's configuration currently resolves to.\n\nSection 26 asks `kr doctor` to report the schema, the locations and each effective value\nwith its source, so the host answers with them rather than leaving a command to read the\ndocument a second time and reach its own conclusion about the platform's defaults."
@@ -14462,7 +14652,8 @@
       "required": [
         "checks",
         "healthy",
-        "configuration"
+        "configuration",
+        "command_integrations"
       ],
       "type": "object"
     },
@@ -16027,7 +16218,7 @@
       "description": "How a session starts its root shell and what may be launched inside it.\n\nSection 23 lists the launch profile among `shell.launch`'s preconditions, beside the terminal\ninput right, the current input lease, a qualified root editor, an empty prompt behind a fence\nand the working-directory revision. It is the one of those six that is a decision about the\nsession rather than a fact about the reader, which is why it is fixed when the session is\ncreated and read back wherever the session is described.",
       "properties": {
         "command_integrations": {
-          "description": "The opt-in command integrations this session applies to interactive invocations.",
+          "description": "The opt-in command integrations this session applies to interactive invocations.\n\nA create request names none: the host fills them from the environment's configuration\nwhen the session is launched, and refuses a request that names one.",
           "items": {
             "$ref": "#/$defs/CommandIntegration"
           },
@@ -22200,6 +22391,21 @@
       "additionalProperties": false,
       "description": "The ordinary preferences, each absent unless this document chooses it.",
       "properties": {
+        "command_integrations": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The installed packages, each as `publisher/plugin`, whose command integration a session\ncreated from now on applies: the command, flags and variables that package's verified\nmanifest declares, added to an interactive invocation of that command.\n\nSection 12's opt-in. Absent leaves the choice to the rung below; an empty list turns\nevery integration off at this rung; a list replaces the one below it rather than adding\nto it. A package named here that this environment has not installed, does not admit, or\nhas not granted `command_integration.launch` integrates nothing, and the doctor says why."
+        },
         "sleep_inhibition": {
           "anyOf": [
             {
