@@ -946,11 +946,9 @@ mod tests {
     fn grants_bridges_and_builds_follow_each_snapshot_under_one_hash() {
         use crate::broker::connectors::fixture;
         let root = tempfile::tempdir().expect("a directory");
-        let source = fixture::claude_code_package(
-            root.path(),
-            std::path::Path::new("/opt/kalareach/bin/kr-hook"),
-        )
-        .expect("the package is written");
+        // A forwarder path that is absolute on every platform, which a bridge's must be.
+        let source = fixture::claude_code_package(root.path(), &root.path().join("kr-hook"))
+            .expect("the package is written");
         let digest = source.package_digest;
         let full = admitted(&source, "kalareach/claude-code");
         let admissions = Admissions::new();

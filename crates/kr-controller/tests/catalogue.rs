@@ -3033,6 +3033,7 @@ mod native_bridges {
     use std::collections::BTreeMap;
     use std::path::PathBuf;
 
+    #[cfg(unix)]
     use super::generations;
 
     use kr_controller::catalogue::native_bridge::{
@@ -3507,6 +3508,7 @@ mod native_bridges {
 
     /// Installs Claude Code's package with its bridge stopped part way, enables it, and returns
     /// the package hash: the bridge is not applied.
+    #[cfg(unix)]
     async fn stopped_part_way(host: &Host) -> String {
         let digest = synchronised(host).await;
         host.module.native_bridges().stop_before(20);
@@ -3518,6 +3520,7 @@ mod native_bridges {
     }
 
     /// A pin the catalogue refuses, whose bridge follow-up finishes what was stopped.
+    #[cfg(unix)]
     async fn refused_pin(host: &Host, digest: &str) {
         let mut wrong = digest.to_owned();
         let last = wrong.pop().expect("a hash");
@@ -3545,6 +3548,7 @@ mod native_bridges {
         );
     }
 
+    #[cfg(unix)]
     fn bridged(snapshot: &kr_controller::catalogue::admissions::Snapshot) -> bool {
         snapshot
             .packages
@@ -3555,6 +3559,10 @@ mod native_bridges {
     /// A change that follows a bridge raises the admission revision even when the change itself
     /// is refused: the bridge it moved is handed over at a revision above every snapshot computed
     /// before it, and every worker is sent a round for it.
+    ///
+    /// Windows applies no native bridge (`refused_on_windows`), so this runs on the other
+    /// platforms.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_bridge_followed_by_a_refused_change_raises_the_admission_revision() {
         let site = Site::new();
@@ -3587,6 +3595,10 @@ mod native_bridges {
     /// A snapshot whose package checks were still running when a change moved a bridge carries a
     /// lower revision than the snapshot computed after the change, so a round that hands it over
     /// later is still below the one that handed over the newer one.
+    ///
+    /// Windows applies no native bridge (`refused_on_windows`), so this runs on the other
+    /// platforms.
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn a_snapshot_computed_across_a_bridge_move_is_below_the_one_after_it() {
         let site = Site::new();
@@ -3642,6 +3654,10 @@ mod native_bridges {
     /// A change that holds the catalogue (here, one whose bridge is being placed) holds a round's
     /// snapshot and revision no longer than the bound the round gives them: both are refused as
     /// busy by then, and both are answered once the change is done.
+    ///
+    /// Windows applies no native bridge (`refused_on_windows`), so this runs on the other
+    /// platforms.
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn a_busy_catalogue_holds_a_round_no_longer_than_its_bound() {
         let site = Site::new();
@@ -3770,6 +3786,7 @@ mod native_bridges {
 
     /// The platform a build of the stand-in executable runs on: this host's, or one release
     /// 0.3.0 also lists.
+    #[cfg(unix)]
     fn stand_in_on(
         os: kr_plugin_sdk::matching::OperatingSystem,
         architecture: kr_plugin_sdk::matching::Architecture,
@@ -3786,6 +3803,7 @@ mod native_bridges {
     }
 
     /// Names the stand-in executable at 2.1.278, built for this host.
+    #[cfg(unix)]
     fn built_here(entry: &mut kr_plugin_sdk::catalogue::IndexEntry) {
         let here = kr_plugin_catalogue::this_host();
         entry.builds = vec![stand_in_on(
@@ -3795,6 +3813,7 @@ mod native_bridges {
     }
 
     /// Names the stand-in executable at 2.1.278, built only for a platform other than this host's.
+    #[cfg(unix)]
     fn built_elsewhere(entry: &mut kr_plugin_sdk::catalogue::IndexEntry) {
         use kr_plugin_sdk::matching::{Architecture, OperatingSystem};
         let here = kr_plugin_catalogue::this_host();
@@ -3808,6 +3827,7 @@ mod native_bridges {
     /// The bridge generation's release 0.3.0 signed again as generation `number` of a repository
     /// of this test's own, its entry edited by `edit`, and put where the host reads its
     /// repository from.
+    #[cfg(unix)]
     async fn signed_again(
         host: &Host,
         home: &Path,
@@ -3839,6 +3859,7 @@ mod native_bridges {
     }
 
     /// Synchronises the repository this test enrolled.
+    #[cfg(unix)]
     async fn sync(host: &Host) {
         let _: wire::CatalogueSyncResult = ok(host
             .module
@@ -3861,6 +3882,10 @@ mod native_bridges {
     /// names: with none for this host, and with one only for another platform, the recipe places
     /// nothing; a synchronisation that adds the build for this host applies it, with no change to
     /// the plugin, and the facts then name the release.
+    ///
+    /// Windows applies no native bridge (`refused_on_windows`), so this runs on the other
+    /// platforms.
+    #[cfg(unix)]
     #[tokio::test]
     async fn the_recipe_applies_once_a_synchronised_record_names_this_hosts_build() {
         let site = Site {
