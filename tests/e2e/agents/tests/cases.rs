@@ -294,6 +294,9 @@ fn staged(
         for (pid, path) in run.system_programs() {
             provenance.note_system_program(pid, &path);
         }
+        for why in provenance.untracked() {
+            run.undiscovered(&why);
+        }
         run.end_everything();
         run.remove_loaded_jobs();
         run.nothing_running().map(|_| ())
@@ -657,6 +660,10 @@ fn run_part(
     }
     for (pid, path) in run.system_programs() {
         provenance.note_system_program(pid, &path);
+    }
+    // What the sampler could not find, the close cannot have found ended either.
+    for why in provenance.untracked() {
+        run.undiscovered(&why);
     }
     let checked = run
         .closing_check()
