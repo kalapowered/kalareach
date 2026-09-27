@@ -1006,18 +1006,22 @@ mod tests {
     }
 
     /// KR-REQ-25.25: whatever a recording is handed, it writes nothing but the view's drawing, and
-    /// what it leaves out it declares. Every string of up to four characters drawn from those that
-    /// steer the recogniser reaches every state it has and leaves by every way out of it; each is
-    /// fed whole and split in two at every point, and a split changes nothing.
+    /// a recording shorter than what it was handed declares something. Every string of up to four
+    /// characters drawn from those that steer the recogniser is fed whole and split in two at every
+    /// point, and a split changes nothing. Between them the strings reach every phase the
+    /// recogniser has, a removed string of either kind included, and meet each phase with every
+    /// character in the list. How many removals each declares, and a sequence past the bound on
+    /// what is held, are checked case by case below.
     #[test]
     fn every_input_writes_only_the_view_s_drawing_and_declares_whatever_it_leaves_out() {
-        // Text, a parameter, a separator, a private marker, an intermediate, the introducers and
-        // the string terminator's second character, a colour's final and a report's, escape, bell,
-        // cancel, return, null, delete, the eight-bit control sequence introducer, string
-        // terminator and next line, and a character outside ASCII.
-        const STEERING: [char; 21] = [
-            'x', '6', ';', '?', ' ', '[', ']', 'P', '\\', 'm', 'n', '\u{1b}', '\u{7}', '\u{18}',
-            '\r', '\u{0}', '\u{7f}', '\u{9b}', '\u{9c}', '\u{85}', 'é',
+        // Text, a parameter, a separator, a private marker, an intermediate, the introducers of a
+        // control sequence, an operating-system command, a device-control string and an
+        // application-program command, the string terminator's second character, a colour's final
+        // and a report's, escape, bell, cancel, return, null, delete, the eight-bit control
+        // sequence introducer, string terminator and next line, and a character outside ASCII.
+        const STEERING: [char; 22] = [
+            'x', '6', ';', '?', ' ', '[', ']', 'P', '_', '\\', 'm', 'n', '\u{1b}', '\u{7}',
+            '\u{18}', '\r', '\u{0}', '\u{7f}', '\u{9b}', '\u{9c}', '\u{85}', 'é',
         ];
         let mut longest = vec![String::new()];
         let mut inputs = Vec::new();
@@ -1051,6 +1055,97 @@ mod tests {
                     (written.clone(), declared.clone()),
                     "{input:?} split at {split}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn a_string_ended_by_an_escape_and_an_escape_then_abandoned_are_each_declared() {
+        // The escape that ends a string is a new escape, and whatever abandons it (an eight-bit
+        // control, a character outside ASCII, another escape, a cancel) leaves it out as well.
+        fn check(input: &str, written: &str, declared: &[(&str, u64)]) {
+            for (body, omissions) in at_every_split(input) {
+                assert_eq!(body, written, "{input:?}");
+                assert_eq!(kinds(&omissions), declared, "{input:?}");
+            }
+        }
+        check(
+            "\u{1b}P\u{1b}\u{85}",
+            "",
+            &[("device_control_string", 1), ("terminal_control", 2)],
+        );
+        check(
+            "\u{1b}]0;t\u{1b}éx",
+            "éx",
+            &[("application_string", 1), ("terminal_control", 1)],
+        );
+        check(
+            "\u{1b}]52;c;x\u{1b}\u{9b}6n",
+            "",
+            &[
+                ("clipboard_write", 1),
+                ("terminal_control", 1),
+                ("terminal_query", 1),
+            ],
+        );
+        check(
+            "\u{1b}P+q\u{1b}\u{1b}[31mx",
+            "\u{1b}[31mx",
+            &[("device_control_string", 1), ("terminal_control", 1)],
+        );
+        check(
+            "\u{1b}_a\u{1b}\u{18}x",
+            "x",
+            &[("application_string", 1), ("terminal_control", 1)],
+        );
+    }
+
+    #[test]
+    fn an_application_string_is_removed_however_it_ends() {
+        // An application-program command, a privacy message and a start-of-string, each in its
+        // escape form or its eight-bit form, ended by the string terminator, cancelled, abandoned
+        // for a new sequence, or still open when the recording ends.
+        let cases = [
+            ("a\u{1b}_payload\u{1b}\\b", "ab"),
+            ("a\u{9f}payload\u{9c}b", "ab"),
+            ("a\u{1b}^message\u{18}b", "ab"),
+            ("a\u{98}string\u{1b}[31mb", "a\u{1b}[31mb"),
+            ("a\u{1b}Xopen", "a"),
+            ("a\u{9e}open", "a"),
+        ];
+        for (input, written) in cases {
+            for (body, omissions) in at_every_split(input) {
+                assert_eq!(body, written, "{input:?}");
+                assert_eq!(kinds(&omissions), [("application_string", 1)], "{input:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_sequence_past_the_bound_on_what_is_held_is_removed_however_it_ends() {
+        // A colour whose parameters run past the bound would be kept whole were it shorter; cut
+        // at the bound it is not the colour it says, so it is removed, whether its final
+        // character comes, a cancel abandons it, or the recording ends first. An escape whose
+        // intermediates run past the bound goes the same way.
+        let colour = format!("\u{1b}[{}", "1;".repeat(MAX_HELD_SEQUENCE));
+        let intermediates = format!("\u{1b}{}", " ".repeat(MAX_HELD_SEQUENCE + 8));
+        let cases = [
+            (format!("{colour}mx"), "x"),
+            (format!("{colour}\u{18}x"), "x"),
+            (colour.clone(), ""),
+            (format!("{intermediates}0x"), "x"),
+            (format!("{intermediates}\u{18}x"), "x"),
+            (intermediates.clone(), ""),
+        ];
+        for (input, written) in &cases {
+            let length = input.len();
+            let whole = filtered(&[input.as_str()]);
+            assert_eq!(whole.0, *written);
+            assert_eq!(kinds(&whole.1), [("terminal_control", 1)]);
+            // Split near the start, at the bound, and near the end, the result is the same.
+            for split in [2, MAX_HELD_SEQUENCE, length - 1] {
+                let (left, right) = input.split_at(split);
+                assert_eq!(filtered(&[left, right]), whole);
             }
         }
     }
