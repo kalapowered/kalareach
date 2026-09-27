@@ -1579,10 +1579,10 @@ impl std::fmt::Display for Breach {
 /// * a module file declared anywhere but among a module's items, which the reading does not read;
 /// * a character outside ASCII anywhere but in a comment or a literal: the compiler compares
 ///   identifiers once it has normalised them, and the reading compares them as written;
-/// * in a macro whose tokens hold a metavariable or a repetition (see [`macro_text`]), a keyed
+/// * in a macro whose tokens hold a metavariable or a repetition (see `macro_text`), a keyed
 ///   helper's name however it is written, and a trusted name anywhere but where the macro cannot
 ///   make a declaration of it;
-/// * a macro's repetition that opens or ends inside an item's header (see [`split_headers`]).
+/// * a macro's repetition that opens or ends inside an item's header (see `split_headers`).
 ///
 /// # Errors
 ///
