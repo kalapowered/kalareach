@@ -32,6 +32,7 @@
 //! | [`terminal`] | Raw mode, terminal size and the saved state the guard holds |
 //! | [`platform`] | The one place this crate calls the operating system directly |
 //! | [`shell`] | `kr shell`: the guarded startup entries and what the integration resolved to |
+//! | [`output`] | Everything written on standard output, and the only writer there |
 //! | [`report`] | Text for people and the `--json` shapes |
 //! | [`error`] | The failures above, each with its own exit code |
 
@@ -48,6 +49,7 @@ pub mod device;
 pub mod diff;
 pub mod doctor;
 pub mod error;
+pub mod output;
 pub mod pair;
 pub mod platform;
 pub mod plugin;

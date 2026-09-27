@@ -10,7 +10,14 @@
 //!   with every value the person typed taken out;
 //! * [`tool_server`], a failure of the tool server by its kind;
 //! * [`VerificationValue`], a pairing's verification value as both devices show it;
-//! * [`BuildName`], a build identifier that is a program's name and its release.
+//! * [`BuildName`], a build identifier that is a program's name and its release;
+//! * [`host_text`], the door for the host's own export text as it arrived on the owner's local
+//!   connection;
+//! * [`withheld`], a value the host wrote said by its class and its length, in the host's own words;
+//! * [`git_revision`], [`git_mode`] and [`hex_digest`], identifiers that arrived as text, said only
+//!   when they match their grammar, and [`socket_address`] and [`host_name`], the two network forms
+//!   a configuration value can take besides a URL;
+//! * [`help`], this program's own help and version, as clap renders its declarations.
 //!
 //! Each type here is made only by the function beside it, so a value of it is always what that
 //! function decided may be said.
@@ -33,9 +40,10 @@ pub fn named(path: &Path) -> Named {
     Named(path.to_path_buf())
 }
 
+/// Spelled as every path this program says: the platform's own separator throughout.
 impl fmt::Display for Named {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(&self.0.display(), formatter)
+        formatter.write_str(&kr_client::shown::spelled(&self.0))
     }
 }
 
@@ -375,6 +383,271 @@ pub fn terminal_application(id: &str) -> Shown {
 #[must_use]
 pub fn errno(error: rustix::io::Errno) -> Shown {
     Shown::io(&std::io::Error::from(error))
+}
+
+/// The host's own export text, as it arrived.
+pub struct HostText(String);
+
+/// Returns what a host's export text says: its words, as the host wrote them.
+///
+/// A host composes an export [`Stated`](kr_protocol::hostinfo::export::Stated) or
+/// [`Sentence`](kr_protocol::hostinfo::export::Sentence) only from its own source's words, numbers,
+/// the terms its build defines, the identifiers it generated, and the class and length of anything
+/// else, so the text carries nothing that arrived at the host. Once it has crossed the wire it is
+/// text that arrived here, which [`Shown::sentence`] measures. This door says it as the host wrote
+/// it instead, as [`Shown::protocol`] says the host's messages: it is for the replies this command
+/// line reads from its own host on the owner's local connection, which are every reply it reads.
+/// It takes only those two types, and a plain string is not one of them:
+///
+/// ```compile_fail
+/// let arrived = String::from("kr-marker-7c1e");
+/// let _ = kr_cli::shown::host_text(&arrived);
+/// ```
+#[must_use]
+pub fn host_text(text: &impl kr_protocol::hostinfo::export::Provenance) -> Shown {
+    shown!("{}", HostText(text.as_str().to_owned()))
+}
+
+impl fmt::Display for HostText {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl Plain for HostText {}
+
+/// A value the host wrote, said as its class and its length.
+pub struct Withheld(String);
+
+/// Returns what a value the host wrote says when nothing asks to show it: its class and its length,
+/// in the host's own words for a value it does not export (`[message withheld, 23 bytes]`).
+#[must_use]
+pub fn withheld(class: kr_protocol::hostinfo::export::ContentClass, value: &str) -> Shown {
+    shown!(
+        "{}",
+        Withheld(kr_protocol::hostinfo::export::withheld(class, value))
+    )
+}
+
+/// Returns what a value of `class` says on the host's own export terms: a term this build defines
+/// and a number as themselves, anything else as its class and its length.
+#[must_use]
+pub fn carried(class: kr_protocol::hostinfo::export::ContentClass, value: &str) -> Shown {
+    shown!(
+        "{}",
+        Withheld(kr_protocol::hostinfo::export::carry(class, value))
+    )
+}
+
+/// Returns what a text field of the host's `type_name` says on the host's own export terms: the
+/// class its allowlist gives the field decides, and a field it does not list is a message.
+#[must_use]
+pub fn exported(type_name: &str, field: &str, value: &str) -> Shown {
+    use kr_protocol::hostinfo::export::{ContentClass, class_of};
+
+    carried(
+        class_of(type_name, field).unwrap_or(ContentClass::Message),
+        value,
+    )
+}
+
+impl fmt::Display for Withheld {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl Plain for Withheld {}
+
+/// Returns the word a value of a closed set goes by on the wire: the name this build's own source
+/// gives the variant.
+///
+/// A value that can be copied and lives for the whole program holds no text that arrived: no owned
+/// string, and no reference but to this program's own words. A value that does not serialise to one
+/// word is named as such.
+#[must_use]
+pub fn wire_word<T: serde::Serialize + Copy + 'static>(value: T) -> Shown {
+    match serde_json::to_value(value) {
+        Ok(serde_json::Value::String(word)) => shown!("{}", Withheld(word)),
+        _ => Shown::said("[a value this build does not name]"),
+    }
+}
+
+/// An identifier that arrived as text and matched its grammar.
+pub struct Checked(String);
+
+impl fmt::Display for Checked {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl Plain for Checked {}
+
+/// What an identifier that is not one says.
+const NOT_AN_IDENTIFIER: &str = "[not an identifier]";
+
+/// Says `text` when `matches` holds of it, and that it is not an identifier otherwise.
+fn checked(text: &str, matches: bool) -> Shown {
+    if matches {
+        shown!("{}", Checked(text.to_owned()))
+    } else {
+        Shown::said(NOT_AN_IDENTIFIER)
+    }
+}
+
+/// Whether `text` is hexadecimal digits, lower case, within `lengths`.
+fn lower_hex(text: &str, lengths: std::ops::RangeInclusive<usize>) -> bool {
+    lengths.contains(&text.len())
+        && text
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Whether `text` is a Git reference name as `git check-ref-format` accepts one: no control
+/// character, space or `~ ^ : ? * [ \`, no `..`, `@{` or `//`, no part that begins with a dot or
+/// ends with `.lock`, and neither `/` nor `.` at either end.
+fn git_reference_name(text: &str) -> bool {
+    !text.is_empty()
+        && text.len() <= 255
+        && text != "@"
+        && !text.bytes().any(|byte| {
+            byte.is_ascii_control()
+                || matches!(byte, b' ' | b'~' | b'^' | b':' | b'?' | b'*' | b'[' | b'\\')
+        })
+        && !text.contains("..")
+        && !text.contains("@{")
+        && !text.contains("//")
+        && !text.starts_with('/')
+        && !text.ends_with('/')
+        && !text.ends_with('.')
+        && text
+            .split('/')
+            .all(|part| !part.starts_with('.') && !part.ends_with(".lock"))
+}
+
+/// What a Git revision that arrived as text says: an object identifier (hexadecimal, 4 to 64
+/// digits) or a reference name, as itself; anything else is not an identifier.
+#[must_use]
+pub fn git_revision(text: &str) -> Shown {
+    checked(text, lower_hex(text, 4..=64) || git_reference_name(text))
+}
+
+/// What a Git file mode that arrived as text says: six octal digits as themselves.
+#[must_use]
+pub fn git_mode(text: &str) -> Shown {
+    checked(
+        text,
+        text.len() == 6 && text.bytes().all(|byte| (b'0'..=b'7').contains(&byte)),
+    )
+}
+
+/// What a digest that arrived as text says: 64 lower-case hexadecimal digits as themselves.
+#[must_use]
+pub fn hex_digest(text: &str) -> Shown {
+    checked(text, lower_hex(text, 64..=64))
+}
+
+/// What a build identifier that arrived as text says: itself, when it is one this build reads
+/// (`kr/0.46.0`), and that it is not an identifier otherwise.
+#[must_use]
+pub fn build_identity(text: &str) -> Shown {
+    checked(
+        text,
+        kr_protocol::hostinfo::export::BuildIdentity::parse(text).is_some(),
+    )
+}
+
+/// What a socket address says, in the form it parses to, when the text is one.
+#[must_use]
+pub fn socket_address(text: &str) -> Option<Shown> {
+    text.parse::<std::net::SocketAddr>()
+        .ok()
+        .map(|address| shown!("{}", Checked(address.to_string())))
+}
+
+/// What a host name says, when the text is one: labels of letters, digits and hyphens, each 1 to 63
+/// bytes and neither beginning nor ending with a hyphen, joined by dots, 253 bytes at most, with a
+/// final dot allowed.
+#[must_use]
+pub fn host_name(text: &str) -> Option<Shown> {
+    let labels = text.strip_suffix('.').unwrap_or(text);
+    let named = !labels.is_empty()
+        && text.len() <= 253
+        && labels.split('.').all(|label| {
+            (1..=63).contains(&label.len())
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        });
+    named.then(|| shown!("{}", Checked(text.to_owned())))
+}
+
+/// This program's help or version, as clap renders what the command declares.
+pub struct Help(String);
+
+/// Returns this program's help or version, when that is what clap answered: the command's own
+/// declarations, which hold nothing that was typed. Any other answer is a usage failure, which
+/// [`usage`] says.
+#[must_use]
+pub fn help(answer: &clap::Error) -> Option<Shown> {
+    use clap::error::ErrorKind;
+
+    matches!(
+        answer.kind(),
+        ErrorKind::DisplayHelp
+            | ErrorKind::DisplayVersion
+            | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+    )
+    .then(|| {
+        let rendered = answer.render().to_string();
+        let text = rendered.strip_suffix('\n').unwrap_or(&rendered);
+        shown!("{}", Help(text.to_owned()))
+    })
+}
+
+impl fmt::Display for Help {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl Plain for Help {}
+
+/// Composes one line of standard output from a template of this program's own and parts that are
+/// each [`Plain`] or content the person asked to read ([`crate::output::Asked`]).
+///
+/// `stdout_line!("{} is {}", question_id, state)`. As with [`kr_client::shown!`], every hole is a
+/// bare `{}` filled by the next part in order, and a template with more or fewer holes than parts
+/// does not build.
+#[macro_export]
+macro_rules! stdout_line {
+    ($template:literal $(,)?) => {{
+        const _: () = ::core::assert!(
+            ::core::matches!(
+                ::kr_client::shown::holes($template),
+                ::core::option::Option::Some(0)
+            ),
+            "a stdout_line! template has one bare {{}} for each part and no other braces"
+        );
+        $crate::output::Line::compose($template, &[])
+    }};
+    ($template:literal, $($part:expr),+ $(,)?) => {{
+        const _: () = ::core::assert!(
+            ::core::matches!(
+                ::kr_client::shown::holes($template),
+                ::core::option::Option::Some(holes)
+                    if holes == 0 $(+ ::kr_client::shown::one(::core::stringify!($part)))+
+            ),
+            "a stdout_line! template has one bare {{}} for each part and no other braces"
+        );
+        $crate::output::Line::compose(
+            $template,
+            &[$($crate::output::Part::piece(&$part)),+],
+        )
+    }};
 }
 
 // The command line's own failures, each held to saying only `Shown` and `Plain` values.

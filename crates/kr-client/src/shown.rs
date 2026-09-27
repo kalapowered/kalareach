@@ -865,7 +865,11 @@ enum Piece<'a> {
 /// On Windows either slash separates the parts of a path, so a root written with one and a name
 /// joined with the other would be said with both; here each is the platform's own. Elsewhere only
 /// `/` separates, and a backslash is a character of a name, so the text is the path's.
-fn spelled(path: &Path) -> String {
+///
+/// This is only how a path is spelled, not whether it may be said: the reducers above decide that
+/// for a diagnostic, and the command line spells a path a person asked to read the same way.
+#[must_use]
+pub fn spelled(path: &Path) -> String {
     path.display()
         .to_string()
         .chars()
@@ -877,6 +881,34 @@ fn spelled(path: &Path) -> String {
             }
         })
         .collect()
+}
+
+/// A network location as a person may read it back: a URL's scheme, host, port and path, and never
+/// its user information, its query or its fragment. `None` when the text is not a URL with a host.
+///
+/// Not a [`Shown`]: this is what the command line shows a person of a location they asked to read.
+/// What it leaves out is left out here, in one place, so no caller keeps a password written in front
+/// of a host or a token carried in a query.
+#[must_use]
+pub fn located(text: &str) -> Option<String> {
+    let address = url::Url::parse(text).ok()?;
+    let host = address.host_str().filter(|host| !host.is_empty())?;
+    let mut said = format!("{}://{host}", address.scheme());
+    if let Some(port) = address.port() {
+        said.push(':');
+        said.push_str(&port.to_string());
+    }
+    // A URL written with no path reads back with the root path, so that one is said only when it
+    // was written.
+    let path = address.path();
+    let written_root = text
+        .split(['?', '#'])
+        .next()
+        .is_some_and(|base| base.ends_with('/'));
+    if path != "/" || written_root {
+        said.push_str(path);
+    }
+    Some(said)
 }
 
 /// Joins the parts of a path after `start` with `separator`, as text: a placeholder is kept where a
@@ -1474,6 +1506,42 @@ mod tests {
             ),
         ] {
             assert_eq!(Shown::address(&origin).as_str(), expected);
+        }
+    }
+
+    /// A location a person asked to read keeps its scheme, host, port and path, and never its user
+    /// information, query or fragment; text that is not a URL with a host is not a location here.
+    #[test]
+    fn a_location_keeps_its_scheme_host_port_and_path_and_nothing_else() {
+        for (text, expected) in [
+            (
+                format!("https://{MARKER}:{MARKER}@proxy.example:8080/relay/?{MARKER}=1#{MARKER}"),
+                Some("https://proxy.example:8080/relay/"),
+            ),
+            (
+                format!("https://{MARKER}@proxy.example?token={MARKER}"),
+                Some("https://proxy.example"),
+            ),
+            (
+                "https://relay.example".to_owned(),
+                Some("https://relay.example"),
+            ),
+            (
+                "https://relay.example/".to_owned(),
+                Some("https://relay.example/"),
+            ),
+            (
+                "http://[::1]:4433/path".to_owned(),
+                Some("http://[::1]:4433/path"),
+            ),
+            (MARKER.to_owned(), None),
+            ("C:\\work\\repository".to_owned(), None),
+            ("file:///srv/repository".to_owned(), None),
+            ("192.0.2.1:4433".to_owned(), None),
+        ] {
+            let said = located(&text);
+            assert_eq!(said.as_deref(), expected, "{text}");
+            assert!(!said.unwrap_or_default().contains(MARKER), "{text}");
         }
     }
 
