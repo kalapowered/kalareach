@@ -1908,9 +1908,10 @@ What a device reaches, in order:
    The four host-and-environment reads leave in their export form, with no account name, local
    path or platform message in them; "What a paired device reads of this host" lists what each
    carries instead.
-4. **Effects the daemon owns** — creating a session, and the repository and workspace mutations —
-   are performed by the daemon, on a task that outlives the connection that asked. They name no
-   session, so no worker owns them.
+4. **Effects the daemon owns** — creating a session, the repository and workspace mutations, and
+   pinning a session's name — are performed by the daemon, on a task that outlives the connection
+   that asked. No worker owns them: the first two name no session, and a session's pinned name is
+   the environment's metadata, which outlives the session.
 5. **Everything a session owns** is forwarded to the worker over a link the daemon opened for that
    connection, under the verified envelope and the deadline the daemon accepted, through the same
    serial barrier a local caller's mutation passes through. That link declares itself a proxy before
@@ -1949,12 +1950,14 @@ recorded after the device's first subscription of that attachment began. The loc
 that comes with no scope, are shown every resource and every transition. `grant.list` answers with
 the grants the device issued and everything delegated from them, and it needs `session.share`.
 
-Four reads are refused as `UNSUPPORTED_CAPABILITY`, with the read and the reason in the message:
+`session.describe` is answered by the daemon from the environment's store of session names,
+filtered for the device: the generated text of a description only when the device's grant reaches
+back to the session's start, and otherwise the pin or the metadata title (*Session names and
+descriptions* has the rule). `privacy.status` is answered by the daemon under `host.manage`.
 
-* `session.describe`, because this host runs no description service; `session.read` and
-  `session.list` carry a session's metadata and verified state.
-* `upload.status`, `download.begin` and `download.chunk`, because a transfer's chunks travel on an
-  attachment-chunk stream and this host opens none on a network connection.
+Three reads are refused as `UNSUPPORTED_CAPABILITY`, with the read and the reason in the message:
+`upload.status`, `download.begin` and `download.chunk`, because a transfer's chunks travel on an
+attachment-chunk stream and this host opens none on a network connection.
 
 What the grant decides, for every request:
 
@@ -2729,6 +2732,58 @@ The generation is written down **before** any subsystem is touched. A generation
 and not recorded would be a boundary a restart could not see, and a late result from before it
 would then be published; a host that cannot record it does not enter privacy mode at all.
 
+### Turning it on and off
+
+Privacy mode is one generation for the whole environment, and the control daemon keeps it. Its
+record, `privacy.sqlite3` in the state directory, holds the generation, whether privacy mode is on,
+and one **obligation** for each session whose own cleanup at that generation has not yet been shown
+to be complete. `kr privacy on` and `kr privacy off` reach it through `privacy.set`, which only this
+host serves: a paired device whose grant carries `host.manage` reads `privacy.status` and changes
+nothing about the host. Both answer one report: the generation, whether the last change has taken
+effect, what each session still owes, what the daemon keeps and why, and what had already left this
+host.
+
+Turning it on writes the record first, in one transaction with an obligation for every session the
+environment holds content for: every worker the registry records and every session whose journal or
+spool is still on the disk. The admission the request carries is asked again immediately before
+that write, so an action whose deadline passed, or whose authority was withdrawn, while it waited
+changes nothing. The write happens inside the backup store's own hold together with the backup
+fence, so no backup decision falls between the two, and no exchange with a delivery destination
+falls between the record and the moment the new state is published, because the send gate below is
+held shut across both. Only then are the daemon's own subsystems taken through the four steps: the
+backup service, the delivery outbox and the stored descriptions.
+
+Each session is told the generation by the daemon, on a tick once a second, over the connection the
+daemon holds to its worker. The worker raises its attention transition, applies the generation to
+the session and answers where its own cleanup stands. The tick tells it again, waiting longer each
+time, until it answers that its cleanup is complete, and only that answer ends its obligation. A
+session whose worker ended first keeps its obligation, reported as unavailable with the archive
+named as what holds its output, because an ended worker is no evidence that what it retained is
+gone.
+
+The report says complete only when every subsystem has nothing outstanding and every obligation has
+ended. A step a store refused is owed, with the store's reason, and the tick tries it again on a
+schedule of its own, one second doubling to a minute; so is whatever the backup service still has to
+clean up. A daemon that stops in the middle reads the record before any subsystem the record drives
+does anything, takes every subsystem through the steps again, which each can do any number of times
+at one generation, and only then reconciles the backup service, starts delivery and serves anything.
+A record it cannot read stops the start rather than leaving the daemon to guess.
+
+Turning it off is refused while a daemon subsystem or a live session still owes cleanup, and the
+refusal names what is owed. A session whose worker has ended does not hold it back, because nothing
+resumes in its store, and its obligation stays recorded. Otherwise the next generation is recorded
+first, the backup fence is released under it, the delivery fence is lifted, and each live session is
+told until it answers.
+
+**The send gate.** Every exchange the delivery outbox has with a destination, a send or a question
+about an earlier one, is admitted under the privacy state the record publishes: only while privacy
+mode is off, and only at the generation the notification was admitted under. The admission is held
+until the answer is recorded. Turning privacy mode on waits for exchanges already admitted, and a
+notification claimed before the change and presented after it, once a credential renewal that waits
+on the gateway has finished, is taken back rather than presented: nothing of it left this host, and
+it is settled as cancelled. Anything the outbox has on the wire when privacy mode is turned on stays
+outstanding until its answer arrives, and is then listed among what left.
+
 Content-history retention, description inference, sync production and backup production are
 disabled prospectively, together. What this host holds itself is removed with them: the retained
 output goes, the spool with it, and the content a settled receipt carries - the intent envelope
@@ -2885,11 +2940,14 @@ reason to keep output.
 Stated here rather than left to be discovered, because the gap between what a mode is called and
 what it removes is exactly the thing a person cannot check for themselves.
 
-* **Nothing in this build turns it on.** The generation, the contract, the two adapters over the
-  spool and the journal and the backup service's own hook are here and tested; no method or command
-  reaches them, and the transfer preview, description inference and sync subsystems are recorded
-  stubs rather than services. Until a caller exists, privacy mode is a contract this host can keep,
-  not a setting a person has.
+* **A session created while privacy mode is on learns the generation from the tick.** Its worker
+  is told about a second after it starts rather than before its shell runs, and its obligation is
+  written when the tick first sees it running, so output in that second may be retained until the
+  worker applies the generation and removes it.
+* **Transfer previews and sync are not driven.** The transfer service keeps no preview store for
+  privacy mode to reach, and sync is the clients' own record; neither is one of the subsystems the
+  daemon takes through the steps. No description process runs on this host, so there is no
+  inference in flight to take back: stored descriptions are removed and titles come from metadata.
 * **The canonical grid keeps its scrollback.** Retention stops at the spool and the resident
   window; the projection's own history is not reached, because removing rows from it while keeping
   the live screen needs an interface the task that owns the projection has to provide.
@@ -2897,8 +2955,8 @@ what it removes is exactly the thing a person cannot check for themselves.
   host-event store, and privacy cleanup removes neither the rows already there nor later ones.
 * **Content that settles is taken in a second step.** An action admitted under privacy mode has
   its receipt content removed where it settles, which is after the transaction that wrote the
-  outcome; a crash between the two leaves it, and two settlement paths do not reach that step at
-  all.
+  outcome; a crash between the two leaves it, and the early rejection path does not reach that step
+  at all.
 * **The archive does not enforce any of this.** A session read after its worker has gone is served
   from the store as it stands: the archive neither finishes an unfinished cleanup nor holds a read
   while one is owed.
@@ -2946,6 +3004,18 @@ session closing and the host restarting. Generated text never replaces a pin and
 status shown beside it. Under privacy mode, description processing stops at once, every queued job
 is taken back, every generated description is removed, pins are kept, and titles come from metadata
 from the instant the fence goes up. `docs/describe/README.md` has the whole of it.
+
+The control daemon serves both methods from that store, on its local socket and to a paired device.
+`session.describe` is a read under `session.view`, filtered for whoever asks: the pin when there is
+one, otherwise generated text, otherwise the title built from the session's display number and the
+directory it started in. Generated text, with its activity line and its provenance, is served only
+while privacy mode is off, only when it was produced under the generation in force, and only to a
+caller whose history reaches the whole session: the owner at this machine, or a device whose grant's
+history bound is at or before the session's start. A grant with no history bound retains no history,
+so its device is shown the pin or the metadata title. This daemon runs no description process, so
+the answer says inference is paused because no model runs here, and has no queue age.
+`session.rename` needs `session.rename`: it pins a title of at most 64 codepoints, or clears the pin
+with no title, records who set it, and answers what the session is shown as afterwards.
 
 ## What an idle session wakes for
 

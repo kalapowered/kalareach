@@ -30,12 +30,13 @@ worker directly for what a session owns.
 | `kr device [list/revoke]` | — | The devices paired with this host, and revoking one |
 | `kr plugin [list/install/remove/pin/enable/disable]` | — | Plugin packages and what they may do |
 | `kr plugin repo [list/add/sync/pin/remove]` | — | The repositories plugins come from, and the trust placed in them |
+| `kr privacy [on/off/status]` | — | Turn this environment's privacy mode on or off, or show where it stands |
 
 `--help`, `--version` and `--json` work everywhere. A literal `--` ends option parsing. Neither
 shell commands nor paths are assembled by interpolating text.
 
-The commands from `kr project` to `kr plugin repo` act in this installation's own environment, or in
-the one `--environment <id>` names. Each is a client of one method the control daemon serves, and
+The commands from `kr project` to `kr privacy` act in this installation's own environment, or in the
+one `--environment <id>` names. Each is a client of one method the control daemon serves, and
 the daemon decides every refusal. A command that removes or revokes something names it by its
 identifier, never by a label or a number.
 
@@ -1239,6 +1240,30 @@ platform's own listing said of it, and why none is held can carry what its facil
 line says each as its class and its length; `pmset -g assertions` on macOS lists the assertion
 itself. `docs/host/platforms.md` has the facility each platform uses and what an assertion does not
 promise.
+
+## `kr privacy`
+
+Privacy mode is one switch for the whole environment, and only this host turns it on or off:
+
+```sh
+kr privacy on        # stop retaining content, and clean up what this host kept
+kr privacy status    # where it stands, and what is still owed
+kr privacy off       # retention starts again, once the cleanup is complete
+```
+
+Turning privacy mode on records a new privacy generation before anything else happens, and then
+stops, takes back and removes what the host's own services and each session hold. The answer says
+whether that has finished. Until it has, `kr privacy on` prints what is still owed and exits with 1
+and `RESOURCE_UNAVAILABLE`, as a revocation still pending does, and `kr privacy status` reports how
+far it has got: work that had already left this host and has not been answered, and each session
+whose worker has not yet said its own cleanup is complete. `kr privacy off` is refused while any of
+that is owed, and says what. Nothing privacy mode removed comes back when it is turned off.
+
+`kr privacy status` also names what this host keeps while privacy mode is on, and why, and lists
+what had already left it before privacy mode was turned on: backup archives and notifications, each
+with whether this host holds any way to ask for its removal. It changes nothing. A paired device
+whose grant carries `host.manage` reads the same report; no device can turn privacy mode on or off.
+`docs/host/README.md` has what each step does and what privacy mode does not reach yet.
 
 ## `--json` shapes
 
