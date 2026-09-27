@@ -107,7 +107,7 @@ fn an_integration_that_does_not_apply_gives_no_entry() {
         &fixture::Shape {
             plugin_name: "silent",
             integration: None,
-            ..fixture::Shape::claude_code()
+            ..fixture::Shape::gemini_cli(&[])
         },
         |_| {},
     );
