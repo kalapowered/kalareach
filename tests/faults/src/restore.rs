@@ -224,19 +224,29 @@ pub struct Account {
 /// Follows each owed side effect to the delivery that performed it.
 ///
 /// An occurrence is matched by the cursor it is delivered at, which is where its sequence began, and
-/// by what it is, so two equal effects are never taken for each other. An owed effect with no match
-/// is lost when a resynchronisation was requested at the cursor that completed it, and a failure
-/// otherwise; a delivery that matches no owed effect is a failure.
+/// by what it is, so two equal effects are never taken for each other; and the deliveries are
+/// matched in the order the effects were caused, because a terminal that performed two clipboard
+/// writes the other way round ends up holding the wrong one. An owed effect with no match is lost
+/// when a resynchronisation was requested at the cursor that completed it, and a failure otherwise;
+/// a delivery that matches no owed effect is a failure.
 #[must_use]
 pub fn account(owed: &[Caused], delivered: &[Delivered], resyncs_at: &[u64]) -> Account {
     let mut used = vec![false; delivered.len()];
     let mut found = Account::default();
+    // The first delivery a later effect may be matched to.
+    let mut after = 0;
     for effect in owed {
-        let matched = delivered.iter().enumerate().position(|(index, got)| {
-            !used[index] && got.cursor == effect.at && same_effect(&got.kind, &effect.kind)
-        });
+        let matched = delivered
+            .iter()
+            .enumerate()
+            .skip(after)
+            .find(|(_, got)| got.cursor == effect.at && same_effect(&got.kind, &effect.kind))
+            .map(|(index, _)| index);
         match matched {
-            Some(index) => used[index] = true,
+            Some(index) => {
+                used[index] = true;
+                after = index + 1;
+            }
             None => {
                 let what = format!(
                     "its terminal never performed {:?}, which the application began at byte {} and \
@@ -252,13 +262,25 @@ pub fn account(owed: &[Caused], delivered: &[Delivered], resyncs_at: &[u64]) -> 
         }
     }
     for (got, used) in delivered.iter().zip(used) {
-        if !used {
-            found.failures.push(format!(
+        if used {
+            continue;
+        }
+        let caused = owed
+            .iter()
+            .any(|effect| got.cursor == effect.at && same_effect(&got.kind, &effect.kind));
+        found.failures.push(if caused {
+            format!(
+                "its terminal performed {:?} from a delivery at byte {} out of the order the \
+                 application caused it in",
+                got.kind, got.cursor
+            )
+        } else {
+            format!(
                 "its terminal performed {:?} from a delivery at byte {}, which the application did \
                  not cause while it held the lease",
                 got.kind, got.cursor
-            ));
-        }
+            )
+        });
     }
     found
 }
@@ -1284,6 +1306,67 @@ mod tests {
         assert!(found.lost.is_empty(), "{found:?}");
         assert_eq!(found.failures.len(), 1, "{found:?}");
         assert!(found.failures[0].contains("began at byte 9"), "{found:?}");
+    }
+
+    fn clipboard(content: &str, at: u64) -> Caused {
+        Caused {
+            kind: SideEffectKind::ClipboardWrite {
+                selection: kr_term::sideeffect::ClipboardSelection::Clipboard,
+                content: content.as_bytes().to_vec(),
+            },
+            at,
+            completed_at: at + 5,
+        }
+    }
+
+    fn performed(effect: &Caused) -> Delivered {
+        Delivered {
+            cursor: effect.at,
+            kind: effect.kind.clone(),
+        }
+    }
+
+    #[test]
+    fn two_effects_performed_the_other_way_round_fail() {
+        let (first, second) = (clipboard("first", 10), clipboard("second", 20));
+        let found = account(
+            &[first.clone(), second.clone()],
+            &[performed(&second), performed(&first)],
+            &[],
+        );
+        assert!(found.lost.is_empty(), "{found:?}");
+        assert!(
+            found
+                .failures
+                .iter()
+                .any(|failure| failure.contains("out of the order")),
+            "{found:?}"
+        );
+        let in_order = account(
+            &[first.clone(), second.clone()],
+            &[performed(&first), performed(&second)],
+            &[],
+        );
+        assert_eq!(in_order, Account::default());
+    }
+
+    #[test]
+    fn a_reversed_pair_fails_beside_an_effect_that_was_lost() {
+        let (first, second) = (clipboard("first", 10), clipboard("second", 20));
+        let found = account(
+            &[bell(4, 5), first.clone(), second.clone()],
+            &[performed(&second), performed(&first)],
+            &[5],
+        );
+        assert_eq!(found.lost.len(), 1, "the bell is lost: {found:?}");
+        assert!(found.lost[0].contains("completed at byte 5"), "{found:?}");
+        assert!(
+            found
+                .failures
+                .iter()
+                .any(|failure| failure.contains("out of the order")),
+            "the reversal still fails: {found:?}"
+        );
     }
 
     #[test]
