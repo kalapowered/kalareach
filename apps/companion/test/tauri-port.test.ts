@@ -17,7 +17,7 @@ import type { ConnectionState } from '../src/host/port'
 import { CONNECTION_EVENT, tauriPort } from '../src/host/tauri'
 
 const shell = vi.hoisted(() => ({
-  invoked: [] as { command: string; args: unknown }[],
+  invoked: [] as { command: string; args: unknown; options?: unknown }[],
   /** What a command answers, by its name; one not named here answers a session snapshot. */
   answers: new Map<string, unknown>(),
   /** The handler native code publishes each event to, by the event's name. */
@@ -25,8 +25,8 @@ const shell = vi.hoisted(() => ({
 }))
 
 vi.mock('@tauri-apps/api/core', () => ({
-  invoke: (command: string, args: unknown) => {
-    shell.invoked.push({ command, args })
+  invoke: (command: string, args: unknown, options?: unknown) => {
+    shell.invoked.push(options === undefined ? { command, args } : { command, args, options })
     return Promise.resolve(shell.answers.has(command) ? shell.answers.get(command) : null)
   },
   // The page's end of a channel: native code calls `onmessage` with each message.
@@ -173,6 +173,26 @@ describe('the desktop port and the published methods', () => {
       {
         command: 'history_page',
         args: { params: { session_id: SESSION, from_cursor: '0', max_bytes: '65536' } }
+      }
+    ])
+  })
+
+  it('hands a pasted or picked file over as raw bytes, with its name and subject in headers', async () => {
+    const bytes = new Uint8Array([1, 2, 3])
+    await tauriPort().attachmentUploadBytes(
+      { name: 'café notes.txt', bytes },
+      { sessionId: SESSION }
+    )
+    expect(shell.invoked).toEqual([
+      {
+        command: 'attachment_upload_bytes',
+        args: bytes,
+        options: {
+          headers: {
+            'kr-file-name': 'caf%C3%A9%20notes.txt',
+            'kr-subject': JSON.stringify({ sessionId: SESSION })
+          }
+        }
       }
     ])
   })

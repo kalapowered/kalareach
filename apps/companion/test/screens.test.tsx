@@ -6,7 +6,7 @@
  */
 
 import { describe, expect, it, vi } from 'vitest'
-import { act, render, screen, waitFor, within } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 
 import { App } from '../src/App'
@@ -454,6 +454,34 @@ describe('the semantic view', () => {
     })
     expect(screen.queryByTestId('draft-attachments')).toBeNull()
     expect(screen.queryByTestId('insertion-refusal')).toBeNull()
+  })
+
+  it('sends a pasted file through the transfer service as a dropped one goes', async () => {
+    const { port, controls } = fakeHost()
+    render(
+      <AppProvider
+        port={port}
+        initialPlace={{ view: 'session', sessionId: SESSION_MAIN, pane: 'semantic' }}
+      >
+        <App />
+      </AppProvider>
+    )
+    await screen.findByTestId('composer-queue')
+    const input = screen.getByTestId('composer-input')
+
+    // Pasted text is text: the field takes it and nothing is uploaded.
+    fireEvent.paste(input, { clipboardData: { files: [] } })
+    expect(controls.uploaded).toEqual([])
+
+    const pasted = new File([new Uint8Array([137, 80, 78, 71])], 'Screenshot.png', { type: 'image/png' })
+    fireEvent.paste(input, { clipboardData: { files: [pasted] } })
+    await waitFor(() => {
+      expect(controls.uploaded).toEqual(['Screenshot.png'])
+    })
+    expect(await screen.findByTestId('insertion-refusal')).toHaveTextContent(
+      'Screenshot.png is uploaded and kept with this draft.'
+    )
+    expect(within(screen.getByTestId('draft-attachments')).getByText('Uploaded')).toBeInTheDocument()
   })
 
   it('does not send a file this window was never given', async () => {

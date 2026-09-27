@@ -38,7 +38,9 @@ import { useConnectionRights } from '../app/rights'
 import {
   failureCode,
   failureMessage,
+  MAX_HANDED_BYTES,
   watch,
+  type AttachmentHandle,
   type DroppedFile,
   type SessionSubject
 } from '../host/port'
@@ -384,28 +386,49 @@ export function Conversation({
   )
 
   /**
-   * A dropped file goes through the transfer service, and the handle it publishes is kept with the
-   * draft.
+   * A dropped or pasted file goes through the transfer service, and the handle it publishes is kept
+   * with the draft.
    *
-   * Section 12 keeps the upload, the insertion into the agent's composer and the submission apart,
-   * and only upstream evidence makes an attachment accepted by an agent. Inserting a handle names
-   * the contribution the agent's integration declared for it, which this view is not given, so the
-   * view inserts nothing: it keeps the handle with the draft and says what the person can do. A
-   * file is sent only where the agent says it takes attachments now.
+   * A dropped file reaches native code as a path the platform handed it, and the page never holds
+   * its bytes. A pasted file reaches the page itself, so the page hands its bytes over, and they go
+   * through the same upload. Section 12 keeps the upload, the insertion into the agent's composer
+   * and the submission apart, and only upstream evidence makes an attachment accepted by an agent.
+   * Inserting a handle names the contribution the agent's integration declared for it, which this
+   * view is not given, so the view inserts nothing: it keeps the handle with the draft and says
+   * what the person can do. A file is sent only where the agent says it takes attachments now.
    */
   const attach = useCallback(
-    (files: readonly DroppedFile[]) => {
-      for (const file of files) {
+    (files: readonly Incoming[]) => {
+      for (const incoming of files) {
+        const name = incoming.kind === 'dropped' ? incoming.file.name : incoming.file.name || 'attachment'
         if (!offers.attach.offered) {
-          setInsertion(`${file.name} was not sent: ${offers.attach.reason ?? 'this agent takes no attachments here.'}`)
+          setInsertion(`${name} was not sent: ${offers.attach.reason ?? 'this agent takes no attachments here.'}`)
           continue
         }
-        const path = file.path
-        if (!path) {
-          setInsertion('That file was not given to this window, so it was not sent.')
-          continue
+        let upload: () => Promise<AttachmentHandle>
+        if (incoming.kind === 'dropped') {
+          const path = incoming.file.path
+          if (!path) {
+            setInsertion('That file was not given to this window, so it was not sent.')
+            continue
+          }
+          upload = () => port.attachmentUpload(path, subject)
+        } else {
+          const file = incoming.file
+          if (file.size > MAX_HANDED_BYTES) {
+            setInsertion(
+              `${name} is larger than a pasted file can be. Drop it on the window to send it.`
+            )
+            continue
+          }
+          upload = () =>
+            file
+              .arrayBuffer()
+              .then((buffer) =>
+                port.attachmentUploadBytes({ name, bytes: new Uint8Array(buffer) }, subject)
+              )
         }
-        // The file is on the draft from the moment it is dropped, so no prompt is sent without it
+        // The file is on the draft from the moment it arrives, so no prompt is sent without it
         // while it uploads, and it stays until the person removes it whatever the upload does.
         const localId = `file-${Date.now()}-${Math.random()}`
         // Settles the file with what its upload said, and answers whether it is still on the
@@ -436,9 +459,12 @@ export function Conversation({
               {
                 localId,
                 transferId: null,
-                name: file.name,
-                byteLen: file.byte_len,
-                mediaType: file.media_type,
+                name,
+                byteLen: incoming.kind === 'dropped' ? incoming.file.byte_len : incoming.file.size,
+                mediaType:
+                  incoming.kind === 'dropped'
+                    ? incoming.file.media_type
+                    : incoming.file.type || 'application/octet-stream',
                 presentedAsImage: false,
                 upload: 'uploading',
                 acceptedUpstream: false
@@ -446,8 +472,7 @@ export function Conversation({
             ]
           }
         }))
-        port
-          .attachmentUpload(path, subject)
+        upload()
           .then((handle) => {
             // The upload is done and the handle is verified.
             const kept = settle({
@@ -465,14 +490,21 @@ export function Conversation({
           })
           .catch((error: unknown) => {
             if (!settle({ upload: 'failed' })) return
-            setInsertion(`${file.name} was not uploaded: ${failureMessage(error)}`)
+            setInsertion(`${name} was not uploaded: ${failureMessage(error)}`)
           })
       }
     },
     [port, subject, update, offers.attach]
   )
 
-  useEffect(() => watch([port.onFilesDropped(attach)]).stop, [port, attach])
+  const dropped = useCallback(
+    (files: readonly DroppedFile[]) => {
+      attach(files.map((file) => ({ kind: 'dropped', file })))
+    },
+    [attach]
+  )
+
+  useEffect(() => watch([port.onFilesDropped(dropped)]).stop, [port, dropped])
 
 
   const banner = reconnectBanner(connected, state.submissions)
@@ -770,6 +802,9 @@ export function Conversation({
                 }))
               }
         }
+        onPasteFiles={(files) => {
+          attach(files.map((file) => ({ kind: 'handed', file })))
+        }}
         onRemoveAttachment={(localId) => {
           update((current) => ({
             ...current,
@@ -787,6 +822,11 @@ export function Conversation({
     </div>
   )
 }
+
+/** A file that arrived for the draft: dropped on the window, or pasted into the composer. */
+type Incoming =
+  | { readonly kind: 'dropped'; readonly file: DroppedFile }
+  | { readonly kind: 'handed'; readonly file: File }
 
 /** Whether the view is at the bottom of what is rendered, which is not the same as the live end. */
 function atScrollerEnd(element: HTMLElement): boolean {
@@ -1326,6 +1366,7 @@ function Composer({
   insertion,
   onChange,
   onRetarget,
+  onPasteFiles,
   onRemoveAttachment,
   onAction
 }: {
@@ -1337,6 +1378,8 @@ function Composer({
   readonly onChange: (text: string) => void
   /** Sends a conflicted draft to the conversation the agent is in now, or null while none is. */
   readonly onRetarget: (() => void) | null
+  /** Takes files pasted into the composer, which go through the transfer service. */
+  readonly onPasteFiles: (files: readonly File[]) => void
   readonly onRemoveAttachment: (localId: string) => void
   readonly onAction: (action: ComposerAction) => void
 }): ReactNode {
@@ -1411,6 +1454,13 @@ function Composer({
           onChange={(event) => {
             onChange(event.target.value)
             setShowCommands(event.target.value.startsWith('/'))
+          }}
+          onPaste={(event) => {
+            // A pasted file is an attachment; pasted text is text, and the field takes it as it is.
+            const files = [...event.clipboardData.files]
+            if (files.length === 0) return
+            event.preventDefault()
+            onPasteFiles(files)
           }}
           onKeyDown={(event) => {
             if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {

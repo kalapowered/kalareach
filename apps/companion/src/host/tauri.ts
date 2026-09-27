@@ -158,6 +158,14 @@ export function tauriPort(): HostPort {
         subject,
         sessionId: subject.sessionId ?? null
       }),
+    // The bytes are the call's raw body; the name and the subject travel as its two headers.
+    attachmentUploadBytes: (file, subject) =>
+      invoke<AttachmentHandle>('attachment_upload_bytes', file.bytes, {
+        headers: {
+          'kr-file-name': encodeURIComponent(file.name),
+          'kr-subject': JSON.stringify(subject)
+        }
+      }),
     draftAddAttachment: (params, subject) =>
       mutate<Settled>('draft_add_attachment', params, subject),
     attachmentImage: (params) =>

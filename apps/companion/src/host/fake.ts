@@ -65,7 +65,7 @@ import type {
   VoiceStartRequest,
   Written
 } from './port'
-import { receivedConnection, viewMoveArguments, viewSizeArguments } from './port'
+import { MAX_HANDED_BYTES, receivedConnection, viewMoveArguments, viewSizeArguments } from './port'
 import { codeComplete } from '../pairing/words'
 import { AGENT_DRAFT_ADD_ATTACHMENT_PARAMS, decodeParams } from './fake-decode'
 import { EVERY_RIGHT, ScriptedRecords } from './fake-state'
@@ -756,6 +756,24 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
         declared_media_type: 'image/png',
         original_file_name: name,
         presented_as_image: true
+      })
+    },
+    attachmentUploadBytes: (file) => {
+      requireConnection()
+      if (file.bytes.length > MAX_HANDED_BYTES) {
+        refuse('QUOTA_EXCEEDED', 'a pasted or picked file is at most 64 MiB; drop a larger one on the window')
+      }
+      // Native code keeps the last component of the name, as metadata.
+      const name = file.name.split(/[\\/]/).pop()?.trim() || 'attachment'
+      uploaded.push(name)
+      return Promise.resolve({
+        transfer_id: '99999999-9999-4999-8999-999999999998',
+        environment_id: ENVIRONMENT,
+        byte_len: String(file.bytes.length),
+        content_digest: 'b'.repeat(64),
+        declared_media_type: /\.png$/i.test(name) ? 'image/png' : 'application/octet-stream',
+        original_file_name: name,
+        presented_as_image: /\.png$/i.test(name)
       })
     },
     draftAddAttachment: (params) => {

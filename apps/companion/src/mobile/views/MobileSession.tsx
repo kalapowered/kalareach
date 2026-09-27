@@ -41,6 +41,7 @@ import {
   startDraft,
   submittable,
   type Draft,
+  type DraftAttachment,
   type DraftTarget
 } from '../../model/drafts'
 import {
@@ -171,12 +172,9 @@ export function MobileSession({
   // Whether the session is too short for the conversation's floor under the whole composer.
   const [short, setShort] = useState(false)
   const sessionRef = useRef<HTMLDivElement | null>(null)
-  // What the person picked, held here until there is a command that carries bytes to a host. It
-  // is shown rather than dropped, because a file that vanishes after a success message is worse
-  // than one that says plainly it has not gone anywhere.
-  const [heldFiles, setHeldFiles] = useState<
-    readonly { readonly picked: Picked; readonly file: File }[]
-  >([])
+  // The files the person took off the draft while they uploaded: what their uploads answer is
+  // about files that are no longer there, and nothing is said about them.
+  const removedFiles = useRef(new Set<string>())
   const target = minimumTarget(surface)
   // One scroll position per view, kept across a switch: coming back to a view you were reading
   // halfway down and finding the top of it is losing your place.
@@ -255,6 +253,75 @@ export function MobileSession({
       })
     },
     [lifecycle]
+  )
+
+  /** Changes the files on this session's draft, whatever else changed it meanwhile. */
+  const changeFiles = useCallback(
+    (change: (files: readonly DraftAttachment[]) => readonly DraftAttachment[]) => {
+      lifecycle.setDrafts((drafts) => {
+        const stored = drafts.find((each) => each.draftId === draft.draftId)
+        const base = stored ?? draft
+        const next = { ...base, attachments: change(base.attachments) }
+        return [...drafts.filter((each) => each.draftId !== draft.draftId), next]
+      })
+    },
+    [lifecycle, draft]
+  )
+
+  /**
+   * Sends a picked file to the host and keeps it on the draft.
+   *
+   * The platform gave the file to the page, so the page hands its bytes to native code, which
+   * sends them through the same upload a dropped file takes. The file is on the draft from the
+   * moment it is picked and stays there, uploading, uploaded or failed, until the person removes
+   * it; no prompt is sent without it meanwhile.
+   */
+  const upload = useCallback(
+    (picked: Picked, file: File) => {
+      const localId = `file-${Date.now()}-${Math.random()}`
+      changeFiles((files) => [
+        ...files,
+        {
+          localId,
+          transferId: null,
+          name: picked.name,
+          byteLen: picked.byteLen,
+          mediaType: picked.mediaType,
+          presentedAsImage: false,
+          upload: 'uploading',
+          acceptedUpstream: false
+        }
+      ])
+      const settle = (change: Partial<DraftAttachment>) => {
+        changeFiles((files) =>
+          files.map((each) => (each.localId === localId ? { ...each, ...change } : each))
+        )
+      }
+      ask(() => file.arrayBuffer())
+        .then((buffer) =>
+          port.attachmentUploadBytes({ name: picked.name, bytes: new Uint8Array(buffer) }, { sessionId })
+        )
+        .then((handle) => {
+          settle({
+            transferId: handle.transfer_id,
+            name: handle.original_file_name,
+            byteLen: Number(handle.byte_len),
+            mediaType: handle.declared_media_type,
+            presentedAsImage: handle.presented_as_image,
+            upload: 'uploaded'
+          })
+          if (removedFiles.current.has(localId)) return
+          say(
+            `${handle.original_file_name} is uploaded and kept with this draft. A prompt sent from here cannot carry it; remove it to send the text on its own.`
+          )
+        })
+        .catch((failure: unknown) => {
+          settle({ upload: 'failed' })
+          if (removedFiles.current.has(localId)) return
+          say(`${picked.name} was not uploaded: ${failureMessage(failure)}`, 'danger')
+        })
+    },
+    [changeFiles, port, say, sessionId]
   )
 
   // A draft written before the agent was read keeps the first conversation it learns, so that a
@@ -869,30 +936,34 @@ export function MobileSession({
             </>
           ) : null}
 
-          {draft.attachments.length > 0 || heldFiles.length > 0 ? (
-            <div className="m-attachments">
+          {draft.attachments.length > 0 ? (
+            <div className="m-attachments" data-testid="draft-attachments">
               {draft.attachments.map((attachment) => (
-                <span key={attachment.localId} className="m-attachment">
+                <span
+                  key={attachment.localId}
+                  className="m-attachment"
+                  data-upload={attachment.upload}
+                >
                   {attachment.name}
-                  <span className="m-row-detail">{describeBytes(attachment.byteLen)}</span>
-                </span>
-              ))}
-              {heldFiles.map(({ picked }) => (
-                <span key={`${picked.name}-${picked.byteLen}`} className="m-attachment">
-                  {picked.name}
                   <span className="m-row-detail">
-                    {`${describeBytes(picked.byteLen)} · held in this screen`}
+                    {`${describeBytes(attachment.byteLen)} · ${UPLOAD_WORDS[attachment.upload]}`}
                   </span>
+                  <Button
+                    tone="quiet"
+                    style={{ minBlockSize: target, minInlineSize: target }}
+                    aria-label={`Remove ${attachment.name} from this draft`}
+                    onClick={() => {
+                      removedFiles.current.add(attachment.localId)
+                      changeFiles((files) =>
+                        files.filter((each) => each.localId !== attachment.localId)
+                      )
+                    }}
+                  >
+                    Remove
+                  </Button>
                 </span>
               ))}
             </div>
-          ) : null}
-          {heldFiles.length > 0 ? (
-            <p className="m-hint">
-              {heldFiles.length === 1 ? 'That file is' : 'Those files are'} on this device and{' '}
-              {heldFiles.length === 1 ? 'has' : 'have'} not been sent: this build has no command that
-              carries picked bytes to a host. Nothing has been discarded.
-            </p>
           ) : null}
 
           {typingToProgram ? null : (
@@ -953,7 +1024,7 @@ export function MobileSession({
                       say(admission.reason, 'danger')
                       continue
                     }
-                    setHeldFiles((current) => [...current, { picked, file }])
+                    upload(picked, file)
                   }
                 }}
               />
@@ -970,6 +1041,13 @@ export function MobileSession({
       </div>
     </div>
   )
+}
+
+/** Where a file's upload stands, in words. */
+const UPLOAD_WORDS: Readonly<Record<DraftAttachment['upload'], string>> = {
+  uploading: 'uploading',
+  uploaded: 'uploaded',
+  failed: 'not uploaded'
 }
 
 /** How many cells the probe that measures the grid's cell holds. */

@@ -210,6 +210,39 @@ describe('the terminal keys and the two views (KR-REQ-13.17, 13.03)', () => {
   })
 })
 
+describe('a picked file is uploaded, not held in the screen (KR-REQ-13.17)', () => {
+  it('sends a picked file through the transfer service and keeps it on the draft', async () => {
+    // The files picker takes every type; the platform's picker, not the test, decides what it offers.
+    const person = userEvent.setup({ applyAccept: false })
+    const { controls } = start('ios')
+    await person.click(await screen.findByRole('button', { name: /^Sessions/ }))
+    await person.click(await screen.findByRole('button', { name: /Session 1/ }))
+    await screen.findByText('Find why the reconnect test is flaky.')
+    await person.type(screen.getByLabelText('Message this session'), 'Look at this')
+
+    const group = screen.getByRole('group', { name: 'Add an attachment' })
+    const files = group.parentElement?.querySelector<HTMLInputElement>('input[accept="*/*"]')
+    if (!files) throw new Error('no file picker')
+    await person.upload(files, new File(['a picked file'], 'notes.txt', { type: 'text/plain' }))
+
+    await waitFor(() => {
+      expect(controls.uploaded).toEqual(['notes.txt'])
+    })
+    const draft = await screen.findByTestId('draft-attachments')
+    await waitFor(() => {
+      expect(draft.textContent).toContain('uploaded')
+    })
+    expect(draft.textContent).not.toContain('held in this screen')
+    // The prompt cannot carry the file, so none is sent that would leave it behind.
+    expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled()
+    await person.click(screen.getByRole('button', { name: 'Remove notes.txt from this draft' }))
+    expect(screen.queryByTestId('draft-attachments')).toBeNull()
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Send' })).toBeEnabled()
+    })
+  })
+})
+
 describe('one semantic interface on the desktop and the phones', () => {
   // KR-REQ-13.08: the desktop window and the two phones are layouts of one semantic interface. The
   // shell each platform gets comes from the one bundle, the same session document reaches each of

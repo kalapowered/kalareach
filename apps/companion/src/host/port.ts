@@ -490,6 +490,15 @@ export interface Settled<T = unknown> {
   readonly action_id: string | null
 }
 
+/** The largest file the page may hand native code as bytes, as native code bounds it. */
+export const MAX_HANDED_BYTES = 64 * 1024 * 1024
+
+/** A file the platform gave the page: the name it came with, and its bytes. */
+export interface HandedFile {
+  readonly name: string
+  readonly bytes: Uint8Array
+}
+
 /** A session's live agent instances, and every request its agents' broker is still arbitrating. */
 export interface SessionAgents {
   readonly instances: AgentInstanceList
@@ -621,6 +630,14 @@ export interface HostPort {
    * the file on the window; this names that path back, and the backend refuses any other.
    */
   attachmentUpload(path: string, subject: SessionSubject): Promise<AttachmentHandle>
+  /**
+   * Sends one file the platform gave the page rather than a path, pasted onto the window or
+   * picked on a phone, and answers with the verified handle.
+   *
+   * The page hands the bytes to native code, which sends them through the same upload a dropped
+   * file takes. A file larger than {@link MAX_HANDED_BYTES} is refused there.
+   */
+  attachmentUploadBytes(file: HandedFile, subject: SessionSubject): Promise<AttachmentHandle>
   draftAddAttachment(params: unknown, subject: SessionSubject): Promise<Settled>
   /** Reads the bytes behind one validated attachment handle. */
   attachmentImage(params: unknown): Promise<{ bytes: number[]; media_type: string }>
