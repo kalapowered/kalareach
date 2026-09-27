@@ -3107,7 +3107,8 @@ fn slash_commands_interrupts_queued_prompts_and_steering_each_work_from_a_device
         logged.submit(
             stage,
             &format!(
-                "Count from 1 to 400, one number per line, and write nothing else. ({mark}-i)"
+                "Without using any tool or file, count from 1 to 400 in your reply, one number per \
+                 line, and write nothing else. ({mark}-i)"
             ),
             "a long turn to interrupt",
         );
@@ -3133,8 +3134,9 @@ fn slash_commands_interrupts_queued_prompts_and_steering_each_work_from_a_device
         logged.submit(
             stage,
             &format!(
-                "Count from 1 to 400, one number per line, then write the word DONE, a hyphen, the \
-                 code {mark} in upper case and -Q, and nothing else. ({mark}-q)"
+                "Without using any tool or file, count from 1 to 400 in your reply, one number per \
+                 line, then write the word DONE, a hyphen, the code {mark} in upper case and -Q, \
+                 and nothing else. ({mark}-q)"
             ),
             "a turn to queue behind",
         );
@@ -3204,8 +3206,9 @@ fn slash_commands_interrupts_queued_prompts_and_steering_each_work_from_a_device
             logged.submit(
                 stage,
                 &format!(
-                    "Count from 1 to 400, one number per line, then write the word DONE, a \
-                     hyphen, the code {mark} in upper case and -S, and nothing else. ({mark}-s)"
+                    "Without using any tool or file, count from 1 to 400 in your reply, one number \
+                     per line, then write the word DONE, a hyphen, the code {mark} in upper case \
+                     and -S, and nothing else. ({mark}-s)"
                 ),
                 "a turn to steer",
             );
@@ -3618,9 +3621,9 @@ fn a_disconnection_after_the_agent_took_a_prompt_leaves_one_reply_and_no_duplica
         let upper = mark.to_uppercase();
         let (begin, end) = (format!("{upper}-START"), format!("{upper}-END"));
         let prompt = format!(
-            "Begin your reply with the code {mark} in upper case followed by -START, then count \
-             from 1 to 60, one number per line, then write the same code in upper case followed by \
-             -END, and nothing else."
+            "Without using any tool or file, begin your reply with the code {mark} in upper case \
+             followed by -START, then count from 1 to 60, one number per line, then write the same \
+             code in upper case followed by -END, and nothing else."
         );
         // Every event the device is sent from the submission until it goes is applied on its own
         // and the screen looked at after it, and every byte of output it is sent is read: a reply
