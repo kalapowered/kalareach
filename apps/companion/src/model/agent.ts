@@ -91,9 +91,9 @@ export interface WithheldCount {
  * where it started, so its count includes whatever later parts count too: what it withheld on its
  * own is its count less theirs. That is why a read that found entries reads on from after the last
  * one, and why the next read, which starts at the same place as the last part or later, takes the
- * last part's count over. Whatever order the filter withholds entries in, nothing is counted twice;
- * an entry the filter withholds while a read is on its way can be left out of the count, never
- * added to it twice.
+ * last part's count over. Whatever order the filter withholds entries in, nothing is counted twice.
+ * An entry withheld after a read counted the range it falls in can be left out, so the total is a
+ * lower bound, and a view says "at least".
  */
 export function foldWithheld(
   count: WithheldCount | undefined,

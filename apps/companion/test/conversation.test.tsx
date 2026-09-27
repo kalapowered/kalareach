@@ -304,7 +304,7 @@ describe('what the conversation says it does not show (KR-REQ-13.15, 25.25)', ()
       expect(shown()).toEqual(HISTORY.slice(2))
     })
     expect(screen.getByTestId('withheld').textContent).toContain(
-      '2 entries are outside what this device may see.'
+      'At least 2 entries are outside what this device may see.'
     )
 
     await shownAgain()
@@ -315,7 +315,7 @@ describe('what the conversation says it does not show (KR-REQ-13.15, 25.25)', ()
     })
     await shownAgain()
     expect(screen.getByTestId('withheld').textContent).toContain(
-      '2 entries are outside what this device may see.'
+      'At least 2 entries are outside what this device may see.'
     )
   })
 
@@ -329,7 +329,7 @@ describe('what the conversation says it does not show (KR-REQ-13.15, 25.25)', ()
       expect(shown()).toEqual(HISTORY.slice(0, 4))
     })
     expect(screen.getByTestId('withheld').textContent).toContain(
-      '1 entry is outside what this device may see.'
+      'At least 1 entry is outside what this device may see.'
     )
     await shownAgain()
     controls.records.appendEntry(SESSION_MAIN, 'message', 'After the withheld one.')
@@ -339,7 +339,7 @@ describe('what the conversation says it does not show (KR-REQ-13.15, 25.25)', ()
     })
     await shownAgain()
     expect(screen.getByTestId('withheld').textContent).toContain(
-      '1 entry is outside what this device may see.'
+      'At least 1 entry is outside what this device may see.'
     )
   })
 
@@ -433,6 +433,30 @@ describe('what the person writes goes where they wrote it (KR-REQ-13.12)', () =>
     await waitFor(() => {
       expect(sent).toEqual(['5'])
     })
+  })
+
+  it('keeps a draft written before the agent was read to the first conversation it learns', async () => {
+    const person = userEvent.setup()
+    const { port, controls } = fakeHost()
+    const held = controls.hold('agentSnapshot')
+    openConversation(port)
+    await made(held, 1)
+    // Written while the agent is still being read.
+    await person.type(screen.getByTestId('composer-input'), 'Written early')
+    held.release()
+    await waitFor(() => {
+      expect(shown()).toEqual(HISTORY)
+    })
+
+    // The conversation moves on without another keystroke: the draft does not follow it.
+    controls.records.moveBinding(SESSION_MAIN)
+    await shownAgain()
+    await waitFor(() => {
+      expect(screen.getByTestId('composer-reason')).toHaveTextContent(
+        'The conversation changed since this was written.'
+      )
+    })
+    expect(screen.getByTestId('composer-send')).toBeDisabled()
   })
 
   it('sends what was written at the binding revision it was written at', async () => {

@@ -24,6 +24,7 @@ import {
 } from '../src/model/conversation'
 import { FrameBatcher } from '../src/model/frame'
 import {
+  adoptFirstTarget,
   againstCurrent,
   connectionLost,
   edit,
@@ -335,21 +336,42 @@ describe('drafts', () => {
 
   it('sends no prompt that would leave a file on the draft behind', () => {
     const file = {
+      localId: 'f-1',
       transferId: 't-1',
       name: 'diagram.png',
       byteLen: 10,
       mediaType: 'image/png',
       presentedAsImage: true,
+      upload: 'uploaded' as const,
       acceptedUpstream: false
     }
     const withFile = { ...edit(startDraft('d1', target, 0), 'look at this', 1), attachments: [file] }
     expect(submittable(withFile)).toBe(false)
     expect(notSubmittableBecause(withFile)).toMatch(/Remove them to send the text on its own/)
     expect(submittable({ ...withFile, attachments: [] })).toBe(true)
-    // One the agent took into its own composer does not hold the prompt back.
+    // One the agent took into its own composer does not hold the prompt back; one still uploading,
+    // or one whose upload failed, does.
     expect(submittable({ ...withFile, attachments: [{ ...file, acceptedUpstream: true }] })).toBe(
       true
     )
+    for (const upload of ['uploading', 'failed'] as const) {
+      expect(
+        submittable({ ...withFile, attachments: [{ ...file, transferId: null, upload }] })
+      ).toBe(false)
+    }
+  })
+
+  it('keeps the first conversation a draft written before any was known learns', () => {
+    const early = edit(startDraft('d1', { ...target, applicationInstanceId: null }, 0), 'early', 1)
+    const first = { ...target, agentBindingRevision: '4' }
+    const kept = adoptFirstTarget(early, first)
+    expect(kept.target).toEqual(first)
+    // From then on a move is a conflict, not a new conversation the text follows.
+    expect(againstCurrent(kept, { ...first, agentBindingRevision: '5' }).state).toBe('conflicted')
+    // A draft with a conversation already, or an empty one, is left as it is.
+    expect(adoptFirstTarget(kept, { ...first, agentBindingRevision: '5' })).toBe(kept)
+    const empty = startDraft('d2', { ...target, applicationInstanceId: null }, 0)
+    expect(adoptFirstTarget(empty, first)).toBe(empty)
   })
 
   it('retains the draft on every refused insertion and offers the terminal workflow', () => {

@@ -373,6 +373,49 @@ describe('the semantic view', () => {
     expect(screen.getByTestId('composer-send')).toBeEnabled()
   })
 
+  it('sends no prompt while a dropped file uploads, or after its upload failed, until it is removed', async () => {
+    const person = userEvent.setup()
+    const { port, controls } = fakeHost()
+    let fail: (reason: unknown) => void = () => undefined
+    render(
+      <AppProvider
+        port={{
+          ...port,
+          attachmentUpload: () =>
+            new Promise((_, reject) => {
+              fail = reject
+            })
+        }}
+        initialPlace={{ view: 'session', sessionId: SESSION_MAIN, pane: 'semantic' }}
+      >
+        <App />
+      </AppProvider>
+    )
+    await screen.findByTestId('composer-queue')
+    await person.type(screen.getByTestId('composer-input'), 'Look at this')
+
+    controls.dropFiles([
+      { name: 'diagram.png', media_type: 'image/png', byte_len: 10, path: '/tmp/diagram.png' }
+    ])
+    const files = await screen.findByTestId('draft-attachments')
+    expect(within(files).getByText('Uploading…')).toBeInTheDocument()
+    expect(screen.getByTestId('composer-send')).toBeDisabled()
+    expect(screen.getByTestId('composer-queue')).toBeDisabled()
+
+    await act(async () => {
+      fail({ code: 'STORAGE_UNAVAILABLE', message: 'The staging area is full.', user_action: 'retry' })
+      await Promise.resolve()
+    })
+    expect(await within(files).findByText('Not uploaded')).toBeInTheDocument()
+    expect(screen.getByTestId('insertion-refusal')).toHaveTextContent(
+      'diagram.png was not uploaded: The staging area is full.'
+    )
+    expect(screen.getByTestId('composer-send')).toBeDisabled()
+
+    await person.click(screen.getByRole('button', { name: 'Remove diagram.png from this draft' }))
+    expect(screen.getByTestId('composer-send')).toBeEnabled()
+  })
+
   it('does not send a file this window was never given', async () => {
     const { port, controls } = fakeHost()
     render(

@@ -46,11 +46,16 @@ export interface Draft {
 
 /** One attachment on a draft. */
 export interface DraftAttachment {
-  readonly transferId: string
+  /** This device's own name for the file, from the moment it was added. */
+  readonly localId: string
+  /** The transfer that carried it, once the upload has published a verified handle. */
+  readonly transferId: string | null
   readonly name: string
   readonly byteLen: number
   readonly mediaType: string
   readonly presentedAsImage: boolean
+  /** Where its upload stands. A file stays on the draft whatever became of it. */
+  readonly upload: 'uploading' | 'uploaded' | 'failed'
   /** True once the agent accepted it upstream, which only upstream evidence sets. */
   readonly acceptedUpstream: boolean
 }
@@ -138,6 +143,21 @@ function sameTarget(a: DraftTarget, b: DraftTarget): boolean {
   )
 }
 
+/**
+ * Records the conversation a draft was written for, the first time one is known.
+ *
+ * A draft written before this device knew which conversation the agent was in takes the first one
+ * it learns, and keeps it from then on: a later move is then a conflict like any other, rather than
+ * a new conversation the text follows without a word. An empty draft needs no target kept, and any
+ * other draft is returned as it is.
+ */
+export function adoptFirstTarget(draft: Draft, current: DraftTarget | null): Draft {
+  if (current === null || draft.state !== 'bound') return draft
+  if (draft.target.applicationInstanceId !== null) return draft
+  if (draft.text.length === 0 && draft.attachments.length === 0) return draft
+  return { ...draft, target: current }
+}
+
 /** Retargets a conflicted draft, which is the one thing that clears a conflict. */
 export function retarget(draft: Draft, target: DraftTarget, attachmentId: string | null): Draft {
   return { ...draft, target, state: 'bound', attachmentId }
@@ -147,8 +167,8 @@ export function retarget(draft: Draft, target: DraftTarget, attachmentId: string
  * Whether a file on the draft keeps a prompt from being sent.
  *
  * A prompt sent from here carries its text inline, so it cannot carry a file: one the agent has
- * not accepted into its own composer would be left behind without a word. A draft that holds one
- * is sent only once the person removes it.
+ * not accepted into its own composer, whether it is still uploading, uploaded or failed, would be
+ * left behind without a word. A draft that holds one is sent only once the person removes it.
  */
 function holdsUnsentFiles(draft: Draft): boolean {
   return draft.attachments.some((attachment) => !attachment.acceptedUpstream)

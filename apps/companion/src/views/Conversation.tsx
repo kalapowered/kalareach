@@ -71,6 +71,7 @@ import {
   type ControlState
 } from '../model/controls'
 import {
+  adoptFirstTarget,
   againstCurrent,
   connectionLost,
   edit,
@@ -78,6 +79,7 @@ import {
   retarget,
   submittable,
   type Draft,
+  type DraftAttachment,
   type DraftTarget
 } from '../model/drafts'
 import { FrameBatcher } from '../model/frame'
@@ -253,6 +255,15 @@ export function Conversation({
     [sessionId, agent.instance, agent.binding]
   )
 
+  // A draft written before the agent was read keeps the first conversation it learns, so that a
+  // later move is a conflict rather than a new conversation the text follows.
+  useEffect(() => {
+    update((current) => {
+      const adopted = adoptFirstTarget(current.draft, currentTarget)
+      return adopted === current.draft ? current : { ...current, draft: adopted }
+    })
+  }, [currentTarget, update])
+
   // Losing contact removes the association, not the draft, and a moved conversation conflicts the
   // draft rather than taking it. Both are facts about the session now, so they are derived here
   // rather than written into the stored draft: the text, the revision and the attachments are
@@ -386,34 +397,58 @@ export function Conversation({
           setInsertion('That file was not given to this window, so it was not sent.')
           continue
         }
+        // The file is on the draft from the moment it is dropped, so no prompt is sent without it
+        // while it uploads, and it stays until the person removes it whatever the upload does.
+        const localId = `file-${Date.now()}-${Math.random()}`
+        const settle = (change: Partial<DraftAttachment>) => {
+          update((current) => ({
+            ...current,
+            draft: {
+              ...current.draft,
+              attachments: current.draft.attachments.map((attachment) =>
+                attachment.localId === localId ? { ...attachment, ...change } : attachment
+              )
+            }
+          }))
+        }
+        update((current) => ({
+          ...current,
+          draft: {
+            ...current.draft,
+            attachments: [
+              ...current.draft.attachments,
+              {
+                localId,
+                transferId: null,
+                name: file.name,
+                byteLen: file.byte_len,
+                mediaType: file.media_type,
+                presentedAsImage: false,
+                upload: 'uploading',
+                acceptedUpstream: false
+              }
+            ]
+          }
+        }))
         port
           .attachmentUpload(path, subject)
           .then((handle) => {
-            // The upload is done and the handle is verified. It is kept with the draft until the
-            // person removes it.
-            update((current) => ({
-              ...current,
-              draft: {
-                ...current.draft,
-                attachments: [
-                  ...current.draft.attachments,
-                  {
-                    transferId: handle.transfer_id,
-                    name: handle.original_file_name,
-                    byteLen: Number(handle.byte_len),
-                    mediaType: handle.declared_media_type,
-                    presentedAsImage: handle.presented_as_image,
-                    acceptedUpstream: false
-                  }
-                ]
-              }
-            }))
+            // The upload is done and the handle is verified.
+            settle({
+              transferId: handle.transfer_id,
+              name: handle.original_file_name,
+              byteLen: Number(handle.byte_len),
+              mediaType: handle.declared_media_type,
+              presentedAsImage: handle.presented_as_image,
+              upload: 'uploaded'
+            })
             setInsertion(
               `${handle.original_file_name} is uploaded and kept with this draft. A prompt sent from here cannot carry it: type its path in the terminal to give it to the agent, or remove it to send the text on its own.`
             )
           })
           .catch((error: unknown) => {
-            setInsertion(`${file.name} was not sent: ${failureMessage(error)}`)
+            settle({ upload: 'failed' })
+            setInsertion(`${file.name} was not uploaded: ${failureMessage(error)}`)
           })
       }
     },
@@ -619,8 +654,8 @@ export function Conversation({
             ) : null}
             {withheld > 0 ? (
               <p className="small faint" data-testid="withheld">
-                {withheld} {withheld === 1 ? 'entry is' : 'entries are'} outside what
-                this device may see.
+                At least {withheld} {withheld === 1 ? 'entry is' : 'entries are'} outside
+                what this device may see.
               </p>
             ) : null}
           </div>
@@ -678,13 +713,13 @@ export function Conversation({
                 }))
               }
         }
-        onRemoveAttachment={(transferId) => {
+        onRemoveAttachment={(localId) => {
           update((current) => ({
             ...current,
             draft: {
               ...current.draft,
               attachments: current.draft.attachments.filter(
-                (attachment) => attachment.transferId !== transferId
+                (attachment) => attachment.localId !== localId
               )
             }
           }))
@@ -1245,7 +1280,7 @@ function Composer({
   readonly onChange: (text: string) => void
   /** Sends a conflicted draft to the conversation the agent is in now, or null while none is. */
   readonly onRetarget: (() => void) | null
-  readonly onRemoveAttachment: (transferId: string) => void
+  readonly onRemoveAttachment: (localId: string) => void
   readonly onAction: (action: ComposerAction) => void
 }): ReactNode {
   const [showCommands, setShowCommands] = useState(false)
@@ -1270,10 +1305,18 @@ function Composer({
       {draft.attachments.length > 0 ? (
         <div className="row wrap" data-testid="draft-attachments">
           {draft.attachments.map((attachment) => (
-            <span className="attachment-chip" key={attachment.transferId}>
+            <span
+              className="attachment-chip"
+              key={attachment.localId}
+              data-upload={attachment.upload}
+            >
               {attachment.name}
               {attachment.acceptedUpstream ? (
                 <Badge tone="success">Accepted</Badge>
+              ) : attachment.upload === 'uploading' ? (
+                <Badge tone="neutral">Uploading…</Badge>
+              ) : attachment.upload === 'failed' ? (
+                <Badge tone="danger">Not uploaded</Badge>
               ) : (
                 <Badge tone="neutral">Uploaded</Badge>
               )}
@@ -1282,7 +1325,7 @@ function Composer({
                 data-testid="remove-attachment"
                 aria-label={`Remove ${attachment.name} from this draft`}
                 onClick={() => {
-                  onRemoveAttachment(attachment.transferId)
+                  onRemoveAttachment(attachment.localId)
                 }}
               >
                 Remove

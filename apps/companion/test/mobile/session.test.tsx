@@ -215,6 +215,30 @@ describe("the phone's composer and the conversation it writes to (KR-REQ-13.12)"
     })
   })
 
+  it('keeps a draft written before the agent was read to the first conversation it learns', async () => {
+    const person = userEvent.setup()
+    const { port, controls } = fakeHost()
+    const held = controls.hold('agentSnapshot')
+    render(
+      <AppProvider port={port}>
+        <OnSession sessionId={SESSION_MAIN} />
+      </AppProvider>
+    )
+    await made(held, 1)
+    await person.type(screen.getByLabelText('Message this session'), 'Written early')
+    held.release()
+    await screen.findByText('Find why the reconnect test is flaky.')
+
+    controls.records.moveBinding(SESSION_MAIN)
+    act(() => {
+      controls.setConnected(true)
+    })
+    await waitFor(() => {
+      expect(screen.getByText(/The conversation changed since this was written/)).toBeInTheDocument()
+    })
+    expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled()
+  })
+
   it('says why the agent will not take a prompt, in its own words', async () => {
     const person = userEvent.setup()
     const { port, controls } = fakeHost()

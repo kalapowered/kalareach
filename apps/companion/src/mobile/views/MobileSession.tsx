@@ -33,6 +33,7 @@ import type { ConversationItem } from '../../model/conversation'
 import { Badge, Banner, Button, Segmented } from '../../components/ui'
 import { failureCode, failureMessage } from '../../host/port'
 import {
+  adoptFirstTarget,
   againstCurrent,
   edit,
   notSubmittableBecause,
@@ -230,7 +231,7 @@ export function MobileSession({
     const withheld = withheldTotal(session.agent.withheld)
     if (withheld > 0) {
       notes.push(
-        `${withheld} ${withheld === 1 ? 'entry is' : 'entries are'} outside what this device may see.`
+        `At least ${withheld} ${withheld === 1 ? 'entry is' : 'entries are'} outside what this device may see.`
       )
     }
     return notes
@@ -255,6 +256,14 @@ export function MobileSession({
     },
     [lifecycle]
   )
+
+  // A draft written before the agent was read keeps the first conversation it learns, so that a
+  // later move is a conflict rather than a new conversation the text follows.
+  useEffect(() => {
+    if (held === undefined) return
+    const adopted = adoptFirstTarget(held, currentTarget)
+    if (adopted !== held) setDraft(adopted)
+  }, [held, currentTarget, setDraft])
 
   // The terminal's grid: as many cells as its surface shows at the current zoom, a column measured
   // from a probe of the grid's own font and a row as tall as the grid's own lines.
@@ -863,7 +872,7 @@ export function MobileSession({
           {draft.attachments.length > 0 || heldFiles.length > 0 ? (
             <div className="m-attachments">
               {draft.attachments.map((attachment) => (
-                <span key={attachment.transferId} className="m-attachment">
+                <span key={attachment.localId} className="m-attachment">
                   {attachment.name}
                   <span className="m-row-detail">{describeBytes(attachment.byteLen)}</span>
                 </span>
