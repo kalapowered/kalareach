@@ -58,7 +58,7 @@ pub use state::AppState;
 /// continue past.
 ///
 /// iOS and Android do not run a binary of their own: the system starts the process and calls
-/// into this library. [`mobile`] is where that call arrives.
+/// into this library. `mobile` is where that call arrives.
 pub fn run() {
     use tauri::Manager as _;
 
