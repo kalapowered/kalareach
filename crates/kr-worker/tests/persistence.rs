@@ -1844,11 +1844,13 @@ fn a_contiguous_spool_pages_from_end_to_end_with_no_gap() {
 
 /// What the spool's segment files hold on the disk, counted from the directory itself.
 fn segment_bytes_on_disk(directory: &std::path::Path) -> u64 {
+    // Each size is read through the file, not from `DirEntry::metadata`: NTFS keeps a size in the
+    // directory entry that it does not bring up to date while the spool holds the file open.
     std::fs::read_dir(directory)
         .expect("reads the spool")
         .flatten()
         .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "out"))
-        .filter_map(|entry| entry.metadata().ok())
+        .filter_map(|entry| std::fs::metadata(entry.path()).ok())
         .filter(std::fs::Metadata::is_file)
         .map(|metadata| metadata.len())
         .sum()

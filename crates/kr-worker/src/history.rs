@@ -1085,9 +1085,16 @@ impl Spool {
             let Ok(start) = stem.parse::<u64>() else {
                 continue;
             };
-            let metadata = entry
-                .metadata()
-                .map_err(|error| WorkerError::storage("read the output spool", error))?;
+            // The size and the time come from the file itself, not from `DirEntry::metadata`: on
+            // Windows that reads what NTFS keeps in the directory entry, which it does not bring
+            // up to date while a handle to the file is open, so a segment still being written
+            // would read shorter than it is. A segment that went between the listing and this
+            // read is a range the spool no longer holds.
+            let metadata = match std::fs::metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(WorkerError::storage("read the output spool", error)),
+            };
             let len = metadata.len();
             let written_at_ms = metadata
                 .modified()
