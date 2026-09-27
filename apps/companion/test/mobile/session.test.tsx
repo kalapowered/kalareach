@@ -99,11 +99,15 @@ describe("the phone's session view keeps each read to its own session", () => {
     rerender(onSession(SESSION_BUILD))
     await made(held, 2)
 
+    // The build session's read finds its entry and reads on from after it before it is done.
     await answer(held, 1)
+    await made(held, 3)
+    await answer(held, 2)
     expect(screen.getByText('Claude Code started.')).toBeInTheDocument()
     await answer(held, 0)
     expect(screen.queryByText('Find why the reconnect test is flaky.')).toBeNull()
     expect(screen.getByText('Claude Code started.')).toBeInTheDocument()
+    held.release()
   })
 
   it('says it is reading the conversation before the first answer, not that it is empty', async () => {
@@ -118,7 +122,11 @@ describe("the phone's session view keeps each read to its own session", () => {
 
     expect(screen.getByText('Reading the conversation…')).toBeInTheDocument()
     expect(screen.queryByText('Nothing in this conversation yet.')).toBeNull()
+    // The read that finds the history reads on from after it before it is done.
     await answer(held, 0)
+    await made(held, 2)
+    expect(screen.getByText('Reading the conversation…')).toBeInTheDocument()
+    await answer(held, 1)
     expect(screen.getByText('Find why the reconnect test is flaky.')).toBeInTheDocument()
     expect(screen.queryByText('Reading the conversation…')).toBeNull()
   })
@@ -164,6 +172,62 @@ describe("the phone's session view keeps each read to its own session", () => {
       </AppProvider>
     )
     expect(await screen.findByText('Find why the reconnect test is flaky.')).toBeInTheDocument()
+  })
+})
+
+describe("the phone's composer and the conversation it writes to (KR-REQ-13.12)", () => {
+  it('asks before sending a draft to a conversation that moved on while it was written', async () => {
+    const person = userEvent.setup()
+    const { port, controls } = fakeHost()
+    const sent: string[] = []
+    render(
+      <AppProvider
+        port={{
+          ...port,
+          composerSubmit: (params) => {
+            sent.push(params.target.binding_revision)
+            return port.composerSubmit(params)
+          }
+        }}
+      >
+        <OnSession sessionId={SESSION_MAIN} />
+      </AppProvider>
+    )
+    await screen.findByText('Find why the reconnect test is flaky.')
+    await person.type(screen.getByLabelText('Message this session'), 'Keep the timer')
+
+    // The agent moves to another conversation, and the view reads it again, as it does when the
+    // host is heard from.
+    controls.records.moveBinding(SESSION_MAIN)
+    act(() => {
+      controls.setConnected(true)
+    })
+    await waitFor(() => {
+      expect(screen.getByText(/The conversation changed since this was written/)).toBeInTheDocument()
+    })
+    expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled()
+    expect(screen.getByLabelText('Message this session')).toHaveValue('Keep the timer')
+
+    await person.click(screen.getByTestId('composer-retarget'))
+    await person.click(screen.getByRole('button', { name: 'Send' }))
+    await waitFor(() => {
+      expect(sent).toEqual(['5'])
+    })
+  })
+
+  it('says why the agent will not take a prompt, in its own words', async () => {
+    const person = userEvent.setup()
+    const { port, controls } = fakeHost()
+    controls.records.suspend(SESSION_MAIN, 'The conversation changed outside this host.')
+    render(
+      <AppProvider port={port}>
+        <OnSession sessionId={SESSION_MAIN} />
+      </AppProvider>
+    )
+    await screen.findByText('Find why the reconnect test is flaky.')
+    await person.type(screen.getByLabelText('Message this session'), 'go on')
+    expect(await screen.findByText('The conversation changed outside this host.')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled()
   })
 })
 
@@ -1271,7 +1335,7 @@ describe("the phone's raw terminal view (KR-REQ-08.02, 13.18)", () => {
         <OnSession sessionId={SESSION_MAIN} />
       </AppProvider>
     )
-    const empty = 'Write something, or add an attachment.'
+    const empty = 'Write something to send.'
     expect(screen.getByRole('group', { name: 'Add an attachment' })).toBeInTheDocument()
     expect(screen.getByText(empty)).toBeInTheDocument()
 
@@ -1480,7 +1544,7 @@ describe("the phone's composer on a short session (KR-REQ-13.19)", () => {
       const line = () => send().closest('.m-composer-line')
       // The whole composer: Send under the pickers, and words for why an empty draft waits.
       expect(line()).toBeNull()
-      expect(screen.getByText('Write something, or add an attachment.')).toBeInTheDocument()
+      expect(screen.getByText('Write something to send.')).toBeInTheDocument()
 
       await person.click(field)
       await person.type(field, 'hel')
@@ -1498,7 +1562,7 @@ describe("the phone's composer on a short session (KR-REQ-13.19)", () => {
       await person.type(field, 'lo')
       expect(field).toHaveValue('hello')
       await person.clear(field)
-      expect(screen.queryByText('Write something, or add an attachment.')).toBeNull()
+      expect(screen.queryByText('Write something to send.')).toBeNull()
       expect(send()).toBeDisabled()
 
       resized(40)
@@ -1508,7 +1572,7 @@ describe("the phone's composer on a short session (KR-REQ-13.19)", () => {
       expect(document.querySelector('.m-session')).toHaveAttribute('data-composer', 'whole')
       expect(screen.getByLabelText('Message this session')).toBe(field)
       expect(field).toHaveFocus()
-      expect(screen.getByText('Write something, or add an attachment.')).toBeInTheDocument()
+      expect(screen.getByText('Write something to send.')).toBeInTheDocument()
     } finally {
       heights.mockRestore()
       root.style.removeProperty('font-size')

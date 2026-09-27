@@ -11,6 +11,9 @@
 
 import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react'
 
+import type { ActionRight } from '@kalareach/protocol'
+
+import { ShellRights } from '../app/rights'
 import { useApp } from '../app/state'
 import { Toast } from '../components/ui'
 import { failureMessage, follow } from '../host/port'
@@ -96,6 +99,7 @@ export function MobileApp({
   const [connection, setConnection] = useState<{
     readonly connected: boolean
     readonly reason: string | null
+    readonly rights: readonly ActionRight[] | null
   } | null>(null)
   const [actionable, setActionable] = useState(0)
   const lifecycle = useLifecycle(storage)
@@ -134,10 +138,14 @@ export function MobileApp({
         (listener) => port.onConnection(listener),
         () => port.connectionState(),
         (state) => {
-          setConnection({ connected: state.connected, reason: state.reason })
+          setConnection({
+            connected: state.connected,
+            reason: state.reason,
+            rights: state.connected ? state.rights : null
+          })
         },
         (failure) => {
-          setConnection({ connected: false, reason: failureMessage(failure) })
+          setConnection({ connected: false, reason: failureMessage(failure), rights: null })
         }
       ),
     [port]
@@ -182,7 +190,7 @@ export function MobileApp({
     }
   }, [inSession])
 
-  return (
+  const shell = (
     <div className="m-shell" data-surface={resolved}>
       <TopBar
         title={title}
@@ -229,4 +237,5 @@ export function MobileApp({
       <Toast message={toast} onDismiss={dismissToast} />
     </div>
   )
+  return <ShellRights.Provider value={connection?.rights ?? null}>{shell}</ShellRights.Provider>
 }

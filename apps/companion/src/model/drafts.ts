@@ -110,27 +110,73 @@ export function rebind(draft: Draft, observed: DraftTarget | null, attachmentId:
   return { ...draft, state: 'bound', attachmentId }
 }
 
+/**
+ * The draft as it stands against the conversation the session's agent is in now.
+ *
+ * A draft keeps the conversation it was written for: the instance and the binding revision the
+ * person was writing to. One that holds nothing goes with whatever conversation is current, and so
+ * does one written before this device knew which conversation that was. One whose conversation has
+ * since moved, to another instance or another binding revision, is conflicted: the person chooses
+ * whether it goes to the new one, and nothing sends it there for them. A draft that is detached,
+ * orphaned or already conflicted stays as it is, and so does any draft while no agent is known.
+ */
+export function againstCurrent(draft: Draft, current: DraftTarget | null): Draft {
+  if (current === null || draft.state !== 'bound') return draft
+  const empty = draft.text.length === 0 && draft.attachments.length === 0
+  if (empty || draft.target.applicationInstanceId === null) {
+    return sameTarget(draft.target, current) ? draft : { ...draft, target: current }
+  }
+  return sameTarget(draft.target, current) ? draft : { ...draft, state: 'conflicted' }
+}
+
+/** Whether two targets are the same session, instance and binding revision. */
+function sameTarget(a: DraftTarget, b: DraftTarget): boolean {
+  return (
+    a.sessionId === b.sessionId &&
+    a.applicationInstanceId === b.applicationInstanceId &&
+    a.agentBindingRevision === b.agentBindingRevision
+  )
+}
+
 /** Retargets a conflicted draft, which is the one thing that clears a conflict. */
 export function retarget(draft: Draft, target: DraftTarget, attachmentId: string | null): Draft {
   return { ...draft, target, state: 'bound', attachmentId }
 }
 
+/**
+ * Whether a file on the draft keeps a prompt from being sent.
+ *
+ * A prompt sent from here carries its text inline, so it cannot carry a file: one the agent has
+ * not accepted into its own composer would be left behind without a word. A draft that holds one
+ * is sent only once the person removes it.
+ */
+function holdsUnsentFiles(draft: Draft): boolean {
+  return draft.attachments.some((attachment) => !attachment.acceptedUpstream)
+}
+
 /** Whether the person may submit this draft as it stands. */
 export function submittable(draft: Draft): boolean {
-  return draft.state === 'bound' && (draft.text.trim().length > 0 || draft.attachments.length > 0)
+  return (
+    draft.state === 'bound' &&
+    !holdsUnsentFiles(draft) &&
+    (draft.text.trim().length > 0 || draft.attachments.length > 0)
+  )
 }
 
 /** Why the draft cannot be submitted, for the composer to say. */
 export function notSubmittableBecause(draft: Draft): string | null {
   switch (draft.state) {
     case 'bound':
+      if (holdsUnsentFiles(draft)) {
+        return 'A prompt sent from here cannot carry the files on this draft. Remove them to send the text on its own.'
+      }
       return draft.text.trim().length === 0 && draft.attachments.length === 0
-        ? 'Write something, or add an attachment.'
+        ? 'Write something to send.'
         : null
     case 'detached':
       return 'Not in contact with this host. The draft is kept here.'
     case 'conflicted':
-      return 'The application changed. Choose where this draft should go.'
+      return 'The conversation changed since this was written. Choose whether it goes to the new one.'
     case 'orphaned':
       return 'The session this was written for has gone. Choose another.'
   }

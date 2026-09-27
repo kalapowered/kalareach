@@ -153,6 +153,7 @@ describe('the live instance (KR-REQ-11.03)', () => {
 describe('what the composer offers (KR-REQ-13.12, 11.03)', () => {
   it('offers every action when the capability, the right and the binding allow it', () => {
     const offers = composerOffers({
+      known: true,
       binding: binding(),
       capabilities: capabilities(),
       rights: EVERY_RIGHT
@@ -161,17 +162,25 @@ describe('what the composer offers (KR-REQ-13.12, 11.03)', () => {
   })
 
   it('offers nothing before the capability records are read', () => {
-    const offers = composerOffers({ binding: binding(), capabilities: null, rights: EVERY_RIGHT })
+    const offers = composerOffers({ known: true, binding: binding(), capabilities: null, rights: EVERY_RIGHT })
     for (const offer of Object.values(offers)) expect(offer.offered).toBe(false)
   })
 
-  it('offers nothing while no agent is running', () => {
-    const offers = composerOffers({ binding: null, capabilities: capabilities(), rights: null })
-    expect(offers.submit.reason).toBe('No agent is running in this session.')
+  it('offers nothing while no agent is running, and claims none before the agent is read', () => {
+    const none = composerOffers({
+      known: true,
+      binding: null,
+      capabilities: capabilities(),
+      rights: EVERY_RIGHT
+    })
+    expect(none.submit.reason).toBe('No agent is running in this session.')
+    const unread = composerOffers({ known: false, binding: null, capabilities: null, rights: null })
+    expect(unread.submit).toEqual({ offered: false, reason: 'Reading this session’s agent…' })
   })
 
   it('offers nothing while the binding is unverified, in the host’s words where it gave any', () => {
     const suspended = composerOffers({
+      known: true,
       binding: binding({
         rich_mutations_suspended: true,
         suspension_reason: 'The conversation changed outside this host.'
@@ -184,6 +193,7 @@ describe('what the composer offers (KR-REQ-13.12, 11.03)', () => {
       reason: 'The conversation changed outside this host.'
     })
     const silent = composerOffers({
+      known: true,
       binding: binding({ rich_mutations_suspended: true }),
       capabilities: capabilities(),
       rights: EVERY_RIGHT
@@ -193,6 +203,7 @@ describe('what the composer offers (KR-REQ-13.12, 11.03)', () => {
 
   it('offers steering and interrupting only while a turn is running', () => {
     const idle = composerOffers({
+      known: true,
       binding: binding({ turn_id: null }),
       capabilities: capabilities(),
       rights: EVERY_RIGHT
@@ -204,6 +215,7 @@ describe('what the composer offers (KR-REQ-13.12, 11.03)', () => {
 
   it('offers queueing and steering only where the upstream does, in its own words', () => {
     const offers = composerOffers({
+      known: true,
       binding: binding(),
       capabilities: capabilities({
         'agent.prompt.queue': record('agent.prompt.queue', 'incompatible', 'This upstream has no queue.')
@@ -214,16 +226,27 @@ describe('what the composer offers (KR-REQ-13.12, 11.03)', () => {
     expect(offers.steer.offered).toBe(true)
   })
 
-  it('offers nothing this device was not granted, and decides nothing on rights it was not told', () => {
+  it('offers nothing this device was not granted, and nothing before it is told what it may do', () => {
     const viewer = composerOffers({
+      known: true,
       binding: binding(),
       capabilities: capabilities(),
       rights: new Set(['session.view'])
     })
     expect(viewer.submit).toEqual({ offered: false, reason: 'This device was not granted this.' })
     expect(viewer.attach.offered).toBe(false)
-    const untold = composerOffers({ binding: binding(), capabilities: capabilities(), rights: null })
-    expect(untold.submit.offered).toBe(true)
+    const untold = composerOffers({
+      known: true,
+      binding: binding(),
+      capabilities: capabilities(),
+      rights: null
+    })
+    for (const offer of Object.values(untold)) {
+      expect(offer).toEqual({
+        offered: false,
+        reason: 'This device does not know yet what it may do here.'
+      })
+    }
   })
 })
 
@@ -296,28 +319,64 @@ describe('an entry of the history (KR-REQ-13.15)', () => {
 })
 
 describe('what the host withheld, counted once (KR-REQ-25.25)', () => {
-  it('replaces the count of a range read again, and keeps a closed range', () => {
-    // The first read covers everything from the start and withholds two.
-    let count = foldWithheld(undefined, null, [part({ withheld_entries: '2' })])
-    expect(withheldTotal(new Map([['i-1', count]]))).toBe(2)
-    // Nothing new was shown, so the next read starts at the same place and says the same.
-    count = foldWithheld(count, null, [part({ withheld_entries: '2' })])
-    expect(withheldTotal(new Map([['i-1', count]]))).toBe(2)
-    // A shown entry moved the start on: what was withheld before it stays counted.
-    count = foldWithheld(count, '6', [part({ withheld_entries: '0' })])
-    expect(withheldTotal(new Map([['i-1', count]]))).toBe(2)
+  /** A part carrying the entries numbered `nodes`, and what it withheld in its range. */
+  function carrying(nodes: readonly number[], withheld: number, next: number | null = null) {
+    return part({
+      entries: nodes.map((node) => ({
+        node: String(node),
+        kind: 'message',
+        text: String(node),
+        omitted_text_bytes: '0',
+        observed_at: '0'
+      })),
+      withheld_entries: String(withheld),
+      continuation:
+        next === null
+          ? null
+          : { limit: 'nodes', limit_value: '40', from_node: String(next), nodes: '40', bytes: '0' }
+    })
+  }
+  const total = (count: ReturnType<typeof foldWithheld>) => withheldTotal(new Map([['i-1', count]]))
+
+  it('counts a range read again once, and keeps what it counted before a shown entry', () => {
+    // The first read shows nothing and withholds two; the next reads the same range again.
+    let count = foldWithheld(undefined, null, [carrying([], 2)])
+    expect(total(count)).toBe(2)
+    count = foldWithheld(count, null, [carrying([], 2)])
+    expect(total(count)).toBe(2)
+    // An entry arrives: the read that finds it reads on from after it, and nothing is withheld
+    // there, so the two it withheld before it stay counted, once.
+    count = foldWithheld(count, null, [carrying([3], 2), carrying([], 0)])
+    expect(count).toEqual({ settled: 2, tail: { from: '4', count: 0 } })
+    count = foldWithheld(count, '4', [carrying([], 0)])
+    expect(total(count)).toBe(2)
   })
 
-  it('adds a part that stopped at a limit, whose range no later read covers', () => {
-    const count = foldWithheld(undefined, null, [
-      part({
-        withheld_entries: '3',
-        continuation: { limit: 'nodes', limit_value: '40', from_node: '44', nodes: '40', bytes: '0' }
-      }),
-      part({ withheld_entries: '1' })
-    ])
+  it('counts an entry withheld after a shown one once, whatever order the filter works in', () => {
+    // Entry 1 is shown and entry 2 withheld: the read of 1 counts 2, and so does the read from 2.
+    let count = foldWithheld(undefined, null, [carrying([1], 1), carrying([], 1)])
+    expect(total(count)).toBe(1)
+    count = foldWithheld(count, '2', [carrying([], 1)])
+    expect(total(count)).toBe(1)
+    // Entry 3 is shown after it: the one withheld before it is counted once.
+    count = foldWithheld(count, '2', [carrying([3], 1), carrying([], 0)])
+    expect(total(count)).toBe(1)
+  })
+
+  it('adds a part that stopped at a limit, whose range no later part covers', () => {
+    const count = foldWithheld(undefined, null, [carrying([1], 3, 44), carrying([], 1)])
     expect(count).toEqual({ settled: 3, tail: { from: '44', count: 1 } })
     expect(withheldTotal(new Map([['i-1', count], ['i-2', { settled: 2, tail: null }]]))).toBe(6)
+  })
+
+  it('settles a read the bound cut short against the next one, which starts after it', () => {
+    // The read ended at the bound on a part that found entry 5 and counted two beyond it.
+    let count = foldWithheld(undefined, null, [carrying([5], 3)])
+    expect(count).toEqual({ settled: 0, tail: { from: null, count: 3 } })
+    // The next read starts after entry 5 and finds the two: the one before entry 5 is kept.
+    count = foldWithheld(count, '6', [carrying([], 2)])
+    expect(count).toEqual({ settled: 1, tail: { from: '6', count: 2 } })
+    expect(total(count)).toBe(3)
   })
 })
 

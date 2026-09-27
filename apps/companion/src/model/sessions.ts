@@ -50,6 +50,13 @@ export interface AgentReading {
   readonly withheld: ReadonlyMap<string, WithheldCount>
   /** Whether a read found that entries it asked for were no longer retained. */
   readonly gap: boolean
+  /**
+   * The instances this device stopped reading because another took their place or they ended.
+   *
+   * An instance's history goes with it, so what it wrote after the last read of it here is not
+   * shown, and the conversation says so rather than implying it saw everything.
+   */
+  readonly unfinished: ReadonlySet<string>
 }
 
 /** Nothing read yet. */
@@ -64,7 +71,8 @@ export function unreadAgent(): AgentReading {
     commandsOf: null,
     nextNode: new Map(),
     withheld: new Map(),
-    gap: false
+    gap: false,
+    unfinished: new Set()
   }
 }
 

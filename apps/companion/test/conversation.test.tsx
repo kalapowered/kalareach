@@ -3,10 +3,12 @@
  *
  * The history is an ordered log with a number on every entry, and the host announces nothing when
  * an entry is added, so the view reads it again while it is shown, each time from the entry after
- * the last one it holds: nothing falls between two reads and nothing is read twice. One read is on
+ * the last one it holds: while an agent runs, nothing falls between two reads and nothing is read
+ * twice, and an agent that ended before its last entries were read is said to have. One read is on
  * its way at a time. What a package shows arrives on the host's event stream, for the session the
  * stream names. A refusal to read, and a stream that cannot be followed, are each shown for what
  * they are, and what the host's filter withheld is counted once however often the view reads.
+ * What the person writes goes to the conversation they wrote it for, or nowhere until they choose.
  */
 
 import { describe, expect, it } from 'vitest'
@@ -222,9 +224,13 @@ describe('the conversation reads the agent from its worker (KR-REQ-13.02, 11.03)
     })
     expect(held.count).toBe(1)
 
+    // The read that found the history reads on from after its last entry, and only then is it
+    // one read done.
     await answer(held, 0)
-    expect(shown()).toEqual(HISTORY)
     await made(held, 2)
+    await answer(held, 1)
+    expect(shown()).toEqual(HISTORY)
+    await made(held, 3)
     held.release()
   })
 
@@ -280,10 +286,11 @@ describe('the conversation reads the agent from its worker (KR-REQ-13.02, 11.03)
     await made(held, 2)
     expect(screen.queryByTestId('conversation-unread')).toBeNull()
 
-    await answer(held, 1)
-    expect(shown()).toEqual(HISTORY)
-    expect(screen.queryByTestId('conversation-unread')).toBeNull()
     held.release()
+    await waitFor(() => {
+      expect(shown()).toEqual(HISTORY)
+    })
+    expect(screen.queryByTestId('conversation-unread')).toBeNull()
   })
 })
 
@@ -309,6 +316,49 @@ describe('what the conversation says it does not show (KR-REQ-13.15, 25.25)', ()
     await shownAgain()
     expect(screen.getByTestId('withheld').textContent).toContain(
       '2 entries are outside what this device may see.'
+    )
+  })
+
+  it('counts an entry withheld after a shown one once, however often it reads', async () => {
+    const { port, controls } = fakeHost()
+    // The filter withholds the newest entry, and keeps doing so as the history grows past it.
+    controls.records.withholdEntry(SESSION_MAIN, 5)
+    openConversation(port)
+
+    await waitFor(() => {
+      expect(shown()).toEqual(HISTORY.slice(0, 4))
+    })
+    expect(screen.getByTestId('withheld').textContent).toContain(
+      '1 entry is outside what this device may see.'
+    )
+    await shownAgain()
+    controls.records.appendEntry(SESSION_MAIN, 'message', 'After the withheld one.')
+    await shownAgain()
+    await waitFor(() => {
+      expect(shown()).toEqual([...HISTORY.slice(0, 4), entry(6)])
+    })
+    await shownAgain()
+    expect(screen.getByTestId('withheld').textContent).toContain(
+      '1 entry is outside what this device may see.'
+    )
+  })
+
+  it('says so when an agent it was reading ended before its last entries were read', async () => {
+    const { port, controls } = fakeHost()
+    openConversation(port)
+    await waitFor(() => {
+      expect(shown()).toEqual(HISTORY)
+    })
+
+    controls.records.appendEntry(SESSION_MAIN, 'message', 'Written just before it quit.')
+    const next = controls.records.restartAgent(SESSION_MAIN)
+    await shownAgain()
+
+    await waitFor(() => {
+      expect(shown()).toEqual([...HISTORY, `${next}:1`])
+    })
+    expect(screen.getByTestId('unfinished').textContent).toContain(
+      'Anything it wrote after this device last read it is not shown.'
     )
   })
 
@@ -345,6 +395,65 @@ describe('what the conversation says it does not show (KR-REQ-13.15, 25.25)', ()
     expect(screen.getByTestId('history-notes').textContent).toContain(
       'Some of this agent’s earlier entries were no longer kept when this device read them.'
     )
+  })
+})
+
+describe('what the person writes goes where they wrote it (KR-REQ-13.12)', () => {
+  it('asks before sending a draft to a conversation that moved on while it was written', async () => {
+    const person = userEvent.setup()
+    const { port, controls } = fakeHost()
+    const sent: string[] = []
+    openConversation({
+      ...port,
+      composerSubmit: (params) => {
+        sent.push(params.target.binding_revision)
+        return port.composerSubmit(params)
+      }
+    })
+    await waitFor(() => {
+      expect(shown()).toEqual(HISTORY)
+    })
+    await person.type(screen.getByTestId('composer-input'), 'Keep the timer')
+
+    // The agent moves to another conversation while the draft is on screen.
+    controls.records.moveBinding(SESSION_MAIN)
+    await shownAgain()
+    await waitFor(() => {
+      expect(screen.getByTestId('composer-reason')).toHaveTextContent(
+        'The conversation changed since this was written.'
+      )
+    })
+    expect(screen.getByTestId('composer-send')).toBeDisabled()
+    expect(screen.getByTestId('composer-input')).toHaveValue('Keep the timer')
+
+    // Only the person sends it on.
+    await person.click(screen.getByTestId('composer-retarget'))
+    expect(screen.getByTestId('composer-send')).toBeEnabled()
+    await person.click(screen.getByTestId('composer-send'))
+    await waitFor(() => {
+      expect(sent).toEqual(['5'])
+    })
+  })
+
+  it('sends what was written at the binding revision it was written at', async () => {
+    const person = userEvent.setup()
+    const { port } = fakeHost()
+    const sent: string[] = []
+    openConversation({
+      ...port,
+      composerSubmit: (params) => {
+        sent.push(params.target.binding_revision)
+        return port.composerSubmit(params)
+      }
+    })
+    await waitFor(() => {
+      expect(shown()).toEqual(HISTORY)
+    })
+    await person.type(screen.getByTestId('composer-input'), 'Run the tests')
+    await person.click(screen.getByTestId('composer-send'))
+    await waitFor(() => {
+      expect(sent).toEqual(['4'])
+    })
   })
 })
 

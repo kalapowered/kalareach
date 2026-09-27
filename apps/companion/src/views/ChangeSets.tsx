@@ -14,13 +14,54 @@ import type { ChangesetReadResult, ReviewReadResult, ReviewState } from '@kalare
 
 import { Badge, Banner, Button, Card, CommitButton } from '../components/ui'
 import { useApp } from '../app/state'
-import { failureMessage, watch, type Watch } from '../host/port'
+import { failureCode, failureMessage, watch, type HostPort, type Watch } from '../host/port'
 import { ask } from '../mobile/model/call'
 import { outcomeMessage, outcomeTone } from '../model/receipts'
 import type { RetainedArtefacts } from '../model/pending'
 
 /** The largest page of review state one read asks for. */
 const PAGE_REVIEWS = '200'
+
+/** The most pages of review state one read follows. */
+const MAX_REVIEW_PAGES = 16
+
+/**
+ * Every review subject the host holds for this caller, page by page.
+ *
+ * Each page continues after the last subject of the one before, until the host says there is no
+ * more or the bound is reached; the answer's `more` then says whether the host holds more than was
+ * read. A subject can go between two pages, and the host refuses a page that continues after one
+ * it no longer holds: the list is then read again from its start, once.
+ */
+async function readAllReviews(port: HostPort): Promise<ReviewReadResult> {
+  const follow = async (): Promise<ReviewReadResult> => {
+    let page = await port.reviewRead({
+      session_id: null,
+      subject: null,
+      max_reviews: PAGE_REVIEWS,
+      after: null
+    })
+    const reviews = [...page.reviews]
+    for (let pages = 1; page.more && pages < MAX_REVIEW_PAGES; pages += 1) {
+      const last = page.reviews.at(-1)
+      if (last === undefined) break
+      page = await port.reviewRead({
+        session_id: null,
+        subject: null,
+        max_reviews: PAGE_REVIEWS,
+        after: last.subject
+      })
+      reviews.push(...page.reviews)
+    }
+    return { ...page, reviews }
+  }
+  try {
+    return await follow()
+  } catch (failure: unknown) {
+    if (failureCode(failure) !== 'DRAFT_CONFLICT') throw failure
+    return await follow()
+  }
+}
 
 /** A review subject that is a change set, with where it was captured. */
 interface ChangeSetReview {
@@ -79,19 +120,19 @@ export function ChangeSets(): ReactNode {
     const current = reads.current?.read() ?? null
     if (current === null) return
     ask(async () => {
-      const listed = await port.reviewRead({
-        session_id: null,
-        subject: null,
-        max_reviews: PAGE_REVIEWS,
-        after: null
-      })
-      // Each change set is read at its newest version, which is what its review names.
+      const listed = await readAllReviews(port)
+      // Each change set is read at the version its review names, so what is shown, the review's
+      // mark and what marking it reviewed acknowledges are all the same version, whatever was
+      // captured since the list was read.
       const read = await Promise.all(
         changeSetsOf(listed).map(
           async (each) =>
             [
               each.changeSetId,
-              await port.changesetRead({ change_set_id: each.changeSetId, version: null })
+              await port.changesetRead({
+                change_set_id: each.changeSetId,
+                version: each.review.current_version
+              })
             ] as const
         )
       )
@@ -170,6 +211,12 @@ export function ChangeSets(): ReactNode {
           detail={failure}
           action={<Button onClick={load}>Try again</Button>}
         />
+      ) : null}
+
+      {reviews?.more ? (
+        <p className="small muted" data-testid="reviews-more">
+          The host holds more change sets than this list shows.
+        </p>
       ) : null}
 
       {changeSets.length === 0 ? (

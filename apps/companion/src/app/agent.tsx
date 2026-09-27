@@ -4,9 +4,11 @@
  * The session's own worker is the one source: which instance is live, what it can do now, the
  * requests it is waiting on a person for, and its semantic history. The history is an ordered log
  * with a number on every entry, and the host announces nothing when an entry is added, so the view
- * reads it again while it is shown, each time from the entry after the last one it holds. Nothing
- * can fall between two reads, and nothing is read twice: an entry keeps its identity, and a copy
- * carrying more of its text than the one held replaces it.
+ * reads it again while it is shown, each time from the entry after the last one it holds. While an
+ * instance runs, nothing falls between two reads, and nothing is read twice: an entry keeps its
+ * identity, and a copy carrying more of its text than the one held replaces it. An instance's
+ * history goes with it when it ends, so what it wrote after the last read is not read, and the
+ * session's store records that instance as unfinished.
  *
  * What is read goes into the session's own store, so the conversation and the terminal, and a
  * change of view, share it, and a read that answers after the view moved on changes nothing.
@@ -113,8 +115,10 @@ export function useSessionAgent(
           continue
         }
         const last = read.entries.at(-1)
-        if (last !== undefined) from = String(BigInt(last.node) + 1n)
-        break
+        if (last === undefined) break
+        // A part that found entries is read on from after the last of them, so that what it
+        // counted as withheld beyond them is counted apart from what it withheld before them.
+        from = String(BigInt(last.node) + 1n)
       }
       return { agents, instance, facts, commands, start, parts, from }
     }
@@ -122,6 +126,13 @@ export function useSessionAgent(
     const fold = (found: Read) => {
       update((state) => {
         const { agents, instance, facts, commands, start, parts, from } = found
+        // An instance this view was reading that is no longer the one it reads has taken what it
+        // wrote since the last read with it.
+        const previous = state.agent.instance
+        const unfinished =
+          previous !== null && previous !== instance
+            ? new Set([...state.agent.unfinished, previous])
+            : state.agent.unfinished
         if (instance === null || facts === null) {
           return {
             ...state,
@@ -132,7 +143,8 @@ export function useSessionAgent(
               resources: agents.resources,
               instance: null,
               binding: null,
-              capabilities: null
+              capabilities: null,
+              unfinished
             }
           }
         }
@@ -158,7 +170,8 @@ export function useSessionAgent(
             commandsOf: instance,
             nextNode,
             withheld,
-            gap: state.agent.gap || parts.some((part) => part.history_gap)
+            gap: state.agent.gap || parts.some((part) => part.history_gap),
+            unfinished
           }
         }
       })

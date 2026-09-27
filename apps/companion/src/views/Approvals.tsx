@@ -22,6 +22,7 @@ import { base64UrlToBytes } from '@kalareach/protocol'
 import { Banner, Button, CommitButton } from '../components/ui'
 import { AGENT_READ_CADENCE_MS } from '../app/agent'
 import { readOnCadence } from '../app/cadence'
+import { useConnectionRights } from '../app/rights'
 import { useApp } from '../app/state'
 import { failureMessage, watch, type Watch } from '../host/port'
 import { ask } from '../mobile/model/call'
@@ -68,6 +69,7 @@ export function ApprovalRequests({
   readonly onAnswered?: () => void
 }): ReactNode {
   const { port, say } = useApp()
+  const rights = useConnectionRights()
   // This view of this session: nothing read in an earlier visit to it is shown on a return.
   const visit = useMemo(() => ({ sessionId }), [sessionId])
   // What the newest read found, in the visit it was read in, and when: how long ago each request
@@ -194,9 +196,10 @@ export function ApprovalRequests({
         const { resource, inspection, facts } = request
         const decoding = inspection.decoding
         const offer = composerOffers({
+          known: true,
           binding: facts.binding,
           capabilities: capabilityRecords(facts.capabilities.records),
-          rights: null
+          rights: rights === null ? null : new Set(rights)
         }).answer
         const source = sourceText(decoding.source_bytes)
         const busy = answering === resource.resource_id

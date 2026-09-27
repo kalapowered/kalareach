@@ -77,7 +77,7 @@ export function agentEntry(instance: string, entry: AgentSnapshotEntry): AgentEn
 
 /** How many of one instance's entries this device's history filter withheld, as its reads said. */
 export interface WithheldCount {
-  /** Withheld in ranges a read closed, which no later read covers again. */
+  /** Withheld in ranges already counted apart, which no later read covers again. */
   readonly settled: number
   /** The newest read of the history's open end: where it started, and how many it withheld. */
   readonly tail: { readonly from: string | null; readonly count: number } | null
@@ -86,32 +86,53 @@ export interface WithheldCount {
 /**
  * Folds one read's parts, the first of which started at `from`, into an instance's count.
  *
- * Each part counts what it withheld in the range it covered. A part that stopped at a limit covers a
- * closed range. The last part covers everything from where it started, so the next read counts that
- * range again when it starts at the same entry, and its count replaces this one. A next read that
- * starts later closes the range up to where it starts: the host's filter withholds what is older
- * than the grant reaches back to, so what it withheld there precedes the entry the next read follows.
+ * Each part counts what it withheld in the range it covered. A part that stopped at a limit covers
+ * a closed range, which ends where the next part begins. A part that did not covers everything from
+ * where it started, so its count includes whatever later parts count too: what it withheld on its
+ * own is its count less theirs. That is why a read that found entries reads on from after the last
+ * one, and why the next read, which starts at the same place as the last part or later, takes the
+ * last part's count over. Whatever order the filter withholds entries in, nothing is counted twice;
+ * an entry the filter withholds while a read is on its way can be left out of the count, never
+ * added to it twice.
  */
 export function foldWithheld(
   count: WithheldCount | undefined,
   from: string | null,
   parts: readonly AgentSnapshotResult[]
 ): WithheldCount {
-  let settled = count?.settled ?? 0
+  if (parts.length === 0) return count ?? { settled: 0, tail: null }
+  // The ranges read, in order: the previous open-ended read when this one starts later than it
+  // did, then this read's parts. A previous read that started where this one does is read again.
   const previous = count?.tail ?? null
-  if (previous !== null && previous.from !== from) settled += previous.count
-  let tail: WithheldCount['tail'] = null
-  let start = from
-  for (const part of parts) {
-    const withheld = Number(part.withheld_entries)
-    if (part.continuation === null) {
-      tail = { from: start, count: withheld }
-      continue
-    }
-    settled += withheld
-    start = part.continuation.from_node
+  const ranges: { readonly withheld: number; readonly closed: boolean }[] = []
+  if (previous !== null && previous.from !== from) {
+    ranges.push({ withheld: previous.count, closed: false })
   }
-  return { settled, tail }
+  let start = from
+  let lastStart = from
+  for (const part of parts) {
+    lastStart = start
+    ranges.push({ withheld: Number(part.withheld_entries), closed: part.continuation !== null })
+    const last = part.entries.at(-1)
+    start =
+      part.continuation?.from_node ?? (last === undefined ? start : String(BigInt(last.node) + 1n))
+  }
+  // From the last range back: a closed range's count is its own, and an open one's is its count
+  // less everything after it.
+  const own = new Array<number>(ranges.length).fill(0)
+  let after = 0
+  for (let index = ranges.length - 1; index >= 0; index -= 1) {
+    const range = ranges[index]
+    if (range === undefined) continue
+    own[index] = range.closed ? range.withheld : Math.max(0, range.withheld - after)
+    after += own[index] ?? 0
+  }
+  const openEnded = parts.at(-1)?.continuation === null
+  const settledNow = own.slice(0, openEnded ? -1 : undefined).reduce((total, each) => total + each, 0)
+  return {
+    settled: (count?.settled ?? 0) + settledNow,
+    tail: openEnded ? { from: lastStart, count: own.at(-1) ?? 0 } : null
+  }
 }
 
 /** How many entries of every instance read so far the host withheld from this device. */
@@ -163,11 +184,13 @@ export type ComposerOffers = Readonly<Record<keyof typeof COMPOSER_CAPABILITIES,
 
 /** What decides the offers. */
 export interface ComposerFacts {
+  /** Whether the session's agent has been read at all. */
+  readonly known: boolean
   /** The binding in force, or null before one has been read or when no agent is live. */
   readonly binding: AgentBindingState | null
   /** The instance's capability records, or null before they have been read. */
   readonly capabilities: ReadonlyMap<string, InstanceCapabilityRecord> | null
-  /** The rights this device holds, or null when it has not been told. */
+  /** The rights this device holds, or null while it has not been told. */
   readonly rights: ReadonlySet<string> | null
 }
 
@@ -179,10 +202,17 @@ const OFFERED: Offer = { offered: true, reason: null }
  * An action is offered only when its capability is usable now, this device holds the right it
  * needs, and the binding is one the host has verified. Steering and interrupting also need a turn
  * to be running, since each names that turn. A fact nobody has told this device is not a fact it
- * guesses: until the capability records are read, nothing is offered.
+ * guesses: until the capability records are read and the connection has said what it may do,
+ * nothing is offered.
  */
-export function composerOffers({ binding, capabilities, rights }: ComposerFacts): ComposerOffers {
+export function composerOffers({
+  known,
+  binding,
+  capabilities,
+  rights
+}: ComposerFacts): ComposerOffers {
   const offer = (action: keyof typeof COMPOSER_CAPABILITIES): Offer => {
+    if (!known) return { offered: false, reason: 'Reading this session’s agent…' }
     if (binding === null) return { offered: false, reason: 'No agent is running in this session.' }
     if (binding.rich_mutations_suspended) {
       return {
@@ -205,8 +235,10 @@ export function composerOffers({ binding, capabilities, rights }: ComposerFacts)
         reason: record.disabled_reason ?? 'This agent cannot do this right now.'
       }
     }
-    const missing = rights === null ? [] : COMPOSER_RIGHTS[action].filter((right) => !rights.has(right))
-    if (missing.length > 0) {
+    if (rights === null) {
+      return { offered: false, reason: 'This device does not know yet what it may do here.' }
+    }
+    if (COMPOSER_RIGHTS[action].some((right) => !rights.has(right))) {
       return { offered: false, reason: 'This device was not granted this.' }
     }
     return OFFERED

@@ -7,9 +7,12 @@
 
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 
+import type { ActionRight } from '@kalareach/protocol'
+
 import { AccountPanel, useAccount } from './components/AccountPanel'
 import { Brand, Sheet, Toast } from './components/ui'
 import { isSigningIn, type AccountView } from './model/account'
+import { ShellRights } from './app/rights'
 import { useApp, type Place } from './app/state'
 import { Attention } from './views/Attention'
 import { ChangeSets } from './views/ChangeSets'
@@ -39,6 +42,7 @@ export function App(): ReactNode {
   const [connection, setConnection] = useState<{
     readonly connected: boolean
     readonly reason: string | null
+    readonly rights: readonly ActionRight[] | null
   } | null>(null)
   const account = useAccount(port)
   const [accountOpen, setAccountOpen] = useState(false)
@@ -62,11 +66,15 @@ export function App(): ReactNode {
         (listener) => port.onConnection(listener),
         () => port.connectionState(),
         (state) => {
-          setConnection({ connected: state.connected, reason: state.reason })
+          setConnection({
+            connected: state.connected,
+            reason: state.reason,
+            rights: state.connected ? state.rights : null
+          })
         },
         // A failure to answer is itself an answer: the window says it is not connected, and why.
         (failure) => {
-          setConnection({ connected: false, reason: failureMessage(failure) })
+          setConnection({ connected: false, reason: failureMessage(failure), rights: null })
         }
       ),
     [port]
@@ -89,7 +97,7 @@ export function App(): ReactNode {
     }
   }, [])
 
-  return (
+  const shell = (
     <div className="app-shell">
       <a className="skip-link" href="#main">
         Skip to content
@@ -206,6 +214,7 @@ export function App(): ReactNode {
       <Toast message={toast} onDismiss={dismissToast} />
     </div>
   )
+  return <ShellRights.Provider value={connection?.rights ?? null}>{shell}</ShellRights.Provider>
 }
 
 /** The Account item's second line: signing in, or who is signed in. */

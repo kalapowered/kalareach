@@ -25,7 +25,9 @@ import {
   count,
   emptyMessage,
   filter,
+  inboxNotes,
   order,
+  readWholeInbox,
   type AttentionFilter,
   type AttentionRow
 } from '../../model/attention'
@@ -83,12 +85,14 @@ export function Inbox({
     const current = reads.current?.read() ?? null
     if (current === null) return Promise.resolve()
     const inboxRead = ask(() =>
-      port.attentionRead({
-        session_id: null,
-        include_acknowledged: false,
-        max_items: PAGE_ITEMS,
-        after: null
-      })
+      readWholeInbox((after) =>
+        port.attentionRead({
+          session_id: null,
+          include_acknowledged: false,
+          max_items: PAGE_ITEMS,
+          after
+        })
+      )
     )
       .then((answer) => {
         if (!current()) return
@@ -134,6 +138,7 @@ export function Inbox({
     if (counts && onCounts) onCounts(counts.actionable)
   }, [counts, onCounts])
 
+  const notes = useMemo(() => (inbox ? inboxNotes(inbox.result) : []), [inbox])
   const shown = filter(rows, chosen)
   const whereOf = (row: AttentionRow): string => {
     const sessionId = row.item.session_id
@@ -169,6 +174,14 @@ export function Inbox({
           </button>
         ))}
       </div>
+
+      {notes.length > 0 ? (
+        <ul className="m-notes" data-testid="inbox-notes">
+          {notes.map((note) => (
+            <li key={note}>{note}</li>
+          ))}
+        </ul>
+      ) : null}
 
       {shown.length === 0 ? (
         <p className="m-empty">{inbox ? emptyMessage(chosen) : 'Reading the inbox…'}</p>

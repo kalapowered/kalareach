@@ -28,12 +28,13 @@ import {
 } from 'react'
 
 import type { DocumentNode } from '@kalareach/plugin-sdk'
-import type { ActionRight, AgentCommand } from '@kalareach/protocol'
+import type { AgentCommand } from '@kalareach/protocol'
 import { promptTextProblem } from '@kalareach/protocol'
 
 import { Badge, Banner, Button, Card, CommitButton, IconButton } from '../components/ui'
 import { useApp, useSession } from '../app/state'
 import { useSessionAgent } from '../app/agent'
+import { useConnectionRights } from '../app/rights'
 import {
   failureCode,
   failureMessage,
@@ -46,6 +47,7 @@ import {
   actionableApprovals,
   bindingStateOf,
   composerOffers,
+  subjectOf,
   targetOf,
   withheldTotal,
   type ComposerOffers
@@ -69,12 +71,14 @@ import {
   type ControlState
 } from '../model/controls'
 import {
+  againstCurrent,
   connectionLost,
   edit,
   notSubmittableBecause,
-  readInsertionRefusal,
+  retarget,
   submittable,
-  type Draft
+  type Draft,
+  type DraftTarget
 } from '../model/drafts'
 import { FrameBatcher } from '../model/frame'
 import { eventIsFor } from '../model/sessions'
@@ -122,20 +126,18 @@ export function Conversation({
   sessionId,
   subject,
   connected,
-  rights,
   launch,
   onLaunched
 }: {
   readonly sessionId: string
   readonly subject: SessionSubject
   readonly connected: boolean
-  /** The rights this connection holds, or null when it has not been told. */
-  readonly rights: readonly ActionRight[] | null
   /** The launch surface as it was read, and the prompt's generation as the view knows it now. */
   readonly launch: { readonly surface: LaunchSurface; readonly promptGeneration: string } | null
   readonly onLaunched: () => void
 }): ReactNode {
   const { port, say } = useApp()
+  const rights = useConnectionRights()
   const { state, update } = useSession(sessionId)
   const { unread, refresh } = useSessionAgent(sessionId)
   const [insertion, setInsertion] = useState<string | null>(null)
@@ -227,14 +229,38 @@ export function Conversation({
   const offers = useMemo(
     () =>
       composerOffers({
+        known: agent.instances !== null,
         binding: agent.binding,
         capabilities: agent.capabilities,
         rights: rights === null ? null : new Set(rights)
       }),
-    [agent.binding, agent.capabilities, rights]
+    [agent.instances, agent.binding, agent.capabilities, rights]
   )
   const waitingOnPerson =
     agent.instances === null ? null : actionableApprovals(agent.resources).length > 0
+
+  // The conversation the session's agent is in now: what a draft is written for, and what it is
+  // checked against before it is sent.
+  const currentTarget: DraftTarget | null = useMemo(
+    () =>
+      agent.instance === null || agent.binding === null
+        ? null
+        : {
+            sessionId,
+            applicationInstanceId: agent.instance,
+            agentBindingRevision: agent.binding.binding_revision
+          },
+    [sessionId, agent.instance, agent.binding]
+  )
+
+  // Losing contact removes the association, not the draft, and a moved conversation conflicts the
+  // draft rather than taking it. Both are facts about the session now, so they are derived here
+  // rather than written into the stored draft: the text, the revision and the attachments are
+  // untouched, and a rebind or a retarget is still the explicit act it has to be.
+  const presented = useMemo(() => {
+    const drafted = againstCurrent(state.draft, currentTarget)
+    return connected ? drafted : connectionLost(drafted)
+  }, [connected, state.draft, currentTarget])
 
   // What a control's visibility is decided from: every fact this device has been told.
   const controlState: ControlState = useMemo(
@@ -256,7 +282,19 @@ export function Conversation({
       const binding = agent.binding
       const instance = agent.instance
       if (binding === null || instance === null) return
-      const typed = state.draft.text
+      // What the person wrote goes to the conversation they wrote it for, at the binding revision
+      // they wrote it at: the host refuses it if that conversation has moved on since. Only an
+      // interruption, which carries no text, names the conversation as it is now.
+      const draft = presented
+      if (action !== 'interrupt' && !submittable(draft)) return
+      const written = draft.target
+      if (
+        action !== 'interrupt' &&
+        (written.applicationInstanceId === null || written.agentBindingRevision === null)
+      ) {
+        return
+      }
+      const typed = draft.text
       if (action !== 'interrupt' && promptTextProblem(typed) === 'too-long') {
         say('That is longer than one prompt carries. It is kept here.', 'danger')
         return
@@ -273,7 +311,14 @@ export function Conversation({
         draft: clears ? edit(current.draft, '', Date.now()) : current.draft
       }))
 
-      const target = targetOf(sessionId, instance, binding)
+      const now = targetOf(sessionId, instance, binding)
+      const target =
+        action === 'interrupt'
+          ? now
+          : {
+              subject: subjectOf(sessionId, written.applicationInstanceId ?? instance),
+              binding_revision: written.agentBindingRevision ?? binding.binding_revision
+            }
       const turn = binding.turn_id ?? ''
       const call =
         action === 'submit'
@@ -282,7 +327,7 @@ export function Conversation({
             ? port.composerQueue({ target, draft_id: null, text: typed })
             : action === 'steer'
               ? port.composerSteer({ target, turn_id: turn, text: typed })
-              : port.composerInterrupt({ target, turn_id: turn })
+              : port.composerInterrupt({ target: now, turn_id: turn })
 
       call
         .then((result) => {
@@ -316,17 +361,18 @@ export function Conversation({
         })
         .finally(refresh)
     },
-    [port, sessionId, agent.binding, agent.instance, state.draft.text, update, say, returnRefusedText, refresh]
+    [port, sessionId, agent.binding, agent.instance, presented, update, say, returnRefusedText, refresh]
   )
 
   /**
-   * A dropped file becomes an attachment in three steps, and they stay three.
+   * A dropped file goes through the transfer service, and the handle it publishes is kept with the
+   * draft.
    *
-   * The transfer publishes a verified handle. The insertion binds that handle to the draft. The
-   * submission is a separate act the person performs. Section 12 keeps them apart because a failed
-   * insertion must leave the completed upload and the draft alone, and because only upstream
-   * evidence makes an attachment accepted by an agent. A file is sent only where the agent says it
-   * takes attachments now.
+   * Section 12 keeps the upload, the insertion into the agent's composer and the submission apart,
+   * and only upstream evidence makes an attachment accepted by an agent. Inserting a handle names
+   * the contribution the agent's integration declared for it, which this view is not given, so the
+   * view inserts nothing: it keeps the handle with the draft and says what the person can do. A
+   * file is sent only where the agent says it takes attachments now.
    */
   const attach = useCallback(
     (files: readonly DroppedFile[]) => {
@@ -343,8 +389,8 @@ export function Conversation({
         port
           .attachmentUpload(path, subject)
           .then((handle) => {
-            // The upload is done and the handle is verified. It is kept whatever the insertion
-            // does next.
+            // The upload is done and the handle is verified. It is kept with the draft until the
+            // person removes it.
             update((current) => ({
               ...current,
               draft: {
@@ -362,45 +408,20 @@ export function Conversation({
                 ]
               }
             }))
-            return port
-              .draftAddAttachment(
-                {
-                  draft_id: state.draft.draftId,
-                  transfer_id: handle.transfer_id,
-                  insertion_method: 'typed_submission'
-                },
-                subject
-              )
-              .then((result) => {
-                // Only an applied answer says the attachment reached the draft. The upload is
-                // done either way, and the handle above is kept.
-                say(
-                  outcomeMessage(`${handle.original_file_name} attached`, result),
-                  outcomeTone(result)
-                )
-              })
-              .catch((error: unknown) => {
-                const refusal = readInsertionRefusal(failureCode(error) ?? 'UNKNOWN')
-                setInsertion(refusal.fallback)
-              })
+            setInsertion(
+              `${handle.original_file_name} is uploaded and kept with this draft. A prompt sent from here cannot carry it: type its path in the terminal to give it to the agent, or remove it to send the text on its own.`
+            )
           })
           .catch((error: unknown) => {
             setInsertion(`${file.name} was not sent: ${failureMessage(error)}`)
           })
       }
     },
-    [port, state.draft.draftId, subject, update, say, offers.attach]
+    [port, subject, update, offers.attach]
   )
 
   useEffect(() => watch([port.onFilesDropped(attach)]).stop, [port, attach])
 
-  // Losing contact removes the association, not the draft. That is a fact about the connection, so
-  // it is derived here rather than written into the stored draft: the text, the revision and the
-  // attachments are untouched, and a rebind is still the explicit act it has to be.
-  const presented = useMemo(
-    () => (connected ? state.draft : connectionLost(state.draft)),
-    [connected, state.draft]
-  )
 
   const banner = reconnectBanner(connected, state.submissions)
   const rendered = useMemo(() => visibleNodes(state.conversation), [state.conversation])
@@ -582,12 +603,18 @@ export function Conversation({
         data-following={state.conversation.following ? 'true' : 'false'}
         data-window-start={state.conversation.windowStart}
       >
-        {agent.gap || withheld > 0 || hidden > 0 ? (
+        {agent.gap || withheld > 0 || agent.unfinished.size > 0 || hidden > 0 ? (
           <div className="history-edge" data-testid="history-notes">
             {agent.gap ? (
               <p className="small faint">
                 Some of this agent’s earlier entries were no longer kept when this device read
                 them.
+              </p>
+            ) : null}
+            {agent.unfinished.size > 0 ? (
+              <p className="small faint" data-testid="unfinished">
+                An agent that ran here earlier is no longer read. Anything it wrote after this
+                device last read it is not shown.
               </p>
             ) : null}
             {withheld > 0 ? (
@@ -636,7 +663,32 @@ export function Conversation({
         commands={agent.commands}
         insertion={insertion}
         onChange={(next) => {
-          update((current) => ({ ...current, draft: edit(current.draft, next, Date.now()) }))
+          update((current) => ({
+            ...current,
+            draft: edit(againstCurrent(current.draft, currentTarget), next, Date.now())
+          }))
+        }}
+        onRetarget={
+          currentTarget === null
+            ? null
+            : () => {
+                update((current) => ({
+                  ...current,
+                  draft: retarget(current.draft, currentTarget, current.draft.attachmentId)
+                }))
+              }
+        }
+        onRemoveAttachment={(transferId) => {
+          update((current) => ({
+            ...current,
+            draft: {
+              ...current.draft,
+              attachments: current.draft.attachments.filter(
+                (attachment) => attachment.transferId !== transferId
+              )
+            }
+          }))
+          setInsertion(null)
         }}
         onAction={send}
       />
@@ -1181,6 +1233,8 @@ function Composer({
   commands,
   insertion,
   onChange,
+  onRetarget,
+  onRemoveAttachment,
   onAction
 }: {
   readonly draft: Draft
@@ -1189,13 +1243,19 @@ function Composer({
   readonly commands: readonly AgentCommand[]
   readonly insertion: string | null
   readonly onChange: (text: string) => void
+  /** Sends a conflicted draft to the conversation the agent is in now, or null while none is. */
+  readonly onRetarget: (() => void) | null
+  readonly onRemoveAttachment: (transferId: string) => void
   readonly onAction: (action: ComposerAction) => void
 }): ReactNode {
   const [showCommands, setShowCommands] = useState(false)
   const typed = draft.text.startsWith('/') ? draft.text.slice(1).toLowerCase() : null
   const offered =
     typed === null ? [] : commands.filter((command) => command.name.toLowerCase().startsWith(typed))
-  const reason = offers.submit.offered ? notSubmittableBecause(draft) : offers.submit.reason
+  // The draft's own reason comes first: a detached, conflicted or empty draft says so whatever the
+  // agent offers. Then why the agent will not take one as it stands.
+  const reason =
+    notSubmittableBecause(draft) ?? (offers.submit.offered ? null : offers.submit.reason)
   const canSubmit = offers.submit.offered && submittable(draft) && connected
   const canWrite = submittable(draft) && connected
 
@@ -1208,7 +1268,7 @@ function Composer({
       ) : null}
 
       {draft.attachments.length > 0 ? (
-        <div className="row wrap">
+        <div className="row wrap" data-testid="draft-attachments">
           {draft.attachments.map((attachment) => (
             <span className="attachment-chip" key={attachment.transferId}>
               {attachment.name}
@@ -1217,8 +1277,26 @@ function Composer({
               ) : (
                 <Badge tone="neutral">Uploaded</Badge>
               )}
+              <Button
+                tone="quiet"
+                data-testid="remove-attachment"
+                aria-label={`Remove ${attachment.name} from this draft`}
+                onClick={() => {
+                  onRemoveAttachment(attachment.transferId)
+                }}
+              >
+                Remove
+              </Button>
             </span>
           ))}
+        </div>
+      ) : null}
+
+      {draft.state === 'conflicted' && onRetarget !== null ? (
+        <div className="composer-note">
+          <Button data-testid="composer-retarget" onClick={onRetarget}>
+            Keep it for the new conversation
+          </Button>
         </div>
       ) : null}
 

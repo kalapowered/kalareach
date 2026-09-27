@@ -103,6 +103,31 @@ describe('the attention inbox', () => {
   })
 })
 
+describe('the whole inbox, and who may answer (KR-REQ-13.09, 11.26)', () => {
+  it('reads every page of the inbox, not only the first', async () => {
+    const { controls } = start()
+    controls.records.raiseNotices(SESSION_MAIN, 250)
+    await userEvent.click(await screen.findByRole('button', { name: 'Notices' }))
+    await waitFor(() => {
+      expect(screen.getAllByTestId('attention-notice')).toHaveLength(251)
+    })
+  })
+
+  it('offers no decision this device was not granted, and says why', async () => {
+    const { controls } = start()
+    act(() => {
+      controls.setRights(['session.view', 'agent.prompt'])
+    })
+    const approval = await screen.findByTestId('approval')
+    await waitFor(() => {
+      expect(within(approval).getByTestId('approval-unavailable')).toHaveTextContent(
+        'This device was not granted this.'
+      )
+    })
+    expect(within(approval).getByRole('button', { name: 'Allow once' })).toBeDisabled()
+  })
+})
+
 describe('the session list', () => {
   it('shows the number, the directory, the attachment count and the state', async () => {
     start({ view: 'sessions' })
@@ -213,13 +238,13 @@ describe('the semantic view', () => {
       await Promise.resolve()
     })
     await waitFor(() => {
-      expect(screen.getByTestId('composer-reason')).toHaveTextContent(
-        'The conversation changed outside this host.'
-      )
+      expect(screen.queryByTestId('composer-queue')).toBeNull()
     })
     await userEvent.type(screen.getByTestId('composer-input'), 'go on')
+    expect(screen.getByTestId('composer-reason')).toHaveTextContent(
+      'The conversation changed outside this host.'
+    )
     expect(screen.getByTestId('composer-send')).toBeDisabled()
-    expect(screen.queryByTestId('composer-queue')).toBeNull()
   })
 
   it('keeps the draft when the host goes out of contact, and says the draft is kept', async () => {
@@ -308,7 +333,8 @@ describe('the semantic view', () => {
     expect(within(screen.getByTestId('launch-surface')).getByRole('button', { name: /Codex/ })).toBeDisabled()
   })
 
-  it('sends a dropped file through the transfer service before it touches the draft', async () => {
+  it('sends a dropped file through the transfer service and keeps it with the draft', async () => {
+    const person = userEvent.setup()
     const { port, controls } = fakeHost()
     render(
       <AppProvider
@@ -318,7 +344,7 @@ describe('the semantic view', () => {
         <App />
       </AppProvider>
     )
-    await screen.findByTestId('composer')
+    await screen.findByTestId('composer-queue')
 
     controls.dropFiles([
       { name: 'diagram.png', media_type: 'image/png', byte_len: 10, path: '/tmp/diagram.png' }
@@ -327,7 +353,24 @@ describe('the semantic view', () => {
     await waitFor(() => {
       expect(controls.uploaded).toEqual(['/tmp/diagram.png'])
     })
-    expect(await screen.findByText(/diagram.png attached/)).toBeInTheDocument()
+    expect(await screen.findByTestId('insertion-refusal')).toHaveTextContent(
+      'diagram.png is uploaded and kept with this draft.'
+    )
+    const files = screen.getByTestId('draft-attachments')
+    expect(within(files).getByText('Uploaded')).toBeInTheDocument()
+    expect(screen.queryByText(/attached\./)).toBeNull()
+
+    // A prompt from here cannot carry it, so none is sent that would leave it behind.
+    await person.type(screen.getByTestId('composer-input'), 'Look at this')
+    expect(screen.getByTestId('composer-send')).toBeDisabled()
+    expect(screen.getByTestId('composer-reason')).toHaveTextContent(
+      'Remove them to send the text on its own.'
+    )
+
+    // Only the person takes it off, and then the text goes on its own.
+    await person.click(screen.getByRole('button', { name: 'Remove diagram.png from this draft' }))
+    expect(screen.queryByTestId('draft-attachments')).toBeNull()
+    expect(screen.getByTestId('composer-send')).toBeEnabled()
   })
 
   it('does not send a file this window was never given', async () => {
@@ -350,46 +393,6 @@ describe('the semantic view', () => {
       'was not given to this window'
     )
     expect(controls.uploaded).toEqual([])
-  })
-
-  it('tells the person the draft is kept when a composer insertion is refused', async () => {
-    const { port, controls } = fakeHost()
-    render(
-      <AppProvider port={port} initialPlace={{ view: 'session', sessionId: SESSION_MAIN, pane: 'semantic' }}>
-        <App />
-      </AppProvider>
-    )
-    await screen.findByTestId('composer')
-
-    // The host's own rule: a native composer insertion into a buffer it cannot qualify is refused.
-    const refusing = {
-      ...port,
-      draftAddAttachment: () =>
-        Promise.reject({
-          code: 'DRAFT_CONFLICT',
-          message: 'The agent composer is not at an empty, qualified boundary.',
-          user_action: 'nothing'
-        })
-    }
-    render(
-      <AppProvider
-        port={refusing}
-        initialPlace={{ view: 'session', sessionId: SESSION_MAIN, pane: 'semantic' }}
-      >
-        <App />
-      </AppProvider>
-    )
-    // The window hears a drop once its listener is registered, which completes after the render.
-    await act(async () => {
-      await Promise.resolve()
-    })
-    controls.dropFiles([
-      { name: 'diagram.png', media_type: 'image/png', byte_len: 10, path: '/tmp/diagram.png' }
-    ])
-
-    const refusal = await screen.findByTestId('insertion-refusal')
-    expect(refusal.textContent).toMatch(/kept/)
-    expect(refusal.textContent).toMatch(/terminal/)
   })
 })
 
@@ -886,9 +889,12 @@ describe('the sheet', () => {
 
     const carries = await screen.findByTestId('invitation-carries')
     await waitFor(() => {
-      expect(carries.textContent).toContain('See the live screen and what follows it')
+      expect(carries.textContent).toContain('See what the session shows and does from when they accept')
     })
     expect(carries.querySelector('[data-notice]')).toBeNull()
+    expect(within(carries).getByTestId('no-current-screen')).toHaveTextContent(
+      'It does not include what is on the screen now'
+    )
 
     // Letting a viewer answer questions is the authority the explanation names, and the host's own
     // sentence for it is shown before anything is issued.
@@ -968,6 +974,27 @@ describe('change sets', () => {
     expect(shown.querySelector('[data-change="deleted"]')?.textContent).toContain('Deleted')
     expect(shown.textContent).toContain('Covered by a secret rule, so never read')
     expect(shown.textContent).toContain('Identical source does not reproduce')
+  })
+
+  it('reads each change set at the version its review names', async () => {
+    const { port } = fakeHost()
+    const asked: (string | null)[] = []
+    render(
+      <AppProvider
+        port={{
+          ...port,
+          changesetRead: (params) => {
+            asked.push(params.version)
+            return port.changesetRead(params)
+          }
+        }}
+        initialPlace={{ view: 'changesets' }}
+      >
+        <App />
+      </AppProvider>
+    )
+    await screen.findByTestId('mark-reviewed')
+    expect(asked).toEqual(['2'])
   })
 
   it('marks the version it shows reviewed, and says that approves nothing', async () => {

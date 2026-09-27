@@ -9,7 +9,7 @@
 
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 
-import type { ActionRight, SessionReadResult } from '@kalareach/protocol'
+import type { SessionReadResult } from '@kalareach/protocol'
 
 import { Badge, Banner, Button, Card, CommitButton, Segmented, Sheet, Switch, ThemeChooser } from '../components/ui'
 import { useApp } from '../app/state'
@@ -63,8 +63,6 @@ export function Session({
   const [reading, setReading] = useState<SessionReading | null>(null)
   const [launch, setLaunch] = useState<Launch | null>(null)
   const [connected, setConnected] = useState(true)
-  // What this connection may do, as native code said with its newest state, or null until then.
-  const [rights, setRights] = useState<readonly ActionRight[] | null>(null)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [closing, setClosing] = useState(false)
   // "Try again" registers the listeners again, and reads only once they are.
@@ -96,11 +94,6 @@ export function Session({
         .catch(() => {
           if (current() && connectionChanges === connectionAt) setConnected(false)
         })
-      ask(() => port.connectionState())
-        .then((state) => {
-          if (current() && connectionChanges === connectionAt) setRights(state.rights)
-        })
-        .catch(() => undefined)
       ask(() => port.launchSurface({ session_id: sessionId }))
         .then((surface) => {
           if (!current() || watching === null) return
@@ -131,7 +124,6 @@ export function Session({
         port.onConnection((state) => {
           connectionChanges += 1
           setConnected(state.connected)
-          setRights(state.rights)
         }),
         port.subscribe((event) => {
           const body = event.body as { kind?: string; prompt_generation?: string }
@@ -287,7 +279,6 @@ export function Session({
           sessionId={sessionId}
           subject={subject}
           connected={connected}
-          rights={rights}
           launch={
             offered
               ? { surface: offered.surface, promptGeneration: offered.promptGeneration }

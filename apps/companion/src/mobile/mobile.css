@@ -369,6 +369,19 @@
   text-align: center;
 }
 
+/* What the inbox as a whole says beyond its items, above the list it is about. */
+.m-notes {
+  list-style: none;
+  margin: 0 0 var(--gap-4);
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap-1);
+  color: var(--muted);
+  font-size: 0.8125rem;
+  line-height: 1.5;
+}
+
 /* ---- Filters --------------------------------------------------------------------------------- */
 
 .m-filters {

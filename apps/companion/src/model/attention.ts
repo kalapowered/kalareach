@@ -15,6 +15,8 @@
 
 import type { AttentionItem, AttentionReadResult } from '@kalareach/protocol'
 
+import { failureCode } from '../host/port'
+
 /**
  * How long after one read of the inbox the next starts while it is shown.
  *
@@ -22,6 +24,43 @@ import type { AttentionItem, AttentionReadResult } from '@kalareach/protocol'
  * is how soon an item raised or resolved elsewhere reaches a screen that is open.
  */
 export const ATTENTION_READ_CADENCE_MS = 5_000
+
+/** The most pages of the inbox one read follows. Sixteen pages hold every item a host retains. */
+export const MAX_INBOX_PAGES = 16
+
+/**
+ * The whole inbox, page by page, from the oldest item on.
+ *
+ * `read` asks for the page after one key, or the first page for null. Each page continues after
+ * the last item of the one before, until the host says there is no more or the bound is reached,
+ * and the answer's `more` then says whether the host holds more than was read. An item can go
+ * between two pages, and the host refuses a page that continues after an item it no longer holds:
+ * the inbox is then read again from its start, once.
+ */
+export async function readWholeInbox(
+  read: (after: string | null) => Promise<AttentionReadResult>
+): Promise<AttentionReadResult> {
+  try {
+    return await followPages(read)
+  } catch (failure: unknown) {
+    if (failureCode(failure) !== 'DRAFT_CONFLICT') throw failure
+    return await followPages(read)
+  }
+}
+
+async function followPages(
+  read: (after: string | null) => Promise<AttentionReadResult>
+): Promise<AttentionReadResult> {
+  let page = await read(null)
+  const items = [...page.items]
+  for (let pages = 1; page.more && pages < MAX_INBOX_PAGES; pages += 1) {
+    const last = page.items.at(-1)
+    if (last === undefined) break
+    page = await read(last.key)
+    items.push(...page.items)
+  }
+  return { ...page, items }
+}
 
 /** What an item is asking for, as the inbox tells them apart. */
 export type AttentionKind =
@@ -240,12 +279,15 @@ export function emptyMessage(chosen: AttentionFilter): string {
 }
 
 /**
- * What the inbox as a whole says beyond its items: what the host let go to stay inside its bound,
- * records it can no longer read, and quiet hours. Each is said rather than hidden, because a shorter
- * inbox that looked complete would be a claim nobody made.
+ * What the inbox as a whole says beyond its items: items it holds beyond what was read, what the
+ * host let go to stay inside its bound, records it can no longer read, and quiet hours. Each is said
+ * rather than hidden, because a shorter inbox that looked complete would be a claim nobody made.
  */
 export function inboxNotes(inbox: AttentionReadResult): readonly string[] {
   const notes: string[] = []
+  if (inbox.more) {
+    notes.push('The host holds more items than this list shows.')
+  }
   const dropped = Number(inbox.dropped)
   if (dropped > 0) {
     notes.push(

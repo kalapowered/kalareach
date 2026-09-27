@@ -27,16 +27,20 @@ import { flushSync } from 'react-dom'
 
 import { useApp, useSession } from '../../app/state'
 import { useSessionAgent } from '../../app/agent'
-import { targetOf } from '../../model/agent'
+import { useConnectionRights } from '../../app/rights'
+import { composerOffers, subjectOf, withheldTotal } from '../../model/agent'
 import type { ConversationItem } from '../../model/conversation'
 import { Badge, Banner, Button, Segmented } from '../../components/ui'
 import { failureCode, failureMessage } from '../../host/port'
 import {
+  againstCurrent,
   edit,
   notSubmittableBecause,
+  retarget,
   startDraft,
   submittable,
-  type Draft
+  type Draft,
+  type DraftTarget
 } from '../../model/drafts'
 import {
   answered,
@@ -182,15 +186,64 @@ export function MobileSession({
   // empty draft a different object on every render and the composer would lose what was typed.
   const [openedAtMs] = useState(() => Date.now())
   const held = lifecycle.state.drafts.find((each) => each.target.sessionId === sessionId)
+  // The conversation the session's agent is in now: what a draft is written for, and what it is
+  // checked against before it is sent.
+  const { instance: liveInstance, binding: liveBinding, capabilities } = session.agent
+  const currentTarget: DraftTarget | null = useMemo(
+    () =>
+      liveInstance === null || liveBinding === null
+        ? null
+        : {
+            sessionId,
+            applicationInstanceId: liveInstance,
+            agentBindingRevision: liveBinding.binding_revision
+          },
+    [sessionId, liveInstance, liveBinding]
+  )
+  // A draft keeps the conversation it was written for; one whose conversation moved on is
+  // conflicted, and the person chooses whether it goes to the new one.
   const draft = useMemo(
     () =>
-      held ??
-      startDraft(
-        `draft-${sessionId}`,
-        { sessionId, applicationInstanceId: null, agentBindingRevision: null },
-        openedAtMs
+      againstCurrent(
+        held ??
+          startDraft(
+            `draft-${sessionId}`,
+            { sessionId, applicationInstanceId: null, agentBindingRevision: null },
+            openedAtMs
+          ),
+        currentTarget
       ),
-    [held, sessionId, openedAtMs]
+    [held, sessionId, openedAtMs, currentTarget]
+  )
+  const rights = useConnectionRights()
+  // What the conversation does not show, said above what it does.
+  const historyNotes = useMemo(() => {
+    const notes: string[] = []
+    if (session.agent.unfinished.size > 0) {
+      notes.push(
+        'An agent that ran here earlier is no longer read. Anything it wrote after this device last read it is not shown.'
+      )
+    }
+    if (session.agent.gap) {
+      notes.push('Some of this agent’s earlier entries were no longer kept when this device read them.')
+    }
+    const withheld = withheldTotal(session.agent.withheld)
+    if (withheld > 0) {
+      notes.push(
+        `${withheld} ${withheld === 1 ? 'entry is' : 'entries are'} outside what this device may see.`
+      )
+    }
+    return notes
+  }, [session.agent.unfinished, session.agent.gap, session.agent.withheld])
+  const submitOffer = useMemo(
+    () =>
+      composerOffers({
+        known: session.agent.instances !== null,
+        binding: liveBinding,
+        capabilities,
+        rights: rights === null ? null : new Set(rights)
+      }).submit,
+    [session.agent.instances, liveBinding, capabilities, rights]
   )
 
   const setDraft = useCallback(
@@ -364,14 +417,16 @@ export function MobileSession({
       // Local feedback first, and it says queued rather than sent, because it has not left yet.
       lifecycle.setSubmissions((current) => [...current, submission])
       setBusy(true)
-      const { binding, instance } = session.agent
+      // What the person wrote goes to the conversation they wrote it for, at the binding revision
+      // they wrote it at: the host refuses it if that conversation has moved on since.
+      const { applicationInstanceId: instance, agentBindingRevision: revision } = draft.target
       ask(() => {
-        if (binding === null || instance === null) {
+        if (instance === null || revision === null) {
           // eslint-disable-next-line @typescript-eslint/only-throw-error -- refused as a command's failure is: data
           throw { code: 'UNSUPPORTED_CAPABILITY', message: 'No agent is running in this session.' }
         }
         return port.composerSubmit({
-          target: targetOf(sessionId, instance, binding),
+          target: { subject: subjectOf(sessionId, instance), binding_revision: revision },
           draft_id: null,
           text
         })
@@ -419,7 +474,7 @@ export function MobileSession({
           setBusy(false)
         })
     },
-    [draft, lifecycle, port, say, sessionId, session.agent]
+    [draft, lifecycle, port, say, sessionId]
   )
 
   // Focus that a terminal key, the program's keyboard or the mode button held when control or the
@@ -447,7 +502,7 @@ export function MobileSession({
   const blocked =
     waiting.length > 0
       ? `${waiting.length === 1 ? 'One action has' : `${waiting.length} actions have`} no confirmed outcome yet. Sending again could run it twice.`
-      : notSubmittableBecause(draft)
+      : (notSubmittableBecause(draft) ?? (submitOffer.offered ? null : submitOffer.reason))
   // The composer is its line, the field with Send beside it, while the terminal shows and on a
   // session too short for the whole composer under the conversation's floor.
   const asLine = pane === 'terminal' || short
@@ -528,7 +583,7 @@ export function MobileSession({
     <Button
       id={sendId}
       tone="primary"
-      disabled={!submittable(draft) || busy || waiting.length > 0}
+      disabled={!submittable(draft) || !submitOffer.offered || busy || waiting.length > 0}
       style={{ minBlockSize: target }}
       onClick={() => {
         send(draft.text)
@@ -592,6 +647,13 @@ export function MobileSession({
       <div className="m-pane" ref={paneRef} onScroll={remember}>
         {pane === 'semantic' ? (
           <div className="m-stream" data-testid="mobile-conversation">
+            {historyNotes.length > 0 ? (
+              <ul className="m-notes" data-testid="history-notes">
+                {historyNotes.map((note) => (
+                  <li key={note}>{note}</li>
+                ))}
+              </ul>
+            ) : null}
             {read !== null && read.refusal !== null ? (
               <Banner
                 tone="warning"
@@ -862,6 +924,17 @@ export function MobileSession({
           {pane === 'semantic' ? (
             <>
               {reason}
+              {draft.state === 'conflicted' && currentTarget !== null ? (
+                <Button
+                  data-testid="composer-retarget"
+                  style={{ minBlockSize: target }}
+                  onClick={() => {
+                    setDraft(retarget(draft, currentTarget, draft.attachmentId))
+                  }}
+                >
+                  Keep it for the new conversation
+                </Button>
+              ) : null}
               <AttachmentPicker
                 surface={surface}
                 onPicked={(files) => {

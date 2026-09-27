@@ -24,6 +24,7 @@ import {
 } from '../src/model/conversation'
 import { FrameBatcher } from '../src/model/frame'
 import {
+  againstCurrent,
   connectionLost,
   edit,
   notSubmittableBecause,
@@ -304,11 +305,51 @@ describe('drafts', () => {
       'att-2'
     )
     expect(submittable(conflicted)).toBe(false)
-    expect(notSubmittableBecause(conflicted)).toMatch(/Choose where this draft should go/)
+    expect(notSubmittableBecause(conflicted)).toMatch(/Choose whether it goes to the new one/)
 
     const retargeted = retarget(conflicted, { ...target, agentBindingRevision: '9' }, 'att-2')
     expect(retargeted.state).toBe('bound')
     expect(submittable(retargeted)).toBe(true)
+  })
+
+  it('keeps what was written to the conversation it was written for', () => {
+    const now = { ...target, agentBindingRevision: '4' }
+    // An empty draft goes with whatever conversation is current.
+    const empty = againstCurrent(startDraft('d1', { ...target, applicationInstanceId: null }, 0), now)
+    expect(empty.target).toEqual(now)
+    expect(empty.state).toBe('bound')
+    // Written, it keeps that conversation; the same conversation leaves it as it was.
+    const written = edit(empty, 'text', 1)
+    expect(againstCurrent(written, now)).toBe(written)
+    // A conversation that moved conflicts it, and nothing sends it on.
+    const moved = againstCurrent(written, { ...now, agentBindingRevision: '5' })
+    expect(moved.state).toBe('conflicted')
+    expect(moved.target).toEqual(now)
+    expect(submittable(moved)).toBe(false)
+    // Written before any conversation was known, it takes the first one.
+    const early = edit(startDraft('d2', { ...target, applicationInstanceId: null }, 0), 'early', 1)
+    expect(againstCurrent(early, now).target).toEqual(now)
+    // With no agent known, nothing changes.
+    expect(againstCurrent(written, null)).toBe(written)
+  })
+
+  it('sends no prompt that would leave a file on the draft behind', () => {
+    const file = {
+      transferId: 't-1',
+      name: 'diagram.png',
+      byteLen: 10,
+      mediaType: 'image/png',
+      presentedAsImage: true,
+      acceptedUpstream: false
+    }
+    const withFile = { ...edit(startDraft('d1', target, 0), 'look at this', 1), attachments: [file] }
+    expect(submittable(withFile)).toBe(false)
+    expect(notSubmittableBecause(withFile)).toMatch(/Remove them to send the text on its own/)
+    expect(submittable({ ...withFile, attachments: [] })).toBe(true)
+    // One the agent took into its own composer does not hold the prompt back.
+    expect(submittable({ ...withFile, attachments: [{ ...file, acceptedUpstream: true }] })).toBe(
+      true
+    )
   })
 
   it('retains the draft on every refused insertion and offers the terminal workflow', () => {

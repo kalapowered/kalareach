@@ -25,6 +25,7 @@ import {
   filter as filtered,
   inboxNotes,
   order,
+  readWholeInbox,
   type AttentionFilter,
   type AttentionRow
 } from '../model/attention'
@@ -71,12 +72,14 @@ export function Attention(): ReactNode {
     const current = reads.current?.read() ?? null
     if (current === null) return Promise.resolve()
     const inboxRead = ask(() =>
-      port.attentionRead({
-        session_id: null,
-        include_acknowledged: false,
-        max_items: PAGE_ITEMS,
-        after: null
-      })
+      readWholeInbox((after) =>
+        port.attentionRead({
+          session_id: null,
+          include_acknowledged: false,
+          max_items: PAGE_ITEMS,
+          after
+        })
+      )
     )
       .then((result) => {
         if (!current()) return

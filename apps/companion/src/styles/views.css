@@ -290,10 +290,14 @@
   overscroll-behavior: contain;
 }
 
+/* What the conversation says it does not show, above what it does: one line each, centred. */
 .history-edge {
   display: flex;
-  justify-content: center;
-  padding: 10px 0 14px;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding: 10px 22px 14px;
+  text-align: center;
 }
 
 .message {

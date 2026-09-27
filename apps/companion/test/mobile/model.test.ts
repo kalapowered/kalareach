@@ -19,7 +19,9 @@ import {
   emptyMessage,
   filter,
   inboxNotes,
-  order
+  MAX_INBOX_PAGES,
+  order,
+  readWholeInbox
 } from '../../src/model/attention'
 import {
   ACCESSORY_KEYS,
@@ -98,6 +100,57 @@ const INBOX = inbox([
   item({ rule: 'attention.command_failed', source: 'host_events', last_seen_ms: String(NOW - 500) }),
   item({ rule: 'attention.pending_approval', level: 'urgent', last_seen_ms: String(NOW - 2000) })
 ])
+
+describe('reading the whole inbox (KR-REQ-13.09)', () => {
+  /** An inbox of `total` items, served `size` at a time, oldest first, as the host pages it. */
+  function paged(total: number, size: number) {
+    const all = Array.from({ length: total }, (_, index) =>
+      item({ rule: 'attention.application_notice', key: `k-${String(index).padStart(4, '0')}` })
+    )
+    const asked: (string | null)[] = []
+    const read = (after: string | null): Promise<AttentionReadResult> => {
+      asked.push(after)
+      const start = after === null ? 0 : all.findIndex((each) => each.key === after) + 1
+      return Promise.resolve(
+        inbox(all.slice(start, start + size), { more: start + size < total })
+      )
+    }
+    return { read, asked }
+  }
+
+  it('follows the pages until the host has no more', async () => {
+    const { read, asked } = paged(450, 200)
+    const whole = await readWholeInbox(read)
+    expect(whole.items).toHaveLength(450)
+    expect(whole.more).toBe(false)
+    expect(asked).toEqual([null, 'k-0199', 'k-0399'])
+  })
+
+  it('stops at its bound and says the host holds more', async () => {
+    const { read, asked } = paged(MAX_INBOX_PAGES * 10 + 5, 10)
+    const whole = await readWholeInbox(read)
+    expect(asked).toHaveLength(MAX_INBOX_PAGES)
+    expect(whole.more).toBe(true)
+    expect(inboxNotes(whole)).toContain('The host holds more items than this list shows.')
+  })
+
+  it('reads again from the start, once, when an item it continued after has gone', async () => {
+    let reads = 0
+    const whole = await readWholeInbox((after) => {
+      reads += 1
+      if (after !== null && reads === 2) {
+        return Promise.reject({ code: 'DRAFT_CONFLICT', message: 'gone', user_action: 'retry' })
+      }
+      return Promise.resolve(
+        inbox([item({ rule: 'attention.review_ready', key: after === null ? 'a' : 'b' })], {
+          more: after === null
+        })
+      )
+    })
+    expect(reads).toBe(4)
+    expect(whole.items.map((each) => each.key)).toEqual(['a', 'b'])
+  })
+})
 
 describe('the attention inbox (KR-REQ-13.01, 13.02)', () => {
   it('tells the four kinds apart and puts what is waiting for a person first', () => {

@@ -1,8 +1,10 @@
 /**
  * Sharing a session with a paired device: an invitation, and the grants already issued.
  *
- * Section 25 sets the rules this screen keeps. A viewer sees the live screen and what follows, and a
- * reviewer also sees diffs and files. Only a controller or an owner answers the agent's questions
+ * Section 25 sets the rules this screen keeps. A viewer sees what the session shows from when the
+ * invitation is accepted, and a reviewer also sees diffs and files. What is on the screen when it is
+ * issued is not shared: that needs a preview this host cannot give, so the invitation leaves it out
+ * and says so. Only a controller or an owner answers the agent's questions
  * by default; a viewer or reviewer can be given that too, through an option that explains what it
  * means first, because any answer, free text included, is input the agent may act on under its own
  * permissions. What an invitation would carry is shown before it exists, in the protocol's own
@@ -34,7 +36,7 @@ import { answeredState, outcomeMessage, outcomeTone } from '../model/receipts'
 
 /** What each action lets a recipient do, in words. */
 const ACTION_WORDS: Partial<Readonly<Record<ActionRight, string>>> = {
-  'session.view': 'See the live screen and what follows it',
+  'session.view': 'See what the session shows and does from when they accept',
   'files.read': 'Read the diffs and files it is shown',
   'question.respond': 'Answer the agent’s questions',
   'terminal.input': 'Type into the terminal',
@@ -217,7 +219,10 @@ export function Sharing({
       <div className="settings-row">
         <div>
           <h3>What they can do</h3>
-          <p>A viewer sees the live screen. A reviewer also sees diffs and files.</p>
+          <p>
+            A viewer sees what the session shows from when they accept. A reviewer also sees
+            diffs and files.
+          </p>
         </div>
         <Segmented
           label="Role"
@@ -255,6 +260,9 @@ export function Sharing({
                 <li key={action}>{ACTION_WORDS[action] ?? action}</li>
               ))}
             </ul>
+            <p className="small muted invitation-notice" data-testid="no-current-screen">
+              It does not include what is on the screen now, or anything before it.
+            </p>
             {(shown?.notices ?? []).map((each) => (
               <p
                 className="small warning-text invitation-notice"
