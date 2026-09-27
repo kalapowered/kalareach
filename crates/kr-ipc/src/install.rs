@@ -1,0 +1,1298 @@
+//! Where this host's installed releases are, which release a process runs, and the hold that keeps
+//! a release on disk for as long as a process runs it.
+//!
+//! # The store
+//!
+//! A host installed with `kr host install` keeps every release it runs under one per-user
+//! directory, the store, and never changes a release in place:
+//!
+//! | Path | What it is |
+//! | --- | --- |
+//! | `versions/<release>/` | One release: `bin/`, `shells/`, `share/` and `release.json`, read-only once it is there |
+//! | `current` | A relative symbolic link to the release new processes start from |
+//! | `staging/` | A release being unpacked and checked, before it is renamed into `versions/` |
+//! | `trash/` | A release being removed, renamed out of `versions/` before anything of it goes |
+//! | `roots/` | The runtime and state roots the control daemons of this store have served |
+//! | `install.json` | The store's own record, which makes the directory a store |
+//! | `update.lock`, `install.lock` | The locks an update and a starting control daemon take |
+//!
+//! An update puts the new release beside the old ones and renames a new `current` link over the
+//! old one, and nothing else changes: whatever must follow an update names its path through
+//! `current` ([`Running::stable`]), and whatever starts another process of its own release names
+//! its release's own directory ([`Running::own`]).
+//!
+//! # Which release a process runs
+//!
+//! The kernel's record of the process's own image says, never the path the process was started
+//! through: `proc_pidpath` on macOS, and `/proc/self/exe` on Linux and `GetModuleFileNameW` on
+//! Windows, which is what the standard library reads on those two ([`image_path`]). On macOS the
+//! standard library returns the path as started, so a `kr` started as `current/bin/kr` moments
+//! before an update would resolve `current` afterwards and find the other release's files beside a
+//! program of this one. Nothing else in the host's own crates asks where its program is.
+//!
+//! # The hold
+//!
+//! Each host executable of a store takes a shared lock on its release's `release.json` when it
+//! starts ([`this_process`]) and keeps it until it exits; the kernel lets go of it however the
+//! process ends. A release is removed only by whoever takes an exclusive lock on that same file
+//! ([`Store::retire`]), which no running process of the release lets happen, and it is renamed out
+//! of `versions/` while that lock is held, before anything is deleted. A process that opened the
+//! manifest just as its release was being removed still gets its shared lock once the remover lets
+//! go, so after locking it checks that `versions/<release>/release.json` is still the very file it
+//! locked, and refuses to run when it is not.
+//!
+//! A process that starts another from its own release holds the release for it until the other
+//! has a hold of its own: the control daemon's hold covers the workers it launches, and an update
+//! waits for the daemon's launches to settle before the daemon stops.
+//!
+//! Windows keeps no store here: a directory link there cannot be replaced in one step by a user
+//! who does not administer the machine, so every Windows process runs as a build outside a store.
+
+use std::ffi::OsStr;
+use std::fs::File;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
+use kr_protocol::update::{MANIFEST_FILE, ReleaseManifest, ReleaseName};
+
+/// The store's record, whose presence is what makes a directory a store.
+pub const STORE_RECORD: &str = "install.json";
+
+/// The link to the current release.
+pub const CURRENT: &str = "current";
+
+/// The directory each release is in.
+pub const VERSIONS: &str = "versions";
+
+/// A host executable, by the name it has in every release's `bin/`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Program {
+    /// The command line.
+    Kr,
+    /// The command line's terminal restoration guard.
+    AttachGuard,
+    /// The control daemon.
+    Controller,
+    /// The session worker.
+    Worker,
+    /// The forwarder a native bridge and a launched agent run.
+    Hook,
+}
+
+impl Program {
+    /// Every host executable a release carries.
+    pub const ALL: [Self; 5] = [
+        Self::Kr,
+        Self::AttachGuard,
+        Self::Controller,
+        Self::Worker,
+        Self::Hook,
+    ];
+
+    /// The program's name.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Kr => "kr",
+            Self::AttachGuard => "kr-attach-guard",
+            Self::Controller => "kr-controller",
+            Self::Worker => "kr-worker",
+            Self::Hook => "kr-hook",
+        }
+    }
+
+    /// The program's file name on this platform.
+    #[must_use]
+    pub fn file_name(self) -> String {
+        format!("{}{}", self.name(), std::env::consts::EXE_SUFFIX)
+    }
+}
+
+/// Why a store could not be read or changed, or why a program of it may not run.
+#[derive(Debug, thiserror::Error)]
+pub enum InstallError {
+    /// This process's own image could not be read from the operating system.
+    #[error("where this program is could not be read from the operating system: {0}")]
+    Image(#[source] std::io::Error),
+    /// The release this process is in is not the one it started from, or is being removed.
+    #[error("{path} {reason}")]
+    Replaced {
+        /// The release's directory, or its manifest.
+        path: PathBuf,
+        /// What happened to it.
+        reason: &'static str,
+    },
+    /// A release's manifest is not one this build reads.
+    #[error("{path} is not a release manifest this build reads: {source}")]
+    Manifest {
+        /// The manifest.
+        path: PathBuf,
+        /// What is wrong with it.
+        #[source]
+        source: kr_protocol::update::ManifestError,
+    },
+    /// A file or directory of the store could not be read or changed.
+    #[error("{operation} {path}: {source}")]
+    Io {
+        /// What was being done.
+        operation: &'static str,
+        /// The path involved.
+        path: PathBuf,
+        /// What the operating system said.
+        #[source]
+        source: std::io::Error,
+    },
+    /// This platform keeps no store.
+    #[error("this host keeps no store of releases on this platform")]
+    Unsupported,
+}
+
+impl InstallError {
+    fn io(operation: &'static str, path: impl Into<PathBuf>, source: std::io::Error) -> Self {
+        Self::Io {
+            operation,
+            path: path.into(),
+            source,
+        }
+    }
+}
+
+/// The result of an operation on a store.
+pub type Result<T> = std::result::Result<T, InstallError>;
+
+/// Reads this process's own image from the kernel.
+///
+/// # Errors
+///
+/// Returns the operating system's error when it does not say.
+pub fn image_path() -> std::io::Result<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        let pid = i32::try_from(std::process::id())
+            .map_err(|_| std::io::Error::other("this process's number is out of range"))?;
+        libproc::proc_pid::pidpath(pid)
+            .map(PathBuf::from)
+            .map_err(std::io::Error::other)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // `/proc/self/exe` on Linux and `GetModuleFileNameW` on Windows: the kernel's own record of
+        // the image, which is what this module is for.
+        std::env::current_exe()
+    }
+}
+
+/// What this process runs, read once, with its hold taken when it is a release of a store.
+///
+/// Each host executable calls this first thing, before it does anything a release could matter to,
+/// and refuses to run on an error: a program whose release is being removed must not start work
+/// the removal would take away from under it. Every later call answers the same.
+///
+/// # Errors
+///
+/// Returns the error the first call met: an image the kernel would not describe, a release that
+/// was replaced or is being removed, or a manifest this build does not read.
+pub fn this_process() -> std::result::Result<&'static Running, &'static InstallError> {
+    static RUNNING: OnceLock<Result<Running>> = OnceLock::new();
+    RUNNING
+        .get_or_init(|| {
+            let image = image_path().map_err(InstallError::Image)?;
+            Running::of_image(&image)
+        })
+        .as_ref()
+}
+
+/// What a process runs.
+#[derive(Debug)]
+pub enum Running {
+    /// A release of a store, held for as long as this value lives.
+    Installed(Box<Installed>),
+    /// A build outside any store, whose programs are the ones beside its own.
+    Loose {
+        /// The directory the process's image is in.
+        directory: PathBuf,
+    },
+}
+
+/// A release of a store, and the hold on it.
+#[derive(Debug)]
+pub struct Installed {
+    store: Store,
+    release: ReleaseName,
+    manifest: ReleaseManifest,
+    /// The manifest, opened and locked shared. Nothing reads it again: holding it is the point.
+    _hold: File,
+}
+
+impl Running {
+    /// Works out what a process whose image is `image` runs, and takes the hold when that is a
+    /// release of a store.
+    ///
+    /// A program under `versions/<release>/bin/` of a directory that holds a store record is that
+    /// release's, and is held. A program under `trash/` or `staging/` of a store is refused: its
+    /// release is being removed, or is not yet installed. Anything else is a build outside a store.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InstallError::Replaced`] for a release being removed or replaced, and
+    /// [`InstallError::Manifest`] for a manifest this build does not read.
+    pub fn of_image(image: &Path) -> Result<Self> {
+        let directory = image.parent().map(Path::to_path_buf).unwrap_or_default();
+        let Some(placed) = Placed::of(image) else {
+            return Ok(Self::Loose { directory });
+        };
+        match placed.place {
+            Place::Versions => {
+                let release = placed
+                    .release_directory_name
+                    .to_str()
+                    .and_then(|name| ReleaseName::new(name).ok())
+                    .ok_or_else(|| InstallError::Replaced {
+                        path: placed.release_directory.clone(),
+                        reason: "is not named as a release is",
+                    })?;
+                let (hold, manifest) = hold(&placed.store, &release)?;
+                Ok(Self::Installed(Box::new(Installed {
+                    store: placed.store,
+                    release,
+                    manifest,
+                    _hold: hold,
+                })))
+            }
+            Place::Trash => Err(InstallError::Replaced {
+                path: placed.release_directory,
+                reason: "is being removed from this host, so this program of it does not start",
+            }),
+            Place::Staging => Err(InstallError::Replaced {
+                path: placed.release_directory,
+                reason: "is still being installed, so this program of it does not start",
+            }),
+        }
+    }
+
+    /// The release, where this is one of a store.
+    #[must_use]
+    pub const fn release(&self) -> Option<&ReleaseName> {
+        match self {
+            Self::Installed(installed) => Some(&installed.release),
+            Self::Loose { .. } => None,
+        }
+    }
+
+    /// The release's manifest, where this is one of a store.
+    #[must_use]
+    pub const fn manifest(&self) -> Option<&ReleaseManifest> {
+        match self {
+            Self::Installed(installed) => Some(&installed.manifest),
+            Self::Loose { .. } => None,
+        }
+    }
+
+    /// The store, where this is one of a store.
+    #[must_use]
+    pub const fn store(&self) -> Option<&Store> {
+        match self {
+            Self::Installed(installed) => Some(&installed.store),
+            Self::Loose { .. } => None,
+        }
+    }
+
+    /// This release's own copy of a program: what a process starts when the program has to be of
+    /// the same release as itself, such as the worker a control daemon launches.
+    #[must_use]
+    pub fn own(&self, program: Program) -> PathBuf {
+        match self {
+            Self::Installed(installed) => installed
+                .store
+                .release_directory(&installed.release)
+                .join("bin")
+                .join(program.file_name()),
+            Self::Loose { directory } => directory.join(program.file_name()),
+        }
+    }
+
+    /// The program an update replaces: the path through `current` that whatever this host
+    /// records for later names, such as the service definition that starts the control daemon.
+    ///
+    /// Outside a store it is the program beside this one, as before.
+    #[must_use]
+    pub fn stable(&self, program: Program) -> PathBuf {
+        match self {
+            Self::Installed(installed) => installed.store.stable(program),
+            Self::Loose { directory } => directory.join(program.file_name()),
+        }
+    }
+
+    /// This release's qualified shell packages, where this is a release of a store.
+    ///
+    /// A build outside a store finds its packages where it always has.
+    #[must_use]
+    pub fn shells(&self) -> Option<PathBuf> {
+        match self {
+            Self::Installed(installed) => Some(
+                installed
+                    .store
+                    .release_directory(&installed.release)
+                    .join("shells"),
+            ),
+            Self::Loose { .. } => None,
+        }
+    }
+
+    /// The release a process of this build states in its build identifier: the release's name in
+    /// a store, and `outside` beyond one.
+    #[must_use]
+    pub fn stated_release<'a>(&'a self, outside: &'a str) -> &'a str {
+        self.release().map_or(outside, ReleaseName::as_str)
+    }
+}
+
+/// Where in a store an image is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Place {
+    /// An installed release.
+    Versions,
+    /// A release being removed.
+    Trash,
+    /// A release being installed.
+    Staging,
+}
+
+/// An image that is inside a store.
+struct Placed {
+    store: Store,
+    place: Place,
+    release_directory: PathBuf,
+    release_directory_name: std::ffi::OsString,
+}
+
+impl Placed {
+    /// Where `image` is in a store, when it is `<store>/<place>/<release>/bin/<program>` and
+    /// `<store>` holds a store record.
+    fn of(image: &Path) -> Option<Self> {
+        if cfg!(windows) {
+            return None;
+        }
+        let bin = image.parent()?;
+        if bin.file_name()? != OsStr::new("bin") {
+            return None;
+        }
+        let release_directory = bin.parent()?;
+        let holder = release_directory.parent()?;
+        let place = match holder.file_name()?.to_str()? {
+            VERSIONS => Place::Versions,
+            "trash" => Place::Trash,
+            "staging" => Place::Staging,
+            _ => return None,
+        };
+        let store = Store::at(holder.parent()?);
+        if !store.is_store() {
+            return None;
+        }
+        Some(Self {
+            store,
+            place,
+            release_directory: release_directory.to_path_buf(),
+            release_directory_name: release_directory.file_name()?.to_os_string(),
+        })
+    }
+}
+
+/// Opens a release's manifest, takes the shared hold on it, and checks that the file locked is
+/// still the release's manifest.
+#[cfg(unix)]
+fn hold(store: &Store, release: &ReleaseName) -> Result<(File, ReleaseManifest)> {
+    let path = store.manifest(release);
+    let file = File::open(&path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            InstallError::Replaced {
+                path: path.clone(),
+                reason: "is gone: this release was removed from this host after this program \
+                         started",
+            }
+        } else {
+            InstallError::io("open", &path, error)
+        }
+    })?;
+    hold_opened(file, path, release)
+}
+
+/// Takes the shared hold on a manifest already opened at `path`, checks that `path` still names
+/// the file locked, and reads the manifest.
+///
+/// Separate from the open, because what happens between the two is what the check is for: a
+/// release removed after its manifest was opened leaves the open file behind, and the lock on it
+/// is granted as soon as the removal lets go.
+#[cfg(unix)]
+fn hold_opened(
+    file: File,
+    path: PathBuf,
+    release: &ReleaseName,
+) -> Result<(File, ReleaseManifest)> {
+    use std::io::Read as _;
+    use std::os::unix::fs::MetadataExt as _;
+
+    lock(&file, &path, rustix::fs::FlockOperation::LockShared)?;
+    let held = file
+        .metadata()
+        .map_err(|error| InstallError::io("read", &path, error))?;
+    let named = std::fs::symlink_metadata(&path).ok();
+    if named.is_none_or(|named| named.dev() != held.dev() || named.ino() != held.ino()) {
+        return Err(InstallError::Replaced {
+            path,
+            reason: "is no longer the file this program locked: its release was removed or \
+                     replaced while it started",
+        });
+    }
+    let mut bytes = Vec::new();
+    let limit = kr_protocol::update::MAX_MANIFEST_LEN;
+    (&file)
+        .take(limit + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| InstallError::io("read", &path, error))?;
+    if bytes.len() as u64 > limit {
+        return Err(InstallError::Manifest {
+            path,
+            source: kr_protocol::update::ManifestError::Malformed(
+                "it is larger than any release's manifest".to_owned(),
+            ),
+        });
+    }
+    let manifest =
+        ReleaseManifest::read_document(&bytes).map_err(|source| InstallError::Manifest {
+            path: path.clone(),
+            source,
+        })?;
+    if manifest.release != *release {
+        return Err(InstallError::Replaced {
+            path,
+            reason: "names another release than the directory it is in",
+        });
+    }
+    Ok((file, manifest))
+}
+
+#[cfg(not(unix))]
+fn hold(_store: &Store, _release: &ReleaseName) -> Result<(File, ReleaseManifest)> {
+    Err(InstallError::Unsupported)
+}
+
+/// Takes a lock on an open file, waiting for it, and again if a signal interrupts the wait.
+#[cfg(unix)]
+fn lock(file: &File, path: &Path, operation: rustix::fs::FlockOperation) -> Result<()> {
+    loop {
+        match rustix::fs::flock(file, operation) {
+            Ok(()) => return Ok(()),
+            Err(rustix::io::Errno::INTR) => {}
+            Err(error) => {
+                return Err(InstallError::io("lock", path, std::io::Error::from(error)));
+            }
+        }
+    }
+}
+
+/// A host's store of installed releases.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Store {
+    root: PathBuf,
+}
+
+impl Store {
+    /// The store at `root`, whether or not there is one there yet.
+    pub fn at(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+
+    /// Where this user's store is on this platform, where the platform says where a user's own
+    /// data goes: `~/Library/Application Support/KalaReach/host` on macOS,
+    /// `$XDG_DATA_HOME/kalareach/host` on Linux (`~/.local/share` when that is unset) and
+    /// `%LOCALAPPDATA%\KalaReach\host` on Windows.
+    #[must_use]
+    pub fn default_root() -> Option<PathBuf> {
+        let nonempty = |name: &str| std::env::var_os(name).filter(|value| !value.is_empty());
+        if cfg!(windows) {
+            return nonempty("LOCALAPPDATA")
+                .map(|base| PathBuf::from(base).join("KalaReach").join("host"));
+        }
+        let home = nonempty("HOME").map(PathBuf::from);
+        if cfg!(target_os = "macos") {
+            return home.map(|home| {
+                home.join("Library")
+                    .join("Application Support")
+                    .join("KalaReach")
+                    .join("host")
+            });
+        }
+        nonempty("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .or_else(|| home.map(|home| home.join(".local").join("share")))
+            .map(|data| data.join("kalareach").join("host"))
+    }
+
+    /// The store's directory.
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Whether the directory is a store: whether it holds a store record.
+    #[must_use]
+    pub fn is_store(&self) -> bool {
+        self.record().is_file()
+    }
+
+    /// The store's record.
+    #[must_use]
+    pub fn record(&self) -> PathBuf {
+        self.root.join(STORE_RECORD)
+    }
+
+    /// The directory the releases are in.
+    #[must_use]
+    pub fn versions(&self) -> PathBuf {
+        self.root.join(VERSIONS)
+    }
+
+    /// One release's directory.
+    #[must_use]
+    pub fn release_directory(&self, release: &ReleaseName) -> PathBuf {
+        self.versions().join(release.as_str())
+    }
+
+    /// One release's manifest.
+    #[must_use]
+    pub fn manifest(&self, release: &ReleaseName) -> PathBuf {
+        self.release_directory(release).join(MANIFEST_FILE)
+    }
+
+    /// The link to the current release.
+    #[must_use]
+    pub fn current_link(&self) -> PathBuf {
+        self.root.join(CURRENT)
+    }
+
+    /// Where releases are unpacked and checked.
+    #[must_use]
+    pub fn staging(&self) -> PathBuf {
+        self.root.join("staging")
+    }
+
+    /// Where a release goes to be removed.
+    #[must_use]
+    pub fn trash(&self) -> PathBuf {
+        self.root.join("trash")
+    }
+
+    /// Where the roots this store's daemons served are recorded.
+    #[must_use]
+    pub fn roots(&self) -> PathBuf {
+        self.root.join("roots")
+    }
+
+    /// The program an update replaces, through `current`.
+    #[must_use]
+    pub fn stable(&self, program: Program) -> PathBuf {
+        self.current_link().join("bin").join(program.file_name())
+    }
+
+    /// The current release's qualified shell packages, through `current`.
+    #[must_use]
+    pub fn stable_shells(&self) -> PathBuf {
+        self.current_link().join("shells")
+    }
+
+    /// Creates the store's directories, owner-only, where they are missing. The store record is
+    /// the caller's to write: until it exists nothing treats the directory as a store.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InstallError::Io`] when a directory cannot be created, or is not owner-only.
+    pub fn create_directories(&self) -> Result<()> {
+        for directory in [
+            self.root.clone(),
+            self.versions(),
+            self.staging(),
+            self.trash(),
+            self.roots(),
+        ] {
+            crate::paths::create_private_tree(&self.root, &directory).map_err(|error| {
+                InstallError::io(
+                    "create the store directory",
+                    &directory,
+                    std::io::Error::other(error),
+                )
+            })?;
+        }
+        Ok(())
+    }
+
+    /// The release `current` names, where it names one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InstallError::Io`] when the link cannot be read, and [`InstallError::Replaced`]
+    /// when it names something other than a release of this store.
+    pub fn current(&self) -> Result<Option<ReleaseName>> {
+        let link = self.current_link();
+        let target = match std::fs::read_link(&link) {
+            Ok(target) => target,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(InstallError::io("read the link", &link, error)),
+        };
+        let mut parts = target.components();
+        let release = match (parts.next(), parts.next(), parts.next()) {
+            (
+                Some(std::path::Component::Normal(versions)),
+                Some(std::path::Component::Normal(name)),
+                None,
+            ) if versions == OsStr::new(VERSIONS) => {
+                name.to_str().and_then(|name| ReleaseName::new(name).ok())
+            }
+            _ => None,
+        };
+        release.map(Some).ok_or(InstallError::Replaced {
+            path: link,
+            reason: "names something other than a release of this store",
+        })
+    }
+
+    /// Every release in `versions/`, by name, in name order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InstallError::Io`] when the directory cannot be read.
+    pub fn releases(&self) -> Result<Vec<ReleaseName>> {
+        let versions = self.versions();
+        let entries = match std::fs::read_dir(&versions) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(InstallError::io("read", &versions, error)),
+        };
+        let mut releases = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|error| InstallError::io("read", &versions, error))?;
+            if let Some(release) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| ReleaseName::new(name).ok())
+            {
+                releases.push(release);
+            }
+        }
+        releases.sort();
+        Ok(releases)
+    }
+}
+
+#[cfg(unix)]
+impl Store {
+    /// Takes the update lock, which one update holds from its first look at the host to its last
+    /// start, when no other update holds it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InstallError::Io`] when the lock file cannot be opened or locked for any reason
+    /// but another holder.
+    pub fn try_lock_update(&self) -> Result<Option<StoreLock>> {
+        StoreLock::try_take(
+            &self.root.join("update.lock"),
+            rustix::fs::FlockOperation::NonBlockingLockExclusive,
+        )
+    }
+
+    /// Takes the install lock exclusively, waiting for it: nothing starts a control daemon of this
+    /// store while it is held, which is what an update switches `current` under.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InstallError::Io`] when the lock file cannot be opened or locked.
+    pub fn lock_install(&self) -> Result<StoreLock> {
+        StoreLock::take(
+            &self.root.join("install.lock"),
+            rustix::fs::FlockOperation::LockExclusive,
+        )
+    }
+
+    /// Takes the install lock shared, waiting for it: a control daemon holds it while it starts,
+    /// so `current` cannot change between its look at it and its taking the environment.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InstallError::Io`] when the lock file cannot be opened or locked.
+    pub fn lock_start(&self) -> Result<StoreLock> {
+        StoreLock::take(
+            &self.root.join("install.lock"),
+            rustix::fs::FlockOperation::LockShared,
+        )
+    }
+
+    /// Makes `release` current: one new link, renamed over `current`, and the store's directory
+    /// flushed so the rename survives a crash. Nothing else changes.
+    ///
+    /// `held` is the install lock, taken exclusively: nothing starts a control daemon of this
+    /// store while `current` changes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InstallError::Io`] when the link cannot be made, renamed or flushed, and
+    /// [`InstallError::Replaced`] when the release is not in this store.
+    pub fn switch(&self, release: &ReleaseName, held: &StoreLock) -> Result<()> {
+        debug_assert_eq!(held.path, self.root.join("install.lock"));
+        if !self.manifest(release).is_file() {
+            return Err(InstallError::Replaced {
+                path: self.release_directory(release),
+                reason: "is not a release of this store",
+            });
+        }
+        let temporary = self.root.join(format!(".{CURRENT}-{}", crate::new_uuid()));
+        std::os::unix::fs::symlink(Path::new(VERSIONS).join(release.as_str()), &temporary)
+            .map_err(|error| InstallError::io("make the link", &temporary, error))?;
+        if let Err(error) = std::fs::rename(&temporary, self.current_link()) {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(InstallError::io("rename", self.current_link(), error));
+        }
+        sync_directory(&self.root)
+    }
+
+    /// Whether a running process holds `release`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InstallError::Io`] when its manifest cannot be opened or locked for any reason
+    /// but a holder.
+    pub fn held(&self, release: &ReleaseName) -> Result<bool> {
+        let path = self.manifest(release);
+        let file = File::open(&path).map_err(|error| InstallError::io("open", &path, error))?;
+        match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => Ok(false),
+            Err(rustix::io::Errno::WOULDBLOCK) => Ok(true),
+            Err(error) => Err(InstallError::io("lock", &path, std::io::Error::from(error))),
+        }
+    }
+
+    /// Removes a release no running process holds, and says whether it did.
+    ///
+    /// The release's manifest is locked exclusively, which fails while any process holds the
+    /// release, and the release is renamed into `trash/` while that lock is held: from then on no
+    /// process can take a hold on it, because a hold checks that `versions/<release>/release.json`
+    /// is the file it locked. Only then is anything deleted.
+    ///
+    /// `_held` is the update lock: releases are removed by one update at a time.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InstallError::Io`] when the release cannot be locked, moved or deleted.
+    pub fn retire(&self, release: &ReleaseName, _held: &StoreLock) -> Result<bool> {
+        let path = self.manifest(release);
+        let file = File::open(&path).map_err(|error| InstallError::io("open", &path, error))?;
+        match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => {}
+            Err(rustix::io::Errno::WOULDBLOCK) => return Ok(false),
+            Err(error) => {
+                return Err(InstallError::io("lock", &path, std::io::Error::from(error)));
+            }
+        }
+        crate::paths::create_private_directory(&self.trash()).map_err(|error| {
+            InstallError::io(
+                "create the store directory",
+                self.trash(),
+                std::io::Error::other(error),
+            )
+        })?;
+        let removed = self
+            .trash()
+            .join(format!("{release}-{}", crate::new_uuid()));
+        let directory = self.release_directory(release);
+        std::fs::rename(&directory, &removed)
+            .map_err(|error| InstallError::io("move", &directory, error))?;
+        sync_directory(&self.versions())?;
+        drop(file);
+        remove_tree(&removed)?;
+        Ok(true)
+    }
+
+    /// Records the runtime and state roots a control daemon of this store serves, so an update
+    /// finds every environment this store's daemons have run.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InstallError::Io`] when the record cannot be written.
+    pub fn record_roots(&self, runtime_root: &Path, state_root: &Path) -> Result<()> {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let roots = self.roots();
+        crate::paths::create_private_directory(&roots).map_err(|error| {
+            InstallError::io(
+                "create the store directory",
+                &roots,
+                std::io::Error::other(error),
+            )
+        })?;
+        let state = state_root.as_os_str().as_bytes();
+        let runtime = runtime_root.as_os_str().as_bytes();
+        let digest = kr_cbor::sha256(state);
+        let name: String = digest[..16]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let mut contents = Vec::with_capacity(runtime.len() + state.len() + 1);
+        contents.extend_from_slice(runtime);
+        contents.push(0);
+        contents.extend_from_slice(state);
+        let path = roots.join(format!("{name}.root"));
+        crate::paths::write_owner_only_file(&path, &contents)
+            .map_err(|error| InstallError::io("write", &path, std::io::Error::other(error)))
+    }
+
+    /// Every pair of roots a control daemon of this store has served, in record order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InstallError::Io`] when the records cannot be read.
+    pub fn recorded_roots(&self) -> Result<Vec<RecordedRoots>> {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let roots = self.roots();
+        let entries = match std::fs::read_dir(&roots) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(InstallError::io("read", &roots, error)),
+        };
+        let mut recorded = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|error| InstallError::io("read", &roots, error))?;
+            let path = entry.path();
+            if path.extension() != Some(OsStr::new("root")) {
+                continue;
+            }
+            let Some(contents) = crate::paths::read_owner_only_file(&path, 64 * 1024)
+                .map_err(|error| InstallError::io("read", &path, std::io::Error::other(error)))?
+            else {
+                continue;
+            };
+            let Some(split) = contents.iter().position(|byte| *byte == 0) else {
+                continue;
+            };
+            recorded.push(RecordedRoots {
+                runtime_root: PathBuf::from(OsStr::from_bytes(&contents[..split])),
+                state_root: PathBuf::from(OsStr::from_bytes(&contents[split + 1..])),
+                record: path,
+            });
+        }
+        recorded.sort_by(|one, other| one.record.cmp(&other.record));
+        Ok(recorded)
+    }
+}
+
+/// The roots one control daemon of a store served.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecordedRoots {
+    /// The runtime root.
+    pub runtime_root: PathBuf,
+    /// The state root.
+    pub state_root: PathBuf,
+    /// The record that says so.
+    pub record: PathBuf,
+}
+
+/// A lock on one of a store's lock files, released when this is dropped.
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct StoreLock {
+    file: File,
+    path: PathBuf,
+}
+
+#[cfg(unix)]
+impl StoreLock {
+    fn open(path: &Path) -> Result<File> {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(crate::paths::OWNER_ONLY_FILE_MODE)
+            .open(path)
+            .map_err(|error| InstallError::io("open the lock", path, error))
+    }
+
+    fn take(path: &Path, operation: rustix::fs::FlockOperation) -> Result<Self> {
+        let file = Self::open(path)?;
+        lock(&file, path, operation)?;
+        Ok(Self {
+            file,
+            path: path.to_path_buf(),
+        })
+    }
+
+    fn try_take(path: &Path, operation: rustix::fs::FlockOperation) -> Result<Option<Self>> {
+        let file = Self::open(path)?;
+        match rustix::fs::flock(&file, operation) {
+            Ok(()) => Ok(Some(Self {
+                file,
+                path: path.to_path_buf(),
+            })),
+            Err(rustix::io::Errno::WOULDBLOCK) => Ok(None),
+            Err(error) => Err(InstallError::io("lock", path, std::io::Error::from(error))),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl StoreLock {
+    /// The lock file.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+#[cfg(unix)]
+impl Drop for StoreLock {
+    fn drop(&mut self) {
+        // The lock belongs to the open file. A process started while it was held may still hold a
+        // descriptor onto that file until its own program takes over, so the lock is let go of
+        // here rather than left to the close.
+        let _ = rustix::fs::flock(&self.file, rustix::fs::FlockOperation::Unlock);
+    }
+}
+
+/// Flushes a directory, so a name just added to it or taken out of it survives a crash.
+#[cfg(unix)]
+fn sync_directory(directory: &Path) -> Result<()> {
+    File::open(directory)
+        .and_then(|opened| opened.sync_all())
+        .map_err(|error| InstallError::io("flush", directory, error))
+}
+
+/// Deletes a release that was moved out of `versions/`, its directories made writable first, since
+/// a release is installed read-only.
+#[cfg(unix)]
+fn remove_tree(directory: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    fn writable(directory: &Path) -> std::io::Result<()> {
+        std::fs::set_permissions(
+            directory,
+            std::fs::Permissions::from_mode(crate::paths::OWNER_ONLY_DIRECTORY_MODE),
+        )?;
+        for entry in std::fs::read_dir(directory)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                writable(&entry.path())?;
+            }
+        }
+        Ok(())
+    }
+
+    writable(directory)
+        .and_then(|()| std::fs::remove_dir_all(directory))
+        .map_err(|error| InstallError::io("remove", directory, error))
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use kr_protocol::hello::PackageVersion;
+    use kr_protocol::update::{
+        CommitId, CompatibilityLevel, FloorSystem, FloorVersion, ManifestKind, OsFloor,
+    };
+
+    /// A store of this test's own, removed with it.
+    struct TestStore {
+        store: Store,
+        _root: TempRoot,
+    }
+
+    struct TempRoot(PathBuf);
+
+    impl Drop for TempRoot {
+        fn drop(&mut self) {
+            let _ = remove_tree(&self.0);
+        }
+    }
+
+    fn test_store() -> TestStore {
+        let root = std::env::temp_dir().join(format!("kr-store-{}", crate::new_uuid()));
+        let store = Store::at(root.join("host"));
+        store.create_directories().expect("the store's directories");
+        crate::paths::write_owner_only_file(&store.record(), b"{}\n").expect("a record");
+        TestStore {
+            store,
+            _root: TempRoot(root),
+        }
+    }
+
+    fn release(name: &str) -> ReleaseName {
+        ReleaseName::new(name).expect("a release name")
+    }
+
+    fn manifest_of(release: &ReleaseName) -> String {
+        let manifest = ReleaseManifest {
+            kind: ManifestKind::Release,
+            release: release.clone(),
+            sequence: kr_protocol::scalars::U64::new(1),
+            commit: CommitId::new("4254aa6e62e585478ff8dcff5518f23c7263f4ce").expect("a commit"),
+            target: "aarch64-apple-darwin".to_owned(),
+            os_floor: OsFloor {
+                system: FloorSystem::Macos,
+                version: FloorVersion {
+                    major: 14,
+                    minor: 0,
+                },
+            },
+            protocol_version: PackageVersion::new(0, 48, 0),
+            public_majors: vec![1],
+            retained_levels: vec![CompatibilityLevel::of(PackageVersion::new(0, 48, 0))],
+            shells: Vec::new(),
+            files: Vec::new(),
+        };
+        serde_json::json!({ "signed": manifest, "signatures": [] }).to_string()
+    }
+
+    /// Puts a release in the store: a program under `bin/` and its manifest.
+    fn install(store: &Store, name: &ReleaseName) -> PathBuf {
+        let directory = store.release_directory(name);
+        std::fs::create_dir_all(directory.join("bin")).expect("the release's bin");
+        std::fs::write(store.manifest(name), manifest_of(name)).expect("the manifest");
+        let program = directory.join("bin").join(Program::Kr.file_name());
+        std::fs::write(&program, b"#!/bin/sh\n").expect("a program");
+        program
+    }
+
+    /// A program under a store's `versions/<release>/bin/` is that release's, held, and names its
+    /// own release's programs and the current ones apart; the same layout without a store record
+    /// is a build outside a store.
+    #[test]
+    fn a_program_of_a_release_is_held_and_names_its_own_programs_and_the_current_ones() {
+        let test = test_store();
+        let one = release("0.1.0+aaaaaaaaaaaa");
+        let image = install(&test.store, &one);
+        let running = Running::of_image(&image).expect("a release of the store");
+        assert_eq!(running.release(), Some(&one));
+        assert_eq!(running.store(), Some(&test.store));
+        assert_eq!(
+            running.own(Program::Worker),
+            test.store
+                .release_directory(&one)
+                .join("bin")
+                .join(Program::Worker.file_name())
+        );
+        assert_eq!(
+            running.stable(Program::Controller),
+            test.store
+                .root()
+                .join("current/bin")
+                .join(Program::Controller.file_name())
+        );
+        assert_eq!(
+            running.shells(),
+            Some(test.store.release_directory(&one).join("shells"))
+        );
+        assert_eq!(running.stated_release("0.1.0"), one.as_str());
+        assert!(
+            test.store.held(&one).expect("asks"),
+            "the program holds its release"
+        );
+        drop(running);
+        assert!(
+            !test.store.held(&one).expect("asks"),
+            "the hold goes with the program"
+        );
+
+        // The control: the same layout with no store record is not a store.
+        std::fs::remove_file(test.store.record()).expect("the record goes");
+        let loose = Running::of_image(&image).expect("a build outside a store");
+        assert_eq!(loose.release(), None);
+        assert_eq!(
+            loose.own(Program::Worker),
+            image.with_file_name(Program::Worker.file_name())
+        );
+        assert_eq!(
+            loose.stable(Program::Controller),
+            image.with_file_name(Program::Controller.file_name())
+        );
+    }
+
+    /// A held release is never removed; one nobody holds is, and it is moved out of `versions/`
+    /// first.
+    #[test]
+    fn a_held_release_is_never_removed_and_one_nobody_holds_is() {
+        let test = test_store();
+        let one = release("0.1.0+aaaaaaaaaaaa");
+        let image = install(&test.store, &one);
+        let update = test
+            .store
+            .try_lock_update()
+            .expect("locks")
+            .expect("nothing else updates");
+        let running = Running::of_image(&image).expect("held");
+        assert!(
+            !test.store.retire(&one, &update).expect("asks"),
+            "a held release stays"
+        );
+        assert!(test.store.manifest(&one).is_file());
+        drop(running);
+        assert!(
+            test.store.retire(&one, &update).expect("removes"),
+            "the control: nobody holds it now, and it goes"
+        );
+        assert!(!test.store.release_directory(&one).exists());
+        assert_eq!(
+            std::fs::read_dir(test.store.trash())
+                .expect("the trash")
+                .count(),
+            0,
+            "nothing of it is left in the trash"
+        );
+    }
+
+    /// A program that opened its manifest while its release was being removed does not run: once
+    /// its lock is granted, the path no longer names the file it locked.
+    #[test]
+    fn a_program_whose_release_went_while_it_started_refuses_to_run() {
+        let test = test_store();
+        let one = release("0.1.0+aaaaaaaaaaaa");
+        install(&test.store, &one);
+        let path = test.store.manifest(&one);
+
+        // The control: opened and locked with nothing in between, it is the release's manifest.
+        let opened = File::open(&path).expect("a program opens its manifest");
+        let (held, manifest) = hold_opened(opened, path.clone(), &one).expect("held");
+        assert_eq!(manifest.release, one);
+        drop(held);
+
+        // Opened, then the release moved out of `versions/` as a removal moves it.
+        let opened = File::open(&path).expect("a program opens its manifest");
+        let aside = test.store.trash().join("moved");
+        std::fs::rename(test.store.release_directory(&one), &aside).expect("moved aside");
+        assert!(matches!(
+            hold_opened(opened, path.clone(), &one),
+            Err(InstallError::Replaced { .. })
+        ));
+
+        // Opened, then another manifest put at the same path: the name is the same, the file is
+        // not, and the lock is on the file.
+        std::fs::rename(&aside, test.store.release_directory(&one)).expect("moved back");
+        let opened = File::open(&path).expect("a program opens its manifest");
+        std::fs::remove_file(&path).expect("the manifest goes");
+        std::fs::write(&path, manifest_of(&one)).expect("another manifest at its path");
+        assert!(matches!(
+            hold_opened(opened, path, &one),
+            Err(InstallError::Replaced { .. })
+        ));
+
+        // And a program whose release has gone altogether does not start.
+        let image = test
+            .store
+            .release_directory(&one)
+            .join("bin")
+            .join(Program::Kr.file_name());
+        std::fs::remove_dir_all(test.store.release_directory(&one)).expect("gone");
+        std::fs::create_dir_all(image.parent().expect("bin")).expect("an empty bin");
+        assert!(matches!(
+            Running::of_image(&image),
+            Err(InstallError::Replaced { .. })
+        ));
+    }
+
+    /// The switch replaces `current` in one rename, and names only releases of the store.
+    #[test]
+    fn the_switch_renames_one_link_over_current() {
+        let test = test_store();
+        let one = release("0.1.0+aaaaaaaaaaaa");
+        let two = release("0.2.0+bbbbbbbbbbbb");
+        install(&test.store, &one);
+        install(&test.store, &two);
+        assert_eq!(test.store.current().expect("reads"), None);
+        let held = test.store.lock_install().expect("locks");
+        test.store.switch(&one, &held).expect("switches");
+        assert_eq!(test.store.current().expect("reads"), Some(one.clone()));
+        test.store.switch(&two, &held).expect("switches");
+        assert_eq!(test.store.current().expect("reads"), Some(two.clone()));
+        assert_eq!(
+            std::fs::read_link(test.store.current_link()).expect("a link"),
+            Path::new("versions").join(two.as_str()),
+            "the link is relative, so the store can move"
+        );
+        assert_eq!(
+            test.store.releases().expect("lists"),
+            vec![one.clone(), two.clone()]
+        );
+        // The control: a release that is not in the store is never made current.
+        let absent = release("0.3.0+cccccccccccc");
+        assert!(test.store.switch(&absent, &held).is_err());
+        assert_eq!(test.store.current().expect("reads"), Some(two));
+        let leftovers: Vec<_> = std::fs::read_dir(test.store.root())
+            .expect("the store")
+            .filter_map(std::result::Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with('.'))
+            .collect();
+        assert!(leftovers.is_empty(), "no temporary link is left behind");
+    }
+
+    /// One update at a time: the update lock is refused while another holds it.
+    #[test]
+    fn one_update_at_a_time() {
+        let test = test_store();
+        let first = test.store.try_lock_update().expect("locks").expect("free");
+        assert!(test.store.try_lock_update().expect("asks").is_none());
+        drop(first);
+        assert!(test.store.try_lock_update().expect("asks").is_some());
+    }
+
+    /// The roots a daemon records are read back whole, a path of any bytes included.
+    #[test]
+    fn the_roots_a_daemon_served_are_read_back() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let test = test_store();
+        let odd = PathBuf::from(OsStr::from_bytes(b"/tmp/state-\xff"));
+        test.store
+            .record_roots(Path::new("/tmp/runtime"), &odd)
+            .expect("records");
+        test.store
+            .record_roots(Path::new("/tmp/runtime-two"), Path::new("/tmp/state-two"))
+            .expect("records");
+        // The same state root recorded again replaces its record rather than adding one.
+        test.store
+            .record_roots(Path::new("/tmp/runtime-again"), &odd)
+            .expect("records");
+        let mut recorded: Vec<(PathBuf, PathBuf)> = test
+            .store
+            .recorded_roots()
+            .expect("reads")
+            .into_iter()
+            .map(|roots| (roots.runtime_root, roots.state_root))
+            .collect();
+        recorded.sort();
+        assert_eq!(
+            recorded,
+            vec![
+                (PathBuf::from("/tmp/runtime-again"), odd),
+                (
+                    PathBuf::from("/tmp/runtime-two"),
+                    PathBuf::from("/tmp/state-two")
+                ),
+            ]
+        );
+    }
+
+    /// A program in a release being installed or removed does not start.
+    #[test]
+    fn a_program_in_the_staging_or_the_trash_does_not_start() {
+        let test = test_store();
+        for holder in [test.store.staging(), test.store.trash()] {
+            let image = holder
+                .join("0.1.0+aaaaaaaaaaaa-x")
+                .join("bin")
+                .join(Program::Kr.file_name());
+            assert!(matches!(
+                Running::of_image(&image),
+                Err(InstallError::Replaced { .. })
+            ));
+        }
+    }
+}

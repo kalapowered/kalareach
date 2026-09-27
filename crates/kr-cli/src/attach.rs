@@ -523,13 +523,16 @@ pub async fn resize(
     call(client, Method::TerminalResize, target(descriptor), params).await
 }
 
-/// Returns the guard executable that sits beside this one.
+/// Returns the guard executable of this command's own release, which sits beside this one.
+///
+/// The guard reads the terminal state this command writes, so it has to be of the same release,
+/// never the one an update has made current since this command started.
 #[must_use]
 pub fn guard_program() -> std::path::PathBuf {
-    std::env::current_exe()
-        .ok()
-        .and_then(|path| path.parent().map(|parent| parent.join("kr-attach-guard")))
-        .unwrap_or_else(|| std::path::PathBuf::from("kr-attach-guard"))
+    kr_ipc::install::this_process().map_or_else(
+        |_| std::path::PathBuf::from("kr-attach-guard"),
+        |running| running.own(kr_ipc::install::Program::AttachGuard),
+    )
 }
 
 /// The variable the integration exports for the command it is about to run.

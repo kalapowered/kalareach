@@ -612,9 +612,13 @@ async fn answered_by(
     }
 }
 
-/// The control daemon the standalone start runs: the one installed beside this command.
+/// The control daemon the standalone start runs, and the service definition names: the one
+/// installed beside this command.
 ///
-/// The link a command was run through is followed first, so a `kr` reached through a link on the
+/// A command of an installed release names the daemon through the store's `current`, so a
+/// service definition written now starts the daemon of whichever release an update has made
+/// current since, and never the one of a release an update has left behind. Anywhere else the
+/// link a command was run through is followed first, so a `kr` reached through a link on the
 /// search path finds the daemon beside the program itself rather than beside the link. It is
 /// never looked for on the search path.
 ///
@@ -629,7 +633,16 @@ pub fn daemon_program() -> Result<PathBuf> {
             Shown::io(&error)
         ))
     };
-    let this = std::env::current_exe()
+    let running = kr_ipc::install::this_process().map_err(|_| {
+        CliError::HostUnavailable(Shown::said(
+            "the standalone start runs the control daemon installed beside this command, and \
+             which installation this command is could not be read",
+        ))
+    })?;
+    if running.store().is_some() {
+        return Ok(running.stable(kr_ipc::install::Program::Controller));
+    }
+    let this = kr_ipc::install::image_path()
         .and_then(std::fs::canonicalize)
         .map_err(unreadable)?;
     // Resolved on Windows, a path carries the verbatim prefix, which the task that runs the daemon
