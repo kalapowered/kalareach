@@ -197,10 +197,10 @@ The rest of what a command prints is decided by what it is:
   the command derived itself, `named` for one the person typed.
 - The host's own sentences, which it composes only from its source's words, numbers, its own terms,
   identifiers it generated and the measure of anything else, are printed as the host wrote them,
-  over the owner's own connection to the host. `kr doctor`'s report of this host's locations and of
-  each effective value is content the person asked for; a value is printed by its class: a word or
-  a number as itself, a location by its shape, a path through `host_path`, and anything else as its
-  class and its length.
+  over the owner's own connection to the host. `kr doctor`'s report of this host's locations, of
+  where each effective value came from and of each value is content the person asked for; a value
+  is printed by its class: a word or a number as itself, a location by its shape, a path through
+  `host_path`, and anything else as its class and its length.
 - Any other text a host wrote is printed as its class and its length.
 
 Three commands own standard output for a protocol or a terminal rather than for lines: the tool

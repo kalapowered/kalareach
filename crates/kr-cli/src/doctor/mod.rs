@@ -22,6 +22,7 @@ pub mod configuration;
 
 use kr_client::shown;
 use kr_client::shown::Shown;
+use kr_protocol::hostinfo::configuration::ValueSource;
 use kr_protocol::hostinfo::{
     CommandIntegrationReport, CommandIntegrationUnavailable, DoctorCheck, DoctorStatus,
     EffectiveConfiguration, HostDoctorResult, HostInfoResult,
@@ -501,6 +502,16 @@ fn location(path: &str) -> Asked {
     Asked::path(Request::Diagnostics, path)
 }
 
+/// Where in its rung a value came from: the configuration document's path, said whole as this
+/// host's other locations are, or the name of the profile the person selected. Section 26 has
+/// `kr doctor` show each value's source.
+fn origin_of(source: ValueSource, origin: &str) -> Asked {
+    match source {
+        ValueSource::HostConfiguration => location(origin),
+        _ => Asked::text(Request::Diagnostics, origin),
+    }
+}
+
 /// Renders this host's effective configuration.
 ///
 /// The host's own sentences are said as it wrote them; this host's own locations whole
@@ -602,7 +613,7 @@ pub fn configuration_report(effective: &EffectiveConfiguration) -> Document {
                             value
                                 .origin
                                 .as_ref()
-                                .map(|origin| configured_field("EffectiveValue", "origin", origin)),
+                                .map(|named| origin_of(value.source, named)),
                         )
                         .with(
                             "variable",
@@ -630,7 +641,7 @@ pub fn configuration_report(effective: &EffectiveConfiguration) -> Document {
                             ceiling
                                 .origin
                                 .as_ref()
-                                .map(|origin| configured_field("CeilingValue", "origin", origin)),
+                                .map(|named| origin_of(ceiling.source, named)),
                         )
                         .with("effect", ceiling.effect.as_str())
                         .with("narrowed_by", ceiling.narrowed_by.as_ref().map(host_text))
@@ -817,7 +828,7 @@ pub fn configurable_lines(effective: &EffectiveConfiguration) -> Vec<Line> {
                 value
                     .origin
                     .as_ref()
-                    .map(|origin| configured_field("EffectiveValue", "origin", origin))
+                    .map(|named| origin_of(value.source, named))
             });
         lines.push(match origin {
             Some(origin) => stdout_line!(
@@ -847,7 +858,7 @@ pub fn configurable_lines(effective: &EffectiveConfiguration) -> Vec<Line> {
         let origin = ceiling
             .origin
             .as_ref()
-            .map(|origin| configured_field("CeilingValue", "origin", origin));
+            .map(|named| origin_of(ceiling.source, named));
         let narrowed = ceiling
             .narrowed_by
             .as_ref()

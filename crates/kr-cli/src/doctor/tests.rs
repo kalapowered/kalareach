@@ -228,9 +228,9 @@ fn the_configurable_defaults_are_shown_with_their_value_and_source() {
 }
 
 /// KR-REQ-23.25, KR-REQ-26.44: planted text in the diagnostics shows only where the person asked
-/// `kr doctor` for it, this host's own locations and each effective value by its class, and where
-/// the host's own export text is said through its door: a check's words and the configuration's
-/// own sentences.
+/// `kr doctor` for it, this host's own locations, where each value came from and each value by its
+/// class, and where the host's own export text is said through its door: a check's words and the
+/// configuration's own sentences.
 #[test]
 fn planted_text_in_the_diagnostics_shows_only_where_it_was_asked_for() {
     use crate::output::planted::{only_asked_or_host_text, planted};
@@ -316,6 +316,8 @@ fn planted_text_in_the_diagnostics_shows_only_where_it_was_asked_for() {
         "runtime_directory",
         "state_directory",
         "stale_documents[]",
+        "values[].origin",
+        "ceilings[].origin",
     ] {
         assert!(shown.contains(asked), "{asked} shows what was asked for");
     }
