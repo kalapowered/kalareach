@@ -1995,7 +1995,9 @@ async fn a_retained_receipt_is_read_after_its_window_is_gone_without_redispatch(
 }
 
 /// KR-REQ-09.07, KR-REQ-09.08: a journal an earlier build wrote opens, migrates and keeps every
-/// record it held.
+/// record it held, from the oldest version this build migrates. One older than that is refused
+/// where it is opened, names the explicit import and is left as it was; the persistence suite
+/// imports the two shapes the builds recording version 1 wrote.
 ///
 /// The order matters and it is the order a reader would not guess. A `CREATE TABLE IF NOT EXISTS`
 /// adds no column to a table that already exists, so creating this build's schema over an older
@@ -2096,6 +2098,20 @@ fn a_journal_an_earlier_build_wrote_opens_and_keeps_its_receipts() {
                     rusqlite::params!["device:phone", [3_u8; 16].as_slice(), [0xa0_u8].as_slice()],
                 )
                 .expect("a retained result");
+        }
+
+        if version < kr_worker::persistence::migration::OLDEST_MIGRATABLE {
+            let refused = Journal::open(&path).expect_err("a journal below the window is refused");
+            assert!(
+                refused.to_string().contains("kr host import-journals"),
+                "version {version}: the refusal names the import: {refused}"
+            );
+            assert_eq!(
+                Journal::recorded_schema_version(&path).expect("reads the version"),
+                version,
+                "version {version}: nothing brought it forward"
+            );
+            continue;
         }
 
         // This build opens it, migrates it and reads every record.
