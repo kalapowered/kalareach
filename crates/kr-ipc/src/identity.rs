@@ -30,9 +30,10 @@
 //! can still be running.
 
 use kr_protocol::identity::{BootIdentity, ProcessStartIdentity, ProcessStartSource};
-// Only a platform that produces a boot identity names where it came from. The Apple mobile
-// systems refuse instead, so on those targets nothing here has a source to name.
-#[cfg(not(all(target_vendor = "apple", not(target_os = "macos"))))]
+// Only a platform module that produces a boot identity names where it came from here. macOS
+// decides its source in `macos_boot`, and the Apple mobile systems refuse instead, so on the Apple
+// targets nothing here has a source to name.
+#[cfg(not(target_vendor = "apple"))]
 use kr_protocol::identity::BootIdentitySource;
 use kr_protocol::ids::BootEpoch;
 
@@ -853,42 +854,26 @@ mod platform {
         Ok((info.e_tdev != u32::MAX).then_some(info.e_tdev))
     }
 
-    use super::{
-        BootIdentity, BootIdentitySource, ProcessStartIdentity, ProcessStartSource, Result,
-        unavailable,
-    };
-
-    const BOOT_SESSION_CONTROL: &str = "kern.bootsessionuuid";
-    const BOOT_TIME_CONTROL: &str = "kern.boottime";
+    use super::{BootIdentity, ProcessStartIdentity, ProcessStartSource, Result, unavailable};
 
     pub(super) fn boot_identity() -> Result<BootIdentity> {
-        if let Ok(control) = sysctl::Ctl::new(BOOT_SESSION_CONTROL)
-            && let Ok(sysctl::CtlValue::String(value)) = control.value()
-            && !value.trim().is_empty()
-        {
-            return Ok(BootIdentity {
-                source: BootIdentitySource::MacosBootSessionUuid,
-                value: kr_protocol::scalars::Bytes::new(value.trim().as_bytes().to_vec()),
-            });
+        super::macos_boot::boot_identity(&Sysctl)
+    }
+
+    /// This kernel, read through `sysctl`.
+    struct Sysctl;
+
+    impl super::macos_boot::Kernel for Sysctl {
+        fn read(&self, control: &str) -> std::result::Result<Vec<u8>, String> {
+            let value = sysctl::Ctl::new(control)
+                .and_then(|reading| reading.value())
+                .map_err(|error| format!("{control}: {error}"))?;
+            match value {
+                sysctl::CtlValue::String(text) => Ok(text.into_bytes()),
+                sysctl::CtlValue::Struct(bytes) => Ok(bytes),
+                _ => Err(format!("{control} holds neither text nor a structure")),
+            }
         }
-        // Older kernels do not publish a boot session identifier. The boot time changes with every
-        // boot too, so it answers the same question with a different unit.
-        let control = sysctl::Ctl::new(BOOT_TIME_CONTROL).map_err(|error| {
-            unavailable("boot identity", format!("{BOOT_TIME_CONTROL}: {error}"))
-        })?;
-        let value = control.value().map_err(|error| {
-            unavailable("boot identity", format!("{BOOT_TIME_CONTROL}: {error}"))
-        })?;
-        let sysctl::CtlValue::Struct(bytes) = value else {
-            return Err(unavailable(
-                "boot identity",
-                format!("{BOOT_TIME_CONTROL} did not return a structure"),
-            ));
-        };
-        Ok(BootIdentity {
-            source: BootIdentitySource::BootTime,
-            value: kr_protocol::scalars::Bytes::new(bytes),
-        })
     }
 
     /// Where this platform's start value comes from.
@@ -949,6 +934,58 @@ mod platform {
             .find(|character: char| !character.is_ascii_digit())
             .map_or(after, |end| &after[..end]);
         digits.parse().ok()
+    }
+}
+
+/// The macOS boot identity, decided from what the kernel says.
+///
+/// Apart from the platform module, so that a test can stand in for the kernel: a kernel that
+/// publishes no boot session identifier, and a clock that is set while the host runs, are not
+/// things a test can arrange on the machine it runs on.
+#[cfg(any(target_os = "macos", test))]
+mod macos_boot {
+    use kr_protocol::identity::{BootIdentity, BootIdentitySource};
+
+    use super::{Result, unavailable};
+
+    /// The control that holds the kernel's identifier for its boot.
+    pub(super) const BOOT_SESSION_CONTROL: &str = "kern.bootsessionuuid";
+
+    /// The control that holds the time the kernel reckons it booted at.
+    pub(super) const BOOT_TIME_CONTROL: &str = "kern.boottime";
+
+    /// A macOS kernel's controls.
+    pub(super) trait Kernel {
+        /// What a control holds, as bytes: a text control's text, and a structure as the kernel
+        /// lays it out. Or why it could not be read, a control the kernel does not have among the
+        /// reasons.
+        fn read(&self, control: &str) -> std::result::Result<Vec<u8>, String>;
+    }
+
+    /// The text a control holds, trimmed, when it holds some.
+    fn text(kernel: &impl Kernel, control: &str) -> Option<String> {
+        let text = String::from_utf8(kernel.read(control).ok()?).ok()?;
+        let text = text.trim();
+        (!text.is_empty()).then(|| text.to_owned())
+    }
+
+    /// Reads the identity of the kernel's current boot.
+    pub(super) fn boot_identity(kernel: &impl Kernel) -> Result<BootIdentity> {
+        if let Some(value) = text(kernel, BOOT_SESSION_CONTROL) {
+            return Ok(BootIdentity {
+                source: BootIdentitySource::MacosBootSessionUuid,
+                value: kr_protocol::scalars::Bytes::new(value.into_bytes()),
+            });
+        }
+        // Older kernels do not publish a boot session identifier. The boot time changes with every
+        // boot too, so it answers the same question with a different unit.
+        let bytes = kernel
+            .read(BOOT_TIME_CONTROL)
+            .map_err(|detail| unavailable("boot identity", detail))?;
+        Ok(BootIdentity {
+            source: BootIdentitySource::BootTime,
+            value: kr_protocol::scalars::Bytes::new(bytes),
+        })
     }
 }
 
@@ -1669,6 +1706,101 @@ mod tests {
     /// What a query about `pid` says about the process `identity` recorded.
     fn state_from(identity: &ProcessStartIdentity, pid: u32, query: ProcessQuery) -> ProcessState {
         current_from(identity, pid, query).into()
+    }
+
+    /// A macOS kernel a test stands in for: a boot session identifier or none, a release, and a
+    /// boot time that moves when the clock is set, as `kern.boottime` does.
+    struct StandInKernel {
+        session: Option<&'static str>,
+        release: Option<&'static str>,
+        /// The boot time the kernel reckons, as seconds and microseconds since 1970.
+        boot_time: std::cell::Cell<(i64, i32)>,
+    }
+
+    impl StandInKernel {
+        /// A kernel that publishes `session`, reckoning its boot at a fixed moment.
+        fn publishing(session: Option<&'static str>) -> Self {
+            Self {
+                session,
+                release: Some("16.7.0"),
+                boot_time: std::cell::Cell::new((1_700_000_000, 250_000)),
+            }
+        }
+
+        /// Sets the clock forward: the kernel reckons its boot that much later.
+        fn set_the_clock_forward(&self, seconds: i64) {
+            let (at, micros) = self.boot_time.get();
+            self.boot_time.set((at + seconds, micros));
+        }
+    }
+
+    impl macos_boot::Kernel for StandInKernel {
+        fn read(&self, control: &str) -> std::result::Result<Vec<u8>, String> {
+            let text = |value: Option<&str>| {
+                value
+                    .map(|value| value.as_bytes().to_vec())
+                    .ok_or_else(|| format!("{control}: no such control"))
+            };
+            match control {
+                "kern.bootsessionuuid" => text(self.session),
+                "kern.osrelease" => text(self.release),
+                "kern.boottime" => {
+                    // A `struct timeval`: the seconds, the microseconds and the padding after them.
+                    let (seconds, micros) = self.boot_time.get();
+                    let mut bytes = seconds.to_le_bytes().to_vec();
+                    bytes.extend_from_slice(&micros.to_le_bytes());
+                    bytes.extend_from_slice(&[0; 4]);
+                    Ok(bytes)
+                }
+                _ => Err(format!("{control}: no such control")),
+            }
+        }
+    }
+
+    /// A macOS kernel that publishes no boot session identifier gives one boot one identity, or a
+    /// refusal that names the kernel and what the host needs; the clock set while the host runs
+    /// changes neither. What it must not give is two identities for one boot, which is what the
+    /// boot time does, because the kernel moves it with the clock.
+    #[test]
+    fn a_macos_kernel_without_a_boot_session_identifier_gives_one_boot_one_identity_or_a_refusal() {
+        let kernel = StandInKernel::publishing(None);
+        let before = macos_boot::boot_identity(&kernel);
+        kernel.set_the_clock_forward(7);
+        let after = macos_boot::boot_identity(&kernel);
+        match (before, after) {
+            (Ok(before), Ok(after)) => assert_eq!(
+                before, after,
+                "one boot has one identity, whatever the clock did in between"
+            ),
+            (Err(before), Err(after)) => {
+                for refusal in [before, after] {
+                    let said = refusal.to_string();
+                    for named in ["kern.bootsessionuuid", "Darwin 16.7.0", "macOS 14"] {
+                        assert!(said.contains(named), "the refusal names {named}: {said}");
+                    }
+                }
+            }
+            (before, after) => {
+                panic!("one boot is read the same way twice: {before:?}, then {after:?}")
+            }
+        }
+    }
+
+    /// The control: a kernel that publishes its boot session identifier gives that identifier,
+    /// the same before and after the clock is set.
+    #[test]
+    fn a_macos_kernel_with_a_boot_session_identifier_gives_it_whatever_the_clock_does() {
+        let session = "0D1E5C7A-8F42-4B61-9C3D-2E7A55B0C1F4";
+        let kernel = StandInKernel::publishing(Some(session));
+        let before = macos_boot::boot_identity(&kernel).expect("an identity");
+        kernel.set_the_clock_forward(7);
+        let after = macos_boot::boot_identity(&kernel).expect("an identity");
+        assert_eq!(before, after);
+        assert_eq!(
+            before.source,
+            kr_protocol::identity::BootIdentitySource::MacosBootSessionUuid
+        );
+        assert_eq!(before.value.as_slice(), session.as_bytes());
     }
 
     #[test]
