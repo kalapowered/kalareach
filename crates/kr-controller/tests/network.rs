@@ -4530,7 +4530,8 @@ fn asked_ids(
 /// the grant the invitation carries reads that question from the worker while it is open, and not
 /// once it has been answered, and a device whose grant reaches back to the same moment and names
 /// nothing never reads it. A device's connection is decided under the grant its record holds, so
-/// the test redeems the invitation and gives the device's record the grant it carries.
+/// the test redeems the invitation and writes the device's record with the grant it carries, as a
+/// pairing writes a record with the grant it carries.
 #[ignore = "launches a worker process; run through scripts/end-to-end.sh"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_10_51_a_device_reads_the_question_its_grant_names_while_it_is_open() {
@@ -4551,15 +4552,9 @@ async fn kr_req_10_51_a_device_reads_the_question_its_grant_names_while_it_is_op
         session_ids: [session_id].into_iter().collect(),
     };
 
-    // The device the owner shares with, paired to see this session.
+    // The device the owner shares with, and the identity the host gives it.
     let named = Device::create(&loopback()).await;
-    let named_record = pair_with(
-        &daemon,
-        &named,
-        &owner,
-        proposing(&[ActionRight::SessionView], only_this_session()),
-    )
-    .await;
+    let named_device_id = DeviceId::new(kr_ipc::new_uuid());
 
     // The owner shares the session with it, reaching back to just after the question and naming
     // it, and is shown the question as the worker holds it.
@@ -4570,7 +4565,7 @@ async fn kr_req_10_51_a_device_reads_the_question_its_grant_names_while_it_is_op
     };
     let share = kr_protocol::sharing::GrantCreateParams {
         session_id,
-        recipient_device_id: named_record.device_id,
+        recipient_device_id: named_device_id,
         parent_grant_id: Nullable::null(),
         accepted_notices: kr_protocol::sharing::AuthorityNotice::for_actions(&selection.actions()),
         selection,
@@ -4599,19 +4594,31 @@ async fn kr_req_10_51_a_device_reads_the_question_its_grant_names_while_it_is_op
         }]
     );
 
-    // The device holds the grant the invitation carries.
+    // The device holds the grant the invitation carries, in a record of its own keys.
     let redeemed = daemon
         .controller
         .sharing()
         .redeem(
             issued.preview.invitation_id,
-            named_record.device_id,
+            named_device_id,
             kr_ipc::now_ms().get(),
         )
         .expect("the invitation is redeemed");
+    let keys = named.keys.public_keys();
     let named_record = DeviceRecord {
+        device_id: named_device_id,
+        endpoint_id: keys.transport,
+        device_key_revision: DeviceKeyRevision::new(1),
+        authorisation: keys.authorisation,
+        stored_envelope: Some(keys.stored_envelope),
+        notification_preview: Some(keys.notification_preview),
+        device_name: DeviceName::new("A test phone").expect("a name"),
+        platform: DevicePlatform::Android,
         grant: redeemed,
-        ..named_record
+        paired_at_ms: kr_ipc::now_ms(),
+        revoked_at_ms: None,
+        committed_invitation_id: None,
+        expired_at_ms: None,
     };
     daemon
         .network
