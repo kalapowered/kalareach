@@ -138,6 +138,11 @@ impl Clock for SystemClock {
 pub struct DeliveryModule {
     producer: Mutex<Producer>,
     secrets: secrets::DestinationSecrets,
+    /// The privacy state every exchange with a destination is admitted under: a send, and a
+    /// question about one. The environment's privacy record publishes into it
+    /// ([`crate::privacy::EnvironmentPrivacy::open`]); until something does, it is generation 0 with
+    /// privacy mode off, which is what an environment that never turned privacy mode on is.
+    privacy: crate::privacy::PrivacyState,
 }
 
 /// What storing one destination's credential did.
@@ -185,7 +190,15 @@ impl DeliveryModule {
         Ok(Self {
             producer: Mutex::new(producer),
             secrets,
+            privacy: crate::privacy::PrivacyState::default(),
         })
+    }
+
+    /// Returns the privacy state this module's exchanges are admitted under, for the environment's
+    /// privacy record to publish into.
+    #[must_use]
+    pub const fn privacy_state(&self) -> &crate::privacy::PrivacyState {
+        &self.privacy
     }
 
     /// Returns true when this module serves `method`.
@@ -619,6 +632,18 @@ impl DeliveryModule {
         let Some(credential) = credentials.current(push.sender_record_id) else {
             return Ok(Considered::HadItsTurn(None));
         };
+        // Asked only under an admission of the generation the record was admitted under, held to
+        // the end of the exchange. A change of privacy mode waits for it, and none is given while
+        // privacy mode is on: the journal's own fence goes up after the change is published, and
+        // nothing is asked in between.
+        let Some(_admission) = self
+            .privacy
+            .admit_send(kr_worker::privacy::PrivacyGeneration::new(
+                record.privacy_generation,
+            ))
+        else {
+            return Ok(Considered::KeepsItsTurn);
+        };
         if !status.reserve(clock.steady_ms()) {
             return Ok(Considered::KeepsItsTurn);
         }
@@ -889,6 +914,26 @@ impl DeliveryModule {
         })
     }
 
+    /// Admits one claimed delivery to be presented: only while privacy mode is off and the
+    /// generation it was admitted under is the one in force ([`crate::privacy::PrivacyState`]).
+    fn admitted(&self, delivery: &ClaimedDelivery) -> Option<crate::privacy::SendAdmission<'_>> {
+        self.privacy
+            .admit_send(kr_worker::privacy::PrivacyGeneration::new(
+                delivery.privacy_generation,
+            ))
+    }
+
+    /// Settles a claimed delivery privacy mode took back before it was presented. Nothing was
+    /// presented, so nothing left this host, and its content goes with the settlement.
+    fn taken_back(&self, delivery: &ClaimedDelivery, now_ms: u64) -> Result<()> {
+        self.settle(
+            delivery,
+            DeliveryState::Cancelled,
+            "privacy mode took it back before it was presented",
+            now_ms,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn attempt_push(
         &self,
@@ -943,6 +988,11 @@ impl DeliveryModule {
                 now_ms,
             );
         }
+        // Presented only under an admission of the generation this was admitted under, taken
+        // after the renewal, which waits on the gateway, and held until the answer is recorded.
+        let Some(_admission) = self.admitted(delivery) else {
+            return self.taken_back(delivery, now_ms);
+        };
         let outcome =
             if delivery.next == NextAction::Receipt {
                 // The gateway is holding this notification and retrying the provider itself. What is
@@ -1062,6 +1112,11 @@ impl DeliveryModule {
         };
         let message = client::message_from(&delivery.content)?;
         let attempt = delivery.attempt;
+        // Presented only under an admission of the generation this was admitted under, held until
+        // the answer is recorded.
+        let Some(_admission) = self.admitted(delivery) else {
+            return self.taken_back(delivery, now_ms);
+        };
         let outcome = external.send(
             destination,
             held.as_ref().map(|held| &held.secret),

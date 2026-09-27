@@ -50,7 +50,11 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 
 use kr_delivery::privacy::DeliveryOutbox;
 use kr_protocol::ids::SessionId;
-use kr_protocol::scalars::TimestampMs;
+use kr_protocol::privacy::{
+    PrivacyCompletion, PrivacyGenerationAck, PrivacyOutstanding, PrivacyReport, PrivacySession,
+    PrivacySessionStanding, PrivacyUnavailable,
+};
+use kr_protocol::scalars::{TimestampMs, U64};
 use kr_worker::privacy::{
     Completion, Disabled, Enabling, Exported, KeptExplicitly, PrivacyGeneration, PrivacyMode,
     PrivacySubsystem, Unavailable,
@@ -276,7 +280,14 @@ enum Reach {
 struct Answer {
     generation: PrivacyGeneration,
     enabled: bool,
-    completion: Completion,
+    completion: PrivacyCompletion,
+}
+
+impl Answer {
+    /// Whether its worker said its cleanup is complete.
+    const fn is_complete(&self) -> bool {
+        matches!(self.completion, PrivacyCompletion::Complete)
+    }
 }
 
 /// A notice one session's worker is owed: the generation in force and whether privacy mode is on.
@@ -345,6 +356,54 @@ pub struct Report {
     pub unlisted: Vec<(&'static str, Unavailable)>,
 }
 
+impl Report {
+    /// The report as `privacy.set` and `privacy.status` answer it.
+    #[must_use]
+    pub fn to_wire(&self) -> PrivacyReport {
+        PrivacyReport {
+            generation: U64::new(self.generation.get()),
+            enabled: self.enabled,
+            changed_at_ms: self.changed_at_ms,
+            completion: (&self.completion).into(),
+            sessions: self
+                .obligations
+                .iter()
+                .map(|obligation| PrivacySession {
+                    session_id: obligation.session_id,
+                    generation: U64::new(obligation.generation.get()),
+                    standing: match &obligation.standing {
+                        Standing::AwaitingWorker => PrivacySessionStanding::AwaitingWorker,
+                        Standing::Reconciling { outstanding } => {
+                            PrivacySessionStanding::Reconciling {
+                                outstanding: U64::new(*outstanding),
+                            }
+                        }
+                        Standing::Unavailable { reason } => PrivacySessionStanding::Unavailable {
+                            reason: reason.clone(),
+                        },
+                        Standing::WorkerEnded => PrivacySessionStanding::WorkerEnded,
+                    },
+                })
+                .collect(),
+            disabled: self
+                .disabled
+                .iter()
+                .map(|disabled| (*disabled).into())
+                .collect(),
+            kept: self.kept.iter().map(Into::into).collect(),
+            exported: self.exported.iter().map(Into::into).collect(),
+            unlisted: self
+                .unlisted
+                .iter()
+                .map(|(subsystem, unavailable)| PrivacyUnavailable {
+                    subsystem: (*subsystem).to_owned(),
+                    reason: unavailable.reason().to_owned(),
+                })
+                .collect(),
+        }
+    }
+}
+
 /// The environment's privacy record, and its composition root.
 #[derive(Debug)]
 pub struct EnvironmentPrivacy {
@@ -376,8 +435,10 @@ struct Inner {
 impl EnvironmentPrivacy {
     /// Opens the environment's privacy record in `state_dir` and publishes the state it holds.
     ///
-    /// Nothing is driven here: [`Self::resume`] is what takes the subsystems through the steps the
-    /// record asks for.
+    /// The state is published into the delivery module's own ([`DeliveryModule::privacy_state`]),
+    /// which every exchange with a destination is admitted under, so the send gate is this record
+    /// from the moment it is open. Nothing is driven here: [`Self::resume`] is what takes the
+    /// subsystems through the steps the record asks for.
     ///
     /// # Errors
     ///
@@ -392,7 +453,7 @@ impl EnvironmentPrivacy {
         let record = Record::open(state_dir)?;
         let stored = record.read()?;
         let obligations = record.obligations()?;
-        let state = PrivacyState::default();
+        let state = delivery.privacy_state().clone();
         state.publish(Published {
             generation: stored.generation,
             private: stored.enabled,
@@ -451,12 +512,21 @@ impl EnvironmentPrivacy {
     /// anything else happens; the state is published as it commits; then every daemon subsystem
     /// is taken through its steps. Privacy mode already on is answered with where it stands.
     ///
+    /// `admitted` is asked immediately before the record is written, after every wait: an
+    /// admission that has lapsed by then, its deadline passed or its authority withdrawn, changes
+    /// nothing.
+    ///
     /// # Errors
     ///
-    /// Returns [`ControllerError::RegistryUnavailable`] when the record cannot be written. Nothing
-    /// has been fenced or removed then: a privacy mode this environment cannot write down is one
-    /// it must not claim to be in.
-    pub fn enable(&self, sessions: &[SessionId], now_ms: TimestampMs) -> Result<Report> {
+    /// Returns [`ControllerError::RegistryUnavailable`] when the record cannot be written, and
+    /// what `admitted` returns when it refuses. Nothing has been fenced or removed then: a privacy
+    /// mode this environment cannot write down is one it must not claim to be in.
+    pub fn enable(
+        &self,
+        sessions: &[SessionId],
+        now_ms: TimestampMs,
+        admitted: &dyn Fn() -> Result<()>,
+    ) -> Result<Report> {
         let mut inner = self.inner();
         if inner.mode.is_enabled() {
             return Ok(self.report(&inner, now_ms));
@@ -488,6 +558,7 @@ impl EnvironmentPrivacy {
         // withholding production, and the steps below try it again.
         let record = &mut inner.record;
         let _raised = self.backup.raise_fence_recorded(generation, now_ms, || {
+            admitted()?;
             let recorded = record.enable(generation, &owing, now_ms);
             #[cfg(test)]
             if recorded.is_ok() {
@@ -528,8 +599,13 @@ impl EnvironmentPrivacy {
     ///
     /// Returns [`ControllerError::Refused`], with
     /// [`kr_protocol::error::ErrorCode::ResourceUnavailable`], while cleanup is owed, naming what
-    /// is owed, and [`ControllerError::RegistryUnavailable`] when the record cannot be written.
-    pub fn disable(&self, now_ms: TimestampMs) -> Result<Report> {
+    /// is owed, [`ControllerError::RegistryUnavailable`] when the record cannot be written, and
+    /// what `admitted` returns when it refuses, asked immediately before the record is written.
+    pub fn disable(
+        &self,
+        now_ms: TimestampMs,
+        admitted: &dyn Fn() -> Result<()>,
+    ) -> Result<Report> {
         let mut inner = self.inner();
         if !inner.mode.is_enabled() {
             return Ok(self.report(&inner, now_ms));
@@ -546,6 +622,7 @@ impl EnvironmentPrivacy {
         }
         let mut mode = inner.mode;
         let resumed = mode.disable(now_ms);
+        admitted()?;
         inner.record.disable(resumed.generation, now_ms)?;
         inner.mode = mode;
         inner.changed_at_ms = now_ms;
@@ -600,6 +677,37 @@ impl EnvironmentPrivacy {
         self.report(&inner, now_ms)
     }
 
+    /// Answers `privacy.set`: turns privacy mode on or off and says where the change stands.
+    ///
+    /// `sessions` are the sessions the environment holds content for, each of which owes its own
+    /// cleanup when privacy mode is turned on ([`Self::enable`]); turning it off is refused while
+    /// cleanup is owed ([`Self::disable`]). `admitted` is asked immediately before the change is
+    /// written. Asking for the state already in force changes nothing.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::enable`] and [`Self::disable`].
+    pub fn set(
+        &self,
+        enabled: bool,
+        sessions: &[SessionId],
+        now_ms: TimestampMs,
+        admitted: &dyn Fn() -> Result<()>,
+    ) -> Result<PrivacyReport> {
+        let report = if enabled {
+            self.enable(sessions, now_ms, admitted)?
+        } else {
+            self.disable(now_ms, admitted)?
+        };
+        Ok(report.to_wire())
+    }
+
+    /// Answers `privacy.status`: where privacy mode stands, without retrying anything.
+    #[must_use]
+    pub fn status(&self, now_ms: TimestampMs) -> PrivacyReport {
+        self.report_now(now_ms).to_wire()
+    }
+
     /// Says where privacy mode stands, without retrying anything.
     #[must_use]
     pub fn report_now(&self, now_ms: TimestampMs) -> Report {
@@ -628,7 +736,7 @@ impl EnvironmentPrivacy {
         let progress = inner.sessions.entry(session_id).or_default();
         progress.reach = Reach::Live;
         let settled = progress.answer.as_ref().is_some_and(|answer| {
-            answer.generation == generation && answer.enabled && answer.completion.is_complete()
+            answer.generation == generation && answer.enabled && answer.is_complete()
         });
         if enabled && !settled && !inner.obligations.contains_key(&session_id) {
             // Held here first, so a write that fails still keeps the session owed: it counts
@@ -660,6 +768,40 @@ impl EnvironmentPrivacy {
         }
     }
 
+    /// Brings what this record knows of the sessions' workers into line with the daemon's: each
+    /// session in `live` has a worker running, and each tracked session that `recorded` no longer
+    /// lists has ended. A session in neither keeps what was known of it, because a worker this
+    /// daemon has not reached yet is not one that has ended.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first obligation that could not be written ([`Self::note_session_live`]); every
+    /// session is still noted, and each such obligation is held and written again by the tick.
+    pub fn sessions_seen(
+        &self,
+        live: &[SessionId],
+        recorded: &[SessionId],
+        now_ms: TimestampMs,
+    ) -> Result<()> {
+        let ended: Vec<SessionId> = self
+            .inner()
+            .sessions
+            .keys()
+            .filter(|session_id| !recorded.contains(session_id) && !live.contains(session_id))
+            .copied()
+            .collect();
+        for session_id in ended {
+            self.note_session_ended(session_id);
+        }
+        let mut refused = None;
+        for session_id in live {
+            if let Err(error) = self.note_session_live(*session_id, now_ms) {
+                refused.get_or_insert(error);
+            }
+        }
+        refused.map_or(Ok(()), Err)
+    }
+
     /// Returns the notices owed to live sessions whose turn has come, and schedules the next.
     ///
     /// A session is owed one until its worker answers that it holds the generation in force, in
@@ -669,15 +811,19 @@ impl EnvironmentPrivacy {
         let mut inner = self.inner();
         let generation = inner.mode.generation();
         let enabled = inner.mode.is_enabled();
+        // Every worker starts at the initial generation with privacy mode off, and none is told
+        // another until the environment records one, so while that is what is in force nothing
+        // is owed.
+        if generation == PrivacyGeneration::INITIAL && !enabled {
+            return Vec::new();
+        }
         let mut due = Vec::new();
         for (session_id, progress) in &mut inner.sessions {
             if progress.reach != Reach::Live || !progress.notices.due(now_ms) {
                 continue;
             }
             let settled = progress.answer.as_ref().is_some_and(|answer| {
-                answer.generation == generation
-                    && answer.enabled == enabled
-                    && answer.completion.is_complete()
+                answer.generation == generation && answer.enabled == enabled && answer.is_complete()
             });
             if settled {
                 continue;
@@ -702,16 +848,18 @@ impl EnvironmentPrivacy {
     ///
     /// Returns [`ControllerError::RegistryUnavailable`] when the obligation's end cannot be
     /// written. The obligation then stays, and the next answer ends it.
-    pub fn note_answer(
-        &self,
-        session_id: SessionId,
-        generation: PrivacyGeneration,
-        enabled: bool,
-        completion: Completion,
-    ) -> Result<()> {
+    pub fn note_answer(&self, ack: &PrivacyGenerationAck) -> Result<()> {
+        let session_id = ack.session_id;
+        let generation = PrivacyGeneration::new(ack.generation.get());
+        let answer = Answer {
+            generation,
+            enabled: ack.enabled,
+            completion: ack.completion.clone(),
+        };
         let mut inner = self.inner();
-        let current = generation == inner.mode.generation() && enabled == inner.mode.is_enabled();
-        if current && completion.is_complete() && inner.obligations.contains_key(&session_id) {
+        let current =
+            generation == inner.mode.generation() && ack.enabled == inner.mode.is_enabled();
+        if current && answer.is_complete() && inner.obligations.contains_key(&session_id) {
             inner.record.discharge(session_id, generation)?;
             inner.obligations.remove(&session_id);
             inner.unrecorded.remove(&session_id);
@@ -720,11 +868,7 @@ impl EnvironmentPrivacy {
         if progress.reach == Reach::Unknown {
             progress.reach = Reach::Live;
         }
-        progress.answer = Some(Answer {
-            generation,
-            enabled,
-            completion,
-        });
+        progress.answer = Some(answer);
         Ok(())
     }
 
@@ -1120,22 +1264,15 @@ impl EnvironmentPrivacy {
                     .as_ref()
                     .filter(|answer| answer.generation == generation && !answer.enabled);
                 match answer.map(|answer| &answer.completion) {
-                    Some(Completion::Complete) => {}
-                    Some(Completion::Reconciling { outstanding: owed }) => outstanding.push((
-                        "sessions",
-                        owed.iter().map(|(_, count)| count).sum::<u64>().max(1),
-                    )),
-                    Some(Completion::Unavailable {
+                    Some(PrivacyCompletion::Complete) => {}
+                    Some(PrivacyCompletion::Reconciling { outstanding: owed }) => {
+                        outstanding.push(("sessions", owed_count(owed).max(1)));
+                    }
+                    Some(PrivacyCompletion::Unavailable {
                         unavailable: owed, ..
                     }) => unavailable.push((
                         "sessions",
-                        Unavailable::new(format!(
-                            "session {session_id}: {}",
-                            owed.iter()
-                                .map(|(name, reason)| format!("{name}: {reason}"))
-                                .collect::<Vec<_>>()
-                                .join("; ")
-                        )),
+                        Unavailable::new(format!("session {session_id}: {}", reasons(owed))),
                     )),
                     None => outstanding.push(("sessions", 1)),
                 }
@@ -1248,6 +1385,23 @@ fn owe(inner: &mut Inner, subsystem: Subsystem, work: Work, owing: Owing, now_ms
     inner.owed.insert(subsystem, Owed { work, owing, retry });
 }
 
+/// Returns how much a worker says is outstanding, over all its subsystems.
+fn owed_count(outstanding: &[PrivacyOutstanding]) -> u64 {
+    outstanding
+        .iter()
+        .map(|owed| owed.count.get())
+        .fold(0, u64::saturating_add)
+}
+
+/// Returns what a worker says is in the way, one subsystem after another.
+fn reasons(unavailable: &[PrivacyUnavailable]) -> String {
+    unavailable
+        .iter()
+        .map(|owed| format!("{}: {}", owed.subsystem, owed.reason))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 /// Returns every session obligation, with where it stands.
 fn obligations(inner: &Inner) -> Vec<Obligation> {
     let generation = inner.mode.generation();
@@ -1262,21 +1416,17 @@ fn obligations(inner: &Inner) -> Vec<Obligation> {
                 Some(SessionProgress {
                     answer: Some(answer),
                     ..
-                }) if answer.generation == generation && answer.enabled == enabled => {
-                    match &answer.completion {
-                        Completion::Complete => Standing::AwaitingWorker,
-                        Completion::Reconciling { outstanding } => Standing::Reconciling {
-                            outstanding: outstanding.iter().map(|(_, count)| count).sum(),
-                        },
-                        Completion::Unavailable { unavailable, .. } => Standing::Unavailable {
-                            reason: unavailable
-                                .iter()
-                                .map(|(name, reason)| format!("{name}: {reason}"))
-                                .collect::<Vec<_>>()
-                                .join("; "),
-                        },
-                    }
-                }
+                }) if answer.generation == generation && answer.enabled == enabled => match &answer
+                    .completion
+                {
+                    PrivacyCompletion::Complete => Standing::AwaitingWorker,
+                    PrivacyCompletion::Reconciling { outstanding } => Standing::Reconciling {
+                        outstanding: owed_count(outstanding),
+                    },
+                    PrivacyCompletion::Unavailable { unavailable, .. } => Standing::Unavailable {
+                        reason: reasons(unavailable),
+                    },
+                },
                 _ => Standing::AwaitingWorker,
             };
             Obligation {
@@ -1876,6 +2026,48 @@ mod tests {
         }
     }
 
+    /// An admission that stands, as the owner's own path does.
+    #[allow(clippy::unnecessary_wraps)]
+    fn standing() -> Result<()> {
+        Ok(())
+    }
+
+    /// A worker's answer to a notice, as it arrives.
+    fn ack(
+        session_id: SessionId,
+        generation: u64,
+        enabled: bool,
+        completion: PrivacyCompletion,
+    ) -> PrivacyGenerationAck {
+        PrivacyGenerationAck {
+            session_id,
+            generation: U64::new(generation),
+            enabled,
+            completion,
+        }
+    }
+
+    /// A worker's account of cleanup still settling in one of its subsystems.
+    fn reconciling(subsystem: &str, count: u64) -> PrivacyCompletion {
+        PrivacyCompletion::Reconciling {
+            outstanding: vec![PrivacyOutstanding {
+                subsystem: subsystem.to_owned(),
+                count: U64::new(count),
+            }],
+        }
+    }
+
+    /// A worker's account of one of its subsystems that could not finish.
+    fn refused(subsystem: &str, reason: &str) -> PrivacyCompletion {
+        PrivacyCompletion::Unavailable {
+            unavailable: vec![PrivacyUnavailable {
+                subsystem: subsystem.to_owned(),
+                reason: reason.to_owned(),
+            }],
+            outstanding: Vec::new(),
+        }
+    }
+
     /// Why one subsystem cannot answer, as a report says.
     fn unavailable(report: &Report, name: &str) -> Vec<String> {
         match &report.completion {
@@ -1904,7 +2096,7 @@ mod tests {
 
         let refused = host
             .privacy
-            .enable(&[session(1)], at(10))
+            .enable(&[session(1)], at(10), &standing)
             .expect_err("a privacy mode this environment cannot write down");
         assert!(
             refused.to_string().contains("refused the record"),
@@ -1929,7 +2121,7 @@ mod tests {
             .expect("the record is accepted again");
         let report = host
             .privacy
-            .enable(&[session(1)], at(20))
+            .enable(&[session(1)], at(20), &standing)
             .expect("privacy mode is enabled");
         assert!(report.enabled);
         assert_eq!(report.generation, PrivacyGeneration::new(1));
@@ -1966,7 +2158,7 @@ mod tests {
 
         let report = host
             .privacy
-            .enable(&[], at(10))
+            .enable(&[], at(10), &standing)
             .expect("privacy mode is enabled");
         assert!(!report.completion.is_complete());
         assert!(
@@ -2023,7 +2215,7 @@ mod tests {
             .expect("the store refuses writes");
         let report = host
             .privacy
-            .enable(&[], at(10))
+            .enable(&[], at(10), &standing)
             .expect("the record is written");
         let reasons = unavailable(&report, "backup");
         assert!(
@@ -2081,7 +2273,7 @@ mod tests {
 
         let report = host
             .privacy
-            .enable(&[], at(10))
+            .enable(&[], at(10), &standing)
             .expect("privacy mode is enabled");
         assert!(!report.completion.is_complete());
         let state = host.privacy.state();
@@ -2126,7 +2318,7 @@ mod tests {
             .expect("the upload is on its way");
         let report = host
             .privacy
-            .enable(&[], at(10))
+            .enable(&[], at(10), &standing)
             .expect("privacy mode is enabled");
         assert!(outstanding(&report, "backup") > 0);
 
@@ -2180,7 +2372,7 @@ mod tests {
             .expect("the store refuses writes");
         let report = host
             .privacy
-            .enable(&[], at(0))
+            .enable(&[], at(0), &standing)
             .expect("the record is written");
         assert!(!unavailable(&report, "backup").is_empty());
         assert!(host.backup.unready().is_some());
@@ -2222,14 +2414,17 @@ mod tests {
 
         let report = host
             .privacy
-            .enable(&[], at(0))
+            .enable(&[], at(0), &standing)
             .expect("privacy mode is enabled");
         assert!(
             outstanding(&report, "backup") > 0,
             "{:?}",
             report.completion
         );
-        let refused = host.privacy.disable(at(10)).expect_err("cleanup is owed");
+        let refused = host
+            .privacy
+            .disable(at(10), &standing)
+            .expect_err("cleanup is owed");
         assert!(refused.to_string().contains("unfinished"), "{refused}");
         assert!(host.privacy.state().is_private());
 
@@ -2247,7 +2442,7 @@ mod tests {
 
         let report = host
             .privacy
-            .disable(at(2_000))
+            .disable(at(2_000), &standing)
             .expect("nothing is owed now");
         assert!(!report.enabled);
         assert_eq!(report.generation, PrivacyGeneration::new(2));
@@ -2271,13 +2466,16 @@ mod tests {
         let host = Host::open();
         let report = host
             .privacy
-            .enable(&[], at(0))
+            .enable(&[], at(0), &standing)
             .expect("privacy mode is enabled");
         assert!(report.completion.is_complete(), "{:?}", report.completion);
         host.backup
             .set_query_only(true)
             .expect("the store refuses writes");
-        let report = host.privacy.disable(at(10)).expect("the record is written");
+        let report = host
+            .privacy
+            .disable(at(10), &standing)
+            .expect("the record is written");
         assert!(!report.enabled);
         assert!(
             unavailable(&report, "backup")
@@ -2307,7 +2505,7 @@ mod tests {
         let host = Host::open();
         let report = host
             .privacy
-            .enable(&[session(1), session(2)], at(0))
+            .enable(&[session(1), session(2)], at(0), &standing)
             .expect("privacy mode is enabled");
         assert_eq!(report.obligations.len(), 2);
         assert_eq!(outstanding(&report, "sessions"), 2);
@@ -2331,23 +2529,11 @@ mod tests {
 
         // One worker says its cleanup is still going, then that it is complete.
         host.privacy
-            .note_answer(
-                session(1),
-                PrivacyGeneration::new(1),
-                true,
-                Completion::Reconciling {
-                    outstanding: vec![("attention", 1)],
-                },
-            )
+            .note_answer(&ack(session(1), 1, true, reconciling("attention", 1)))
             .expect("an answer");
         assert_eq!(host.privacy.notices_due(at(1_010)).len(), 2);
         host.privacy
-            .note_answer(
-                session(1),
-                PrivacyGeneration::new(1),
-                true,
-                Completion::Complete,
-            )
+            .note_answer(&ack(session(1), 1, true, PrivacyCompletion::Complete))
             .expect("an answer");
         let report = host.privacy.report_now(at(1_020));
         assert_eq!(report.obligations.len(), 1);
@@ -2356,7 +2542,7 @@ mod tests {
         // The other session's worker is live and has not said: privacy mode stays on.
         let refused = host
             .privacy
-            .disable(at(1_030))
+            .disable(at(1_030), &standing)
             .expect_err("a live session still owes");
         assert!(refused.to_string().contains("has not said"), "{refused}");
 
@@ -2365,7 +2551,7 @@ mod tests {
         host.privacy.note_session_ended(session(2));
         let report = host
             .privacy
-            .disable(at(1_040))
+            .disable(at(1_040), &standing)
             .expect("an ended session does not hold privacy mode on");
         assert!(!report.enabled);
         assert_eq!(report.obligations.len(), 1);
@@ -2391,12 +2577,7 @@ mod tests {
             }]
         );
         host.privacy
-            .note_answer(
-                session(1),
-                PrivacyGeneration::new(2),
-                false,
-                Completion::Complete,
-            )
+            .note_answer(&ack(session(1), 2, false, PrivacyCompletion::Complete))
             .expect("an answer");
         let report = host.privacy.report_now(at(2_010));
         assert_eq!(outstanding(&report, "sessions"), 0);
@@ -2407,7 +2588,7 @@ mod tests {
         host.privacy.resume(at(3_000));
         let report = host
             .privacy
-            .enable(&[], at(3_010))
+            .enable(&[], at(3_010), &standing)
             .expect("privacy mode is enabled again");
         assert_eq!(report.generation, PrivacyGeneration::new(3));
         assert_eq!(report.obligations.len(), 1);
@@ -2440,7 +2621,7 @@ mod tests {
                     .expect("the delivery outbox");
             });
             held_rx.recv().expect("the delivery outbox is held");
-            let enabling = scope.spawn(|| host.privacy.enable(&[], at(10)));
+            let enabling = scope.spawn(|| host.privacy.enable(&[], at(10), &standing));
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
             while !host.privacy.state().is_private() {
                 assert!(
@@ -2515,7 +2696,7 @@ mod tests {
     fn a_session_that_joins_while_private_owes_its_cleanup_until_its_worker_answers() {
         let host = Host::open();
         host.privacy
-            .enable(&[], at(0))
+            .enable(&[], at(0), &standing)
             .expect("privacy mode is enabled");
         host.privacy
             .note_session_live(session(5), at(10))
@@ -2524,7 +2705,7 @@ mod tests {
         assert_eq!(report.obligations.len(), 1);
         assert!(!report.completion.is_complete());
         assert!(
-            host.privacy.disable(at(30)).is_err(),
+            host.privacy.disable(at(30), &standing).is_err(),
             "a live session has not answered"
         );
 
@@ -2542,12 +2723,7 @@ mod tests {
             .note_session_live(session(6), at(60))
             .expect("a live session");
         host.privacy
-            .note_answer(
-                session(6),
-                PrivacyGeneration::new(1),
-                true,
-                Completion::Complete,
-            )
+            .note_answer(&ack(session(6), 1, true, PrivacyCompletion::Complete))
             .expect("an answer");
         assert_eq!(host.privacy.report_now(at(70)).obligations.len(), 1);
     }
@@ -2562,46 +2738,31 @@ mod tests {
             .note_session_live(session(1), at(0))
             .expect("a live session");
         host.privacy
-            .enable(&[], at(10))
+            .enable(&[], at(10), &standing)
             .expect("privacy mode is enabled");
         host.privacy
-            .note_answer(
-                session(1),
-                PrivacyGeneration::new(1),
-                true,
-                Completion::Complete,
-            )
+            .note_answer(&ack(session(1), 1, true, PrivacyCompletion::Complete))
             .expect("an answer");
-        let report = host.privacy.disable(at(20)).expect("nothing is owed");
+        let report = host
+            .privacy
+            .disable(at(20), &standing)
+            .expect("nothing is owed");
         assert_eq!(outstanding(&report, "sessions"), 1, "not yet answered");
 
         host.privacy
-            .note_answer(
-                session(1),
-                PrivacyGeneration::new(2),
-                false,
-                Completion::Reconciling {
-                    outstanding: vec![("history", 2)],
-                },
-            )
+            .note_answer(&ack(session(1), 2, false, reconciling("history", 2)))
             .expect("an answer");
         let report = host.privacy.report_now(at(30));
         assert_eq!(outstanding(&report, "sessions"), 2);
         assert!(!report.completion.is_complete());
 
         host.privacy
-            .note_answer(
+            .note_answer(&ack(
                 session(1),
-                PrivacyGeneration::new(2),
+                2,
                 false,
-                Completion::Unavailable {
-                    unavailable: vec![(
-                        "receipts",
-                        Unavailable::new("the journal refused the redaction"),
-                    )],
-                    outstanding: Vec::new(),
-                },
-            )
+                refused("receipts", "the journal refused the redaction"),
+            ))
             .expect("an answer");
         let report = host.privacy.report_now(at(40));
         assert!(
@@ -2613,12 +2774,7 @@ mod tests {
         );
 
         host.privacy
-            .note_answer(
-                session(1),
-                PrivacyGeneration::new(2),
-                false,
-                Completion::Complete,
-            )
+            .note_answer(&ack(session(1), 2, false, PrivacyCompletion::Complete))
             .expect("an answer");
         assert!(host.privacy.report_now(at(50)).completion.is_complete());
     }
@@ -2641,7 +2797,7 @@ mod tests {
         let directory = staged[0].parent().expect("a directory").to_path_buf();
         set_writable(&directory, false);
         host.privacy
-            .enable(&[], at(0))
+            .enable(&[], at(0), &standing)
             .expect("privacy mode is enabled");
         Connection::open(host.root.path().join(PRIVACY_RECORD))
             .expect("the record")
@@ -2682,7 +2838,7 @@ mod tests {
             .set_query_only(true)
             .expect("the store refuses writes");
         host.privacy
-            .enable(&[], at(0))
+            .enable(&[], at(0), &standing)
             .expect("the record is written");
         assert!(matches!(
             host.owed(Subsystem::Backup),
@@ -2728,7 +2884,7 @@ mod tests {
             .set_query_only(true)
             .expect("the store refuses writes");
         host.privacy
-            .enable(&[], at(0))
+            .enable(&[], at(0), &standing)
             .expect("the record is written");
         host.privacy.tick(at(1_000));
         assert!(matches!(
@@ -2789,7 +2945,7 @@ mod tests {
             .expect("the store will refuse the removal");
         let report = host
             .privacy
-            .enable(&[], at(0))
+            .enable(&[], at(0), &standing)
             .expect("privacy mode is enabled");
         assert!(matches!(
             host.owed(Subsystem::Backup),
@@ -2825,7 +2981,7 @@ mod tests {
             .expect("the journal will refuse the fence");
         let report = host
             .privacy
-            .enable(&[], at(0))
+            .enable(&[], at(0), &standing)
             .expect("privacy mode is enabled");
         assert!(
             unavailable(&report, "delivery")
@@ -2895,7 +3051,7 @@ mod tests {
 
         let report = host
             .privacy
-            .enable(&[], at(10))
+            .enable(&[], at(10), &standing)
             .expect("privacy mode is enabled");
         assert!(report.completion.is_complete(), "{:?}", report.completion);
         assert_eq!(other.generated_count().expect("a count"), 0);
@@ -2956,7 +3112,7 @@ mod tests {
     fn an_obligation_the_store_refused_is_still_owed_and_written_on_a_retry() {
         let host = Host::open();
         host.privacy
-            .enable(&[], at(0))
+            .enable(&[], at(0), &standing)
             .expect("privacy mode is enabled");
         let record = Connection::open(host.root.path().join(PRIVACY_RECORD)).expect("the record");
         record
@@ -2982,7 +3138,7 @@ mod tests {
             report.completion
         );
         assert!(
-            host.privacy.disable(at(30)).is_err(),
+            host.privacy.disable(at(30), &standing).is_err(),
             "the session still owes"
         );
 
@@ -3016,7 +3172,7 @@ mod tests {
     fn a_repeated_live_note_says_the_obligation_is_recorded_only_once_it_is() {
         let host = Host::open();
         host.privacy
-            .enable(&[], at(0))
+            .enable(&[], at(0), &standing)
             .expect("privacy mode is enabled");
         let record = Connection::open(host.root.path().join(PRIVACY_RECORD)).expect("the record");
         record
@@ -3078,7 +3234,7 @@ mod tests {
         std::thread::scope(|scope| {
             // Owned here, so a failed assertion lets the stopped enabling go on rather than wait.
             let release = release;
-            let enabling = scope.spawn(|| host.privacy.enable(&[], at(10)));
+            let enabling = scope.spawn(|| host.privacy.enable(&[], at(10), &standing));
             arrived
                 .recv_timeout(std::time::Duration::from_secs(30))
                 .expect("the record is written");
@@ -3112,7 +3268,7 @@ mod tests {
             "refused while privacy mode is on"
         );
         host.privacy
-            .disable(at(20))
+            .disable(at(20), &standing)
             .expect("privacy mode is turned off");
         assert!(
             state.admit_send(PrivacyGeneration::new(2)).is_some(),
@@ -3131,7 +3287,7 @@ mod tests {
         std::thread::scope(|scope| {
             // Owned here, so a failed assertion lets the stopped enabling go on rather than wait.
             let release = release;
-            let enabling = scope.spawn(|| host.privacy.enable(&[], at(10)));
+            let enabling = scope.spawn(|| host.privacy.enable(&[], at(10), &standing));
             arrived
                 .recv_timeout(std::time::Duration::from_secs(30))
                 .expect("the record is written");
