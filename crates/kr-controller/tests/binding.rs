@@ -961,7 +961,7 @@ async fn a_worker_fenced_between_its_claim_and_its_specification_leaves_once_its
 /// worker the host stopped trusting is a member again, pending and never sent a round, until its
 /// process has ended.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn a_fenced_worker_is_a_member_again_after_a_restart_until_its_process_ends() {
+async fn kr_req_11_12_a_fenced_worker_is_a_member_again_after_a_restart_until_its_process_ends() {
     let mut hosted = Hosted::start().await;
     let created = hosted.session().await;
     let launched = hosted.launched_for(Some(created.session.session_id)).await;

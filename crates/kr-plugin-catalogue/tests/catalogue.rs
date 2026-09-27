@@ -4480,7 +4480,7 @@ async fn install_second(
 /// retryably and naming the worker, and removes nothing; once every worker has reported, the same
 /// installation proceeds and removes what nothing protects.
 #[tokio::test]
-async fn a_reclaim_that_needs_room_waits_for_a_pending_worker_and_removes_nothing() {
+async fn kr_req_11_12_a_reclaim_that_needs_room_waits_for_a_pending_worker_and_removes_nothing() {
     let home = tempfile::tempdir().expect("a temporary directory");
     let first = Generation::build(home.path(), GenerationSpec::default()).await;
     let second = second_release(home.path(), &first).await;
@@ -4549,7 +4549,7 @@ async fn a_reclaim_that_needs_room_waits_for_a_pending_worker_and_removes_nothin
 /// change committed and not yet announced to them already counts, and a worker that reported only
 /// at the revision before it holds the reclaim up.
 #[tokio::test]
-async fn a_reclaim_asks_at_the_revision_its_own_transaction_reads() {
+async fn kr_req_11_12_a_reclaim_asks_at_the_revision_its_own_transaction_reads() {
     let home = tempfile::tempdir().expect("a temporary directory");
     let first = Generation::build(home.path(), GenerationSpec::default()).await;
     let second = second_release(home.path(), &first).await;
