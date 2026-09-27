@@ -569,6 +569,10 @@ impl Provenance {
                                 entry.pid,
                                 &error.to_string(),
                             ) {
+                                // Its number goes with the part's evidence whatever else holds.
+                                if !seen.other_users.iter().any(|(pid, _)| *pid == entry.pid) {
+                                    seen.other_users.push((entry.pid, path.clone()));
+                                }
                                 // What it started could not be followed back to it, so it may
                                 // start nothing.
                                 if let Some(child) =
@@ -584,9 +588,6 @@ impl Provenance {
                                         ),
                                     );
                                     continue;
-                                }
-                                if !seen.other_users.iter().any(|(pid, _)| *pid == entry.pid) {
-                                    seen.other_users.push((entry.pid, path));
                                 }
                                 continue;
                             }

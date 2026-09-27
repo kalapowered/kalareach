@@ -1321,7 +1321,8 @@ fn login_holds(stage: &Stage<'_, '_>, variables: &[(String, String)]) {
 }
 
 /// The files the build list says must not exist before the agent starts, with `{config}` and
-/// `{work}` made the run's configuration and working directories.
+/// `{work}` made the run's configuration and working directories and `{user}` the person's account
+/// name.
 fn absent_paths(stage: &Stage<'_, '_>) -> Vec<PathBuf> {
     let account = stage.login.expect("a part with a login").account();
     let config = stage
@@ -1331,10 +1332,17 @@ fn absent_paths(stage: &Stage<'_, '_>) -> Vec<PathBuf> {
         .display()
         .to_string();
     let work = stage.run.work().display().to_string();
+    let user = std::env::var("USER").unwrap_or_default();
     account
         .absent
         .iter()
-        .map(|path| PathBuf::from(path.replace("{config}", &config).replace("{work}", &work)))
+        .map(|path| {
+            PathBuf::from(
+                path.replace("{config}", &config)
+                    .replace("{work}", &work)
+                    .replace("{user}", &user),
+            )
+        })
         .collect()
 }
 

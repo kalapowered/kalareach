@@ -927,22 +927,29 @@ pub fn beneath(run: &Run, ancestor: &ProcessStartIdentity, what: &str) -> Vec<Ag
                 ProcessQuery::Present(identity) => identity,
                 ProcessQuery::Gone => continue,
                 // One of the system's own programs running as another user is none of the
-                // agent's processes; the run's own search above noted it, and failed had it
-                // started anything.
-                ProcessQuery::CannotEstablish(error)
-                    if kr_e2e_m1b::run::system_program_of_another_user(
+                // agent's processes: it is noted for the run's close, and it may start nothing,
+                // since what it started could not be followed back to it.
+                ProcessQuery::CannotEstablish(error) => {
+                    let Some(path) = kr_e2e_m1b::run::system_program_of_another_user(
                         entry.pid,
                         &error.to_string(),
-                    )
-                    .is_some() =>
-                {
+                    ) else {
+                        panic!(
+                            "process {} beneath {what} could not be identified: {error}",
+                            entry.pid
+                        )
+                    };
+                    run.note_system_program(entry.pid, &path);
+                    if let Some(child) = table.iter().find(|child| child.parent == entry.pid) {
+                        panic!(
+                            "the system program {} (process {}) beneath {what} started process \
+                             {}, which cannot be followed back to it",
+                            path.display(),
+                            entry.pid,
+                            child.pid
+                        )
+                    }
                     continue;
-                }
-                ProcessQuery::CannotEstablish(error) => {
-                    panic!(
-                        "process {} beneath {what} could not be identified: {error}",
-                        entry.pid
-                    )
                 }
             };
             let Some(described) = describe(&identity)
