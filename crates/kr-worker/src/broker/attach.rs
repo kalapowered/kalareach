@@ -598,10 +598,10 @@ pub struct NativeGateway {
 
 /// Stops a process a launch started, and waits for it, because the launch failed after it.
 ///
-/// The process has not been told where to connect, so it has done nothing anyone depends on, and
-/// it is ended at once rather than given a grace period. It is waited for so that it is gone, not
-/// merely signalled, when the launch returns. What it started in the meantime is ended with it:
-/// on Windows by its job, and elsewhere as [`end_started`] finds it.
+/// The process is still held ([`held_command`]): it has run nothing of its program, so it has
+/// forked nothing, and ending it ends everything the launch started. It is ended at once rather
+/// than given a grace period, and waited for so that it is gone, not merely signalled, when the
+/// launch returns. On Windows its job is ended with it, which ends anything it started.
 fn stop_started(mut child: std::process::Child, started: &ProcessStartIdentity) {
     #[cfg(windows)]
     if let Some(job) = crate::windows::job::agent_job(started) {
@@ -610,82 +610,86 @@ fn stop_started(mut child: std::process::Child, started: &ProcessStartIdentity) 
     }
     #[cfg(not(windows))]
     let _ = started;
-    end_started(&mut child);
-}
-
-/// Ends a process this host started and has not collected, with what it forked, and collects it.
-///
-/// On Unix the agent stays in this worker's process group, which is the boundary the platform's
-/// service manager ends with the worker's job, so it is not given a group of its own. What it forked
-/// is found by parentage instead ([`frozen_descendants`]) and ended by the identity it was found
-/// with, and the agent is ended through its handle and collected last: until then its identifier
-/// is still its own. A process that has already exited cannot be signalled, and that is the
-/// outcome wanted.
-fn end_started(child: &mut std::process::Child) {
-    #[cfg(unix)]
-    for forked in frozen_descendants(child.id()) {
-        if kr_ipc::identity::process_state(&forked) == kr_ipc::identity::ProcessState::Running {
-            signal(forked.pid.get(), rustix::process::Signal::KILL);
-        }
-    }
+    // A process that has already exited cannot be killed, and that is the outcome wanted.
     let _ = child.kill();
     let _ = child.wait();
 }
 
-/// Returns every process `pid` forked that is still in this worker's process group, each one
-/// stopped as it is found.
-///
-/// The process itself is stopped first, so it forks nothing more while its children are looked
-/// for, and so is each child found, before its own children are looked for; a pass over the group
-/// that finds nothing new ends the search. A child is one whose parent, read from the kernel and
-/// checked by start identity, is a process already found. A process that left the group on purpose,
-/// or whose parent had already exited when it was looked for, is not found.
+/// The shell a Unix launch holds its program in.
 #[cfg(unix)]
-fn frozen_descendants(pid: u32) -> Vec<ProcessStartIdentity> {
-    signal(u64::from(pid), rustix::process::Signal::STOP);
-    let Ok(started) = kr_ipc::identity::process_start_identity(pid) else {
-        return Vec::new();
-    };
-    let Ok(group) = u32::try_from(rustix::process::getpgrp().as_raw_nonzero().get()) else {
-        return Vec::new();
-    };
-    let mut found = vec![started];
-    while let Ok(members) = kr_ipc::identity::processes_in_group(group) {
-        let before = found.len();
-        for member in members {
-            if member == std::process::id()
-                || found
-                    .iter()
-                    .any(|known| known.pid.get() == u64::from(member))
-            {
-                continue;
-            }
-            let Ok(identity) = kr_ipc::identity::process_start_identity(member) else {
-                continue;
-            };
-            let forked = crate::questions::binding::parent_of(&identity)
-                .is_some_and(|parent| found.iter().any(|known| known.matches(&parent)));
-            if forked {
-                signal(u64::from(member), rustix::process::Signal::STOP);
-                found.push(identity);
-            }
+const HOLDING_SHELL: &str = "/bin/sh";
+
+/// What the holding shell runs: wait for one line, then become the program, with its arguments.
+///
+/// The program and its arguments are the script's own parameters, so none of them is read as
+/// script. A standard input that closes before the line comes is a launch that never committed,
+/// and the program is not run.
+#[cfg(unix)]
+const HOLD: &str = r#"read -r released || exit 1; exec "$0" "$@""#;
+
+/// Returns the command that starts `program` with `arguments`, held until its launch has
+/// committed.
+///
+/// On Unix the command is a shell that waits for one line on its standard input and then replaces
+/// itself with the program, so the program runs nothing, and forks nothing, until [`release`] says
+/// the launch has committed; a launch that fails before then ends a process that has run nothing
+/// of it ([`stop_started`]). The process keeps its identifier and its start across the
+/// replacement, so the identity read when it starts is the program's. A program that is not a file
+/// this host can run is refused here, before anything starts, as starting it directly would have
+/// been. Elsewhere the program is started as it is, and its job holds what it starts.
+///
+/// # Errors
+///
+/// Returns [`BrokerError::LedgerUnavailable`] for a program that is not a file this host can run.
+fn held_command(program: &str, arguments: &[String]) -> Result<std::process::Command> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let runnable = std::fs::metadata(program)
+            .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0);
+        if !runnable {
+            return Err(BrokerError::ledger(format!(
+                "could not start {program}: it is not a file this host can run"
+            )));
         }
-        if found.len() == before {
-            break;
-        }
+        let mut command = std::process::Command::new(HOLDING_SHELL);
+        command.arg("-c").arg(HOLD).arg(program).args(arguments);
+        Ok(command)
     }
-    found.split_off(1)
+    #[cfg(not(unix))]
+    {
+        let mut command = std::process::Command::new(program);
+        command.args(arguments);
+        Ok(command)
+    }
 }
 
-/// Sends one signal to one process, where the identifier can name one.
-#[cfg(unix)]
-fn signal(pid: u64, signal: rustix::process::Signal) {
-    if let Some(pid) = i32::try_from(pid)
-        .ok()
-        .and_then(rustix::process::Pid::from_raw)
+/// Lets a held process become its program, now that its launch has committed
+/// ([`held_command`]).
+///
+/// # Errors
+///
+/// Returns [`BrokerError::LedgerUnavailable`] when the word cannot be written, which is a process
+/// that has gone.
+fn release(child: &mut std::process::Child) -> Result<()> {
+    #[cfg(unix)]
     {
-        let _ = rustix::process::kill_process(pid, signal);
+        use std::io::Write as _;
+        let stdin = child.stdin.as_mut().ok_or_else(|| {
+            BrokerError::ledger("the started process has no standard input to be released through")
+        })?;
+        stdin
+            .write_all(b"\n")
+            .and_then(|()| stdin.flush())
+            .map_err(|error| {
+                BrokerError::ledger(format!(
+                    "the started process could not be released: {error}"
+                ))
+            })?;
     }
+    #[cfg(not(unix))]
+    let _ = child;
+    Ok(())
 }
 
 /// Starts the agent `command` names and reads back what the kernel started.
@@ -694,7 +698,8 @@ fn signal(pid: u64, signal: rustix::process::Signal) {
 /// for the broker: a Windows process keeps naming a parent after that parent exits, so the broker
 /// places a caller under an agent by what the agent's job holds rather than by a walk up the
 /// parents. Elsewhere the broker walks the parents, and the agent is started as it is, in this
-/// worker's process group.
+/// worker's process group, which is the boundary the platform's service manager ends with the
+/// worker's job.
 fn start_agent(
     command: &mut std::process::Command,
     program: &str,
@@ -716,7 +721,8 @@ fn start_agent(
             // identity later, so it is stopped now, while the handle still names it.
             #[cfg(windows)]
             let _ = job.terminate(1);
-            end_started(&mut child);
+            let _ = child.kill();
+            let _ = child.wait();
             return Err(BrokerError::ledger(format!(
                 "the started process cannot be read, so it was stopped: {error}"
             )));
@@ -919,9 +925,8 @@ impl NativeGateway {
         let broker = Arc::clone(&self.broker);
         let reservation = broker.execute_launch(intent, foreground, application_instance_id)?;
         let program = reservation.profile().binary.resolved_path.clone();
-        let mut command = std::process::Command::new(&program);
+        let mut command = held_command(&program, &reservation.profile().arguments)?;
         command
-            .args(&reservation.profile().arguments)
             .current_dir(&self.runtime_directory)
             // One variable: the registration names the credential file beside it.
             .env("KR_REGISTRATION", &registration_path)
@@ -930,7 +935,7 @@ impl NativeGateway {
             // whatever the launched process says to the host that started it.
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped());
-        let (child, started) = start_agent(&mut command, &program)?;
+        let (mut child, started) = start_agent(&mut command, &program)?;
         #[cfg(feature = "testing")]
         {
             self.last_started = Some(started.clone());
@@ -973,6 +978,20 @@ impl NativeGateway {
         let profile_id = registered.profile().profile_id.clone();
         match self.publish(&profile_id, &started, &credential_path, &registration_path) {
             Ok(registration) => {
+                // The launch has committed everything it can fail at, so the held process becomes
+                // its program now, and not before.
+                if let Err(error) = release(&mut child) {
+                    // Published for a process that will never run its program, so the name goes
+                    // the way the credential does.
+                    let _ = std::fs::remove_file(&registration_path);
+                    return Err(self.fail_after_start(
+                        child,
+                        &started,
+                        registered,
+                        Some(&credential_path),
+                        error,
+                    ));
+                }
                 let profile = registered.commit();
                 self.launch.expected_process = Some(started.clone());
                 let _ = self.registration.set(registration);
