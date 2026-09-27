@@ -48,10 +48,20 @@ nothing it read for a session it has left. The host announces no new entry in an
 no change to the attention inbox and no new request an agent is waiting on, so a screen that shows
 one reads it again while the page is shown: on a cadence, and at once when the page is shown again
 or the host is heard to be back. It has one read on its way at a time, and a read asked for
-meanwhile, as after an action, follows it. The conversation reads each agent's history from the
-entry after the last one it holds, and counts what the host withheld from this device once however
-often it reads. What a package shows arrives on the event stream, and a node already held is
-replaced only by a newer revision of it. In a session, when the launch surface was read at an older
+meanwhile, as after an action, follows it. The inbox and review state are read page by page, and
+a list the bound cut short says the host holds more. The conversation reads each agent's history
+from the entry after the last one it holds, and counts what the host withheld from this device once
+however often it reads. An agent's history goes with it when it ends, so the conversation says when
+one it was reading ended before its last entries were read. What a package shows arrives on the
+event stream, and a node already held is replaced only by a newer revision of it.
+
+A draft keeps the conversation it was written for: the agent's instance and the binding revision
+the person wrote to. If the agent moves to another conversation while the draft is on screen, the
+draft is conflicted and nothing sends it on; the person chooses whether it goes to the new one. A
+file dropped on the window goes through the transfer service and is kept with the draft, but a
+prompt sent from here carries its text inline and cannot carry the file, so a draft that holds one
+is not sent until the person removes it. Nothing that needs a right is offered before the connection
+has said what it may do. In a session, when the launch surface was read at an older
 prompt generation than the view has heard since, its buttons start disabled.
 
 Nothing claims contact, or its loss, before an answer says which. Until the first answer the
