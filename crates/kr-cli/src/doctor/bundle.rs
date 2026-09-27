@@ -146,7 +146,10 @@ pub fn write(path: &Path, bundle: &ComposedBundle, content: &[Content]) -> Resul
             Shown::json(&error)
         ))
     })?;
-    let report = super::doctor_lines(bundle.doctor().get(), true);
+    let report = super::report_lines(bundle.doctor().get())
+        .into_iter()
+        .map(|line| line.into_string() + "\n")
+        .collect::<String>();
     let mut archive = Archive::new();
     archive.file(MANIFEST, &manifest)?;
     archive.file(REPORT, report.as_bytes())?;

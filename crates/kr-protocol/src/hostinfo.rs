@@ -277,6 +277,30 @@ impl DoctorCheck {
         self.remedy.as_ref().map(export::Stated::as_str)
     }
 
+    /// The identifier as it was stated, which a reader says on the terms its provenance sets.
+    #[must_use]
+    pub const fn stated_id(&self) -> &export::Stated {
+        &self.id
+    }
+
+    /// The title as it was stated.
+    #[must_use]
+    pub const fn stated_title(&self) -> &export::Stated {
+        &self.title
+    }
+
+    /// The detail as it was composed.
+    #[must_use]
+    pub const fn stated_detail(&self) -> &export::Sentence {
+        &self.detail
+    }
+
+    /// The remedy as it was stated, when there is one.
+    #[must_use]
+    pub fn stated_remedy(&self) -> Option<&export::Stated> {
+        self.remedy.as_ref()
+    }
+
     /// Returns the evidence lines `kr doctor --verbose` prints under this check.
     #[must_use]
     pub fn evidence(&self) -> Vec<String> {
@@ -588,6 +612,13 @@ impl EffectiveValue {
     #[must_use]
     pub fn about(&self) -> &str {
         self.about.as_str()
+    }
+
+    /// What this value decides, as it was stated, which a reader says on the terms its provenance
+    /// sets.
+    #[must_use]
+    pub const fn stated_about(&self) -> &export::Stated {
+        &self.about
     }
 
     /// The value in force, in its stable spelling.

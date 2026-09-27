@@ -1963,7 +1963,7 @@ mod tests {
         else {
             panic!("no daemon serves another environment");
         };
-        assert_eq!(refused.code(), "HOST_NOT_CONFIGURED");
+        assert_eq!(refused.code().as_str(), "HOST_NOT_CONFIGURED");
         let message = refused.to_string();
         assert!(
             message.contains(&format!(
@@ -2072,7 +2072,7 @@ mod tests {
         else {
             panic!("nothing answered");
         };
-        assert_eq!(refused.code(), "ENVIRONMENT_UNAVAILABLE");
+        assert_eq!(refused.code().as_str(), "ENVIRONMENT_UNAVAILABLE");
         assert!(
             refused
                 .to_string()

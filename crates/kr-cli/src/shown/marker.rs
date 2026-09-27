@@ -81,7 +81,7 @@ pub(crate) fn failure_renderings(error: CliError) -> Vec<String> {
         format!("{error:?}"),
         format!("{error:#?}"),
         kr_client::shown!("kr: {}", error).into_string(),
-        crate::report::failure(&error).to_string(),
+        crate::report::failure(&error).json().to_string(),
     ];
     let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
         let failed: Result<(), CliError> = std::hint::black_box(Err(error));

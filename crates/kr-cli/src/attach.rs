@@ -737,7 +737,7 @@ mod a_worker_of_another_build {
             matches!(&refusal, CliError::Refused(error) if error.code == ErrorCode::UnsupportedSchema),
             "{refusal}"
         );
-        assert_eq!(refusal.code(), "UNSUPPORTED_SCHEMA");
+        assert_eq!(refusal.code(), ErrorCode::UnsupportedSchema);
         assert_eq!(refusal.exit_code(), 8);
         refusal.to_string()
     }

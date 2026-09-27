@@ -260,6 +260,7 @@ fn pattern_example(pattern: &str) -> Value {
             "0e1f9a2b-3c4d-4e5f-8a9b-0c1d2e3f4a5b"
         }
         "^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$" => "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "^([A-Za-z0-9_-]{4})*([A-Za-z0-9_-][AQgw]|[A-Za-z0-9_-]{2}[AEIMQUYcgkosw048])?$" => "AAAA",
         other => panic!("the planted values have no example of the pattern {other}"),
     };
     Value::from(example)
@@ -312,11 +313,27 @@ fn walk(value: &Value, path: &str, found: &mut BTreeSet<String>) {
 ///
 /// Panics, naming the path, where the marker shows anywhere else.
 pub(crate) fn only_asked(label: &str, document: &Document) -> BTreeSet<String> {
+    only_asked_or_host_text(label, document, &[])
+}
+
+/// Holds a document to its rule where some of its fields say the host's own export text through
+/// the door for it ([`crate::shown::host_text`]): the marker shows only where the document holds
+/// asked content or at one of `doors`. The schema a value is planted from cannot tell a field of
+/// that text from any other string, so the fields are named here. Returns where the marker showed.
+///
+/// # Panics
+///
+/// Panics, naming the path, where the marker shows anywhere else.
+pub(crate) fn only_asked_or_host_text(
+    label: &str,
+    document: &Document,
+    doors: &[&str],
+) -> BTreeSet<String> {
     let json = document.json();
     let found = marked(&json);
     for path in &found {
         assert!(
-            document.asked().contains(path),
+            document.asked().contains(path) || doors.contains(&path.as_str()),
             "{label}: the planted text shows at {path}, which holds no asked content\n{json:#}"
         );
     }

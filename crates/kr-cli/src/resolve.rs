@@ -490,7 +490,7 @@ mod tests {
             matches!(refused, CliError::AmbiguousSession(_)),
             "{refused}"
         );
-        assert_eq!(refused.code(), "AMBIGUOUS_SESSION");
+        assert_eq!(refused.code().as_str(), "AMBIGUOUS_SESSION");
         assert_ne!(refused.exit_code(), 0);
 
         let (known, descriptor) = find(host.paths(), &SessionSelector::Display(1), Some(second))
@@ -527,7 +527,11 @@ mod tests {
             panic!("the connection was still waiting for a hello after {patience:?}");
         };
         let refused = opened.map(|_| ()).expect_err("nothing answered");
-        assert_eq!(refused.code(), "ENVIRONMENT_UNAVAILABLE", "{refused}");
+        assert_eq!(
+            refused.code().as_str(),
+            "ENVIRONMENT_UNAVAILABLE",
+            "{refused}"
+        );
         assert!(
             refused.to_string().contains(&format!(
                 "the control daemon listening for environment {} accepted the connection and did \

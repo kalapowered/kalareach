@@ -444,7 +444,7 @@ mod tests {
             (ApplyOutcomeClass::UncertainOutcome, "OUTCOME_UNKNOWN"),
         ] {
             let error = unfinished(&result(Some(outcome)), true).expect("a failure");
-            assert_eq!(error.code(), code, "{outcome:?}");
+            assert_eq!(error.code().as_str(), code, "{outcome:?}");
             assert_ne!(error.exit_code(), 0, "{outcome:?}");
             assert!(
                 error.to_string().starts_with("the revert did not finish"),

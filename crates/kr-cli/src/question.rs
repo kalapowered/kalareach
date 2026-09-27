@@ -1497,7 +1497,7 @@ mod tests {
             assert_eq!(document["state"], "retired");
             assert_eq!(document["reason_code"], code, "{document}");
             let refused = answer_failure(AnswerError::Retired(reason));
-            assert_eq!(refused.code(), code);
+            assert_eq!(refused.code().as_str(), code);
             assert!(
                 refused
                     .to_string()

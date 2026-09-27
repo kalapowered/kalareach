@@ -263,13 +263,15 @@ const ONLY_STD_DEBUG: &str = "only the standard library's Debug may carry the na
 
 /// The library's macros, which the files that define what may be shown write: what each writes is
 /// read where it is used, or is theirs to decide.
-const LIBRARY_MACROS: [&str; 6] = [
+const LIBRARY_MACROS: [&str; 7] = [
     SHOWN_MACRO,
     DEBUG_AS_NAME,
     DEBUG_FIELDS,
     DEBUG_AS_DISPLAY,
     "kr_client::display_as_said",
     "kr_client::plain",
+    // The command line's composition of a standard output line, which writes a call and no item.
+    "kr_cli::stdout_line",
 ];
 
 /// Macros from outside the workspace that the two crates may use, each read in its source for

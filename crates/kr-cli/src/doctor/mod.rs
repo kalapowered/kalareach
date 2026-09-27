@@ -26,9 +26,11 @@ use kr_protocol::hostinfo::{
     CommandIntegrationReport, CommandIntegrationUnavailable, DoctorCheck, DoctorStatus,
     EffectiveConfiguration, HostDoctorResult, HostInfoResult,
 };
-use serde_json::{Value, json};
 
 use crate::error::{CliError, Result};
+use crate::output::{Asked, Document, Line, Request, configured, configured_field};
+use crate::shown::host_text;
+use crate::stdout_line;
 
 /// Adds the service start's own check to the daemon's diagnostics, where there is anything of it
 /// to report: whether the definition kr wrote is the one `kr new` would have the service manager
@@ -272,59 +274,152 @@ fn startup_check(environment: &kr_ipc::paths::EnvironmentPaths) -> Option<Doctor
 }
 
 /// Renders diagnostics.
+///
+/// A check's words are the host's own export text, said as the host wrote them.
 #[must_use]
-pub fn doctor(result: &HostDoctorResult) -> Value {
-    json!({
-        "healthy": result.healthy,
-        "checks": result.checks.iter().map(|check| json!({
-            "id": check.id(),
-            "title": check.title(),
-            "status": check.status.as_str(),
-            "detail": check.detail(),
-            "remedy": check.remedy(),
-        })).collect::<Vec<_>>(),
-        "command_integrations": result.command_integrations.iter().map(|report| json!({
-            "plugin_id": report.plugin_id,
-            "version": report.version.0,
-            "command": report.command.0,
-            "flags": report.flags,
-            "variables": report.variables.iter().map(|variable| json!({
-                "name": variable.name,
-                "value": variable.value,
-            })).collect::<Vec<_>>(),
-            "state": report.state.as_str(),
-            "unavailable": report.unavailable.0.map(CommandIntegrationUnavailable::as_str),
-            "mode": report.mode.as_str(),
-            "executable": report.executable.0,
-            "executable_version": report.executable_version.0,
-            "reason": report.reason.0,
-        })).collect::<Vec<_>>(),
-    })
+pub fn doctor(result: &HostDoctorResult) -> Document {
+    Document::new()
+        .with("healthy", result.healthy)
+        .with(
+            "checks",
+            result
+                .checks
+                .iter()
+                .map(|check| {
+                    Document::new()
+                        .with("id", host_text(check.stated_id()))
+                        .with("title", host_text(check.stated_title()))
+                        .with("status", check.status.as_str())
+                        .with("detail", host_text(check.stated_detail()))
+                        .with("remedy", check.stated_remedy().map(host_text))
+                })
+                .collect::<Vec<_>>(),
+        )
+        .with(
+            "command_integrations",
+            result
+                .command_integrations
+                .iter()
+                .map(integration)
+                .collect::<Vec<_>>(),
+        )
+}
+
+/// One command integration, in the shape the protocol answers it.
+///
+/// Its package, release, command, flags, variables, resolved executable and that executable's
+/// version are what `kr doctor` is asked to show of it (section 7), so they are shown whole; what
+/// the host adds about why it is in its state is the host's text, said as its class and its length.
+#[must_use]
+pub fn integration(report: &CommandIntegrationReport) -> Document {
+    let asked = |text: &str| Asked::text(Request::Diagnostics, text);
+    Document::new()
+        .with("plugin_id", asked(&report.plugin_id))
+        .with(
+            "version",
+            report.version.as_ref().map(|version| asked(version)),
+        )
+        .with(
+            "command",
+            report.command.as_ref().map(|command| asked(command)),
+        )
+        .with(
+            "flags",
+            report
+                .flags
+                .iter()
+                .map(|flag| asked(flag))
+                .collect::<Vec<_>>(),
+        )
+        .with(
+            "variables",
+            report
+                .variables
+                .iter()
+                .map(|variable| {
+                    Document::new()
+                        .with("name", asked(&variable.name))
+                        .with("value", asked(&variable.value))
+                })
+                .collect::<Vec<_>>(),
+        )
+        .with("state", report.state.as_str())
+        .with(
+            "unavailable",
+            report.unavailable.as_ref().map(|why| why.as_str()),
+        )
+        .with("mode", report.mode.as_str())
+        .with(
+            "executable",
+            report
+                .executable
+                .as_ref()
+                .map(|executable| Asked::path(Request::Diagnostics, executable)),
+        )
+        .with(
+            "executable_version",
+            report
+                .executable_version
+                .as_ref()
+                .map(|version| asked(version)),
+        )
+        .with(
+            "reason",
+            report
+                .reason
+                .as_ref()
+                .map(|reason| crate::shown::exported("CommandIntegrationReport", "reason", reason)),
+        )
 }
 
 /// One command integration as the lines a person reads: what a session created now gets of it and
 /// the mode its command runs in, why none could launch through it here where none could, the flags
 /// it adds as the elements they are and the variables it sets, and where the daemon's search path
-/// resolves its command, with the version a signed record gives that executable.
+/// resolves its command, with the version a signed record gives that executable. What `kr doctor`
+/// is asked to show of it is shown whole; what the host adds about its state is said as its class
+/// and its length. `first` goes in front of the first line and `rest` in front of the others.
 #[must_use]
-pub fn integration_lines(report: &CommandIntegrationReport) -> Vec<String> {
-    let release = report
-        .version
-        .0
-        .as_deref()
-        .map_or_else(String::new, |version| format!(" {version}"));
-    let named = match report.command.0.as_deref() {
-        Some(command) => format!("{command} ({}{release})", report.plugin_id),
-        None => format!("{}{release}", report.plugin_id),
-    };
-    let mut lines = vec![format!(
-        "{named}: {}, {}",
-        report.state.as_str(),
-        report.mode.as_str()
-    )];
-    if let Some(why) = report.unavailable.0 {
-        lines.push(format!(
-            "a new session cannot launch through it here ({}): {}",
+pub fn integration_lines(
+    report: &CommandIntegrationReport,
+    first: &'static str,
+    rest: &'static str,
+) -> Vec<Line> {
+    let asked = |text: &str| Asked::text(Request::Diagnostics, text);
+    let quoted = |text: &str| serde_json::to_string(text).unwrap_or_else(|_| format!("{text:?}"));
+    let state = report.state.as_str();
+    let mode = report.mode.as_str();
+    let mut lines = vec![match (report.command.as_ref(), report.version.as_ref()) {
+        (Some(command), Some(version)) => stdout_line!(
+            "{}{} ({} {}): {}, {}",
+            first,
+            asked(command),
+            asked(&report.plugin_id),
+            asked(version),
+            state,
+            mode
+        ),
+        (Some(command), None) => stdout_line!(
+            "{}{} ({}): {}, {}",
+            first,
+            asked(command),
+            asked(&report.plugin_id),
+            state,
+            mode
+        ),
+        (None, Some(version)) => stdout_line!(
+            "{}{} {}: {}, {}",
+            first,
+            asked(&report.plugin_id),
+            asked(version),
+            state,
+            mode
+        ),
+        (None, None) => stdout_line!("{}{}: {}, {}", first, asked(&report.plugin_id), state, mode),
+    }];
+    if let Some(why) = report.unavailable.as_ref() {
+        lines.push(stdout_line!(
+            "{}a new session cannot launch through it here ({}): {}",
+            rest,
             why.as_str(),
             match why {
                 CommandIntegrationUnavailable::Platform => {
@@ -340,155 +435,327 @@ pub fn integration_lines(report: &CommandIntegrationReport) -> Vec<String> {
             }
         ));
     }
-    if let Some(command) = report.command.0.as_deref() {
-        let quoted =
-            |text: &str| serde_json::to_string(text).unwrap_or_else(|_| format!("{text:?}"));
-        let flags = if report.flags.is_empty() {
-            "adds no flag".to_owned()
-        } else {
-            let elements: Vec<String> = report.flags.iter().map(|flag| quoted(flag)).collect();
-            format!("adds {}", elements.join(" "))
-        };
-        let variables = if report.variables.is_empty() {
-            "sets no variable".to_owned()
-        } else {
-            let set: Vec<String> = report
-                .variables
-                .iter()
-                .map(|variable| format!("{}={}", variable.name, quoted(&variable.value)))
-                .collect();
-            format!("sets {}", set.join(" "))
-        };
-        lines.push(format!("{flags}; {variables}"));
-        lines.push(match (
-            report.executable.0.as_deref(),
-            report.executable_version.0.as_deref(),
-        ) {
-            (Some(executable), Some(version)) => format!(
-                "resolves to {executable} on the daemon's search path, {version} by its signed \
-                 record"
-            ),
-            (Some(executable), None) => format!(
-                "resolves to {executable} on the daemon's search path, a build no signed record \
-                 names, so its version is not known"
-            ),
-            (None, _) => format!(
-                "{command} is not on the daemon's search path; a session looks for it on its own"
+    if let Some(command) = report.command.as_ref() {
+        let flags: Vec<String> = report.flags.iter().map(|flag| quoted(flag)).collect();
+        let variables: Vec<String> = report
+            .variables
+            .iter()
+            .map(|variable| format!("{}={}", variable.name, quoted(&variable.value)))
+            .collect();
+        lines.push(match (flags.is_empty(), variables.is_empty()) {
+            (true, true) => stdout_line!("{}adds no flag; sets no variable", rest),
+            (false, true) => {
+                stdout_line!("{}adds {}; sets no variable", rest, asked(&flags.join(" ")))
+            }
+            (true, false) => {
+                stdout_line!("{}adds no flag; sets {}", rest, asked(&variables.join(" ")))
+            }
+            (false, false) => stdout_line!(
+                "{}adds {}; sets {}",
+                rest,
+                asked(&flags.join(" ")),
+                asked(&variables.join(" "))
             ),
         });
+        lines.push(
+            match (
+                report.executable.as_ref(),
+                report.executable_version.as_ref(),
+            ) {
+                (Some(executable), Some(version)) => stdout_line!(
+                    "{}resolves to {} on the daemon's search path, {} by its signed record",
+                    rest,
+                    Asked::path(Request::Diagnostics, executable),
+                    asked(version)
+                ),
+                (Some(executable), None) => stdout_line!(
+                    "{}resolves to {} on the daemon's search path, a build no signed record \
+                     names, so its version is not known",
+                    rest,
+                    Asked::path(Request::Diagnostics, executable)
+                ),
+                (None, _) => stdout_line!(
+                    "{}{} is not on the daemon's search path; a session looks for it on its own",
+                    rest,
+                    asked(command)
+                ),
+            },
+        );
     }
-    if let Some(reason) = report.reason.0.as_deref() {
-        lines.push(reason.to_owned());
+    if let Some(reason) = report.reason.as_ref() {
+        lines.push(stdout_line!(
+            "{}{}",
+            rest,
+            crate::shown::exported("CommandIntegrationReport", "reason", reason)
+        ));
     }
     lines
 }
 
 /// Renders this host's effective configuration.
+///
+/// The host's own sentences are said as it wrote them; each other text field, and each value, by
+/// the class it is made of ([`configured`]).
 #[must_use]
-pub fn configuration_report(effective: &EffectiveConfiguration) -> Value {
-    json!({
-        "schema_version": effective.schema_version.to_string(),
-        "revision": effective.revision.to_string(),
-        "document": effective.document,
-        "status": {
-            "state": effective.status.state.as_str(),
-            "detail": effective.status.detail,
-        },
+pub fn configuration_report(effective: &EffectiveConfiguration) -> Document {
+    const REPORT: &str = "EffectiveConfiguration";
+
+    Document::new()
+        .with(
+            "schema_version",
+            crate::output::said(&effective.schema_version),
+        )
+        .with("revision", crate::output::said(&effective.revision))
+        .with(
+            "document",
+            configured_field(REPORT, "document", &effective.document),
+        )
+        .with(
+            "status",
+            Document::new()
+                .with("state", effective.status.state.as_str())
+                .with("detail", host_text(&effective.status.detail)),
+        )
         // Whether the values below are what this host is acting on, and what its workers still
         // owe a fence one of them raised. A reader that saw only the values would have no way to
         // tell a configuration in force from one that could not be applied.
-        "not_in_force": effective.not_in_force.as_ref().cloned(),
-        "fence_outstanding": effective.fence_outstanding.as_ref().cloned(),
-        "runtime_directory": effective.runtime_directory,
-        "state_directory": effective.state_directory,
+        .with(
+            "not_in_force",
+            effective.not_in_force.as_ref().map(host_text),
+        )
+        .with(
+            "fence_outstanding",
+            effective.fence_outstanding.as_ref().map(host_text),
+        )
+        .with(
+            "runtime_directory",
+            configured_field(REPORT, "runtime_directory", &effective.runtime_directory),
+        )
+        .with(
+            "state_directory",
+            configured_field(REPORT, "state_directory", &effective.state_directory),
+        )
         // Section 26's native OS-appropriate locations: where this host's files are, and the rule
         // this platform followed to put them there. Both, because a rule without the resolved path
         // does not say where anything is, and a path without the rule does not say where the next
         // one would go.
-        "locations": effective.locations.iter().map(|location| json!({
-            "what": location.what,
-            "documented": location.documented,
-        })).collect::<Vec<_>>(),
-        "precedence": effective.precedence,
-        "overrides": effective.overrides.iter().map(|entry| json!({
-            "variable": entry.variable,
-            "preference": entry.preference,
-            "position": entry.position.as_str(),
-            "why": entry.why,
-            "set": entry.set,
-        })).collect::<Vec<_>>(),
-        "values": effective.values.iter().map(|value| json!({
-            "key": value.key,
-            "about": value.about(),
-            "value": value.value(),
-            // What the value is made of, which is what decides how it leaves this host. A reader
-            // that sees a path and a word in the same shape of row has no other way to tell them
-            // apart.
-            "class": value.class().as_str(),
-            "source": value.source.as_str(),
-            "origin": value.origin.as_ref().cloned(),
-            "variable": value.variable.as_ref().cloned(),
-            "effect": value.effect.as_str(),
-        })).collect::<Vec<_>>(),
-        "ceilings": effective.ceilings.iter().map(|ceiling| json!({
-            "key": ceiling.key,
-            "configured": ceiling.configured.as_ref().cloned(),
-            "value": ceiling.value,
-            "source": ceiling.source.as_str(),
-            "origin": ceiling.origin.as_ref().cloned(),
-            "effect": ceiling.effect.as_str(),
-            "narrowed_by": ceiling.narrowed_by.as_ref().cloned(),
-            "refused": ceiling.refused,
-        })).collect::<Vec<_>>(),
-        "secrets": effective.secrets.iter().map(|reference| json!({
-            "name": reference.name,
-            "store": reference.store,
-            "item": reference.item,
-        })).collect::<Vec<_>>(),
-        "stale_documents": effective.stale_documents,
-    })
+        .with(
+            "locations",
+            effective
+                .locations
+                .iter()
+                .map(|location| {
+                    Document::new()
+                        .with(
+                            "what",
+                            configured_field("ReportedLocation", "what", &location.what),
+                        )
+                        .with("documented", host_text(&location.documented))
+                })
+                .collect::<Vec<_>>(),
+        )
+        .with(
+            "precedence",
+            effective
+                .precedence
+                .iter()
+                .map(host_text)
+                .collect::<Vec<_>>(),
+        )
+        .with(
+            "overrides",
+            effective
+                .overrides
+                .iter()
+                .map(|entry| {
+                    Document::new()
+                        .with(
+                            "variable",
+                            configured_field("OverrideReport", "variable", &entry.variable),
+                        )
+                        .with(
+                            "preference",
+                            configured_field("OverrideReport", "preference", &entry.preference),
+                        )
+                        .with("position", entry.position.as_str())
+                        .with("why", host_text(&entry.why))
+                        .with("set", entry.set)
+                })
+                .collect::<Vec<_>>(),
+        )
+        .with(
+            "values",
+            effective
+                .values
+                .iter()
+                .map(|value| {
+                    Document::new()
+                        .with("key", configured_field("EffectiveValue", "key", &value.key))
+                        .with("about", host_text(value.stated_about()))
+                        .with("value", configured(value.class(), value.value()))
+                        // What the value is made of, which is what decides how it leaves this
+                        // host. A reader that sees a path and a word in the same shape of row has
+                        // no other way to tell them apart.
+                        .with("class", value.class().as_str())
+                        .with("source", value.source.as_str())
+                        .with(
+                            "origin",
+                            value
+                                .origin
+                                .as_ref()
+                                .map(|origin| configured_field("EffectiveValue", "origin", origin)),
+                        )
+                        .with(
+                            "variable",
+                            value.variable.as_ref().map(|variable| {
+                                configured_field("EffectiveValue", "variable", variable)
+                            }),
+                        )
+                        .with("effect", value.effect.as_str())
+                })
+                .collect::<Vec<_>>(),
+        )
+        .with(
+            "ceilings",
+            effective
+                .ceilings
+                .iter()
+                .map(|ceiling| {
+                    Document::new()
+                        .with("key", configured_field("CeilingValue", "key", &ceiling.key))
+                        .with("configured", ceiling.configured.as_ref().map(host_text))
+                        .with("value", host_text(&ceiling.value))
+                        .with("source", ceiling.source.as_str())
+                        .with(
+                            "origin",
+                            ceiling
+                                .origin
+                                .as_ref()
+                                .map(|origin| configured_field("CeilingValue", "origin", origin)),
+                        )
+                        .with("effect", ceiling.effect.as_str())
+                        .with("narrowed_by", ceiling.narrowed_by.as_ref().map(host_text))
+                        .with("refused", ceiling.refused)
+                })
+                .collect::<Vec<_>>(),
+        )
+        .with(
+            "secrets",
+            effective
+                .secrets
+                .iter()
+                .map(|reference| {
+                    Document::new()
+                        .with(
+                            "name",
+                            configured_field("SecretReference", "name", &reference.name),
+                        )
+                        .with(
+                            "store",
+                            configured_field("SecretReference", "store", &reference.store),
+                        )
+                        .with(
+                            "item",
+                            configured_field("SecretReference", "item", &reference.item),
+                        )
+                })
+                .collect::<Vec<_>>(),
+        )
+        .with(
+            "stale_documents",
+            effective
+                .stale_documents
+                .iter()
+                .map(|stale| configured_field(REPORT, "stale_documents", stale))
+                .collect::<Vec<_>>(),
+        )
 }
 
-/// Renders diagnostics as lines for a person.
-///
 /// Every check's verdict, and its evidence under it. `verbose` decides how much evidence: with it,
 /// every check shows the value, its source and its location; without it, only a check that did not
 /// pass does, because a person looking for what is wrong should not have to read past twenty lines
 /// that are right.
 #[must_use]
-pub fn doctor_lines(result: &HostDoctorResult, verbose: bool) -> String {
-    let mut text = String::new();
+pub fn check_lines(result: &HostDoctorResult, verbose: bool) -> Vec<Shown> {
+    let mut lines = Vec::new();
     for check in &result.checks {
-        text.push_str(&format!(
-            "{:<14} {}\n",
-            check.status.as_str(),
-            check.title()
+        let status = check.status.as_str();
+        lines.push(shown!(
+            "{}{} {}",
+            status,
+            padding(14, status),
+            host_text(check.stated_title())
         ));
         if verbose || check.status != DoctorStatus::Ok {
-            for line in check.evidence() {
-                text.push_str(&format!("               {line}\n"));
+            lines.push(shown!(
+                "               {}",
+                host_text(check.stated_detail())
+            ));
+            if let Some(remedy) = check.stated_remedy() {
+                lines.push(shown!("               {}", host_text(remedy)));
             }
         }
     }
+    lines
+}
+
+/// Renders diagnostics as lines for a person: every check ([`check_lines`]), each command
+/// integration ([`integration_lines`]) and the summary.
+#[must_use]
+pub fn doctor_lines(result: &HostDoctorResult, verbose: bool) -> Vec<Line> {
+    let mut lines: Vec<Line> = check_lines(result, verbose)
+        .into_iter()
+        .map(|line| stdout_line!("{}", line))
+        .collect();
     for report in &result.command_integrations {
-        let mut lines = integration_lines(report).into_iter();
-        if let Some(head) = lines.next() {
-            text.push_str(&format!("{:<14} {head}\n", "integration"));
-        }
-        for line in lines {
-            text.push_str(&format!("               {line}\n"));
-        }
+        lines.extend(integration_lines(
+            report,
+            "integration    ",
+            "               ",
+        ));
     }
-    text.push_str(&summary(result));
-    text
+    lines.push(stdout_line!("{}", summary(result)));
+    lines
+}
+
+/// The diagnostics as the support bundle's report carries them: every check with its evidence,
+/// each command integration by its state, its mode and how many flags and variables it adds, and
+/// the summary. The bundle is read by somebody else, so an integration's names and paths, which
+/// its exported copy holds only as their class and length, are left out of these lines.
+#[must_use]
+pub fn report_lines(result: &HostDoctorResult) -> Vec<Shown> {
+    let mut lines = check_lines(result, true);
+    for report in &result.command_integrations {
+        lines.push(shown!(
+            "{}{} {}, {}, {} flags, {} variables{}",
+            "integration",
+            padding(14, "integration"),
+            report.state.as_str(),
+            report.mode.as_str(),
+            report.flags.len(),
+            report.variables.len(),
+            report.unavailable.as_ref().map_or_else(
+                || Shown::said(""),
+                |why| shown!(", unavailable: {}", why.as_str())
+            )
+        ));
+    }
+    lines.push(summary(result));
+    lines
+}
+
+/// The spaces that pad `word` to `width` characters.
+fn padding(width: usize, word: &str) -> &'static str {
+    const SPACES: &str = "                ";
+    &SPACES[..width.saturating_sub(word.chars().count()).min(SPACES.len())]
 }
 
 /// The last line: how many checks ran and how they came out.
 #[must_use]
-pub fn summary(result: &HostDoctorResult) -> String {
-    let mut failed = 0;
-    let mut warning = 0;
-    let mut not_applicable = 0;
+pub fn summary(result: &HostDoctorResult) -> Shown {
+    let mut failed = 0_usize;
+    let mut warning = 0_usize;
+    let mut not_applicable = 0_usize;
     for check in &result.checks {
         match check.status {
             DoctorStatus::Failed => failed += 1,
@@ -497,11 +764,13 @@ pub fn summary(result: &HostDoctorResult) -> String {
             DoctorStatus::Ok => {}
         }
     }
-    format!(
-        "{} checks: {} passed, {warning} with something worth knowing, {failed} failed, \
-         {not_applicable} not applicable\n",
+    shown!(
+        "{} checks: {} passed, {} with something worth knowing, {} failed, {} not applicable",
         result.checks.len(),
-        result.checks.len() - warning - failed - not_applicable
+        result.checks.len() - warning - failed - not_applicable,
+        warning,
+        failed,
+        not_applicable
     )
 }
 
@@ -511,63 +780,102 @@ pub fn summary(result: &HostDoctorResult) -> String {
 /// each one is printed with the value in force and where that value came from rather than as a
 /// constant a person has to go and look up.
 #[must_use]
-pub fn configurable_lines(effective: &EffectiveConfiguration) -> Vec<String> {
-    let mut lines = vec![format!(
+pub fn configurable_lines(effective: &EffectiveConfiguration) -> Vec<Line> {
+    const REPORT: &str = "EffectiveConfiguration";
+
+    let mut lines = vec![stdout_line!(
         "configuration {} (schema version {}, revision {}): {}",
-        effective.document, effective.schema_version, effective.revision, effective.status.detail
+        configured_field(REPORT, "document", &effective.document),
+        effective.schema_version,
+        effective.revision,
+        host_text(&effective.status.detail)
     )];
-    lines.push(format!(
+    lines.push(stdout_line!(
         "  runtime directory {}",
-        effective.runtime_directory
+        configured_field(REPORT, "runtime_directory", &effective.runtime_directory)
     ));
-    lines.push(format!("  state directory {}", effective.state_directory));
+    lines.push(stdout_line!(
+        "  state directory {}",
+        configured_field(REPORT, "state_directory", &effective.state_directory)
+    ));
     // Section 26's native OS-appropriate locations: where this platform puts each of them, beside
     // the three paths above that say where this host's own are. The rule is what an owner needs in
     // order to find the next one, or to know that a variable of theirs chose this one instead.
     for location in &effective.locations {
-        lines.push(format!(
+        lines.push(stdout_line!(
             "  {} belongs at {}",
-            location.what, location.documented
+            configured_field("ReportedLocation", "what", &location.what),
+            host_text(&location.documented)
         ));
     }
     for value in &effective.values {
+        let key = configured_field("EffectiveValue", "key", &value.key);
+        let said = configured(value.class(), value.value());
+        let effect = value.effect.describe();
         let origin = value
             .variable
             .as_ref()
-            .map(|variable| format!(" ({variable})"))
-            .or_else(|| value.origin.as_ref().map(|origin| format!(" ({origin})")))
-            .unwrap_or_default();
-        lines.push(format!(
-            "  {} = {} from {}{origin}, applies {}",
-            value.key,
-            value.value(),
-            value.source.as_str(),
-            value.effect.describe()
-        ));
+            .map(|variable| configured_field("EffectiveValue", "variable", variable))
+            .or_else(|| {
+                value
+                    .origin
+                    .as_ref()
+                    .map(|origin| configured_field("EffectiveValue", "origin", origin))
+            });
+        lines.push(match origin {
+            Some(origin) => stdout_line!(
+                "  {} = {} from {} ({}), applies {}",
+                key,
+                said,
+                value.source.as_str(),
+                origin,
+                effect
+            ),
+            None => stdout_line!(
+                "  {} = {} from {}, applies {}",
+                key,
+                said,
+                value.source.as_str(),
+                effect
+            ),
+        });
     }
     for ceiling in &effective.ceilings {
-        let narrowed = ceiling
-            .narrowed_by
-            .as_ref()
-            .map(|why| format!(" ({why})"))
-            .unwrap_or_default();
+        let refused = if ceiling.refused {
+            ", the configured value was more permissive and was refused"
+        } else {
+            ""
+        };
+        let key = configured_field("CeilingValue", "key", &ceiling.key);
         let origin = ceiling
             .origin
             .as_ref()
-            .map(|path| format!(" ({path})"))
-            .unwrap_or_default();
-        lines.push(format!(
-            "  {} ceiling {} from {}{origin}, applies {}{}{narrowed}",
-            ceiling.key,
-            ceiling.value,
-            ceiling.source.as_str(),
-            ceiling.effect.describe(),
-            if ceiling.refused {
-                ", the configured value was more permissive and was refused"
-            } else {
-                ""
-            }
-        ));
+            .map(|origin| configured_field("CeilingValue", "origin", origin));
+        let narrowed = ceiling
+            .narrowed_by
+            .as_ref()
+            .map_or_else(|| Shown::said(""), |why| shown!(" ({})", host_text(why)));
+        lines.push(match origin {
+            Some(origin) => stdout_line!(
+                "  {} ceiling {} from {} ({}), applies {}{}{}",
+                key,
+                host_text(&ceiling.value),
+                ceiling.source.as_str(),
+                origin,
+                ceiling.effect.describe(),
+                refused,
+                narrowed
+            ),
+            None => stdout_line!(
+                "  {} ceiling {} from {}, applies {}{}{}",
+                key,
+                host_text(&ceiling.value),
+                ceiling.source.as_str(),
+                ceiling.effect.describe(),
+                refused,
+                narrowed
+            ),
+        });
     }
     lines
 }

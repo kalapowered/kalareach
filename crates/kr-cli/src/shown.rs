@@ -378,6 +378,33 @@ pub fn terminal_application(id: &str) -> Shown {
         )
 }
 
+/// The names the terminal catalogue gives the applications it names.
+const TERMINAL_APPLICATION_NAMES: &[(&str, &str)] = &[
+    ("alacritty", "alacritty"),
+    ("apple-terminal", "Terminal"),
+    ("gnome-terminal", "gnome-terminal"),
+    ("iterm2", "iTerm2"),
+    ("kitty", "kitty"),
+    ("konsole", "konsole"),
+    ("windows-console", "Console window"),
+    ("windows-terminal", "Windows Terminal"),
+    ("xfce4-terminal", "xfce4-terminal"),
+    ("xterm", "xterm"),
+];
+
+/// What a terminal application's name says: the name the terminal catalogue gives the identifier,
+/// and a placeholder for an identifier it does not name.
+#[must_use]
+pub fn terminal_application_name(id: &str) -> Shown {
+    TERMINAL_APPLICATION_NAMES
+        .iter()
+        .find(|(known, _)| *known == id)
+        .map_or_else(
+            || Shown::said("[a terminal this build does not list]"),
+            |(_, name)| Shown::said(name),
+        )
+}
+
 /// What an operating system error number says: its kind and its number, as [`Shown::io`] says any
 /// input or output failure.
 #[must_use]

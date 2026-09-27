@@ -9,11 +9,12 @@ use kr_cli::cli::{
     AccountCommand, AccountTokenCommand, Cli, Command, HostCommand, ShellArguments, ShellCommand,
 };
 use kr_cli::error::{CliError, Result};
+use kr_cli::output::{self, Asked, Document, Request};
 use kr_cli::report::Completion;
 use kr_cli::resolve::{SessionSelector, find, open_controller, open_worker};
 use kr_cli::session::AttachOptions;
 use kr_cli::terminal::ControllingTerminal;
-use kr_cli::{build_id, report};
+use kr_cli::{build_id, report, stdout_line};
 use kr_ipc::paths::HostPaths;
 use kr_protocol::desktop::SleepInhibitionSetting;
 use kr_protocol::envelope::ActionTarget;
@@ -59,7 +60,7 @@ fn main() -> ExitCode {
         Ok(Completion::Reported(error)) => ExitCode::from(error.exit_code()),
         Err(error) => {
             if json {
-                print_json(&report::failure(&error));
+                output::document(&report::failure(&error));
             } else {
                 report::failed(&error);
             }
@@ -74,18 +75,20 @@ fn main() -> ExitCode {
 /// what was typed: an argument this command does not take can be a secret pasted in the wrong
 /// place.
 fn usage(error: &clap::Error, json: bool) -> ExitCode {
-    if error.use_stderr() {
-        let failure = CliError::Usage(shown!("{}", kr_cli::shown::usage(error)));
-        if json {
-            print_json(&report::failure(&failure));
-        } else {
-            report::say(&shown!("{}", kr_cli::shown::usage(error)));
-        }
-        return ExitCode::from(failure.exit_code());
-    }
     // `--help` and `--version` are not failures.
-    print!("{}", error.render());
-    ExitCode::SUCCESS
+    if !error.use_stderr()
+        && let Some(help) = kr_cli::shown::help(error)
+    {
+        output::say(&help);
+        return ExitCode::SUCCESS;
+    }
+    let failure = CliError::Usage(shown!("{}", kr_cli::shown::usage(error)));
+    if json {
+        output::document(&report::failure(&failure));
+    } else {
+        report::say(&shown!("{}", kr_cli::shown::usage(error)));
+    }
+    ExitCode::from(failure.exit_code())
 }
 
 async fn run(cli: Cli) -> Result<Completion> {
@@ -168,10 +171,10 @@ async fn run(cli: Cli) -> Result<Completion> {
                 .chosen()
                 .unwrap_or(info.default_worker_profile);
             if !cli.json {
-                println!(
-                    "{}",
-                    report::execution_context_line(profile, arguments.execution.chosen().is_some())
-                );
+                output::say(&report::execution_context_line(
+                    profile,
+                    arguments.execution.chosen().is_some(),
+                ));
             }
             let launch_profile = arguments.launch_profile()?;
             // What the request asked for, kept for the report below: the profile itself travels
@@ -229,72 +232,56 @@ async fn run(cli: Cli) -> Result<Completion> {
                 Err(error) => (Some(error), None),
             };
             if cli.json {
-                let mut document = report::session(&created.session);
-                if let Some(object) = document.as_object_mut() {
-                    object.insert(
-                        "presentation".to_owned(),
-                        serde_json::json!(presentation.as_str()),
+                let mut document = report::session(&created.session)
+                    .with("presentation", presentation.as_str())
+                    .with(
+                        "presentation_error",
+                        presentation_error.as_ref().map(|error| output::said(error)),
+                    )
+                    .with(
+                        "execution_context_chosen",
+                        arguments.execution.chosen().is_some(),
+                    )
+                    .with(
+                        "outcome",
+                        outcome.as_ref().map(kr_cli::session::AttachOutcome::detail),
                     );
-                    object.insert(
-                        "presentation_error".to_owned(),
-                        presentation_error
-                            .as_ref()
-                            .map_or(serde_json::Value::Null, |error| {
-                                serde_json::json!(error.to_string())
-                            }),
-                    );
-                    object.insert(
-                        "execution_context_chosen".to_owned(),
-                        serde_json::json!(arguments.execution.chosen().is_some()),
-                    );
-                    object.insert(
-                        "outcome".to_owned(),
-                        outcome.as_ref().map_or(serde_json::Value::Null, |outcome| {
-                            serde_json::json!(outcome.detail().as_str())
-                        }),
-                    );
-                    // An attachment that ended with the session's closure has its record, so the
-                    // document describes the session as this command leaves it.
-                    if let Some(record) = outcome
-                        .as_ref()
-                        .and_then(kr_cli::session::AttachOutcome::closure)
-                    {
-                        object.insert(
-                            "state".to_owned(),
-                            serde_json::json!(kr_protocol::session::SessionState::Closed.as_str()),
-                        );
-                        object.insert("closure".to_owned(), report::closure(record));
-                    }
+                // An attachment that ended with the session's closure has its record, so the
+                // document describes the session as this command leaves it.
+                if let Some(record) = outcome
+                    .as_ref()
+                    .and_then(kr_cli::session::AttachOutcome::closure)
+                {
+                    document.set("state", kr_protocol::session::SessionState::Closed.as_str());
+                    document.set("closure", report::closure(record));
                 }
-                print_json(&document);
+                output::document(&document);
             } else {
-                println!(
+                output::say(&shown!(
                     "created session {} ({})",
-                    created.session.display_number, created.session.session_id
-                );
+                    created.session.display_number.get(),
+                    created.session.session_id
+                ));
                 // The receipt, not the request: what the session was actually created with.
-                println!("{}", report::desktop_line(&created.session));
+                output::line(&report::desktop_line(&created.session));
+                let shell = Asked::path(Request::Sessions, &created.session.shell_path);
                 match created.session.shell_mode {
-                    ShellMode::Managed => println!(
+                    ShellMode::Managed if fenced_launch => output::line(&stdout_line!(
                         "shell mode managed: Ctrl-D at an empty root prompt detaches this client, \
-                         and {}",
-                        if fenced_launch {
-                            format!(
-                                "a launch installs a command in {}'s own editor",
-                                created.session.shell_path
-                            )
-                        } else {
-                            "this session's launch profile admits no fenced launch, so a launch \
-                             installs no command"
-                                .to_owned()
-                        }
-                    ),
-                    ShellMode::NativeCompat => println!(
+                         and a launch installs a command in {}'s own editor",
+                        shell
+                    )),
+                    ShellMode::Managed => output::say(&Shown::said(
+                        "shell mode managed: Ctrl-D at an empty root prompt detaches this client, \
+                         and this session's launch profile admits no fenced launch, so a launch \
+                         installs no command",
+                    )),
+                    ShellMode::NativeCompat => output::line(&stdout_line!(
                         "shell mode native_compat: Ctrl-D at the prompt follows {}'s own behaviour \
                          and can close the session, a launch installs no command, and kr detach \
                          takes --attachment because this session records no originating attachment",
-                        created.session.shell_path
-                    ),
+                        shell
+                    )),
                 }
                 if let Some(error) = presentation_error.as_ref() {
                     report::say(&shown!(
@@ -303,7 +290,7 @@ async fn run(cli: Cli) -> Result<Completion> {
                     ));
                 }
                 if let Some(outcome) = outcome.as_ref() {
-                    println!("{}", outcome.detail());
+                    output::say(&outcome.detail());
                 }
             }
             Ok(match (presentation_error, outcome) {
@@ -346,14 +333,15 @@ async fn run(cli: Cli) -> Result<Completion> {
             )
             .await?;
             if cli.json {
-                print_json(&serde_json::json!({
-                    "ok": !outcome.is_failure(),
-                    "session_id": session_id.to_string(),
-                    "outcome": outcome.detail().as_str(),
-                    "closure": outcome.closure().map(report::closure),
-                }));
+                output::document(
+                    &Document::new()
+                        .with("ok", !outcome.is_failure())
+                        .with("session_id", output::said(&session_id))
+                        .with("outcome", outcome.detail())
+                        .with("closure", outcome.closure().map(report::closure)),
+                );
             } else {
-                println!("{}", outcome.detail());
+                output::say(&outcome.detail());
             }
             Ok(outcome
                 .into_error()
@@ -379,17 +367,19 @@ async fn run(cli: Cli) -> Result<Completion> {
                 kr_cli::attach::detach_attachment(&mut client, &descriptor, attachment_id).await?;
             let detached = result.attachment_id;
             if cli.json {
-                print_json(&serde_json::json!({
-                    "ok": true,
-                    "session_id": descriptor.session_id.to_string(),
-                    "detached": detached.to_string(),
-                    "remaining": result.remaining.get(),
-                }));
-            } else {
-                println!(
-                    "detached {detached}; {} attachment(s) remain",
-                    result.remaining
+                output::document(
+                    &Document::new()
+                        .with("ok", true)
+                        .with("session_id", output::said(&descriptor.session_id))
+                        .with("detached", output::said(&detached))
+                        .with("remaining", result.remaining.get()),
                 );
+            } else {
+                output::say(&shown!(
+                    "detached {}; {} attachment(s) remain",
+                    detached,
+                    result.remaining
+                ));
             }
             Ok(Completion::Done)
         }
@@ -473,19 +463,17 @@ async fn run(cli: Cli) -> Result<Completion> {
                 }
             };
             if cli.json {
-                print_json(&serde_json::json!({
-                    "ok": true,
-                    "session_id": closed.session_id.to_string(),
-                    "state": closed.state.as_str(),
-                    "durability": match closed.durability {
-                        kr_protocol::session::Durability::Durable => "durable",
-                        kr_protocol::session::Durability::Volatile => "volatile",
-                    },
-                }));
+                output::document(
+                    &Document::new()
+                        .with("ok", true)
+                        .with("session_id", output::said(&closed.session_id))
+                        .with("state", closed.state.as_str())
+                        .with("durability", report::durability_word(closed.durability)),
+                );
             } else {
-                println!("session {} is {}", closed.session_id, closed.state);
+                output::say(&shown!("session {} is {}", closed.session_id, closed.state));
                 if closed.durability == kr_protocol::session::Durability::Volatile {
-                    println!("this closure was not recorded durably");
+                    output::say(&Shown::said("this closure was not recorded durably"));
                 }
             }
             Ok(Completion::Done)
@@ -504,14 +492,21 @@ async fn run(cli: Cli) -> Result<Completion> {
                 .await?;
             let listed: SessionListResult = typed(outcome)?;
             if cli.json {
-                print_json(&serde_json::json!({
-                    "sessions": listed.sessions.iter().map(report::session).collect::<Vec<_>>(),
-                }));
+                output::document(
+                    &Document::new().with(
+                        "sessions",
+                        listed
+                            .sessions
+                            .iter()
+                            .map(report::session)
+                            .collect::<Vec<_>>(),
+                    ),
+                );
             } else if listed.sessions.is_empty() {
-                println!("no sessions");
+                output::say(&Shown::said("no sessions"));
             } else {
                 for summary in &listed.sessions {
-                    println!("{}", report::session_line(summary));
+                    output::line(&report::session_line(summary));
                 }
             }
             Ok(Completion::Done)
@@ -560,64 +555,55 @@ async fn run(cli: Cli) -> Result<Completion> {
             };
             let summary = &read.session;
             if cli.json {
-                let mut document = report::session(summary);
-                if let Some(object) = document.as_object_mut() {
-                    object.insert(
-                        "power".to_owned(),
-                        power
-                            .as_ref()
-                            .map_or(serde_json::Value::Null, report::power),
-                    );
-                    object.insert(
-                        "launch_profile".to_owned(),
-                        read.launch_profile
-                            .as_ref()
-                            .map_or(serde_json::Value::Null, launch_profile_document),
-                    );
-                    object.insert(
-                        "terminal_attachments".to_owned(),
+                let mut document = report::session(summary)
+                    .with("power", power.as_ref().map(report::power))
+                    .with(
+                        "launch_profile",
+                        read.launch_profile.as_ref().map(launch_profile_document),
+                    )
+                    .with(
+                        "terminal_attachments",
                         match attachments.as_ref() {
-                            Some(Ok(attachments)) => report::terminal_attachments(attachments),
-                            Some(Err(_)) | None => serde_json::Value::Null,
+                            Some(Ok(attachments)) => {
+                                Some(report::terminal_attachments(attachments))
+                            }
+                            Some(Err(_)) | None => None,
                         },
                     );
-                    if let Some(Err(why)) = attachments.as_ref() {
-                        object.insert(
-                            "terminal_attachments_unread".to_owned(),
-                            serde_json::json!(why.as_str()),
-                        );
-                    }
+                if let Some(Err(why)) = attachments.as_ref() {
+                    document.set("terminal_attachments_unread", why.clone());
                 }
-                print_json(&document);
+                output::document(&document);
             } else {
-                println!("{}", report::session_line(summary));
-                println!("{}", report::desktop_line(summary));
+                output::line(&report::session_line(summary));
+                output::line(&report::desktop_line(summary));
                 if let Some(profile) = read.launch_profile.as_ref() {
-                    println!("{}", launch_profile_line(profile));
+                    output::line(&launch_profile_line(profile));
                 }
                 if let Some(power) = power.as_ref() {
-                    println!("{}", power.describe());
+                    output::say(&report::power_line(power));
                 }
                 match attachments.as_ref() {
                     Some(Ok(attachments)) => {
                         for line in report::terminal_attachment_lines(attachments) {
-                            println!("{line}");
+                            output::say(&line);
                         }
                     }
-                    Some(Err(why)) => {
-                        println!("terminal attachments: not read from the session's worker: {why}")
-                    }
+                    Some(Err(why)) => output::say(&shown!(
+                        "terminal attachments: not read from the session's worker: {}",
+                        why.clone()
+                    )),
                     None => {}
                 }
                 if let Some(closure) = summary.closure.as_ref() {
-                    println!(
+                    output::say(&shown!(
                         "closed: {} ({})",
                         closure.reason.as_str(),
                         match closure.durability {
                             kr_protocol::session::Durability::Durable => "recorded",
                             kr_protocol::session::Durability::Volatile => "not recorded durably",
                         }
-                    );
+                    ));
                 }
             }
             Ok(Completion::Done)
@@ -682,7 +668,6 @@ async fn run(cli: Cli) -> Result<Completion> {
                 },
             )
             .await?;
-            let report = kr_cli::doctor::doctor_lines(&checks, arguments.verbose);
             // The bundle is written before anything is printed, so `--json` produces one document
             // and a bundle that could not be written is the command's failure rather than a note
             // after a result that already said everything went well.
@@ -717,63 +702,71 @@ async fn run(cli: Cli) -> Result<Completion> {
                         Vec::new(),
                     );
                     kr_cli::doctor::bundle::write(path, &bundle, &content)?;
-                    Some((path.display().to_string(), bundle, content.len()))
+                    Some((path, bundle, content.len()))
                 }
                 None => None,
             };
             // One document, whether the diagnostics passed or not. A command that printed a result
             // and then a failure would give a reader two documents to reconcile.
             if cli.json {
-                let mut document = serde_json::json!({
-                    "ok": checks.healthy,
-                    "host": report::host(&info),
-                    "doctor": kr_cli::doctor::doctor(&checks),
-                    "configuration": kr_cli::doctor::configuration_report(&checks.configuration),
-                    "environment": report::environment_capabilities(&capabilities),
-                });
+                let mut document = Document::new()
+                    .with("ok", checks.healthy)
+                    .with("host", report::host(&info))
+                    .with("doctor", kr_cli::doctor::doctor(&checks))
+                    .with(
+                        "configuration",
+                        kr_cli::doctor::configuration_report(&checks.configuration),
+                    )
+                    .with(
+                        "environment",
+                        report::environment_capabilities(&capabilities),
+                    );
                 if let Some((path, written, entries)) = bundle.as_ref() {
-                    document["bundle"] = serde_json::json!({
-                        // The destination this person typed, echoed to the terminal they typed it
-                        // in. A command that would not say where it had written a file would be
-                        // withholding something from the only reader of this line, and the bundle
-                        // itself carries none of it.
-                        "path": path,
-                        "software": written.software().len(),
-                        "capabilities": written.capabilities().len(),
-                        "checks": written.doctor().get().checks.len(),
-                        "content_entries": entries,
-                    });
+                    document.set(
+                        "bundle",
+                        Document::new()
+                            // The destination this person typed, echoed to the terminal they
+                            // typed it in. A command that would not say where it had written a file
+                            // would be withholding something from the only reader of this line, and
+                            // the bundle itself carries none of it.
+                            .with("path", shown!("{}", kr_cli::shown::named(path)))
+                            .with("software", written.software().len())
+                            .with("capabilities", written.capabilities().len())
+                            .with("checks", written.doctor().get().checks.len())
+                            .with("content_entries", *entries),
+                    );
                 }
-                print_json(&document);
+                output::document(&document);
             } else {
-                println!(
+                output::say(&shown!(
                     "environment {} generation {} ({} of {} sessions)",
-                    info.environment_id, info.generation, info.live_sessions, info.session_limit
-                );
-                println!(
+                    info.environment_id,
+                    info.generation.get(),
+                    info.live_sessions,
+                    info.session_limit
+                ));
+                output::say(&shown!(
                     "sessions are created in the {} execution context by default",
                     info.default_worker_profile.as_str()
-                );
-                println!("{}", report::desktop_summary_line(&capabilities.desktop));
-                for line in report::capability_lines(&capabilities.desktop) {
-                    println!("{line}");
-                }
+                ));
+                output::line(&report::desktop_summary_line(&capabilities.desktop));
+                output::lines(&report::capability_lines(&capabilities.desktop));
                 for line in report::persistence_lines(&capabilities.persistence) {
-                    println!("{line}");
+                    output::say(&line);
                 }
-                println!("{}", info.power.describe());
-                for line in kr_cli::doctor::configurable_lines(&checks.configuration) {
-                    println!("{line}");
-                }
-                print!("{report}");
+                output::say(&report::power_line(&info.power));
+                output::lines(&kr_cli::doctor::configurable_lines(&checks.configuration));
+                output::lines(&kr_cli::doctor::doctor_lines(&checks, arguments.verbose));
                 if let Some((path, written, entries)) = bundle.as_ref() {
-                    println!(
-                        "support bundle written to {path} ({} software versions, {} capability \
-                         records, {} checks, {entries} content-bearing entries)",
+                    output::say(&shown!(
+                        "support bundle written to {} ({} software versions, {} capability \
+                         records, {} checks, {} content-bearing entries)",
+                        kr_cli::shown::named(path),
                         written.software().len(),
                         written.capabilities().len(),
-                        written.doctor().get().checks.len()
-                    );
+                        written.doctor().get().checks.len(),
+                        *entries
+                    ));
                 }
             }
             if checks.healthy {
@@ -816,18 +809,19 @@ async fn run(cli: Cli) -> Result<Completion> {
                 let info: HostInfoResult =
                     host_read(&mut client, &environment.paths, Method::HostInfo, &()).await?;
                 if cli.json {
-                    print_json(&serde_json::json!({
-                        "ok": true,
-                        "environment_id": environment.environment_id.to_string(),
-                        "power": report::power(&info.power),
-                    }));
+                    output::document(
+                        &Document::new()
+                            .with("ok", true)
+                            .with("environment_id", output::said(&environment.environment_id))
+                            .with("power", report::power(&info.power)),
+                    );
                 } else {
-                    println!("{}", info.power.describe());
+                    output::say(&report::power_line(&info.power));
                     if info.power.setting == SleepInhibitionSetting::Off {
-                        println!(
+                        output::say(&Shown::said(
                             "kr host power --set mains_only keeps this host awake for work it has \
-                             admitted, while it is on mains power"
-                        );
+                             admitted, while it is on mains power",
+                        ));
                     }
                 }
                 Ok(Completion::Done)
@@ -873,29 +867,61 @@ async fn run(cli: Cli) -> Result<Completion> {
                     environment.paths.state_dir(),
                 );
                 if cli.json {
-                    print_json(&serde_json::json!({
-                        "ok": true,
-                        "environment_id": environment.environment_id.to_string(),
-                        "preferred": preferred,
-                        "available": available
-                            .iter()
-                            .map(|application| serde_json::json!({
-                                "id": application.id,
-                                "name": application.name,
-                                "detail": application.detail,
-                            }))
-                            .collect::<Vec<_>>(),
-                    }));
+                    output::document(
+                        &Document::new()
+                            .with("ok", true)
+                            .with("environment_id", output::said(&environment.environment_id))
+                            .with(
+                                "preferred",
+                                preferred
+                                    .as_deref()
+                                    .map(kr_cli::shown::terminal_application),
+                            )
+                            .with(
+                                "available",
+                                available
+                                    .iter()
+                                    .map(|application| {
+                                        Document::new()
+                                            .with(
+                                                "id",
+                                                kr_cli::shown::terminal_application(
+                                                    &application.id,
+                                                ),
+                                            )
+                                            .with(
+                                                "name",
+                                                kr_cli::shown::terminal_application_name(
+                                                    &application.id,
+                                                ),
+                                            )
+                                            .with(
+                                                "detail",
+                                                kr_cli::shown::exported(
+                                                    "TerminalApplication",
+                                                    "detail",
+                                                    &application.detail,
+                                                ),
+                                            )
+                                    })
+                                    .collect::<Vec<_>>(),
+                            ),
+                    );
                 } else if available.is_empty() {
-                    println!("no terminal application this host can open was found");
+                    output::say(&Shown::said(
+                        "no terminal application this host can open was found",
+                    ));
                 } else {
-                    println!("available: {}", describe_terminals(&available));
+                    output::say(&shown!("available: {}", describe_terminals(&available)));
                     match preferred {
-                        Some(preferred) => println!("preferred: {preferred}"),
-                        None => println!(
+                        Some(preferred) => output::say(&shown!(
+                            "preferred: {}",
+                            kr_cli::shown::terminal_application(&preferred)
+                        )),
+                        None => output::say(&shown!(
                             "preferred: none, so a new window opens in {}",
-                            available[0].id
-                        ),
+                            kr_cli::shown::terminal_application(&available[0].id)
+                        )),
                     }
                 }
                 Ok(Completion::Done)
@@ -1039,46 +1065,68 @@ fn shell_selector(arguments: &ShellArguments) -> Option<&str> {
     }
 }
 
-/// Renders a session's launch profile as a line.
-fn launch_profile_line(profile: &kr_protocol::session::LaunchProfile) -> String {
-    let integrations: Vec<String> = profile
+/// Renders a session's launch profile as a line: the commands its integrations are for are the
+/// session's own, shown to the person who asked about it.
+fn launch_profile_line(profile: &kr_protocol::session::LaunchProfile) -> kr_cli::output::Line {
+    let integrations: Vec<&str> = profile
         .command_integrations
         .iter()
         .filter(|integration| integration.enabled)
-        .map(|integration| integration.command.clone())
+        .map(|integration| integration.command.as_str())
         .collect();
-    let integrated = if integrations.is_empty() {
-        "no command integration".to_owned()
+    let fenced = if profile.fenced_launch {
+        "fenced launch"
     } else {
-        format!("command integration for {}", integrations.join(", "))
+        "no fenced launch"
     };
-    format!(
-        "launch: {} startup, {}, {integrated}",
-        profile.startup.as_str(),
-        if profile.fenced_launch {
-            "fenced launch"
-        } else {
-            "no fenced launch"
-        }
-    )
+    if integrations.is_empty() {
+        stdout_line!(
+            "launch: {} startup, {}, no command integration",
+            profile.startup.as_str(),
+            fenced
+        )
+    } else {
+        stdout_line!(
+            "launch: {} startup, {}, command integration for {}",
+            profile.startup.as_str(),
+            fenced,
+            Asked::text(Request::Sessions, &integrations.join(", "))
+        )
+    }
 }
 
 /// Renders a session's launch profile as a document.
-fn launch_profile_document(profile: &kr_protocol::session::LaunchProfile) -> serde_json::Value {
-    serde_json::json!({
-        "startup": profile.startup.as_str(),
-        "fenced_launch": profile.fenced_launch,
-        "command_integrations": profile
-            .command_integrations
-            .iter()
-            .map(|integration| serde_json::json!({
-                "plugin_id": integration.plugin_id.as_str(),
-                "command": integration.command,
-                "flags": integration.flags,
-                "enabled": integration.enabled,
-            }))
-            .collect::<Vec<_>>(),
-    })
+fn launch_profile_document(profile: &kr_protocol::session::LaunchProfile) -> Document {
+    Document::new()
+        .with("startup", profile.startup.as_str())
+        .with("fenced_launch", profile.fenced_launch)
+        .with(
+            "command_integrations",
+            profile
+                .command_integrations
+                .iter()
+                .map(|integration| {
+                    Document::new()
+                        .with(
+                            "plugin_id",
+                            Asked::text(Request::Sessions, integration.plugin_id.as_str()),
+                        )
+                        .with(
+                            "command",
+                            Asked::text(Request::Sessions, &integration.command),
+                        )
+                        .with(
+                            "flags",
+                            integration
+                                .flags
+                                .iter()
+                                .map(|flag| Asked::text(Request::Sessions, flag))
+                                .collect::<Vec<_>>(),
+                        )
+                        .with("enabled", integration.enabled)
+                })
+                .collect::<Vec<_>>(),
+        )
 }
 
 /// Names the terminal applications this host has, in the order it would choose them.
@@ -1176,12 +1224,11 @@ async fn attach_unpublished(
                 ),
             ));
             if json {
-                let mut document = report::failure(&error);
-                document["session_id"] = serde_json::json!(session_id.to_string());
-                document["closure"] = record
-                    .as_ref()
-                    .map_or(serde_json::Value::Null, report::closure);
-                print_json(&document);
+                output::document(
+                    &report::failure(&error)
+                        .with("session_id", output::said(&session_id))
+                        .with("closure", record.as_ref().map(report::closure)),
+                );
             } else {
                 report::failed(&error);
             }
@@ -1481,10 +1528,11 @@ fn report_answered(
         }
         Err(error @ CliError::AnswerKept { .. }) => {
             if json {
-                let mut document = report::failure(&error);
-                document["kept"] = serde_json::Value::Bool(true);
-                document["question_id"] = serde_json::json!(question_id.to_string());
-                print_json(&document);
+                output::document(
+                    &report::failure(&error)
+                        .with("kept", true)
+                        .with("question_id", output::said(&question_id)),
+                );
             } else {
                 report::failed(&error);
             }

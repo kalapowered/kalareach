@@ -1134,6 +1134,8 @@ const HOST_TREE_NAMES: &[&str] = &[
     "c.sock",
     "r.sock",
     "account-token.json",
+    // The host's configuration document.
+    "config.json",
 ];
 
 /// The extensions a file named by an identifier carries in this installation's tree.

@@ -72,10 +72,15 @@ fn result() -> HostDoctorResult {
     HostDoctorResult::new(checks(), configured())
 }
 
+/// The lines as a person reads them.
+fn text(lines: &[Line]) -> String {
+    lines.iter().map(Line::text).collect::<Vec<_>>().join("\n")
+}
+
 /// KR-REQ-01.23: the default output shows evidence for what did not pass, and nothing else.
 #[test]
 fn the_default_output_shows_evidence_only_where_a_check_did_not_pass() {
-    let text = doctor_lines(&result(), false);
+    let text = text(&doctor_lines(&result(), false));
     assert!(
         text.contains("The runtime directory is owner-only"),
         "{text}"
@@ -101,7 +106,7 @@ fn the_default_output_shows_evidence_only_where_a_check_did_not_pass() {
 /// KR-REQ-01.23: `--verbose` shows every check's evidence, including the ones that passed.
 #[test]
 fn verbose_shows_every_checks_evidence() {
-    let text = doctor_lines(&result(), true);
+    let text = text(&doctor_lines(&result(), true));
     for evidence in [
         "[path withheld, 23 bytes]",
         "1 verified, 1 quarantined",
@@ -158,7 +163,7 @@ fn integrated() -> HostDoctorResult {
 /// launch through one where it cannot; the document form carries them all.
 #[test]
 fn the_doctor_shows_each_command_integration() {
-    let text = doctor_lines(&integrated(), false);
+    let text = text(&doctor_lines(&integrated(), false));
     for shown in [
         "claude (kalareach/claude-code 0.4.0): on, native_bridge",
         r#""--dangerously-load-development-channels" "plugin:kalareach-channels@skills-dir""#,
@@ -170,7 +175,7 @@ fn the_doctor_shows_each_command_integration() {
     ] {
         assert!(text.contains(shown), "{shown} is missing: {text}");
     }
-    let document = doctor(&integrated());
+    let document = doctor(&integrated()).json();
     let reported = document["command_integrations"]
         .as_array()
         .expect("the integrations are in the document");
@@ -185,8 +190,8 @@ fn the_doctor_shows_each_command_integration() {
 /// KR-REQ-01.23: the summary counts every verdict.
 #[test]
 fn the_summary_counts_each_verdict() {
-    let text = doctor_lines(&result(), false);
-    let last = text.lines().next_back().expect("a summary line");
+    let lines = doctor_lines(&result(), false);
+    let last = lines.last().expect("a summary line").text();
     assert_eq!(
         last,
         "3 checks: 1 passed, 1 with something worth knowing, 0 failed, 1 not applicable"
@@ -197,9 +202,16 @@ fn the_summary_counts_each_verdict() {
 /// and the owner is shown where their own files are.
 #[test]
 fn the_configurable_defaults_are_shown_with_their_value_and_source() {
-    let lines = configurable_lines(&configured());
+    let lines = configurable_lines(&configured())
+        .iter()
+        .map(|line| line.text().to_owned())
+        .collect::<Vec<_>>();
+    // The document is a path, said as this installation's paths are: its configured roots whole,
+    // and below them the names its tree writes, the document's own among them.
+    let document = Shown::host_path(std::path::Path::new("/tmp/kalareach/config.json"));
+    assert!(document.as_str().ends_with("config.json"), "{document}");
     assert!(
-        lines[0].contains("/tmp/kalareach/config.json"),
+        lines[0].contains(document.as_str()),
         "the owner is told which document this is: {lines:?}"
     );
     assert!(

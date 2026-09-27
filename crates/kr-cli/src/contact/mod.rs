@@ -918,10 +918,7 @@ fn asked_nothing() -> CliError {
 fn refusal(error: CliError) -> CallToolResult {
     let protocol = match &error {
         CliError::Refused(refused) => refused.clone(),
-        other => kr_client::error::refusal(
-            ErrorCode::from_wire(&other.code()).unwrap_or(ErrorCode::ResourceUnavailable),
-            other.said(),
-        ),
+        other => kr_client::error::refusal(other.code(), other.said()),
     };
     let mut value = json!({
         "code": protocol.code.as_str(),

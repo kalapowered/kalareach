@@ -128,48 +128,26 @@ impl CliError {
 
     /// Returns the stable code a `--json` failure carries.
     #[must_use]
-    pub fn code(&self) -> String {
+    pub const fn code(&self) -> kr_protocol::error::ErrorCode {
         match self {
-            Self::Usage(_) => kr_protocol::error::ErrorCode::InvalidArgument
-                .as_str()
-                .to_owned(),
+            Self::Usage(_) => kr_protocol::error::ErrorCode::InvalidArgument,
             Self::HostUnavailable(_) | Self::Ipc(_) => {
                 kr_protocol::error::ErrorCode::HostNotConfigured
-                    .as_str()
-                    .to_owned()
             }
-            Self::UnknownSession(_) => kr_protocol::error::ErrorCode::UnknownSession
-                .as_str()
-                .to_owned(),
-            Self::NotInSession => kr_protocol::error::ErrorCode::NotInKrSession
-                .as_str()
-                .to_owned(),
+            Self::UnknownSession(_) => kr_protocol::error::ErrorCode::UnknownSession,
+            Self::NotInSession => kr_protocol::error::ErrorCode::NotInKrSession,
             Self::ShellIntegrationUnsupported(_) => {
                 kr_protocol::error::ErrorCode::ShellIntegrationUnsupported
-                    .as_str()
-                    .to_owned()
             }
-            Self::AmbiguousSession(_) => kr_protocol::error::ErrorCode::AmbiguousSession
-                .as_str()
-                .to_owned(),
+            Self::AmbiguousSession(_) => kr_protocol::error::ErrorCode::AmbiguousSession,
             Self::NotATerminal | Self::Terminal(_) | Self::TerminalProbeFailed(_) => {
                 kr_protocol::error::ErrorCode::TerminalProbeFailed
-                    .as_str()
-                    .to_owned()
             }
-            Self::TerminalUnavailable(_) => kr_protocol::error::ErrorCode::TerminalUnavailable
-                .as_str()
-                .to_owned(),
-            Self::Refused(error) => error.code.as_str().to_owned(),
-            Self::SessionClosed(_) => kr_protocol::error::ErrorCode::SessionClosed
-                .as_str()
-                .to_owned(),
-            Self::Unfinished { code, .. } | Self::AnswerKept { code, .. } => {
-                code.as_str().to_owned()
-            }
-            Self::Other(_) => kr_protocol::error::ErrorCode::ResourceUnavailable
-                .as_str()
-                .to_owned(),
+            Self::TerminalUnavailable(_) => kr_protocol::error::ErrorCode::TerminalUnavailable,
+            Self::Refused(error) => error.code,
+            Self::SessionClosed(_) => kr_protocol::error::ErrorCode::SessionClosed,
+            Self::Unfinished { code, .. } | Self::AnswerKept { code, .. } => *code,
+            Self::Other(_) => kr_protocol::error::ErrorCode::ResourceUnavailable,
         }
     }
 }

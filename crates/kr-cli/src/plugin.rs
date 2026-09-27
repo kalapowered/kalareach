@@ -41,7 +41,9 @@ use crate::cli::{
 };
 use crate::daemon::{Daemon, identifier};
 use crate::error::{CliError, Result};
+use crate::output::{self, Asked, Document, Request};
 use crate::report;
+use crate::stdout_line;
 
 /// Runs one `kr plugin` command and prints its result.
 ///
@@ -101,51 +103,53 @@ async fn integration(
         .iter()
         .find(|report| report.plugin_id == plugin.as_str());
     if json {
-        let document = crate::doctor::doctor(&diagnosed);
-        report::print_json(&serde_json::json!({
-            "ok": true,
-            "environment_id": daemon.environment_id().to_string(),
-            "plugin_id": plugin.as_str(),
-            "enabled": enabled,
-            "revision": revision.to_string(),
-            "in_force": in_force.map(|value| serde_json::json!({
-                "value": value.value(),
-                "source": value.source.as_str(),
-                "origin": value.origin.as_ref().cloned(),
-            })),
-            "integration": document["command_integrations"]
-                .as_array()
-                .and_then(|reports| {
-                    reports
-                        .iter()
-                        .find(|report| report["plugin_id"] == plugin.as_str())
-                        .cloned()
-                }),
-        }));
+        output::document(
+            &Document::new()
+                .with("ok", true)
+                .with("environment_id", output::said(&daemon.environment_id()))
+                .with("plugin_id", Asked::text(Request::Plugins, plugin.as_str()))
+                .with("enabled", enabled)
+                .with("revision", output::said(&revision))
+                .with(
+                    "in_force",
+                    in_force.map(|value| {
+                        Document::new()
+                            .with("value", output::configured(value.class(), value.value()))
+                            .with("source", value.source.as_str())
+                            .with(
+                                "origin",
+                                value.origin.as_ref().map(|origin| {
+                                    output::configured_field("EffectiveValue", "origin", origin)
+                                }),
+                            )
+                    }),
+                )
+                .with("integration", reported.map(crate::doctor::integration)),
+        );
         return Ok(());
     }
-    println!(
-        "{plugin}'s command integration is {} in this host's list, for sessions created from now \
-         on (configuration revision {revision})",
-        if enabled { "on" } else { "off" }
-    );
+    output::line(&stdout_line!(
+        "{}'s command integration is {} in this host's list, for sessions created from now on \
+         (configuration revision {})",
+        Asked::text(Request::Plugins, plugin.as_str()),
+        if enabled { "on" } else { "off" },
+        revision
+    ));
     if let Some(value) = in_force {
-        println!(
+        output::line(&stdout_line!(
             "a new session applies the command integrations of: {}",
-            value.value()
-        );
+            output::configured(value.class(), value.value())
+        ));
         if value.source == ValueSource::Profile {
-            println!(
+            output::line(&stdout_line!(
                 "the selected profile's list decides that, over this host's own list; change the \
                  profile in the configuration document to change it"
-            );
+            ));
         }
     }
     // What a session created now gets of this package's integration, as the doctor reports it.
     if let Some(reported) = reported {
-        for line in crate::doctor::integration_lines(reported) {
-            println!("{line}");
-        }
+        output::lines(&crate::doctor::integration_lines(reported, "", ""));
     }
     Ok(())
 }

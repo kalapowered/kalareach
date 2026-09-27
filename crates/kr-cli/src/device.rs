@@ -319,7 +319,7 @@ mod tests {
             worker(3, BarrierState::Acknowledged, ""),
         ]);
         let error = pending(device, &waiting).expect("pending is not success");
-        assert_eq!(error.code(), "RESOURCE_UNAVAILABLE");
+        assert_eq!(error.code().as_str(), "RESOURCE_UNAVAILABLE");
         assert_eq!(error.exit_code(), 1);
         assert!(
             error

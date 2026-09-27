@@ -13,13 +13,15 @@ use kr_client::shown::{Said, Shown};
 use kr_protocol::attachment::{AttachMode, AttachmentSummary, TerminalPresentationMode};
 use kr_protocol::desktop::{
     CapabilityRecord, DesktopCapabilityReport, DesktopContext, EnvironmentCapabilitiesResult,
-    SleepInhibitionState,
+    SleepInhibitionSetting, SleepInhibitionState,
 };
 use kr_protocol::hostinfo::HostInfoResult;
 use kr_protocol::session::{ClosureRecord, SessionState, SessionSummary};
 use serde_json::{Value, json};
 
 use crate::error::CliError;
+use crate::output::{self, Asked, Document, Line, Request, left, right};
+use crate::stdout_line;
 
 /// How a command finished.
 ///
@@ -37,13 +39,20 @@ pub enum Completion {
 ///
 /// The message is what the failure says, which its type holds to a [`Shown`].
 #[must_use]
-pub fn failure(error: &CliError) -> Value {
-    json!({
-        "ok": false,
-        "code": error.code(),
-        "message": error.said().as_str(),
-        "exit_code": error.exit_code(),
-    })
+pub fn failure(error: &CliError) -> Document {
+    Document::new()
+        .with("ok", false)
+        .with("code", output::said(&error.code()))
+        .with("message", error.said())
+        .with("exit_code", error.exit_code())
+}
+
+/// Renders a result that is also a failure: the result, with the failure's code, message and exit
+/// status beside it and `ok` false.
+#[must_use]
+pub fn with_failure(mut document: Document, error: &CliError) -> Document {
+    document.merge(failure(error));
+    document
 }
 
 /// Writes one line on standard error.
@@ -107,8 +116,11 @@ pub fn answer_that_failed<T: serde::Serialize>(
     error: &CliError,
 ) -> Result<Value, CliError> {
     let mut document = self::answer(answer)?;
-    if let (Some(object), Value::Object(failed)) = (document.as_object_mut(), failure(error)) {
-        object.extend(failed);
+    if let Some(object) = document.as_object_mut() {
+        object.insert("ok".to_owned(), Value::Bool(false));
+        object.insert("code".to_owned(), json!(error.code().as_str()));
+        object.insert("message".to_owned(), json!(error.said().as_str()));
+        object.insert("exit_code".to_owned(), json!(error.exit_code()));
     }
     Ok(document)
 }
@@ -133,198 +145,405 @@ pub fn print_json(document: &Value) {
 
 /// Renders one session.
 #[must_use]
-pub fn session(summary: &SessionSummary) -> Value {
-    json!({
-        "session_id": summary.session_id.to_string(),
-        "display_number": summary.display_number.get(),
-        "environment_id": summary.environment_id.to_string(),
-        "state": summary.state.as_str(),
-        "shell_mode": summary.shell_mode.as_str(),
-        "shell": summary.shell_path,
-        "cwd": summary.cwd,
-        "dimensions": {
-            "columns": summary.dimensions.columns(),
-            "rows": summary.dimensions.rows(),
-        },
-        "attachments": summary.attachment_count.get(),
-        "worker_profile": summary.worker_profile.as_str(),
+pub fn session(summary: &SessionSummary) -> Document {
+    Document::new()
+        .with("session_id", output::said(&summary.session_id))
+        .with("display_number", summary.display_number.get())
+        .with("environment_id", output::said(&summary.environment_id))
+        .with("state", summary.state.as_str())
+        .with("shell_mode", summary.shell_mode.as_str())
+        .with("shell", Asked::path(Request::Sessions, &summary.shell_path))
+        .with("cwd", Asked::path(Request::Sessions, &summary.cwd))
+        .with("dimensions", dimensions(summary.dimensions))
+        .with("attachments", summary.attachment_count.get())
+        .with("worker_profile", summary.worker_profile.as_str())
         // The desktop this session's processes run on, which is not the terminal it is shown in.
         // A session with no desktop says so with nulls rather than with a placeholder.
-        "desktop": {
-            "desktop_session_id": summary
-                .desktop
-                .desktop_session_id
-                .as_ref()
-                .map(ToString::to_string),
-            "login_generation": summary.desktop.login_generation.as_ref().map(|value| value.get()),
-        },
-        "created_at_ms": summary.created_at_ms.get(),
-        "closure": summary.closure.as_ref().map(closure),
-    })
+        .with(
+            "desktop",
+            Document::new()
+                .with(
+                    "desktop_session_id",
+                    summary
+                        .desktop
+                        .desktop_session_id
+                        .as_ref()
+                        .map(|desktop| Asked::text(Request::Sessions, &desktop.to_string())),
+                )
+                .with(
+                    "login_generation",
+                    summary
+                        .desktop
+                        .login_generation
+                        .as_ref()
+                        .map(|value| value.get()),
+                ),
+        )
+        .with("created_at_ms", summary.created_at_ms.get())
+        .with("closure", summary.closure.as_ref().map(closure))
 }
+
+/// Renders a size as its columns and rows.
+#[must_use]
+pub fn dimensions(dimensions: kr_protocol::session::Dimensions) -> Document {
+    Document::new()
+        .with("columns", dimensions.columns())
+        .with("rows", dimensions.rows())
+}
+
+/// The kinds of resource a closure record says survived, as a worker and this host's daemon write
+/// them. Any other kind is replaced.
+const SURVIVING_KINDS: [&str; 3] = ["process", "unestablished", "unaccounted_worker"];
 
 /// Renders a session's closure record, whole: how it closed, what it terminated and what survived
 /// it.
+///
+/// A process's name is the session's own, shown to the person who asked about the session; what a
+/// surviving resource's detail says is the host's sentence, said as its class and its length.
 #[must_use]
-pub fn closure(record: &ClosureRecord) -> Value {
-    json!({
-        "session_id": record.session_id.to_string(),
-        "session_epoch": serde_json::to_value(record.session_epoch).unwrap_or(Value::Null),
-        "terminated": record.terminated.iter().map(|process| json!({
-            "pid": process.identity.pid.get(),
-            "start": serde_json::to_value(&process.identity).unwrap_or(Value::Null),
-            "name": process.name.as_ref().cloned(),
-            "forced": process.forced,
-        })).collect::<Vec<_>>(),
-        "surviving": record.surviving.iter().map(|resource| json!({
-            "kind": resource.kind,
-            "detail": resource.detail,
-        })).collect::<Vec<_>>(),
-        "reason": record.reason.as_str(),
-        "exit_code": record.root_exit_code.as_ref().map(|code| code.get()),
-        "signal": record.root_signal.as_ref().cloned(),
-        "ownership_coverage": match record.ownership_coverage {
-            kr_protocol::session::OwnershipCoverage::Complete => "complete",
-            kr_protocol::session::OwnershipCoverage::Incomplete => "incomplete",
-        },
-        "durability": match record.durability {
-            kr_protocol::session::Durability::Durable => "durable",
-            kr_protocol::session::Durability::Volatile => "volatile",
-        },
-        "closed_at_ms": record.closed_at_ms.get(),
-    })
+pub fn closure(record: &ClosureRecord) -> Document {
+    Document::new()
+        .with("session_id", output::said(&record.session_id))
+        .with("session_epoch", output::said(&record.session_epoch))
+        .with(
+            "terminated",
+            record
+                .terminated
+                .iter()
+                .map(|process| {
+                    Document::new()
+                        .with("pid", process.identity.pid.get())
+                        .with(
+                            "start",
+                            Document::new()
+                                .with("pid", output::said(&process.identity.pid))
+                                .with("source", crate::shown::wire_word(process.identity.source))
+                                .with("start_value", output::said(&process.identity.start_value)),
+                        )
+                        .with(
+                            "name",
+                            process
+                                .name
+                                .as_ref()
+                                .map(|name| Asked::text(Request::Sessions, name)),
+                        )
+                        .with("forced", process.forced)
+                })
+                .collect::<Vec<_>>(),
+        )
+        .with(
+            "surviving",
+            record
+                .surviving
+                .iter()
+                .map(|resource| {
+                    Document::new()
+                        .with("kind", surviving_kind(&resource.kind))
+                        .with(
+                            "detail",
+                            crate::shown::exported("SurvivingResource", "detail", &resource.detail),
+                        )
+                })
+                .collect::<Vec<_>>(),
+        )
+        .with("reason", record.reason.as_str())
+        .with(
+            "exit_code",
+            record.root_exit_code.as_ref().map(|code| code.get()),
+        )
+        .with("signal", Shown::signal(record))
+        .with(
+            "ownership_coverage",
+            match record.ownership_coverage {
+                kr_protocol::session::OwnershipCoverage::Complete => "complete",
+                kr_protocol::session::OwnershipCoverage::Incomplete => "incomplete",
+            },
+        )
+        .with("durability", durability_word(record.durability))
+        .with("closed_at_ms", record.closed_at_ms.get())
+}
+
+/// What kind of resource survived a session: one of the kinds a worker and this host write, or a
+/// placeholder.
+fn surviving_kind(kind: &str) -> Shown {
+    SURVIVING_KINDS
+        .iter()
+        .find(|known| **known == kind)
+        .map_or_else(
+            || Shown::said("[a resource kind]"),
+            |known| Shown::said(known),
+        )
+}
+
+/// The word a record's durability goes by.
+#[must_use]
+pub const fn durability_word(durability: kr_protocol::session::Durability) -> &'static str {
+    match durability {
+        kr_protocol::session::Durability::Durable => "durable",
+        kr_protocol::session::Durability::Volatile => "volatile",
+    }
 }
 
 /// Renders one session as a line for a person.
 #[must_use]
-pub fn session_line(summary: &SessionSummary) -> String {
+pub fn session_line(summary: &SessionSummary) -> Line {
     let state = match summary.state {
         SessionState::Creating => "creating",
         SessionState::Live => "live",
         SessionState::Closing => "closing",
         SessionState::Closed => "closed",
     };
-    format!(
-        "{:>4}  {:<8} {:<14} {:>4}x{:<4} {} attachment{}  {}",
-        summary.display_number.get(),
-        state,
-        summary.shell_mode.as_str(),
-        summary.dimensions.columns(),
-        summary.dimensions.rows(),
+    stdout_line!(
+        "{}  {} {} {}x{} {} attachment{}  {}",
+        right(4, &summary.display_number.get()),
+        left(8, &state),
+        left(14, &summary.shell_mode.as_str()),
+        right(4, &summary.dimensions.columns()),
+        left(4, &summary.dimensions.rows()),
         summary.attachment_count.get(),
         if summary.attachment_count.get() == 1 {
             ""
         } else {
             "s"
         },
-        summary.shell_path,
+        Asked::path(Request::Sessions, &summary.shell_path),
     )
 }
 
 /// Renders the host's own state.
 #[must_use]
-pub fn host(info: &HostInfoResult) -> Value {
-    json!({
-        "build_id": info.build_id.to_string(),
-        "protocol_version": info.protocol_version.to_string(),
-        "environment_id": info.environment_id.to_string(),
-        "generation": info.generation.get(),
-        "live_sessions": info.live_sessions.get(),
-        "session_limit": info.session_limit.get(),
-        "started_at_ms": info.started_at_ms.get(),
-        "default_worker_profile": info.default_worker_profile.as_str(),
-        "power": power(&info.power),
-    })
+pub fn host(info: &HostInfoResult) -> Document {
+    Document::new()
+        .with(
+            "build_id",
+            crate::shown::build_identity(&info.build_id.to_string()),
+        )
+        .with(
+            "protocol_version",
+            shown!(
+                "{}.{}",
+                info.protocol_version.major,
+                info.protocol_version.minor
+            ),
+        )
+        .with("environment_id", output::said(&info.environment_id))
+        .with("generation", info.generation.get())
+        .with("live_sessions", info.live_sessions.get())
+        .with("session_limit", info.session_limit.get())
+        .with("started_at_ms", info.started_at_ms.get())
+        .with(
+            "default_worker_profile",
+            info.default_worker_profile.as_str(),
+        )
+        .with("power", power(&info.power))
 }
 
 /// Renders what the host's sleep inhibition is doing.
+///
+/// The assertion's name and why none is held are the host's text, said as their class and length.
 #[must_use]
-pub fn power(state: &SleepInhibitionState) -> Value {
-    json!({
-        "setting": state.setting.as_str(),
-        "active": state.active,
-        "reason": state.reason.as_ref().map(|reason| reason.as_str()),
-        "mechanism": state.mechanism.as_str(),
-        "power_source": state.power_source.as_str(),
-        "sessions_with_work": state.sessions_with_work.get(),
-        "pending_requests": state.pending_requests.get(),
-        "since_ms": state.since_ms.as_ref().map(|since| since.get()),
-        "holder": state.holder.as_ref().cloned(),
-        "withheld_reason": state.withheld_reason.as_ref().cloned(),
-        "description": state.describe(),
-    })
+pub fn power(state: &SleepInhibitionState) -> Document {
+    Document::new()
+        .with("setting", state.setting.as_str())
+        .with("active", state.active)
+        .with(
+            "reason",
+            state.reason.as_ref().map(|reason| reason.as_str()),
+        )
+        .with("mechanism", state.mechanism.as_str())
+        .with("power_source", state.power_source.as_str())
+        .with("sessions_with_work", state.sessions_with_work.get())
+        .with("pending_requests", state.pending_requests.get())
+        .with("since_ms", state.since_ms.as_ref().map(|since| since.get()))
+        .with(
+            "holder",
+            state
+                .holder
+                .as_ref()
+                .map(|holder| crate::shown::exported("SleepInhibitionState", "holder", holder)),
+        )
+        .with(
+            "withheld_reason",
+            state.withheld_reason.as_ref().map(|reason| {
+                crate::shown::exported("SleepInhibitionState", "withheld_reason", reason)
+            }),
+        )
+        .with("description", power_line(state))
+}
+
+/// The line host status and `kr status` print about sleep, in the words the power state describes
+/// itself with, the assertion's name and why none is held said as their class and length.
+#[must_use]
+pub fn power_line(state: &SleepInhibitionState) -> Shown {
+    if state.active {
+        let reason = state
+            .reason
+            .as_ref()
+            .map_or("work the host has admitted", |reason| reason.describe());
+        let holder = state.holder.as_ref().map_or_else(
+            || Shown::said("an assertion"),
+            |holder| crate::shown::exported("SleepInhibitionState", "holder", holder),
+        );
+        return shown!(
+            "sleep inhibited ({}): {}, held as {} on {} power",
+            state.setting.as_str(),
+            reason,
+            holder,
+            state.power_source.as_str()
+        );
+    }
+    match state.setting {
+        SleepInhibitionSetting::Off => Shown::said("sleep policy unchanged (off)"),
+        setting => shown!(
+            "sleep policy unchanged ({}): {}",
+            setting.as_str(),
+            state.withheld_reason.as_ref().map_or_else(
+                || Shown::said("nothing currently justifies an assertion"),
+                |reason| crate::shown::exported("SleepInhibitionState", "withheld_reason", reason)
+            )
+        ),
+    }
 }
 
 /// Renders one desktop execution context.
+///
+/// The desktop's identifier and the account it belongs to are the session's own, shown to the
+/// person who asked; the platform's session name and the compositor's are the host's text, said as
+/// their class and length.
 #[must_use]
-pub fn desktop(context: &DesktopContext) -> Value {
-    json!({
-        "desktop_session_id": context.desktop_session_id.as_ref().map(ToString::to_string),
-        "kind": context.kind.as_str(),
-        "platform_session": context.platform_session.as_ref().cloned(),
-        "login_generation": context.login_generation.as_ref().map(|value| value.get()),
-        "generation_source": context.generation_source.as_str(),
-        "os_user": context.os_user,
-        "uid": context.uid.as_ref().map(|uid| uid.get()),
-        "graphic_access": context.graphic_access,
-        "remote": context.remote,
-        "availability": context.availability.as_str(),
-        "container": context.container.as_str(),
-        "display_server": context.display_server.as_str(),
-        "compositor": context.compositor.as_ref().cloned(),
-        "worker_profile": context.worker_profile.as_str(),
-    })
+pub fn desktop(context: &DesktopContext) -> Document {
+    Document::new()
+        .with(
+            "desktop_session_id",
+            context
+                .desktop_session_id
+                .as_ref()
+                .map(|desktop| Asked::text(Request::Sessions, &desktop.to_string())),
+        )
+        .with("kind", context.kind.as_str())
+        .with(
+            "platform_session",
+            context.platform_session.as_ref().map(|session| {
+                crate::shown::exported("DesktopContext", "platform_session", session)
+            }),
+        )
+        .with(
+            "login_generation",
+            context.login_generation.as_ref().map(|value| value.get()),
+        )
+        .with("generation_source", context.generation_source.as_str())
+        .with("os_user", Asked::text(Request::Sessions, &context.os_user))
+        .with("uid", context.uid.as_ref().map(|uid| uid.get()))
+        .with("graphic_access", context.graphic_access)
+        .with("remote", context.remote)
+        .with("availability", context.availability.as_str())
+        .with("container", context.container.as_str())
+        .with("display_server", context.display_server.as_str())
+        .with(
+            "compositor",
+            context.compositor.as_ref().map(|compositor| {
+                crate::shown::exported("DesktopContext", "compositor", compositor)
+            }),
+        )
+        .with("worker_profile", context.worker_profile.as_str())
 }
 
 /// Renders one capability record.
+///
+/// The binary it was established about is said whole: it is what `kr doctor` was asked to
+/// diagnose. The facility's identity and the reason a person is given are the host's text.
 #[must_use]
-pub fn capability(record: &CapabilityRecord) -> Value {
-    json!({
-        "capability": record.capability.to_string(),
-        "version": record.version.get(),
-        "revision": record.revision.get(),
-        "state": record.state.as_str(),
-        "evidence_source": record.evidence_source.as_str(),
-        // A capability's own identity and its sentence come from whatever probed it: a binary
-        // found on `PATH`, a facility's version string, a platform's own message. The host
-        // withholds all three at its export boundary, so what is printed here is what it sent.
-        "binary": record.identity.binary.0.as_deref(),
-        "facility_identity": record.identity.version.0.as_deref(),
-        "profile": record.identity.profile.as_ref().map(|profile| profile.as_str()),
-        "invalidation": record
-            .invalidation
-            .iter()
-            .map(|trigger| trigger.as_str())
-            .collect::<Vec<_>>(),
-        "disabled_reason": record.disabled_reason.0.as_deref(),
-        "observed_at_ms": record.observed_at_ms.get(),
-    })
+pub fn capability(record: &CapabilityRecord) -> Document {
+    Document::new()
+        .with(
+            "capability",
+            crate::shown::exported(
+                "CapabilityRecord",
+                "capability",
+                &record.capability.to_string(),
+            ),
+        )
+        .with("version", record.version.get())
+        .with("revision", record.revision.get())
+        .with("state", record.state.as_str())
+        .with("evidence_source", record.evidence_source.as_str())
+        .with(
+            "binary",
+            record
+                .identity
+                .binary
+                .as_ref()
+                .map(|binary| Asked::path(Request::Diagnostics, binary)),
+        )
+        .with(
+            "facility_identity",
+            record
+                .identity
+                .version
+                .as_ref()
+                .map(|version| crate::shown::exported("CapabilityIdentity", "version", version)),
+        )
+        .with(
+            "profile",
+            record
+                .identity
+                .profile
+                .as_ref()
+                .map(|profile| profile.as_str()),
+        )
+        .with(
+            "invalidation",
+            record
+                .invalidation
+                .iter()
+                .map(|trigger| trigger.as_str())
+                .collect::<Vec<_>>(),
+        )
+        .with(
+            "disabled_reason",
+            record.disabled_reason.as_ref().map(|reason| {
+                crate::shown::exported("CapabilityRecord", "disabled_reason", reason)
+            }),
+        )
+        .with("observed_at_ms", record.observed_at_ms.get())
 }
 
 /// Renders a desktop and what may be done on it.
 #[must_use]
-pub fn desktop_capabilities(report: &DesktopCapabilityReport) -> Value {
-    json!({
-        "desktop": desktop(&report.desktop),
-        "capabilities": report.records.iter().map(capability).collect::<Vec<_>>(),
-    })
+pub fn desktop_capabilities(report: &DesktopCapabilityReport) -> Document {
+    Document::new()
+        .with("desktop", desktop(&report.desktop))
+        .with(
+            "capabilities",
+            report.records.iter().map(capability).collect::<Vec<_>>(),
+        )
 }
 
 /// Renders what one environment can currently do.
 #[must_use]
-pub fn environment_capabilities(result: &EnvironmentCapabilitiesResult) -> Value {
-    json!({
-        "environment_id": result.environment_id.to_string(),
-        "default_worker_profile": result.default_worker_profile.as_str(),
-        "desktop": desktop_capabilities(&result.desktop),
-        "persistence": result.persistence.iter().map(|entry| json!({
-            "profile": entry.profile.as_str(),
-            "persistence": entry.persistence.as_str(),
-            "mechanism": entry.mechanism().as_str(),
-            "detail": entry.detail().as_str(),
-        })).collect::<Vec<_>>(),
-        "power": power(&result.power),
-    })
+pub fn environment_capabilities(result: &EnvironmentCapabilitiesResult) -> Document {
+    Document::new()
+        .with("environment_id", output::said(&result.environment_id))
+        .with(
+            "default_worker_profile",
+            result.default_worker_profile.as_str(),
+        )
+        .with("desktop", desktop_capabilities(&result.desktop))
+        .with(
+            "persistence",
+            result
+                .persistence
+                .iter()
+                .map(|entry| {
+                    Document::new()
+                        .with("profile", entry.profile.as_str())
+                        .with("persistence", entry.persistence.as_str())
+                        .with("mechanism", crate::shown::host_text(entry.mechanism()))
+                        .with("detail", crate::shown::host_text(entry.detail()))
+                })
+                .collect::<Vec<_>>(),
+        )
+        .with("power", power(&result.power))
 }
 
 /// Renders the execution context a session is about to be created in.
@@ -335,8 +554,8 @@ pub fn environment_capabilities(result: &EnvironmentCapabilitiesResult) -> Value
 pub fn execution_context_line(
     profile: kr_protocol::identity::WorkerProfile,
     chosen: bool,
-) -> String {
-    format!(
+) -> Shown {
+    shown!(
         "execution context {} ({})",
         profile.as_str(),
         if chosen {
@@ -349,18 +568,19 @@ pub fn execution_context_line(
 
 /// Renders the desktop this environment has as a line for a person.
 #[must_use]
-pub fn desktop_summary_line(report: &DesktopCapabilityReport) -> String {
+pub fn desktop_summary_line(report: &DesktopCapabilityReport) -> Line {
     let desktop = &report.desktop;
     let Some(name) = desktop.desktop_session_id.as_ref() else {
-        return "no graphical login session, so no desktop to bind a session to".to_owned();
+        return stdout_line!("no graphical login session, so no desktop to bind a session to");
     };
     let unavailable = report
         .records
         .iter()
         .filter(|record| !record.state.is_available())
         .count();
-    format!(
-        "desktop {name} ({}, {}, {} of {} capabilities established)",
+    stdout_line!(
+        "desktop {} ({}, {}, {} of {} capabilities established)",
+        Asked::text(Request::Sessions, &name.to_string()),
         desktop.display_server.as_str(),
         desktop.availability.as_str(),
         report.records.len() - unavailable,
@@ -370,55 +590,69 @@ pub fn desktop_summary_line(report: &DesktopCapabilityReport) -> String {
 
 /// Renders what a logout does to each execution profile, one line each.
 #[must_use]
-pub fn persistence_lines(persistence: &[kr_protocol::desktop::ProfilePersistence]) -> Vec<String> {
+pub fn persistence_lines(persistence: &[kr_protocol::desktop::ProfilePersistence]) -> Vec<Shown> {
     persistence
         .iter()
         .map(|entry| {
-            format!(
+            shown!(
                 "a {} session at logout: {} ({})",
                 entry.profile.as_str(),
                 entry.persistence.as_str(),
-                entry.mechanism()
+                crate::shown::host_text(entry.mechanism())
             )
         })
         .collect()
 }
 
-/// Renders each capability of one desktop as a line for a person.
+/// Renders each capability of one desktop as a line for a person: the reason a person is given
+/// where there is one, and otherwise the binary it was established about.
 #[must_use]
-pub fn capability_lines(report: &DesktopCapabilityReport) -> Vec<String> {
+pub fn capability_lines(report: &DesktopCapabilityReport) -> Vec<Line> {
     report
         .records
         .iter()
         .map(|record| {
-            // What the host sent. Both the sentence and the facility name come from whatever
-            // probed the capability, and both were withheld at the host's export boundary.
-            let detail = record.disabled_reason.as_ref().cloned().unwrap_or_else(|| {
-                record
-                    .identity
-                    .binary
-                    .as_ref()
-                    .cloned()
-                    .unwrap_or_else(|| "no facility named".to_owned())
-            });
-            format!(
-                "  {:<26} {:<24} {detail}",
-                record.capability.to_string(),
-                record.state.as_str()
-            )
+            let capability = crate::shown::exported(
+                "CapabilityRecord",
+                "capability",
+                &record.capability.to_string(),
+            );
+            match (
+                record.disabled_reason.as_ref(),
+                record.identity.binary.as_ref(),
+            ) {
+                (Some(reason), _) => stdout_line!(
+                    "  {} {} {}",
+                    left(26, &capability),
+                    left(24, &record.state.as_str()),
+                    crate::shown::exported("CapabilityRecord", "disabled_reason", reason)
+                ),
+                (None, Some(binary)) => stdout_line!(
+                    "  {} {} {}",
+                    left(26, &capability),
+                    left(24, &record.state.as_str()),
+                    Asked::path(Request::Diagnostics, binary)
+                ),
+                (None, None) => stdout_line!(
+                    "  {} {} no facility named",
+                    left(26, &capability),
+                    left(24, &record.state.as_str())
+                ),
+            }
         })
         .collect()
 }
 
 /// Renders the desktop a session runs on as a line for a person.
 #[must_use]
-pub fn desktop_line(summary: &SessionSummary) -> String {
+pub fn desktop_line(summary: &SessionSummary) -> Line {
     match summary.desktop.desktop_session_id.as_ref() {
-        Some(desktop) => format!(
-            "execution context {}: desktop {desktop}",
-            summary.worker_profile.as_str()
+        Some(desktop) => stdout_line!(
+            "execution context {}: desktop {}",
+            summary.worker_profile.as_str(),
+            Asked::text(Request::Sessions, &desktop.to_string())
         ),
-        None => format!(
+        None => stdout_line!(
             "execution context {}: no desktop, and none of a desktop's handles",
             summary.worker_profile.as_str()
         ),
@@ -429,32 +663,42 @@ pub fn desktop_line(summary: &SessionSummary) -> String {
 ///
 /// Section 8 asks `kr status` to report each terminal attachment's mode and its reason. An
 /// attachment that is not a terminal has neither and is left out. A viewport whose worker gave no
-/// reason, which a worker built before reasons existed does, says so with a null.
+/// reason, which a worker built before reasons existed does, says so with a null. The terminal's
+/// type is one of the terminfo names this build lists, or its placeholder.
 #[must_use]
-pub fn terminal_attachments(attachments: &[AttachmentSummary]) -> Value {
-    Value::Array(
-        attachments
-            .iter()
-            .filter(|summary| summary.mode == AttachMode::Terminal)
-            .map(|summary| {
-                json!({
-                    "attachment_id": summary.attachment_id.to_string(),
-                    "presentation": summary.presentation.as_ref().map(|mode| mode.as_str()),
-                    "presentation_reason": summary.presentation_reason.map(|reason| reason.as_str()),
-                    "dimensions": summary.dimensions.as_ref().map(|dimensions| json!({
-                        "columns": dimensions.columns(),
-                        "rows": dimensions.rows(),
-                    })),
-                    "terminal_profile_id": summary.terminal_profile_id.as_ref().cloned(),
-                })
-            })
-            .collect(),
-    )
+pub fn terminal_attachments(attachments: &[AttachmentSummary]) -> Vec<Document> {
+    attachments
+        .iter()
+        .filter(|summary| summary.mode == AttachMode::Terminal)
+        .map(|summary| {
+            Document::new()
+                .with("attachment_id", output::said(&summary.attachment_id))
+                .with(
+                    "presentation",
+                    summary.presentation.as_ref().map(|mode| mode.as_str()),
+                )
+                .with(
+                    "presentation_reason",
+                    summary.presentation_reason.map(|reason| reason.as_str()),
+                )
+                .with(
+                    "dimensions",
+                    summary.dimensions.as_ref().copied().map(dimensions),
+                )
+                .with(
+                    "terminal_profile_id",
+                    summary
+                        .terminal_profile_id
+                        .as_ref()
+                        .map(|name| Shown::terminfo(name)),
+                )
+        })
+        .collect()
 }
 
 /// Renders each terminal attachment's presentation and its reason as a line for a person.
 #[must_use]
-pub fn terminal_attachment_lines(attachments: &[AttachmentSummary]) -> Vec<String> {
+pub fn terminal_attachment_lines(attachments: &[AttachmentSummary]) -> Vec<Shown> {
     attachments
         .iter()
         .filter(|summary| summary.mode == AttachMode::Terminal)
@@ -463,16 +707,16 @@ pub fn terminal_attachment_lines(attachments: &[AttachmentSummary]) -> Vec<Strin
                 summary.presentation.as_ref().copied(),
                 summary.presentation_reason,
             ) {
-                (Some(TerminalPresentationMode::Direct), _) => "direct".to_owned(),
+                (Some(TerminalPresentationMode::Direct), _) => Shown::said("direct"),
                 (Some(TerminalPresentationMode::Viewport), Some(reason)) => {
-                    format!("viewport ({}): {}", reason.as_str(), reason.describe())
+                    shown!("viewport ({}): {}", reason.as_str(), reason.describe())
                 }
                 (Some(TerminalPresentationMode::Viewport), None) => {
-                    "viewport, with no reason reported by this session's worker".to_owned()
+                    Shown::said("viewport, with no reason reported by this session's worker")
                 }
-                (None, _) => "no presentation reported".to_owned(),
+                (None, _) => Shown::said("no presentation reported"),
             };
-            format!("attachment {}: {presented}", summary.attachment_id)
+            shown!("attachment {}: {}", summary.attachment_id, presented)
         })
         .collect()
 }
@@ -480,12 +724,18 @@ pub fn terminal_attachment_lines(attachments: &[AttachmentSummary]) -> Vec<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::output::planted::{
+        only_asked, only_asked_lines, only_asked_or_host_text, planted, planted_text,
+    };
+    use crate::shown::marker::MARKER;
 
     #[test]
     fn a_failure_carries_its_code_and_exit_status() {
-        let value = failure(&CliError::AmbiguousSession(Shown::said("3")));
+        let error = CliError::AmbiguousSession(Shown::said("3"));
+        let value = failure(&error).json();
         assert_eq!(value["ok"], json!(false));
         assert_eq!(value["code"], json!("AMBIGUOUS_SESSION"));
+        assert_eq!(value["message"], json!(error.said().as_str()));
         assert_eq!(value["exit_code"], json!(5));
     }
 
@@ -493,22 +743,24 @@ mod tests {
     fn the_execution_context_is_named_before_a_session_is_created() {
         let chosen =
             execution_context_line(kr_protocol::identity::WorkerProfile::DesktopBound, true);
-        assert!(chosen.contains("desktop_bound"), "{chosen}");
-        assert!(chosen.contains("chosen"), "{chosen}");
+        assert_eq!(chosen.as_str(), "execution context desktop_bound (chosen)");
         let defaulted =
             execution_context_line(kr_protocol::identity::WorkerProfile::HeadlessUser, false);
-        assert!(defaulted.contains("headless_user"), "{defaulted}");
-        assert!(defaulted.contains("this host's default"), "{defaulted}");
+        assert_eq!(
+            defaulted.as_str(),
+            "execution context headless_user (this host's default)"
+        );
     }
 
     #[test]
     fn a_session_says_which_desktop_it_runs_on_or_that_it_has_none() {
         let mut summary = summary_for_tests();
-        let line = desktop_line(&summary);
-        assert!(line.contains("headless_user"), "{line}");
-        assert!(line.contains("no desktop"), "{line}");
+        assert_eq!(
+            desktop_line(&summary).text(),
+            "execution context headless_user: no desktop, and none of a desktop's handles"
+        );
         assert!(
-            session(&summary)["desktop"]["desktop_session_id"].is_null(),
+            session(&summary).json()["desktop"]["desktop_session_id"].is_null(),
             "a session with no desktop says so with a null"
         );
 
@@ -524,11 +776,13 @@ mod tests {
                 7,
             )),
         };
-        let line = desktop_line(&summary);
-        assert!(line.contains("desktop_bound"), "{line}");
-        assert!(line.contains("session=100019"), "{line}");
         assert_eq!(
-            session(&summary)["desktop"]["login_generation"],
+            desktop_line(&summary).text(),
+            "execution context desktop_bound: desktop \
+             macos_security_session:uid=501:session=100019:generation=7:boot=ab"
+        );
+        assert_eq!(
+            session(&summary).json()["desktop"]["login_generation"],
             json!(7),
             "the generation is reported beside the name"
         );
@@ -608,12 +862,14 @@ mod tests {
             ),
             attachment(4, AttachMode::Semantic, None, None),
         ];
-        let rendered = terminal_attachments(&attachments);
-        let entries = rendered.as_array().expect("a list");
+        let entries = terminal_attachments(&attachments)
+            .iter()
+            .map(Document::json)
+            .collect::<Vec<_>>();
         assert_eq!(
             entries.len(),
             3,
-            "the semantic attachment is not a terminal: {rendered}"
+            "the semantic attachment is not a terminal"
         );
         assert_eq!(entries[0]["presentation"], "direct");
         assert_eq!(entries[0]["presentation_reason"], Value::Null);
@@ -629,17 +885,21 @@ mod tests {
         let lines = terminal_attachment_lines(&attachments);
         assert_eq!(lines.len(), 3);
         assert_eq!(
-            lines[0],
+            lines[0].as_str(),
             format!("attachment {}: direct", attachments[0].attachment_id)
         );
         assert_eq!(
-            lines[1],
+            lines[1].as_str(),
             format!(
                 "attachment {}: viewport (size_mismatch): its size is not the session's",
                 attachments[1].attachment_id
             )
         );
-        assert!(lines[2].ends_with("viewport, with no reason reported by this session's worker"));
+        assert!(
+            lines[2]
+                .as_str()
+                .ends_with("viewport, with no reason reported by this session's worker")
+        );
     }
 
     #[test]
@@ -663,15 +923,21 @@ mod tests {
                 name: kr_protocol::scalars::Nullable::some("sh".to_owned()),
                 forced: true,
             }],
-            surviving: vec![kr_protocol::session::SurvivingResource {
-                kind: "desktop_resource".to_owned(),
-                detail: "a window the broker opened".to_owned(),
-            }],
+            surviving: vec![
+                kr_protocol::session::SurvivingResource {
+                    kind: "process".to_owned(),
+                    detail: "a window the broker opened".to_owned(),
+                },
+                kr_protocol::session::SurvivingResource {
+                    kind: "desktop_resource".to_owned(),
+                    detail: String::new(),
+                },
+            ],
             ownership_coverage: kr_protocol::session::OwnershipCoverage::Incomplete,
             durability: kr_protocol::session::Durability::Volatile,
             closed_at_ms: kr_protocol::scalars::TimestampMs::new(9),
         };
-        let rendered = closure(&record);
+        let rendered = closure(&record).json();
         assert_eq!(rendered["session_id"], json!(record.session_id.to_string()));
         assert_eq!(rendered["session_epoch"], json!("1"), "{rendered}");
         assert_eq!(rendered["terminated"][0]["pid"], json!(42));
@@ -682,9 +948,14 @@ mod tests {
         );
         assert_eq!(rendered["terminated"][0]["name"], json!("sh"));
         assert_eq!(rendered["terminated"][0]["forced"], json!(true));
+        // A kind this host and its workers write is said as it is, any other replaced; a detail is
+        // the host's sentence, said as its class and length.
         assert_eq!(
             rendered["surviving"],
-            json!([{ "kind": "desktop_resource", "detail": "a window the broker opened" }])
+            json!([
+                { "kind": "process", "detail": "[message withheld, 26 bytes]" },
+                { "kind": "[a resource kind]", "detail": "[message withheld, 0 bytes]" },
+            ])
         );
         assert_eq!(rendered["reason"], json!("close_requested"));
         assert_eq!(rendered["exit_code"], json!(143));
@@ -720,8 +991,97 @@ mod tests {
     #[test]
     fn the_shell_mode_is_reported_rather_than_assumed() {
         let summary = summary_for_tests();
-        assert_eq!(session(&summary)["shell_mode"], json!("native_compat"));
-        assert!(session_line(&summary).contains("native_compat"));
-        assert!(session_line(&summary).contains("1 attachment"));
+        assert_eq!(
+            session(&summary).json()["shell_mode"],
+            json!("native_compat")
+        );
+        assert_eq!(
+            session_line(&summary).text(),
+            "   3  live     native_compat   120x40   1 attachment  /bin/zsh"
+        );
+    }
+
+    /// KR-REQ-23.25: text planted in every leaf of a session, its closure and its size that can
+    /// hold free text reaches the session's document and its lines only as content the person
+    /// asked for: the shell, the directory, the desktop and a terminated process's name. A
+    /// surviving resource's detail is said as its class and length, and a kind this host does not
+    /// write, and a signal no platform names, as their placeholders.
+    #[test]
+    fn planted_text_in_a_session_shows_only_where_it_was_asked_for() {
+        let mut shown = std::collections::BTreeSet::new();
+        for summary in planted::<SessionSummary>() {
+            shown.extend(only_asked("kr status", &session(&summary)));
+            only_asked_lines(
+                "kr status",
+                &[session_line(&summary), desktop_line(&summary)],
+            );
+            if let Some(record) = summary.closure.as_ref() {
+                let rendered = closure(record).json();
+                let withheld = format!("[message withheld, {} bytes]", planted_text().len());
+                assert_eq!(rendered["surviving"][0]["detail"], json!(withheld));
+                assert_eq!(rendered["surviving"][0]["kind"], json!("[a resource kind]"));
+                assert_eq!(
+                    rendered["signal"],
+                    json!("[a signal name this build does not list]")
+                );
+            }
+        }
+        for asked in ["shell", "cwd", "closure.terminated[].name"] {
+            assert!(
+                shown.contains(asked),
+                "{asked} shows what the session holds"
+            );
+        }
+    }
+
+    /// KR-REQ-23.25: the host's power, its build and its desktop show planted text only where the
+    /// person asked for it (the desktop's identifier, its account and a capability's binary) and
+    /// where the host's own export text is said through its door (what a logout does to each
+    /// profile). The assertion's name, why none is held, the platform's session name and the
+    /// compositor's are the host's text, said as their class and length, and so are a
+    /// capability's identity and reason.
+    #[test]
+    fn planted_text_in_the_host_shows_only_where_it_was_asked_for() {
+        for info in planted::<HostInfoResult>() {
+            only_asked("kr doctor", &host(&info));
+            assert!(!power_line(&info.power).as_str().contains(MARKER));
+        }
+        for state in planted::<SleepInhibitionState>() {
+            let rendered = only_asked("kr host power", &power(&state));
+            assert!(rendered.is_empty(), "{rendered:?}");
+            let json = power(&state).json();
+            assert_eq!(
+                json["holder"],
+                json!(format!("[name withheld, {} bytes]", planted_text().len()))
+            );
+        }
+        let mut shown = std::collections::BTreeSet::new();
+        for result in planted::<EnvironmentCapabilitiesResult>() {
+            shown.extend(only_asked_or_host_text(
+                "kr doctor",
+                &environment_capabilities(&result),
+                &["persistence[].mechanism", "persistence[].detail"],
+            ));
+            let mut lines = vec![desktop_summary_line(&result.desktop)];
+            lines.extend(capability_lines(&result.desktop));
+            only_asked_lines("kr doctor", &lines);
+            for (line, entry) in persistence_lines(&result.persistence)
+                .iter()
+                .zip(&result.persistence)
+            {
+                assert_eq!(
+                    line.as_str(),
+                    format!(
+                        "a {} session at logout: {} ({})",
+                        entry.profile.as_str(),
+                        entry.persistence.as_str(),
+                        entry.mechanism().as_str()
+                    )
+                );
+            }
+        }
+        for asked in ["desktop.desktop.os_user", "desktop.capabilities[].binary"] {
+            assert!(shown.contains(asked), "{asked} shows what was asked for");
+        }
     }
 }
