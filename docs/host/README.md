@@ -47,12 +47,17 @@ permissions to inherit. That namespace is shared by every account on the machine
 the only line. The listener proves each caller's account from the connection itself, at the
 connection's first read, and nothing a caller of another account sends reaches a reader. This
 host's own clients open a pipe for identification only, so the server cannot act as them, and check
-before they write that the pipe is owned by this account's user, or by the owner this account's new
-objects receive, and that its list admits no account the machine does not already trust. Where that
-default owner is a group, such as the Administrators group of an elevated token, a pipe that group
-owns is trusted too: an account that already holds the machine that way is not something these
-checks keep out. A name another account created first while the host was not listening is refused
-rather than served or trusted, and the host does not start on a name another account holds.
+before they write that the pipe is owned by an account the client could have created it as, and
+that its list admits no account the machine does not already trust. That is this account's user,
+the owner this account's new objects receive, or the Administrators group where the client's token
+holds that group enabled as an owner, as an elevated administrator's token does whatever default
+owner it was given: a shell of Git for Windows gives its processes the user as default owner, and
+a tree or a pipe an elevated process made is still that administrator's own. An account that
+already holds the machine that way is not something these checks keep out, and a token filtered
+down to what a standard user holds trusts no pipe that group owns. The state and runtime
+directories are checked by the same rule. A name another account created first while the host was
+not listening is refused rather than served or trusted, and the host does not start on a name
+another account holds.
 
 A session's output spool is created the same way rather than inheriting the process umask, because
 it holds the terminal's own output: mode 0700 on Unix, and on Windows the owner-only access list of

@@ -1917,34 +1917,38 @@ async fn the_last_frame_a_client_sends_before_it_closes_arrives() {
     assert_eq!(received, last);
 }
 
-/// Prints the owner new objects of this process receive, as a security identifier.
-const DEFAULT_OWNER: &str = r"
+/// Prints whether this process holds the Administrators group enabled, which an elevated
+/// administrator's token does and one filtered down to a standard user's does not.
+const ELEVATED: &str = r"
 $ErrorActionPreference = 'Stop'
-Write-Output ([System.Security.Principal.WindowsIdentity]::GetCurrent().Owner.Value)
+$principal = [System.Security.Principal.WindowsPrincipal]::new([System.Security.Principal.WindowsIdentity]::GetCurrent())
+Write-Output $principal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
 ";
 
-/// KR-REQ-23.10: the client trusts a pipe owned by this account's user or by the owner its own new
-/// objects receive, and no other. A token whose default owner is the Administrators group trusts a
-/// pipe that group owns; every other token refuses it. The policy is stated here as it is, not as a
-/// same-account guarantee it is not.
+/// KR-REQ-23.10: the client trusts a pipe owned by an account it could have created the pipe as,
+/// and no other: this account's user, the owner its own new objects receive, or the Administrators
+/// group where its token holds that group enabled as one it may give what it creates, as an
+/// elevated administrator's does whatever default owner a shell gave it. So an elevated token
+/// trusts a pipe that group owns, and every other token refuses it. The policy is stated here as
+/// it is, not as a same-account guarantee it is not.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_client_trusts_a_pipe_only_its_own_user_or_default_owner_owns() {
+async fn the_client_trusts_a_pipe_only_an_account_it_could_create_it_as_owns() {
     let host = TempHost::create();
     let endpoint = host
         .environment()
         .worker_endpoint(DisplayNumber::new(6))
         .expect("an endpoint");
-    let owner_script = script(&host, "default-owner", DEFAULT_OWNER);
-    let default_owner = output_of(&owner_script, &[]).trim().to_owned();
+    let elevated_script = script(&host, "elevated", ELEVATED);
+    let elevated = output_of(&elevated_script, &[]).trim() == "True";
     let Ok(_listener) = Listener::bind_with_access_list(&endpoint, "O:BAD:P(A;;GA;;;OW)") else {
         // A token that may not name the Administrators group as an owner cannot make this pipe;
-        // such a token's default owner is not that group, and the case has nothing to prove.
-        assert_ne!(default_owner, "S-1-5-32-544");
+        // such a token is not elevated, and the case has nothing to prove.
+        assert!(!elevated);
         return;
     };
     let reached = Connection::connect(&endpoint).await;
-    if default_owner == "S-1-5-32-544" {
-        reached.expect("a token whose default owner is Administrators trusts a pipe it owns");
+    if elevated {
+        reached.expect("an elevated token trusts a pipe the Administrators group owns");
     } else {
         assert!(
             matches!(reached, Err(kr_ipc::IpcError::PeerAccountRejected { .. })),

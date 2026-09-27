@@ -780,8 +780,9 @@ mod windows {
         GetSecurityDescriptorSacl, GetTokenInformation, INHERITED_ACE, IsValidSid,
         LABEL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
         SCOPE_SECURITY_INFORMATION, SE_DACL_AUTO_INHERITED, SE_DACL_PROTECTED,
-        SE_SACL_AUTO_INHERITED, SE_SACL_PROTECTED, SECURITY_ATTRIBUTES, TOKEN_INFORMATION_CLASS,
-        TOKEN_OWNER, TOKEN_QUERY, TOKEN_USER, TokenOwner, TokenUser,
+        SE_SACL_AUTO_INHERITED, SE_SACL_PROTECTED, SECURITY_ATTRIBUTES, SID_AND_ATTRIBUTES,
+        TOKEN_GROUPS, TOKEN_INFORMATION_CLASS, TOKEN_OWNER, TOKEN_QUERY, TOKEN_USER, TokenGroups,
+        TokenOwner, TokenUser,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         CreateDirectoryW, FILE_ALL_ACCESS, FILE_ATTRIBUTE_ENCRYPTED, FILE_GENERIC_EXECUTE,
@@ -1690,31 +1691,80 @@ mod windows {
         }
     }
 
+    /// The Administrators group, as a security identifier's text.
+    const ADMINISTRATORS: &str = "S-1-5-32-544";
+
     /// Whether an object owned by `owner` is one a process with `accounts` could have created: its
-    /// owner is the process's user, or the owner the process's new objects receive.
+    /// owner is the process's user, the owner the process's new objects receive, or the
+    /// Administrators group where the process's token holds that group enabled as one it may give
+    /// what it creates. An elevated administrator's token holds it so, whatever default owner it
+    /// was given, and a shell of Git for Windows gives its processes the user as default owner: a
+    /// tree an elevated process made, owned by the group, is that administrator's own. A token
+    /// filtered down to what a standard user holds keeps the group for denying access only.
     fn could_have_created(owner: PSID, accounts: &TokenAccounts) -> bool {
-        equal(owner, accounts.user()) || equal(owner, accounts.owner())
+        equal(owner, accounts.user())
+            || equal(owner, accounts.owner())
+            || OwnedSid::parse(ADMINISTRATORS).is_ok_and(|administrators| {
+                equal(owner, administrators.as_psid())
+                    && accounts.holds_to_own(administrators.as_psid())
+            })
     }
 
-    /// The two accounts this process could have created a directory as.
+    /// The accounts this process could have created a directory as.
     struct TokenAccounts {
         /// The buffer holding this process's user identifier.
         user: Vec<u64>,
         /// The buffer holding the identifier new objects of this process are owned by.
         owner: Vec<u64>,
+        /// The buffer holding this process's groups, with what each may be used for.
+        groups: Vec<u64>,
     }
 
     impl TokenAccounts {
-        /// Reads both from this process's own token.
+        /// Reads them from this process's own token.
         fn read() -> std::result::Result<Self, AccessListRefusal> {
             Self::of(&TokenHandle::open()?)
         }
 
-        /// Reads both from a token.
+        /// Reads them from a token.
         fn of(token: &TokenHandle) -> std::result::Result<Self, AccessListRefusal> {
             Ok(Self {
                 user: token.information(TokenUser, std::mem::size_of::<TOKEN_USER>())?,
                 owner: token.information(TokenOwner, std::mem::size_of::<TOKEN_OWNER>())?,
+                groups: token.information(TokenGroups, std::mem::size_of::<TOKEN_GROUPS>())?,
+            })
+        }
+
+        /// Whether the token holds `group` enabled and as one it may give what it creates as
+        /// owner.
+        fn holds_to_own(&self, group: PSID) -> bool {
+            use windows_sys::Win32::System::SystemServices::{SE_GROUP_ENABLED, SE_GROUP_OWNER};
+
+            let wanted = (SE_GROUP_ENABLED | SE_GROUP_OWNER).cast_unsigned();
+            let bytes = self.groups.len() * 8;
+            let entries = std::mem::offset_of!(TOKEN_GROUPS, Groups);
+            let entry = std::mem::size_of::<SID_AND_ATTRIBUTES>();
+            // SAFETY: the buffer holds a `TOKEN_GROUPS` the kernel wrote, aligned for it, and the
+            // count is its first field.
+            let count = unsafe { (*self.groups.as_ptr().cast::<TOKEN_GROUPS>()).GroupCount };
+            let count = usize::try_from(count).unwrap_or(usize::MAX);
+            // Every entry the count names has to lie inside the buffer the kernel filled.
+            if count
+                .checked_mul(entry)
+                .and_then(|length| length.checked_add(entries))
+                .is_none_or(|end| end > bytes)
+            {
+                return false;
+            }
+            // SAFETY: the entries begin at the offset of `Groups` inside the buffer, and all
+            // `count` of them lie inside it, as checked above.
+            let first = unsafe { self.groups.as_ptr().cast::<u8>().add(entries) }
+                .cast::<SID_AND_ATTRIBUTES>();
+            (0..count).any(|index| {
+                // SAFETY: `index` is below the count checked against the buffer above, and each
+                // entry's identifier points into the same buffer, which outlives this read.
+                let held = unsafe { std::ptr::read_unaligned(first.add(index)) };
+                equal(held.Sid, group) && held.Attributes & wanted == wanted
             })
         }
 
