@@ -170,6 +170,34 @@ pub struct RecordedFloor {
     pub in_force: bool,
 }
 
+/// Names a database file to SQLite as immutable: read alone, with no lock, log or shared memory.
+///
+/// A URI filename escapes the three characters it gives a meaning to, and a Windows path is
+/// written with forward slashes after a third slash, as SQLite reads one. A path that is not
+/// Unicode has no URI spelling here, and is not named at all.
+fn immutable_uri(path: &std::path::Path) -> Option<String> {
+    let text = path.to_str()?;
+    #[cfg(windows)]
+    let text = text.replace('\\', "/");
+    let mut uri = String::from("file:");
+    if text.starts_with('/') {
+        uri.push_str("//");
+    } else if cfg!(windows) {
+        // `C:/...`, which SQLite reads after an empty authority and a third slash.
+        uri.push_str("///");
+    }
+    for character in text.chars() {
+        match character {
+            '%' => uri.push_str("%25"),
+            '?' => uri.push_str("%3f"),
+            '#' => uri.push_str("%23"),
+            other => uri.push(other),
+        }
+    }
+    uri.push_str("?immutable=1");
+    Some(uri)
+}
+
 /// The environment registry.
 #[derive(Debug)]
 pub struct Registry {
@@ -196,25 +224,64 @@ impl Registry {
 
     /// Opens a registry that already exists, to read what it records and nothing else.
     ///
-    /// Nothing is created, brought forward, repaired or settled: the file is opened read-only, and
-    /// it is refused unless it records exactly the schema version this build reads and holds the
-    /// tables the workers and the closures are read from. A registry that lost one of those tables
-    /// would otherwise read as recording no worker at all, and that is the one answer a question
-    /// about who may still hold a session's stores must never get by accident. The explicit
-    /// journal import reads its evidence through this.
+    /// Nothing is created, brought forward, repaired or settled, and nothing is written, not even
+    /// beside it: SQLite opens a database in write-ahead-logging mode read-only by making its log
+    /// and shared-memory files, so the file is read as immutable instead, which makes neither. That
+    /// reads the file alone, so a registry whose log holds writes the file has not taken in, or
+    /// whose rollback journal is waiting to be rolled back, is refused rather than read as it was
+    /// before them. The registry is refused, too, unless it records exactly the schema version this
+    /// build reads and holds the tables the workers and the closures are read from: one that lost
+    /// either would otherwise read as recording no worker at all, and that is the one answer a
+    /// question about who may still hold a session's stores must never get by accident. The
+    /// explicit journal import reads its evidence through this, while it holds the environment's
+    /// singleton lock, so nothing writes the registry while it is read.
     ///
     /// # Errors
     ///
     /// Returns [`ControllerError::RegistryUnavailable`] when the file is not there or cannot be
-    /// opened, when it records another schema version or none, and when a table it is read from
-    /// is missing.
+    /// opened, when a write-ahead log or a rollback journal beside it holds anything, when it
+    /// records another schema version or none, and when a table it is read from is missing.
     pub fn open_to_read(
         path: impl AsRef<std::path::Path>,
         environment_id: EnvironmentId,
     ) -> Result<Self> {
+        let path = path.as_ref();
+        for (suffix, what) in [
+            ("-wal", "write-ahead log"),
+            ("-journal", "rollback journal"),
+        ] {
+            let mut beside = path.as_os_str().to_owned();
+            beside.push(suffix);
+            match std::fs::metadata(&beside) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Ok(metadata) if metadata.len() == 0 => {}
+                Ok(_) => {
+                    return Err(ControllerError::RegistryUnavailable {
+                        detail: format!(
+                            "this registry's {what} holds writes its file has not taken in; start \
+                             this build's daemon once and stop it again, so they are taken in, \
+                             and read it then"
+                        ),
+                    });
+                }
+                Err(error) => {
+                    return Err(ControllerError::RegistryUnavailable {
+                        detail: format!("this registry's {what} could not be looked at: {error}"),
+                    });
+                }
+            }
+        }
+        let uri = immutable_uri(path).ok_or_else(|| ControllerError::RegistryUnavailable {
+            detail: format!(
+                "{} is not a path this build can name to SQLite as a file to read alone",
+                path.display()
+            ),
+        })?;
         let connection = Connection::open_with_flags(
-            path.as_ref(),
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            uri,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                | rusqlite::OpenFlags::SQLITE_OPEN_URI
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
         .map_err(ControllerError::registry)?;
         let versions: Vec<i64> = {
@@ -2456,5 +2523,70 @@ mod tests {
             )
             .expect("reads the schema");
         assert_eq!(tables, 0, "reading repaired nothing");
+    }
+
+    /// Every file in `directory`, by name, with what it holds.
+    fn files_in(directory: &std::path::Path) -> Vec<(String, Vec<u8>)> {
+        let mut files: Vec<(String, Vec<u8>)> = std::fs::read_dir(directory)
+            .expect("reads the directory")
+            .map(|entry| {
+                let entry = entry.expect("an entry");
+                (
+                    entry.file_name().to_string_lossy().into_owned(),
+                    std::fs::read(entry.path()).expect("reads the file"),
+                )
+            })
+            .collect();
+        files.sort();
+        files
+    }
+
+    #[test]
+    fn a_registry_opened_to_read_writes_nothing_and_refuses_writes_its_file_has_not_taken_in() {
+        // Reading is evidence-taking, so it leaves the directory exactly as it found it: no
+        // write-ahead log or shared-memory file is made beside the registry, and nothing in it
+        // changes. A write-ahead log that holds writes is refused rather than ignored or brought
+        // in, because bringing it in is a write and ignoring it would read an older registry.
+        let directory = tempfile::tempdir().expect("a directory");
+        let path = directory.path().join("registry.sqlite3");
+        Registry::open(&path, environment())
+            .expect("a registry")
+            .adopt_worker(&worker_row(1, 4_001))
+            .expect("records a worker");
+        let before = files_in(directory.path());
+        assert_eq!(before.len(), 1, "a closed registry is one file: {before:?}");
+        let read = Registry::open_to_read(&path, environment()).expect("a registry reads");
+        assert_eq!(read.workers().expect("reads the workers").len(), 1);
+        assert_eq!(files_in(directory.path()), before, "while it is read");
+        drop(read);
+        assert_eq!(files_in(directory.path()), before, "after it is read");
+
+        // A writer that has not finished: its log holds a worker the file does not.
+        let writer = Connection::open(&path).expect("a writer");
+        writer
+            .pragma_update(None, "wal_autocheckpoint", 0)
+            .expect("no checkpoint");
+        writer
+            .execute("DELETE FROM workers", [])
+            .expect("the log holds a change");
+        let held = files_in(directory.path());
+        let refused = Registry::open_to_read(&path, environment())
+            .expect_err("writes the file has not taken in are refused");
+        assert!(refused.to_string().contains("write-ahead log"), "{refused}");
+        assert_eq!(
+            files_in(directory.path()),
+            held,
+            "a refusal changes nothing"
+        );
+        drop(writer);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_path_is_named_as_an_immutable_file_with_its_own_characters_escaped() {
+        assert_eq!(
+            immutable_uri(std::path::Path::new("/state/a b/r?e#g%1\\x.sqlite3")).as_deref(),
+            Some("file:///state/a b/r%3fe%23g%251\\x.sqlite3?immutable=1")
+        );
     }
 }
