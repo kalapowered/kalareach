@@ -464,8 +464,9 @@ fn the_registry_refuses_every_remote_ingress_on_every_environment_method() {
     }
 }
 
-/// KR-REQ-03.12: the invoker opens a bridge for a locally authenticated invocation only, and carries
-/// its ingress to the far side; every network ingress is refused before a process is started.
+/// KR-REQ-03.12: the invoker opens a bridge for a locally authenticated invocation only, and
+/// carries its ingress to the far side; every network ingress is refused before a process is
+/// started.
 #[test]
 fn a_network_actor_is_refused_a_bridge_before_a_process_exists() {
     use kr_controller::bridge::invoke::{self, Refusal};

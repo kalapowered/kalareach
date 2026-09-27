@@ -1294,8 +1294,8 @@ async fn a_program_adopted_with_no_catalogue_change_is_counted_while_it_runs() {
     );
 }
 
-/// KR-REQ-23.29: a `plugin.disable` ends the package's bindings: the host asks again until the worker
-/// reports the binding closed.
+/// KR-REQ-23.29: a `plugin.disable` ends the package's bindings: the host asks again until the
+/// worker reports the binding closed.
 ///
 /// A binding due to end closes at the first snapshot after every request it admitted settles, and
 /// only a round brings a snapshot. A worker answers the round of a disabling with its binding
