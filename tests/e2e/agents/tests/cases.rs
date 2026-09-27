@@ -98,8 +98,9 @@ struct Stage<'a, 'r> {
     /// Text only this part's own prompts and files carry, chosen before the part starts, by which
     /// what the part left in the person's agent directories is told from what anything else left.
     mark: &'a str,
-    /// Set once the agent has shown, in this part, what only its model could have answered: its
-    /// vendor accepted the login.
+    /// Whether the part's latest request to the agent's model has been answered with what only the
+    /// model could have written: cleared by each charged request, set by its answer. A part that
+    /// ends without passing while it is clear has no proof its login still holds.
     held: &'a std::sync::atomic::AtomicBool,
 }
 
@@ -966,13 +967,15 @@ impl Logged {
             .unwrap_or_else(|why| panic!("{why}"));
     }
 
-    /// Charges one turn to the budget, then types `text` at the composer and submits it.
+    /// Charges one turn to the budget, then types `text` at the composer and submits it. Until the
+    /// agent answers it, the part holds no proof that its login still holds.
     fn submit(&mut self, stage: &Stage<'_, '_>, text: &str, what: &str) {
         let login = stage.login.expect("a part with a login");
         let _ = login
             .ledger
             .charge(self.part, what)
             .unwrap_or_else(|why| panic!("{why}"));
+        stage.held.store(false, std::sync::atomic::Ordering::SeqCst);
         self.turns += 1;
         self.type_text(stage, text);
         // Keys that arrive together can be read as one paste, whose line end is text and not a
@@ -2573,7 +2576,8 @@ fn a_path_typed_at_the_agent_is_terminal_input_that_reaches_its_composer() {
 /// login; a paired device connects, sends a prompt the agent answers, and adds an image through the
 /// attachment path the connector declares, the manual terminal path: the device's own transfer
 /// first, then the image's path given at the composer in the agent's own syntax with a question only
-/// the image answers; and the local terminal shows the same execution. A paired device cannot
+/// the image answers, answered beside the part's code in upper case, which only the model writes;
+/// and the local terminal shows the same execution. A paired device cannot
 /// upload on this host, so the part records failed with that refusal; everything else it checks
 /// still fails it where it does not hold, and is kept as evidence.
 #[test]
@@ -2597,17 +2601,39 @@ fn a_device_prompts_the_agent_and_adds_an_image_and_the_local_terminal_shows_the
         std::fs::write(&file, COLOUR_PNG).expect("writes the image");
         logged.type_text(stage, &image_input(account, &file));
         std::thread::sleep(Duration::from_millis(500));
+        let upper = mark.to_uppercase();
         logged.submit(
             stage,
-            " What colour fills this image? Reply with one lowercase word.",
+            &format!(
+                " What colour fills this image? Reply with one lowercase word, a space, and the \
+                 code {mark} in upper case."
+            ),
             "an image and its question",
         );
-        let answered_rows = logged.wait_for(stage, COLOUR, "the agent answers from the image");
+        let answered_rows = logged.answered(stage, &upper, "the agent answers from the image");
+        let named = |rows: &[String]| {
+            rows.iter().any(|row| {
+                row.contains(&upper)
+                    && row
+                        .split(|character: char| !character.is_alphanumeric())
+                        .any(|word| word == COLOUR)
+            })
+        };
+        assert!(
+            named(&answered_rows),
+            "the answer names the image's colour, {COLOUR}, beside the code:\n{}",
+            answered_rows.join("\n")
+        );
         // The same execution, locally: the local terminal shows the answer, and every process the
         // agent started as still runs.
         let local = logged.agent.session.window.wait_for_screen(
-            COLOUR,
+            &upper,
             "the local terminal shows the execution the device drove",
+        );
+        assert!(
+            named(&local),
+            "the local terminal shows the same answer:\n{}",
+            local.join("\n")
         );
         still_running(&logged.agent.every_process())
             .unwrap_or_else(|why| panic!("the agent's execution is the one it started as: {why}"));
@@ -2621,8 +2647,8 @@ fn a_device_prompts_the_agent_and_adds_an_image_and_the_local_terminal_shows_the
             "detected": detected_evidence(&detected),
             "device_upload": upload.evidence(),
             "prompt": { "question": question, "answer": sum },
-            "image": { "file": file, "syntax": account.image, "answer": COLOUR, "rows": answered_rows.iter().filter(|row| row.contains(COLOUR)).collect::<Vec<_>>() },
-            "local_rows": local.iter().filter(|row| row.contains(COLOUR)).collect::<Vec<_>>(),
+            "image": { "file": file, "syntax": account.image, "answer": COLOUR, "code": upper, "rows": answered_rows.iter().filter(|row| row.contains(&upper)).collect::<Vec<_>>() },
+            "local_rows": local.iter().filter(|row| row.contains(&upper)).collect::<Vec<_>>(),
             "surface": offered.evidence(),
         });
         let mut failures = Vec::new();
@@ -3214,6 +3240,7 @@ fn a_local_and_a_remote_answer_raced_to_one_approval_resolve_it_once() {
             .ledger
             .charge("3", "the control's second approval")
             .unwrap_or_else(|why| panic!("{why}"));
+        stage.held.store(false, std::sync::atomic::Ordering::SeqCst);
         logged.turns += 1;
         local.type_text(
             format!("Use your shell tool to run exactly this command and nothing else: echo {second} >> approved.log").as_bytes(),
@@ -3224,6 +3251,7 @@ fn a_local_and_a_remote_answer_raced_to_one_approval_resolve_it_once() {
             &account.approval.shows,
             "the agent asks for the second approval",
         );
+        stage.held.store(true, std::sync::atomic::Ordering::SeqCst);
         local.type_text(account.approval.deny.as_bytes());
         let device_refused = logged
             .keyboard
@@ -3360,11 +3388,34 @@ fn a_disconnection_after_the_agent_took_a_prompt_leaves_one_reply_and_no_duplica
                 conversations.display()
             );
         };
-        // One more look at what the device has been sent, and then it goes.
-        while logged.screen.pump_one(stage, Duration::from_millis(1)) {
-            let rows = logged.screen.view.rows();
-            code_seen |= rows.iter().any(|row| row.contains(&code_start));
-            reached |= code_seen || marks(&rows) > marks_before;
+        // The device goes: both its connections close, and nothing it had not received by then can
+        // reach it. Every event it received before that, still queued, is then applied and looked
+        // at the same way; one that cannot be applied leaves the boundary unknown, so reached.
+        let old = (
+            logged.keyboard.attachment_id(),
+            logged.keyboard.epoch(),
+            logged.keyboard.next_sequence(),
+        );
+        logged.agent.session.remote.close();
+        logged.screen.remote.close();
+        loop {
+            match stage.runtime.block_on(
+                logged
+                    .screen
+                    .view
+                    .pump_one(&logged.screen.remote, Duration::from_millis(1)),
+            ) {
+                Ok(true) => {
+                    let rows = logged.screen.view.rows();
+                    code_seen |= rows.iter().any(|row| row.contains(&code_start));
+                    reached |= code_seen || marks(&rows) > marks_before;
+                }
+                Ok(false) => break,
+                Err(_) => {
+                    reached = true;
+                    break;
+                }
+            }
         }
         let sent = &logged.screen.view.output()[sent_from..];
         let holds = |needle: &[u8]| {
@@ -3379,13 +3430,6 @@ fn a_disconnection_after_the_agent_took_a_prompt_leaves_one_reply_and_no_duplica
             // Only the model writes the code in upper case: the vendor answered.
             stage.held.store(true, std::sync::atomic::Ordering::SeqCst);
         }
-        let old = (
-            logged.keyboard.attachment_id(),
-            logged.keyboard.epoch(),
-            logged.keyboard.next_sequence(),
-        );
-        logged.agent.session.remote.close();
-        logged.screen.remote.close();
         let count = |file: &Path| {
             let text = std::fs::read_to_string(file).unwrap_or_default();
             let prompts = text
@@ -3459,6 +3503,7 @@ fn a_disconnection_after_the_agent_took_a_prompt_leaves_one_reply_and_no_duplica
             .ledger
             .charge("4", "the control's prompt sent again")
             .unwrap_or_else(|why| panic!("{why}"));
+        stage.held.store(false, std::sync::atomic::Ordering::SeqCst);
         logged.turns += 1;
         let _ = fresh
             .type_text(&logged.agent.session.remote, stage.runtime, &prompt)
@@ -3475,6 +3520,7 @@ fn a_disconnection_after_the_agent_took_a_prompt_leaves_one_reply_and_no_duplica
             );
             std::thread::sleep(Duration::from_millis(200));
         }
+        stage.held.store(true, std::sync::atomic::Ordering::SeqCst);
         let (prompts_twice, replies_twice) = count(&conversation);
         let control = once(prompts_twice, replies_twice);
         assert!(
