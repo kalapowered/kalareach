@@ -276,9 +276,7 @@ impl Run {
         let started = Instant::now();
         while started.elapsed() < CLOSING_WAIT
             && (owned.iter().any(|o| running(&o.identity))
-                || programs
-                    .iter()
-                    .any(|(pid, path)| system_program_runs(*pid, path)))
+                || programs.iter().any(|(pid, _)| system_program_may_run(*pid)))
         {
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -290,7 +288,7 @@ impl Run {
         left.extend(
             programs
                 .iter()
-                .filter(|(pid, path)| system_program_runs(*pid, path))
+                .filter(|(pid, _)| system_program_may_run(*pid))
                 .map(|(pid, path)| {
                     format!("the system program {} (process {pid})", path.display())
                 }),
@@ -431,12 +429,16 @@ impl Run {
                     // One of the system's own programs running as another user is not this run's
                     // to end: it is noted, so the close finds it ended, and it may start nothing,
                     // since what it started could not be followed back to it.
-                    ProcessQuery::CannotEstablish(error)
-                        if system_program_of_another_user(entry.pid, &error.to_string())
-                            .is_some() =>
-                    {
-                        let path = system_program_of_another_user(entry.pid, &error.to_string())
-                            .unwrap_or_default();
+                    ProcessQuery::CannotEstablish(error) => {
+                        let Some(path) =
+                            system_program_of_another_user(entry.pid, &error.to_string())
+                        else {
+                            return Err(format!(
+                                "process {} beneath {what} could not be identified: {error}",
+                                entry.pid
+                            ));
+                        };
+                        self.note_system_program(entry.pid, &path);
                         if let Some(child) = table.iter().find(|child| child.parent == entry.pid) {
                             return Err(format!(
                                 "the system program {} (process {}) beneath {what} started \
@@ -446,14 +448,7 @@ impl Run {
                                 child.pid
                             ));
                         }
-                        self.note_system_program(entry.pid, &path);
                         continue;
-                    }
-                    ProcessQuery::CannotEstablish(error) => {
-                        return Err(format!(
-                            "process {} beneath {what} could not be identified: {error}",
-                            entry.pid
-                        ));
                     }
                 };
                 let Some(described) = describe(&identity)? else {
@@ -599,21 +594,21 @@ pub fn system_program_of_another_user(pid: u32, error: &str) -> Option<PathBuf> 
     }
 }
 
-/// Whether the process `pid`, a system program noted under [`Run::note_system_program`], still
-/// runs that file: the kernel still says it runs `path`.
+/// Whether the process `pid`, a system program noted under [`Run::note_system_program`], may
+/// still run: only the kernel's own list of every process, read and not naming the number, says
+/// it has ended. A number the list still names, whatever runs under it now, and a list that could
+/// not be read, leave it running, so nothing is taken to have ended without the kernel saying so.
 #[must_use]
-pub fn system_program_runs(pid: u32, path: &Path) -> bool {
+pub fn system_program_may_run(pid: u32) -> bool {
     #[cfg(target_os = "macos")]
     {
-        i32::try_from(pid)
-            .ok()
-            .and_then(|pid| libproc::proc_pid::pidpath(pid).ok())
-            .is_some_and(|running| Path::new(&running) == path)
+        libproc::processes::pids_by_type(libproc::processes::ProcFilter::All)
+            .map_or(true, |pids| pids.contains(&pid))
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (pid, path);
-        false
+        let _ = pid;
+        true
     }
 }
 
@@ -893,8 +888,17 @@ mod tests {
         let told = refused
             .as_deref()
             .and_then(|error| system_program_of_another_user(child.id(), error));
+        let running_then = system_program_may_run(child.id());
         let _ = child.kill();
         let _ = child.wait();
+        assert!(
+            running_then,
+            "a program still running is not taken to have ended"
+        );
+        assert!(
+            !system_program_may_run(child.id()),
+            "the kernel's list no longer names a program that has ended"
+        );
         let error = refused.expect("the kernel refuses to describe a set-user-ID program");
         assert_eq!(told, Some(PathBuf::from("/usr/bin/top")), "{error}");
         assert_eq!(
