@@ -78,6 +78,19 @@ pub struct Status {
     pub shows: String,
 }
 
+/// A directory of the run's own the agent keeps its configuration, history and conversations in,
+/// where it runs with the person's home: the variable that names it, and the files its vendor's
+/// first-run steps leave there.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigDirectory {
+    /// The variable the agent reads the directory from.
+    pub variable: String,
+    /// Files written into it before the agent starts, by path relative to it.
+    #[serde(default)]
+    pub files: BTreeMap<String, String>,
+}
+
 /// How the parts that need the person's vendor login run the agent. Nothing here is a credential:
 /// a login is named by its kind and where it lives, and a variable by its name.
 #[derive(Clone, Debug, Deserialize)]
@@ -103,6 +116,29 @@ pub struct Account {
     /// a part learns it from whether the agent reaches its composer and from `signed_out`.
     #[serde(default)]
     pub status: Option<Status>,
+    /// The command that says, without calling a model, that the agent loads no server of the
+    /// person's own, and what its output holds when it loads none.
+    #[serde(default)]
+    pub isolated: Option<Status>,
+    /// Where the agent keeps its configuration in these parts, where it is not the home.
+    #[serde(default)]
+    pub config_directory: Option<ConfigDirectory>,
+    /// Variables the agent's session is given as they are, such as a switch that turns something
+    /// of the person's off.
+    #[serde(default)]
+    pub variables: BTreeMap<String, String>,
+    /// The name of the login's keychain item, whose modification time says whether the agent
+    /// rewrote it (a token refresh); its value is never read here.
+    #[serde(default)]
+    pub keychain_item: Option<String>,
+    /// Files of the person's home, relative to it, that no part may change: a change stops the
+    /// agent.
+    #[serde(default)]
+    pub guarded: Vec<String>,
+    /// Files of the person's home that the person's own programs also write: a change that names
+    /// the run's directory or the part's mark stops the agent, and any other is recorded.
+    #[serde(default)]
+    pub shared: Vec<String>,
     /// Text the agent shows when its login is missing, has expired or is refused.
     #[serde(default)]
     pub signed_out: Vec<String>,
@@ -118,7 +154,8 @@ pub struct Account {
     /// was rewritten rather than appended to.
     #[serde(default)]
     pub stop_on_rewrite: bool,
-    /// Where the agent keeps its conversations, relative to the home it runs with.
+    /// Where the agent keeps its conversations, relative to its configuration directory where it
+    /// has one, and to the home it runs with otherwise.
     pub conversations: String,
     /// What marks the line of a conversation file that holds a prompt the person sent.
     pub prompt_line: String,
