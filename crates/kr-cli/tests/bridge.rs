@@ -254,6 +254,8 @@ async fn stub_controller(
     })
 }
 
+/// KR-REQ-03.12: the helper refuses a bridge opened for any network ingress before it connects to
+/// the destination, so a network actor is never served there as a local one.
 #[test]
 fn a_handshake_that_declares_a_network_actor_is_refused_before_anything_is_connected() {
     let tree = kr_ipc::testing::TempHost::create();
@@ -287,6 +289,7 @@ fn a_handshake_that_declares_a_network_actor_is_refused_before_anything_is_conne
     }
 }
 
+/// KR-REQ-03.12: a request that has already crossed a bridge is not carried over a second one.
 #[test]
 fn a_request_that_has_already_crossed_a_bridge_is_not_chained() {
     let tree = kr_ipc::testing::TempHost::create();
@@ -527,6 +530,8 @@ async fn an_invoker_opens_a_bridge_and_carries_a_request_over_it() {
     stub.abort();
 }
 
+/// KR-REQ-03.12: a refresh carried over a bridge, which the destination would serve as a local
+/// request and which would open a bridge of its own, is refused at the first bridge.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_request_that_would_open_a_second_bridge_is_refused_at_the_first() {

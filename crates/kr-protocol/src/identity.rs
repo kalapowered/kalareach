@@ -694,6 +694,8 @@ mod tests {
         assert_eq!(decoded, identity);
     }
 
+    /// KR-REQ-03.16: an enrolment record holds the distribution's identity, its Linux user and the
+    /// installed helper's path.
     #[test]
     fn an_enrolment_records_the_identity_the_user_and_the_helper() {
         let enrolment = wsl_enrolment();
@@ -703,6 +705,8 @@ mod tests {
         assert_eq!(enrolment.helper_path, "/usr/local/bin/kr");
     }
 
+    /// KR-REQ-03.16: a record missing the distribution, the user or an absolute helper path is
+    /// refused.
     #[test]
     fn an_enrolment_missing_any_of_the_three_is_refused() {
         let mut missing_target = wsl_enrolment();

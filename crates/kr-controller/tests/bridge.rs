@@ -85,6 +85,8 @@ async fn inventory(client: &mut kr_ipc::client::LocalClient) -> EnvironmentInven
         .expect("an inventory")
 }
 
+/// KR-REQ-03.16: the daemon records a distribution's identity, its Linux user and the absolute path
+/// of its installed helper, and lists the record as enrolled.
 #[tokio::test]
 async fn an_enrolment_records_the_identity_the_user_and_the_absolute_helper_path() {
     let owner = kr_crypto::keys::DeviceKeys::generate().expect("owner keys");
@@ -104,6 +106,7 @@ async fn an_enrolment_records_the_identity_the_user_and_the_absolute_helper_path
     host.stop().await;
 }
 
+/// KR-REQ-03.16: an enrolment whose helper path is not absolute is refused and records nothing.
 #[tokio::test]
 async fn a_record_without_an_absolute_helper_path_is_refused() {
     let owner = kr_crypto::keys::DeviceKeys::generate().expect("owner keys");
@@ -381,6 +384,8 @@ async fn a_grouped_listing_keeps_every_environment_identity_distinct() {
     host.stop().await;
 }
 
+/// KR-REQ-03.12: a paired device holding host management reaches no method that enrols, forgets or
+/// refreshes a bridged environment, so it never opens a bridge through this host.
 #[tokio::test]
 async fn a_paired_device_never_reaches_the_bridge_or_the_inventory() {
     let owner = kr_crypto::keys::DeviceKeys::generate().expect("owner keys");
@@ -425,6 +430,8 @@ async fn a_paired_device_never_reaches_the_bridge_or_the_inventory() {
     host.stop().await;
 }
 
+/// KR-REQ-03.12: every environment method, the refresh that opens a bridge among them, admits local
+/// IPC alone, whatever rights a remote caller holds.
 #[test]
 fn the_registry_refuses_every_remote_ingress_on_every_environment_method() {
     // The refusal is the authority table's, not a check restated in the daemon. A method that is
@@ -457,6 +464,8 @@ fn the_registry_refuses_every_remote_ingress_on_every_environment_method() {
     }
 }
 
+/// KR-REQ-03.12: the invoker opens a bridge for a locally authenticated invocation only, and carries
+/// its ingress to the far side; every network ingress is refused before a process is started.
 #[test]
 fn a_network_actor_is_refused_a_bridge_before_a_process_exists() {
     use kr_controller::bridge::invoke::{self, Refusal};
