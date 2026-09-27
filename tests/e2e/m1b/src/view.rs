@@ -69,6 +69,8 @@ pub struct View {
     direct: Terminal,
     output: Vec<u8>,
     kinds: Vec<String>,
+    /// How many times an update this attachment could not apply made it ask for a fresh screen.
+    fresh_screens: u64,
     closed: Option<ClosureRecord>,
     lease: Option<(InputLeaseEpoch, u64)>,
     acknowledged: u64,
@@ -149,6 +151,7 @@ impl View {
             direct: Terminal::new(columns, rows),
             output: Vec::new(),
             kinds: Vec::new(),
+            fresh_screens: 0,
             closed: None,
             lease: None,
             acknowledged: 0,
@@ -178,6 +181,13 @@ impl View {
     #[must_use]
     pub fn kinds(&self) -> &[String] {
         &self.kinds
+    }
+
+    /// How many times an update this attachment could not apply made it ask for a fresh screen:
+    /// what the session drew between that update and the fresh screen was never held here.
+    #[must_use]
+    pub const fn fresh_screens(&self) -> u64 {
+        self.fresh_screens
     }
 
     /// How the session closed, once the attachment has been told.
@@ -230,6 +240,27 @@ impl View {
         Ok(())
     }
 
+    /// Applies the next event the connection has for this attachment, waiting at most `within` for
+    /// it, and says whether there was one, so a caller can look at the screen after each.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`View::pump`] returns.
+    pub async fn pump_one(&mut self, remote: &Remote, within: Duration) -> Result<bool, String> {
+        let notification = match tokio::time::timeout(within, self.events.recv()).await {
+            Err(_) => return Ok(false),
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(missed))) => {
+                return Err(format!("the device fell {missed} events behind"));
+            }
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+                return Err("the connection ended".to_owned());
+            }
+            Ok(Ok(notification)) => notification,
+        };
+        self.apply(remote, &notification).await?;
+        Ok(true)
+    }
+
     async fn apply(&mut self, remote: &Remote, notification: &Notification) -> Result<(), String> {
         let kind = notification.event_type.as_str().to_owned();
         self.kinds.push(kind.clone());
@@ -263,6 +294,7 @@ impl View {
                     // The update continues from a screen this attachment does not hold. A fresh one
                     // is asked for, which is what the contract says to do.
                     eprintln!("the device asks for a fresh screen: {refusal:?}");
+                    self.fresh_screens += 1;
                     self.resubscribe(remote).await?;
                 }
             }
