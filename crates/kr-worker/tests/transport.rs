@@ -2361,6 +2361,178 @@ async fn kr_req_12_02_a_launch_that_fails_after_its_process_started_leaves_nothi
     let _ = std::fs::remove_dir_all(&directory);
 }
 
+/// A launch profile whose backend forks a process of its own first, writes that process's
+/// identifier into `forked` in its working directory once it has, and waits for it.
+#[cfg(unix)]
+fn forking_profile() -> kr_protocol::broker::LaunchProfile {
+    let sleeping = sleeping_profile();
+    kr_protocol::broker::LaunchProfile {
+        binary: kr_protocol::broker::BinaryIdentity {
+            resolved_path: "/bin/sh".to_owned(),
+            ..sleeping.binary.clone()
+        },
+        arguments: vec![
+            "-c".to_owned(),
+            "sleep 600 & echo $! > forked.tmp && mv forked.tmp forked; wait".to_owned(),
+        ],
+        ..sleeping
+    }
+}
+
+/// Waits for the process a forking backend forked, and returns it as the kernel describes it.
+#[cfg(unix)]
+fn forked_by_the_backend(directory: &std::path::Path) -> ProcessStartIdentity {
+    let path = directory.join("forked");
+    let started = std::time::Instant::now();
+    loop {
+        if let Some(pid) = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| text.trim().parse::<u32>().ok())
+        {
+            return kr_ipc::identity::started_process_identity(pid)
+                .expect("the forked process is described");
+        }
+        assert!(
+            started.elapsed() < LIVENESS_DEADLINE,
+            "the backend forks within the liveness deadline"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// Returns whether a process has ended within the liveness deadline.
+#[cfg(unix)]
+fn ends(process: &ProcessStartIdentity) -> bool {
+    let started = std::time::Instant::now();
+    loop {
+        match kr_ipc::identity::process_state(process) {
+            kr_ipc::identity::ProcessState::Ended => return true,
+            _ if started.elapsed() >= LIVENESS_DEADLINE => return false,
+            _ => std::thread::sleep(std::time::Duration::from_millis(10)),
+        }
+    }
+}
+
+/// Stops a process this test recorded, whatever became of it.
+#[cfg(unix)]
+fn stop_recorded(process: &ProcessStartIdentity) {
+    if kr_ipc::identity::process_state(process) == kr_ipc::identity::ProcessState::Running {
+        let _ = std::process::Command::new("/bin/kill")
+            .arg("-KILL")
+            .arg(process.pid.get().to_string())
+            .status();
+    }
+}
+
+/// KR-REQ-12.02 and KR-REQ-07.61: a launch that fails after its process started also stops what
+/// that process forked in the meantime, so nothing the failed launch started is left running.
+#[cfg(unix)]
+#[tokio::test]
+async fn kr_req_12_02_a_failed_launch_stops_what_its_process_forked() {
+    let directory = private_directory();
+    let broker = broker_for_launch();
+    let occupied = directory.join("registration");
+    std::fs::create_dir(&occupied).expect("the registration's name is taken");
+    std::fs::write(occupied.join("held"), b"held").expect("by a directory that is not empty");
+    let mut gateway = kr_worker::broker::NativeGateway::bind(
+        Arc::clone(&broker),
+        &directory,
+        launch_for(None, None),
+    )
+    .expect("the endpoint binds");
+    let (arrived, release) = gateway.pause_before_cleanup();
+    let intent = broker
+        .prepare_launch(
+            forking_profile(),
+            kr_worker::broker::ForegroundMark::idle(4),
+            None,
+        )
+        .expect("the launch is prepared");
+    let launching = std::thread::spawn(move || {
+        let failed = gateway.launch(
+            &intent,
+            &kr_worker::broker::ForegroundMark::idle(4),
+            IntegrationMode::Gateway,
+            TimestampMs::new(1),
+        );
+        (gateway, failed)
+    });
+    arrived
+        .recv_timeout(LIVENESS_DEADLINE)
+        .expect("the failed launch reaches its cleanup");
+    let forked = forked_by_the_backend(&directory);
+    assert_eq!(
+        kr_ipc::identity::process_state(&forked),
+        kr_ipc::identity::ProcessState::Running,
+        "the backend's own process is running when the launch undoes itself"
+    );
+
+    release.send(()).expect("the cleanup goes on");
+    let (gateway, failed) = launching.join().expect("the launch returns");
+    failed.expect_err("the registration cannot be published");
+    let started = gateway
+        .last_started()
+        .cloned()
+        .expect("the backend was started before the failure");
+    assert_eq!(
+        kr_ipc::identity::process_state(&started),
+        kr_ipc::identity::ProcessState::Ended,
+        "the backend was stopped"
+    );
+    let stopped = ends(&forked);
+    stop_recorded(&forked);
+    assert!(stopped, "and so was what it forked");
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+/// KR-REQ-12.02, the control: a launch that succeeds leaves its process, and what that process
+/// forked, running.
+#[cfg(unix)]
+#[tokio::test]
+async fn kr_req_12_02_a_successful_launch_leaves_what_its_process_forked_running() {
+    let directory = private_directory();
+    let broker = broker_for_launch();
+    let mut gateway = kr_worker::broker::NativeGateway::bind(
+        Arc::clone(&broker),
+        &directory,
+        launch_for(None, None),
+    )
+    .expect("the endpoint binds");
+    let intent = broker
+        .prepare_launch(
+            forking_profile(),
+            kr_worker::broker::ForegroundMark::idle(4),
+            None,
+        )
+        .expect("the launch is prepared");
+    let mut launched = gateway
+        .launch(
+            &intent,
+            &kr_worker::broker::ForegroundMark::idle(4),
+            IntegrationMode::Gateway,
+            TimestampMs::new(1),
+        )
+        .expect("the launch succeeds");
+    let forked = forked_by_the_backend(&directory);
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let running = (
+        kr_ipc::identity::process_state(&launched.process),
+        kr_ipc::identity::process_state(&forked),
+    );
+    let _ = launched.child.kill();
+    let _ = launched.child.wait();
+    stop_recorded(&forked);
+    assert_eq!(
+        running,
+        (
+            kr_ipc::identity::ProcessState::Running,
+            kr_ipc::identity::ProcessState::Running
+        ),
+        "the backend and what it forked are running after the launch"
+    );
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
 /// KR-REQ-12.02: a launch that fails after its process started keeps its conversation until that
 /// process is stopped, so no other launch can take the conversation while the failed one's process
 /// still runs.
