@@ -96,10 +96,18 @@ impl Controller {
     /// Recovers a worker whose claim was consumed but whose session never reached the directory.
     async fn recover_claim(&self, reservation: &crate::registry::Reservation) -> Result<()> {
         let endpoint = self.paths.worker_endpoint(reservation.display_number)?;
-        if let Some(key) = reservation.claimed_key
-            && let Ok((proof, described)) = self
-                .challenge(&endpoint, &key, reservation.session_id)
-                .await
+        let challenged = match reservation.claimed_key {
+            Some(key) => Some(
+                self.challenge(&endpoint, &key, reservation.session_id)
+                    .await,
+            ),
+            None => None,
+        };
+        if let Some(Err(refused)) = &challenged {
+            report_unretained(reservation.display_number, refused);
+        }
+        if let Some(Ok((proof, described))) = challenged
+            && let Some(key) = reservation.claimed_key
         {
             // The worker is alive and is the one this reservation admitted. Its descriptor and its
             // registry row are rebuilt from its own signed answer.
@@ -304,7 +312,8 @@ impl Controller {
                 }
                 // A worker that does not answer is not necessarily gone. Reconciliation asks the
                 // kernel; only a confirmed death produces a closure record.
-                Err(_) => {
+                Err(refused) => {
+                    report_unretained(row.display_number, &refused);
                     let _ = self.reconcile(row.session_id).await;
                 }
             }
@@ -410,5 +419,27 @@ impl Controller {
         )
         .await;
         Ok(())
+    }
+}
+
+/// Says, in this daemon's log, that a worker recovery reached runs at a compatibility level this
+/// daemon's release does not retain, by that level.
+///
+/// Such a worker is alive and is left so: it is not adopted, since this daemon could not read or
+/// write its frames, and it is not closed, since nothing about it has ended. Its session runs on,
+/// unreached by this daemon, until it closes or a daemon of a release that retains its level
+/// serves the environment again. An update of this host waits for such a worker rather than make
+/// one, so this is met only by a daemon started outside an update.
+fn report_unretained(
+    display_number: kr_protocol::session::DisplayNumber,
+    refused: &ControllerError,
+) {
+    if let ControllerError::Ipc(kr_ipc::IpcError::UnretainedLevel { worker, level }) = refused {
+        eprintln!(
+            "kr-controller: session {} runs {worker}, and this daemon speaks to workers at protocol \
+             level {level} only: the session is left running, unreached by this daemon, until it \
+             closes or a daemon of its own release serves this environment",
+            display_number.get()
+        );
     }
 }
