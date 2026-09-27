@@ -35,7 +35,7 @@ use kr_e2e_agents::observe::{
     typed_actions,
 };
 use kr_e2e_agents::outcome::Outcome;
-use kr_e2e_agents::provenance::{Expected, Provenance, StopSampling};
+use kr_e2e_agents::provenance::{Expected, NOT_PINNED, Provenance, StopSampling};
 use kr_e2e_agents::stage::{
     AgentProcess, Installation, Installed, Keyboard, Owner, PROMPT, Replacement, Session,
     closed_port, default_keychain_of_a_session, events_snapshot, free_port, inode_of, install,
@@ -47,7 +47,7 @@ use kr_e2e_m1b::LIVENESS;
 use kr_e2e_m1b::ceremony;
 use kr_e2e_m1b::device::Device;
 use kr_e2e_m1b::host::{Host, HostOptions};
-use kr_e2e_m1b::run::{Run, ended_within, running, signal};
+use kr_e2e_m1b::run::{Run, ended_within, output_within, running, signal};
 use kr_e2e_m1b::shells::{self, ManagedShell};
 use kr_e2e_m1b::view::View;
 use kr_e2e_m1b::window::{Window, answered};
@@ -68,6 +68,11 @@ const RESTORE_TERMINAL: &[u8] = b"printf '\\033[=0;1u\\033[>4;0m\\033[?1000l\\03
 
 /// The image whose path is typed at the agent's composer.
 const SHOT: &str = "kalareach-shot.png";
+
+/// How a part says its agent's login could not be established: its status command did not report
+/// it, the agent did not reach its composer with it, or the agent showed that it is signed out. A
+/// part that says so stops its agent.
+const LOGIN_UNPROVEN: &str = "the agent's login is not established:";
 
 /// A one-pixel PNG.
 const PNG: &[u8] = &[
@@ -162,13 +167,16 @@ fn panic_text(panic: &(dyn std::any::Any + Send)) -> String {
 /// closing check has passed.
 ///
 /// A part with a login is also cleaned up after, whatever became of it. Every process it started
-/// has ended first: the closing check ended them, or the run ends them now. Then, where the agent
-/// ran with the person's home, what the part created there is compared, its own conversations
-/// removed and every other change reported, and an agent that rewrote a file it had is stopped;
-/// and where the part carried a key in its session's environment, the run's directory is searched
-/// for the key's bytes, which files held it is recorded by path, and the directory is removed and
-/// checked gone. A search that could not read everything, or a directory still there, fails the
-/// part. A part that stopped part way still records what it left and whether its agent stops.
+/// has ended first: the closing check found so, or, after a part that stopped part way, the run
+/// ends everything and checks again; where that check still finds something running, nothing the
+/// part left is taken as final, the part fails and its agent stops. Then, where the agent ran with
+/// the person's home, what the part created there is compared, its own conversations removed and
+/// every other change reported, and an agent that rewrote a file it had is stopped; and where the
+/// part carried a key in its session's environment, the run's directory is searched for the key's
+/// bytes, which files held it is recorded by path, and the directory is removed and checked gone. A
+/// search that could not read everything, or a directory still there, fails the part. A part that
+/// stopped part way still records what it left, the process numbers its sessions ran, and whether
+/// its agent stops: it stops when its login could not be established.
 fn staged(
     part: &str,
     test: &str,
@@ -207,13 +215,22 @@ fn staged(
     };
     let runtime = runtime();
     let mark = nonce();
-    // The person's agent directories as the part finds them, before anything starts.
+    // The person's agent directories as the part finds them, before anything starts: whole, or the
+    // part does not start, since a file it could not read could later be taken for one it made.
     let person = login
         .as_ref()
         .filter(|login| login.account.home == AccountHome::Person)
         .map(|login| snapshot(&login.person_home, &login.account.directories, HASH_LIMIT));
+    if let Some(before) = person.as_ref().filter(|before| !before.whole()) {
+        panic!(
+            "part {part}: the person's agent directories could not be read whole before it \
+             started, so it does not start: {}",
+            before.unread().join("; ")
+        );
+    }
     let run = Run::start(&format!("part {part}"));
     let root = run.root().to_path_buf();
+    let provenance = Provenance::new(&inputs.build, &run, &shell, part);
     let closed = std::sync::atomic::AtomicBool::new(false);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         run_part(
@@ -224,41 +241,49 @@ fn staged(
             &shell,
             &runtime,
             &run,
+            &provenance,
             &closed,
             body,
         )
     }));
     // What the part left is read only once nothing it started still runs: after the closing
-    // check, before the run's directory goes; otherwise after the run has ended everything.
-    let left = |login: Option<&Login>| {
-        let home = login
-            .zip(person.as_ref())
-            .map(|(login, before)| person_home_report(login, before, &mark, &root));
-        let scan = login
-            .and_then(|login| login.key.as_ref())
-            .map(|(name, value)| (name.clone(), files_holding(&root, value.as_bytes())));
-        (home, scan)
-    };
-    let (home, scan) = if closed.load(std::sync::atomic::Ordering::SeqCst) {
-        let found = left(login.as_ref());
-        drop(run);
-        found
+    // check, or, after a part that stopped part way, once the run has ended everything and found
+    // nothing left. The run's directory is still there then.
+    let writers = if closed.load(std::sync::atomic::Ordering::SeqCst) {
+        Ok(())
+    } else if needs_login {
+        run.end_everything();
+        run.remove_loaded_jobs();
+        run.nothing_running().map(|_| ())
     } else {
-        drop(run);
-        left(login.as_ref())
+        Ok(())
     };
+    let home = login
+        .as_ref()
+        .zip(person.as_ref())
+        .map(|(login, before)| person_home_report(login, before, &mark, &root, writers.is_ok()));
+    let scan = login
+        .as_ref()
+        .and_then(|login| login.key.as_ref())
+        .map(|(name, value)| (name.clone(), files_holding(&root, value.as_bytes())));
+    drop(run);
     let mut key_evidence = None;
     let mut key_failure = None;
     if let Some((name, scan)) = scan {
         let _ = std::fs::remove_dir_all(&root);
         let gone = !root.exists();
         record_key_scan(part, &name, &scan, now_ms(), gone);
-        if !scan.complete() || !gone {
+        if !scan.complete() || !gone || writers.is_err() {
             key_failure = Some(format!(
                 "the run's directory that held {name} was {}searched whole ({} entries unread) \
-                 and is {}gone",
+                 {}and is {}gone",
                 if scan.complete() { "" } else { "not " },
                 scan.unread.len(),
+                if writers.is_ok() {
+                    ""
+                } else {
+                    "while something the part started may still have been writing, "
+                },
                 if gone { "" } else { "not " }
             ));
         }
@@ -269,60 +294,91 @@ fn staged(
             "run_gone": gone,
         }));
     }
-    let stop = home
-        .as_ref()
-        .and_then(|(_, rewrites)| (!rewrites.is_empty()).then(|| rewrites.join(", ")))
-        .filter(|_| {
-            login
+    // Why the agent stops here, if it does: something the part started outlived it, the person's
+    // directories could not be read whole afterwards, or the agent rewrote a file it had there.
+    let mut stop = Vec::new();
+    if let Err(left) = &writers {
+        stop.push(format!(
+            "something the part started still ran after the run ended everything, so what it \
+             left is not final: {left}"
+        ));
+    }
+    if let Some((_, rewrites, whole)) = &home {
+        if !whole {
+            stop.push(
+                "the person's agent directories could not be read whole after the part, so \
+                 nothing was removed and no edit can be ruled out"
+                    .to_owned(),
+            );
+        }
+        if !rewrites.is_empty()
+            && login
                 .as_ref()
                 .is_some_and(|login| login.account.stop_on_rewrite)
-        });
+        {
+            stop.push(format!(
+                "the agent rewrote files it had before the part: {}",
+                rewrites.join(", ")
+            ));
+        }
+    }
     let mut outcome = match result {
         Ok(outcome) => outcome,
         Err(panic) => {
-            // A part with a login that stopped part way still says what it left, and whether its
-            // agent stops, before its failure goes on.
+            // A part with a login that stopped part way still says what it left, the process
+            // numbers its sessions ran, and whether its agent stops, before its failure goes on.
             if needs_login {
+                let said = panic_text(&*panic);
+                if said.starts_with(LOGIN_UNPROVEN) {
+                    stop.push(said.clone());
+                }
                 let mut evidence = serde_json::Map::new();
-                if let Some((report, _)) = &home {
+                evidence.insert("provenance".to_owned(), provenance.evidence());
+                if let Some((report, _, _)) = &home {
                     evidence.insert("person_home".to_owned(), report.clone());
                 }
                 if let Some(keys) = &key_evidence {
                     evidence.insert("key".to_owned(), keys.clone());
                 }
-                if stop.is_some() {
+                if !stop.is_empty() {
                     evidence.insert("stop_agent".to_owned(), json!(true));
                 }
-                let reason = match &stop {
-                    Some(files) => format!(
-                        "{}; and the agent rewrote files it had before the part, so it stops \
-                         here: {files}",
-                        panic_text(&*panic)
+                let evidence = serde_json::Value::Object(evidence);
+                let outcome = match said.find(NOT_PINNED) {
+                    // The session ran something other than the build, so the part did not test
+                    // it: not run, as the harness records such a part.
+                    Some(at) if stop.is_empty() => {
+                        Outcome::not_run(part, test, &said[at..], evidence)
+                    }
+                    _ if stop.is_empty() => Outcome::failed(part, test, &said, evidence),
+                    _ => Outcome::failed(
+                        part,
+                        test,
+                        &format!("{said}; and the agent stops here: {}", stop.join("; ")),
+                        evidence,
                     ),
-                    None => panic_text(&*panic),
                 };
-                Outcome::failed(part, test, &reason, serde_json::Value::Object(evidence))
-                    .append(&inputs.result);
+                outcome.append(&inputs.result);
             }
             std::panic::resume_unwind(panic)
         }
     };
     if let Some(evidence) = outcome.evidence.as_object_mut() {
-        if let Some((report, _)) = &home {
+        if let Some((report, _, _)) = &home {
             evidence.insert("person_home".to_owned(), report.clone());
         }
         if let Some(keys) = &key_evidence {
             evidence.insert("key".to_owned(), keys.clone());
         }
     }
-    if let Some(files) = stop {
+    if !stop.is_empty() {
         if let Some(evidence) = outcome.evidence.as_object_mut() {
             evidence.insert("stop_agent".to_owned(), json!(true));
         }
         outcome = Outcome::failed(
             part,
             test,
-            &format!("the agent rewrote files it had before the part, so it stops here: {files}"),
+            &format!("the agent stops here: {}", stop.join("; ")),
             outcome.evidence.clone(),
         );
     }
@@ -338,17 +394,24 @@ fn staged(
 
 /// What a part changed in the person's agent directories since `before`: its own conversations,
 /// the files it created holding its marker or the run's directory, removed, and every other change
-/// reported; and the files it had that were rewritten or changed and too large to compare.
+/// reported; the files it had that were rewritten or changed and too large to compare; and whether
+/// the directories were read whole afterwards. Nothing is removed unless they were, and unless
+/// everything the part started had ended (`settled`).
 fn person_home_report(
     login: &Login,
     before: &kr_e2e_agents::account::Snapshot,
     mark: &str,
     root: &Path,
-) -> (serde_json::Value, Vec<String>) {
+    settled: bool,
+) -> (serde_json::Value, Vec<String>, bool) {
     let after = snapshot(&login.person_home, &login.account.directories, HASH_LIMIT);
     let found = changes(before, &after);
     let root = root.display().to_string();
-    let (removed, left) = remove_created(before, &found, &[mark, &root]);
+    let (removed, left) = if after.whole() && settled {
+        remove_created(before, &found, &[mark, &root])
+    } else {
+        (Vec::new(), found.created.clone())
+    };
     let home = |paths: &[PathBuf]| -> Vec<String> {
         paths
             .iter()
@@ -372,8 +435,11 @@ fn person_home_report(
             "rewritten": home(&found.rewritten),
             "changed_uncompared": home(&found.changed_uncompared),
             "removed_by_something_else": home(&found.removed),
+            "read_whole_after": after.whole(),
+            "unread_after": after.unread(),
         }),
         rewrites,
+        after.whole(),
     )
 }
 
@@ -392,6 +458,7 @@ fn run_part(
     shell: &ManagedShell,
     runtime: &tokio::runtime::Runtime,
     run: &Run,
+    provenance: &Provenance,
     closed: &std::sync::atomic::AtomicBool,
     body: impl FnOnce(&mut Stage<'_, '_>) -> Ending,
 ) -> Outcome {
@@ -405,7 +472,6 @@ fn run_part(
         }
         _ => RunKeychain::create(&run.home()),
     };
-    let provenance = Provenance::new(&inputs.build, run, shell, part);
     place_forwarder(run);
     let host = Host::start(
         run,
@@ -425,7 +491,7 @@ fn run_part(
     // ended, by a thread of their own, with one more look when the part's own steps end; the
     // thread stops when the part ends, however it ends.
     let outcome = std::thread::scope(|scope| {
-        let _stop = StopSampling(&provenance);
+        let _stop = StopSampling(provenance);
         let _sampler = scope.spawn(|| provenance.sample_until_stopped());
         let ending = {
             let mut stage = Stage {
@@ -436,7 +502,7 @@ fn run_part(
                 runtime,
                 shell,
                 installed: &installed,
-                provenance: &provenance,
+                provenance,
                 login,
                 mark,
             };
@@ -812,8 +878,31 @@ struct Logged {
 impl Logged {
     /// Starts the agent with its login's arguments and `extra`, watches it from the device and takes
     /// the input lease, and brings it to its composer: through the build list's first steps, or,
-    /// where `ready` names the first screen of a start that has none, from there.
+    /// where `ready` names the first screen of a start that has none, from there. The login is
+    /// checked first, where the agent has a status command; a start that does not reach the
+    /// composer is taken as a login that cannot be established.
     fn start(
+        stage: &Stage<'_, '_>,
+        variables: &[(String, String)],
+        what: &str,
+        part: &'static str,
+        extra: &[String],
+        ready: Option<&str>,
+    ) -> Self {
+        login_holds(stage, variables);
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Self::reach_composer(stage, variables, what, part, extra, ready)
+        }))
+        .unwrap_or_else(|panic| {
+            panic!(
+                "{LOGIN_UNPROVEN} the agent did not reach its composer with it: {}",
+                panic_text(&*panic)
+            )
+        })
+    }
+
+    /// [`Logged::start`] without its checks.
+    fn reach_composer(
         stage: &Stage<'_, '_>,
         variables: &[(String, String)],
         what: &str,
@@ -879,11 +968,73 @@ impl Logged {
         self.type_text(stage, &login.account.submit);
     }
 
-    /// Waits until the device's view shows `needle`.
+    /// Waits until the device's view shows `needle`. When it does not, and the screen shows one
+    /// of the texts the agent shows when it is signed out, the part says the login is not
+    /// established.
     fn wait_for(&mut self, stage: &Stage<'_, '_>, needle: &str, why: &str) -> Vec<String> {
-        self.screen
-            .wait_for(stage, &self.agent.session, needle, why)
+        let waited = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.screen
+                .wait_for(stage, &self.agent.session, needle, why)
+        }));
+        waited.unwrap_or_else(|panic| {
+            let account = stage.login.expect("a part with a login").account();
+            let rows = self.screen.view.rows();
+            if let Some(shown) = account
+                .signed_out
+                .iter()
+                .find(|text| rows.iter().any(|row| row.contains(text.as_str())))
+            {
+                panic!(
+                    "{LOGIN_UNPROVEN} the agent shows {shown:?}: {}",
+                    panic_text(&*panic)
+                );
+            }
+            std::panic::resume_unwind(panic)
+        })
     }
+}
+
+/// Checks, where the build list names the agent's status command, that the login holds: the
+/// command, run as the agent runs, with its variables, home and working directory, says so without
+/// calling a model. Its output is read for that text alone and never kept or printed.
+fn login_holds(stage: &Stage<'_, '_>, variables: &[(String, String)]) {
+    let account = stage.login.expect("a part with a login").account();
+    let Some(status) = &account.status else {
+        return;
+    };
+    let mut command = std::process::Command::new("/bin/sh");
+    command
+        .arg("-c")
+        .arg("exec \"$0\" \"$@\"")
+        .arg(&stage.build.command)
+        .args(&status.arguments)
+        .env_clear()
+        .envs(
+            variables
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_str())),
+        )
+        .current_dir(stage.run.work())
+        .stdin(std::process::Stdio::null());
+    let holds = output_within(command, LIVENESS).is_ok_and(|output| {
+        let said: String = String::from_utf8_lossy(&output.stdout)
+            .chars()
+            .chain(String::from_utf8_lossy(&output.stderr).chars())
+            .filter(|character| !character.is_whitespace())
+            .collect();
+        let wanted: String = status
+            .shows
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect();
+        output.status.success() && said.contains(&wanted)
+    });
+    assert!(
+        holds,
+        "{LOGIN_UNPROVEN} `{} {}` did not say that it holds",
+        stage.build.command,
+        status.arguments.join(" ")
+    );
 }
 
 /// A random number below `bound`, from the system's random source.
@@ -2490,6 +2641,44 @@ fn conversation_of(root: &Path, needle: &str, marker: &str) -> Option<PathBuf> {
     }
 }
 
+/// The conversation file under `root` that records the prompt holding `needle`, once the agent has
+/// written it.
+fn recorded(root: &Path, needle: &str, marker: &str) -> PathBuf {
+    let started = std::time::Instant::now();
+    loop {
+        if let Some(file) = conversation_of(root, needle, marker) {
+            return file;
+        }
+        assert!(
+            started.elapsed() < LIVENESS,
+            "one conversation under {} records the prompt holding {needle}",
+            root.display()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Whether the turn whose prompt is at line `prompt` of `conversation` still runs: the device's
+/// view, brought up to date, shows the agent busy, and the conversation holds no reply with `done`
+/// after the prompt, which the turn writes only as it finishes.
+fn turn_runs(
+    stage: &Stage<'_, '_>,
+    logged: &mut Logged,
+    conversation: &Path,
+    prompt: Option<usize>,
+    done: &str,
+) -> bool {
+    let account = stage.login.expect("a part with a login").account();
+    logged.screen.pump(stage, Duration::from_millis(50));
+    let busy = logged
+        .screen
+        .view
+        .rows()
+        .iter()
+        .any(|row| row.contains(&account.busy));
+    busy && first_line_with(conversation, prompt, &[done, &account.reply_line]).is_none()
+}
+
 /// Where a prompt entered during a running turn landed in the conversation, as the queue and
 /// steering checks read it: the line of the running turn's last reply, of the second prompt, and
 /// of that prompt's answer.
@@ -2549,9 +2738,11 @@ fn check_steered(order: &Order) -> Result<(), String> {
 /// KR-REQ-12.32, case 2, part 2a: with the person's login, each of the agent's own terminal
 /// controls from a paired device, on its own. A slash command that calls no model shows its screen.
 /// A long turn stops at the agent's interrupt key, and the agent says so. A prompt entered while a
-/// turn runs waits for it: the agent's own conversation holds the turn's finished work, then the
-/// prompt, then its answer. Where the agent steers a running turn with a prompt entered during it,
-/// the turn takes the prompt before its work finishes, which then never does. The typed steer,
+/// turn runs, which the device's view shows busy and whose finishing reply the conversation does
+/// not yet hold both just before and just after the entry, waits for it: the agent's own
+/// conversation holds the turn's finished work, then the prompt, then its answer. Where the agent
+/// steers a running turn with a prompt entered during it, the turn takes the prompt before its work
+/// finishes, which then never does. The typed steer,
 /// queue and commands stay refused, since the launch has only observation and the terminal. The
 /// queue and steering checks are also shown orders made wrong on purpose, which they must reject.
 #[test]
@@ -2608,41 +2799,44 @@ fn slash_commands_interrupts_queued_prompts_and_steering_each_work_from_a_device
         logged.submit(
             stage,
             &format!(
-                "Count from 1 to 37, one number per line, then write the word DONE, a hyphen, the \
+                "Count from 1 to 200, one number per line, then write the word DONE, a hyphen, the \
                  code {mark} in upper case and -Q, and nothing else. ({mark}-q)"
             ),
             "a turn to queue behind",
         );
         let _ = logged.wait_for(stage, &account.busy, "the first turn runs");
+        let conversation = recorded(&conversations, &format!("{mark}-q"), &account.prompt_line);
+        let first_prompt = first_line_with(
+            &conversation,
+            None,
+            &[&format!("{mark}-q"), &account.prompt_line],
+        );
+        // The first turn runs just before the prompt is entered and still runs just after it.
+        let before_queue = turn_runs(
+            stage,
+            &mut logged,
+            &conversation,
+            first_prompt,
+            &queued_done,
+        );
         logged.submit(
             stage,
             &format!("{queued_question} ({mark}-r)"),
             "a prompt entered during the turn",
         );
-        let busy_at_queue = logged
-            .screen
-            .view
-            .rows()
-            .iter()
-            .any(|row| row.contains(&account.busy));
+        let busy_at_queue = before_queue
+            && turn_runs(
+                stage,
+                &mut logged,
+                &conversation,
+                first_prompt,
+                &queued_done,
+            );
         let _ = logged.wait_for(stage, &queued_sum, "the queued prompt is answered");
         let _ = logged.wait_for(
             stage,
             &account.composer,
             "the composer is back after the queue",
-        );
-        let conversation =
-            conversation_of(&conversations, &format!("{mark}-q"), &account.prompt_line)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "one conversation under {} holds the turn",
-                        conversations.display()
-                    )
-                });
-        let first_prompt = first_line_with(
-            &conversation,
-            None,
-            &[&format!("{mark}-q"), &account.prompt_line],
         );
         let second_prompt = first_line_with(
             &conversation,
@@ -2681,30 +2875,38 @@ fn slash_commands_interrupts_queued_prompts_and_steering_each_work_from_a_device
                 "a turn to steer",
             );
             let _ = logged.wait_for(stage, &account.busy, "the turn to steer runs");
+            let steered_conversation =
+                recorded(&conversations, &format!("{mark}-s"), &account.prompt_line);
+            let steered_prompt = first_line_with(
+                &steered_conversation,
+                None,
+                &[&format!("{mark}-s"), &account.prompt_line],
+            );
+            let before_steer = turn_runs(
+                stage,
+                &mut logged,
+                &steered_conversation,
+                steered_prompt,
+                &steered_done,
+            );
             logged.submit(
                 stage,
                 &format!("Stop counting. {steer_question} ({mark}-t)"),
                 "a steering prompt",
             );
-            let busy_at_steer = logged
-                .screen
-                .view
-                .rows()
-                .iter()
-                .any(|row| row.contains(&account.busy));
+            let busy_at_steer = before_steer
+                && turn_runs(
+                    stage,
+                    &mut logged,
+                    &steered_conversation,
+                    steered_prompt,
+                    &steered_done,
+                );
             let _ = logged.wait_for(stage, &steer_sum, "the steered turn answers");
             let _ = logged.wait_for(
                 stage,
                 &account.composer,
                 "the composer is back after steering",
-            );
-            let steered_conversation =
-                conversation_of(&conversations, &format!("{mark}-s"), &account.prompt_line)
-                    .unwrap_or_else(|| panic!("one conversation holds the steered turn"));
-            let steered_prompt = first_line_with(
-                &steered_conversation,
-                None,
-                &[&format!("{mark}-s"), &account.prompt_line],
             );
             let steering_prompt = first_line_with(
                 &steered_conversation,
@@ -2848,10 +3050,14 @@ fn replayed(rows: &[String], probe: &str, answers: &[&str]) -> Result<(), String
 /// denies. One resolution: the command ran exactly once, as the lease holder's answer says, so the
 /// loser's answer reached nothing; the local terminal's input is refused as terminal input and its
 /// attachment ends with the line that says why, which is its receipt; the host announces no
-/// resource; and after the device reconnects, nothing either typed is typed again: the command has
-/// still run once and no approval is pending. The control breaks the property: the local terminal
-/// attaches again and takes the lease, a second approval is raised, the local terminal denies and
-/// the device's allow is refused, and the same check fails on that command, which never ran.
+/// resource; the agent's own conversation records one answer to the approval. After the device
+/// reconnects, with the new connection's own view and keyboard, nothing either typed is typed
+/// again: the command has still run once, the conversation still records one answer, no approval
+/// is pending, and a probe typed into the empty composer shows neither answer before it. The
+/// control breaks the property: the local terminal attaches again and takes the lease, a second
+/// approval is raised, the local terminal denies and the device's allow is refused, the
+/// conversation records that denial as one more answer, and the same check fails on that command,
+/// which never ran.
 #[test]
 fn a_local_and_a_remote_answer_raced_to_one_approval_resolve_it_once() {
     const TEST: &str = "a_local_and_a_remote_answer_raced_to_one_approval_resolve_it_once";
@@ -2920,6 +3126,9 @@ fn a_local_and_a_remote_answer_raced_to_one_approval_resolve_it_once() {
             .session
             .reconnect(stage.owner, stage.runtime)
             .unwrap_or_else(|why| panic!("the device reconnects: {why}"));
+        // The new connection's own view and keyboard: an attachment belongs to its connection.
+        logged.screen = Watch::open(stage, &logged.agent.session);
+        logged.keyboard = keyboard(stage, &logged.agent.session);
         std::thread::sleep(Duration::from_secs(3));
         let after_reconnect = executions(&log, &mark);
         let decided_after = decisions(&conversation, prompt_at, &account.decision_line, 0);
@@ -3006,8 +3215,10 @@ fn a_local_and_a_remote_answer_raced_to_one_approval_resolve_it_once() {
         );
         let control = loser_reached_nothing(executions(&log, &second));
         assert!(
-            control.is_err() && device_refused.is_some(),
-            "the check fails once the other side holds the lease: {control:?}, the device's answer {device_refused:?}"
+            control.is_err() && device_refused.is_some() && decided_control == decided + 1,
+            "the check fails once the other side holds the lease: {control:?}, the device's answer \
+             {device_refused:?}, and the conversation records the denial as one more answer \
+             ({decided_control} after {decided})"
         );
         let evidence = json!({
             "account": account_evidence(stage, logged.turns),
@@ -3043,8 +3254,10 @@ fn once(prompts: usize, replies: usize) -> Result<(), String> {
 
 /// KR-REQ-12.32, case 4, part 4: with the person's login, the device sends a prompt that asks for a
 /// reply beginning and ending with markers. The moment the agent's own conversation records the
-/// prompt, and while nothing of the reply has reached the device, the device drops both its
-/// connections; the part stops there, before another turn, if the reply had already reached it. The
+/// prompt, and while no screen the device was sent since the submission showed anything of a reply
+/// (the agent's reply mark, or four characters of the code in upper case), the device drops both its
+/// connections; the part stops there, before another turn, if one had, or if the device fell behind
+/// and was sent a fresh screen, which could have skipped one. The
 /// reply finishes while the device is away. A new connection is drawn the reply; the old
 /// attachment's next input is refused; and the conversation that holds the prompt holds it once
 /// with one finished reply, counted again after reconnecting. The identities the device reconciles
@@ -3069,10 +3282,37 @@ fn a_disconnection_after_the_agent_took_a_prompt_leaves_one_reply_and_no_duplica
              from 1 to 60, one number per line, then write the same code in upper case followed by \
              -END, and nothing else."
         );
+        // Every screen the device is sent from the submission until it goes is looked at: a reply
+        // shows the agent's reply mark, and this one begins with the code in upper case, of which
+        // four characters are enough. A screen the device fell behind on and was sent afresh may
+        // have skipped some, so it counts as reached.
+        logged.screen.pump(stage, Duration::from_millis(50));
+        let marks = |rows: &[String]| {
+            rows.iter()
+                .filter(|row| row.contains(&account.reply_mark))
+                .count()
+        };
+        let marks_before = marks(&logged.screen.view.rows());
+        let resyncs = |logged: &Logged| {
+            logged
+                .screen
+                .view
+                .kinds()
+                .iter()
+                .filter(|kind| kind.as_str() == RESYNC)
+                .count()
+        };
+        let resyncs_before = resyncs(&logged);
+        let code_start: String = upper.chars().take(4).collect();
+        let mut reached = false;
         logged.submit(stage, &prompt, "a prompt with a slow reply");
         // The agent's own record of the prompt is its admission.
         let admitted_at = std::time::Instant::now();
         let conversation = loop {
+            logged.screen.pump(stage, Duration::from_millis(10));
+            let rows = logged.screen.view.rows();
+            reached |=
+                marks(&rows) > marks_before || rows.iter().any(|row| row.contains(&code_start));
             if let Some(file) = conversation_of(&conversations, &mark, &account.prompt_line) {
                 break file;
             }
@@ -3081,16 +3321,13 @@ fn a_disconnection_after_the_agent_took_a_prompt_leaves_one_reply_and_no_duplica
                 "the agent's conversation records the prompt under {}",
                 conversations.display()
             );
-            std::thread::sleep(Duration::from_millis(20));
         };
-        // Nothing of the reply may have reached the device before it goes.
+        // One more look at what the device has been sent, and then it goes.
         logged.screen.pump(stage, Duration::from_millis(1));
-        let reached = logged
-            .screen
-            .view
-            .rows()
-            .iter()
-            .any(|row| row.contains(&begin));
+        let rows = logged.screen.view.rows();
+        reached |= marks(&rows) > marks_before
+            || rows.iter().any(|row| row.contains(&code_start))
+            || resyncs(&logged) > resyncs_before;
         let old = (
             logged.keyboard.attachment_id(),
             logged.keyboard.epoch(),
@@ -3114,13 +3351,13 @@ fn a_disconnection_after_the_agent_took_a_prompt_leaves_one_reply_and_no_duplica
             let evidence = json!({
                 "account": account_evidence(stage, logged.turns),
                 "conversation": conversation_id(&conversation),
-                "boundary": "the reply's first words reached the device before the agent's conversation recorded the prompt",
+                "boundary": "a screen the device was sent between the submission and the agent's record of the prompt showed the reply, or the device fell behind and was sent a fresh screen",
             });
             return Ending::new(
                 Outcome::not_run(
                     "4",
                     TEST,
-                    "the reply reached the device before the agent recorded the prompt, so no moment between them was shown",
+                    "the reply reached the device before the agent recorded the prompt, or whether it had could not be told, so no moment between them was shown",
                     evidence,
                 ),
                 logged.agent.sessions(),
@@ -3186,7 +3423,8 @@ fn a_disconnection_after_the_agent_took_a_prompt_leaves_one_reply_and_no_duplica
             "detection": shown.detection.evidence(),
             "detected": detected_evidence(&detected),
             "conversation": conversation_id(&conversation),
-            "admission": "the agent's conversation held the prompt, and nothing of the reply had reached the device, when it disconnected",
+            "admission": "the agent's conversation held the prompt, and no screen the device was sent from the submission until it disconnected showed the reply mark or the code in upper case",
+            "markers": { "reply_begins": begin, "reply_ends": end, "screen_reply_mark": account.reply_mark, "looked_for": code_start },
             "reconciled": { "attachment": old.0.to_string(), "epoch": old.1.get(), "next_sequence": old.2, "stale_input": stale.err().map(|refusal| refusal.detail) },
             "after_reconnect": { "prompts": prompts, "finished_replies": replies, "rows": redrawn.iter().filter(|row| row.contains(&end)).collect::<Vec<_>>() },
             "control": { "what": "the same prompt sent again", "breaks_property": true, "prompts": prompts_twice, "finished_replies": replies_twice, "check": control.err() },

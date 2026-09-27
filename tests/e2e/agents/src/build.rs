@@ -67,6 +67,17 @@ pub struct Approval {
     pub deny: String,
 }
 
+/// A command that says whether a login holds without calling a model, and what its output holds
+/// when it does.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Status {
+    /// The arguments typed after the command.
+    pub arguments: Vec<String>,
+    /// Text the output holds, spaces aside, when the login holds.
+    pub shows: String,
+}
+
 /// How the parts that need the person's vendor login run the agent. Nothing here is a credential:
 /// a login is named by its kind and where it lives, and a variable by its name.
 #[derive(Clone, Debug, Deserialize)]
@@ -88,6 +99,13 @@ pub struct Account {
     /// Arguments typed after the command in these parts, such as a model.
     #[serde(default)]
     pub arguments: Vec<String>,
+    /// The command that says whether the login holds, where the agent has one. Where it has none,
+    /// a part learns it from whether the agent reaches its composer and from `signed_out`.
+    #[serde(default)]
+    pub status: Option<Status>,
+    /// Text the agent shows when its login is missing, has expired or is refused.
+    #[serde(default)]
+    pub signed_out: Vec<String>,
     /// The budget these parts' turns are charged to: one per vendor login.
     pub budget: String,
     /// The most turns the budget allows.
@@ -117,6 +135,8 @@ pub struct Account {
     pub clear: String,
     /// What marks the line of a conversation file that holds one of the agent's replies.
     pub reply_line: String,
+    /// Text the agent's screen shows at the start of each of its replies.
+    pub reply_mark: String,
     /// What marks the line of a conversation file that records the answer to a tool approval:
     /// the command's result, or its refusal.
     pub decision_line: String,
