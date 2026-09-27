@@ -2962,8 +2962,8 @@ pub mod configuration {
                 listed.retain(|named| named != plugin_id);
                 if *enabled {
                     listed.push(plugin_id.clone());
-                    listed.sort();
                 }
+                listed.sort();
                 document.preferences.command_integrations = Nullable::some(listed);
             }
         }
