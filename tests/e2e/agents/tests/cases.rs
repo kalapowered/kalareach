@@ -1470,6 +1470,25 @@ impl Logged {
         }
     }
 
+    /// Waits until the device's view no longer shows the dialog showing `shown`, once the part has
+    /// answered it, so nothing that waits next takes the answered dialog for a new one.
+    fn dialog_goes(&mut self, stage: &Stage<'_, '_>, shown: &str, why: &str) {
+        let started = std::time::Instant::now();
+        while self
+            .screen
+            .view
+            .rows()
+            .iter()
+            .any(|row| row.contains(shown))
+        {
+            assert!(
+                started.elapsed() < LIVENESS,
+                "{why}: the agent still shows {shown:?} after it was answered"
+            );
+            self.screen.pump(stage, Duration::from_millis(200));
+        }
+    }
+
     /// Brings the device's view up to date and refuses a permission dialog it shows, as
     /// [`Logged::refuse`] does; returns whether it refused one. For a part's waits on something
     /// other than the screen.
@@ -1503,7 +1522,17 @@ impl Logged {
                 .screen
                 .wait_for_any(stage, &self.agent.session, &dialogs, why);
             if index == 0 {
-                match account.approval.names_only(&rows, command) {
+                // A dialog can reach the view over more than one update: it is read again, a
+                // moment later, before it is taken for anything but the part's command.
+                let mut rows = rows;
+                let mut named = account.approval.names_only(&rows, command);
+                let settling = std::time::Instant::now();
+                while named.is_err() && settling.elapsed() < Duration::from_secs(1) {
+                    self.screen.pump(stage, Duration::from_millis(200));
+                    rows = self.screen.view.rows();
+                    named = account.approval.names_only(&rows, command);
+                }
+                match named {
                     Ok(()) => {
                         stage.held.store(true, std::sync::atomic::Ordering::SeqCst);
                         guards_hold(stage);
@@ -4204,10 +4233,21 @@ fn refuse_locally(
     else {
         return false;
     };
-    if index == 0
-        && except.is_some_and(|command| account.approval.names_only(rows, command).is_ok())
-    {
-        return false;
+    if let (0, Some(command)) = (index, except) {
+        // A dialog can reach the terminal over more than one update: it is read again, a moment
+        // later, before it is taken for anything but the part's command.
+        let settling = std::time::Instant::now();
+        let mut shown = rows.to_vec();
+        loop {
+            if account.approval.names_only(&shown, command).is_ok() {
+                return false;
+            }
+            if settling.elapsed() >= Duration::from_secs(1) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+            shown = window.screen();
+        }
     }
     let key = if index == 0 {
         account.approval.deny.clone()
@@ -4252,7 +4292,9 @@ fn local_approval(stage: &Stage<'_, '_>, window: &Window, command: &str, why: &s
             );
             continue;
         }
-        if rows.iter().any(|row| row.contains(&account.approval.shows)) {
+        if rows.iter().any(|row| row.contains(&account.approval.shows))
+            && account.approval.names_only(&rows, command).is_ok()
+        {
             return rows;
         }
         assert!(
@@ -4367,6 +4409,11 @@ fn a_local_and_a_remote_answer_raced_to_one_approval_resolve_it_once() {
             "the local terminal's answer is refused and its attachment says why",
         );
         let local_status = logged.agent.session.window.exit_code(LIVENESS);
+        logged.dialog_goes(
+            stage,
+            &account.approval.shows,
+            "the device's allow closes the dialog",
+        );
         let _ = logged.wait_idle(stage, "the agent is back at its composer");
         let ran = executions(&log, &tag);
         loser_reached_nothing(ran).unwrap_or_else(|why| panic!("one resolution: {why}"));
@@ -4487,6 +4534,18 @@ fn a_local_and_a_remote_answer_raced_to_one_approval_resolve_it_once() {
         );
         stage.held.store(true, std::sync::atomic::Ordering::SeqCst);
         local.type_text(account.approval.deny.as_bytes());
+        let denied_at = std::time::Instant::now();
+        while local
+            .screen()
+            .iter()
+            .any(|row| row.contains(&account.approval.shows))
+        {
+            assert!(
+                denied_at.elapsed() < LIVENESS,
+                "the local terminal's denial closes the second dialog"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
         let device_refused = logged
             .keyboard
             .type_text(
