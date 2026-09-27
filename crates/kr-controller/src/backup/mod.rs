@@ -658,6 +658,42 @@ impl BackupService {
         }
     }
 
+    /// Runs `record`, the caller's own record of the privacy boundary, and then raises this
+    /// service's fence for `generation`, both inside one hold of the store.
+    ///
+    /// Every production decision this service makes takes the same hold, so none can fall between
+    /// the caller's record and the fence: work is decided either before the boundary was recorded
+    /// or after this service was stopped at it. When `record` fails nothing here has changed, and
+    /// its error is returned as it was; when the fence then fails, the readiness guard withholds
+    /// production exactly as [`Self::raise_fence`] does.
+    ///
+    /// # Errors
+    ///
+    /// Returns `record`'s own error, untouched, when it fails. Otherwise returns the fence's
+    /// outcome inside `Ok`: [`ControllerError::RegistryUnavailable`] when the store will not accept
+    /// the request or raise the fence.
+    pub fn raise_fence_recorded<E>(
+        &self,
+        generation: PrivacyGeneration,
+        now_ms: TimestampMs,
+        record: impl FnOnce() -> std::result::Result<(), E>,
+    ) -> std::result::Result<Result<Fenced>, E> {
+        let mut store = self.store();
+        record()?;
+        Ok(
+            match Self::fence_within_store(&mut store, generation, now_ms) {
+                Ok(fenced) => {
+                    self.note_step_succeeded(PrivacyStep::Fence, generation.get());
+                    Ok(fenced)
+                }
+                Err(error) => {
+                    self.note_step_failed(PrivacyStep::Fence, generation.get(), &error);
+                    Err(error)
+                }
+            },
+        )
+    }
+
     fn fence_within_store(
         store: &mut BackupStore,
         generation: PrivacyGeneration,
