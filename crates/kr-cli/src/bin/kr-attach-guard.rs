@@ -141,7 +141,7 @@ fn main() -> ExitCode {
 /// Writes back whatever the terminal had reported, without touching any stack.
 #[cfg(unix)]
 fn give_back_the_keyboard(keyboard: Option<&KeyboardState>) -> bool {
-    let terminal = std::io::stdout();
+    let terminal = kr_cli::output::terminal();
     let mut handle = terminal.lock();
     let sequences = keyboard.copied().unwrap_or(KeyboardState::EMPTY);
     handle.write_all(&sequences.cleanup_sequences()).is_ok() && handle.flush().is_ok()
@@ -150,7 +150,7 @@ fn give_back_the_keyboard(keyboard: Option<&KeyboardState>) -> bool {
 /// Writes back whatever the terminal had reported, without touching any stack.
 #[cfg(not(unix))]
 fn give_back_the_keyboard(keyboard: Option<&KeyboardState>) -> bool {
-    let mut handle = std::io::stdout();
+    let mut handle = kr_cli::output::terminal();
     let sequences = keyboard.copied().unwrap_or(KeyboardState::EMPTY);
     handle.write_all(&sequences.cleanup_sequences()).is_ok() && handle.flush().is_ok()
 }
@@ -164,7 +164,7 @@ fn restore(
 ) -> bool {
     use rustix::termios::OptionalActions;
 
-    let terminal = std::io::stdout();
+    let terminal = kr_cli::output::terminal();
     let Ok(mut modes) = rustix::termios::tcgetattr(&terminal) else {
         return false;
     };

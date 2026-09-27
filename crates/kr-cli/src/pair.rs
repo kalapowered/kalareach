@@ -435,7 +435,7 @@ async fn perform(
 /// Refuses unless this is where a host's first owner may be confirmed: at an interactive
 /// terminal, outside every KalaReach session.
 async fn guard(build_id: &BuildId) -> Result<()> {
-    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+    if !std::io::stdin().is_terminal() || !output::is_terminal() {
         return Err(CliError::NotATerminal);
     }
     for variable in [SESSION_VARIABLE, ATTACHMENT_VARIABLE] {

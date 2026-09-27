@@ -41,9 +41,8 @@ use crate::cli::{
 };
 use crate::daemon::{Daemon, identifier};
 use crate::error::{CliError, Result};
-use crate::output::{self, Asked, Document, Request};
-use crate::report;
-use crate::stdout_line;
+use crate::output::{self, Asked, Document, Line, Request, left};
+use crate::{answer, stdout_line};
 
 /// Runs one `kr plugin` command and prints its result.
 ///
@@ -177,12 +176,12 @@ async fn list(paths: &HostPaths, arguments: &PluginListArguments, json: bool) ->
         )
         .await?;
     if json {
-        report::print_json(&report::answer(&listed)?);
+        output::document(&answer::plugin_list_result(&listed));
     } else if listed.plugins.is_empty() {
-        println!("no plugins installed");
+        output::say(&Shown::said("no plugins installed"));
     } else {
         for plugin in &listed.plugins {
-            println!("{}", line(plugin));
+            output::line(&line(plugin));
         }
     }
     Ok(())
@@ -216,21 +215,24 @@ async fn install(paths: &HostPaths, arguments: &PluginInstallArguments, json: bo
         Err(error) => return Err(error),
     };
     if json {
-        report::print_json(&report::answer(&installed)?);
+        output::document(&answer::plugin_install_result(&installed));
         return Ok(());
     }
-    println!("Installed {}.", line(&installed.plugin));
+    output::line(&stdout_line!("Installed {}.", line(&installed.plugin)));
     for capability in &installed.capabilities {
-        println!(
-            "  {:<32} {:<30} {}",
-            capability.capability.as_str(),
-            report::wire_name(&capability.requirement),
+        output::line(&stdout_line!(
+            "  {} {} {}",
+            left(
+                32,
+                &Asked::text(Request::Plugins, capability.capability.as_str())
+            ),
+            left(30, &crate::shown::wire_word(capability.requirement)),
             if capability.permitted {
                 "permitted"
             } else {
                 "not permitted"
             }
-        );
+        ));
     }
     Ok(())
 }
@@ -261,20 +263,21 @@ async fn remove(paths: &HostPaths, arguments: &PluginArguments, json: bool) -> R
         )
         .await?;
     if json {
-        report::print_json(&report::answer(&removed)?);
+        output::document(&answer::plugin_remove_result(&removed));
     } else {
+        let plugin = Asked::text(Request::Plugins, &removed.plugin_id.to_string());
         match removed.affected_bindings.0 {
-            Some(count) => println!(
+            Some(count) => output::line(&stdout_line!(
                 "Removed {}; {} live binding{} told to end.",
-                removed.plugin_id,
+                plugin,
                 count.get(),
                 if count.get() == 1 { "" } else { "s" }
-            ),
-            None => println!(
+            )),
+            None => output::line(&stdout_line!(
                 "Removed {}; a session has not yet said whether a live binding held it, and any \
                  that did is told to end.",
-                removed.plugin_id
-            ),
+                plugin
+            )),
         }
     }
     Ok(())
@@ -298,9 +301,9 @@ async fn pin(paths: &HostPaths, arguments: &PluginPinArguments, json: bool) -> R
         )
         .await?;
     if json {
-        report::print_json(&report::answer(&pinned)?);
+        output::document(&answer::plugin_pin_result(&pinned));
     } else {
-        println!("{}", line(&pinned.plugin));
+        output::line(&line(&pinned.plugin));
     }
     Ok(())
 }
@@ -328,9 +331,9 @@ async fn enable(
         )
         .await?;
     if json {
-        report::print_json(&report::answer(&changed)?);
+        output::document(&answer::plugin_enable_result(&changed));
     } else {
-        println!("{}", line(&changed.plugin));
+        output::line(&line(&changed.plugin));
     }
     Ok(())
 }
@@ -347,12 +350,12 @@ async fn repo_list(paths: &HostPaths, arguments: &PluginListArguments, json: boo
         )
         .await?;
     if json {
-        report::print_json(&report::answer(&listed)?);
+        output::document(&answer::catalogue_list_result(&listed));
     } else if listed.catalogues.is_empty() {
-        println!("no plugin repositories");
+        output::say(&Shown::said("no plugin repositories"));
     } else {
         for catalogue in &listed.catalogues {
-            println!("{}", repo_line(catalogue));
+            output::line(&repo_line(catalogue));
         }
     }
     Ok(())
@@ -385,14 +388,14 @@ async fn repo_sync(paths: &HostPaths, arguments: &PluginRepoArguments, json: boo
         )
         .await?;
     if json {
-        report::print_json(&report::answer(&synced)?);
+        output::document(&answer::catalogue_sync_result(&synced));
     } else {
-        println!(
+        output::line(&stdout_line!(
             "{} is at generation {}, with {} entries.",
-            arguments.catalogue,
-            synced.generation,
+            Asked::text(Request::Plugins, &arguments.catalogue),
+            output::closed_word(&synced.generation),
             synced.entries.get()
-        );
+        ));
     }
     Ok(())
 }
@@ -414,9 +417,9 @@ async fn repo_pin(paths: &HostPaths, arguments: &PluginRepoPinArguments, json: b
         )
         .await?;
     if json {
-        report::print_json(&report::answer(&pinned)?);
+        output::document(&answer::catalogue_pin_result(&pinned));
     } else {
-        println!("{}", repo_line(&pinned.catalogue));
+        output::line(&repo_line(&pinned.catalogue));
     }
     Ok(())
 }
@@ -434,15 +437,18 @@ async fn repo_remove(paths: &HostPaths, arguments: &PluginRepoArguments, json: b
         )
         .await?;
     if json {
-        report::print_json(&report::answer(&removed)?);
+        output::document(&answer::catalogue_remove_result(&removed));
         return Ok(());
     }
-    println!(
+    output::line(&stdout_line!(
         "Removed {}; its root is no longer trusted.",
-        removed.catalogue_id
-    );
+        Asked::text(Request::Plugins, &removed.catalogue_id)
+    ));
     for plugin in &removed.installed_packages {
-        println!("still installed from it: {plugin}");
+        output::line(&stdout_line!(
+            "still installed from it: {}",
+            Asked::text(Request::Plugins, &plugin.to_string())
+        ));
     }
     Ok(())
 }
@@ -451,8 +457,9 @@ fn plugin_identifier(text: &str) -> Result<PluginId> {
     identifier(text, "a plugin")
 }
 
-/// One installed plugin as a line for a person.
-fn line(plugin: &PluginSummary) -> String {
+/// One installed plugin as a line for a person: its identifier, version and repository are what
+/// the person asked about.
+fn line(plugin: &PluginSummary) -> Line {
     let mut states = vec![if plugin.enabled {
         "enabled"
     } else {
@@ -478,33 +485,34 @@ fn line(plugin: &PluginSummary) -> String {
             }
         }
     }
-    format!(
+    stdout_line!(
         "{} {} from {} ({})",
-        plugin.plugin_id,
-        plugin.version,
-        plugin.catalogue_id,
-        states.join(", ")
+        Asked::text(Request::Plugins, &plugin.plugin_id.to_string()),
+        Asked::text(Request::Plugins, &plugin.version),
+        Asked::text(Request::Plugins, &plugin.catalogue_id),
+        Shown::joined(states.into_iter().map(Shown::said), ", ")
     )
 }
 
-/// One repository as a line for a person.
-fn repo_line(catalogue: &CatalogueSummary) -> String {
+/// One repository as a line for a person: its identifier and its metadata's location, which is
+/// said without user information, a query or a fragment.
+fn repo_line(catalogue: &CatalogueSummary) -> Line {
     let generation = catalogue.generation.as_ref().map_or_else(
-        || "no generation yet".to_owned(),
-        |generation| format!("generation {generation}"),
+        || Shown::said("no generation yet"),
+        |generation| shown!("generation {}", output::closed_word(generation)),
     );
-    let pinned = catalogue
-        .pinned_generation
-        .as_ref()
-        .map_or_else(String::new, |generation| {
-            format!(", pinned at {generation}")
-        });
-    format!(
-        "{}  {}  {generation}{pinned}, {} entries  {}",
-        catalogue.catalogue_id,
-        report::wire_name(&catalogue.kind),
+    let pinned = catalogue.pinned_generation.as_ref().map_or_else(
+        || Shown::said(""),
+        |generation| shown!(", pinned at {}", output::closed_word(generation)),
+    );
+    stdout_line!(
+        "{}  {}  {}{}, {} entries  {}",
+        Asked::text(Request::Plugins, &catalogue.catalogue_id),
+        crate::shown::wire_word(catalogue.kind),
+        generation,
+        pinned,
         catalogue.entries.get(),
-        catalogue.metadata_url
+        Asked::location(Request::Plugins, &catalogue.metadata_url)
     )
 }
 
@@ -536,13 +544,13 @@ mod tests {
             detail: "past package_bytes".to_owned(),
         }));
         assert_eq!(
-            line(&past),
+            line(&past).text(),
             "kalareach/example-declarative 0.1.0 from development (enabled, not admitted: past a \
              package limit)"
         );
         for admission in [Nullable::some(PluginAdmission::Admitted), Nullable::null()] {
             assert_eq!(
-                line(&summary(admission)),
+                line(&summary(admission)).text(),
                 "kalareach/example-declarative 0.1.0 from development (enabled)"
             );
         }

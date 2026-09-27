@@ -31,10 +31,22 @@ pub mod environments;
 pub mod helper;
 pub mod pipe;
 
+use kr_client::shown;
+use kr_client::shown::Shown;
+use kr_protocol::identity::{
+    EnvironmentEnrolment, EnvironmentInventoryRow, EnvironmentRefreshResult,
+};
+
 use crate::cli::BridgeCommand;
 use crate::error::Result;
+use crate::output::{self, Asked, Document, Request, closed};
+use crate::stdout_line;
 
 /// Runs one `kr bridge` operation and writes its result.
+///
+/// An enrolment's label, target, user and helper are what the person recorded, shown to them; what
+/// the host says of a bridge's readiness and of opening one is its sentence, said as its class and
+/// its length.
 ///
 /// # Errors
 ///
@@ -44,76 +56,83 @@ pub async fn print(command: &BridgeCommand, json: bool) -> Result<()> {
         BridgeCommand::List(arguments) => {
             let inventory = environments::list(arguments).await?;
             if json {
-                println!("{}", to_json(&inventory)?);
+                output::document(
+                    &Document::new()
+                        .with("rows", inventory.rows.iter().map(row).collect::<Vec<_>>()),
+                );
             } else {
                 if inventory.rows.is_empty() {
-                    println!("no environments are enrolled");
+                    output::say(&Shown::said("no environments are enrolled"));
                 }
                 for row in &inventory.rows {
-                    println!(
+                    let enrolment = &row.enrolment;
+                    output::line(&stdout_line!(
                         "{}  {}  {}  {}  {}  last seen {} ms  {}",
-                        row.enrolment.label,
-                        row.enrolment.access.as_str(),
-                        row.enrolment.target,
-                        row.enrolment.os_user,
-                        row.enrolment.helper_path,
+                        asked(&enrolment.label),
+                        enrolment.access.as_str(),
+                        asked(&enrolment.target),
+                        asked(&enrolment.os_user),
+                        Asked::path(Request::Bridges, &enrolment.helper_path),
                         row.last_observed_at_ms.get(),
                         environments::presence_text(row.status),
-                    );
-                    println!(
+                    ));
+                    output::say(&shown!(
                         "    {}; {}",
                         environments::observation_text(row.observation),
-                        row.readiness.detail
-                    );
+                        readiness_detail(row)
+                    ));
                 }
             }
         }
         BridgeCommand::Enrol(arguments) => {
             let enrolled = environments::enrol(arguments).await?;
             if json {
-                println!("{}", to_json(&enrolled)?);
+                output::document(&Document::new().with("row", row(&enrolled.row)));
             } else {
-                println!(
+                output::line(&stdout_line!(
                     "enrolled {} as environment {}",
-                    enrolled.row.enrolment.label, enrolled.row.enrolment.environment_id
-                );
+                    asked(&enrolled.row.enrolment.label),
+                    enrolled.row.enrolment.environment_id
+                ));
             }
         }
         BridgeCommand::Forget(arguments) => {
             let removed = environments::forget(arguments).await?;
             if json {
-                println!("{}", to_json(&removed)?);
+                output::document(&Document::new().with("forgotten", removed.forgotten));
             } else if removed.forgotten {
-                println!("forgot {}", arguments.label);
+                output::line(&stdout_line!("forgot {}", asked(&arguments.label)));
             } else {
-                println!("{} was not enrolled", arguments.label);
+                output::line(&stdout_line!(
+                    "{} was not enrolled",
+                    asked(&arguments.label)
+                ));
             }
         }
         BridgeCommand::Refresh(arguments) => {
             let refreshed = environments::refresh(arguments).await?;
             if json {
-                println!("{}", to_json(&refreshed)?);
+                output::document(&refresh(&refreshed));
             } else {
-                println!(
+                output::line(&stdout_line!(
                     "{} is {}{}",
-                    refreshed.row.enrolment.label,
+                    asked(&refreshed.row.enrolment.label),
                     environments::presence_text(refreshed.row.status),
                     if refreshed.started {
                         ", started by this refresh"
                     } else {
                         ""
                     }
-                );
-                // What opening the bridge did, whether it answered or not. A person reading this
-                // after a failure has the program, the environment or the refusal in front of them.
-                println!("    {}", refreshed.connection);
+                ));
+                // What opening the bridge did, whether it answered or not, as the host's sentence.
+                output::say(&shown!("    {}", connection(&refreshed)));
                 if let Some(verification) = refreshed.verification.as_ref() {
-                    println!(
+                    output::say(&shown!(
                         "    speaks protocol {}.{}, carries frames to {} bytes",
                         verification.protocol_version.major,
                         verification.protocol_version.minor,
                         verification.max_frame_len.get()
-                    );
+                    ));
                 }
             }
         }
@@ -121,12 +140,78 @@ pub async fn print(command: &BridgeCommand, json: bool) -> Result<()> {
     Ok(())
 }
 
-/// Renders one result as the machine-readable form.
-fn to_json<T: serde::Serialize>(value: &T) -> Result<String> {
-    serde_json::to_string_pretty(value).map_err(|error| {
-        crate::error::CliError::Other(kr_client::shown!(
-            "the result could not be written: {}",
-            kr_client::shown::Shown::json(&error)
-        ))
-    })
+/// What an enrolment holds, which its owner recorded.
+fn asked(text: &str) -> Asked {
+    Asked::text(Request::Bridges, text)
+}
+
+/// What the host says of a bridge's readiness, as its class and its length.
+fn readiness_detail(row: &EnvironmentInventoryRow) -> Shown {
+    crate::shown::exported("EnvironmentReadiness", "detail", &row.readiness.detail)
+}
+
+/// What the host says opening a bridge did, as its class and its length.
+fn connection(refreshed: &EnvironmentRefreshResult) -> Shown {
+    crate::shown::exported(
+        "EnvironmentRefreshResult",
+        "connection",
+        &refreshed.connection,
+    )
+}
+
+/// An enrolment, in the shape the protocol answers it.
+fn enrolment(enrolment: &EnvironmentEnrolment) -> Document {
+    Document::new()
+        .with("environment_id", closed(&enrolment.environment_id))
+        .with("access", closed(&enrolment.access))
+        .with("label", asked(&enrolment.label))
+        .with("target", asked(&enrolment.target))
+        .with("os_user", asked(&enrolment.os_user))
+        .with(
+            "helper_path",
+            Asked::path(Request::Bridges, &enrolment.helper_path),
+        )
+        .with(
+            "clipboard_destination",
+            enrolment
+                .clipboard_destination
+                .as_ref()
+                .map(|destination| asked(destination)),
+        )
+        .with("approved_at_ms", closed(&enrolment.approved_at_ms))
+}
+
+/// A row of the inventory, in the shape the protocol answers it.
+fn row(row: &EnvironmentInventoryRow) -> Document {
+    Document::new()
+        .with("enrolment", enrolment(&row.enrolment))
+        .with("last_observed_at_ms", closed(&row.last_observed_at_ms))
+        .with("status", closed(&row.status))
+        .with("observation", closed(&row.observation))
+        .with(
+            "readiness",
+            Document::new()
+                .with("helper_enrolled", row.readiness.helper_enrolled)
+                .with("channel_scoped", row.readiness.channel_scoped)
+                .with("detail", readiness_detail(row)),
+        )
+}
+
+/// A refresh, in the shape the protocol answers it.
+fn refresh(refreshed: &EnvironmentRefreshResult) -> Document {
+    Document::new()
+        .with("row", row(&refreshed.row))
+        .with("started", refreshed.started)
+        .with(
+            "verification",
+            refreshed.verification.as_ref().map(|verification| {
+                Document::new()
+                    .with("environment_id", closed(&verification.environment_id))
+                    .with("os_user", asked(&verification.os_user))
+                    .with("role", closed(&verification.role))
+                    .with("protocol_version", closed(&verification.protocol_version))
+                    .with("max_frame_len", closed(&verification.max_frame_len))
+            }),
+        )
+        .with("connection", connection(refreshed))
 }

@@ -599,6 +599,12 @@ pub fn build_identity(text: &str) -> Shown {
     )
 }
 
+/// A 32-bit number in eight hexadecimal digits, as a result code is written.
+#[must_use]
+pub fn hexadecimal_word(value: u32) -> Shown {
+    shown!("{}", Checked(format!("{value:08x}")))
+}
+
 /// What a socket address says, in the form it parses to, when the text is one.
 #[must_use]
 pub fn socket_address(text: &str) -> Option<Shown> {
@@ -624,6 +630,18 @@ pub fn host_name(text: &str) -> Option<Shown> {
                     .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
         });
     named.then(|| shown!("{}", Checked(text.to_owned())))
+}
+
+/// Returns the text of a value the writer holds closed ([`crate::output::Closed`]): a protocol value
+/// whose every leaf is a closed word, an identifier, a digest or a number by its type, said as the
+/// protocol encodes it: its one string, or its JSON text when it is not one string.
+#[must_use]
+pub fn closed_text(value: &impl crate::output::Closed) -> Shown {
+    let text = match serde_json::to_value(value).unwrap_or(serde_json::Value::Null) {
+        serde_json::Value::String(text) => text,
+        other => other.to_string(),
+    };
+    shown!("{}", Withheld(text))
 }
 
 /// Returns the name a value of a closed set has in this build's source, as its derived `Debug`

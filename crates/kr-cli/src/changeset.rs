@@ -22,7 +22,8 @@ use crate::cli::{
 };
 use crate::daemon::{Daemon, identifier};
 use crate::error::Result;
-use crate::report;
+use crate::output::{self, Asked, Line, Request, left, right};
+use crate::{answer, stdout_line};
 
 /// Runs one `kr changeset` command and prints its result.
 ///
@@ -78,13 +79,16 @@ async fn capture(
         )
         .await?;
     if json {
-        report::print_json(&report::answer(&captured)?);
+        output::document(&answer::changeset_capture_result(&captured));
     } else {
-        println!("Captured {}.", version_line(&captured.version));
+        output::line(&stdout_line!(
+            "Captured {}.",
+            version_words(&captured.version)
+        ));
         if captured.pinned {
-            println!("It is pinned against its workspace.");
+            output::line(&stdout_line!("It is pinned against its workspace."));
         }
-        print!("{}", details(&captured.version));
+        output::lines(&details(&captured.version));
     }
     Ok(())
 }
@@ -106,34 +110,34 @@ async fn read(paths: &HostPaths, arguments: &ChangesetReadArguments, json: bool)
         )
         .await?;
     if json {
-        report::print_json(&report::answer(&read)?);
+        output::document(&answer::changeset_read_result(&read));
         return Ok(());
     }
-    println!("{}", version_line(&read.version));
-    print!("{}", details(&read.version));
-    println!("versions:");
+    output::line(&version_words(&read.version));
+    output::lines(&details(&read.version));
+    output::line(&stdout_line!("versions:"));
     for version in &read.versions {
-        println!(
-            "  {:>3}  {:<16} base {}",
-            version.version.get(),
-            version.consistency.as_str(),
-            version.base_revision
-        );
+        output::line(&stdout_line!(
+            "  {}  {} base {}",
+            right(3, &version.version.get()),
+            left(16, &version.consistency.as_str()),
+            crate::shown::git_revision(&version.base_revision)
+        ));
     }
     for materialisation in &read.materialisations {
-        println!(
+        output::line(&stdout_line!(
             "materialised {} ({}) at {}",
-            materialisation.materialisation_id,
-            report::wire_name(&materialisation.purpose),
-            materialisation.directory_path
-        );
+            output::closed_word(&materialisation.materialisation_id),
+            crate::shown::wire_word(materialisation.purpose),
+            Asked::path(Request::Changesets, &materialisation.directory_path)
+        ));
     }
     for evidence in &read.evidence {
-        println!(
+        output::line(&stdout_line!(
             "evidence: {} {}",
-            report::wire_name(&evidence.kind),
-            evidence.detail
-        );
+            crate::shown::wire_word(evidence.kind),
+            crate::shown::exported("EvidenceReference", "detail", &evidence.detail)
+        ));
     }
     Ok(())
 }
@@ -157,28 +161,34 @@ async fn materialize(
                 label: arguments
                     .label
                     .clone()
-                    .unwrap_or_else(|| report::wire_name(&purpose)),
+                    .unwrap_or_else(|| crate::shown::wire_word(purpose).into_string()),
             },
         )
         .await?;
     if json {
-        report::print_json(&report::answer(&materialised)?);
+        output::document(&answer::changeset_materialize_result(&materialised));
         return Ok(());
     }
     let record = &materialised.materialisation;
-    println!(
+    output::line(&stdout_line!(
         "Materialised version {} of change set {} as {} at {}: {} paths written.",
         record.version.version.get(),
-        record.version.change_set_id,
-        record.materialisation_id,
-        record.directory_path,
+        output::closed_word(&record.version.change_set_id),
+        output::closed_word(&record.materialisation_id),
+        Asked::path(Request::Changesets, &record.directory_path),
         record.paths_written.get()
-    );
+    ));
     for path in &record.unapplied {
-        println!("not written: {path}");
+        output::line(&stdout_line!(
+            "not written: {}",
+            Asked::path(Request::Changesets, path)
+        ));
     }
     for limitation in &materialised.limitations {
-        println!("note: {limitation}");
+        output::line(&stdout_line!(
+            "note: {}",
+            crate::shown::exported("ChangesetMaterializeResult", "limitations", limitation)
+        ));
     }
     Ok(())
 }
@@ -208,51 +218,55 @@ const fn purpose(argument: PurposeArgument) -> MaterialisationPurpose {
     }
 }
 
-/// One version as a line for a person.
-fn version_line(version: &ChangeSetVersionRecord) -> String {
-    format!(
+/// One version as a line for a person: its label is what they gave it.
+fn version_words(version: &ChangeSetVersionRecord) -> Line {
+    stdout_line!(
         "version {} of change set {} ({}), {}",
         version.version.get(),
-        version.change_set_id,
-        version.label,
+        output::closed_word(&version.change_set_id),
+        Asked::text(Request::Changesets, &version.label),
         version.consistency.as_str()
     )
 }
 
-/// What one version holds, as lines for a person: its counts, its changes and what the host says
-/// it cannot promise.
-fn details(version: &ChangeSetVersionRecord) -> String {
+/// What one version holds, as lines for a person: its counts, its changes and, as their class and
+/// length, what the host says it cannot promise.
+fn details(version: &ChangeSetVersionRecord) -> Vec<Line> {
     let paths = version.summary.total_paths.get();
-    let mut text = format!(
-        "  base {}, {paths} path{}, {} bytes, {} changed\n",
-        version.base_revision,
+    let mut lines = vec![stdout_line!(
+        "  base {}, {} path{}, {} bytes, {} changed",
+        crate::shown::git_revision(&version.base_revision),
+        paths,
         if paths == 1 { "" } else { "s" },
         version.summary.total_bytes.get(),
         version.changes.len() as u64 + version.omitted_changes.get()
-    );
+    )];
     for change in &version.changes {
-        text.push_str(&format!(
-            "  {:<16} {:<8} {}\n",
-            change.class.as_str(),
-            report::wire_name(&change.change),
-            change.path
+        lines.push(stdout_line!(
+            "  {} {} {}",
+            left(16, &change.class.as_str()),
+            left(8, &crate::shown::wire_word(change.change)),
+            Asked::path(Request::Changesets, &change.path)
         ));
     }
     if version.omitted_changes.get() > 0 {
-        text.push_str(&format!(
-            "  and {} more changes\n",
+        lines.push(stdout_line!(
+            "  and {} more changes",
             version.omitted_changes.get()
         ));
     }
     for exclusion in &version.exclusions {
-        text.push_str(&format!(
-            "  left out: {} ({})\n",
-            exclusion.path,
+        lines.push(stdout_line!(
+            "  left out: {} ({})",
+            Asked::path(Request::Changesets, &exclusion.path),
             exclusion.reason.as_str()
         ));
     }
     for limitation in &version.limitations {
-        text.push_str(&format!("  note: {limitation}\n"));
+        lines.push(stdout_line!(
+            "  note: {}",
+            crate::shown::exported("ChangeSetVersionRecord", "limitations", limitation)
+        ));
     }
-    text
+    lines
 }

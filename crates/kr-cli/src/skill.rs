@@ -17,9 +17,10 @@ use kr_protocol::skill::{
     AgentTarget, AgentToolsInstallResult, AgentToolsParams, AgentToolsRemoveResult,
     AgentToolsStatusResult, ChangeManifest, ChangeOperation, InstallScope, InstalledFile,
 };
-use serde_json::{Value, json};
 
 use crate::error::{CliError, Result};
+use crate::output::{Asked, Document, Line, Request, left};
+use crate::stdout_line;
 
 /// Reads the agent, the scope and the project directory a command named.
 ///
@@ -95,184 +96,251 @@ pub async fn remove(
     mutate(client, environment_id, Method::AgentToolsRemove, params).await
 }
 
+/// What the skill's installation holds, which is the agent's files and configuration the person
+/// asked about.
+fn asked(text: &str) -> Asked {
+    Asked::text(Request::AgentFiles, text)
+}
+
+/// A path of the skill's installation.
+fn asked_path(path: &str) -> Asked {
+    Asked::path(Request::AgentFiles, path)
+}
+
 /// Renders an installation for a script.
 #[must_use]
-pub fn installed(result: &AgentToolsInstallResult) -> Value {
-    json!({
-        "agent": result.manifest.agent.as_str(),
-        "scope": result.manifest.scope.as_str(),
-        "root": result.manifest.root,
-        "skill_version": result.manifest.skill_version,
-        "entry_point": result.manifest.entry_point,
-        "already_installed": result.already_installed,
-        "finished": result.unresolved.is_empty(),
-        "unresolved": result.unresolved,
-        "operations": result.manifest.operations.iter().map(operation).collect::<Vec<_>>(),
-    })
+pub fn installed(result: &AgentToolsInstallResult) -> Document {
+    Document::new()
+        .with("agent", result.manifest.agent.as_str())
+        .with("scope", result.manifest.scope.as_str())
+        .with("root", asked_path(&result.manifest.root))
+        .with("skill_version", asked(&result.manifest.skill_version))
+        .with(
+            "entry_point",
+            result
+                .manifest
+                .entry_point
+                .iter()
+                .map(|part| asked(part))
+                .collect::<Vec<_>>(),
+        )
+        .with("already_installed", result.already_installed)
+        .with("finished", result.unresolved.is_empty())
+        .with(
+            "unresolved",
+            result
+                .unresolved
+                .iter()
+                .map(|note| asked_path(note))
+                .collect::<Vec<_>>(),
+        )
+        .with(
+            "operations",
+            result
+                .manifest
+                .operations
+                .iter()
+                .map(operation)
+                .collect::<Vec<_>>(),
+        )
 }
 
 /// Renders an installation's state for a script.
 #[must_use]
-pub fn reported(result: &AgentToolsStatusResult) -> Value {
-    json!({
-        "agent": result.agent.as_str(),
-        "scope": result.scope.as_str(),
-        "root": result.root,
-        "installed": result.installed,
-        "skill_version": result.skill_version.as_ref().cloned(),
-        "files": result.files.iter().map(|file| json!({
-            "path": file.path,
-            "intact": file.is_intact(),
-        })).collect::<Vec<_>>(),
-        "drift": result.drift,
-        "removal": result.removal.iter().map(operation).collect::<Vec<_>>(),
-    })
+pub fn reported(result: &AgentToolsStatusResult) -> Document {
+    Document::new()
+        .with("agent", result.agent.as_str())
+        .with("scope", result.scope.as_str())
+        .with("root", asked_path(&result.root))
+        .with("installed", result.installed)
+        .with(
+            "skill_version",
+            result.skill_version.as_ref().map(|version| asked(version)),
+        )
+        .with(
+            "files",
+            result
+                .files
+                .iter()
+                .map(|file| {
+                    Document::new()
+                        .with("path", asked_path(&file.path))
+                        .with("intact", file.is_intact())
+                })
+                .collect::<Vec<_>>(),
+        )
+        .with(
+            "drift",
+            result
+                .drift
+                .iter()
+                .map(|note| asked(note))
+                .collect::<Vec<_>>(),
+        )
+        .with(
+            "removal",
+            result.removal.iter().map(operation).collect::<Vec<_>>(),
+        )
 }
 
 /// Renders a removal for a script.
 #[must_use]
-pub fn removed(result: &AgentToolsRemoveResult) -> Value {
-    json!({
-        "agent": result.agent.as_str(),
-        "scope": result.scope.as_str(),
-        "removed": result.removed.iter().map(operation).collect::<Vec<_>>(),
-        "retained": result.retained,
-    })
+pub fn removed(result: &AgentToolsRemoveResult) -> Document {
+    Document::new()
+        .with("agent", result.agent.as_str())
+        .with("scope", result.scope.as_str())
+        .with(
+            "removed",
+            result.removed.iter().map(operation).collect::<Vec<_>>(),
+        )
+        .with(
+            "retained",
+            result
+                .retained
+                .iter()
+                .map(|note| asked_path(note))
+                .collect::<Vec<_>>(),
+        )
 }
 
 /// Renders an installation as lines for a person.
 #[must_use]
-pub fn install_lines(result: &AgentToolsInstallResult) -> String {
-    let mut text = String::new();
-    if result.already_installed {
-        text.push_str(&format!(
-            "{} {} is already installed for {} at {} scope\n",
+pub fn install_lines(result: &AgentToolsInstallResult) -> Vec<Line> {
+    let manifest = &result.manifest;
+    let mut lines = vec![if result.already_installed {
+        stdout_line!(
+            "{} {} is already installed for {} at {} scope",
             kr_protocol::skill::SKILL_NAME,
-            result.manifest.skill_version,
-            result.manifest.agent,
-            result.manifest.scope
-        ));
+            asked(&manifest.skill_version),
+            manifest.agent.as_str(),
+            manifest.scope.as_str()
+        )
     } else {
-        text.push_str(&format!(
-            "installed {} {} for {} at {} scope\n",
+        stdout_line!(
+            "installed {} {} for {} at {} scope",
             kr_protocol::skill::SKILL_NAME,
-            result.manifest.skill_version,
-            result.manifest.agent,
-            result.manifest.scope
-        ));
-    }
-    text.push_str(&format!(
-        "tool server  {}\n",
-        result.manifest.entry_point.join(" ")
+            asked(&manifest.skill_version),
+            manifest.agent.as_str(),
+            manifest.scope.as_str()
+        )
+    }];
+    lines.push(stdout_line!(
+        "tool server  {}",
+        asked(&manifest.entry_point.join(" "))
     ));
-    text.push_str(&manifest_lines(&result.manifest));
+    lines.extend(manifest_lines(manifest));
     for note in &result.unresolved {
-        text.push_str(&format!("  unresolved {note}\n"));
+        lines.push(stdout_line!("  unresolved {}", asked_path(note)));
     }
     if !result.unresolved.is_empty() {
-        text.push_str("this installation is not finished while anything above is unresolved\n");
+        lines.push(stdout_line!(
+            "this installation is not finished while anything above is unresolved"
+        ));
     }
-    text
+    lines
 }
 
 /// Renders the change manifest as lines for a person.
 #[must_use]
-pub fn manifest_lines(manifest: &ChangeManifest) -> String {
-    let mut text = String::new();
-    for change in &manifest.operations {
-        text.push_str(&format!("  {}\n", describe(change)));
-    }
-    text
+pub fn manifest_lines(manifest: &ChangeManifest) -> Vec<Line> {
+    manifest
+        .operations
+        .iter()
+        .map(|change| stdout_line!("  {}", describe(change)))
+        .collect()
 }
 
 /// Renders an installation's state as lines for a person.
 #[must_use]
-pub fn status_lines(result: &AgentToolsStatusResult) -> String {
+pub fn status_lines(result: &AgentToolsStatusResult) -> Vec<Line> {
     if !result.installed {
-        let mut text = format!(
-            "{} is not installed for {} at {} scope\n",
+        let mut lines = vec![stdout_line!(
+            "{} is not installed for {} at {} scope",
             kr_protocol::skill::SKILL_NAME,
-            result.agent,
-            result.scope
-        );
+            result.agent.as_str(),
+            result.scope.as_str()
+        )];
         // What this host knows about the place it is not installed in. An installation that began
         // and did not finish says so here, and so does every change it may have left behind.
         for note in &result.drift {
-            text.push_str(&format!("  {note}\n"));
+            lines.push(stdout_line!("  {}", asked(note)));
         }
-        return text;
+        return lines;
     }
-    let mut text = format!(
-        "{} {} is installed for {} at {} scope in {}\n",
+    let mut lines = vec![stdout_line!(
+        "{} {} is installed for {} at {} scope in {}",
         kr_protocol::skill::SKILL_NAME,
         result
             .skill_version
             .as_ref()
-            .map_or("an unknown version", String::as_str),
-        result.agent,
-        result.scope,
-        result.root
-    );
+            .map_or_else(|| asked("an unknown version"), |version| asked(version)),
+        result.agent.as_str(),
+        result.scope.as_str(),
+        asked_path(&result.root)
+    )];
     for file in &result.files {
-        text.push_str(&format!(
-            "  {:<9} {}\n",
-            if file.is_intact() {
-                "intact"
-            } else {
-                "changed"
-            },
-            file.path
+        lines.push(stdout_line!(
+            "  {} {}",
+            left(
+                9,
+                &if file.is_intact() {
+                    "intact"
+                } else {
+                    "changed"
+                }
+            ),
+            asked_path(&file.path)
         ));
     }
     for note in &result.drift {
-        text.push_str(&format!("  changed   {note}\n"));
+        lines.push(stdout_line!("  changed   {}", asked(note)));
     }
-    text
+    lines
 }
 
 /// Renders a removal as lines for a person.
 #[must_use]
-pub fn remove_lines(result: &AgentToolsRemoveResult) -> String {
-    let mut text = format!(
-        "removed {} for {} at {} scope\n",
+pub fn remove_lines(result: &AgentToolsRemoveResult) -> Vec<Line> {
+    let mut lines = vec![stdout_line!(
+        "removed {} for {} at {} scope",
         kr_protocol::skill::SKILL_NAME,
-        result.agent,
-        result.scope
-    );
+        result.agent.as_str(),
+        result.scope.as_str()
+    )];
     for change in &result.removed {
-        text.push_str(&format!("  undone    {}\n", describe(change)));
+        lines.push(stdout_line!("  undone    {}", describe(change)));
     }
     for note in &result.retained {
-        text.push_str(&format!("  kept      {note}\n"));
+        lines.push(stdout_line!("  kept      {}", asked_path(note)));
     }
-    text
+    lines
 }
 
-fn describe(change: &ChangeOperation) -> String {
-    match change {
-        ChangeOperation::CreateDirectory { path } => format!("directory {path}"),
-        ChangeOperation::WriteFile { path, .. } => format!("file      {path}"),
-        ChangeOperation::AddConfigurationEntry { path, entry, .. } => {
-            format!("entry     {entry} in {path}")
-        }
-    }
-}
-
-fn operation(change: &ChangeOperation) -> Value {
+fn describe(change: &ChangeOperation) -> Line {
     match change {
         ChangeOperation::CreateDirectory { path } => {
-            json!({"operation": "create_directory", "path": path})
+            stdout_line!("directory {}", asked_path(path))
         }
-        ChangeOperation::WriteFile { path, digest, .. } => json!({
-            "operation": "write_file",
-            "path": path,
-            "sha256": hex(digest.as_bytes()),
-        }),
-        ChangeOperation::AddConfigurationEntry { path, entry, .. } => json!({
-            "operation": "add_configuration_entry",
-            "path": path,
-            "entry": entry,
-        }),
+        ChangeOperation::WriteFile { path, .. } => stdout_line!("file      {}", asked_path(path)),
+        ChangeOperation::AddConfigurationEntry { path, entry, .. } => {
+            stdout_line!("entry     {} in {}", asked(entry), asked_path(path))
+        }
+    }
+}
+
+fn operation(change: &ChangeOperation) -> Document {
+    match change {
+        ChangeOperation::CreateDirectory { path } => Document::new()
+            .with("operation", "create_directory")
+            .with("path", asked_path(path)),
+        ChangeOperation::WriteFile { path, digest, .. } => Document::new()
+            .with("operation", "write_file")
+            .with("path", asked_path(path))
+            .with("sha256", crate::shown::hex_digest(&hex(digest.as_bytes()))),
+        ChangeOperation::AddConfigurationEntry { path, entry, .. } => Document::new()
+            .with("operation", "add_configuration_entry")
+            .with("path", asked_path(path))
+            .with("entry", asked(entry)),
     }
 }
 

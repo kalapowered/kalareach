@@ -18,9 +18,10 @@ use kr_shell_integration::host::package::{
     PACKAGE_ROOT_VARIABLE, PackageSet, ShellPackage, default_package_root,
 };
 use kr_shell_integration::host::startup::{self, Change, EntryRecord, HomeLayout, RecordError};
-use serde_json::{Value, json};
 
 use crate::error::{CliError, Result};
+use crate::output::{self, Asked, Document, Request};
+use crate::stdout_line;
 
 /// What one shell's integration is, as `kr shell status` reports it.
 #[derive(Clone, PartialEq, Eq)]
@@ -373,79 +374,111 @@ fn record_failure(record: &EntryRecord, error: &RecordError) -> CliError {
     }
 }
 
-/// Renders one report for a script.
+/// Renders one report for a script: the files and what the package resolved to are the shell's own,
+/// shown to the person who asked about it.
 #[must_use]
-pub fn to_json(reports: &[ShellReport]) -> Value {
-    json!({
-        "ok": true,
-        "package_root_variable": PACKAGE_ROOT_VARIABLE,
-        "shells": reports
-            .iter()
-            .map(|report| json!({
-                "shell": report.kind.as_str(),
-                // Null rather than empty where no package was resolved: a reader can tell "this
-                // operation did not ask" from "the package says nothing".
-                "executable": report.package.as_ref().map(|package| package.executable.clone()),
-                "flags": report.package.as_ref().map(|package| package.flags.clone()),
-                "version": report.package.as_ref().map(|package| package.version.clone()),
-                "editor_abi": report.package.as_ref().map(|package| package.editor_abi.clone()),
-                "integration_version": report
-                    .package
-                    .as_ref()
-                    .map(|package| package.integration_version.clone()),
-                "integration_mode": report.package.as_ref().map(|_| "managed"),
-                "entries": report
-                    .entries
-                    .iter()
-                    .map(|entry| json!({
-                        "path": entry.path,
-                        "reason": entry.reason,
-                        "installed": entry.installed,
-                        "change": entry.change.map(change_name),
-                    }))
-                    .collect::<Vec<_>>(),
-            }))
-            .collect::<Vec<_>>(),
-    })
+pub fn document(reports: &[ShellReport]) -> Document {
+    let asked = |text: &str| Asked::text(Request::ShellFiles, text);
+    Document::new()
+        .with("ok", true)
+        .with("package_root_variable", PACKAGE_ROOT_VARIABLE)
+        .with(
+            "shells",
+            reports
+                .iter()
+                .map(|report| {
+                    let package = report.package.as_ref();
+                    Document::new()
+                        .with("shell", report.kind.as_str())
+                        // Null rather than empty where no package was resolved: a reader can tell
+                        // "this operation did not ask" from "the package says nothing".
+                        .with(
+                            "executable",
+                            package.map(|package| {
+                                Asked::path(Request::ShellFiles, &package.executable)
+                            }),
+                        )
+                        .with(
+                            "flags",
+                            package.map(|package| {
+                                package
+                                    .flags
+                                    .iter()
+                                    .map(|flag| asked(flag))
+                                    .collect::<Vec<_>>()
+                            }),
+                        )
+                        .with("version", package.map(|package| asked(&package.version)))
+                        .with(
+                            "editor_abi",
+                            package.map(|package| asked(&package.editor_abi)),
+                        )
+                        .with(
+                            "integration_version",
+                            package.map(|package| asked(&package.integration_version)),
+                        )
+                        .with("integration_mode", package.map(|_| "managed"))
+                        .with(
+                            "entries",
+                            report
+                                .entries
+                                .iter()
+                                .map(|entry| {
+                                    Document::new()
+                                        .with("path", Asked::path(Request::ShellFiles, &entry.path))
+                                        .with("reason", entry.reason)
+                                        .with("installed", entry.installed)
+                                        .with("change", entry.change.map(change_name))
+                                })
+                                .collect::<Vec<_>>(),
+                        )
+                })
+                .collect::<Vec<_>>(),
+        )
 }
 
 /// Prints one report for a person.
 pub fn print(reports: &[ShellReport]) {
     if reports.is_empty() {
-        println!(
-            "no qualified shell packages are installed; set {PACKAGE_ROOT_VARIABLE} to a directory that holds one"
-        );
+        output::say(&shown!(
+            "no qualified shell packages are installed; set {} to a directory that holds one",
+            PACKAGE_ROOT_VARIABLE
+        ));
         return;
     }
+    let asked = |text: &str| Asked::text(Request::ShellFiles, text);
     for report in reports {
         match &report.package {
-            Some(package) => println!(
+            Some(package) => output::line(&stdout_line!(
                 "{} {}: {} ({}), editor ABI {}, integration {}, mode managed",
-                report.kind,
-                package.version,
-                package.executable,
+                report.kind.as_str(),
+                asked(&package.version),
+                Asked::path(Request::ShellFiles, &package.executable),
                 if package.flags.is_empty() {
-                    "no flags".to_owned()
+                    asked("no flags")
                 } else {
-                    package.flags.join(" ")
+                    asked(&package.flags.join(" "))
                 },
-                package.editor_abi,
-                package.integration_version,
-            ),
-            None => println!("{}", report.kind),
+                asked(&package.editor_abi),
+                asked(&package.integration_version),
+            )),
+            None => output::say(&Shown::said(report.kind.as_str())),
         }
         for entry in &report.entries {
-            let state = entry.change.map_or_else(
-                || {
-                    if entry.installed {
-                        "installed".to_owned()
-                    } else {
-                        "not installed".to_owned()
-                    }
+            let state = entry.change.map_or(
+                if entry.installed {
+                    "installed"
+                } else {
+                    "not installed"
                 },
-                |change| change_name(change).to_owned(),
+                change_name,
             );
-            println!("  {}: {state} ({})", entry.path, entry.reason);
+            output::line(&stdout_line!(
+                "  {}: {} ({})",
+                Asked::path(Request::ShellFiles, &entry.path),
+                state,
+                entry.reason
+            ));
         }
     }
 }

@@ -32,7 +32,8 @@ use crate::cli::{
 };
 use crate::daemon::{Daemon, identifier};
 use crate::error::{CliError, Result};
-use crate::report;
+use crate::output::{self, Asked, Document, Line, Request, left, right};
+use crate::{answer, stdout_line};
 
 /// Runs one `kr project` command and prints its result.
 ///
@@ -60,12 +61,12 @@ async fn list(paths: &HostPaths, arguments: &ProjectListArguments, json: bool) -
         )
         .await?;
     if json {
-        report::print_json(&report::answer(&listed)?);
+        output::document(&answer::project_list_result(&listed));
     } else if listed.projects.is_empty() {
-        println!("no repositories");
+        output::say(&Shown::said("no repositories"));
     } else {
         for project in &listed.projects {
-            println!("{}", line(project));
+            output::line(&line(project));
         }
     }
     Ok(())
@@ -89,7 +90,12 @@ async fn init(paths: &HostPaths, arguments: &ProjectInitArguments, json: bool) -
             },
         )
         .await?;
-    report_created("Initialised", &created.project, &created, json)
+    report_created(
+        "Initialised",
+        &created.project,
+        answer::project_init_result(&created),
+        json,
+    )
 }
 
 /// `kr project clone`.
@@ -108,7 +114,12 @@ async fn clone(paths: &HostPaths, arguments: &ProjectCloneArguments, json: bool)
             },
         )
         .await?;
-    report_created("Cloned", &cloned.project, &cloned, json)
+    report_created(
+        "Cloned",
+        &cloned.project,
+        answer::project_clone_result(&cloned),
+        json,
+    )
 }
 
 /// `kr project adopt`.
@@ -127,7 +138,12 @@ async fn adopt(paths: &HostPaths, arguments: &ProjectAdoptArguments, json: bool)
             },
         )
         .await?;
-    report_created("Adopted", &adopted.project, &adopted, json)
+    report_created(
+        "Adopted",
+        &adopted.project,
+        answer::project_adopt_result(&adopted),
+        json,
+    )
 }
 
 /// Names a directory the way the project service takes one: the directory it is in, which the
@@ -240,39 +256,40 @@ fn transport_of(text: &str) -> Result<RemoteTransport> {
     )))
 }
 
-/// Prints what a creation made.
-fn report_created<T: serde::Serialize>(
-    verb: &str,
+/// Prints what a creation made: `document` for a script, and for a person the repository's label
+/// and path, which are what they asked this host to hold.
+fn report_created(
+    verb: &'static str,
     project: &ProjectSummary,
-    answer: &T,
+    document: Document,
     json: bool,
 ) -> Result<()> {
     if json {
-        report::print_json(&report::answer(answer)?);
+        output::document(&document);
     } else {
-        println!(
-            "{verb} {} as repository {} at {}.",
-            project.label, project.project_repository_id, project.display_path
-        );
+        output::line(&stdout_line!(
+            "{} {} as repository {} at {}.",
+            verb,
+            Asked::text(Request::Repositories, &project.label),
+            output::closed_word(&project.project_repository_id),
+            Asked::path(Request::Repositories, &project.display_path)
+        ));
     }
     Ok(())
 }
 
 /// One repository as a line for a person.
-fn line(project: &ProjectSummary) -> String {
-    format!(
-        "{}  {:<8} {:<11} {:>2} workspace{}  {}  {}",
-        project.project_repository_id,
-        report::wire_name(&project.state),
-        report::wire_name(&project.origin),
-        project.workspace_count.get(),
-        if project.workspace_count.get() == 1 {
-            ""
-        } else {
-            "s"
-        },
-        project.label,
-        project.display_path,
+fn line(project: &ProjectSummary) -> Line {
+    let count = project.workspace_count.get();
+    stdout_line!(
+        "{}  {} {} {} workspace{}  {}  {}",
+        output::closed_word(&project.project_repository_id),
+        left(8, &crate::shown::wire_word(project.state)),
+        left(11, &crate::shown::wire_word(project.origin)),
+        right(2, &count),
+        if count == 1 { "" } else { "s" },
+        Asked::text(Request::Repositories, &project.label),
+        Asked::path(Request::Repositories, &project.display_path),
     )
 }
 

@@ -30,21 +30,21 @@ use kr_client::services::voice::{
 use kr_ipc::paths::HostPaths;
 
 use crate::error::{CliError, Result};
+use crate::output::Document;
 use crate::shown::named;
 
 /// What an import did, for a person and for `--json`.
-#[derive(Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Imported {
     /// Where the token was written.
-    pub path: String,
-    /// The origin it belongs to, as a diagnostic names one: the scheme, the host and the port.
-    pub origin: String,
+    pub path: PathBuf,
+    /// The origin it belongs to, as a diagnostic names one.
+    pub origin: Shown,
     /// The scopes it carries that this build knows, by name.
     pub scopes: Vec<&'static str>,
-    /// How many scopes it carries that this build does not know. They are counted, not repeated:
-    /// a scope is whatever the file said.
+    /// How many scopes it carries that this build does not know.
     pub unknown_scopes: usize,
-    /// When it stops being accepted, in UTC milliseconds, or null when the issuer did not say.
+    /// When the service stops accepting it, in UTC milliseconds.
     pub expires_at_ms: Option<u64>,
     /// True when it carries the scope managed voice needs.
     pub carries_voice_scope: bool,
@@ -63,26 +63,44 @@ impl Imported {
     /// Deliberately free of anything derived from the token. A length or a digest would be one
     /// more thing that leaks a little about a secret, for no benefit an operator has asked for.
     #[must_use]
-    pub fn lines(&self) -> Vec<String> {
+    pub fn lines(&self) -> Vec<Shown> {
         let mut lines = vec![
-            format!("Wrote the account token to {}.", self.path),
-            format!("It belongs to {}.", self.origin),
+            shown!(
+                "Wrote the account token to {}.",
+                Shown::host_path(&self.path)
+            ),
+            shown!("It belongs to {}.", self.origin.clone()),
         ];
-        lines.push(format!(
+        lines.push(shown!(
             "It carries {}.",
             scope_words(&self.scopes, self.unknown_scopes)
         ));
         if let Some(expires_at_ms) = self.expires_at_ms {
-            lines.push(format!(
-                "It stops being accepted at {expires_at_ms} in UTC milliseconds."
+            lines.push(shown!(
+                "It stops being accepted at {} in UTC milliseconds.",
+                expires_at_ms
             ));
         }
         if !self.carries_voice_scope {
-            lines.push(format!(
-                "Managed voice needs the {VOICE_SCOPE} scope, which this token does not carry."
+            lines.push(shown!(
+                "Managed voice needs the {} scope, which this token does not carry.",
+                VOICE_SCOPE
             ));
         }
         lines
+    }
+
+    /// What the import did, for a script: where the file went, said as this installation's paths
+    /// are, the origin as a diagnostic names one, and the scopes by name.
+    #[must_use]
+    pub fn document(&self) -> Document {
+        Document::new()
+            .with("path", Shown::host_path(&self.path))
+            .with("origin", self.origin.clone())
+            .with("scopes", self.scopes.clone())
+            .with("unknown_scopes", self.unknown_scopes)
+            .with("expires_at_ms", self.expires_at_ms)
+            .with("carries_voice_scope", self.carries_voice_scope)
     }
 }
 
@@ -91,21 +109,20 @@ impl Imported {
 /// The origin and the scopes are said as a diagnostic says them: the scheme, the host and the
 /// port, and the scopes this build knows by name with the others counted. A stored origin can carry
 /// a user name and a password in front of the host, and a scope is whatever the file said.
-#[derive(Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Held {
     /// Where this host reads its account token.
-    pub path: String,
+    pub path: PathBuf,
     /// True when a token is imported there.
     pub imported: bool,
-    /// The origin it belongs to, when one is imported.
-    pub origin: Option<String>,
+    /// The origin it belongs to, when one is imported, as a diagnostic names one.
+    pub origin: Option<Shown>,
     /// The scopes it carries that this build knows, by name.
     pub scopes: Vec<&'static str>,
     /// How many scopes it carries that this build does not know.
     pub unknown_scopes: usize,
     /// The token's description, for a person.
-    #[serde(skip)]
-    description: Option<String>,
+    description: Option<Shown>,
 }
 
 kr_client::debug_fields!(Held {
@@ -121,29 +138,46 @@ impl Held {
         let (scopes, unknown_scopes) =
             stored.map_or_else(|| (Vec::new(), 0), |stored| scope_names(&stored.scopes));
         Self {
-            path: path.display().to_string(),
+            path: path.to_path_buf(),
             imported: stored.is_some(),
-            origin: stored.map(|stored| Shown::address(&stored.origin).into_string()),
+            origin: stored.map(|stored| Shown::address(&stored.origin)),
             scopes,
             unknown_scopes,
-            description: stored.map(|stored| stored.description().into_string()),
+            description: stored.map(StoredAccountToken::description),
         }
     }
 
     /// The lines a person reads. The token itself is never in them.
     #[must_use]
-    pub fn lines(&self) -> Vec<String> {
+    pub fn lines(&self) -> Vec<Shown> {
         vec![
-            format!("This host reads its account token from {}.", self.path),
+            shown!(
+                "This host reads its account token from {}.",
+                Shown::host_path(&self.path)
+            ),
             self.description.as_ref().map_or_else(
                 || {
-                    "No account token has been imported. Write one with `kr account token import \
-                     <path>`."
-                        .to_owned()
+                    Shown::said(
+                        "No account token has been imported. Write one with `kr account token \
+                         import <path>`.",
+                    )
                 },
-                |description| format!("It holds {description}."),
+                |description| shown!("It holds {}.", description.clone()),
             ),
         ]
+    }
+
+    /// What this host reads, for a script: the path said as this installation's paths are, the
+    /// origin as a diagnostic names one, and the scopes by name.
+    #[must_use]
+    pub fn document(&self) -> Document {
+        Document::new()
+            .with("ok", true)
+            .with("path", Shown::host_path(&self.path))
+            .with("imported", self.imported)
+            .with("origin", self.origin.clone())
+            .with("scopes", self.scopes.clone())
+            .with("unknown_scopes", self.unknown_scopes)
     }
 }
 
@@ -198,8 +232,8 @@ pub fn import_into(source: &Path, runtime_root: &Path) -> Result<Imported> {
 
     let (scopes, unknown_scopes) = scope_names(&stored.scopes);
     Ok(Imported {
-        path: destination.display().to_string(),
-        origin: Shown::address(&stored.origin).into_string(),
+        path: destination,
+        origin: Shown::address(&stored.origin),
         scopes,
         unknown_scopes,
         expires_at_ms: stored.expires_at_ms,
@@ -235,6 +269,15 @@ fn read_source(source: &Path) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
 
+    /// The lines as a person reads them.
+    fn written(lines: &[Shown]) -> String {
+        lines
+            .iter()
+            .map(Shown::as_str)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     /// A disposable runtime root on the internal disk, never on the workspace volume.
     fn runtime_root() -> tempfile::TempDir {
         tempfile::Builder::new()
@@ -258,12 +301,12 @@ mod tests {
 
         let imported = import_into(&source, root.path()).expect("the token is imported");
         assert!(imported.carries_voice_scope);
-        assert_eq!(imported.origin, "https://reach.example");
+        assert_eq!(imported.origin.as_str(), "https://reach.example");
 
         // Nothing a person or a script reads carries the value.
-        let rendered = imported.lines().join("\n");
+        let rendered = written(&imported.lines());
         assert!(!rendered.contains("a-secret-value"), "{rendered}");
-        let json = serde_json::to_string(&imported).expect("the machine-readable answer");
+        let json = imported.document().json().to_string();
         assert!(!json.contains("a-secret-value"), "{json}");
         assert!(!format!("{imported:?}").contains("a-secret-value"));
 
@@ -297,7 +340,7 @@ mod tests {
             imported
                 .lines()
                 .iter()
-                .any(|line| line.contains("does not carry"))
+                .any(|line| line.as_str().contains("does not carry"))
         );
     }
 
@@ -373,14 +416,14 @@ mod tests {
             );
             assert!(stored.scopes.iter().any(|scope| scope == MARKER));
 
-            assert_eq!(imported.origin, origin);
+            assert_eq!(imported.origin.as_str(), origin);
             assert_eq!(imported.scopes, ["voice"]);
             assert_eq!(imported.unknown_scopes, 1);
             assert_unmarked(
                 "an import",
                 &[
-                    imported.lines().join("\n"),
-                    serde_json::to_string(&imported).expect("the machine-readable answer"),
+                    written(&imported.lines()),
+                    imported.document().json().to_string(),
                     format!("{imported:?}"),
                     format!("{imported:#?}"),
                 ],
@@ -407,14 +450,17 @@ mod tests {
         );
 
         let held = Held::of(&path, Some(&stored));
-        assert_eq!(held.origin.as_deref(), Some("https://reach.example"));
+        assert_eq!(
+            held.origin.as_ref().map(Shown::as_str),
+            Some("https://reach.example")
+        );
         assert_eq!(held.scopes, ["voice"]);
         assert_eq!(held.unknown_scopes, 1);
         assert_unmarked(
             "a shown token",
             &[
-                held.lines().join("\n"),
-                serde_json::to_string(&held).expect("the machine-readable answer"),
+                written(&held.lines()),
+                held.document().json().to_string(),
                 format!("{held:?}"),
                 format!("{held:#?}"),
             ],
@@ -422,6 +468,10 @@ mod tests {
 
         let nothing = Held::of(&path, None);
         assert!(!nothing.imported);
-        assert!(nothing.lines()[1].starts_with("No account token has been imported."));
+        assert!(
+            nothing.lines()[1]
+                .as_str()
+                .starts_with("No account token has been imported.")
+        );
     }
 }

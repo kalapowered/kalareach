@@ -27,7 +27,9 @@ use kr_protocol::scalars::{Digest256, Nullable};
 use crate::cli::{DestinationArgument, DiffApplyArguments, DiffCommand, DiffReadArguments};
 use crate::daemon::{Daemon, identifier};
 use crate::error::{CliError, Result};
+use crate::output::{self, Asked, Line, Request, left};
 use crate::report::{self, Completion};
+use crate::{answer, stdout_line};
 
 /// What `--expect` and `--reference-at` take for a path or a reference that does not exist.
 const ABSENT: &str = "absent";
@@ -81,35 +83,42 @@ async fn read(paths: &HostPaths, arguments: &DiffReadArguments, json: bool) -> R
         )
         .await?;
     if json {
-        report::print_json(&report::answer(&read)?);
+        output::document(&answer::diff_read_result(&read));
         return Ok(());
     }
-    println!(
+    output::line(&stdout_line!(
         "workspace {} of repository {}",
-        read.workspace_id, read.project_repository_id
-    );
+        output::closed_word(&read.workspace_id),
+        output::closed_word(&read.project_repository_id)
+    ));
     if let Some(version) = read.source_version.as_ref() {
-        println!(
+        output::line(&stdout_line!(
             "version {} of change set {}",
             version.version.get(),
-            version.change_set_id
-        );
+            output::closed_word(&version.change_set_id)
+        ));
     }
-    println!(
+    output::line(&stdout_line!(
         "base {}{}, head {}{}",
-        read.base_revision,
+        crate::shown::git_revision(&read.base_revision),
         named(read.base_reference.as_ref()),
-        read.head_revision,
+        crate::shown::git_revision(&read.head_revision),
         named(read.head_reference.as_ref())
-    );
+    ));
     for entry in read.tracked.iter().chain(&read.untracked) {
-        println!("{}", entry_line(entry));
+        output::line(&entry_line(entry));
     }
     if read.omitted_entries.get() > 0 {
-        println!("and {} more paths", read.omitted_entries.get());
+        output::line(&stdout_line!(
+            "and {} more paths",
+            read.omitted_entries.get()
+        ));
     }
     for limitation in &read.limitations {
-        println!("note: {limitation}");
+        output::line(&stdout_line!(
+            "note: {}",
+            crate::shown::exported("DiffReadResult", "limitations", limitation)
+        ));
     }
     Ok(())
 }
@@ -167,11 +176,14 @@ async fn apply(
         .await?;
     let unfinished = unfinished(&applied, revert);
     match (&unfinished, json) {
-        (None, true) => report::print_json(&report::answer(&applied)?),
-        (Some(error), true) => report::print_json(&report::answer_that_failed(&applied, error)?),
-        (None, false) => print!("{}", outcome(&applied, revert)),
+        (None, true) => output::document(&answer::diff_apply_result(&applied)),
+        (Some(error), true) => output::document(&report::with_failure(
+            answer::diff_apply_result(&applied),
+            error,
+        )),
+        (None, false) => output::lines(&outcome(&applied, revert)),
         (Some(error), false) => {
-            print!("{}", outcome(&applied, revert));
+            output::lines(&outcome(&applied, revert));
             report::failed(error);
         }
     }
@@ -262,48 +274,50 @@ fn digest(text: &str) -> Option<Digest256> {
 }
 
 /// What one apply or revert came to, as lines for a person: the outcome first, then the host's own
-/// account of it.
-fn outcome(applied: &DiffApplyResult, revert: bool) -> String {
+/// account of it, its sentences said as their class and length and the paths it names as the
+/// person who asked for the change reads them.
+fn outcome(applied: &DiffApplyResult, revert: bool) -> Vec<Line> {
     let done = if revert { "Reverted" } else { "Applied" };
     let place = match applied.destination {
         DestinationClass::Proposal => "as a proposal",
         DestinationClass::VersionedReference => "to the reference",
         DestinationClass::SharedExisting => "to the working tree",
     };
-    let mut text = match applied.outcome.as_ref() {
-        Some(ApplyOutcomeClass::Applied) => format!("{done} {place}.\n"),
-        Some(ApplyOutcomeClass::PreflightConflict) => {
-            "The destination was not what the request expected, and nothing was written.\n"
-                .to_owned()
-        }
-        Some(ApplyOutcomeClass::ConflictAfterPartialWrites) => {
+    let mut lines = match applied.outcome.as_ref() {
+        Some(ApplyOutcomeClass::Applied) => vec![stdout_line!("{} {}.", done, place)],
+        Some(ApplyOutcomeClass::PreflightConflict) => vec![stdout_line!(
+            "The destination was not what the request expected, and nothing was written."
+        )],
+        Some(ApplyOutcomeClass::ConflictAfterPartialWrites) => vec![stdout_line!(
             "Some paths were written, and then the destination stopped being what the request \
-             expected.\n"
-                .to_owned()
-        }
-        Some(ApplyOutcomeClass::InterruptedApply) => {
-            "Some paths were written, and then this host stopped before it finished.\n".to_owned()
-        }
-        Some(ApplyOutcomeClass::UncertainOutcome) => {
-            "This host cannot say what the destination holds now.\n".to_owned()
-        }
+             expected."
+        )],
+        Some(ApplyOutcomeClass::InterruptedApply) => vec![stdout_line!(
+            "Some paths were written, and then this host stopped before it finished."
+        )],
+        Some(ApplyOutcomeClass::UncertainOutcome) => vec![stdout_line!(
+            "This host cannot say what the destination holds now."
+        )],
         // A preflight that found the destination as expected: nothing ran, and the detail says so.
-        None => String::new(),
+        None => Vec::new(),
     };
     if !applied.detail.is_empty() {
-        text.push_str(&format!("{}\n", applied.detail));
+        lines.push(stdout_line!(
+            "{}",
+            crate::shown::exported("DiffApplyResult", "detail", &applied.detail)
+        ));
     }
     if let Some(proposal) = applied.proposal_version.as_ref() {
-        text.push_str(&format!(
-            "proposal: version {} of change set {}\n",
+        lines.push(stdout_line!(
+            "proposal: version {} of change set {}",
             proposal.version.get(),
-            proposal.change_set_id
+            output::closed_word(&proposal.change_set_id)
         ));
     }
     if let Some(reference) = applied.reference.as_ref() {
-        text.push_str(&format!(
-            "reference {}: {}\n",
-            reference.name,
+        lines.push(stdout_line!(
+            "reference {}: {}",
+            Asked::text(Request::Diff, &reference.name),
             if reference.updated {
                 "moved"
             } else {
@@ -312,28 +326,39 @@ fn outcome(applied: &DiffApplyResult, revert: bool) -> String {
         ));
     }
     for path in &applied.changed_paths {
-        text.push_str(&format!("changed: {path}\n"));
+        lines.push(stdout_line!(
+            "changed: {}",
+            Asked::path(Request::Diff, path)
+        ));
     }
     for path in &applied.unresolved_paths {
-        text.push_str(&format!("not established: {path}\n"));
+        lines.push(stdout_line!(
+            "not established: {}",
+            Asked::path(Request::Diff, path)
+        ));
     }
     for conflict in &applied.conflicts {
-        text.push_str(&format!(
-            "conflict: {}: {}\n",
-            conflict.path, conflict.detail
+        lines.push(stdout_line!(
+            "conflict: {}: {}",
+            Asked::path(Request::Diff, &conflict.path),
+            crate::shown::exported("PathConflict", "detail", &conflict.detail)
         ));
     }
     for progress in &applied.progress {
-        text.push_str(&format!(
-            "{:<10} {}{}\n",
-            progress.state.as_str(),
-            progress.path,
-            if progress.detail.is_empty() {
-                String::new()
-            } else {
-                format!(": {}", progress.detail)
-            }
-        ));
+        lines.push(if progress.detail.is_empty() {
+            stdout_line!(
+                "{} {}",
+                left(10, &progress.state.as_str()),
+                Asked::path(Request::Diff, &progress.path)
+            )
+        } else {
+            stdout_line!(
+                "{} {}: {}",
+                left(10, &progress.state.as_str()),
+                Asked::path(Request::Diff, &progress.path),
+                crate::shown::exported("PathProgress", "detail", &progress.detail)
+            )
+        });
     }
     let recovery = &applied.recovery;
     for (what, version) in [
@@ -341,23 +366,33 @@ fn outcome(applied: &DiffApplyResult, revert: bool) -> String {
         ("after", recovery.after_version.as_ref()),
     ] {
         if let Some(version) = version {
-            text.push_str(&format!(
-                "the destination {what} it: version {} of change set {}\n",
+            lines.push(stdout_line!(
+                "the destination {} it: version {} of change set {}",
+                what,
                 version.version.get(),
-                version.change_set_id
+                output::closed_word(&version.change_set_id)
             ));
         }
     }
     if let Some(staged) = recovery.staged_path.as_ref() {
-        text.push_str(&format!("staged at: {staged}\n"));
+        lines.push(stdout_line!(
+            "staged at: {}",
+            Asked::path(Request::Diff, staged)
+        ));
     }
     for leftover in &recovery.staged_leftovers {
-        text.push_str(&format!("left beside a destination path: {leftover}\n"));
+        lines.push(stdout_line!(
+            "left beside a destination path: {}",
+            Asked::path(Request::Diff, leftover)
+        ));
     }
     for limitation in &applied.limitations {
-        text.push_str(&format!("note: {limitation}\n"));
+        lines.push(stdout_line!(
+            "note: {}",
+            crate::shown::exported("DiffApplyResult", "limitations", limitation)
+        ));
     }
-    text
+    lines
 }
 
 /// One path of a read as a line for a person, with the digest `--expect` takes for it.
@@ -366,23 +401,28 @@ fn outcome(applied: &DiffApplyResult, revert: bool) -> String {
 /// the host could not digest, a link, something that is not a file or a file it could not read, is
 /// `unavailable`, which `--expect` does not take, because saying such a path is absent would be
 /// an expectation nobody established.
-fn entry_line(entry: &DiffEntry) -> String {
+fn entry_line(entry: &DiffEntry) -> Line {
     let digest = match (entry.content_digest.as_ref(), entry.change) {
-        (Some(digest), _) => report::wire_name(digest),
-        (None, ChangeKind::Deleted) => ABSENT.to_owned(),
-        (None, ChangeKind::Present | ChangeKind::Unmerged) => UNAVAILABLE.to_owned(),
+        (Some(digest), _) => output::closed_word(digest),
+        (None, ChangeKind::Deleted) => Shown::said(ABSENT),
+        (None, ChangeKind::Present | ChangeKind::Unmerged) => Shown::said(UNAVAILABLE),
     };
-    format!(
-        "{:<18} {:<8} {digest}  {}",
-        entry.class.as_str(),
-        report::wire_name(&entry.change),
-        entry.path
+    stdout_line!(
+        "{} {} {}  {}",
+        left(18, &entry.class.as_str()),
+        left(8, &crate::shown::wire_word(entry.change)),
+        digest,
+        Asked::path(Request::Diff, &entry.path)
     )
 }
 
-/// ` (name)` for a reference that has a name, and nothing for one that has none.
-fn named(reference: Option<&String>) -> String {
-    reference.map_or_else(String::new, |name| format!(" ({name})"))
+/// ` (name)` for a reference that has a name, and nothing for one that has none: the name said when
+/// it is a reference.
+fn named(reference: Option<&String>) -> Shown {
+    reference.map_or_else(
+        || Shown::said(""),
+        |name| shown!(" ({})", crate::shown::git_revision(name)),
+    )
 }
 
 #[cfg(test)]
@@ -456,7 +496,11 @@ mod tests {
     #[test]
     fn an_unfinished_apply_says_what_landed_and_what_to_recover_from() {
         let applied = result(Some(ApplyOutcomeClass::InterruptedApply));
-        let text = outcome(&applied, false);
+        let text = outcome(&applied, false)
+            .iter()
+            .map(|line| line.text().to_owned())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(text.contains("changed: README.md"), "{text}");
         assert!(text.contains("not established: notes.txt"), "{text}");
         assert!(
@@ -464,7 +508,8 @@ mod tests {
             "{text}"
         );
         let error = unfinished(&applied, false).expect("a failure");
-        let document = report::answer_that_failed(&applied, &error).expect("a document");
+        let document =
+            report::with_failure(crate::answer::diff_apply_result(&applied), &error).json();
         assert_eq!(document["ok"], serde_json::Value::Bool(false));
         assert_eq!(document["code"], "OUTCOME_UNKNOWN");
         assert_eq!(document["exit_code"], 1);
@@ -489,20 +534,23 @@ mod tests {
 
     #[test]
     fn a_path_with_no_digest_is_absent_only_when_it_was_deleted() {
-        assert!(entry_line(&entry(ChangeKind::Deleted, None)).contains(" absent  link"));
-        assert!(entry_line(&entry(ChangeKind::Present, None)).contains(" unavailable  link"));
-        assert!(entry_line(&entry(ChangeKind::Unmerged, None)).contains(" unavailable  link"));
+        let text = |line: Line| line.text().to_owned();
+        assert!(text(entry_line(&entry(ChangeKind::Deleted, None))).contains(" absent  link"));
+        assert!(text(entry_line(&entry(ChangeKind::Present, None))).contains(" unavailable  link"));
+        assert!(
+            text(entry_line(&entry(ChangeKind::Unmerged, None))).contains(" unavailable  link")
+        );
         let digest = Digest256::from_bytes([1; 32]);
         assert!(
-            entry_line(&entry(ChangeKind::Present, Some(digest)))
-                .contains(&report::wire_name(&digest))
+            text(entry_line(&entry(ChangeKind::Present, Some(digest))))
+                .contains(output::closed_word(&digest).as_str())
         );
     }
 
     #[test]
     fn an_expectation_names_a_path_and_what_it_holds() {
         let digest = Digest256::from_bytes([9; 32]);
-        let text = format!("docs/a=b.md={}", report::wire_name(&digest));
+        let text = format!("docs/a=b.md={}", output::closed_word(&digest));
         let read = expectation(&text).expect("reads");
         assert_eq!(read.path, "docs/a=b.md", "the digest is the last part");
         assert_eq!(read.expected_worktree_digest, Nullable::some(digest));

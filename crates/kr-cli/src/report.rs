@@ -17,7 +17,6 @@ use kr_protocol::desktop::{
 };
 use kr_protocol::hostinfo::HostInfoResult;
 use kr_protocol::session::{ClosureRecord, SessionState, SessionSummary};
-use serde_json::{Value, json};
 
 use crate::error::CliError;
 use crate::output::{self, Asked, Document, Line, Request, left, right};
@@ -81,66 +80,6 @@ pub fn ready(byte: u8) -> std::io::Result<()> {
     let mut pipe = std::io::stderr();
     pipe.write_all(&[byte])?;
     pipe.flush()
-}
-
-/// Renders a host's answer as machine-readable output: the answer exactly as the host sent it,
-/// marked as a success.
-///
-/// # Errors
-///
-/// Returns [`CliError::Other`] when the answer cannot be written as JSON.
-pub fn answer<T: serde::Serialize>(answer: &T) -> Result<Value, CliError> {
-    let mut document = serde_json::to_value(answer).map_err(|error| {
-        CliError::Other(shown!(
-            "the host's answer could not be written: {}",
-            Shown::json(&error)
-        ))
-    })?;
-    match document.as_object_mut() {
-        Some(object) => {
-            object.insert("ok".to_owned(), Value::Bool(true));
-            Ok(document)
-        }
-        None => Ok(json!({ "ok": true, "answer": document })),
-    }
-}
-
-/// Renders a host's answer that is also a failure: the answer exactly as the host sent it, with the
-/// failure's code, message and exit status beside it and `ok` false.
-///
-/// # Errors
-///
-/// Returns [`CliError::Other`] when the answer cannot be written as JSON.
-pub fn answer_that_failed<T: serde::Serialize>(
-    answer: &T,
-    error: &CliError,
-) -> Result<Value, CliError> {
-    let mut document = self::answer(answer)?;
-    if let Some(object) = document.as_object_mut() {
-        object.insert("ok".to_owned(), Value::Bool(false));
-        object.insert("code".to_owned(), json!(error.code().as_str()));
-        object.insert("message".to_owned(), json!(error.said().as_str()));
-        object.insert("exit_code".to_owned(), json!(error.exit_code()));
-    }
-    Ok(document)
-}
-
-/// Returns the name a value of one of the protocol's named sets goes by on the wire, which is the
-/// name a person is shown.
-#[must_use]
-pub fn wire_name<T: serde::Serialize>(value: &T) -> String {
-    match serde_json::to_value(value) {
-        Ok(Value::String(name)) => name,
-        _ => String::from("unnamed"),
-    }
-}
-
-/// Prints one machine-readable document on standard output.
-pub fn print_json(document: &Value) {
-    println!(
-        "{}",
-        serde_json::to_string_pretty(document).unwrap_or_else(|_| "{}".to_owned())
-    );
 }
 
 /// Renders one session.
@@ -723,6 +662,8 @@ pub fn terminal_attachment_lines(attachments: &[AttachmentSummary]) -> Vec<Shown
 
 #[cfg(test)]
 mod tests {
+    use serde_json::{Value, json};
+
     use super::*;
     use crate::output::planted::{
         only_asked, only_asked_lines, only_asked_or_host_text, planted, planted_text,

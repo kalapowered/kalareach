@@ -191,79 +191,93 @@ pub fn run(paths: &HostPaths, arguments: &StartupArguments, json: bool) -> Resul
         chosen.controller == Some(ControllerStartup::Standalone),
     );
     if json {
-        let mut document = serde_json::json!({
-            "ok": true,
-            "environment_id": environment.environment_id.to_string(),
-            "startup": {
-                "controller": chosen.controller.map(ControllerStartup::as_str),
-                "source": if chosen.controller.is_some() {
+        let startup = crate::output::Document::new()
+            .with(
+                "controller",
+                chosen.controller.map(ControllerStartup::as_str),
+            )
+            .with(
+                "source",
+                if chosen.controller.is_some() {
                     "host_configuration"
                 } else {
                     "default"
                 },
-                "document": chosen.document.display().to_string(),
-                "document_state": chosen.state.as_str(),
-                "revision": chosen.revision.to_string(),
-                "definition": inspection.as_ref().map(service_manager::Inspection::json),
-                "definition_unestablished": unestablished.as_ref().map(Shown::as_str),
-            },
-        });
+            )
+            .with("document", Shown::host_path(&chosen.document))
+            .with("document_state", chosen.state.as_str())
+            .with("revision", crate::output::said(&chosen.revision))
+            .with(
+                "definition",
+                inspection.as_ref().map(service_manager::Inspection::json),
+            )
+            .with("definition_unestablished", unestablished.clone());
         #[cfg(windows)]
-        {
-            if let Some(report) = &task_report {
-                document["startup"]["task"] = report.json();
-            }
-            if let Some(changed) = &task_changed {
-                document["task_change"] = changed.json();
-            }
+        let startup = match &task_report {
+            Some(report) => startup.with("task", report.json()),
+            None => startup,
+        };
+        let mut document = crate::output::Document::new().with("ok", true).with(
+            "environment_id",
+            crate::output::said(&environment.environment_id),
+        );
+        #[cfg(windows)]
+        if let Some(changed) = &task_changed {
+            document.set("task_change", changed.json());
         }
+        // What the service start removed and left are files kr derived and recorded writing, said
+        // whole as every path this program derives is.
         if !removal.removed.is_empty() || !removal.left.is_empty() {
-            document["removed"] = serde_json::json!(
+            document.set(
+                "removed",
                 removal
                     .removed
                     .iter()
-                    .map(|path| path.display().to_string())
-                    .collect::<Vec<_>>()
+                    .map(|path| Shown::root(path))
+                    .collect::<Vec<_>>(),
             );
-            document["left"] = serde_json::json!(
+            document.set(
+                "left",
                 removal
                     .left
                     .iter()
-                    .map(|(path, why)| serde_json::json!({
-                        "path": path.display().to_string(),
-                        "why": why.as_str(),
-                    }))
-                    .collect::<Vec<_>>()
+                    .map(|(path, why)| {
+                        crate::output::Document::new()
+                            .with("path", Shown::root(path))
+                            .with("why", why.clone())
+                    })
+                    .collect::<Vec<_>>(),
             );
         }
         if !notes.is_empty() {
-            document["notes"] = serde_json::json!(notes);
+            document.set("notes", notes);
         }
-        crate::report::print_json(&document);
+        crate::output::document(&document.with("startup", startup));
     } else {
-        println!("{}", describe(&chosen, inspection.as_ref()));
+        crate::output::say(&describe(&chosen, inspection.as_ref()));
         #[cfg(windows)]
         {
             if let Some(changed) = &task_changed {
-                println!("{}", changed.describe(environment.environment_id));
+                crate::output::say(&changed.describe(environment.environment_id));
             }
             if let Some(report) = &task_report {
-                println!("{}", report.describe());
+                crate::output::say(&report.describe());
             }
         }
         if let Some(why) = &unestablished {
-            println!(
-                "what the service start has for this environment cannot be established: {why}"
-            );
+            crate::output::say(&shown!(
+                "what the service start has for this environment cannot be established: {}",
+                why.clone()
+            ));
         }
         for path in &removal.removed {
-            println!("removed {}", path.display());
+            crate::output::say(&shown!("removed {}", Shown::root(path)));
         }
         for (path, why) in &removal.left {
-            println!("left {}: {why}", path.display());
+            crate::output::say(&shown!("left {}: {}", Shown::root(path), why.clone()));
         }
         for note in &notes {
-            println!("{note}");
+            crate::output::say(note);
         }
     }
     Ok(())
@@ -273,7 +287,7 @@ pub fn run(paths: &HostPaths, arguments: &StartupArguments, json: bool) -> Resul
 #[derive(Default)]
 struct Changed {
     /// What a person should know about what the service manager holds.
-    notes: Vec<String>,
+    notes: Vec<Shown>,
     /// What removing the service start's definition did.
     removal: service_manager::Removal,
     /// What happened to the environment's scheduled task.
@@ -342,39 +356,43 @@ fn changed_under(
     })
 }
 
-/// What `kr host startup` tells a person.
-fn describe(chosen: &Chosen, inspection: Option<&service_manager::Inspection>) -> String {
-    let left_over = |text: String| match inspection {
-        Some(inspection) if inspection.recorded => format!(
-            "{text}\na service definition kr wrote is still installed, and nothing uses it: {}; kr \
+/// What `kr host startup` tells a person: the document the choice is in, said as this
+/// installation's paths are.
+fn describe(chosen: &Chosen, inspection: Option<&service_manager::Inspection>) -> Shown {
+    let left_over = |text: Shown| match inspection {
+        Some(inspection) if inspection.recorded => shown!(
+            "{}\na service definition kr wrote is still installed, and nothing uses it: {}; kr \
              host startup --clear removes it",
+            text,
             inspection.describe()
         ),
         _ => text,
     };
+    let document = Shown::host_path(&chosen.document);
     match chosen.controller {
-        Some(ControllerStartup::Service) => format!(
+        Some(ControllerStartup::Service) => shown!(
             "startup: service, from {} at revision {}: kr new asks this user's service manager to \
              start this environment's control daemon when none is running{}",
-            chosen.document.display(),
+            document,
             chosen.revision,
-            inspection.map_or_else(String::new, |inspection| format!(
-                "; {}",
-                inspection.describe()
-            ))
+            inspection.map_or_else(
+                || Shown::said(""),
+                |inspection| shown!("; {}", inspection.describe())
+            )
         ),
-        Some(ControllerStartup::Standalone) => left_over(format!(
-            "startup: standalone, from {} at revision {}: {STANDALONE_SAID}",
-            chosen.document.display(),
-            chosen.revision
+        Some(ControllerStartup::Standalone) => left_over(shown!(
+            "startup: standalone, from {} at revision {}: {}",
+            document,
+            chosen.revision,
+            STANDALONE_SAID
         )),
-        None if chosen.state.is_a_problem() => left_over(format!(
+        None if chosen.state.is_a_problem() => left_over(shown!(
             "startup: none, because the configuration document {} is {}: kr new starts no \
              control daemon",
-            chosen.document.display(),
+            document,
             chosen.state.as_str()
         )),
-        None => left_over(NOTHING_CHOSEN.to_owned()),
+        None => left_over(Shown::said(NOTHING_CHOSEN)),
     }
 }
 
@@ -1226,11 +1244,11 @@ pub(crate) mod task {
     }
 
     /// The word a report's `--json` form gives a last result.
-    pub fn last_result_word(result: LastResult) -> String {
+    pub fn last_result_word(result: LastResult) -> Shown {
         match result {
-            LastResult::NotRun => "not_run".to_owned(),
-            LastResult::Running => "running".to_owned(),
-            LastResult::Ended(code) => format!("0x{code:08x}"),
+            LastResult::NotRun => Shown::said("not_run"),
+            LastResult::Running => Shown::said("running"),
+            LastResult::Ended(code) => shown!("0x{}", crate::shown::hexadecimal_word(code)),
         }
     }
 
@@ -1341,28 +1359,29 @@ pub(crate) mod task {
         }
 
         /// The report as a command's `--json` output carries it.
-        pub fn json(&self) -> serde_json::Value {
+        pub fn json(&self) -> crate::output::Document {
             let differences = match &self.standing {
-                Ok(Standing::Owned(differences)) => differences
-                    .iter()
-                    .map(|found| difference(found).into_string())
-                    .collect::<Vec<_>>(),
+                Ok(Standing::Owned(differences)) => {
+                    differences.iter().map(difference).collect::<Vec<_>>()
+                }
                 _ => Vec::new(),
             };
-            serde_json::json!({
-                "name": name(self.environment_id).into_string(),
-                "ownership": self.ownership(),
-                "valid": match &self.standing {
-                    Ok(Standing::Owned(found)) => Some(found.is_empty()),
-                    _ => None,
-                },
-                "differences": differences,
-                "program_present": self.program_present,
-                "session": self.session,
-                "interactive": self.session.map(|session| session != 0),
-                "last_result": self.last_result.map(last_result_word),
-                "ends_at_sign_out": true,
-            })
+            crate::output::Document::new()
+                .with("name", name(self.environment_id))
+                .with("ownership", self.ownership())
+                .with(
+                    "valid",
+                    match &self.standing {
+                        Ok(Standing::Owned(found)) => Some(found.is_empty()),
+                        _ => None,
+                    },
+                )
+                .with("differences", differences)
+                .with("program_present", self.program_present)
+                .with("session", self.session)
+                .with("interactive", self.session.map(|session| session != 0))
+                .with("last_result", self.last_result.map(last_result_word))
+                .with("ends_at_sign_out", true)
         }
     }
 }
@@ -1445,16 +1464,18 @@ mod windows {
         }
 
         /// What was done, as a command's `--json` output carries it.
-        pub fn json(&self) -> serde_json::Value {
-            serde_json::json!({
-                "change": match &self.change {
-                    TaskChange::Unchanged => "unchanged",
-                    TaskChange::Registered => "registered",
-                    TaskChange::Repaired { .. } => "repaired",
-                    TaskChange::Removed { .. } => "removed",
-                },
-                "left": self.left.is_some(),
-            })
+        pub fn json(&self) -> crate::output::Document {
+            crate::output::Document::new()
+                .with(
+                    "change",
+                    match &self.change {
+                        TaskChange::Unchanged => "unchanged",
+                        TaskChange::Registered => "registered",
+                        TaskChange::Repaired { .. } => "repaired",
+                        TaskChange::Removed { .. } => "removed",
+                    },
+                )
+                .with("left", self.left.is_some())
         }
     }
 
@@ -2311,7 +2332,7 @@ mod tests {
         ] {
             assert!(said.contains(part), "{part}: {said}");
         }
-        let json = usable.json();
+        let json = usable.json().json();
         assert_eq!(json["ownership"], "own");
         assert_eq!(json["valid"], true);
         assert_eq!(json["program_present"], true);
@@ -2329,7 +2350,7 @@ mod tests {
         assert!(said.contains("is not there"), "{said}");
         assert!(said.contains("login session 0"), "{said}");
         assert!(said.contains("its last result cannot be read"), "{said}");
-        assert_eq!(gone.json()["interactive"], false);
+        assert_eq!(gone.json().json()["interactive"], false);
 
         let stale = report(
             Ok(Standing::Owned(marked_findings())),
@@ -2351,8 +2372,8 @@ mod tests {
             said.contains("its last run ended with code 0x00000000800710e0"),
             "{said}"
         );
-        assert_eq!(stale.json()["valid"], false);
-        assert_eq!(stale.json()["last_result"], "0x800710e0");
+        assert_eq!(stale.json().json()["valid"], false);
+        assert_eq!(stale.json().json()["last_result"], "0x800710e0");
 
         let absent = report(Ok(Standing::Absent), true, Some(1), None);
         assert_eq!(absent.ownership(), "absent");
@@ -2374,7 +2395,7 @@ mod tests {
                 .as_str()
                 .contains("it has not run since it was registered")
         );
-        assert_eq!(not_run.json()["last_result"], "not_run");
+        assert_eq!(not_run.json().json()["last_result"], "not_run");
         assert_eq!(
             report(
                 Ok(Standing::Owned(Vec::new())),
@@ -2382,6 +2403,7 @@ mod tests {
                 None,
                 Some(LastResult::Running)
             )
+            .json()
             .json()["last_result"],
             "running"
         );
@@ -2413,7 +2435,7 @@ mod tests {
                 "{said}"
             );
             renderings.push(said);
-            renderings.push(found.json().to_string());
+            renderings.push(found.json().json().to_string());
             renderings.push(
                 task::error(&TaskError::Foreign(foreign(reason)), environment_id).into_string(),
             );
@@ -2470,13 +2492,13 @@ mod tests {
             let unreadable = report(Err(error.clone()), true, Some(1), None);
             assert_eq!(unreadable.ownership(), "unknown");
             renderings.push(unreadable.describe().into_string());
-            renderings.push(unreadable.json().to_string());
+            renderings.push(unreadable.json().json().to_string());
             let said = task::error(&error, environment_id).into_string();
             assert!(said.contains(&name), "the task is named: {said}");
             renderings.push(said);
         }
         renderings.push(stale.describe().into_string());
-        renderings.push(stale.json().to_string());
+        renderings.push(stale.json().json().to_string());
         assert_unmarked("the environment's scheduled task", &renderings);
         assert!(
             task::error(

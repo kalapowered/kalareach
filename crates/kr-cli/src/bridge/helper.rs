@@ -116,7 +116,12 @@ pub fn admit(hello: &BridgeHello) -> std::result::Result<(), Refusal> {
 /// Returns [`CliError::Refused`] when the handshake was refused, and a transport failure when a
 /// stream or the local connection fails.
 pub async fn run(environment: Option<&str>) -> Result<()> {
-    serve(std::io::stdin(), &mut std::io::stdout(), environment).await
+    serve(
+        std::io::stdin(),
+        &mut crate::output::protocol_stream().blocking(),
+        environment,
+    )
+    .await
 }
 
 /// Runs one bridge over the streams given, which is what a test drives.

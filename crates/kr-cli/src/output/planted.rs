@@ -446,6 +446,85 @@ pub(crate) fn same_encoding(
     compare(label, &document.json(), encoded, "", reduced, added);
 }
 
+/// Holds a document to the protocol's encoding of the value it renders wherever it says the value
+/// as it is: the same keys, and the same leaves but where the document holds asked content or where
+/// a reducer or a validator put its own words (`[...]`). Keys in `added` are the document's own.
+///
+/// # Panics
+///
+/// Panics, naming the path, where the document and the encoding part anywhere else.
+pub(crate) fn differs_only_where_said(
+    label: &str,
+    document: &Document,
+    encoded: &Value,
+    added: &[&str],
+) {
+    fn compare(
+        label: &str,
+        asked: &BTreeSet<String>,
+        written: &Value,
+        encoded: &Value,
+        path: &str,
+        added: &[&str],
+    ) {
+        match (written, encoded) {
+            (Value::Object(written), Value::Object(encoded)) => {
+                for key in written.keys() {
+                    let inner = joined(path, key);
+                    assert!(
+                        encoded.contains_key(key) || added.contains(&inner.as_str()),
+                        "{label}: the document adds {inner}, which the protocol does not encode"
+                    );
+                }
+                for (key, value) in encoded {
+                    let inner = joined(path, key);
+                    let Some(held) = written.get(key) else {
+                        panic!("{label}: the document leaves out {inner}");
+                    };
+                    compare(label, asked, held, value, &inner, added);
+                }
+            }
+            (Value::Array(written), Value::Array(encoded)) => {
+                assert_eq!(
+                    written.len(),
+                    encoded.len(),
+                    "{label}: {path} has another length"
+                );
+                let inner = format!("{path}[]");
+                for (held, value) in written.iter().zip(encoded) {
+                    compare(label, asked, held, value, &inner, added);
+                }
+            }
+            (Value::String(said), _) if written != encoded => assert!(
+                asked.contains(path) || (said.starts_with('[') && said.ends_with(']')),
+                "{label}: {path} says {said:?}, which is neither asked content, a reducer's words \
+                 nor what the protocol encodes ({encoded})"
+            ),
+            _ => assert_eq!(
+                written, encoded,
+                "{label}: {path} is not what the protocol encodes"
+            ),
+        }
+    }
+
+    fn joined(path: &str, key: &str) -> String {
+        if path.is_empty() {
+            key.to_owned()
+        } else {
+            format!("{path}.{key}")
+        }
+    }
+
+    compare(
+        label,
+        document.asked(),
+        &document.json(),
+        encoded,
+        "",
+        added,
+    );
+}
+
 /// Holds lines to their rule: the marker shows only inside asked content.
 ///
 /// # Panics

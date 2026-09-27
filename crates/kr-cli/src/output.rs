@@ -187,6 +187,8 @@ pub enum Piece<'a> {
     Plain(&'a dyn Plain),
     /// Content the person asked to read.
     Asked(&'a Asked),
+    /// A line composed before, whole.
+    Line(&'a Line),
     /// Another part, padded with spaces to a width in characters.
     Padded {
         /// The part.
@@ -213,6 +215,12 @@ impl<T: Plain> Part for T {
 impl Part for Asked {
     fn piece(&self) -> Piece<'_> {
         Piece::Asked(self)
+    }
+}
+
+impl Part for Line {
+    fn piece(&self) -> Piece<'_> {
+        Piece::Line(self)
     }
 }
 
@@ -314,6 +322,7 @@ fn written(text: &mut String, piece: &Piece<'_>) {
             let _ = write!(text, "{value}");
         }
         Piece::Asked(asked) => text.push_str(&asked.text),
+        Piece::Line(line) => text.push_str(&line.text),
         Piece::Padded { part, width, right } => {
             let mut inner = String::new();
             written(&mut inner, &part.piece());
@@ -335,6 +344,7 @@ fn asked_in(asked: &mut Vec<String>, piece: &Piece<'_>) {
     match piece {
         Piece::Plain(_) => {}
         Piece::Asked(content) => asked.push(content.text.clone()),
+        Piece::Line(line) => asked.extend(line.asked.iter().cloned()),
         Piece::Padded { part, .. } => asked_in(asked, &part.piece()),
     }
 }
@@ -480,6 +490,12 @@ pub fn closed(value: &impl Closed) -> Held {
     Held::plain(serde_json::to_value(value).unwrap_or(serde_json::Value::Null))
 }
 
+/// A closed value as a line says it: the text the protocol encodes it as.
+#[must_use]
+pub fn closed_word(value: &impl Closed) -> Shown {
+    crate::shown::closed_text(value)
+}
+
 impl<T: Closed> Closed for kr_protocol::scalars::Nullable<T> {}
 impl<T: Closed> Closed for Vec<T> {}
 impl<T: Closed + Ord> Closed for kr_protocol::scalars::CanonicalSet<T> {}
@@ -506,6 +522,51 @@ impl Closed for kr_protocol::invitation::InviteModeKind {}
 impl Closed for kr_protocol::pairing::ConfirmationChannel {}
 impl Closed for kr_protocol::pairing::DevicePlatform {}
 impl Closed for kr_protocol::pairing::PairingConsumedReason {}
+impl Closed for kr_protocol::identity::EnvironmentAccess {}
+impl Closed for kr_protocol::identity::EnvironmentPresence {}
+impl Closed for kr_protocol::identity::ObservationSource {}
+impl Closed for kr_protocol::local::LocalRole {}
+impl Closed for kr_protocol::hello::ProtocolVersion {}
+impl Closed for kr_protocol::catalogue::CatalogueBudgets {}
+impl Closed for kr_protocol::catalogue::CatalogueKind {}
+impl Closed for kr_protocol::catalogue::PluginGrantRequirement {}
+impl Closed for kr_protocol::catalogue::PluginLeftOutReason {}
+impl Closed for kr_protocol::changeset::ApplyOutcomeClass {}
+impl Closed for kr_protocol::changeset::CaptureCount {}
+impl Closed for kr_protocol::changeset::ContentOrigin {}
+impl Closed for kr_protocol::changeset::DestinationClass {}
+impl Closed for kr_protocol::changeset::EvidenceKind {}
+impl Closed for kr_protocol::changeset::ExclusionReason {}
+impl Closed for kr_protocol::changeset::MaterialisationPurpose {}
+impl Closed for kr_protocol::changeset::PathClass {}
+impl Closed for kr_protocol::changeset::PathProgressState {}
+impl Closed for kr_protocol::changeset::SourceConsistency {}
+impl Closed for kr_protocol::changeset::TestedSource {}
+impl Closed for kr_protocol::changeset::TreeSummary {}
+impl Closed for kr_protocol::changeset::VersionRef {}
+impl Closed for kr_protocol::project::ContentClass {}
+impl Closed for kr_protocol::ids::ChangeSetId {}
+impl Closed for kr_protocol::ids::ChangeSetVersion {}
+impl Closed for kr_protocol::ids::EnvironmentId {}
+impl Closed for kr_protocol::ids::MaterialisationId {}
+impl Closed for kr_protocol::ids::ProjectRepositoryId {}
+impl Closed for kr_protocol::ids::RepositoryGeneration {}
+impl Closed for kr_protocol::ids::WorkflowRunId {}
+impl Closed for kr_protocol::ids::WorkspaceId {}
+impl Closed for kr_protocol::project::ChangeKind {}
+impl Closed for kr_protocol::project::DestinationState {}
+impl Closed for kr_protocol::project::FilesystemIdentity {}
+impl Closed for kr_protocol::project::InclusionClass {}
+impl Closed for kr_protocol::project::InclusionPolicy {}
+impl Closed for kr_protocol::project::IsolationMechanism {}
+impl Closed for kr_protocol::project::OperationState {}
+impl Closed for kr_protocol::project::PreviewCount {}
+impl Closed for kr_protocol::project::ProjectOrigin {}
+impl Closed for kr_protocol::project::ProjectState {}
+impl Closed for kr_protocol::project::RemoteTransport {}
+impl Closed for kr_protocol::project::RetainedKind {}
+impl Closed for kr_protocol::project::WorkspaceKind {}
+impl Closed for kr_protocol::project::WorkspaceState {}
 
 /// One `--json` document: keys of this program's own, each holding a [`Held`] value.
 #[derive(Default)]
@@ -897,6 +958,51 @@ mod tests {
         assert_closed::<kr_protocol::pairing::ConfirmationChannel>();
         assert_closed::<kr_protocol::pairing::DevicePlatform>();
         assert_closed::<kr_protocol::pairing::PairingConsumedReason>();
+        assert_closed::<kr_protocol::identity::EnvironmentAccess>();
+        assert_closed::<kr_protocol::identity::EnvironmentPresence>();
+        assert_closed::<kr_protocol::identity::ObservationSource>();
+        assert_closed::<kr_protocol::local::LocalRole>();
+        assert_closed::<kr_protocol::hello::ProtocolVersion>();
+        assert_closed::<kr_protocol::catalogue::CatalogueBudgets>();
+        assert_closed::<kr_protocol::catalogue::CatalogueKind>();
+        assert_closed::<kr_protocol::catalogue::PluginGrantRequirement>();
+        assert_closed::<kr_protocol::catalogue::PluginLeftOutReason>();
+        assert_closed::<kr_protocol::changeset::ApplyOutcomeClass>();
+        assert_closed::<kr_protocol::changeset::CaptureCount>();
+        assert_closed::<kr_protocol::changeset::ContentOrigin>();
+        assert_closed::<kr_protocol::changeset::DestinationClass>();
+        assert_closed::<kr_protocol::changeset::EvidenceKind>();
+        assert_closed::<kr_protocol::changeset::ExclusionReason>();
+        assert_closed::<kr_protocol::changeset::MaterialisationPurpose>();
+        assert_closed::<kr_protocol::changeset::PathClass>();
+        assert_closed::<kr_protocol::changeset::PathProgressState>();
+        assert_closed::<kr_protocol::changeset::SourceConsistency>();
+        assert_closed::<kr_protocol::changeset::TestedSource>();
+        assert_closed::<kr_protocol::changeset::TreeSummary>();
+        assert_closed::<kr_protocol::changeset::VersionRef>();
+        assert_closed::<kr_protocol::project::ContentClass>();
+        assert_closed::<kr_protocol::ids::ChangeSetId>();
+        assert_closed::<kr_protocol::ids::ChangeSetVersion>();
+        assert_closed::<kr_protocol::ids::EnvironmentId>();
+        assert_closed::<kr_protocol::ids::MaterialisationId>();
+        assert_closed::<kr_protocol::ids::ProjectRepositoryId>();
+        assert_closed::<kr_protocol::ids::RepositoryGeneration>();
+        assert_closed::<kr_protocol::ids::WorkflowRunId>();
+        assert_closed::<kr_protocol::ids::WorkspaceId>();
+        assert_closed::<kr_protocol::project::ChangeKind>();
+        assert_closed::<kr_protocol::project::DestinationState>();
+        assert_closed::<kr_protocol::project::FilesystemIdentity>();
+        assert_closed::<kr_protocol::project::InclusionClass>();
+        assert_closed::<kr_protocol::project::InclusionPolicy>();
+        assert_closed::<kr_protocol::project::IsolationMechanism>();
+        assert_closed::<kr_protocol::project::OperationState>();
+        assert_closed::<kr_protocol::project::PreviewCount>();
+        assert_closed::<kr_protocol::project::ProjectOrigin>();
+        assert_closed::<kr_protocol::project::ProjectState>();
+        assert_closed::<kr_protocol::project::RemoteTransport>();
+        assert_closed::<kr_protocol::project::RetainedKind>();
+        assert_closed::<kr_protocol::project::WorkspaceKind>();
+        assert_closed::<kr_protocol::project::WorkspaceState>();
     }
 
     /// The negative control: a type with a leaf of free text fails the claim's check.

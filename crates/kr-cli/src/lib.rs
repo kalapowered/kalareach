@@ -7,6 +7,7 @@
 //!
 //! | Module | What it owns |
 //! | --- | --- |
+//! | [`answer`] | The host's answers printed whole with `--json`, leaf by leaf |
 //! | [`cli`] | The command surface: the commands, their short forms and the standard options |
 //! | [`account`] | The managed-service account token this host presents, and where it is kept |
 //! | [`bind`] | Which session, if any, this process is inside, as the sessions' workers answer |
@@ -37,6 +38,7 @@
 //! | [`error`] | The failures above, each with its own exit code |
 
 pub mod account;
+pub mod answer;
 pub mod attach;
 pub mod bind;
 pub mod bridge;

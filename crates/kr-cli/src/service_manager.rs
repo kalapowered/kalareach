@@ -713,17 +713,17 @@ pub struct Inspection {
 }
 
 impl Inspection {
-    /// The inspection as a command's `--json` output reports it.
+    /// The inspection as a command's `--json` output reports it: the label and the domain as this
+    /// program writes them, and the definition's place as a sentence says it.
     #[must_use]
-    pub fn json(&self) -> serde_json::Value {
-        serde_json::json!({
-            "manager": self.manager.as_str(),
-            "label": self.label,
-            "domain": self.domain,
-            "path": self.path.display().to_string(),
-            "state": self.state.as_str(),
-            "recorded": self.recorded,
-        })
+    pub fn json(&self) -> crate::output::Document {
+        crate::output::Document::new()
+            .with("manager", self.manager.as_str())
+            .with("label", label_said(&self.label))
+            .with("domain", self.domain.as_deref().map(domain_said))
+            .with("path", self.said.clone())
+            .with("state", self.state.as_str())
+            .with("recorded", self.recorded)
     }
 
     /// The inspection as a sentence for a person.
@@ -791,7 +791,7 @@ pub fn inspect(
 /// What `kr host startup --set service` did.
 pub struct Installed {
     /// What a person should know about what the manager holds.
-    pub notes: Vec<String>,
+    pub notes: Vec<Shown>,
 }
 
 /// Writes the definition of an environment's daemon, records it, and has the manager take it.
@@ -906,7 +906,7 @@ pub struct Removal {
     /// Every file left where it was, and why.
     pub left: Vec<(PathBuf, Shown)>,
     /// What a person should know about what the manager still holds.
-    pub notes: Vec<String>,
+    pub notes: Vec<Shown>,
 }
 
 /// Removes exactly what `kr host startup --set service` wrote for an environment, and its record,
@@ -1518,7 +1518,7 @@ mod platform {
     /// Has launchd hold the definition just written, with the environment's service lock held: it is
     /// loaded where launchd holds nothing under its label. Anything else launchd holds there is
     /// named with its remedy, and the definition stays written and recorded.
-    pub(super) fn take(definition: &Definition) -> Result<Vec<String>> {
+    pub(super) fn take(definition: &Definition) -> Result<Vec<Shown>> {
         let domain = definition.domain.as_deref().unwrap_or_default();
         let target = definition.target();
         let said = definition.target_said();
@@ -1576,26 +1576,30 @@ mod platform {
     /// What launchd still holds of a definition kr is removing, or has moved away from, told
     /// rather than changed: launchd keeps a job it loaded until its domain ends, and a job that
     /// runs a daemon keeps it running.
-    pub(super) fn release(record: &Record) -> Vec<String> {
+    pub(super) fn release(record: &Record) -> Vec<Shown> {
         let target = record.target();
-        match job(&target, &record.target_said()) {
+        let said = record.target_said();
+        match job(&target, &said) {
             Ok(Job::NotLoaded) => Vec::new(),
             Ok(Job::Loaded(loaded)) if !loaded.from(&record.path) => Vec::new(),
-            Ok(Job::Loaded(Loaded { pid: Some(pid), .. })) => vec![format!(
-                "the daemon launchd started (process {pid}) keeps serving, and launchd keeps its \
-                 job {target} until its domain ends"
+            Ok(Job::Loaded(Loaded { pid: Some(pid), .. })) => vec![shown!(
+                "the daemon launchd started (process {}) keeps serving, and launchd keeps its \
+                 job {} until its domain ends",
+                pid,
+                said
             )],
-            Ok(Job::Loaded(_)) => vec![format!(
-                "launchd keeps the job {target} until its domain ends; kr asks it to start \
-                 nothing more, though a start requested earlier may still complete"
+            Ok(Job::Loaded(_)) => vec![shown!(
+                "launchd keeps the job {} until its domain ends; kr asks it to start nothing \
+                 more, though a start requested earlier may still complete",
+                said
             )],
-            Err(why) => vec![format!("launchd could not be asked about {target}: {why}")],
+            Err(why) => vec![shown!("launchd could not be asked about {}: {}", said, why)],
         }
     }
 
     /// Nothing to tell launchd once a definition's file has gone: it read the file when it loaded
     /// it.
-    pub(super) fn forget(_record: &Record) -> Vec<String> {
+    pub(super) fn forget(_record: &Record) -> Vec<Shown> {
         Vec::new()
     }
 
@@ -2315,22 +2319,26 @@ mod platform {
     /// Has the user manager read the definition just written, and checks that it would run it as
     /// kr wrote it. What it holds otherwise is named with where the drop-ins it reads are shown,
     /// and the definition stays written and recorded. Drop-ins it applies besides are named too.
-    pub(super) fn take(definition: &Definition) -> Result<Vec<String>> {
+    pub(super) fn take(definition: &Definition) -> Result<Vec<Shown>> {
         let failed = CliError::HostUnavailable;
         reload().map_err(failed)?;
-        let found = unit(&definition.target(), &definition.target_said()).map_err(failed)?;
+        let said = definition.target_said();
+        let found = unit(&definition.target(), &said).map_err(failed)?;
         match found.difference(definition) {
             None if found.drop_ins.is_empty() => Ok(Vec::new()),
-            None => Ok(vec![format!(
+            // A drop-in is a file somebody put beside the unit, named by the listing that found it,
+            // so it is said as this installation's paths are.
+            None => Ok(vec![shown!(
                 "the user manager runs {} as kr wrote it, and applies what else these drop-ins set \
                  for it: {}",
-                definition.target(),
-                found
-                    .drop_ins
-                    .iter()
-                    .map(|drop_in| drop_in.display().to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                said,
+                Shown::joined(
+                    found
+                        .drop_ins
+                        .iter()
+                        .map(|drop_in| Shown::host_path(drop_in)),
+                    ", "
+                )
             )]),
             Some(why) => Err(CliError::HostUnavailable(shown!(
                 "{}; then run kr host startup --set service again. The definition is written and \
@@ -2355,28 +2363,32 @@ mod platform {
 
     /// What the user manager still holds of a definition kr is removing, told rather than changed:
     /// a running daemon keeps its unit until it stops.
-    pub(super) fn release(record: &Record) -> Vec<String> {
-        match unit(&record.target(), &record.target_said()) {
-            Ok(Unit { pid: Some(pid), .. }) => vec![format!(
-                "the daemon the user manager started (process {pid}) keeps serving, and the \
-                 manager keeps its unit {} until that daemon stops",
-                record.target()
+    pub(super) fn release(record: &Record) -> Vec<Shown> {
+        let said = record.target_said();
+        match unit(&record.target(), &said) {
+            Ok(Unit { pid: Some(pid), .. }) => vec![shown!(
+                "the daemon the user manager started (process {}) keeps serving, and the manager \
+                 keeps its unit {} until that daemon stops",
+                pid,
+                said
             )],
             Ok(_) => Vec::new(),
-            Err(why) => vec![format!(
-                "the user manager could not be asked about {}: {why}",
-                record.target()
+            Err(why) => vec![shown!(
+                "the user manager could not be asked about {}: {}",
+                said,
+                why
             )],
         }
     }
 
     /// Tells the user manager that the unit's file has gone.
-    pub(super) fn forget(_record: &Record) -> Vec<String> {
+    pub(super) fn forget(_record: &Record) -> Vec<Shown> {
         match reload() {
             Ok(()) => Vec::new(),
-            Err(why) => vec![format!(
+            Err(why) => vec![shown!(
                 "the user manager was not told the definition has gone, and forgets it at its \
-                 next reload: {why}"
+                 next reload: {}",
+                why
             )],
         }
     }
@@ -2446,7 +2458,7 @@ mod platform {
         Err(unsupported())
     }
 
-    pub(super) fn take(_definition: &Definition) -> Result<Vec<String>> {
+    pub(super) fn take(_definition: &Definition) -> Result<Vec<Shown>> {
         Err(unsupported())
     }
 
@@ -2457,11 +2469,11 @@ mod platform {
         Err(Refusal::NotSetUp(Shown::said(UNSUPPORTED)))
     }
 
-    pub(super) fn release(_record: &Record) -> Vec<String> {
+    pub(super) fn release(_record: &Record) -> Vec<Shown> {
         Vec::new()
     }
 
-    pub(super) fn forget(_record: &Record) -> Vec<String> {
+    pub(super) fn forget(_record: &Record) -> Vec<Shown> {
         Vec::new()
     }
 

@@ -11,6 +11,7 @@
 //! reviewer would see. A removal never takes what a workspace still holds unless the person says
 //! so, and the answer lists what is held.
 
+use kr_client::shown;
 use kr_client::shown::Shown;
 use kr_ipc::paths::HostPaths;
 use kr_protocol::ids::{ChangeSetId, WorkspaceId};
@@ -28,7 +29,8 @@ use crate::cli::{
 };
 use crate::daemon::{Daemon, identifier};
 use crate::error::{CliError, Result};
-use crate::report;
+use crate::output::{self, Asked, Line, Request, left};
+use crate::{answer, stdout_line};
 
 /// Runs one `kr workspace` command and prints its result.
 ///
@@ -61,12 +63,12 @@ async fn list(paths: &HostPaths, arguments: &WorkspaceListArguments, json: bool)
         )
         .await?;
     if json {
-        report::print_json(&report::answer(&listed)?);
+        output::document(&answer::workspace_list_result(&listed));
     } else if listed.workspaces.is_empty() {
-        println!("no workspaces");
+        output::say(&Shown::said("no workspaces"));
     } else {
         for workspace in &listed.workspaces {
-            println!("{}", line(workspace));
+            output::line(&line(workspace));
         }
     }
     Ok(())
@@ -131,21 +133,26 @@ async fn create(paths: &HostPaths, arguments: &WorkspaceCreateArguments, json: b
         )
         .await?;
     if json {
-        report::print_json(&report::answer(&created)?);
+        output::document(&answer::workspace_create_result(&created));
         return Ok(());
     }
     match created.workspace.as_ref() {
-        Some(workspace) => println!(
+        Some(workspace) => output::line(&stdout_line!(
             "Created workspace {} ({}) at {}.",
-            workspace.workspace_id,
-            report::wire_name(&workspace.kind),
-            workspace.display_path
-        ),
-        None => println!("Nothing was created. The workspace would hold:"),
+            output::closed_word(&workspace.workspace_id),
+            crate::shown::wire_word(workspace.kind),
+            Asked::path(Request::Workspaces, &workspace.display_path)
+        )),
+        None => output::say(&Shown::said(
+            "Nothing was created. The workspace would hold:",
+        )),
     }
-    print!("{}", preview(&created.preview));
+    output::lines(&preview(&created.preview));
     for path in &created.unapplied {
-        println!("not carried into the workspace: {path}");
+        output::line(&stdout_line!(
+            "not carried into the workspace: {}",
+            Asked::path(Request::Workspaces, path)
+        ));
     }
     Ok(())
 }
@@ -169,21 +176,27 @@ async fn remove(paths: &HostPaths, arguments: &WorkspaceRemoveArguments, json: b
         )
         .await?;
     if json {
-        report::print_json(&report::answer(&removed)?);
+        output::document(&answer::workspace_remove_result(&removed));
         return Ok(());
     }
-    println!(
+    output::say(&shown!(
         "Workspace {} is {}.",
-        removed.workspace.workspace_id,
-        report::wire_name(&removed.workspace.state)
-    );
+        output::closed_word(&removed.workspace.workspace_id),
+        crate::shown::wire_word(removed.workspace.state)
+    ));
     if removed.working_files_removed {
-        println!("Its working files are gone.");
+        output::say(&Shown::said("Its working files are gone."));
     }
     if !removed.retained.is_empty() {
-        println!("It still holds, until you remove it with --remove-retained:");
+        output::say(&Shown::said(
+            "It still holds, until you remove it with --remove-retained:",
+        ));
         for item in &removed.retained {
-            println!("  {}: {}", report::wire_name(&item.kind), item.detail);
+            output::say(&shown!(
+                "  {}: {}",
+                crate::shown::wire_word(item.kind),
+                crate::shown::exported("RetainedItem", "detail", &item.detail)
+            ));
         }
     }
     Ok(())
@@ -215,36 +228,42 @@ const fn isolation(argument: IsolationArgument) -> IsolationMechanism {
     }
 }
 
-/// What a reviewer would see, as lines for a person: the base, each class's counts and what the
-/// host says the preview cannot promise.
-fn preview(preview: &InclusionPreview) -> String {
-    let mut text = format!("  base {}\n", preview.base_revision);
+/// What a reviewer would see, as lines for a person: the base, each class's counts and, as their
+/// class and length, what the host says the preview cannot promise.
+fn preview(preview: &InclusionPreview) -> Vec<Line> {
+    let mut lines = vec![stdout_line!(
+        "  base {}",
+        crate::shown::git_revision(&preview.base_revision)
+    )];
     for count in &preview.counts {
-        text.push_str(&format!(
-            "  {:<20} {} of {} included\n",
-            count.class.as_str(),
+        lines.push(stdout_line!(
+            "  {} {} of {} included",
+            left(20, &count.class.as_str()),
             count.included.get(),
             count.total.get()
         ));
     }
     if !preview.counts_complete {
-        text.push_str("  the counts are lower bounds\n");
+        lines.push(stdout_line!("  the counts are lower bounds"));
     }
     for limitation in &preview.limitations {
-        text.push_str(&format!("  note: {limitation}\n"));
+        lines.push(stdout_line!(
+            "  note: {}",
+            crate::shown::exported("InclusionPreview", "limitations", limitation)
+        ));
     }
-    text
+    lines
 }
 
-/// One workspace as a line for a person.
-fn line(workspace: &WorkspaceSummary) -> String {
-    format!(
-        "{}  {:<15} {:<15} {}  {}",
-        workspace.workspace_id,
-        report::wire_name(&workspace.kind),
-        report::wire_name(&workspace.state),
-        workspace.label,
-        workspace.display_path,
+/// One workspace as a line for a person: its label and path are what the person asked for.
+fn line(workspace: &WorkspaceSummary) -> Line {
+    stdout_line!(
+        "{}  {} {} {}  {}",
+        output::closed_word(&workspace.workspace_id),
+        left(15, &crate::shown::wire_word(workspace.kind)),
+        left(15, &crate::shown::wire_word(workspace.state)),
+        Asked::text(Request::Workspaces, &workspace.label),
+        Asked::path(Request::Workspaces, &workspace.display_path),
     )
 }
 

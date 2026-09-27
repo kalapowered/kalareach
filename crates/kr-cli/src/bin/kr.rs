@@ -938,10 +938,14 @@ async fn run(cli: Cli) -> Result<Completion> {
                     // and writes this host's, and what it reports never carries the token.
                     let imported = kr_cli::account::import(&import.path)?;
                     if cli.json {
-                        print_json(&serde_json::json!({ "ok": true, "imported": imported }));
+                        output::document(
+                            &Document::new()
+                                .with("ok", true)
+                                .with("imported", imported.document()),
+                        );
                     } else {
                         for line in imported.lines() {
-                            println!("{line}");
+                            output::say(&line);
                         }
                     }
                     Ok(Completion::Done)
@@ -956,17 +960,10 @@ async fn run(cli: Cli) -> Result<Completion> {
                     // printed by anything.
                     let held = kr_cli::account::Held::of(&path, stored.as_ref());
                     if cli.json {
-                        print_json(&serde_json::json!({
-                            "ok": true,
-                            "path": held.path,
-                            "imported": held.imported,
-                            "origin": held.origin,
-                            "scopes": held.scopes,
-                            "unknown_scopes": held.unknown_scopes,
-                        }));
+                        output::document(&held.document());
                     } else {
                         for line in held.lines() {
-                            println!("{line}");
+                            output::say(&line);
                         }
                     }
                     Ok(Completion::Done)
@@ -1029,7 +1026,7 @@ async fn run(cli: Cli) -> Result<Completion> {
                 }
             };
             if cli.json {
-                print_json(&kr_cli::shell::to_json(&reports));
+                output::document(&kr_cli::shell::document(&reports));
             } else {
                 kr_cli::shell::print(&reports);
             }
@@ -1607,28 +1604,37 @@ async fn skill(
         SkillCommand::Install(_) => {
             let result = skill::install(&mut client, environment.environment_id, &params).await?;
             if json {
-                print_json(&serde_json::json!({"ok": true, "install": skill::installed(&result)}));
+                output::document(
+                    &Document::new()
+                        .with("ok", true)
+                        .with("install", skill::installed(&result)),
+                );
             } else {
-                print!("{}", skill::install_lines(&result));
+                output::lines(&skill::install_lines(&result));
             }
         }
         SkillCommand::Status(_) => {
             let result = skill::status(&mut client, &params).await?;
             if json {
-                print_json(&serde_json::json!({
-                    "ok": skill::is_intact(&result),
-                    "status": skill::reported(&result),
-                }));
+                output::document(
+                    &Document::new()
+                        .with("ok", skill::is_intact(&result))
+                        .with("status", skill::reported(&result)),
+                );
             } else {
-                print!("{}", skill::status_lines(&result));
+                output::lines(&skill::status_lines(&result));
             }
         }
         SkillCommand::Remove(_) => {
             let result = skill::remove(&mut client, environment.environment_id, &params).await?;
             if json {
-                print_json(&serde_json::json!({"ok": true, "remove": skill::removed(&result)}));
+                output::document(
+                    &Document::new()
+                        .with("ok", true)
+                        .with("remove", skill::removed(&result)),
+                );
             } else {
-                print!("{}", skill::remove_lines(&result));
+                output::lines(&skill::remove_lines(&result));
             }
         }
     }
@@ -1638,7 +1644,7 @@ async fn skill(
 fn stdio_is_terminal() -> bool {
     use std::io::IsTerminal as _;
 
-    std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
+    std::io::stdin().is_terminal() && output::is_terminal()
 }
 
 /// Reads one host answer, on a new connection when the authority behind this one was withdrawn.
@@ -1688,13 +1694,6 @@ fn typed<T: kr_protocol::wire::WireMessage>(
                 Shown::cbor(&error)
             ))
         })
-}
-
-fn print_json(value: &serde_json::Value) {
-    println!(
-        "{}",
-        serde_json::to_string_pretty(value).unwrap_or_else(|_| "{}".to_owned())
-    );
 }
 
 #[cfg(test)]
