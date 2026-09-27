@@ -207,3 +207,63 @@ fn an_effective_value_carries_its_source_and_its_effect() {
     assert_eq!(reported.source, ValueSource::Request);
     assert_eq!(reported.effect, ValueEffect::NewSessionsOnly);
 }
+
+/// KR-REQ-12.07: the command integrations a new session applies resolve on the ladder: a profile's
+/// list replaces the host's, an empty one turns every integration off, and a profile that names
+/// none leaves the host's; with no document, none is on.
+#[test]
+fn command_integrations_resolve_on_the_ladder() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let environment = temp.environment();
+    let absent = Resolver::open(&environment).command_integrations();
+    assert!(absent.value.is_empty());
+    assert_eq!(absent.source, ValueSource::Default);
+    assert_eq!(absent.preference.effect, ValueEffect::NewSessionsOnly);
+
+    let named = |plugins: &[&str]| -> Vec<String> {
+        plugins.iter().map(|plugin| (*plugin).to_owned()).collect()
+    };
+    let mut document = ConfigurationDocument::empty();
+    document.preferences.command_integrations =
+        Nullable::some(named(&["kalareach/claude-code", "kalareach/gemini-cli"]));
+    for (name, list) in [
+        ("quiet", Some(named(&[]))),
+        ("one", Some(named(&["kalareach/qoder-cli"]))),
+        ("silent", None),
+    ] {
+        document.profiles.insert(
+            name.to_owned(),
+            PreferenceSet {
+                command_integrations: Nullable(list),
+                ..PreferenceSet::default()
+            },
+        );
+    }
+    kr_ipc::paths::write_owner_only_file(
+        &document_path(&environment),
+        configuration::contents(&document).as_bytes(),
+    )
+    .expect("writes the document");
+
+    let host = Resolver::open(&environment).command_integrations();
+    assert_eq!(
+        host.value,
+        named(&["kalareach/claude-code", "kalareach/gemini-cli"])
+    );
+    assert_eq!(host.source, ValueSource::HostConfiguration);
+    for (profile, expected, source) in [
+        ("quiet", named(&[]), ValueSource::Profile),
+        ("one", named(&["kalareach/qoder-cli"]), ValueSource::Profile),
+        (
+            "silent",
+            named(&["kalareach/claude-code", "kalareach/gemini-cli"]),
+            ValueSource::HostConfiguration,
+        ),
+    ] {
+        let resolved = Resolver::open(&environment)
+            .with_profile(Some(profile.to_owned()))
+            .command_integrations();
+        assert_eq!(resolved.value, expected, "{profile}");
+        assert_eq!(resolved.source, source, "{profile}");
+    }
+}

@@ -261,6 +261,20 @@ impl Resolver {
         )
     }
 
+    /// Resolves the installed packages whose command integration a new session applies.
+    ///
+    /// No request names them: a session is created with what its environment's configuration
+    /// turns on. A profile's list replaces the host's rather than adding to it, and the product
+    /// default turns none on, because an integration changes how a person's own program runs and
+    /// is the owner's choice to make.
+    #[must_use]
+    pub fn command_integrations(&self) -> Effective<Vec<String>> {
+        configuration::resolve(
+            configuration::COMMAND_INTEGRATIONS,
+            self.layers(None, |set| set.command_integrations.0.clone(), Vec::new()),
+        )
+    }
+
     /// Resolves the runtime tree this installation uses.
     ///
     /// The allowlisted variable acts at the request rung, which is where

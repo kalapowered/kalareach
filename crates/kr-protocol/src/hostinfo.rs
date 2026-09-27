@@ -1341,6 +1341,9 @@ pub mod configuration {
     /// How many profiles one document may declare.
     pub const MAX_PROFILES: usize = 64;
 
+    /// How many packages one rung's `command_integrations` may name.
+    pub const MAX_COMMAND_INTEGRATIONS: usize = 64;
+
     /// The largest session ceiling this host can record.
     ///
     /// The registry keeps the number in a signed 64-bit column, which is the limit every SQLite
@@ -1478,6 +1481,15 @@ pub mod configuration {
         pub sleep_inhibition: Nullable<SleepInhibitionSetting>,
         /// The execution context a session is created in when the request does not choose one.
         pub worker_profile: Nullable<WorkerProfile>,
+        /// The installed packages, each as `publisher/plugin`, whose command integration a session
+        /// created from now on applies: the command, flags and variables that package's verified
+        /// manifest declares, added to an interactive invocation of that command.
+        ///
+        /// Section 12's opt-in. Absent leaves the choice to the rung below; an empty list turns
+        /// every integration off at this rung; a list replaces the one below it rather than adding
+        /// to it. A package named here that this environment has not installed, does not admit, or
+        /// has not granted `command_integration.launch` integrates nothing, and the doctor says why.
+        pub command_integrations: Nullable<Vec<String>>,
     }
 
     impl Default for PreferenceSet {
@@ -1486,6 +1498,7 @@ pub mod configuration {
             Self {
                 sleep_inhibition: Nullable::null(),
                 worker_profile: Nullable::null(),
+                command_integrations: Nullable::null(),
             }
         }
     }
@@ -2499,6 +2512,14 @@ pub mod configuration {
         /// Choose how this environment's control daemon is started when a command finds none
         /// running, or clear the choice so that none is started.
         ControllerStartup(Option<ControllerStartup>),
+        /// Turn one installed package's command integration on or off for the sessions created
+        /// from now on, in this host's own list.
+        CommandIntegration {
+            /// The package, as `publisher/plugin`.
+            plugin_id: String,
+            /// Whether its integration is on.
+            enabled: bool,
+        },
     }
 
     impl Change {
@@ -2512,6 +2533,7 @@ pub mod configuration {
                 Self::GrantRights(_) => "grant_rights",
                 Self::Enrolment(_) => "enrolment",
                 Self::ControllerStartup(_) => STARTUP_CONTROLLER.key,
+                Self::CommandIntegration { .. } => COMMAND_INTEGRATIONS.key,
             }
         }
 
@@ -2523,7 +2545,9 @@ pub mod configuration {
                 | Self::SessionLimit(_)
                 | Self::GrantRights(_)
                 | Self::Enrolment(_) => ValueEffect::Immediately,
-                Self::WorkerProfile(_) => ValueEffect::NewSessionsOnly,
+                Self::WorkerProfile(_) | Self::CommandIntegration { .. } => {
+                    ValueEffect::NewSessionsOnly
+                }
                 Self::ControllerStartup(_) => Selection::EFFECT,
             }
         }
@@ -2690,6 +2714,7 @@ pub mod configuration {
             Change::ControllerStartup(startup) => {
                 document.startup.controller = Nullable(*startup);
             }
+            Change::CommandIntegration { .. } => {}
         }
         document.version = VERSION;
         document.revision = based_on + 1;
@@ -3057,15 +3082,23 @@ pub mod configuration {
         about: "the state tree holding the registry, journals and this document",
     };
 
+    /// The installed packages whose command integration a new session applies.
+    pub const COMMAND_INTEGRATIONS: Preference = Preference {
+        key: "command_integrations",
+        effect: ValueEffect::NewSessionsOnly,
+        about: "the installed packages whose command integration a new session applies",
+    };
+
     /// Every preference this host resolves, in the order `kr doctor` prints them.
     ///
     /// The two directories are here because they resolve through [`resolve`] like everything else:
     /// an allowlisted variable supplies them at the request rung, and the platform default is the
     /// bottom rung. Keeping them in this table is also what makes the allowlist checkable, because
     /// every entry must name a key that appears here.
-    pub const PREFERENCES: [Preference; 4] = [
+    pub const PREFERENCES: [Preference; 5] = [
         SLEEP_INHIBITION,
         WORKER_PROFILE,
+        COMMAND_INTEGRATIONS,
         RUNTIME_DIRECTORY,
         STATE_DIRECTORY,
     ];
@@ -7977,5 +8010,154 @@ mod tests {
             EffectiveConfiguration::unread(),
         );
         assert!(!result.healthy);
+    }
+
+    /// KR-REQ-12.07: a command integration is turned on and off one package at a time, in the
+    /// host's own list, for the sessions created from then on; a document without the list reads
+    /// as it did.
+    #[test]
+    fn a_command_integration_is_turned_on_and_off_for_new_sessions() {
+        use configuration::{Change, Loaded, ValueEffect};
+
+        let change = |plugin: &str, enabled: bool| Change::CommandIntegration {
+            plugin_id: plugin.to_owned(),
+            enabled,
+        };
+        assert_eq!(
+            change("kalareach/claude-code", true).key(),
+            "command_integrations"
+        );
+        assert_eq!(
+            change("kalareach/claude-code", true).effect(),
+            ValueEffect::NewSessionsOnly
+        );
+        assert_eq!(
+            configuration::preference("command_integrations").map(|preference| preference.effect),
+            Some(ValueEffect::NewSessionsOnly)
+        );
+
+        let listed = |loaded: &Loaded| {
+            loaded
+                .document
+                .as_ref()
+                .and_then(|document| document.preferences.command_integrations.0.clone())
+        };
+        let mut loaded = configuration::load(None);
+        for (step, expected) in [
+            (
+                change("kalareach/gemini-cli", true),
+                &["kalareach/gemini-cli"][..],
+            ),
+            (
+                change("kalareach/claude-code", true),
+                &["kalareach/claude-code", "kalareach/gemini-cli"][..],
+            ),
+            (
+                change("kalareach/claude-code", true),
+                &["kalareach/claude-code", "kalareach/gemini-cli"][..],
+            ),
+            (
+                change("kalareach/gemini-cli", false),
+                &["kalareach/claude-code"][..],
+            ),
+            (
+                change("kalareach/qoder-cli", false),
+                &["kalareach/claude-code"][..],
+            ),
+            (change("kalareach/claude-code", false), &[][..]),
+        ] {
+            let edited = configuration::edit(&loaded, &step).expect("a valid edit");
+            assert_eq!(edited.effect, ValueEffect::NewSessionsOnly);
+            loaded = configuration::load(Some(edited.contents.as_bytes()));
+            assert_eq!(
+                listed(&loaded),
+                Some(expected.iter().map(|plugin| (*plugin).to_owned()).collect()),
+                "{step:?}"
+            );
+        }
+
+        let without = configuration::load(Some(
+            br#"{"version":1,"revision":3,"preferences":{"sleep_inhibition":"off"}}"#,
+        ));
+        assert_eq!(
+            listed(&without),
+            None,
+            "a document without the list reads as it did"
+        );
+    }
+
+    /// KR-REQ-12.07: a configured command integration names a package, each once and within the
+    /// bound, on the host's rung and on a profile's; a refused entry is named by its class rather
+    /// than repeated.
+    #[test]
+    fn a_configured_command_integration_names_a_package_once() {
+        let at_host = |list: Vec<String>| {
+            let mut document = ConfigurationDocument::empty();
+            document.preferences.command_integrations = Nullable::some(list);
+            document
+        };
+        let in_profile = |list: Vec<String>| {
+            let mut document = ConfigurationDocument::empty();
+            document.profiles.insert(
+                "review".to_owned(),
+                PreferenceSet {
+                    command_integrations: Nullable::some(list),
+                    ..PreferenceSet::default()
+                },
+            );
+            document
+        };
+        let named = |plugins: &[&str]| -> Vec<String> {
+            plugins.iter().map(|plugin| (*plugin).to_owned()).collect()
+        };
+        for document in [
+            at_host(named(&[
+                "kalareach/claude-code",
+                "someone.example/their-agent",
+            ])),
+            in_profile(named(&[])),
+            at_host(
+                (0..configuration::MAX_COMMAND_INTEGRATIONS)
+                    .map(|index| format!("kalareach/p{index}"))
+                    .collect(),
+            ),
+        ] {
+            configuration::validate(&document).expect("a list of packages");
+        }
+        for list in [
+            named(&["claude-code"]),
+            named(&["Kalareach/Claude-Code"]),
+            named(&["kalareach/claude code"]),
+            named(&["kalareach/claude-code/extra"]),
+            named(&["/claude-code"]),
+            named(&[""]),
+            named(&["kalareach/claude-code", "kalareach/claude-code"]),
+            (0..=configuration::MAX_COMMAND_INTEGRATIONS)
+                .map(|index| format!("kalareach/p{index}"))
+                .collect(),
+        ] {
+            for document in [at_host(list.clone()), in_profile(list.clone())] {
+                configuration::validate(&document)
+                    .expect_err(&format!("{list:?} is not a list of packages, each once"));
+            }
+        }
+
+        let refused = configuration::edit(
+            &configuration::load(None),
+            &configuration::Change::CommandIntegration {
+                plugin_id: "sk-live-abc123 kalareach".to_owned(),
+                enabled: true,
+            },
+        );
+        let Err(configuration::EditRefused::Invalid(problems)) = refused else {
+            panic!("an entry that names no package is refused: {refused:?}");
+        };
+        let listed = problems
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("; ");
+        assert!(!listed.contains("sk-live-abc123"), "{listed}");
+        assert!(listed.contains("[name withheld, 24 bytes]"), "{listed}");
     }
 }

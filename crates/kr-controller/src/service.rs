@@ -7475,10 +7475,10 @@ impl Controller {
 
     /// The ordinary preferences the last acceptance put in force.
     fn in_force(&self) -> crate::config::InForce {
-        *self
-            .in_force
+        self.in_force
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// Returns what this host's configuration currently resolves to.

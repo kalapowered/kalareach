@@ -1252,3 +1252,52 @@ fn the_network_check_says_what_is_in_force_and_what_waits_for_the_next_start() {
          service names no managed broker"
     );
 }
+
+/// KR-REQ-12.07, KR-REQ-26.13: the command integrations a new session applies are in force once
+/// the document is accepted, and the report names them with their source and their effect, as
+/// names an export withholds; with none on, the report says so.
+#[test]
+fn the_command_integrations_in_force_are_reported_with_their_source() {
+    use kr_protocol::hostinfo::export::ContentClass;
+
+    let temp = kr_ipc::testing::TempHost::create();
+    let environment = temp.environment();
+    let change = |plugin: &str, enabled: bool| Change::CommandIntegration {
+        plugin_id: plugin.to_owned(),
+        enabled,
+    };
+    edit_once(&environment, &change("kalareach/claude-code", true)).expect("the owner's choice");
+    edit_once(&environment, &change("kalareach/gemini-cli", true)).expect("the owner's choice");
+    assert_eq!(
+        InForce::of(&open(&environment)).command_integrations,
+        ["kalareach/claude-code", "kalareach/gemini-cli"]
+    );
+    let report = reported(&environment);
+    let row = report
+        .values
+        .iter()
+        .find(|value| value.key == "command_integrations")
+        .expect("the command integrations");
+    assert_eq!(row.value(), "kalareach/claude-code, kalareach/gemini-cli");
+    assert_eq!(row.class(), ContentClass::Name);
+    assert_eq!(
+        row.source,
+        kr_protocol::hostinfo::configuration::ValueSource::HostConfiguration
+    );
+    assert_eq!(row.effect, ValueEffect::NewSessionsOnly);
+
+    edit_once(&environment, &change("kalareach/claude-code", false)).expect("the owner's choice");
+    edit_once(&environment, &change("kalareach/gemini-cli", false)).expect("the owner's choice");
+    assert!(
+        InForce::of(&open(&environment))
+            .command_integrations
+            .is_empty()
+    );
+    let report = reported(&environment);
+    let row = report
+        .values
+        .iter()
+        .find(|value| value.key == "command_integrations")
+        .expect("the command integrations");
+    assert_eq!(row.value(), "none");
+}

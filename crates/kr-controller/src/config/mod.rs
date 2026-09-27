@@ -267,7 +267,7 @@ pub struct AcceptedState {
 /// the desktop reading a session is created in - run outside the acceptance that decided it. This
 /// is the value they read, written from the document that was accepted, so an effect acts on the
 /// reading the report describes rather than on a second reading taken a moment later.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InForce {
     /// Whether this host keeps itself awake for work it has admitted, and on which power source.
     pub sleep_inhibition: SleepInhibitionSetting,
@@ -276,15 +276,18 @@ pub struct InForce {
     /// The product default is the platform's own answer, which is established when the desktop is
     /// read rather than here, so this is the choice above it rather than the resolved value.
     pub worker_profile: Option<WorkerProfile>,
+    /// The installed packages whose command integration a session created now applies.
+    pub command_integrations: Vec<String>,
 }
 
 impl InForce {
-    /// Reads both preferences from one configuration.
+    /// Reads the preferences from one configuration.
     #[must_use]
     pub fn of(resolver: &Resolver) -> Self {
         Self {
             sleep_inhibition: resolver.sleep_inhibition(None).value,
             worker_profile: resolver.chosen_worker_profile(),
+            command_integrations: Vec::new(),
         }
     }
 }
