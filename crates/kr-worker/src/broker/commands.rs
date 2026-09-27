@@ -1910,13 +1910,13 @@ mod tests {
         std::fs::create_dir_all(&directory).expect("a directory");
         let program = directory.join("program");
         std::fs::write(&program, [0x7f, b'E', b'L', b'F']).expect("a program");
-        for (mode, expected) in [
-            (0o700, true),
-            (0o755, true),
-            (0o600, false),
-            (0o601, false),
-            (0o610, false),
-        ] {
+        let mut modes = vec![(0o700, true), (0o755, true), (0o600, false)];
+        // The superuser may execute a file any execute bit allows, so only an ordinary account
+        // has a mode that lets another account execute a file and not itself.
+        if !rustix::process::geteuid().is_root() {
+            modes.extend([(0o601, false), (0o610, false)]);
+        }
+        for (mode, expected) in modes {
             std::fs::set_permissions(&program, std::fs::Permissions::from_mode(mode))
                 .expect("its mode");
             assert_eq!(runnable(&program), expected, "mode {mode:o}");

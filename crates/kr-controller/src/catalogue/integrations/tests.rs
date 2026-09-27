@@ -591,7 +591,14 @@ fn a_candidate_this_account_cannot_execute_is_passed_over() {
     let first = store.0.join("first");
     let second = store.0.join("second");
     let locked = executable(&first, "claude");
-    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o601)).expect("its mode");
+    // The superuser may execute a file any execute bit allows, so only a file with none is closed
+    // to it; an ordinary account is given one only another account may execute.
+    let closed = if rustix::process::geteuid().is_root() {
+        0o600
+    } else {
+        0o601
+    };
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(closed)).expect("its mode");
     let runnable = executable(&second, "claude");
     assert_eq!(
         resolve_with("claude", &[first, second], &[String::new()]),
