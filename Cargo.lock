@@ -4600,6 +4600,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "kr-faults"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "kr-cli",
+ "kr-client",
+ "kr-crypto",
+ "kr-ipc",
+ "kr-protocol",
+ "kr-term",
+ "kr-worker",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "kr-flush"
 version = "0.1.0"
 dependencies = [
