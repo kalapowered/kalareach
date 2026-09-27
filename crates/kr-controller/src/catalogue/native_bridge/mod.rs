@@ -844,6 +844,11 @@ impl NativeBridges {
 
     /// Reads every executable the package's match rules name on the search path and holds each to
     /// the recipe's range by the version a signed record names for its digest.
+    ///
+    /// The search joins each match rule's bare name to each directory and adds no executable
+    /// suffix, which is how macOS and Linux name a program. It never runs on Windows, where a
+    /// command is found by its suffixes: [`Self::preflight`] is its only caller and refuses there
+    /// first, through [`supported_platform`], before it looks for anything.
     fn versions(
         &self,
         target: &BridgeTarget,
