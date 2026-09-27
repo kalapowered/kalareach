@@ -3007,8 +3007,10 @@ fn turn_runs(
 /// of that prompt's answer.
 #[derive(Clone, Copy, Debug, serde::Serialize)]
 struct Order {
-    /// Whether the running turn still ran just before and just after the second prompt was
-    /// submitted: both readings below.
+    /// Whether the running turn still ran across the second prompt's submission: just before, the
+    /// view showed it busy and the conversation held no closing reply; just after, the conversation
+    /// still held none. The view's own reading just after is kept but not required, since an agent
+    /// can redraw its status line once a prompt waits behind the turn.
     busy_at_submission: bool,
     /// The reading just before.
     before: Running,
@@ -3175,7 +3177,7 @@ fn slash_commands_interrupts_queued_prompts_and_steering_each_work_from_a_device
             &[&format!("{mark}-r"), &account.prompt_line],
         );
         let queue = Order {
-            busy_at_submission: before_queue.holds() && after_queue.holds(),
+            busy_at_submission: before_queue.holds() && after_queue.unfinished,
             before: before_queue,
             after: after_queue,
             first_finished: first_line_with(
@@ -3246,7 +3248,7 @@ fn slash_commands_interrupts_queued_prompts_and_steering_each_work_from_a_device
                 &[&format!("{mark}-t"), &account.prompt_line],
             );
             let steer = Order {
-                busy_at_submission: before_steer.holds() && after_steer.holds(),
+                busy_at_submission: before_steer.holds() && after_steer.unfinished,
                 before: before_steer,
                 after: after_steer,
                 first_finished: first_line_with(
