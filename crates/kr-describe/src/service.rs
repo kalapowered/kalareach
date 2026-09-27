@@ -1827,7 +1827,7 @@ impl DescriptionService {
     }
 
     /// Puts a job back in the queue with its aging position. A job put back after a failure is put
-    /// back once: its session's next failure is not retried.
+    /// back once: its session's next failure is not retried, however many pauses come between.
     fn requeue(&mut self, dispatched: Dispatched, after_failure: bool) -> Outcome {
         let session_id = dispatched.job.session_id;
         // A job whose session closed, or opened again, belongs to a session that is gone.
@@ -1838,7 +1838,7 @@ impl DescriptionService {
             self.counts.cancelled = self.counts.cancelled.saturating_add(1);
             return Outcome::Cancelled { session_id };
         }
-        if after_failure {
+        if after_failure || dispatched.requeued_before {
             self.retried.insert(session_id);
         }
         self.scheduler.requeue(dispatched.job);

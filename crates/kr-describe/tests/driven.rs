@@ -1390,6 +1390,70 @@ fn a_session_opened_again_owes_nothing_to_an_earlier_failure() {
     }
 }
 
+/// KR-REQ-22.21: a job is retried once after a failure, however many pauses come between. A job
+/// that failed, was sent again, was stopped by a pause and sent once more after it, ends failed
+/// when its process fails a second time. The control is its first failure, which queues it again.
+#[test]
+fn a_pause_between_a_failure_and_its_retry_keeps_the_retry_used() {
+    let hot = HostConditions::measured(
+        16 * GIB,
+        12 * GIB,
+        PowerSource::Mains,
+        ThermalState::Critical,
+    );
+    let mut service = service();
+    queue(&mut service, &session(1), "kalareach", at(0));
+    assert!(matches!(
+        loaded(&mut service, at(3_000)),
+        Instruction::Generate { .. }
+    ));
+    // The control: the first failure queues the job again.
+    assert_eq!(
+        service
+            .process_ended(ProcessEnd::Exited, at(3_100))
+            .expect("the end")[0],
+        Outcome::Requeued {
+            session_id: session(1)
+        }
+    );
+    // The retry is sent, and a pause stops it.
+    let (now, id, _) = next_job(&mut service, at(3_100 + RESTART_FIRST_MS));
+    assert_eq!(
+        service
+            .next(&hot, now.after_ms(50))
+            .expect("an instruction"),
+        Instruction::Cancel {
+            id,
+            work: Work::Job
+        }
+    );
+    assert_eq!(
+        service
+            .finished(
+                id,
+                Answered::Ended {
+                    why: JobEnd::Cancelled,
+                    detail: None,
+                },
+                now.after_ms(100),
+            )
+            .expect("the answer"),
+        Outcome::Requeued {
+            session_id: session(1)
+        }
+    );
+    // The pause clears, the job is sent once more, and its process fails again.
+    let (now, _, _) = next_job(&mut service, now.after_ms(60_000));
+    let ended = service
+        .process_ended(ProcessEnd::Exited, now.after_ms(100))
+        .expect("the end");
+    assert!(
+        matches!(ended[0], Outcome::Failed { session_id, .. } if session_id == session(1)),
+        "{ended:?}"
+    );
+    assert_eq!(service.scheduler().queued(), 0);
+}
+
 /// Builds a service over a store of the test's own.
 fn service_over(store: DescriptionStore) -> DescriptionService {
     DescriptionService::new(
