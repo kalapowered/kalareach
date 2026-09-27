@@ -6362,8 +6362,9 @@ async fn kr_req_12_11_a_backlog_larger_than_one_page_recovers_in_pages() {
 /// is about is what a client receives. The view's own queue is filled until the worker tells it to
 /// resynchronise. A resource then settles while the view is holding nothing — those events are not
 /// queued for it at all, by design. What the view is given when it subscribes again is the state
-/// as it now stands, at the position it stands at: the resource that settled is gone from it, the
-/// ones still open are in it, and the position says which later events it must still apply.
+/// as it now stands, at the position it stands at: the resource that settled is in it as it ended,
+/// because its connection is still open, the ones still open are in it, and the position says
+/// which later events it must still apply.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_12_13_a_resynchronised_view_is_given_the_brokers_state_and_its_position() {
     let host = kr_ipc::testing::TempHost::create();

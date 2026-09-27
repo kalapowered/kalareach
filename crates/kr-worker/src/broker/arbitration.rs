@@ -808,23 +808,39 @@ impl Arbitration {
         self.volatile_touched.clear();
     }
 
-    /// Forgets every resource that has reached a terminal state.
+    /// Forgets every settled resource whose settlement is final, and returns how many it forgot.
     ///
-    /// The ledger keeps them; this is the live map, and a resolved resource in it is only a
-    /// resource a later answer has to be told about.
-    pub fn forget_resolved(&mut self) -> usize {
-        let resolved: Vec<PendingResourceId> = self
+    /// The ledger keeps every record; this is the live map, and it holds a settled resource only
+    /// while something can still name it. Its own connection can: a second answer, the upstream's
+    /// response and a request that reuses its identifier all arrive there, and the live record is
+    /// what refuses each of them without a store read. So a resource is forgotten once it has
+    /// reached a terminal state and its connection is not `open`. The one exception is a resource
+    /// the open gap touched while `gap_open`: its state is written only when the recovery commits
+    /// the gap, and the recovery reads it from here.
+    pub fn forget_resolved(
+        &mut self,
+        open: impl Fn(kr_protocol::ids::GatewayConnectionId) -> bool,
+        gap_open: bool,
+    ) -> usize {
+        let settled: Vec<PendingResourceId> = self
             .by_id
             .iter()
-            .filter(|(_, pending)| pending.resource.state.is_terminal())
+            .filter(|(resource_id, pending)| {
+                pending.resource.state.is_terminal()
+                    && !open(pending.resource.request.connection)
+                    && !(gap_open && self.volatile_touched.contains(resource_id))
+            })
             .map(|(resource_id, _)| *resource_id)
             .collect();
-        for resource_id in &resolved {
+        for resource_id in &settled {
             if let Some(pending) = self.by_id.remove(resource_id) {
                 self.by_request.remove(&pending.resource.request);
             }
+            // Outside a gap the set holds nothing a recovery still owes, and inside one a resource
+            // it holds is not forgotten.
+            self.volatile_touched.remove(resource_id);
         }
-        resolved.len()
+        settled.len()
     }
 
     /// Refuses a settlement for a claim whose answer was never dispatched.
@@ -1230,5 +1246,74 @@ mod tests {
                 .state,
             PendingState::Claimed
         );
+    }
+
+    /// A settled resource is kept while its connection is open, identifier and all, and forgotten
+    /// once the connection has gone; a pending one is kept either way, because a connection ending
+    /// is not an answer.
+    #[test]
+    fn a_settled_resource_is_forgotten_once_its_connection_has_gone() {
+        let mut arbitration = Arbitration::new();
+        let settled = resource(7, "11");
+        let settled_id = settled.resource_id;
+        let waiting = resource(8, "12");
+        let waiting_id = waiting.resource_id;
+        arbitration
+            .record(settled.clone(), None, None)
+            .expect("recorded");
+        arbitration.record(waiting, None, None).expect("recorded");
+        let withdrawn = arbitration
+            .plan_upstream_resolved(&settled.request)
+            .expect("planned");
+        arbitration.commit(withdrawn).expect("committed");
+
+        assert_eq!(arbitration.forget_resolved(|_| true, false), 0);
+        assert!(
+            arbitration.get(settled_id).is_some(),
+            "its connection is open"
+        );
+        assert!(
+            arbitration.holds_request(&settled.request),
+            "so its identifier is still taken"
+        );
+
+        assert_eq!(arbitration.forget_resolved(|_| false, false), 1);
+        assert!(arbitration.get(settled_id).is_none());
+        assert!(!arbitration.holds_request(&settled.request));
+        assert_eq!(
+            arbitration
+                .get(waiting_id)
+                .expect("a pending resource is kept")
+                .resource
+                .state,
+            PendingState::Pending
+        );
+    }
+
+    /// A settlement the open gap touched is kept while the gap is open, because the recovery
+    /// writes it from here, and forgotten once the gap has been written.
+    #[test]
+    fn a_settlement_the_open_gap_touched_is_kept_until_the_gap_is_written() {
+        let mut arbitration = Arbitration::new();
+        let settled = resource(7, "11");
+        let settled_id = settled.resource_id;
+        arbitration
+            .record(settled.clone(), None, None)
+            .expect("recorded");
+        arbitration.enter_volatile();
+        let withdrawn = arbitration
+            .plan_upstream_resolved(&settled.request)
+            .expect("planned");
+        arbitration.commit(withdrawn).expect("committed");
+
+        assert_eq!(arbitration.forget_resolved(|_| false, true), 0);
+        assert_eq!(
+            arbitration.volatile_records().len(),
+            1,
+            "the recovery still reads it"
+        );
+        arbitration.clear_volatile_records();
+        assert_eq!(arbitration.forget_resolved(|_| false, false), 1);
+        assert!(arbitration.get(settled_id).is_none());
     }
 }

@@ -2550,7 +2550,11 @@ impl Broker {
         self.state().bindings.get(&binding_id).cloned()
     }
 
-    /// Returns one pending resource.
+    /// Returns one resource the live arbitration holds.
+    ///
+    /// That is every resource that can still happen and every settled one whose connection is
+    /// still open. A settlement is final once its connection has gone, and the ledger's record,
+    /// read with [`Broker::recorded`], is then the only one.
     #[must_use]
     pub fn pending(&self, resource_id: PendingResourceId) -> Option<PendingResource> {
         self.state()
@@ -2717,6 +2721,9 @@ impl Broker {
                 .collect();
             state.volatile.owe_reconciliation(owed);
             state.arbitration.clear_volatile_records();
+            // What the gap settled is written now, so a settled resource of a connection that has
+            // gone is final.
+            state.forget_resolved();
             return Ok(beginning);
         }
         Err(BrokerError::RichWorkFenced {
@@ -3291,13 +3298,16 @@ impl Broker {
     /// Closes one gateway connection.
     ///
     /// The pending resources it produced stay exactly where they are: a connection ending is not
-    /// an answer, and a reconnect is what reconciles them.
+    /// an answer, and a reconnect is what reconciles them. The ones it settled are final now,
+    /// because nothing can name them on a connection that has gone, and they are forgotten; the
+    /// ledger keeps their record.
     pub fn close_connection(&self, connection: GatewayConnectionId) {
         let mut state = self.state();
         state.gateway.close(connection);
         state.connection_dispatch.remove(&connection);
         // Its upstream is out of reach from here, so what it keeps is its own to say.
         state.continuous.remove(&connection);
+        state.forget_resolved();
     }
 
     /// Admits one rich invocation against the closed method table.
@@ -3805,12 +3815,7 @@ impl BrokerState {
                 detail: format!("this binding's rich capabilities are disabled: {reason}"),
             });
         }
-        let pending = self
-            .arbitration
-            .get(resource_id)
-            .ok_or_else(|| BrokerError::unknown(format!("no pending resource {resource_id}")))?
-            .resource
-            .clone();
+        let pending = self.pending_resource(resource_id)?.resource.clone();
         if pending.state != PendingState::Pending {
             return Err(BrokerError::Arbitration(
                 kr_protocol::gateway::ArbitrationError::AlreadyResolved {
@@ -4677,11 +4682,32 @@ impl BrokerState {
         GatewayConnectionId::new(self.next_connection)
     }
 
-    /// Returns one pending resource, or says this broker does not hold it.
+    /// Returns one resource the live arbitration holds, or says why there is none.
+    ///
+    /// A settled resource leaves the live arbitration once its settlement is final, and the
+    /// ledger's record then says how it ended. A caller that names it is told that, as it was
+    /// told while the live record was held, rather than that nothing of the name exists; a
+    /// resource the ledger does not hold as settled is one this broker does not hold.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::Arbitration`] for a resource that has ended,
+    /// [`BrokerError::UnknownSubject`] for one this broker does not hold, and what the ledger's
+    /// read fails with.
     fn pending_resource(&self, resource_id: PendingResourceId) -> Result<&Pending> {
-        self.arbitration
-            .get(resource_id)
-            .ok_or_else(|| BrokerError::unknown(format!("no pending resource {resource_id}")))
+        if let Some(pending) = self.arbitration.get(resource_id) {
+            return Ok(pending);
+        }
+        match self.ledger.pending(resource_id)? {
+            Some(recorded) if recorded.state.is_terminal() => Err(BrokerError::Arbitration(
+                kr_protocol::gateway::ArbitrationError::AlreadyResolved {
+                    state: recorded.state,
+                },
+            )),
+            _ => Err(BrokerError::unknown(format!(
+                "no pending resource {resource_id}"
+            ))),
+        }
     }
 
     /// Returns the binding whose decoder interpreted one resource, where one did.
@@ -4798,7 +4824,27 @@ impl BrokerState {
         self.remember(&event);
         let settled = self.arbitration.commit(transition)?;
         self.publish(&settled, &event);
+        // A resource whose connection has already gone, restored after a restart or reconciled
+        // after a reconnect, is final as soon as its settlement is written.
+        if settled.state.is_terminal() && !self.gateway.contains(settled.request.connection) {
+            self.forget_resolved();
+        }
         Ok(settled)
+    }
+
+    /// Forgets every settled resource whose settlement is final (see
+    /// [`Arbitration::forget_resolved`]).
+    ///
+    /// It runs where a settlement can become final: a settlement written after its connection
+    /// has gone, a connection or channel closing, and a recovery writing the gap. What a settled
+    /// resource of a connection that is still open is asked is answered from the live record,
+    /// and what one that has been forgotten is asked is answered from the ledger's
+    /// ([`BrokerState::pending_resource`]).
+    fn forget_resolved(&mut self) {
+        let gap_open = !self.volatile.writes_are_durable();
+        let gateway = &self.gateway;
+        self.arbitration
+            .forget_resolved(|connection| gateway.contains(connection), gap_open);
     }
 
     /// Takes the next position in this broker's stream of transitions.
@@ -5145,10 +5191,7 @@ impl BrokerState {
 
     /// Checks that one pending resource is still one an answer may be dispatched for.
     fn recheck_answerable(&self, resource_id: PendingResourceId) -> Result<()> {
-        let pending = self
-            .arbitration
-            .get(resource_id)
-            .ok_or_else(|| BrokerError::unknown(format!("no pending resource {resource_id}")))?;
+        let pending = self.pending_resource(resource_id)?;
         let instance = self
             .instances
             .get(&pending.resource.application_instance_id)

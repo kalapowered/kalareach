@@ -12,7 +12,8 @@ use kr_protocol::broker::{BrokerGrant, BrokerGrants, IntegrationMode};
 use kr_protocol::gateway::{GatewayMode, NativeFraming, PendingResource, PendingState};
 use kr_protocol::identity::{ProcessStartIdentity, ProcessStartSource};
 use kr_protocol::ids::{
-    ActorId, AgentBindingRevision, ApplicationInstanceId, BrokerBindingId, PublisherId, SessionId,
+    ActorId, AgentBindingRevision, ApplicationInstanceId, BrokerBindingId, PendingResourceId,
+    PublisherId, SessionId,
 };
 use kr_protocol::scalars::{Digest256, Nullable, TimestampMs, Uuid};
 use kr_worker::broker::bridge::{AdmittedBridge, BridgeProcess, BridgeStream, BridgeSurface};
@@ -274,6 +275,17 @@ fn relayed(broker: &Broker, number: u8, request_id: &str) -> Option<PendingResou
         resource.application_instance_id == instance(number)
             && resource.request.upstream.as_str() == format!("\"{request_id}\"")
     })
+}
+
+/// How one resource ended, as the ledger records it.
+///
+/// A resource a channel settled is final once the channel has gone, and the live arbitration no
+/// longer holds it.
+fn settled_as(broker: &Broker, resource_id: PendingResourceId) -> Option<PendingState> {
+    broker
+        .recorded(resource_id)
+        .expect("the ledger reads")
+        .map(|resource| resource.state)
 }
 
 fn memory_broker() -> Arc<Broker> {
@@ -575,15 +587,11 @@ async fn kr_req_12_18_a_closed_channel_settles_what_it_relayed() {
         .expect("the writer says so");
 
     channel.close().await;
+    // Settled on a channel that has gone, so the ledger's record is the one that says how each
+    // ended.
     eventually("the channel settles what it relayed", || {
-        broker
-            .pending(unanswered.resource_id)
-            .map(|resource| resource.state)
-            == Some(PendingState::Cancelled)
-            && broker
-                .pending(answered.resource_id)
-                .map(|resource| resource.state)
-                == Some(PendingState::Uncertain)
+        settled_as(&broker, unanswered.resource_id) == Some(PendingState::Cancelled)
+            && settled_as(&broker, answered.resource_id) == Some(PendingState::Uncertain)
     })
     .await;
     drop(go);
@@ -1086,9 +1094,7 @@ async fn kr_req_12_18_a_channel_whose_writer_fails_is_closed_while_its_reader_is
         "nothing carries answers on the closed channel"
     );
     assert_eq!(
-        broker
-            .pending(resource.resource_id)
-            .map(|resource| resource.state),
+        settled_as(&broker, resource.resource_id),
         Some(PendingState::Uncertain),
         "the answer went and nothing says whether it arrived"
     );

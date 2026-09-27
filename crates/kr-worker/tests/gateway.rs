@@ -1138,6 +1138,58 @@ async fn kr_req_12_13_a_settled_resource_reads_as_settled_before_and_after_its_r
     );
 }
 
+/// KR-REQ-11.37 and KR-REQ-12.13: a settlement made while the journal is faulted, on a run that
+/// ends inside the gap, is kept until the recovery writes it and forgotten then. The recovery
+/// commits the gap from the live arbitration, so a record forgotten before that would stay in the
+/// ledger as it stood when the fault opened.
+#[tokio::test]
+async fn kr_req_11_37_a_settlement_inside_the_gap_is_kept_until_the_recovery_writes_it() {
+    let mut store = common::SharedStore::open();
+    let (broker, _upstream) = gateway_sharing(&store);
+    let run = agent_run(&broker);
+    let settling = forwarded(&broker, run, "4", 2);
+
+    store.fault_acceptance();
+    assert_eq!(broker.mode(), GatewayMode::NativeOnlyVolatile);
+    let settled = answered(&broker, run, "4", 3);
+    assert_eq!(settled.state, PendingState::Resolved);
+    broker.close_connection(run);
+    assert_eq!(
+        broker
+            .pending(settling.resource_id)
+            .expect("kept for the recovery that writes it")
+            .state,
+        PendingState::Resolved
+    );
+    assert_eq!(
+        broker
+            .recorded(settling.resource_id)
+            .expect("the ledger reads")
+            .expect("the ledger holds it")
+            .state,
+        PendingState::Pending,
+        "the ledger still has it as it stood when the fault opened"
+    );
+
+    store.recover_journal(4);
+    broker
+        .recover(TimestampMs::new(4))
+        .expect("the gap is committed");
+    assert!(
+        broker.pending(settling.resource_id).is_none(),
+        "forgotten once the gap is written"
+    );
+    assert_eq!(
+        broker
+            .recorded(settling.resource_id)
+            .expect("the ledger reads")
+            .expect("the ledger holds it")
+            .state,
+        PendingState::Resolved,
+        "and the ledger has how it ended"
+    );
+}
+
 /// KR-REQ-12.16: a reverse filesystem or terminal request runs in the agent's own host
 /// environment, under the user the agent runs as.
 #[test]

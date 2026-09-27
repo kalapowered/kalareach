@@ -544,6 +544,8 @@ impl Broker {
         }
         state.gateway.close_channel(connection);
         state.continuous.remove(&connection);
+        // What it settled, here or before, is final now that nothing can name it on the channel.
+        state.forget_resolved();
         if state.volatile.mode() == GatewayMode::Recovering {
             let generation = state.volatile.generation();
             let _ = state
