@@ -204,7 +204,7 @@ pub fn run(paths: &HostPaths, arguments: &StartupArguments, json: bool) -> Resul
                     "default"
                 },
             )
-            .with("document", Shown::host_path(&chosen.document))
+            .with("document", Shown::root(&chosen.document))
             .with("document_state", chosen.state.as_str())
             .with("revision", crate::output::said(&chosen.revision))
             .with(
@@ -356,8 +356,8 @@ fn changed_under(
     })
 }
 
-/// What `kr host startup` tells a person: the document the choice is in, said as this
-/// installation's paths are.
+/// What `kr host startup` tells a person: the document the choice is in, whose path this command
+/// derived itself and says whole, as its failures do.
 fn describe(chosen: &Chosen, inspection: Option<&service_manager::Inspection>) -> Shown {
     let left_over = |text: Shown| match inspection {
         Some(inspection) if inspection.recorded => shown!(
@@ -368,7 +368,7 @@ fn describe(chosen: &Chosen, inspection: Option<&service_manager::Inspection>) -
         ),
         _ => text,
     };
-    let document = Shown::host_path(&chosen.document);
+    let document = Shown::root(&chosen.document);
     match chosen.controller {
         Some(ControllerStartup::Service) => shown!(
             "startup: service, from {} at revision {}: kr new asks this user's service manager to \
