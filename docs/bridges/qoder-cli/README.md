@@ -85,9 +85,10 @@ for its own application on each integrated launch, on this installation's own `k
 finds `kr-hook` on the launch's search path, and a hook that runs another copy, or says it is
 another application's, is refused at admission.
 The two elements are added together or not at all, so a Qoder CLI command typed with `--settings`
-of its own runs as typed. Sessions are created with no command integration enabled, and the worker
-holds no installed connector to launch from, so no launch passes these two elements and Qoder CLI
-runs no KalaReach hook.
+of its own, as two elements or as `--settings=<file>`, runs as typed, and the shell is told
+`flags_conflict`. The integration applies to the sessions created after the owner turns it on with
+`kr plugin integration enable kalareach/qoder-cli`, and only while the installation holds
+`command_integration.launch`; without it Qoder CLI runs no KalaReach hook.
 
 Qoder CLI runs no hook from any source, the launch's included, in a folder the person has not
 trusted. It starts a session before the person answers its trust question, so the session in which

@@ -1063,6 +1063,7 @@ too, and so is any action a worker could not show did not run before the revocat
 | `kr plugin remove <plugin>` | Removes an installed plugin and closes its live bindings |
 | `kr plugin pin <plugin> [--digest <hash>]` | Holds it at one exact hash, or releases the pin when no hash is given |
 | `kr plugin enable <plugin>` and `kr plugin disable <plugin>` | Enables it, or disables it without removing it |
+| `kr plugin integration enable <plugin>` and `kr plugin integration disable <plugin>` | Turns its command integration on or off for the sessions created from now on |
 | `kr plugin repo list` | Lists the enrolled repositories with their roots, generations and budgets |
 | `kr plugin repo add <repository> --root <file> --metadata-url <url> --targets-url <url>` | Refused at a terminal, as below |
 | `kr plugin repo sync <repository>` | Fetches its newest generation inside the trust it already has |
@@ -1081,6 +1082,16 @@ declares a command integration.
 already permitted needs. When the host answers that this one needs the owner, `kr` exits with
 `OWNER_CONFIRMATION_REQUIRED` and says to confirm and install it from an owner device. It leaves no
 confirmation waiting.
+
+A command integration the owner confirmed at installation applies only once the environment's
+configuration turns it on. `kr plugin integration enable <plugin>` adds the package to the host's
+`command_integrations` list in the configuration document, as a validated edit, and `kr plugin
+integration disable <plugin>` takes it out; either applies to the sessions created afterwards, and a
+session keeps the integrations it was created with. The command then asks the daemon for its
+diagnostics, which puts the document in force, and prints what a new session applies and what it
+gets of this package's integration: on or off, the flags and variables it adds, and the executable
+the daemon's search path resolves its command to. A profile that names its own list decides over the
+host's, and the command says when one does.
 
 ## `kr host startup`
 

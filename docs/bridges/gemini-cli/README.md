@@ -107,10 +107,12 @@ launched process runs the session and starts the hooks itself. It then gives up 
 a very large session runs out of memory sooner, and the restart: when Gemini CLI exits with code
 199 after an update or to apply a change, the session ends and the person starts `gemini` again.
 The relay of administrator settings serves only a restarted child. A package declares the variable
-as its command integration's, the one pair the package contract permits, and the worker exports it
-beside `KR_REGISTRATION` for an integrated launch. Sessions are created with no command integration
-enabled, and the shell does not apply an integration whose entry names no flag, so no launch sets
-it.
+as its command integration's, the one pair the package contract permits. The integration adds no
+flag and still integrates the invocation. The worker names the variable in the backend's launch
+record, and the launcher sets it only once the launch is committed, so a `gemini` that runs as
+typed keeps the person's own environment, their own value of `GEMINI_CLI_NO_RELAUNCH` included. The
+integration applies to the sessions created after the owner turns it on with `kr plugin integration
+enable kalareach/gemini-cli`.
 
 An interactive Gemini CLI runs its `SessionEnd` hooks more than once when it exits, with the same
 session and reason (twice in one run, three times in two others), and prints three lines of its own

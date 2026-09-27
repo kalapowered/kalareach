@@ -99,14 +99,16 @@ somebody else too.
 
 ## Launching from the shell
 
-When the Claude Code connector's command integration is on, a `claude` typed at a managed Zsh or
-Bash prompt starts under a launch the worker made for it. The shell asks the worker about the
-command before it forks, as the shell integration's contract describes, and for an integrated
-command the worker establishes a backend: an endpoint in a fresh owner-only directory, a credential,
-and a launch record, `launch`, that names the two. Nothing is reserved and no registration exists
-yet. The answer adds the integration's flags to the vector and gives the forked child
-`KR_REGISTRATION` and the absolute path of the installation's `kr-hook`, which the child runs as
-`kr-hook launch -- <executable> claude <arguments...>`.
+When the Claude Code connector's command integration is on for a session, which it is for the
+sessions created after its owner ran `kr plugin integration enable kalareach/claude-code`, a
+`claude` typed at a managed Zsh or Bash prompt starts under a launch the worker made for it. The
+shell asks the worker about the command before it forks, as the shell integration's contract
+describes, and for an integrated command the worker establishes a backend: an endpoint in a fresh
+owner-only directory, a credential, and a launch record, `launch`, that names the two and the
+variables the package declares, which for Claude Code are none. Nothing is reserved and no
+registration exists yet. The answer adds the integration's flags to the vector and gives the forked
+child `KR_REGISTRATION` and the absolute path of the installation's `kr-hook`, which the child runs
+as `kr-hook launch -- <executable> claude <arguments...>`.
 
 The launcher presents itself on the endpoint with the credential, its process and start, the
 executable and the vector. The worker admits it only when the kernel names the connecting process
@@ -154,10 +156,12 @@ A package turns the integration on by declaring it in its manifest, as
 [the plugin reference](../../plugins/README.md#command-integration) describes; for Claude Code that
 is `claude` and the two flags above. The worker takes them only from the verified package, and only
 while the installation holds `command_integration.launch`, which the owner confirms for each
-release. The two flags are added together or not at all, so a `claude` typed with one of them runs
-as typed. The worker holds the connectors its session's plugin admissions carry, and it launches
-from those alone, but sessions are still created with no command integration enabled, so a `claude`
-typed at a prompt runs as typed.
+release. The two flags are added together or not at all, so a `claude` typed with one of them, or
+with the flag and another plugin, runs as typed, and the shell is told `flags_conflict`. The worker
+holds the connectors its session's plugin admissions carry, and it launches from those alone. A
+session carries the integrations its environment's configuration turned on when it was created, each
+naming its package, and launches through one only while that same package integrates `claude` with
+the same flags. `kr doctor` shows what a new session gets of the integration.
 
 ## A Claude Code the integration did not launch
 

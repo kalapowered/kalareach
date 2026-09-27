@@ -144,15 +144,20 @@ beside the exact list `CommandIntegration::statement` renders from the declarati
 each flag as a JSON string in order, and each variable as `NAME="value"`, nothing shortened.
 
 A host reads the integration only from the verified manifest, never from what an installation says
-about it, and applies it only while the installation holds `command_integration.launch`. For an
-integrated launch the worker exports the declared variables after `KR_REGISTRATION`; the answer for
-an invocation that bypasses the integration names no backend and no variable. Nothing is read from
-the flags to decide what a launch admits. A package that installs a native bridge gets the bridge its
-installation put in place, or none where the installation did not. A package that installs none gets
-a hook bridge of its own; Qoder CLI's inline settings, for example, register its hook by naming
-`kr-hook` as a bare command. Where a hook is registered and how its command is spelt decide nothing:
-a bridge is admitted only when it says it is the package's own and runs this installation's own
-`kr-hook`, under the launch's registration and credential.
+about it, and applies it only while the installation holds `command_integration.launch`. The
+environment's configuration decides which integrations a session applies (`kr plugin integration
+enable <package>`), and the session's entry names the package, its command and its flags; a launch
+establishes a backend only while that package still integrates the command with those flags. For an
+integrated launch the worker names the declared variables in the backend's owner-only launch record,
+and the launcher sets them only once the launch is committed: the shell exports `KR_REGISTRATION`
+alone. An invocation that runs as typed, because the integration bypassed it or its launch failed,
+keeps the person's own environment, their own value of a declared variable included. Nothing is read
+from the flags to decide what a launch admits. A package that installs a native bridge gets the
+bridge its installation put in place, or none where the installation did not. A package that
+installs none gets a hook bridge of its own; Qoder CLI's inline settings, for example, register its
+hook by naming `kr-hook` as a bare command. Where a hook is registered and how its command is spelt
+decide nothing: a bridge is admitted only when it says it is the package's own and runs this
+installation's own `kr-hook`, under the launch's registration and credential.
 
 ## Capabilities
 
