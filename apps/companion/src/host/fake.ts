@@ -2239,28 +2239,71 @@ const U32: IntegerType = { name: 'u32', least: 0n, greatest: 2n ** 32n - 1n }
 const U64: IntegerType = { name: 'u64', least: 0n, greatest: 2n ** 64n - 1n }
 const I64: IntegerType = { name: 'i64', least: -(2n ** 63n), greatest: 2n ** 63n - 1n }
 
-/** How native code's decoder names a value it did not expect. */
-function unexpected(value: unknown): string {
-  if (typeof value === 'boolean') return `boolean \`${value}\``
-  if (typeof value === 'string') return `string ${JSON.stringify(value)}`
-  if (typeof value === 'number' && Number.isFinite(value)) return `floating point \`${value}\``
-  if (typeof value === 'object' && value !== null) return Array.isArray(value) ? 'sequence' : 'map'
-  return 'null'
+/**
+ * A number as native code's decoder holds the JSON the page's port writes for it: the port writes
+ * its shortest decimal form, and digits alone that fit a 64-bit integer, signed or unsigned, are an
+ * integer; anything else, a fraction, an exponent or digits past 64 bits, is a floating point
+ * number. NaN and the infinities are written as null, which is none.
+ */
+function asDecoded(value: number): { readonly integer: bigint } | { readonly float: number } | null {
+  const text = JSON.stringify(value)
+  if (text === 'null') return null
+  if (/^-?\d+$/.test(text)) {
+    const integer = BigInt(text)
+    if (integer >= I64.least && integer <= U64.greatest) return { integer }
+  }
+  return { float: Number(text) }
 }
 
 /**
- * Why native code's decoder does not read `value`, sent as JSON, as an integer of `type`, in its
- * words, or null when it does. JSON writes a number in its shortest decimal form, and the decoder
- * takes an integer only from digits alone, within the type's range: never from a fraction or an
- * exponent, and never past the largest integer JavaScript can hold exactly, as long as the type
- * holds it.
+ * A floating point number as native code's decoder writes one in its words: every digit, without an
+ * exponent, and with a decimal point.
+ */
+function asFloatWords(value: number): string {
+  const text = String(value)
+  const exponent = /^(-?)(\d)(?:\.(\d+))?e([+-]\d+)$/.exec(text)
+  let written = text
+  if (exponent !== null) {
+    const [, sign = '', lead = '', rest = '', power = '0'] = exponent
+    const digits = lead + rest
+    const point = 1 + Number(power)
+    written =
+      point >= digits.length
+        ? sign + digits + '0'.repeat(point - digits.length)
+        : point <= 0
+          ? `${sign}0.${'0'.repeat(-point)}${digits}`
+          : `${sign}${digits.slice(0, point)}.${digits.slice(point)}`
+  }
+  return written.includes('.') ? written : `${written}.0`
+}
+
+/** How native code's decoder names a value it did not expect, in its words. */
+function unexpected(value: unknown): string {
+  if (typeof value === 'boolean') return `boolean \`${value}\``
+  if (typeof value === 'string') return `string ${JSON.stringify(value)}`
+  if (typeof value === 'number') {
+    const decoded = asDecoded(value)
+    if (decoded === null) return 'unit value'
+    return 'integer' in decoded
+      ? `integer \`${decoded.integer}\``
+      : `floating point \`${asFloatWords(decoded.float)}\``
+  }
+  if (typeof value === 'object' && value !== null) return Array.isArray(value) ? 'sequence' : 'map'
+  return 'unit value'
+}
+
+/**
+ * Why native code's decoder does not read `value` as an integer of `type`, in its words, or null
+ * when it does: it takes an integer within the type's range, and a number past
+ * Number.MAX_SAFE_INTEGER is read like any other.
  */
 function notInteger(type: IntegerType, value: unknown): string | null {
-  const text = typeof value === 'number' ? JSON.stringify(value) : null
-  if (text === null || !/^-?\d+$/.test(text)) return `invalid type: ${unexpected(value)}, expected ${type.name}`
-  const integer = BigInt(text)
-  if (integer < type.least || integer > type.greatest) {
-    return `invalid value: integer \`${text}\`, expected ${type.name}`
+  const decoded = typeof value === 'number' ? asDecoded(value) : null
+  if (decoded === null || !('integer' in decoded)) {
+    return `invalid type: ${unexpected(value)}, expected ${type.name}`
+  }
+  if (decoded.integer < type.least || decoded.integer > type.greatest) {
+    return `invalid value: integer \`${decoded.integer}\`, expected ${type.name}`
   }
   return null
 }

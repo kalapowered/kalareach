@@ -126,7 +126,7 @@ describe('the scripted host reads input as native code does (KR-REQ-10.01)', () 
       expect(typeof readTerminalInput(shape), JSON.stringify(shape)).toBe('string')
     }
     expect(readTerminalInput({ kind: 'release', number: 4 })).toEqual({ kind: 'release', number: 4 })
-    // The largest each type holds, past what JavaScript holds exactly for a u64, is read.
+    // A u64 past Number.MAX_SAFE_INTEGER is read, and so is the largest u32.
     expect(readTerminalInput({ kind: 'take', number: 2 ** 53 })).toEqual({ kind: 'take', number: 2 ** 53 })
     expect(
       readTerminalInput({ kind: 'wheel', take: 1, column: 2 ** 32 - 1, line: 0, turns: 1, shift: false, alt: false, control: false })
@@ -201,7 +201,7 @@ describe("the scripted host reads a view's opening, size and moves as native cod
     [{ columns: 80, rows: 1025 }, 'rows 1025 must be between 1 and 1024'],
     // Within each bound on its own, and over the cells a terminal may have.
     [{ columns: 1024, rows: 257 }, 'cells 263168 must not exceed 262144'],
-    // A whole number past what JavaScript holds exactly is still one the decoder reads.
+    // A whole number past Number.MAX_SAFE_INTEGER is one the decoder reads, and the bound refuses.
     [{ columns: 2 ** 53, rows: 1 }, 'columns 9007199254740992 must be between 1 and 2048']
   ]
 
@@ -281,12 +281,14 @@ describe("the scripted host reads a view's opening, size and moves as native cod
     expect(() => view.move(null as never)).toThrow(TypeError)
     expect(controls.terminalViews[0]?.grids).toEqual([{ columns: 80, rows: 8 }])
     expect(controls.terminalViews[0]?.moves).toEqual([])
-    // What native code takes, the scripted host takes: the largest whole numbers the decoder reads
-    // among them, and a move with `live`, which the port sends as a return to the live screen.
+    // What native code takes, the scripted host takes: whole numbers past Number.MAX_SAFE_INTEGER
+    // among them, negative zero as zero, and a move with `live`, which the port sends as a return to
+    // the live screen.
     await view.resize({ columns: 40, rows: 6 })
     await view.move({ number: 1, across: 2 ** 53, down: -(2 ** 53) })
     await view.move({ number: 2 ** 53, live: true })
     await view.move({ number: 2 ** 53 + 2, across: 3, down: 4, live: false } as never)
+    await view.move({ number: -0, across: -0, down: 1 })
     expect(controls.terminalViews[0]?.grids).toEqual([
       { columns: 80, rows: 8 },
       { columns: 40, rows: 6 }
@@ -294,7 +296,41 @@ describe("the scripted host reads a view's opening, size and moves as native cod
     expect(controls.terminalViews[0]?.moves).toEqual([
       { number: 1, across: 2 ** 53, down: -(2 ** 53) },
       { number: 2 ** 53, live: true },
-      { number: 2 ** 53 + 2, live: true }
+      { number: 2 ** 53 + 2, live: true },
+      { number: -0, across: -0, down: 1 }
     ])
+  })
+
+  it('words each refusal as the command layer or native code words it', async () => {
+    const { port } = fakeHost()
+    const view: TerminalView = await port.openTerminalView(SESSION_MAIN, { columns: 80, rows: 8 }, () => {})
+    const said = async (call: Promise<unknown>): Promise<unknown> => call.then(() => 'taken', (refusal: unknown) => refusal)
+    expect(await said(port.openTerminalView(1 as never, { columns: 80, rows: 8 }, () => {}))).toBe(
+      'invalid args `sessionId` for command `terminal_view_open`: invalid type: integer `1`, expected a string'
+    )
+    for (const [grid, words] of [
+      [{ columns: 80.5, rows: 24 }, 'invalid args `columns` for command `terminal_view_resize`: invalid type: floating point `80.5`, expected u64'],
+      [{ columns: -1, rows: 24 }, 'invalid args `columns` for command `terminal_view_resize`: invalid value: integer `-1`, expected u64'],
+      [{ columns: 80, rows: Number.NaN }, 'invalid args `rows` for command `terminal_view_resize`: invalid type: unit value, expected u64'],
+      [{ columns: 80 }, 'invalid args `rows` for command `terminal_view_resize`: command terminal_view_resize missing required key rows']
+    ] as const) {
+      expect(await said(view.resize(grid as never)), JSON.stringify(grid)).toBe(words)
+    }
+    for (const [move, words] of [
+      // Digits past 64 bits are a floating point number to the decoder.
+      [{ number: 2 ** 64, live: true }, 'invalid args `number` for command `terminal_view_move`: invalid type: floating point `18446744073709552000.0`, expected u64'],
+      // JSON writes 2^63 as 9223372036854776000, an integer the decoder reads and i64 does not hold.
+      [{ number: 1, across: 2 ** 63, down: 0 }, 'invalid args `across` for command `terminal_view_move`: invalid value: integer `9223372036854776000`, expected i64'],
+      // The least i64 as JavaScript writes it is past 64 bits too.
+      [{ number: 1, across: -(2 ** 63), down: 0 }, 'invalid args `across` for command `terminal_view_move`: invalid type: floating point `-9223372036854776000.0`, expected i64'],
+      [{ number: 1, across: 0, down: 1e21 }, 'invalid args `down` for command `terminal_view_move`: invalid type: floating point `1000000000000000000000.0`, expected i64']
+    ] as const) {
+      expect(await said(view.move(move as never)), JSON.stringify(move)).toBe(words)
+    }
+    expect(await said(view.resize({ columns: 1024, rows: 257 }))).toEqual({
+      code: 'INVALID_ARGUMENT',
+      message: "that is not a terminal's size: cells 263168 must not exceed 262144",
+      user_action: expect.any(String) as string
+    })
   })
 })
