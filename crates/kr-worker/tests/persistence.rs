@@ -1015,12 +1015,32 @@ fn a_recovery_gap_survives_reopening_the_journal() {
 // ---------------------------------------------------------------------------------------------
 
 #[test]
-fn a_database_an_earlier_build_wrote_is_brought_forward_and_keeps_its_rows() {
-    // KR-REQ-24.30. The fixture is a version 1 journal with one receipt, written by hand exactly
-    // as the first build of this schema wrote it, and the migration has to reach it through every
-    // step of the ladder without losing it.
-    let path = journal_path("migration-fixture");
+fn a_version_one_journal_is_refused_in_place_and_names_the_importer() {
+    // KR-REQ-24.30. Version 1 is older than the ladder, so no host brings it forward on its own:
+    // it is refused by name, with the command that imports it, rather than read in its old shape
+    // or migrated behind the person's back.
+    let path = journal_path("version-one-refused");
     write_version_one_fixture(&path);
+    let error = Journal::open(&path).expect_err("a version 1 journal is not opened in place");
+    assert!(
+        error.to_string().contains(migration::IMPORTER),
+        "the refusal names the importer: {error}"
+    );
+    assert!(migration::IMPORTER.contains("kr host import-journals"));
+    assert_eq!(
+        Journal::recorded_schema_version(&path).expect("reads the version"),
+        1,
+        "the refusal changed nothing"
+    );
+    std::fs::remove_dir_all(path.parent().expect("a parent")).ok();
+}
+
+#[test]
+fn a_version_two_journal_is_brought_forward_in_place_and_keeps_its_rows() {
+    // The control: version 2 is inside the ladder, so opening it brings it forward through every
+    // later step, each one transaction, and keeps what it held.
+    let path = journal_path("version-two-migrates");
+    write_version_two_fixture(&path);
     let journal = Journal::open(&path).expect("migrates and opens");
     assert_eq!(
         journal.schema_version().expect("a version"),
@@ -1031,14 +1051,253 @@ fn a_database_an_earlier_build_wrote_is_brought_forward_and_keeps_its_rows() {
         .expect("reads")
         .expect("the earlier build's receipt survived");
     assert_eq!(receipt.state, ReceiptState::Accepted);
-    // Every object of the current schema is there afterwards, including the ones the last step
-    // added.
-    let tables = journal.table_names().expect("reads the schema");
-    for expected in ["outbox", "outbox_cursors", "journal_gaps"] {
-        assert!(tables.iter().any(|name| name == expected), "{expected}");
-    }
     drop(journal);
     std::fs::remove_dir_all(path.parent().expect("a parent")).ok();
+}
+
+#[test]
+fn the_importer_brings_a_version_one_journal_to_the_current_version_once() {
+    // KR-REQ-24.30's explicit importer, for both shapes a build recording version 1 wrote: the
+    // receipt table alone, and the receipt table with results and a closure. One import, one
+    // transaction, the current version at the end, every row kept; a second run finds nothing to
+    // import.
+    use kr_worker::persistence::import::{Imported, import_journal};
+    for with_results in [false, true] {
+        let path = journal_path("version-one-imported");
+        write_version_one_fixture(&path);
+        if with_results {
+            add_version_one_results_and_closure(&path);
+        }
+        assert_eq!(
+            import_journal(&path).expect("imports"),
+            Imported::Imported {
+                from: 1,
+                to: migration::CURRENT,
+                receipts: 1,
+            }
+        );
+        let journal = Journal::open_existing(&path).expect("a current journal");
+        assert_eq!(
+            journal.schema_version().expect("a version"),
+            migration::CURRENT
+        );
+        let mut tables = journal.table_names().expect("reads the schema");
+        tables.retain(|name| !name.starts_with("sqlite_"));
+        tables.sort();
+        let mut current: Vec<String> = migration::tables_at(migration::CURRENT)
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect();
+        current.sort();
+        assert_eq!(
+            tables, current,
+            "the imported journal is the current schema"
+        );
+        let receipt = journal
+            .read(actor(), kr_worker::journal::action_id_from([7; 16]))
+            .expect("reads")
+            .expect("the receipt survived");
+        assert_eq!(receipt.state, ReceiptState::Accepted);
+        if with_results {
+            assert_eq!(
+                journal
+                    .read_result(&actor(), kr_worker::journal::action_id_from([7; 16]))
+                    .expect("reads")
+                    .as_deref(),
+                Some([0xf6_u8].as_slice()),
+                "the result survived"
+            );
+            assert!(
+                journal
+                    .read_closure(fixture_session())
+                    .expect("reads")
+                    .is_some(),
+                "the closure survived"
+            );
+        }
+        drop(journal);
+        assert_eq!(
+            import_journal(&path).expect("answers"),
+            Imported::NothingToImport {
+                version: migration::CURRENT
+            },
+            "an imported journal is never read in its old shape again"
+        );
+        std::fs::remove_dir_all(path.parent().expect("a parent")).ok();
+    }
+}
+
+#[test]
+fn a_journal_the_importer_cannot_read_is_refused_by_name_and_left_as_it_was() {
+    // "Refuses what it cannot read by name": a version it does not read, an object no version 1
+    // build made, and a row the current build cannot decode are each named, and the file is left
+    // exactly as it was, because the refusal comes before anything is committed.
+    use kr_worker::persistence::import::import_journal;
+    let refused = |name: &str, spoil: &dyn Fn(&rusqlite::Connection), named: &str| {
+        let path = journal_path(name);
+        write_version_one_fixture(&path);
+        add_version_one_results_and_closure(&path);
+        spoil(&rusqlite::Connection::open(&path).expect("opens the fixture"));
+        let before = std::fs::read(&path).expect("reads the fixture");
+        let error = import_journal(&path).expect_err("refused");
+        assert!(
+            error.to_string().contains(named),
+            "the refusal names {named}: {error}"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("reads the store again"),
+            before,
+            "a refused import leaves the file as it was"
+        );
+        std::fs::remove_dir_all(path.parent().expect("a parent")).ok();
+    };
+    refused(
+        "import-version-zero",
+        &|connection| {
+            connection
+                .execute("UPDATE schema_version SET version = 0", [])
+                .expect("records version 0");
+        },
+        "version 0",
+    );
+    refused(
+        "import-unknown-table",
+        &|connection| {
+            connection
+                .execute_batch("CREATE TABLE notes (body TEXT);")
+                .expect("adds a table no build made");
+        },
+        "notes",
+    );
+    refused(
+        "import-unreadable-closure",
+        &|connection| {
+            connection
+                .execute("UPDATE closure SET record = x'ff00'", [])
+                .expect("spoils the closure record");
+        },
+        "closure",
+    );
+}
+
+/// The session the version 1 fixture's closure belongs to.
+fn fixture_session() -> SessionId {
+    SessionId::new(Uuid::from_bytes([9; 16]))
+}
+
+/// Adds what the second build recording version 1 made beside the receipts: a result for the
+/// fixture's receipt and a closure record.
+fn add_version_one_results_and_closure(path: &std::path::Path) {
+    let closure = kr_protocol::session::ClosureRecord {
+        session_id: fixture_session(),
+        session_epoch: SessionEpoch::V1,
+        reason: kr_protocol::session::ClosureReason::CloseRequested,
+        root_exit_code: Nullable::null(),
+        root_signal: Nullable::null(),
+        terminated: Vec::new(),
+        surviving: Vec::new(),
+        ownership_coverage: kr_protocol::session::OwnershipCoverage::Incomplete,
+        durability: Durability::Durable,
+        closed_at_ms: TimestampMs::new(2_000),
+    };
+    let connection = rusqlite::Connection::open(path).expect("opens the fixture");
+    connection
+        .execute_batch(
+            "CREATE TABLE results (
+                 actor_id  TEXT NOT NULL,
+                 action_id BLOB NOT NULL,
+                 result    BLOB NOT NULL,
+                 PRIMARY KEY (actor_id, action_id)
+             );
+             CREATE TABLE closure (
+                 session_id BLOB PRIMARY KEY,
+                 record     BLOB NOT NULL
+             );",
+        )
+        .expect("the second version 1 shape");
+    connection
+        .execute(
+            "INSERT INTO results (actor_id, action_id, result) VALUES (?1, ?2, x'f6')",
+            rusqlite::params![
+                "test:persistence",
+                Uuid::from_bytes([7; 16]).as_bytes().as_slice()
+            ],
+        )
+        .expect("the earlier build's result");
+    connection
+        .execute(
+            "INSERT INTO closure (session_id, record) VALUES (?1, ?2)",
+            rusqlite::params![
+                fixture_session().get().as_bytes().as_slice(),
+                kr_cbor::to_canonical_vec(&closure).expect("encodes the closure"),
+            ],
+        )
+        .expect("the earlier build's closure");
+}
+
+/// Writes the journal the first build recording version 2 wrote, with one receipt.
+fn write_version_two_fixture(path: &std::path::Path) {
+    let connection = rusqlite::Connection::open(path).expect("creates the fixture");
+    connection
+        .execute_batch(
+            "CREATE TABLE schema_version (version INTEGER NOT NULL);
+             CREATE TABLE receipts (
+                 actor_id             TEXT    NOT NULL,
+                 action_id            BLOB    NOT NULL,
+                 method               TEXT    NOT NULL,
+                 method_version       INTEGER NOT NULL,
+                 revision             INTEGER NOT NULL,
+                 state                TEXT    NOT NULL,
+                 reason               TEXT,
+                 payload_digest       BLOB    NOT NULL,
+                 intent               BLOB    NOT NULL,
+                 accepted_deadline_ms INTEGER,
+                 error_code           TEXT,
+                 error_message        TEXT,
+                 created_at_ms        INTEGER NOT NULL,
+                 updated_at_ms        INTEGER NOT NULL,
+                 PRIMARY KEY (actor_id, action_id)
+             );
+             CREATE INDEX receipts_created_at ON receipts (created_at_ms);
+             CREATE TABLE results (
+                 actor_id  TEXT NOT NULL,
+                 action_id BLOB NOT NULL,
+                 result    BLOB NOT NULL,
+                 PRIMARY KEY (actor_id, action_id),
+                 FOREIGN KEY (actor_id, action_id)
+                     REFERENCES receipts (actor_id, action_id) ON DELETE CASCADE
+             );
+             CREATE TABLE receipt_events (
+                 sequence       INTEGER PRIMARY KEY AUTOINCREMENT,
+                 actor_id       TEXT    NOT NULL,
+                 action_id      BLOB    NOT NULL,
+                 revision       INTEGER NOT NULL,
+                 state          TEXT    NOT NULL,
+                 recorded_at_ms INTEGER NOT NULL,
+                 FOREIGN KEY (actor_id, action_id)
+                     REFERENCES receipts (actor_id, action_id) ON DELETE CASCADE
+             );
+             CREATE TABLE closure (
+                 session_id BLOB PRIMARY KEY,
+                 record     BLOB NOT NULL
+             );
+             INSERT INTO schema_version (version) VALUES (2);",
+        )
+        .expect("the version 2 schema");
+    connection
+        .execute(
+            "INSERT INTO receipts (
+                 actor_id, action_id, method, method_version, revision, state,
+                 payload_digest, intent, accepted_deadline_ms, created_at_ms, updated_at_ms
+             ) VALUES (?1, ?2, ?3, 1, 1, 'accepted', ?4, x'a0', 10000, 1000, 1000)",
+            rusqlite::params![
+                "test:persistence",
+                Uuid::from_bytes([7; 16]).as_bytes().as_slice(),
+                Method::SessionClose.as_str(),
+                [7_u8; 32].as_slice(),
+            ],
+        )
+        .expect("the earlier build's receipt");
 }
 
 #[test]
@@ -1108,15 +1367,18 @@ fn a_store_that_has_lost_any_table_of_its_own_version_is_refused_rather_than_ref
 
 #[test]
 fn a_database_older_than_the_ladder_names_the_importer_rather_than_restoring_in_part() {
-    let error = migration::plan(0).expect_err("version 0 is not migratable");
-    assert_eq!(
-        error,
-        MigrationError::Unsupported {
-            found: 0,
-            oldest: migration::OLDEST_MIGRATABLE,
-            importer: migration::IMPORTER,
-        }
-    );
+    for older in [0, 1] {
+        let error = migration::plan(older).expect_err("older than the ladder");
+        assert_eq!(
+            error,
+            MigrationError::Unsupported {
+                found: older,
+                oldest: migration::OLDEST_MIGRATABLE,
+                importer: migration::IMPORTER,
+            }
+        );
+    }
+    assert_eq!(migration::OLDEST_MIGRATABLE, 2);
 }
 
 #[test]

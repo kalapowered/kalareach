@@ -1108,3 +1108,194 @@ fn publish_descriptor(
     };
     kr_ipc::descriptor::publish(archive.paths(), &descriptor).expect("publishes the descriptor");
 }
+
+// ---------------------------------------------------------------------------------------------
+// KR-REQ-24.30: a journal older than the ladder, refused by name and imported explicitly
+// ---------------------------------------------------------------------------------------------
+
+/// Writes the journal the first build of this schema wrote, version 1 with one receipt, where the
+/// session's journal belongs.
+fn write_version_one_journal(archive: &ArchiveService, session_id: SessionId) {
+    let path = archive.paths().journal_database(session_id);
+    std::fs::create_dir_all(path.parent().expect("a parent")).expect("the journal directory");
+    let connection = rusqlite::Connection::open(&path).expect("creates the fixture");
+    connection
+        .execute_batch(
+            "CREATE TABLE schema_version (version INTEGER NOT NULL);
+             CREATE TABLE receipts (
+                 actor_id             TEXT    NOT NULL,
+                 action_id            BLOB    NOT NULL,
+                 method               TEXT    NOT NULL,
+                 method_version       INTEGER NOT NULL,
+                 revision             INTEGER NOT NULL,
+                 state                TEXT    NOT NULL,
+                 reason               TEXT,
+                 payload_digest       BLOB    NOT NULL,
+                 accepted_deadline_ms INTEGER,
+                 error_code           TEXT,
+                 error_message        TEXT,
+                 created_at_ms        INTEGER NOT NULL,
+                 updated_at_ms        INTEGER NOT NULL,
+                 PRIMARY KEY (actor_id, action_id)
+             );
+             CREATE INDEX receipts_created_at ON receipts (created_at_ms);
+             INSERT INTO schema_version (version) VALUES (1);",
+        )
+        .expect("the version 1 schema");
+    connection
+        .execute(
+            "INSERT INTO receipts (
+                 actor_id, action_id, method, method_version, revision, state,
+                 payload_digest, accepted_deadline_ms, created_at_ms, updated_at_ms
+             ) VALUES ('test:archive', ?1, 'session.close', 1, 1, 'rejected', ?2, 10000, 1000, 1000)",
+            rusqlite::params![[5_u8; 16].as_slice(), [5_u8; 32].as_slice()],
+        )
+        .expect("the earlier build's receipt");
+}
+
+#[test]
+fn a_closed_sessions_journal_older_than_the_ladder_is_refused_by_name_rather_than_brought_forward()
+{
+    // KR-REQ-24.30. The archive brings a journal inside the ladder forward on its own; one older
+    // than the ladder it neither migrates nor reads in part. It says so, naming the command that
+    // imports it, and leaves the store where it was.
+    let (_temp, archive) = host();
+    let session_id = session();
+    write_version_one_journal(&archive, session_id);
+    let read = archive.archive(session_id).expect("reads the archive");
+    assert!(
+        read.incompleteness.iter().any(|missing| matches!(
+            missing,
+            Incompleteness::JournalUnreadable { detail } if detail.contains("kr host import-journals")
+        )),
+        "the refusal names the importer: {:?}",
+        read.incompleteness
+    );
+    assert_eq!(
+        Journal::recorded_schema_version(archive.paths().journal_database(session_id))
+            .expect("reads the version"),
+        1,
+        "nothing brought it forward behind the person's back"
+    );
+}
+
+#[test]
+fn the_importer_brings_a_closed_sessions_version_one_journal_forward_once() {
+    // The explicit import, run as `kr host import-journals` runs it: every journal older than the
+    // ladder is brought to the current version once, what is left of a worker whose end is
+    // confirmed is fenced first, a journal already inside the ladder is left alone, and the
+    // archive then reads the imported one.
+    use kr_controller::archive::ImportOutcome;
+    let (_temp, archive) = host();
+    let old = session();
+    write_version_one_journal(&archive, old);
+    let ended = kr_ipc::identity::ended_process_identity(1);
+    publish_descriptor(&archive, old, &ended);
+    let current = session();
+    {
+        let mut journal = journal_for(&archive, current);
+        journal
+            .record_session(&summary(current))
+            .expect("records the summary");
+    }
+
+    let imported = archive.import_journals().expect("imports");
+    let outcome_of = |session_id: SessionId| {
+        imported
+            .iter()
+            .find(|done| done.session_id == session_id)
+            .map(|done| done.outcome.clone())
+            .expect("the session is reported")
+    };
+    assert_eq!(
+        outcome_of(old),
+        ImportOutcome::Imported {
+            from: 1,
+            to: kr_worker::persistence::migration::CURRENT,
+            receipts: 1,
+        }
+    );
+    assert_eq!(
+        outcome_of(current),
+        ImportOutcome::Untouched {
+            version: kr_worker::persistence::migration::CURRENT
+        }
+    );
+    assert!(
+        !archive.paths().descriptor_file(old).exists(),
+        "the ended worker's descriptor was fenced before the journal was opened"
+    );
+    let read = archive.archive(old).expect("reads the archive");
+    assert_eq!(read.receipts, 1, "the receipt was kept");
+    assert!(
+        !read
+            .incompleteness
+            .iter()
+            .any(|missing| matches!(missing, Incompleteness::JournalUnreadable { .. })),
+        "{:?}",
+        read.incompleteness
+    );
+    assert_eq!(
+        archive
+            .import_journals()
+            .expect("imports")
+            .into_iter()
+            .find(|done| done.session_id == old)
+            .map(|done| done.outcome),
+        Some(ImportOutcome::Untouched {
+            version: kr_worker::persistence::migration::CURRENT
+        }),
+        "a second run finds nothing to import"
+    );
+}
+
+#[test]
+fn a_journal_a_worker_may_still_own_is_not_imported() {
+    // A worker can outlive its daemon. Each of the three things that can say a worker may still
+    // be there - its published descriptor, the registry's worker row, and a closure that never
+    // confirmed its end - keeps the journal from being opened, and the store stays at version 1.
+    use kr_controller::archive::ImportOutcome;
+    let (_temp, archive) = host();
+    let alive = kr_ipc::identity::current_process_start_identity().expect("an identity");
+
+    let described = session();
+    write_version_one_journal(&archive, described);
+    publish_descriptor(&archive, described, &alive);
+
+    let unconfirmed = session();
+    write_version_one_journal(&archive, unconfirmed);
+    {
+        let mut registry = kr_controller::registry::Registry::open(
+            archive.paths().registry_database(),
+            archive.paths().environment_id(),
+        )
+        .expect("the registry");
+        let mut record = closure(unconfirmed, ClosureReason::WorkerCrash);
+        record.surviving = vec![SurvivingResource {
+            kind: "unaccounted_worker".to_owned(),
+            detail: "its end was never confirmed".to_owned(),
+        }];
+        registry
+            .record_closure(&record)
+            .expect("records the closure");
+    }
+
+    let imported = archive.import_journals().expect("imports");
+    for session_id in [described, unconfirmed] {
+        let outcome = imported
+            .iter()
+            .find(|done| done.session_id == session_id)
+            .map(|done| done.outcome.clone())
+            .expect("the session is reported");
+        assert!(
+            matches!(outcome, ImportOutcome::Refused { .. }),
+            "{session_id}: {outcome:?}"
+        );
+        assert_eq!(
+            Journal::recorded_schema_version(archive.paths().journal_database(session_id))
+                .expect("reads the version"),
+            1,
+            "a journal a worker may still own is left alone"
+        );
+    }
+}

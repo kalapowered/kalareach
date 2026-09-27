@@ -873,6 +873,9 @@ pub enum HostCommand {
     Terminal(TerminalArguments),
     /// Show or choose how `kr new` starts this environment's control daemon when none is running.
     Startup(StartupArguments),
+    /// Bring this environment's journals that are older than this build migrates forward, once,
+    /// while its control daemon is stopped.
+    ImportJournals,
 }
 
 /// `kr host startup`.

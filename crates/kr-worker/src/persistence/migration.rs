@@ -1,8 +1,9 @@
-//! Forward-only transactional migrations, and the importer for what this build cannot migrate.
+//! Forward-only transactional migrations, and the range of versions they cover.
 //!
 //! Section 24: *database upgrades are transactional, forward-only migrations keyed by a schema
 //! version. Code reads one current schema after migration; do not maintain permanent dual
-//! readers. Restoring an unsupported archive uses an explicit versioned importer or a supported
+//! readers. Distributed host migrators remain only for the documented installed-version upgrade
+//! window. Restoring an unsupported archive uses an explicit versioned importer or a supported
 //! older exporter, never an unannounced partial restore.*
 //!
 //! Three rules follow, and this module is where each is decidable rather than assumed.
@@ -12,15 +13,21 @@
 //! * **One current schema.** Every migration ends at [`CURRENT`], and the code that runs
 //!   afterwards reads that version alone. There is no branch anywhere that reads version 2 and
 //!   version 3 differently; there is a migration that makes a version 2 database a version 3 one.
-//! * **An unsupported archive is imported explicitly.** A database below the oldest version this
-//!   ladder starts from is not partly restored. It is named, with the importer that would take
-//!   it, which is what stops a partial restore being mistaken for a complete one.
+//! * **The ladder covers a window, and what is older is imported explicitly.** A host brings a
+//!   journal forward on its own only from [`OLDEST_MIGRATABLE`]. A journal older than that is not
+//!   partly restored or read in its old shape: it is refused and named with [`IMPORTER`], the
+//!   command a person runs to bring it forward once, while no process holds it. Version 1 is
+//!   outside the window: it was written by the builds of this schema's first day, whose version 2
+//!   successor already refused it, and [`crate::persistence::import`] reads it.
 
 /// The schema version this build reads after migration.
 pub const CURRENT: i64 = 6;
 
-/// The oldest schema version this build's ladder can bring forward.
-pub const OLDEST_MIGRATABLE: i64 = 1;
+/// The oldest schema version this build's ladder brings forward on its own.
+///
+/// It is the start of the window a host migrates in place. A journal older than it is named with
+/// [`IMPORTER`] instead.
+pub const OLDEST_MIGRATABLE: i64 = 2;
 
 /// One step of the ladder.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,11 +42,6 @@ pub struct Migration {
 
 /// Every step, in order. Each one is one transaction.
 pub static LADDER: &[Migration] = &[
-    Migration {
-        from: 1,
-        to: 2,
-        summary: "the session summary and the host events an attachment never saw",
-    },
     Migration {
         from: 2,
         to: 3,
@@ -98,13 +100,12 @@ pub enum MigrationError {
     },
 }
 
-/// What an unsupported store is named against.
+/// What a journal older than the ladder is named against: the command that imports it.
 ///
-/// Section 24 asks for an explicit versioned importer or a supported older exporter, and neither
-/// exists in this build: what exists is the refusal that stops a store older than the ladder
-/// being restored in part. The refusal names the route rather than a command, because naming a
-/// command this build does not ship would send a person somewhere there is nothing to run.
-pub const IMPORTER: &str = "an explicit versioned import of a store this build cannot migrate";
+/// It runs against the environment's own files while it holds the environment's singleton lock,
+/// so no daemon is running, and it refuses a session whose worker may still be there.
+pub const IMPORTER: &str =
+    "the explicit import `kr host import-journals`, run while this environment's daemon is stopped";
 
 /// Returns the tables a store recording `version` must hold.
 ///
@@ -240,7 +241,7 @@ mod tests {
 
     #[test]
     fn a_store_an_earlier_build_wrote_is_planned_all_the_way_forward() {
-        let steps = plan(1).expect("version 1 is migratable");
+        let steps = plan(OLDEST_MIGRATABLE).expect("the window's oldest version is migratable");
         assert_eq!(steps.len(), (CURRENT - OLDEST_MIGRATABLE) as usize);
         assert_eq!(steps[0].from, OLDEST_MIGRATABLE);
         assert_eq!(steps.last().expect("a last step").to, CURRENT);
@@ -285,15 +286,17 @@ mod tests {
 
     #[test]
     fn a_store_older_than_the_ladder_names_the_importer_rather_than_being_partly_restored() {
-        let error = plan(0).expect_err("version 0 is not migratable");
-        assert_eq!(
-            error,
-            MigrationError::Unsupported {
-                found: 0,
-                oldest: OLDEST_MIGRATABLE,
-                importer: IMPORTER,
-            }
-        );
-        assert!(error.to_string().contains(IMPORTER));
+        for older in [0, 1] {
+            let error = plan(older).expect_err("older than the window");
+            assert_eq!(
+                error,
+                MigrationError::Unsupported {
+                    found: older,
+                    oldest: OLDEST_MIGRATABLE,
+                    importer: IMPORTER,
+                }
+            );
+            assert!(error.to_string().contains(IMPORTER));
+        }
     }
 }

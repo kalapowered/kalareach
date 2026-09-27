@@ -20,6 +20,7 @@ worker directly for what a session owns.
 | `kr host power` | — | Show or change whether this host stays awake for work it has admitted |
 | `kr host terminal` | — | Show the terminal applications this host has, and which one a new window opens in |
 | `kr host startup` | — | Show or choose how `kr new` starts this environment's control daemon when none is running |
+| `kr host import-journals` | — | Bring this environment's journals that are older than this build migrates forward, once, while its daemon is stopped |
 | `kr bridge --stdio` | — | Serve this environment to a local process bridge on standard input and output |
 | `kr bridge [list/enrol/forget/refresh]` | — | The environments this host has enrolled, and what it last saw of them |
 | `kr pair [invite/confirm/cancel/status]` | `kr p` | Pair a device: issue an invitation, approve the device that answers it, withdraw one, or read one |
@@ -1267,6 +1268,26 @@ what had already left it before privacy mode was turned on: backup archives and 
 with whether this host holds any way to ask for its removal. It changes nothing. A paired device
 whose grant carries `host.manage` reads the same report; no device can turn privacy mode on or off.
 `docs/host/README.md` has what each step does and what privacy mode does not reach yet.
+
+## `kr host import-journals`
+
+A session's journal is brought forward to this build's schema by whatever opens it, but only from
+the oldest version this build's migrations cover. A journal older than that is refused wherever it
+is opened, and the refusal names this command. It imports every such journal in this
+installation's environment once, forward only, each in one transaction, and leaves every other
+journal alone:
+
+```sh
+kr host import-journals           # one line per journal: imported, left alone, or not imported and why
+kr host import-journals --json    # { "ok": ..., "journals": [ { "session_id", "outcome", ... } ] }
+```
+
+It works on the environment's own files, so it runs only while the control daemon is stopped: it
+takes the environment's singleton lock first, which a running daemon holds, and is refused while
+the daemon or another import holds it. A worker can outlive its daemon, so a journal is not opened
+while anything this host can read says its worker may still be there, or while what would say so
+cannot be read. A journal the importer cannot read is refused by name and left exactly as it was,
+and the command then exits with a failure.
 
 ## `--json` shapes
 

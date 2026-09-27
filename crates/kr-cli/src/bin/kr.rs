@@ -931,6 +931,7 @@ async fn run(cli: Cli) -> Result<Completion> {
                 kr_cli::startup::run(&paths, &startup, cli.json)?;
                 Ok(Completion::Done)
             }
+            HostCommand::ImportJournals => kr_cli::import::run(&paths, cli.json),
         },
         Command::Account(arguments) => match arguments.command {
             AccountCommand::Token(token) => match token {

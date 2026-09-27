@@ -2356,10 +2356,15 @@ read stays faulted until the store itself says its pages are sound.
 
 Migrations are forward-only, transactional and keyed by a schema version.
 `kr_worker::persistence::migration::LADDER` is the list of steps, each one transaction, each
-moving one version. A store a newer build wrote is refused rather than read, because reading it
-would mean guessing what a column this build does not know about means. A store older than the
-ladder starts from is refused too, and named: it needs an explicit versioned import rather than
-being restored in part. Code reads one current schema after migration, and there is no branch
+moving one version, and whatever opens a journal brings it forward through them. The ladder is a
+window: it starts at version 2. A store a newer build wrote is refused rather than read, because
+reading it would mean guessing what a column this build does not know about means. A store older
+than the ladder is refused too, wherever it is opened, and the refusal names `kr host
+import-journals`: the explicit importer, which reads exactly the two shapes the builds recording
+version 1 wrote and brings such a journal to the current schema once, in one transaction, while
+the environment's daemon is stopped and no worker can hold it. It checks the version, every object,
+every column and every row first, names anything it cannot read, and leaves a refused journal
+exactly as it was. Code reads one current schema after migration or import, and there is no branch
 anywhere that reads two.
 
 ## Retained output, and what eviction leaves behind

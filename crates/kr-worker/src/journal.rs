@@ -388,7 +388,6 @@ impl Journal {
                     .map_err(|error| unavailable_detail_owned(error.to_string()))?;
                 for step in steps {
                     match (step.from, step.to) {
-                        (1, 2) => self.migrate_1_to_2()?,
                         (2, 3) => self.migrate_2_to_3()?,
                         (3, 4) => self.migrate_3_to_4()?,
                         (4, 5) => self.migrate_4_to_5()?,
@@ -411,145 +410,7 @@ impl Journal {
 
     /// Creates every object of the current schema that is not already there.
     fn create_current_schema(&self) -> Result<()> {
-        self.connection
-            .execute_batch(
-                "CREATE TABLE IF NOT EXISTS receipts (
-                     actor_id             TEXT    NOT NULL,
-                     action_id            BLOB    NOT NULL,
-                     method               TEXT    NOT NULL,
-                     method_version       INTEGER NOT NULL,
-                     revision             INTEGER NOT NULL,
-                     state                TEXT    NOT NULL,
-                     reason               TEXT,
-                     payload_digest       BLOB    NOT NULL,
-                     subject_digest       BLOB,
-                     intent               BLOB,
-                     accepted_deadline_ms INTEGER,
-                     created_boot         BLOB,
-                     created_continuous_ms INTEGER,
-                     error_code           TEXT,
-                     error_message        TEXT,
-                     created_at_ms        INTEGER NOT NULL,
-                     updated_at_ms        INTEGER NOT NULL,
-                     PRIMARY KEY (actor_id, action_id)
-                 );
-                 CREATE INDEX IF NOT EXISTS receipts_created_at ON receipts (created_at_ms);
-                 CREATE INDEX IF NOT EXISTS receipts_subject
-                     ON receipts (actor_id, subject_digest, state);
-                 CREATE INDEX IF NOT EXISTS receipts_action ON receipts (action_id);
-                 CREATE TABLE IF NOT EXISTS observations (
-                     sequence          INTEGER PRIMARY KEY AUTOINCREMENT,
-                     actor_id          TEXT    NOT NULL,
-                     action_id         BLOB    NOT NULL,
-                     provenance        TEXT    NOT NULL,
-                     subject           TEXT    NOT NULL,
-                     subject_revision  INTEGER,
-                     source_cursor     INTEGER,
-                     claimed_result    TEXT    NOT NULL,
-                     observed_at_ms    INTEGER NOT NULL
-                 );
-                 CREATE INDEX IF NOT EXISTS observations_action
-                     ON observations (actor_id, action_id, sequence);
-                 CREATE TABLE IF NOT EXISTS results (
-                     actor_id  TEXT NOT NULL,
-                     action_id BLOB NOT NULL,
-                     result    BLOB NOT NULL,
-                     PRIMARY KEY (actor_id, action_id)
-                 );
-                 CREATE TABLE IF NOT EXISTS receipt_events (
-                     sequence       INTEGER PRIMARY KEY AUTOINCREMENT,
-                     actor_id       TEXT    NOT NULL,
-                     action_id      BLOB    NOT NULL,
-                     revision       INTEGER NOT NULL,
-                     state          TEXT    NOT NULL,
-                     recorded_at_ms INTEGER NOT NULL
-                 );
-                 CREATE TABLE IF NOT EXISTS closure (
-                     session_id BLOB PRIMARY KEY,
-                     record     BLOB NOT NULL
-                 );
-                 CREATE TABLE IF NOT EXISTS session (
-                     session_id BLOB PRIMARY KEY,
-                     summary    BLOB NOT NULL
-                 );
-                 CREATE TABLE IF NOT EXISTS host_events (
-                     sequence       INTEGER PRIMARY KEY AUTOINCREMENT,
-                     kind           TEXT    NOT NULL,
-                     detail         TEXT    NOT NULL,
-                     output_cursor  INTEGER NOT NULL,
-                     recorded_at_ms INTEGER NOT NULL
-                 );
-                 CREATE INDEX IF NOT EXISTS host_events_recorded_at
-                     ON host_events (recorded_at_ms);
-                 CREATE TABLE IF NOT EXISTS host_time (
-                     id    INTEGER PRIMARY KEY CHECK (id = 1),
-                     state BLOB NOT NULL
-                 );
-                 CREATE TABLE IF NOT EXISTS fence_evidence (
-                     revision  INTEGER NOT NULL,
-                     position  INTEGER NOT NULL,
-                     kind      TEXT    NOT NULL,
-                     actor_id  TEXT    NOT NULL,
-                     action_id BLOB    NOT NULL,
-                     method    TEXT,
-                     state     TEXT,
-                     PRIMARY KEY (revision, position)
-                 );
-                 CREATE UNIQUE INDEX IF NOT EXISTS fence_evidence_named
-                     ON fence_evidence (revision, kind, actor_id, action_id);
-                 CREATE TABLE IF NOT EXISTS fence_state (
-                     id             INTEGER PRIMARY KEY CHECK (id = 1),
-                     since_sequence INTEGER NOT NULL
-                 );
-                 CREATE TABLE IF NOT EXISTS fence_delivery (
-                     revision   INTEGER PRIMARY KEY,
-                     named      INTEGER NOT NULL,
-                     delivered  INTEGER NOT NULL,
-                     generation INTEGER NOT NULL
-                 );
-                 CREATE TABLE IF NOT EXISTS fence_forgotten (
-                     id              INTEGER PRIMARY KEY CHECK (id = 1),
-                     before_revision INTEGER NOT NULL
-                 );
-                 CREATE TABLE IF NOT EXISTS outbox (
-                     cursor           INTEGER PRIMARY KEY AUTOINCREMENT,
-                     event_id         BLOB    NOT NULL UNIQUE,
-                     stream           TEXT    NOT NULL,
-                     source           TEXT    NOT NULL,
-                     actor_id         TEXT,
-                     action_id        BLOB,
-                     subject_revision INTEGER NOT NULL,
-                     causal_root      BLOB,
-                     causal_parent    BLOB,
-                     content          TEXT    NOT NULL,
-                     detail           TEXT    NOT NULL,
-                     recorded_at_ms   INTEGER NOT NULL
-                 );
-                 CREATE INDEX IF NOT EXISTS outbox_stream ON outbox (stream, cursor);
-                 CREATE TABLE IF NOT EXISTS outbox_cursors (
-                     consumer  TEXT PRIMARY KEY,
-                     cursor    INTEGER NOT NULL,
-                     delivered INTEGER NOT NULL
-                 );
-                 CREATE TABLE IF NOT EXISTS journal_gaps (
-                     sequence        INTEGER PRIMARY KEY AUTOINCREMENT,
-                     kind            TEXT    NOT NULL,
-                     detail          TEXT    NOT NULL,
-                     faulted_at_ms   INTEGER NOT NULL,
-                     recovered_at_ms INTEGER NOT NULL,
-                     durable_through INTEGER NOT NULL,
-                     resumed_at      INTEGER NOT NULL
-                 );
-                 CREATE TABLE IF NOT EXISTS privacy (
-                     id               INTEGER PRIMARY KEY CHECK (id = 1),
-                     generation       INTEGER NOT NULL,
-                     enabled          INTEGER NOT NULL,
-                     recorded_at_ms   INTEGER NOT NULL,
-                     questions_head   INTEGER NOT NULL DEFAULT 0,
-                     host_events_head INTEGER NOT NULL DEFAULT 0
-                 );",
-            )
-            .map_err(|error| faulted(&self.health, error))?;
+        create_current_objects(&self.connection).map_err(|error| faulted(&self.health, error))?;
         self.add_delivery_generation()?;
         Ok(())
     }
@@ -561,13 +422,7 @@ impl Journal {
     /// gets it. A journal that later loses its privacy record serves no attention text rather than
     /// being given a fresh one, which would read as a session that never changed privacy mode.
     fn create_starting_privacy(&self, now_ms: TimestampMs) -> Result<()> {
-        self.connection
-            .execute(
-                "INSERT OR IGNORE INTO privacy
-                     (id, generation, enabled, recorded_at_ms, questions_head, host_events_head)
-                 VALUES (1, 0, 0, ?1, 0, 0)",
-                params![i64::try_from(now_ms.get()).unwrap_or(i64::MAX)],
-            )
+        write_starting_privacy(&self.connection, now_ms)
             .map_err(|error| faulted(&self.health, error))?;
         Ok(())
     }
@@ -856,29 +711,6 @@ impl Journal {
                 )
                 .map_err(|error| faulted(&self.health, error))?;
         }
-        Ok(())
-    }
-
-    fn migrate_1_to_2(&self) -> Result<()> {
-        self.connection
-            .execute_batch(
-                "BEGIN;
-                 ALTER TABLE receipts ADD COLUMN intent BLOB;
-                 CREATE TABLE IF NOT EXISTS session (
-                     session_id BLOB PRIMARY KEY,
-                     summary    BLOB NOT NULL
-                 );
-                 CREATE TABLE IF NOT EXISTS host_events (
-                     sequence       INTEGER PRIMARY KEY AUTOINCREMENT,
-                     kind           TEXT    NOT NULL,
-                     detail         TEXT    NOT NULL,
-                     output_cursor  INTEGER NOT NULL,
-                     recorded_at_ms INTEGER NOT NULL
-                 );
-                 UPDATE schema_version SET version = 2;
-                 COMMIT;",
-            )
-            .map_err(|error| faulted(&self.health, error))?;
         Ok(())
     }
 
@@ -2855,9 +2687,17 @@ impl Journal {
             .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
             .map_err(unavailable)?;
         if recorded != SCHEMA_VERSION {
-            return Err(unavailable_detail_owned(format!(
-                "this journal is at schema version {recorded}; this build reads {SCHEMA_VERSION}"
-            )));
+            // A journal the ladder does not cover is refused with what the ladder says about it:
+            // one older than the ladder names the command that imports it, and one a newer build
+            // wrote says so. One inside the ladder is brought forward by its owner before it is
+            // read, and is refused here until it has been.
+            let detail = match crate::persistence::migration::plan(recorded) {
+                Err(refusal) => refusal.to_string(),
+                Ok(_) => format!(
+                    "this journal is at schema version {recorded}; this build reads {SCHEMA_VERSION}"
+                ),
+            };
+            return Err(unavailable_detail_owned(detail));
         }
         let journal = Self {
             connection,
@@ -3895,6 +3735,165 @@ pub const fn action_id_from(bytes: [u8; 16]) -> ActionId {
 ///
 /// Every durable path in this file goes through here, which is what makes the seam's condition a
 /// fact about the store rather than a summary somebody remembered to update.
+/// Creates every object of the current schema that is not already there, through `connection`.
+///
+/// It opens no transaction of its own, so it runs inside whichever one its caller holds: the
+/// journal's own opening, and the explicit importer's single transaction, which is what lets an
+/// imported journal reach the current schema in the same commit as the rows it keeps.
+pub(crate) fn create_current_objects(connection: &Connection) -> rusqlite::Result<()> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS receipts (
+                     actor_id             TEXT    NOT NULL,
+                     action_id            BLOB    NOT NULL,
+                     method               TEXT    NOT NULL,
+                     method_version       INTEGER NOT NULL,
+                     revision             INTEGER NOT NULL,
+                     state                TEXT    NOT NULL,
+                     reason               TEXT,
+                     payload_digest       BLOB    NOT NULL,
+                     subject_digest       BLOB,
+                     intent               BLOB,
+                     accepted_deadline_ms INTEGER,
+                     created_boot         BLOB,
+                     created_continuous_ms INTEGER,
+                     error_code           TEXT,
+                     error_message        TEXT,
+                     created_at_ms        INTEGER NOT NULL,
+                     updated_at_ms        INTEGER NOT NULL,
+                     PRIMARY KEY (actor_id, action_id)
+                 );
+                 CREATE INDEX IF NOT EXISTS receipts_created_at ON receipts (created_at_ms);
+                 CREATE INDEX IF NOT EXISTS receipts_subject
+                     ON receipts (actor_id, subject_digest, state);
+                 CREATE INDEX IF NOT EXISTS receipts_action ON receipts (action_id);
+                 CREATE TABLE IF NOT EXISTS observations (
+                     sequence          INTEGER PRIMARY KEY AUTOINCREMENT,
+                     actor_id          TEXT    NOT NULL,
+                     action_id         BLOB    NOT NULL,
+                     provenance        TEXT    NOT NULL,
+                     subject           TEXT    NOT NULL,
+                     subject_revision  INTEGER,
+                     source_cursor     INTEGER,
+                     claimed_result    TEXT    NOT NULL,
+                     observed_at_ms    INTEGER NOT NULL
+                 );
+                 CREATE INDEX IF NOT EXISTS observations_action
+                     ON observations (actor_id, action_id, sequence);
+                 CREATE TABLE IF NOT EXISTS results (
+                     actor_id  TEXT NOT NULL,
+                     action_id BLOB NOT NULL,
+                     result    BLOB NOT NULL,
+                     PRIMARY KEY (actor_id, action_id)
+                 );
+                 CREATE TABLE IF NOT EXISTS receipt_events (
+                     sequence       INTEGER PRIMARY KEY AUTOINCREMENT,
+                     actor_id       TEXT    NOT NULL,
+                     action_id      BLOB    NOT NULL,
+                     revision       INTEGER NOT NULL,
+                     state          TEXT    NOT NULL,
+                     recorded_at_ms INTEGER NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS closure (
+                     session_id BLOB PRIMARY KEY,
+                     record     BLOB NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS session (
+                     session_id BLOB PRIMARY KEY,
+                     summary    BLOB NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS host_events (
+                     sequence       INTEGER PRIMARY KEY AUTOINCREMENT,
+                     kind           TEXT    NOT NULL,
+                     detail         TEXT    NOT NULL,
+                     output_cursor  INTEGER NOT NULL,
+                     recorded_at_ms INTEGER NOT NULL
+                 );
+                 CREATE INDEX IF NOT EXISTS host_events_recorded_at
+                     ON host_events (recorded_at_ms);
+                 CREATE TABLE IF NOT EXISTS host_time (
+                     id    INTEGER PRIMARY KEY CHECK (id = 1),
+                     state BLOB NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS fence_evidence (
+                     revision  INTEGER NOT NULL,
+                     position  INTEGER NOT NULL,
+                     kind      TEXT    NOT NULL,
+                     actor_id  TEXT    NOT NULL,
+                     action_id BLOB    NOT NULL,
+                     method    TEXT,
+                     state     TEXT,
+                     PRIMARY KEY (revision, position)
+                 );
+                 CREATE UNIQUE INDEX IF NOT EXISTS fence_evidence_named
+                     ON fence_evidence (revision, kind, actor_id, action_id);
+                 CREATE TABLE IF NOT EXISTS fence_state (
+                     id             INTEGER PRIMARY KEY CHECK (id = 1),
+                     since_sequence INTEGER NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS fence_delivery (
+                     revision   INTEGER PRIMARY KEY,
+                     named      INTEGER NOT NULL,
+                     delivered  INTEGER NOT NULL,
+                     generation INTEGER NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS fence_forgotten (
+                     id              INTEGER PRIMARY KEY CHECK (id = 1),
+                     before_revision INTEGER NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS outbox (
+                     cursor           INTEGER PRIMARY KEY AUTOINCREMENT,
+                     event_id         BLOB    NOT NULL UNIQUE,
+                     stream           TEXT    NOT NULL,
+                     source           TEXT    NOT NULL,
+                     actor_id         TEXT,
+                     action_id        BLOB,
+                     subject_revision INTEGER NOT NULL,
+                     causal_root      BLOB,
+                     causal_parent    BLOB,
+                     content          TEXT    NOT NULL,
+                     detail           TEXT    NOT NULL,
+                     recorded_at_ms   INTEGER NOT NULL
+                 );
+                 CREATE INDEX IF NOT EXISTS outbox_stream ON outbox (stream, cursor);
+                 CREATE TABLE IF NOT EXISTS outbox_cursors (
+                     consumer  TEXT PRIMARY KEY,
+                     cursor    INTEGER NOT NULL,
+                     delivered INTEGER NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS journal_gaps (
+                     sequence        INTEGER PRIMARY KEY AUTOINCREMENT,
+                     kind            TEXT    NOT NULL,
+                     detail          TEXT    NOT NULL,
+                     faulted_at_ms   INTEGER NOT NULL,
+                     recovered_at_ms INTEGER NOT NULL,
+                     durable_through INTEGER NOT NULL,
+                     resumed_at      INTEGER NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS privacy (
+                     id               INTEGER PRIMARY KEY CHECK (id = 1),
+                     generation       INTEGER NOT NULL,
+                     enabled          INTEGER NOT NULL,
+                     recorded_at_ms   INTEGER NOT NULL,
+                     questions_head   INTEGER NOT NULL DEFAULT 0,
+                     host_events_head INTEGER NOT NULL DEFAULT 0
+                 );",
+    )
+}
+
+/// Writes the privacy record a journal starts with, when it has none: privacy mode off at the first
+/// generation, with nothing before it.
+pub(crate) fn write_starting_privacy(
+    connection: &Connection,
+    now_ms: TimestampMs,
+) -> rusqlite::Result<usize> {
+    connection.execute(
+        "INSERT OR IGNORE INTO privacy
+             (id, generation, enabled, recorded_at_ms, questions_head, host_events_head)
+         VALUES (1, 0, 0, ?1, 0, 0)",
+        params![i64::try_from(now_ms.get()).unwrap_or(i64::MAX)],
+    )
+}
+
 fn faulted(
     health: &crate::persistence::fault::JournalHealth,
     error: rusqlite::Error,

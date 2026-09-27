@@ -51,6 +51,7 @@ pub mod device;
 pub mod diff;
 pub mod doctor;
 pub mod error;
+pub mod import;
 pub mod output;
 pub mod pair;
 pub mod platform;

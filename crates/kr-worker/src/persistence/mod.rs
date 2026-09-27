@@ -13,12 +13,14 @@
 //! | [`fault`] | The journal-fault and recovery seam: fault detected, rich work fenced, gap committed |
 //! | [`outbox`] | A state transition and its event in one transaction, with at-least-once idempotent fan-out |
 //! | [`capacity`] | A full durable store refusing new mutations before dispatch, with the stated exceptions |
-//! | [`migration`] | Forward-only transactional migrations and the explicit importer |
+//! | [`migration`] | Forward-only transactional migrations, and the version range they cover |
+//! | [`import`] | The explicit importer for a journal older than that range |
 //! | [`retention`] | Seven-day output retention under the host and session caps, and what eviction leaves behind |
 
 pub mod capacity;
 pub mod contract;
 pub mod fault;
+pub mod import;
 pub mod migration;
 pub mod outbox;
 pub mod retention;

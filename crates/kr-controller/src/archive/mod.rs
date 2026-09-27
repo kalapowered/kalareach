@@ -57,6 +57,10 @@ use kr_worker::persistence::fault::RecoveryGap;
 
 use crate::error::{ControllerError, Result};
 
+mod import;
+
+pub use import::{ImportOutcome, JournalImport, RefusalCause, UNACCOUNTED_WORKER};
+
 /// The most bytes one archive history page carries.
 ///
 /// A control frame carries [`kr_protocol::limits::MAX_CONTROL_FRAME_LEN`] in all, and a page is a
