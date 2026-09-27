@@ -157,18 +157,90 @@ struct Guards {
     shared: Vec<String>,
     /// When the files were last read.
     read_at: std::sync::Mutex<Option<std::time::Instant>>,
+    /// What changed, once a look found a change: the part stops on it.
+    changed: std::sync::Mutex<Option<String>>,
+    /// Whether the watcher still reads them.
+    watching: std::sync::atomic::AtomicBool,
+}
+
+impl Guards {
+    /// What changed since the part started, where anything did: a file of the person's that no
+    /// part may change, or one the person's own programs also write that now holds `needles` (the
+    /// part's mark or the run's directory), or a file that cannot be read.
+    fn change(&self, needles: &[&str]) -> Option<String> {
+        let now = match guarded_files(&self.home, &self.files, needles) {
+            Ok(now) => now,
+            Err(why) => return Some(why),
+        };
+        if let Ok(mut read_at) = self.read_at.lock() {
+            *read_at = Some(std::time::Instant::now());
+        }
+        self.before.iter().zip(&now).find_map(|(first, second)| {
+            let changed = first.sha256 != second.sha256;
+            if changed && self.guarded.contains(&first.relative) {
+                Some(format!("~/{} changed while the part ran", first.relative))
+            } else if changed && second.holds && self.shared.contains(&first.relative) {
+                Some(format!(
+                    "~/{} changed to hold the part's mark or the run's directory",
+                    first.relative
+                ))
+            } else {
+                None
+            }
+        })
+    }
+
+    /// What a look has found changed, once one has.
+    fn changed(&self) -> Option<String> {
+        self.changed.lock().ok().and_then(|changed| changed.clone())
+    }
+}
+
+/// How often the watcher reads the files a part watches.
+const GUARD_WATCH: Duration = Duration::from_millis(250);
+
+/// Reads the files the part watches every [`GUARD_WATCH`] while it runs, from a thread of its own,
+/// so a change is seen whatever the part's own steps wait on: at the first change it records what
+/// changed and ends everything the part started, the agent's own processes among them, so the
+/// agent does nothing more; the part then stops on it at its next step, and its outcome says so.
+fn watch_guards(guards: &Guards, provenance: &Provenance, run: &Run, needles: &[&str]) {
+    while guards.watching.load(std::sync::atomic::Ordering::SeqCst) {
+        if let Some(what) = guards.change(needles) {
+            if let Ok(mut changed) = guards.changed.lock() {
+                changed.get_or_insert(what);
+            }
+            hand_over(provenance, run);
+            run.end_everything();
+            return;
+        }
+        std::thread::sleep(GUARD_WATCH);
+    }
+}
+
+/// Stops the watcher of a part's files when the part's own steps end, however they end.
+struct StopWatching<'g>(Option<&'g Guards>);
+
+impl Drop for StopWatching<'_> {
+    fn drop(&mut self) {
+        if let Some(guards) = self.0 {
+            guards
+                .watching
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
 }
 
 /// How often a part that waits reads the files it watches again.
 const GUARD_EVERY: Duration = Duration::from_millis(500);
 
-/// [`guards_hold`], where the files were not read in the last [`GUARD_EVERY`]: for a part's waits,
-/// which call it on every turn of their loops.
+/// [`guards_hold`], where the files were not read in the last [`GUARD_EVERY`], and at once where the
+/// watcher found a change: for a part's waits, which call it on every turn of their loops.
 fn guards_hold_while_waiting(stage: &Stage<'_, '_>) {
     let due = stage.guards.is_some_and(|guards| {
-        guards.read_at.lock().map_or(true, |read_at| {
-            read_at.is_none_or(|at| at.elapsed() >= GUARD_EVERY)
-        })
+        guards.changed().is_some()
+            || guards.read_at.lock().map_or(true, |read_at| {
+                read_at.is_none_or(|at| at.elapsed() >= GUARD_EVERY)
+            })
     });
     if due {
         guards_hold(stage);
@@ -177,31 +249,20 @@ fn guards_hold_while_waiting(stage: &Stage<'_, '_>) {
 
 /// Stops the part at once when a file of the person's that no part may change has changed since the
 /// part started, or one the person's own programs also write has changed to hold the part's mark or
-/// the run's directory; or when either cannot be read.
+/// the run's directory; or when either cannot be read; or when the watcher has found so.
 fn guards_hold(stage: &Stage<'_, '_>) {
     let Some(guards) = stage.guards else {
         return;
     };
-    let root = stage.run.root().display().to_string();
-    let now = guarded_files(&guards.home, &guards.files, &[stage.mark, root.as_str()])
-        .unwrap_or_else(|why| panic!("{GUARD_CHANGED} {why}"));
-    if let Ok(mut read_at) = guards.read_at.lock() {
-        *read_at = Some(std::time::Instant::now());
+    if let Some(what) = guards.changed() {
+        panic!("{GUARD_CHANGED} {what}");
     }
-    for (first, second) in guards.before.iter().zip(&now) {
-        let changed = first.sha256 != second.sha256;
-        if changed && guards.guarded.contains(&first.relative) {
-            panic!(
-                "{GUARD_CHANGED} ~/{} changed while the part ran",
-                first.relative
-            );
+    let root = stage.run.root().display().to_string();
+    if let Some(what) = guards.change(&[stage.mark, root.as_str()]) {
+        if let Ok(mut changed) = guards.changed.lock() {
+            changed.get_or_insert(what.clone());
         }
-        if changed && second.holds && guards.shared.contains(&first.relative) {
-            panic!(
-                "{GUARD_CHANGED} ~/{} changed to hold the part's mark or the run's directory",
-                first.relative
-            );
-        }
+        panic!("{GUARD_CHANGED} {what}");
     }
 }
 
@@ -369,6 +430,8 @@ fn staged(
             guarded: login.account.guarded.clone(),
             shared: login.account.shared.clone(),
             read_at: std::sync::Mutex::new(None),
+            changed: std::sync::Mutex::new(None),
+            watching: std::sync::atomic::AtomicBool::new(false),
         });
     let run = Run::start(&format!("part {part}"));
     let root = run.root().to_path_buf();
@@ -399,6 +462,9 @@ fn staged(
         )
     }));
     let login_held = held.load(std::sync::atomic::Ordering::SeqCst);
+    // What the watcher of the person's files found changed while the part ran, where anything did:
+    // the agent stops on it, whatever the part's own steps then failed on.
+    let guard_change = guards.as_ref().and_then(Guards::changed);
     // What the part left is read only once nothing it started still runs: after the closing
     // check, or, after a part that stopped part way, once the run has ended everything and found
     // nothing left. The run's directory is still there then.
@@ -555,6 +621,11 @@ fn staged(
     // directories could not be read whole afterwards, the agent rewrote a file it had there, or a
     // file of the person's that must not change did.
     let mut stop = watched_stop;
+    if let Some(what) = &guard_change {
+        stop.push(format!(
+            "{GUARD_CHANGED} {what}; everything the part started was ended when it was seen"
+        ));
+    }
     if let Err(left) = &writers {
         stop.push(format!(
             "something the part started still ran after the run ended everything, so what it \
@@ -589,7 +660,7 @@ fn staged(
                 let said = panic_text(&*panic);
                 if said.starts_with(LOGIN_UNPROVEN)
                     || said.starts_with(ISOLATION_UNPROVEN)
-                    || said.starts_with(GUARD_CHANGED)
+                    || (said.starts_with(GUARD_CHANGED) && guard_change.is_none())
                 {
                     stop.push(said.clone());
                 }
@@ -823,10 +894,20 @@ fn run_part(
     // The sessions an agent is launched in are watched from just before the launch until they have
     // ended, by a thread of their own, with one more look when the part's own steps end; the
     // thread stops when the part ends, however it ends.
+    let root_text = run.root().display().to_string();
     let outcome = std::thread::scope(|scope| {
         let _stop = StopSampling(provenance);
         let _sampler = scope.spawn(|| provenance.sample_until_stopped());
+        // The person's files are watched while the part's own steps run, the probes among them.
+        if let Some(guards) = guards {
+            guards
+                .watching
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let root_text = root_text.as_str();
+            scope.spawn(move || watch_guards(guards, provenance, run, &[mark, root_text]));
+        }
         let ending = {
+            let _watching = StopWatching(guards);
             let mut stage = Stage {
                 build: &inputs.build,
                 run,
@@ -1000,7 +1081,7 @@ fn start_agent_as(
             (&words.join(" "), &server.ready),
             stage.provenance,
             &Expected::pinned(stage.build),
-            &|| guards_hold_while_waiting(stage),
+            &|| guards_hold(stage),
         );
         // The line that says it listens can come before the server answers requests.
         let listening = std::time::Instant::now();
@@ -1034,7 +1115,7 @@ fn start_agent_as(
         (&line, ready),
         stage.provenance,
         &Expected::pinned(stage.build),
-        &|| guards_hold_while_waiting(stage),
+        &|| guards_hold(stage),
     );
     Agent {
         session,
@@ -4184,6 +4265,11 @@ fn loser_reached_nothing(executions: usize) -> Result<(), String> {
     }
 }
 
+/// How many requests the part has refused so far.
+fn refusals(stage: &Stage<'_, '_>) -> usize {
+    stage.declined.lock().map_or(0, |declined| declined.len())
+}
+
 /// How many times the approval-gated command ran: the lines holding `mark` in its log.
 fn executions(log: &Path, mark: &str) -> usize {
     std::fs::read_to_string(log)
@@ -4430,8 +4516,11 @@ fn a_local_and_a_remote_answer_raced_to_one_approval_resolve_it_once() {
             "an approval-gated command",
         );
         // Only the model asks for a tool, so the dialog says the vendor answered; it is answered
-        // only when it asks to run the part's command and nothing else.
+        // only when it asks to run the part's command and nothing else. From here on the part must
+        // refuse nothing: a second request, which a code tool's one call can make, would be one
+        // the count of answers could not tell apart.
         let _ = logged.approval_for(stage, &command, "the agent asks for approval");
+        let refused_before = refusals(stage);
         // The race: the local terminal denies and, at once, the device, which holds the lease,
         // allows. The local key is written to its terminal first; the lease decides.
         logged
@@ -4474,6 +4563,12 @@ fn a_local_and_a_remote_answer_raced_to_one_approval_resolve_it_once() {
             1,
         );
         one_decision(decided).unwrap_or_else(|why| panic!("one resolution: {why}"));
+        assert_eq!(
+            refusals(stage),
+            refused_before,
+            "one resolution: the agent asked for approval again after the race, so one request is \
+             not shown"
+        );
         let snapshot = events_snapshot(
             &logged.agent.session.remote,
             stage.runtime,
@@ -4515,6 +4610,7 @@ fn a_local_and_a_remote_answer_raced_to_one_approval_resolve_it_once() {
         assert!(
             after_reconnect == ran
                 && decided_after == decided
+                && refusals(stage) == refused_before
                 && !rows.iter().any(|row| row.contains(&account.approval.shows)),
             "after the device reconnects the command has run {after_reconnect} time(s) and the \
              conversation records {decided_after} answer(s), as before, and no approval is \
@@ -4622,6 +4718,11 @@ fn a_local_and_a_remote_answer_raced_to_one_approval_resolve_it_once() {
             decided + 1,
         );
         let control = loser_reached_nothing(executions(&log, &second));
+        assert_eq!(
+            refusals(stage),
+            refused_before,
+            "the control: the agent asked for nothing but the second approval"
+        );
         assert!(
             control.is_err() && device_refused.is_some() && decided_control == decided + 1,
             "the check fails once the other side holds the lease: {control:?}, the device's answer \

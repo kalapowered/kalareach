@@ -811,8 +811,8 @@ pub struct AgentProcess {
 /// checked and the session is watched from then to the end of the part; once the agent draws its
 /// first screen, the image every process beneath the shell maps is recorded and checked, and the
 /// launch must have run `expected` in the way its build list names ([`Provenance`]). `between` is
-/// called every few tens of milliseconds while the agent is awaited, for what the part checks
-/// while it waits.
+/// called just before the command is typed and every few tens of milliseconds while the agent is
+/// awaited, for what the part checks.
 ///
 /// # Panics
 ///
@@ -841,6 +841,8 @@ pub fn launch(
         .check_path(command)
         .unwrap_or_else(|why| panic!("{why}"));
     provenance.watch(session.root_shell.clone());
+    // The last look before the agent's command is typed, once the session is set up.
+    between();
     let typed_at = session.window.mark();
     session.window.type_text(format!("{line}\r").as_bytes());
     let drawn = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
