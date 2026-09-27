@@ -47,6 +47,7 @@ legs = [
   "dep:url",
   "dep:portable-pty",
   "dep:rustix",
+  "dep:libproc",
 ]
 
 [dependencies]
@@ -91,6 +92,10 @@ url = { workspace = true, optional = true }
 portable-pty = { workspace = true, optional = true }
 # Signals by recorded process, and the modes of a terminal read from the device itself.
 rustix = { workspace = true, features = ["fs", "process", "termios"], optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# The file a process runs, which the kernel says of a process it will not otherwise describe.
+libproc = { workspace = true, optional = true }
 
 [dev-dependencies]
 # A program a test starts is placed by a process of its own, so that no child another test starts

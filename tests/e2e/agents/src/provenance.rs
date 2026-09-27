@@ -148,6 +148,9 @@ struct Seen {
     problem: Option<String>,
     /// How many times the processes were looked at.
     samples: u64,
+    /// The system's own programs seen running as another user beneath a session, which the kernel
+    /// will not describe: by number and the file each runs.
+    other_users: Vec<serde_json::Value>,
 }
 
 /// What a stage's sessions ran, checked as they ran it.
@@ -489,6 +492,7 @@ impl Provenance {
             "launches": seen.launches,
             "executed": executed,
             "pids": pids,
+            "system_programs_of_another_user": seen.other_users,
             "ended_before_read": seen.unread,
         })
     }
@@ -543,6 +547,18 @@ impl Provenance {
                         ProcessQuery::Present(identity) => identity,
                         ProcessQuery::Gone => continue,
                         ProcessQuery::CannotEstablish(error) => {
+                            // One of the system's own programs running as another user runs a
+                            // file the system protects, and is recorded as such.
+                            if let Some(path) = kr_e2e_m1b::run::system_program_of_another_user(
+                                entry.pid,
+                                &error.to_string(),
+                            ) {
+                                let found = json!({ "pid": entry.pid, "image": path });
+                                if !seen.other_users.contains(&found) {
+                                    seen.other_users.push(found);
+                                }
+                                continue;
+                            }
                             problem(
                                 &mut seen,
                                 format!(
