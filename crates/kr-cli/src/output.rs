@@ -811,6 +811,80 @@ mod tests {
         assert_eq!(Asked::text(Request::Question, MARKER).text, MARKER);
     }
 
+    /// A configured location is said piece by piece, at the host's own `, ` join, each by its
+    /// shape: a URL as its scheme, host, port and path, never the user information, the query or
+    /// the fragment written with it; a socket address in its parsed form and a host name as
+    /// itself; anything else as its class and its length.
+    #[test]
+    fn a_configured_location_says_each_piece_by_its_shape_and_never_its_credentials() {
+        use kr_protocol::hostinfo::export::ContentClass;
+
+        let proxy = configured(
+            ContentClass::Location,
+            &format!("http://someone:{MARKER}@proxy.example:3128/tunnel?token={MARKER}#{MARKER}"),
+        );
+        assert_eq!(proxy.text, "http://proxy.example:3128/tunnel");
+        assert!(!proxy.text.contains(MARKER), "{}", proxy.text);
+        assert!(!proxy.text.contains("someone"), "{}", proxy.text);
+        assert!(!proxy.text.contains("token"), "{}", proxy.text);
+        assert_eq!(proxy.request(), Request::Diagnostics);
+
+        let relays = configured(
+            ContentClass::Location,
+            "https://relay-one.example/, https://relay-two.example:8443",
+        );
+        assert_eq!(
+            relays.text,
+            "https://relay-one.example/, https://relay-two.example:8443"
+        );
+
+        let unreadable = format!("{MARKER} is not a location");
+        let shapes = configured(
+            ContentClass::Location,
+            &format!("127.0.0.1:4433, [::1]:4433, relay.example, {unreadable}"),
+        );
+        assert_eq!(
+            shapes.text,
+            format!(
+                "127.0.0.1:4433, [::1]:4433, relay.example, [location withheld, {} bytes]",
+                unreadable.len()
+            )
+        );
+    }
+
+    /// A configured path is said piece by piece through the host-path rule, and a term, a number
+    /// and anything else by the host's own export terms.
+    #[test]
+    fn a_configured_value_of_any_other_class_is_said_on_the_host_s_terms() {
+        use kr_protocol::hostinfo::export::ContentClass;
+
+        let pieces = ["/Users/someone/kalareach", &format!("/opt/{MARKER}/state")];
+        let paths = configured(ContentClass::Path, &pieces.join(", "));
+        assert_eq!(
+            paths.text,
+            pieces
+                .iter()
+                .map(|piece| shown::Shown::host_path(Path::new(piece)).into_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        assert!(!paths.text.contains(MARKER), "{}", paths.text);
+
+        assert_eq!(configured(ContentClass::Number, "42").text, "42");
+        assert_eq!(
+            configured(ContentClass::Term, "session_limit").text,
+            "session_limit"
+        );
+        assert_eq!(
+            configured(ContentClass::Term, MARKER).text,
+            format!("[name withheld, {} bytes]", MARKER.len())
+        );
+        assert_eq!(
+            configured(ContentClass::Message, MARKER).text,
+            format!("[message withheld, {} bytes]", MARKER.len())
+        );
+    }
+
     /// A line fills its holes in order, pads a part to its width and keeps a doubled brace; content
     /// the person asked for is written as it arrived.
     #[test]
