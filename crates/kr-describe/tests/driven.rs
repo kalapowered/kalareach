@@ -471,3 +471,121 @@ fn an_answer_for_work_not_in_flight_is_dropped_and_counted() {
     assert_eq!(service.counts().published, 1);
     assert_eq!(service.inference_restarts(), 0);
 }
+
+/// KR-PERF-009: every attempt is measured once, however it ends. Its queue wait and execution go
+/// into the latency ledger, and its execution into the service time the cadence is worked out
+/// from: a job past its deadline, a cancelled job and a job whose process ended count as a
+/// published one does. The control is an answer for work not in flight, which measures nothing.
+#[test]
+fn every_attempt_is_measured_however_it_ends() {
+    let deadline = Budgets::DEFAULTS.execution_deadline_ms;
+    let cooldown = Budgets::DEFAULTS.session_cooldown_ms;
+    let mut service = service();
+    let measured = |service: &DescriptionService| {
+        let reading = service.latency().reading(1).expect("measured");
+        assert_eq!(reading.queue_wait.samples, reading.execution.samples);
+        (
+            reading.execution.samples,
+            reading.execution.max_ms,
+            service.scheduler().service_time().samples(),
+        )
+    };
+
+    // Past its deadline.
+    queue(&mut service, &session(1), "kalareach", at(0));
+    let Instruction::Generate { id, .. } = loaded(&mut service, at(3_000)) else {
+        panic!("the job is sent");
+    };
+    assert_eq!(
+        service
+            .finished(
+                id,
+                Answered::Ended {
+                    why: JobEnd::DeadlineExceeded,
+                    detail: None
+                },
+                at(3_000 + deadline)
+            )
+            .expect("the answer"),
+        Outcome::DeadlineExceeded {
+            session_id: session(1)
+        }
+    );
+    assert_eq!(measured(&service), (1, deadline, 1));
+    assert_eq!(
+        service.scheduler().service_time().mean_ms(),
+        Some(deadline),
+        "the cadence is worked out from what the process was busy for"
+    );
+
+    // Cancelled.
+    let second = 3_000 + deadline + cooldown;
+    change(&mut service, &session(1), "crates", at(second - 2_000));
+    assert!(
+        service
+            .settle(&session(1), Priority::Ordinary, at(second))
+            .is_some()
+    );
+    let Instruction::Generate { id, .. } = service.next(&roomy(), at(second)).expect("a job")
+    else {
+        panic!("the job is sent");
+    };
+    assert!(service.cancel_running(&session(1)));
+    assert_eq!(
+        service
+            .finished(
+                id,
+                Answered::Ended {
+                    why: JobEnd::Cancelled,
+                    detail: None
+                },
+                at(second + 700)
+            )
+            .expect("the answer"),
+        Outcome::Cancelled {
+            session_id: session(1)
+        }
+    );
+    assert_eq!(measured(&service).0, 2);
+    assert_eq!(measured(&service).2, 2);
+
+    // Its process ended.
+    let third = second + deadline + cooldown;
+    change(&mut service, &session(1), "docs", at(third - 2_000));
+    assert!(
+        service
+            .settle(&session(1), Priority::Ordinary, at(third))
+            .is_some()
+    );
+    assert!(matches!(
+        service.next(&roomy(), at(third)).expect("a job"),
+        Instruction::Generate { .. }
+    ));
+    assert_eq!(
+        service
+            .process_ended(ProcessEnd::Exited, at(third + 400))
+            .expect("the end")[0],
+        Outcome::Requeued {
+            session_id: session(1)
+        }
+    );
+    assert_eq!(measured(&service).0, 3);
+    assert_eq!(measured(&service).2, 3);
+
+    // The control: an answer for work not in flight measures nothing.
+    assert_eq!(
+        service
+            .finished(
+                id,
+                Answered::Ended {
+                    why: JobEnd::Failed,
+                    detail: None
+                },
+                at(third + 500)
+            )
+            .expect("an answer"),
+        Outcome::Dropped { id }
+    );
+    assert_eq!(measured(&service).0, 3);
+    assert_eq!(measured(&service).2, 3);
+}

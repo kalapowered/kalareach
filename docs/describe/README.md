@@ -163,6 +163,11 @@ Queue-wait and execution latency are published separately at 1, 5, 20 and 50 ses
 different questions — one is what fairness costs, the other is what the host costs — and a single
 figure would hide the difference.
 
+Every attempt is measured once, however it ended: published, refused, past its deadline, cancelled,
+or cut short when its process ended. Each one occupied the process, so each counts toward the
+service time the cadence is worked out from and toward both latency figures. A host that measured
+only its successes would report a cadence it cannot keep.
+
 ## What goes into a description
 
 The context revision advances on meaningful changes only: the working directory, the foreground

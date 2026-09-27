@@ -1158,7 +1158,7 @@ impl DescriptionService {
     pub fn process_ended(&mut self, why: ProcessEnd, now: Reading) -> Result<Vec<Outcome>> {
         let mut outcomes = Vec::new();
         if let Some(dispatched) = self.job.take() {
-            outcomes.push(self.job_ended_with_process(dispatched, why));
+            outcomes.push(self.job_ended_with_process(dispatched, why, now));
         }
         if let Model::Loading { cancel_sent, .. } = &self.model {
             let load_why = match why {
@@ -1428,9 +1428,9 @@ impl DescriptionService {
         now: Reading,
     ) -> Result<Outcome> {
         let session_id = dispatched.job.session_id;
-        let execution_ms = now.since_ms(dispatched.dequeued_ms);
         self.running.finished();
         self.in_flight.reconciled(&session_id);
+        let execution_ms = self.measure(&dispatched, now);
         let (bytes, peak_rss_bytes) = match answer {
             Answered::Produced {
                 bytes,
@@ -1438,11 +1438,6 @@ impl DescriptionService {
                 ..
             } => (bytes, peak_rss_bytes),
             Answered::Ended { why, detail } => {
-                self.latency.record(
-                    self.live_sessions.len() as u32,
-                    dispatched.queue_wait_ms,
-                    execution_ms,
-                );
                 return Ok(self.job_ended(dispatched, why, detail, now));
             }
             // A load's answer to a job is not an answer to it.
@@ -1454,12 +1449,6 @@ impl DescriptionService {
                 ));
             }
         };
-        self.scheduler.record_service(execution_ms.max(1));
-        self.latency.record(
-            self.live_sessions.len() as u32,
-            dispatched.queue_wait_ms,
-            execution_ms,
-        );
         // A job that was being stopped for a pause is still wanted, and its token is cancelled, so
         // what it produced is not published: it goes back in the queue. So does a job whose
         // answer arrives after descriptions were turned off, which publish nothing new.
@@ -1482,6 +1471,20 @@ impl DescriptionService {
             self.restart.succeeded();
         }
         Ok(outcome)
+    }
+
+    /// Records one attempt's queue wait and execution, however it ended, and returns the
+    /// execution. The service time the cadence is worked out from is what the process was busy
+    /// for, so a job that timed out or was cancelled counts as well as one that published.
+    fn measure(&mut self, dispatched: &Dispatched, now: Reading) -> u64 {
+        let execution_ms = now.since_ms(dispatched.dequeued_ms);
+        self.scheduler.record_service(execution_ms.max(1));
+        self.latency.record(
+            self.live_sessions.len() as u32,
+            dispatched.queue_wait_ms,
+            execution_ms,
+        );
+        execution_ms
     }
 
     /// Validates a job's bytes against what is in force now, and publishes them.
@@ -1640,10 +1643,16 @@ impl DescriptionService {
     }
 
     /// Ends the job the process had when it ended.
-    fn job_ended_with_process(&mut self, dispatched: Dispatched, why: ProcessEnd) -> Outcome {
+    fn job_ended_with_process(
+        &mut self,
+        dispatched: Dispatched,
+        why: ProcessEnd,
+        now: Reading,
+    ) -> Outcome {
         let session_id = dispatched.job.session_id;
         self.running.finished();
         self.in_flight.reconciled(&session_id);
+        self.measure(&dispatched, now);
         match (why, dispatched.stopping) {
             (ProcessEnd::PastDeadline, _) => {
                 self.counts.deadline_exceeded = self.counts.deadline_exceeded.saturating_add(1);
