@@ -1374,6 +1374,16 @@ mod tests {
             "text in the place of an identifier or a time that is not shaped as one is not kept"
         );
         assert_eq!(
+            line_identity(br#"{"session_id":"s3","ts":["something private"]}"#),
+            (Some("s3".to_owned()), None),
+            "a time that is a list is not kept"
+        );
+        assert_eq!(
+            line_identity(br#"{"session_id":"s4","ts":true}"#),
+            (Some("s4".to_owned()), None),
+            "a time that is neither a number nor text is not kept"
+        );
+        assert_eq!(
             line_identity(br#"{"id":{"a":1},"session_id":"s2","ts":1.5}"#),
             (None, Some(json!(1.5))),
             "an identifier that is not text is not kept, nor a later key in its place"
