@@ -676,7 +676,8 @@ impl AttachmentTable {
     /// shared encoder, so it produces whichever protocol is in force. A terminal attachment sends
     /// what its terminal sends, so what it offers is what that terminal implements, which is why
     /// the declaration matters: `crate::input::KEYBOARD_PROTOCOLS` says what a named terminal is
-    /// known to implement, and a name outside it still sends the ordinary encoding.
+    /// known to implement, and what the companion's view, which names itself there, produces; a name
+    /// outside it still sends the ordinary encoding.
     ///
     /// `None` is an attachment that declared nothing, which is what `--no-probe` chooses. Nothing
     /// was established about it in either direction, so section 8 does not let it hold the lease

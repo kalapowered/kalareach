@@ -415,6 +415,168 @@ async fn a_controller_that_produces_both_keeps_the_keys_across_the_change() {
     runtime.close(ClosureReason::CloseRequested).1.release();
 }
 
+/// The negotiations the companion's raw terminal view is to take the keys under: each with the
+/// sequence an application writes for it, and the one that puts the ordinary encoding back.
+const COMPANION_NEGOTIATIONS: &[(&str, &[u8], &[u8])] = &[
+    ("the ordinary encoding", b"", b""),
+    ("modifyOtherKeys level 1", b"\x1b[>4;1m", b"\x1b[>4;0m"),
+    ("modifyOtherKeys level 2", b"\x1b[>4;2m", b"\x1b[>4;0m"),
+    ("Kitty flags 1", b"\x1b[=1;1u", b"\x1b[=0;1u"),
+    ("Kitty flags 2", b"\x1b[=2;1u", b"\x1b[=0;1u"),
+    ("Kitty flags 3", b"\x1b[=3;1u", b"\x1b[=0;1u"),
+];
+
+/// The companion's raw terminal view: a terminal attachment that declares its own profile, whose
+/// keys are built through the shared encoder.
+fn companion_view(session_id: SessionId) -> SessionAttachParams {
+    terminal(session_id, Some("kalareach-companion"))
+}
+
+/// KR-REQ-08.60: the companion's view takes the keys over every encoding it supplies: the
+/// ordinary one, modifyOtherKeys at either level, and the Kitty protocol with disambiguation,
+/// event types or both.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_companions_view_takes_the_keys_over_each_encoding_it_supplies() {
+    let host = kr_ipc::testing::TempHost::create();
+    let config = configuration(&host, "sleep 120");
+    let session_id = config.session_id;
+    let mut session = Session::open(config).expect("opens");
+    session.launch().expect("launches");
+
+    let view = attach(&mut session, &companion_view(session_id));
+    let xterm = attach(&mut session, &terminal(session_id, Some("xterm-256color")));
+    for (name, negotiation, ordinary) in COMPANION_NEGOTIATIONS {
+        negotiates(&mut session, negotiation);
+        let acquired = session
+            .acquire_input(view, connection(), None)
+            .unwrap_or_else(|error| panic!("{name}: {error:?}"));
+        assert_eq!(acquired.lease.holder.as_ref(), Some(&view), "{name}");
+        // Another controller takes the keys back, so the next negotiation starts from a lease
+        // the view does not hold.
+        negotiates(&mut session, ordinary);
+        session
+            .acquire_input(xterm, connection(), None)
+            .unwrap_or_else(|error| panic!("{name}, back to the ordinary encoding: {error:?}"));
+    }
+
+    let runtime = Arc::new(
+        SessionRuntime::start(
+            session,
+            std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+        )
+        .expect("starts"),
+    );
+    runtime.close(ClosureReason::CloseRequested).1.release();
+}
+
+/// KR-REQ-08.60: the companion's view is refused what it does not produce, with the code a view
+/// reads as a refusal of the take: alternate keys, and every key as an escape code.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_companions_view_is_refused_an_encoding_it_does_not_produce() {
+    let host = kr_ipc::testing::TempHost::create();
+    let config = configuration(&host, "sleep 120");
+    let session_id = config.session_id;
+    let mut session = Session::open(config).expect("opens");
+    session.launch().expect("launches");
+
+    let view = attach(&mut session, &companion_view(session_id));
+    for (name, negotiation) in [
+        ("alternate keys", &b"\x1b[=5;1u"[..]),
+        ("every key as an escape code", &b"\x1b[=9;1u"[..]),
+    ] {
+        negotiates(&mut session, negotiation);
+        let refused = session
+            .acquire_input(view, connection(), None)
+            .expect_err(name);
+        assert_eq!(
+            refused.to_protocol_error().code,
+            ErrorCode::InputIncompatible,
+            "{name}"
+        );
+        assert!(
+            session.subscribe(view).is_ok(),
+            "{name}: and it keeps everything else it had"
+        );
+    }
+
+    let runtime = Arc::new(
+        SessionRuntime::start(
+            session,
+            std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+        )
+        .expect("starts"),
+    );
+    runtime.close(ClosureReason::CloseRequested).1.release();
+}
+
+/// KR-REQ-08.61: the companion's view keeps the keys across a change between encodings it
+/// supplies, and loses them, explicitly, the moment the application asks for one it does not; back
+/// on one it supplies, it takes them again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_change_the_companions_view_cannot_follow_ends_its_lease() {
+    let host = kr_ipc::testing::TempHost::create();
+    let config = configuration(&host, "sleep 120");
+    let session_id = config.session_id;
+    let mut session = Session::open(config).expect("opens");
+    session.launch().expect("launches");
+
+    let view = attach(&mut session, &companion_view(session_id));
+    let acquired = session
+        .acquire_input(view, connection(), None)
+        .expect("takes the keys under the ordinary encoding");
+    let epoch = acquired.lease.epoch.get();
+    for negotiation in [
+        &b"\x1b[=1;1u"[..],
+        &b"\x1b[=3;1u"[..],
+        &b"\x1b[=0;1u"[..],
+        &b"\x1b[>4;2m"[..],
+    ] {
+        negotiates(&mut session, negotiation);
+        let lease = session.lease();
+        assert_eq!(
+            lease.holder.as_ref(),
+            Some(&view),
+            "kept across a change it supplies"
+        );
+        assert_eq!(
+            lease.epoch.get(),
+            epoch,
+            "and nothing happened to the lease"
+        );
+    }
+
+    // The application asks for alternate keys as well, which the view does not produce.
+    negotiates(&mut session, b"\x1b[=5;1u");
+    let lease = session.lease();
+    assert!(
+        !lease.holder.is_present(),
+        "the keys were taken from the view rather than left to send an encoding it only advertised"
+    );
+    assert!(
+        lease.epoch.get() > epoch,
+        "and the release advanced the epoch"
+    );
+    let refused = session
+        .write_input(view, epoch, 0, b"x", None, std::time::Instant::now())
+        .expect_err("its epoch went with the lease");
+    assert_eq!(refused.to_protocol_error().code, ErrorCode::LeaseLost);
+
+    negotiates(&mut session, b"\x1b[=1;1u");
+    let regained = session
+        .acquire_input(view, connection(), None)
+        .expect("back on an encoding it supplies, it takes the keys again");
+    assert_eq!(regained.lease.holder.as_ref(), Some(&view));
+
+    let runtime = Arc::new(
+        SessionRuntime::start(
+            session,
+            std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+        )
+        .expect("starts"),
+    );
+    runtime.close(ClosureReason::CloseRequested).1.release();
+}
+
 // ---------------------------------------------------------------------------------------------
 // KR-REQ-08.62, KR-ACC-008: one lease with an epoch, and an immediate linearised takeover.
 // ---------------------------------------------------------------------------------------------

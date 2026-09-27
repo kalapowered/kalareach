@@ -1479,6 +1479,7 @@ everything else it had: it goes on watching, and its typed actions are unaffecte
 | --- | --- |
 | A semantic attachment | whichever protocol is in force, because it builds each key from the logical key and its modifiers through the shared encoder |
 | A terminal that declared what it is | what that terminal is known to implement, from `kr_worker::input::KEYBOARD_PROTOCOLS` |
+| The companion's raw terminal view, which declares `kalareach-companion` | `modifyOtherKeys` and the Kitty protocol's disambiguation and event types, which it builds through the shared encoder from what its platform reports of each key; not every key as an escape code, because an input method or a phone's software keyboard gives text with no key to report it by |
 | A terminal outside that table, but declared | the ordinary encoding, which every terminal sends |
 | A terminal that declared nothing, which is what `--no-probe` chooses | nothing, in either direction: a terminal nobody was allowed to ask about is as likely to have been left in an enhanced protocol by whatever ran before it |
 

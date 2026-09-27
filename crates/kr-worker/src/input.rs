@@ -104,7 +104,8 @@ impl Encoders {
     }
 }
 
-/// The keyboard protocols each terminal this build has measured is known to implement.
+/// The keyboard protocols each terminal this build has measured is known to implement, and those
+/// the companion's raw terminal view produces.
 ///
 /// What a *presentation* needs is a different question from what a keyboard needs, so this is a
 /// different list from [`crate::attachments::QUALIFIED_TERMINALS`]. A terminal outside this one is
@@ -138,6 +139,14 @@ pub const KEYBOARD_PROTOCOLS: &[TerminalKeyboard] = &[
     TerminalKeyboard::new("tmux-256color", 0, 0),
     // GNU screen implements neither.
     TerminalKeyboard::new("screen-256color", 0, 0),
+    // The companion's raw terminal view, which is not a terminal: it builds each key through the
+    // client's shared encoder from what its platform reports of the key, so it produces
+    // `modifyOtherKeys` and the Kitty protocol's disambiguation and event types. Not every key as
+    // an escape code: an input method, a dead key and a phone's software keyboard give text with
+    // no key, and that flag has no spelling for such text without associated text, which kr-vt/1
+    // does not advertise. Nor alternate keys, which the encoder does not write. The name is no
+    // qualified terminal, so the view is always drawn a projection.
+    TerminalKeyboard::new("kalareach-companion", 2, 0b0000_0011),
 ];
 
 /// One terminal's keyboard protocols.
@@ -695,6 +704,40 @@ mod tests {
         assert!(
             !Encoders::TYPED.supplies(KeyboardEncoding::Kitty(0b0001_0000)),
             "text association is outside the profile, so nothing advertises it"
+        );
+    }
+
+    /// KR-REQ-08.60: the companion's raw terminal view supplies what its typed keys produce from
+    /// every platform it runs on, and no more; and it is never handed the live stream.
+    #[test]
+    fn the_companions_view_supplies_what_its_typed_keys_produce_everywhere() {
+        let companion = terminal_encoders("kalareach-companion");
+        for required in [
+            KeyboardEncoding::Legacy,
+            KeyboardEncoding::ModifyOtherKeys(1),
+            KeyboardEncoding::ModifyOtherKeys(2),
+            KeyboardEncoding::Kitty(0b0000_0001),
+            KeyboardEncoding::Kitty(0b0000_0010),
+            KeyboardEncoding::Kitty(0b0000_0011),
+        ] {
+            assert!(companion.supplies(required), "{required:?}");
+        }
+        for refused in [
+            KeyboardEncoding::Kitty(KITTY_ALTERNATE_KEYS),
+            KeyboardEncoding::Kitty(0b0000_1000),
+            KeyboardEncoding::Kitty(0b0000_1001),
+            KeyboardEncoding::Kitty(0b0000_1011),
+            KeyboardEncoding::Kitty(KITTY_QUALIFIED_FLAGS),
+        ] {
+            assert!(
+                !companion.supplies(refused),
+                "{refused:?}: text from an input method or a software keyboard has no key to report \
+                 every key with, and the encoder writes no alternate keys"
+            );
+        }
+        assert!(
+            !crate::attachments::is_qualified_terminal("kalareach-companion"),
+            "the view is drawn a projection, never the live stream"
         );
     }
 
