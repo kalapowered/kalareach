@@ -381,23 +381,86 @@ impl LocalTerminal {
 
     /// The tick numbers this terminal has been shown, in the order they arrived.
     fn ticks(&self) -> Vec<u64> {
-        self.seen
-            .split("kr-tick-")
-            .skip(1)
-            .filter_map(|rest| {
-                let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
-                (!digits.is_empty() && rest[digits.len()..].starts_with('.'))
-                    .then(|| digits.parse().expect("a number"))
-            })
+        ticks_in(&self.seen)
+            .into_iter()
+            .map(|(tick, _)| tick)
             .collect()
     }
 }
 
-/// KR-ACC-006: the control daemon is killed while the session is producing output. The terminal
-/// attached on this machine keeps receiving that output, every tick of it in order, and keeps
-/// typing into the shell while no daemon exists; a replacement daemon finds the session live with
-/// that terminal still attached; and a terminal attaching after the reconnect is drawn the screen
-/// as it now is, with the line written before the kill still on it.
+/// Every tick in `stream`, with the offset just past it, in the order they were written.
+///
+/// A tick is `kr-tick-` and a number and a full stop. The shell's echo of the command that starts
+/// the ticker spells `kr-tick-%d.`, which has no number, so only the ticker's own ticks count.
+fn ticks_in(stream: &str) -> Vec<(u64, usize)> {
+    let mut found = Vec::new();
+    let mut from = 0;
+    while let Some(at) = stream[from..].find("kr-tick-") {
+        let start = from + at + "kr-tick-".len();
+        let digits: String = stream[start..]
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        let end = start + digits.len();
+        if !digits.is_empty() && stream[end..].starts_with('.') {
+            found.push((digits.parse().expect("a number"), end + 1));
+        }
+        from = start;
+    }
+    found
+}
+
+/// The ticks that stayed on a line of the screen the watched `stream` drew.
+///
+/// Each tick is written at the start of the same line, over the one before, so a tick stays on
+/// the screen only when the line is ended before the next tick is written over it: when a line
+/// break follows it first. Whatever else was written after it on that line (the shell announcing
+/// the job it started, for one) does not change that.
+fn ticks_left_on_the_screen(stream: &str) -> std::collections::BTreeSet<u64> {
+    let ticks = ticks_in(stream);
+    ticks
+        .iter()
+        .enumerate()
+        .filter(|(index, (_, after))| {
+            let next_tick = ticks.get(index + 1).map_or(stream.len(), |(_, next)| *next);
+            stream[*after..next_tick].contains('\n')
+        })
+        .map(|(_, (tick, _))| *tick)
+        .collect()
+}
+
+/// A screen the shell wrote its notice of the ticker's job onto, after the first tick and on the
+/// same line, keeps that tick; it is still a screen and not a replay. The output itself, handed
+/// over as a replay would hand it, shows the ticks later ones were written over.
+#[test]
+fn a_screen_that_kept_the_first_tick_is_a_screen_and_the_output_is_a_replay() {
+    let stream = "\rkr-tick-1.[1] 87790\n\rkr-tick-2.\rkr-tick-3.\nkr-ticker-done\n";
+    let screen = "kr-tick-1.[1] 87790\r\nkr-tick-3.\r\nkr-ticker-done";
+    assert!(
+        screen.contains("kr-tick-1."),
+        "the first tick is on the screen"
+    );
+    assert_eq!(ticks_only_a_replay_shows(screen, stream), Vec::<u64>::new());
+    assert_eq!(ticks_only_a_replay_shows(stream, stream), vec![2]);
+}
+
+/// The ticks `shown` holds that the screen the watched `stream` drew did not: ticks only a replay
+/// of the output would show. Empty when `shown` is a screen.
+fn ticks_only_a_replay_shows(shown: &str, stream: &str) -> Vec<u64> {
+    let left = ticks_left_on_the_screen(stream);
+    ticks_in(shown)
+        .into_iter()
+        .map(|(tick, _)| tick)
+        .filter(|tick| !left.contains(tick))
+        .collect()
+}
+
+/// KR-ACC-006; KR-REQ-27.05, the daemon killed on its own: the control daemon is killed while the
+/// session is producing output. The terminal attached on this machine keeps receiving that output,
+/// every tick of it in order, and keeps typing into the shell while no daemon exists; a replacement
+/// daemon finds the session live with that terminal still attached; and a terminal attaching after
+/// the reconnect is drawn the screen as it now is, with the line written before the kill still on
+/// it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_daemon_killed_during_output_leaves_local_work_running_and_a_reconnect_finds_it() {
     let host = teardown::Tree::create();
@@ -462,9 +525,9 @@ async fn a_daemon_killed_during_output_leaves_local_work_running_and_a_reconnect
 
     // A terminal on this machine writes a line of the screen before anything else happens, and
     // then starts a ticker: numbered ticks, one every tenth of a second, until a file appears in
-    // the session's directory. Each tick rewrites one line in place rather than scrolling, so the
-    // line written first stays on the screen. The shell echoes the command with `%d`, so only the
-    // ticker itself prints a number.
+    // the session's directory, and then a line that says it has stopped. Each tick rewrites one
+    // line in place rather than scrolling, so the line written first stays on the screen. The shell
+    // echoes the command with `%d`, so only the ticker itself prints a number.
     let mut watching = LocalTerminal::attach(&host, session_id, dimensions, true).await;
     watching
         .type_line("printf 'kr-%s-%s\\n' before the-kill")
@@ -473,7 +536,7 @@ async fn a_daemon_killed_during_output_leaves_local_work_running_and_a_reconnect
     watching
         .type_line(
             "i=0; (while [ ! -e kr-stop ] && [ $i -lt 3000 ]; do i=$((i+1)); \
-             printf '\\rkr-tick-%d.' $i; sleep 0.1; done) &",
+             printf '\\rkr-tick-%d.' $i; sleep 0.1; done; printf '\\nkr-%s\\n' ticker-done) &",
         )
         .await;
     watching.shown("kr-tick-", 3).await;
@@ -528,11 +591,12 @@ async fn a_daemon_killed_during_output_leaves_local_work_running_and_a_reconnect
     );
 
     // The output never stopped and nothing was lost or repeated: the terminal was shown every
-    // tick, in order, from the first.
+    // tick, in order, from the first, up to the line that says the ticker stopped.
     watching
         .type_line(": > kr-stop; printf 'kr-%s\\n' settled")
         .await;
     watching.shown("kr-settled", 1).await;
+    watching.shown("kr-ticker-done", 1).await;
     let ticks = watching.ticks();
     assert!(
         ticks.len() >= before_the_kill + 5,
@@ -547,15 +611,24 @@ async fn a_daemon_killed_during_output_leaves_local_work_running_and_a_reconnect
 
     // A terminal attaching after the reconnect is drawn the screen as it now is: the line written
     // before the daemon was killed is still on it, beside what was typed afterwards. What it is
-    // given is the screen rather than a replay of the output, which the first tick shows: the
-    // ticker wrote over it long ago, so it is in the history and not on the screen.
+    // given is the screen rather than a replay of the output, which the ticks show: every tick it
+    // is shown is one that stayed on a line of the screen, and a replay would show the ticks each
+    // later one wrote over.
     let mut late = LocalTerminal::attach(&host, session_id, dimensions, false).await;
+    late.shown("kr-ticker-done", 1).await;
     late.shown("kr-settled", 1).await;
     late.shown("kr-before-the-kill", 1).await;
-    assert!(
-        !late.seen.contains("kr-tick-1."),
+    assert_eq!(
+        ticks_only_a_replay_shows(&late.seen, &watching.seen),
+        Vec::<u64>::new(),
         "the late terminal was replayed the output rather than drawn the screen: {:?}",
         late.seen
+    );
+    // The control: the output itself, as a replay would hand it over, fails the same check.
+    assert!(
+        !ticks_only_a_replay_shows(&watching.seen, &watching.seen).is_empty(),
+        "the check tells a replay from a screen: {:?}",
+        watching.seen
     );
 
     let _ = local
