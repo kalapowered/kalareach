@@ -168,6 +168,10 @@ fn attention_at(path: &std::path::Path, now_ms: u64) -> Attention {
 
 /// KR-ACC-032. Two workflows trigger one another across restarts and share one budget.
 ///
+/// KR-REQ-25.16: one causal budget spans every workflow in the chain and survives a restart;
+/// exhaustion at the default depth of 16 pauses the chain with `CAUSAL_LIMIT`, admits no further
+/// descendant and raises one attention item.
+///
 /// Each definition is a single node with no edges, so neither is cyclic on its own and neither
 /// can breach a per-run ceiling. The first finishes by producing the event the second is triggered
 /// by, and the second the event that triggers the first. The chain they form between them is what
@@ -490,6 +494,8 @@ async fn a_descendant_takes_its_ancestry_from_the_node_that_produced_its_trigger
     );
 }
 
+/// KR-REQ-25.16: a chain creates at most its default ten sessions.
+///
 /// A node that creates a session spends the chain's session allowance.
 #[tokio::test]
 async fn created_sessions_are_reserved_against_the_chain() {
@@ -538,6 +544,8 @@ async fn created_sessions_are_reserved_against_the_chain() {
     assert!(budget.exhausted, "the eleventh session exhausted the chain");
 }
 
+/// KR-REQ-25.16: a chain lives for its default hour and no longer.
+///
 /// A chain that has run out of time starts nothing further.
 #[tokio::test]
 async fn an_expired_lifetime_stops_further_descendants() {
@@ -566,6 +574,9 @@ async fn an_expired_lifetime_stops_further_descendants() {
     assert!(error.to_string().contains("lifetime"), "{error}");
 }
 
+/// KR-REQ-25.17: only a rearm under a grant this host holds with the management right starts a new
+/// budget; a late descendant of the old one cannot spend it.
+///
 /// An authorised rearm gives the chain a fresh budget; a late descendant does not get it.
 #[tokio::test]
 async fn rearm_is_authorised_and_refuses_late_descendants() {
@@ -639,6 +650,9 @@ async fn rearm_is_authorised_and_refuses_late_descendants() {
     assert_ne!(fresh.causal_root_id, root);
 }
 
+/// KR-REQ-25.16: a reservation and the exhaustion it causes are one atomic step, and an exhausted
+/// chain owes one attention item however many reservations it refused.
+///
 /// Concurrent dispatches cannot both take the last free action of a chain.
 #[test]
 fn concurrent_action_reservations_do_not_oversubscribe() {
@@ -677,6 +691,9 @@ fn concurrent_action_reservations_do_not_oversubscribe() {
     assert_eq!(pending[0].subject, AttentionSubject::CausalRoot(root));
 }
 
+/// KR-REQ-25.16: each of the chain's ceilings, depth, runs, actions and lifetime, pauses and
+/// exhausts the chain when it is passed, and an exhausted chain refuses everything after.
+///
 /// The budget itself, not a run, is what the ceilings live on.
 #[test]
 fn budget_enforces_each_default_ceiling() {
@@ -737,6 +754,8 @@ fn budget_enforces_each_default_ceiling() {
     );
 }
 
+/// KR-REQ-25.16: a chain's reservations survive a restart.
+///
 /// A budget is the journal's, not a process's: it comes back as it was left.
 #[test]
 fn budget_persists_across_store_reopen() {
@@ -760,6 +779,9 @@ fn budget_persists_across_store_reopen() {
     }
 }
 
+/// KR-REQ-25.18: a callback whose causality is not authenticated starts a chain of its own at depth
+/// one, under its own budget, and cannot join or spend another; a replay of it runs once.
+///
 /// An unauthenticated external callback starts a new chain under host-wide limits.
 #[tokio::test]
 async fn an_external_callback_is_a_new_external_trigger() {
@@ -857,6 +879,9 @@ fn one_step(
     def
 }
 
+/// KR-REQ-25.17: a rearm under a grant without the management right changes nothing; an
+/// authorised one continues the chain once, and a late descendant stays refused.
+///
 /// An authorised rearm continues the chain it rearms: the descendant the exhausted budget refused
 /// runs once, in the same chain and the new generation, and spends the new budget. A descendant
 /// of a run from the old generation that settles after the rearm stays refused, and a second
@@ -1030,6 +1055,8 @@ async fn a_rearm_continues_its_chain_once_and_late_descendants_stay_refused() {
     );
 }
 
+/// KR-REQ-25.17: an authorised rearm is what gives a chain its depth ceiling stopped a new budget.
+///
 /// A chain its depth ceiling stopped is continued by a rearm, and goes as deep again: the ceiling
 /// counts the depth the new generation adds past where the previous one stopped, so the
 /// continuation one level past the ceiling is admitted rather than refused by the ceiling again.
@@ -1101,6 +1128,9 @@ async fn a_rearm_continues_a_chain_its_depth_ceiling_stopped() {
     assert!(budget.exhausted);
 }
 
+/// KR-REQ-25.17: a rearm continues a refused descendant at most once, so a second rearm cannot
+/// spend it again.
+///
 /// A continuation the new generation's budget refuses is spent with the rest: the rearm's
 /// transaction leaves the chain holding no continuation, so a later rearm has nothing to spend a
 /// second time.
@@ -1166,4 +1196,203 @@ fn a_continuation_the_new_budget_refuses_is_spent() {
         })
         .expect("a second rearm");
     assert_eq!(handed_again, 0, "the continuation was spent");
+}
+
+/// KR-REQ-25.16: a chain the host admits holds section 25's defaults: depth 16, 64 runs, 100
+/// actions, ten created sessions and one hour. One root whose success triggers 64 workflows
+/// admits 63 of them, which fill its 64 runs, and the next is refused with `CAUSAL_LIMIT`; a
+/// second root spends its 100 actions, and the next is refused the same way.
+#[tokio::test]
+async fn a_new_chain_holds_the_default_ceilings() {
+    let service = in_memory();
+    let producer = one_step(30, "producer", "manual", "p", WorkflowActionKind::RunTests);
+    install_and_enable(&service, &producer, 1_000);
+    // Each consumer raises a notice, which produces no event, so nothing goes deeper than them.
+    for index in 0..64_u8 {
+        let consumer = one_step(
+            100 + index,
+            "consumer",
+            "tests.passed",
+            "n",
+            WorkflowActionKind::AttentionNotice,
+        );
+        install_and_enable(&service, &consumer, 1_000);
+    }
+
+    let root = service
+        .submit_run(&run_params(&producer, "evt-runs"), 1_000)
+        .await
+        .expect("the root runs")
+        .causal_root_id;
+    let budget = service.store().get_budget(root).unwrap().expect("a budget");
+    assert_eq!(
+        (
+            budget.max_depth,
+            budget.max_runs,
+            budget.max_actions,
+            budget.max_sessions,
+            budget.max_lifetime_ms,
+        ),
+        (16, 64, 100, 10, 3_600_000),
+        "section 25's defaults"
+    );
+    assert_eq!(budget.total_runs, 1, "the root is the chain's first run");
+
+    let decisions = service.dispatch_triggers(1_100).await.expect("a pass");
+    assert_eq!(decisions.len(), 64, "every consumer was decided");
+    assert_eq!(
+        decisions
+            .iter()
+            .filter(|decision| decision.outcome.is_ok())
+            .count(),
+        63,
+        "the root and 63 descendants fill the 64 runs"
+    );
+    for refused in decisions
+        .iter()
+        .filter_map(|decision| decision.outcome.as_ref().err())
+    {
+        assert_eq!(code(refused), ErrorCode::CausalLimit, "{refused}");
+    }
+    let budget = service.store().get_budget(root).unwrap().expect("a budget");
+    assert_eq!(budget.total_runs, 64);
+    assert!(budget.exhausted && budget.paused);
+
+    // A second chain: its root's node took its first action, and it has 99 more.
+    let second = service
+        .submit_run(&run_params(&producer, "evt-actions"), 2_000)
+        .await
+        .expect("a second root runs")
+        .causal_root_id;
+    assert_eq!(
+        service
+            .store()
+            .get_budget(second)
+            .unwrap()
+            .expect("a budget")
+            .total_actions,
+        1
+    );
+    for action in 2..=100 {
+        service
+            .store()
+            .reserve_budget_action(second, 0, 0, 2_000)
+            .unwrap_or_else(|error| panic!("action {action} fits the chain: {error}"));
+    }
+    let refused = service
+        .store()
+        .reserve_budget_action(second, 0, 0, 2_000)
+        .expect_err("the 101st action is past the ceiling");
+    assert_eq!(code(&refused), ErrorCode::CausalLimit, "{refused}");
+    let budget = service
+        .store()
+        .get_budget(second)
+        .unwrap()
+        .expect("a budget");
+    assert_eq!(budget.total_actions, 100);
+    assert!(budget.exhausted && budget.paused);
+}
+
+/// A host whose managed allowance for new chains can change while chains run.
+#[derive(Debug)]
+struct Allowance(std::sync::atomic::AtomicU64);
+
+impl kr_automation::HostCeilings for Allowance {
+    fn sessions(&self) -> u64 {
+        128
+    }
+
+    fn managed_spend(&self) -> u64 {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// KR-REQ-25.16: a chain inherits the host's managed allowance when its root is admitted, and its
+/// actions spend no more than that. The spend past it is refused with `CAUSAL_LIMIT` and pauses
+/// the chain, whose next descendant is refused, with one attention item between them; a host that
+/// raises its allowance afterwards widens only the chains that begin after the raise.
+#[tokio::test]
+async fn a_chain_spends_no_more_managed_allowance_than_it_inherited() {
+    let allowance = Arc::new(Allowance(std::sync::atomic::AtomicU64::new(5)));
+    let mut host = common::host(
+        Arc::new(MockActionRunner::new()),
+        authority(),
+        Arc::new(ManualClock::new(1_000)),
+    );
+    host.ceilings = Arc::clone(&allowance) as Arc<dyn kr_automation::HostCeilings>;
+    let service = AutomationService::in_memory(host).expect("a service");
+    let producer = one_step(40, "producer", "manual", "p", WorkflowActionKind::RunTests);
+    let consumer = one_step(
+        41,
+        "consumer",
+        "tests.passed",
+        "n",
+        WorkflowActionKind::AttentionNotice,
+    );
+    install_and_enable(&service, &producer, 1_000);
+    install_and_enable(&service, &consumer, 1_000);
+
+    let root = service
+        .submit_run(&run_params(&producer, "evt-narrow"), 1_000)
+        .await
+        .expect("the root runs")
+        .causal_root_id;
+    let budget = |root| {
+        service
+            .store()
+            .get_budget(root)
+            .expect("the journal reads")
+            .expect("the chain has a budget")
+    };
+    assert_eq!(budget(root).max_managed_spend, 5);
+
+    // The host gives more from here on; the chain keeps what it inherited.
+    allowance.0.store(50, std::sync::atomic::Ordering::SeqCst);
+    service
+        .store()
+        .reserve_budget_action(root, 0, 3, 1_100)
+        .expect("three of the five");
+    service
+        .store()
+        .reserve_budget_action(root, 0, 2, 1_100)
+        .expect("the last two");
+    let refused = service
+        .store()
+        .reserve_budget_action(root, 0, 1, 1_100)
+        .expect_err("past what the chain inherited");
+    assert_eq!(code(&refused), ErrorCode::CausalLimit, "{refused}");
+    assert_eq!(budget(root).managed_spend, 5);
+    assert!(budget(root).exhausted && budget(root).paused);
+
+    // The producer's success still waits to trigger the consumer, and the paused chain refuses it.
+    let decision = only(service.dispatch_triggers(1_200).await.expect("a pass"));
+    assert_eq!(decision.workflow_id, consumer.workflow_id);
+    assert_eq!(
+        code(decision.outcome.as_ref().expect_err("refused")),
+        ErrorCode::CausalLimit
+    );
+    assert!(
+        service
+            .store()
+            .list_runs(Some(consumer.workflow_id))
+            .expect("the journal reads")
+            .is_empty(),
+        "the refused descendant never ran"
+    );
+    let owed = service
+        .store()
+        .pending_attention()
+        .expect("the outbox reads")
+        .into_iter()
+        .filter(|record| record.subject == AttentionSubject::CausalRoot(root))
+        .count();
+    assert_eq!(owed, 1, "one item for the exhausted chain");
+
+    // A chain that begins after the raise inherits the new allowance.
+    let wider = service
+        .submit_run(&run_params(&producer, "evt-wide"), 1_300)
+        .await
+        .expect("a new root runs")
+        .causal_root_id;
+    assert_eq!(budget(wider).max_managed_spend, 50);
 }

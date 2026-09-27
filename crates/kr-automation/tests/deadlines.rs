@@ -637,6 +637,8 @@ impl kr_automation::HostCeilings for Moving {
     }
 }
 
+/// KR-REQ-25.16: a chain inherits the host's resource ceiling when its root is admitted.
+///
 /// A new chain's created-session ceiling is the lower of section 25's ten and the host's session
 /// limit at the moment its root is admitted, and it is the root's record a descendant is held to:
 /// the host raising its limit later widens no chain already running, while a chain begun after

@@ -94,6 +94,8 @@ fn run_of(
     }
 }
 
+/// KR-REQ-25.16: a per-grant admission rate applies to every run under a grant.
+///
 /// Each grant has its own minute's allowance: one grant spending all of its own leaves another's
 /// untouched, and the window moves on after a minute.
 #[tokio::test]
@@ -119,6 +121,9 @@ async fn per_grant_rate_limits_isolate_tenants() {
         .expect("the second grant's allowance is its own");
 }
 
+/// KR-REQ-25.16 and 25.18: a per-host admission rate applies across every grant, and an external
+/// trigger, a callback among them, is admitted only under it.
+///
 /// The host admits no more than its own minute's allowance, whichever grants the runs are under,
 /// and a callback that arrives as a new external trigger is counted like any other.
 #[tokio::test]
@@ -146,6 +151,9 @@ async fn host_wide_rate_limits_throttle_excessive_traffic() {
     assert!(refused.to_string().contains("host-wide"), "{refused}");
 }
 
+/// KR-REQ-25.16: the admission rate applies beyond the workflow's concurrency, which each run
+/// releases, and its breach pauses the revision with one attention record.
+///
 /// A breached per-workflow limit pauses the revision and leaves one attention record.
 #[tokio::test]
 async fn a_breached_workflow_limit_pauses_the_workflow_and_raises_one_item() {
@@ -507,6 +515,8 @@ async fn a_read_that_names_a_chain_shows_only_its_alerts() {
     assert_eq!(read.alerts[0].causal_root_id.0, Some(roots[0]));
 }
 
+/// KR-REQ-25.16: the admission rates survive a restart.
+///
 /// The admission rates are the journal's, not the running service's: a minute's allowance spent
 /// before a restart is still spent after it, so reopening the service is not a way past the rate.
 #[tokio::test]

@@ -50,6 +50,7 @@ fn make_dummy_grant(grant_id: GrantId, has_terminal_input: bool) -> Grant {
     }
 }
 
+/// KR-REQ-25.13: a definition whose edges form a graph without a cycle validates.
 #[test]
 fn valid_dag_definition_passes() {
     let grant = make_dummy_grant(test_grant_id(1), false);
@@ -73,6 +74,8 @@ fn valid_dag_definition_passes() {
     assert!(validate_definition(&def, &grant).is_ok());
 }
 
+/// KR-REQ-25.13: a definition whose edges lead from one node to another and back is refused as
+/// cyclic.
 #[test]
 fn cyclic_graph_is_rejected_two_nodes() {
     let grant = make_dummy_grant(test_grant_id(1), false);
@@ -102,6 +105,7 @@ fn cyclic_graph_is_rejected_two_nodes() {
     assert!(err.to_string().contains("cyclic"));
 }
 
+/// KR-REQ-25.13: an edge from a node to itself is a cycle, and the definition is refused.
 #[test]
 fn cyclic_graph_is_rejected_self_loop() {
     let grant = make_dummy_grant(test_grant_id(1), false);
@@ -125,6 +129,7 @@ fn cyclic_graph_is_rejected_self_loop() {
     assert!(err.to_string().contains("cyclic"));
 }
 
+/// KR-REQ-25.13: a cycle through three nodes, closed by a failure edge, is refused.
 #[test]
 fn cyclic_graph_is_rejected_three_nodes() {
     let grant = make_dummy_grant(test_grant_id(1), false);
@@ -216,6 +221,8 @@ fn broad_shell_command_requires_declared_environment_and_terminal_input() {
     assert!(validate_definition(&def2, &grant_with_terminal).is_ok());
 }
 
+/// KR-REQ-25.13: a node's parameters that hold template code, in any of the common template and
+/// shell substitution syntaxes, are refused; a node evaluates no template.
 #[test]
 fn arbitrary_template_syntax_is_strictly_rejected() {
     let grant = make_dummy_grant(test_grant_id(1), false);
@@ -253,6 +260,8 @@ fn arbitrary_template_syntax_is_strictly_rejected() {
     }
 }
 
+/// KR-REQ-25.13: a node names a registered action kind.
+///
 /// A kind nothing registers never becomes a node: the definition naming it is refused when it is
 /// read, before anything could validate or run it.
 #[test]
@@ -299,6 +308,8 @@ fn one_node_with(
     )
 }
 
+/// KR-REQ-25.13: every node is typed by its registered kind.
+///
 /// Every registered kind takes its complete typed parameters and nothing else. A parameter set that
 /// lacks what the kind needs, carries a field the kind does not take, or holds an empty name is
 /// refused when the definition is installed, and the complete set is accepted.
@@ -635,4 +646,131 @@ fn each_action_kind_takes_its_complete_typed_parameters() {
             "{kind}: {error}"
         );
     }
+}
+
+/// KR-REQ-25.13: a workflow definition is a versioned JSON document. One read from its text, with
+/// an event trigger, a resource scope, typed action nodes, success and failure edges, deadlines and
+/// a grant reference, installs under the revision that both the request and the document name.
+/// Each later install takes a higher revision, and an installed revision never changes: a changed
+/// document under a number already installed, a lower number than the latest, and a request that
+/// names another revision than its document are each refused, and every installed revision reads
+/// back as it was installed.
+#[test]
+fn a_definition_is_a_versioned_json_document_whose_installed_revisions_never_change() {
+    use std::sync::Arc;
+
+    use common::Submit;
+    use kr_automation::{AutomationService, ManualClock, MockActionRunner};
+    use kr_protocol::automation::{WorkflowDefinition, WorkflowInstallParams};
+    use kr_protocol::error::{ErrorCode, ProtocolError};
+    use kr_protocol::scalars::U64;
+
+    let workflow_id = test_wf_id(12);
+    let grant_id = test_grant_id(13);
+    let service = AutomationService::in_memory(common::host(
+        Arc::new(MockActionRunner::new()),
+        common::every_right(&[grant_id]),
+        Arc::new(ManualClock::new(1_000)),
+    ))
+    .expect("a service");
+
+    // The document as a client sends it: JSON text whose revision is a decimal string. The tests
+    // run first; a review follows their success and a notice their failure.
+    let read = |revision: u64, name: &str| -> WorkflowDefinition {
+        let text = serde_json::json!({
+            "workflow_id": "0c0c0c0c-0c0c-0c0c-0c0c-0c0c0c0c0c0c",
+            "revision": revision.to_string(),
+            "name": name,
+            "description": "Runs the unit tests on a captured change and asks for a review.",
+            "trigger": { "event_type": "changeset.captured" },
+            "resource_scope": {
+                "environment_id": null,
+                "workspace_id": null,
+                "session_id": null,
+            },
+            "nodes": [
+                {
+                    "node_id": "tests",
+                    "action_kind": "run_tests",
+                    "action_params": common::params(WorkflowActionKind::RunTests),
+                    "declared_environment": null,
+                },
+                {
+                    "node_id": "review",
+                    "action_kind": "request_review",
+                    "action_params": common::params(WorkflowActionKind::RequestReview),
+                    "declared_environment": null,
+                },
+                {
+                    "node_id": "notice",
+                    "action_kind": "attention_notice",
+                    "action_params": r#"{"summary":"the unit tests failed"}"#,
+                    "declared_environment": null,
+                },
+            ],
+            "edges": [
+                { "from_node": "tests", "to_node": "review", "condition": "success" },
+                { "from_node": "tests", "to_node": "notice", "condition": "failure" },
+            ],
+            "deadlines": { "run_deadline_ms": "900000", "action_wait_ms": "300000" },
+            "grant_reference": "0d0d0d0d-0d0d-0d0d-0d0d-0d0d0d0d0d0d",
+            "enabled": true,
+            "explicit_recurrence": false,
+        })
+        .to_string();
+        serde_json::from_str(&text).expect("the document reads")
+    };
+    let install = |definition: &WorkflowDefinition| WorkflowInstallParams {
+        workflow_id: definition.workflow_id,
+        revision: definition.revision,
+        definition: definition.clone(),
+        grant_reference: definition.grant_reference,
+    };
+    let installed = |revision: u64| {
+        service
+            .store()
+            .get_definition(workflow_id, revision)
+            .expect("the journal reads")
+            .map(|installed| installed.definition)
+    };
+    let refused = |params: &WorkflowInstallParams, why: &str| {
+        let refusal = ProtocolError::from(
+            service
+                .submit_install(params, 1_000)
+                .expect_err("the install is refused"),
+        );
+        assert_eq!(refusal.code, ErrorCode::DraftConflict, "{why}: {refusal:?}");
+    };
+
+    let first = read(1, "tests then review");
+    assert_eq!(first.workflow_id, workflow_id);
+    assert_eq!(first.grant_reference, grant_id);
+    assert_eq!(first.revision, U64::new(1));
+    service
+        .submit_install(&install(&first), 1_000)
+        .expect("the document's first revision installs");
+
+    // The request and the document name different revisions: nothing is installed under either.
+    let mut mismatched = install(&read(2, "tests then review"));
+    mismatched.revision = U64::new(3);
+    refused(&mismatched, "a request naming another revision");
+    assert_eq!(installed(2), None);
+    assert_eq!(installed(3), None);
+
+    // A changed document under the number already installed does not replace it.
+    refused(
+        &install(&read(1, "a changed document")),
+        "an installed revision again",
+    );
+    assert_eq!(installed(1).as_ref(), Some(&first));
+
+    // A later revision installs beside the first; a number below the latest is refused after it.
+    let third = read(3, "tests then review, revised");
+    service
+        .submit_install(&install(&third), 1_000)
+        .expect("a later revision installs");
+    refused(&install(&read(2, "a lower number")), "a lower revision");
+    assert_eq!(installed(2), None);
+    assert_eq!(installed(1).as_ref(), Some(&first));
+    assert_eq!(installed(3).as_ref(), Some(&third));
 }
