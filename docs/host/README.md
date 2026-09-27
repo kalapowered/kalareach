@@ -1981,9 +1981,14 @@ What the subject decides stays the subject's, and the conditional requirements t
 evaluate are exactly those: whose subject it is. A device detaches the attachment its own
 connection created and nothing else, and it cancels or reads its own action and nothing else,
 because the worker enforces both inside its own dispatch barrier — the attachment list is the
-connection's, and the receipt journal is keyed by the verified actor and the action together. A
-local caller keeps its cross-window detach, because every local caller is the same authenticated
-operating-system user. An `action.read` names an action rather than a session, so it goes to the
+connection's, and the receipt journal is keyed by the verified actor and the action together. Whose
+attachment a caller may detach is decided before the dispatch marker, so a detach refused for it
+is recorded as a rejection; a detach that fails after the marker, as one does when the session's
+budget refuses the size the next claim would take, is recorded as an outcome nobody can establish.
+The local owner keeps its cross-window detach, because it is the operating-system user the listener
+authenticated, acting under no grant; any other caller, one the daemon heard on its local socket
+under a grant included, detaches only what its own connection made. An `action.read` names an
+action rather than a session, so it goes to the
 session the device's connection is already serving, which is where its actions on this host were
 performed.
 
