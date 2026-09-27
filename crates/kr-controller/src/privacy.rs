@@ -77,13 +77,14 @@ const LONGEST_RETRY_MS: u64 = 60_000;
 
 /// What the environment's privacy state is, as every reader sees it.
 ///
-/// It is published as the record commits, before the delivery outbox and the descriptions are
-/// driven, and at open, before anything runs. It is cheap to clone and to read.
+/// It is published with the record, before the delivery outbox and the descriptions are driven,
+/// and at open, before anything runs. It is cheap to clone and to read.
 ///
 /// It is also the admission every delivery exchange takes: [`Self::admit_send`] is held from the
-/// check to the end of the exchange, and publishing a change waits until every admission taken
-/// before it has ended. So an exchange either finished before privacy mode was turned on, and is
-/// in flight at that moment, or it is never started.
+/// check to the end of the exchange, and a change of state holds the write side from before its
+/// record is written until it is published, so taking it waits until every admission taken before
+/// it has ended and none is taken in between. An exchange either finished before privacy mode was
+/// turned on, and is in flight at that moment, or it is checked against the published boundary.
 #[derive(Clone, Debug, Default)]
 pub struct PrivacyState {
     published: Arc<RwLock<Published>>,
@@ -149,11 +150,32 @@ impl PrivacyState {
         self.now().generation == produced_under
     }
 
+    /// Takes the write side for a change of state: it waits for every admission taken before it
+    /// to end, and while the change is held nothing is admitted and nothing is read.
+    fn change(&self) -> Change<'_> {
+        Change {
+            held: self
+                .published
+                .write()
+                .unwrap_or_else(PoisonError::into_inner),
+        }
+    }
+
     fn publish(&self, published: Published) {
-        *self
-            .published
-            .write()
-            .unwrap_or_else(PoisonError::into_inner) = published;
+        self.change().publish(published);
+    }
+}
+
+/// A change of [`PrivacyState`] in progress: the write side, held until the change is published
+/// or given up.
+struct Change<'a> {
+    held: std::sync::RwLockWriteGuard<'a, Published>,
+}
+
+impl Change<'_> {
+    /// Publishes the new state, which ends the change.
+    fn publish(mut self, published: Published) {
+        *self.held = published;
     }
 }
 
@@ -453,6 +475,12 @@ impl EnvironmentPrivacy {
         );
         owing.sort_unstable();
         owing.dedup();
+        // The state's write side is taken before the record is written and held until the new
+        // state is published. Taking it waits for every delivery exchange already admitted, and
+        // holding it admits none, so a send checked under the generation before the boundary has
+        // either ended before the record or is checked against the published boundary: none passes
+        // between the two. A record that fails gives the change up with nothing published.
+        let change = self.state.change();
         // The record and the backup fence are one step for backup production: both happen inside
         // one hold of the backup store, which every backup production decision takes, so none is
         // decided after the boundary is recorded and before the backup service stops at it. A
@@ -469,7 +497,7 @@ impl EnvironmentPrivacy {
         })?;
         inner.mode = mode;
         inner.changed_at_ms = now_ms;
-        self.state.publish(Published {
+        change.publish(Published {
             generation,
             private: true,
         });
@@ -3037,6 +3065,59 @@ mod tests {
         assert_eq!(report.obligations.len(), 1);
         assert_eq!(report.obligations[0].session_id, session(5));
         assert!(!report.completion.is_complete());
+    }
+
+    /// A send checked at the generation before the boundary, once the boundary is recorded and
+    /// before it is published, is refused: the check waits for the publication rather than
+    /// passing between the two. A send checked after it at the new generation is refused while
+    /// privacy mode is on, and one at the generation after is admitted once it is off, as before.
+    #[test]
+    fn a_send_checked_between_the_record_and_its_publication_is_refused() {
+        let host = Host::open();
+        let (arrived, release) = host.privacy.after_record.arm();
+        std::thread::scope(|scope| {
+            // Owned here, so a failed assertion lets the stopped enabling go on rather than wait.
+            let release = release;
+            let enabling = scope.spawn(|| host.privacy.enable(&[], at(10)));
+            arrived
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .expect("the record is written");
+            let state = host.privacy.state();
+            let (checked_tx, checked_rx) = std::sync::mpsc::channel();
+            scope.spawn(move || {
+                // The admission is dropped at once, so nothing here holds the publication back.
+                let admitted = state.admit_send(PrivacyGeneration::INITIAL).is_some();
+                let _ = checked_tx.send(admitted);
+            });
+            let before = checked_rx.recv_timeout(std::time::Duration::from_millis(300));
+            release.send(()).expect("the enabling goes on");
+            enabling
+                .join()
+                .expect("the enabling finishes")
+                .expect("privacy mode is enabled");
+            let admitted = before.unwrap_or_else(|_| {
+                checked_rx
+                    .recv_timeout(std::time::Duration::from_secs(30))
+                    .expect("the check is answered")
+            });
+            assert!(
+                !admitted,
+                "a send checked between the record and its publication is refused"
+            );
+        });
+
+        let state = host.privacy.state();
+        assert!(
+            state.admit_send(PrivacyGeneration::new(1)).is_none(),
+            "refused while privacy mode is on"
+        );
+        host.privacy
+            .disable(at(20))
+            .expect("privacy mode is turned off");
+        assert!(
+            state.admit_send(PrivacyGeneration::new(2)).is_some(),
+            "admitted at the generation after"
+        );
     }
 
     /// The record and the backup fence are one step for backup production. An enabling stopped
