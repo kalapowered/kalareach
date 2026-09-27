@@ -287,7 +287,7 @@ impl InForce {
         Self {
             sleep_inhibition: resolver.sleep_inhibition(None).value,
             worker_profile: resolver.chosen_worker_profile(),
-            command_integrations: Vec::new(),
+            command_integrations: resolver.command_integrations().value,
         }
     }
 }
@@ -475,15 +475,26 @@ pub fn effective(
     let ceilings = resolver.ceilings();
     let power = resolver.sleep_inhibition(None);
     let profile = resolver.worker_profile(None, platform_profile);
+    let integrations = resolver.command_integrations();
     let runtime = resolver.runtime_directory();
     let state = resolver.state_directory();
     // Each row carries what its value is made of. The two settings resolve to one of this build's
-    // own words; the two directories resolve to a path this host composed from a home directory,
-    // an environment variable or an owner's own choice, and a path is not this build's to publish
-    // to anybody but the owner.
+    // own words; the command integrations to packages the owner named; the two directories resolve
+    // to a path this host composed from a home directory, an environment variable or an owner's
+    // own choice, and a path is not this build's to publish to anybody but the owner.
     let mut values: Vec<EffectiveValue> = vec![
         effective_value(&power, &Declared::term(power.value.as_str())),
         effective_value(&profile, &Declared::term(profile.value.as_str())),
+        // The packages are names the owner wrote down, so an export carries their class and
+        // length rather than which agents this host runs.
+        effective_value(
+            &integrations,
+            &if integrations.value.is_empty() {
+                Declared::stated("none")
+            } else {
+                Declared::names(integrations.value.iter().map(String::as_str))
+            },
+        ),
         effective_value(
             &runtime,
             &Declared::path(std::path::Path::new(&runtime.value)),

@@ -2193,6 +2193,22 @@ pub mod configuration {
     // Validation and edits
     // ---------------------------------------------------------------------------------------
 
+    /// Returns whether `text` has the shape of a package's identifier: its publisher and its name,
+    /// each lower-case letters, digits, `-` and `.`, joined by one `/`.
+    fn is_package_identifier(text: &str) -> bool {
+        let part = |part: &str| {
+            !part.is_empty()
+                && part.len() <= 64
+                && part.bytes().all(|byte| {
+                    byte.is_ascii_lowercase()
+                        || byte.is_ascii_digit()
+                        || matches!(byte, b'-' | b'.')
+                })
+        };
+        text.split_once('/')
+            .is_some_and(|(publisher, plugin)| part(publisher) && part(plugin))
+    }
+
     /// Checks a document against every rule this schema states.
     ///
     /// # Errors
@@ -2284,6 +2300,55 @@ pub mod configuration {
                             .stated("a configured right (")
                             .withheld(Name, right)
                             .stated(") is not an action right"),
+                    );
+                }
+            }
+        }
+        // The packages each rung turns a command integration on for: each a package's identifier,
+        // named once, and no more of them than one rung may name. Anything else is refused rather
+        // than read as no integration at all, which is what a misspelt package would come to.
+        let mut rungs: Vec<(Option<&str>, &PreferenceSet)> = vec![(None, &document.preferences)];
+        rungs.extend(
+            document
+                .profiles
+                .iter()
+                .map(|(name, set)| (Some(name.as_str()), set)),
+        );
+        for (profile, set) in rungs {
+            let Some(listed) = set.command_integrations.as_ref() else {
+                continue;
+            };
+            let rung = || match profile {
+                None => Sentence::new().stated("command_integrations"),
+                Some(name) => Sentence::new()
+                    .stated("the command_integrations of the profile ")
+                    .withheld(Name, name),
+            };
+            if listed.len() > MAX_COMMAND_INTEGRATIONS {
+                problems.push(
+                    rung()
+                        .stated(" names ")
+                        .number(listed.len() as u64)
+                        .stated(" packages, more than the ")
+                        .number(MAX_COMMAND_INTEGRATIONS as u64)
+                        .stated(" one rung may name"),
+                );
+            }
+            let mut named = std::collections::BTreeSet::new();
+            for plugin in listed {
+                if !is_package_identifier(plugin) {
+                    problems.push(
+                        rung()
+                            .stated(" names ")
+                            .withheld(Name, plugin)
+                            .stated(", which is not a package's publisher/plugin identifier"),
+                    );
+                } else if !named.insert(plugin.as_str()) {
+                    problems.push(
+                        rung()
+                            .stated(" names ")
+                            .withheld(Name, plugin)
+                            .stated(" more than once"),
                     );
                 }
             }
@@ -2714,7 +2779,22 @@ pub mod configuration {
             Change::ControllerStartup(startup) => {
                 document.startup.controller = Nullable(*startup);
             }
-            Change::CommandIntegration { .. } => {}
+            Change::CommandIntegration { plugin_id, enabled } => {
+                // One package at a time, in the host's own list, which stays sorted and names each
+                // package once whatever order the edits arrive in.
+                let mut listed = document
+                    .preferences
+                    .command_integrations
+                    .0
+                    .take()
+                    .unwrap_or_default();
+                listed.retain(|named| named != plugin_id);
+                if *enabled {
+                    listed.push(plugin_id.clone());
+                    listed.sort();
+                }
+                document.preferences.command_integrations = Nullable::some(listed);
+            }
         }
         document.version = VERSION;
         document.revision = based_on + 1;
@@ -4910,6 +4990,15 @@ pub mod export {
             Self {
                 class: ContentClass::Number,
                 value: value.to_string(),
+            }
+        }
+
+        /// Several names an owner or a package supplied, as one value, in the order given.
+        #[must_use]
+        pub fn names<'a>(values: impl IntoIterator<Item = &'a str>) -> Self {
+            Self {
+                class: ContentClass::Name,
+                value: values.into_iter().collect::<Vec<_>>().join(", "),
             }
         }
 

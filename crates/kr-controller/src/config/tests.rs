@@ -326,10 +326,10 @@ fn the_effective_report_names_every_value_its_source_and_its_effect() {
     assert_eq!(report.overrides.len(), 2);
     assert_eq!(
         report.values.len(),
-        4 + configuration::SELECTIONS.len(),
-        "two preferences, two locations and every selection read at the next start"
+        5 + configuration::SELECTIONS.len(),
+        "three preferences, two locations and every selection read at the next start"
     );
-    for (row, selection) in report.values[4..].iter().zip(configuration::SELECTIONS) {
+    for (row, selection) in report.values[5..].iter().zip(configuration::SELECTIONS) {
         assert_eq!(row.key, selection.key);
         assert_eq!(row.effect, ValueEffect::NextStart);
         assert_eq!(
