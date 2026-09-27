@@ -949,6 +949,195 @@ fn kr_req_12_13_an_identifier_keeps_its_json_type_and_a_request_resolves_nothing
     assert_eq!(failed.resource_id, text.resource_id);
 }
 
+/// Opens one more native connection for the instance, as an agent run that connects does.
+fn agent_run(broker: &Broker) -> GatewayConnectionId {
+    broker
+        .open_native_connection(
+            instance(2),
+            &CREDENTIAL,
+            &process_identity(41, 900),
+            &package(),
+            "1",
+        )
+        .expect("the run connects")
+}
+
+/// Forwards one request that expects a response on `connection`, and returns what it recorded.
+fn forwarded(
+    broker: &Broker,
+    connection: GatewayConnectionId,
+    id: &str,
+    now: u64,
+) -> kr_protocol::gateway::PendingResource {
+    broker
+        .forward_native(
+            connection,
+            frame(id, "fs/write_text_file").as_bytes(),
+            TimestampMs::new(now),
+        )
+        .expect("forwarded")
+        .1
+        .expect("it expects a response")
+}
+
+/// The native client's own answer to one request on `connection`.
+fn answered(
+    broker: &Broker,
+    connection: GatewayConnectionId,
+    id: &str,
+    now: u64,
+) -> kr_protocol::gateway::PendingResource {
+    broker
+        .native_answer_through(
+            connection,
+            response(id).as_bytes(),
+            TimestampMs::new(now),
+            |_| Ok(()),
+        )
+        .expect("the answer is carried")
+}
+
+/// KR-REQ-12.13: a long session's resource snapshot does not grow with what ended runs settled.
+///
+/// Each agent run is a connection of its own, and every request it made was answered before it
+/// ended. Once the connection has closed nothing can name what it settled any more: no second
+/// answer, no response and no request reusing one of its identifiers arrives on a connection that
+/// has gone, and the ledger holds the record. So the snapshot after each run is the one before it,
+/// however many runs the session has had, and it carries the one request that is still waiting.
+#[test]
+fn kr_req_12_13_a_long_sessions_snapshot_does_not_grow_with_what_ended_runs_settled() {
+    let broker = gateway(None);
+    let waiting = forwarded(&broker, GatewayConnectionId::new(1), "1", 2);
+    let mut carried = Vec::new();
+    for run in 0..6_u64 {
+        let connection = agent_run(&broker);
+        for request in 0..4_u64 {
+            let id = (100 + run * 10 + request).to_string();
+            forwarded(&broker, connection, &id, 3 + run);
+            let settled = answered(&broker, connection, &id, 4 + run);
+            assert_eq!(settled.state, PendingState::Resolved);
+        }
+        broker.close_connection(connection);
+        let snapshot = broker.resource_snapshot();
+        carried.push(
+            snapshot
+                .resources
+                .iter()
+                .map(|resource| resource.resource_id)
+                .collect::<Vec<_>>(),
+        );
+    }
+    assert!(
+        carried
+            .iter()
+            .all(|resources| *resources == [waiting.resource_id]),
+        "after every run the snapshot carries the waiting request alone: {carried:?}"
+    );
+}
+
+/// KR-REQ-12.13, the control: a request nobody answered is carried whatever becomes of its
+/// connection, because a connection ending is not an answer, and one still waiting on a connection
+/// that stays is carried beside it.
+#[test]
+fn kr_req_12_13_an_unanswered_request_is_carried_after_its_run_has_ended() {
+    let broker = gateway(None);
+    let waiting = forwarded(&broker, GatewayConnectionId::new(1), "1", 2);
+    let run = agent_run(&broker);
+    forwarded(&broker, run, "7", 3);
+    answered(&broker, run, "7", 4);
+    let unanswered = forwarded(&broker, run, "8", 5);
+    broker.close_connection(run);
+
+    let carried: Vec<_> = broker
+        .resource_snapshot()
+        .resources
+        .into_iter()
+        .map(|resource| (resource.resource_id, resource.state))
+        .collect();
+    assert!(
+        carried.contains(&(waiting.resource_id, PendingState::Pending)),
+        "the request on the connection that stays: {carried:?}"
+    );
+    assert!(
+        carried.contains(&(unanswered.resource_id, PendingState::Pending)),
+        "and the one its ended run left unanswered: {carried:?}"
+    );
+    assert_eq!(
+        broker
+            .pending(unanswered.resource_id)
+            .expect("the live arbitration holds it")
+            .state,
+        PendingState::Pending
+    );
+}
+
+/// KR-REQ-12.13 and KR-REQ-11.33, the control: a settled resource reads as settled wherever it is
+/// read from. While its run is connected the live arbitration holds it and a snapshot carries it
+/// settled, so a view that missed the event installs the outcome. Once the run has ended the
+/// ledger's record is the one read, and a rich answer that arrives late is still told the resource
+/// ended rather than that nothing of the name exists.
+#[tokio::test]
+async fn kr_req_12_13_a_settled_resource_reads_as_settled_before_and_after_its_run_ends() {
+    let broker = gateway(None);
+    let run = agent_run(&broker);
+    let recorded = broker
+        .forward_native(
+            run,
+            frame("5", "session/request_permission").as_bytes(),
+            TimestampMs::new(2),
+        )
+        .expect("forwarded")
+        .1
+        .expect("it expects a response");
+    let approval = broker
+        .interpret(
+            binding(9),
+            recorded.resource_id,
+            projection(),
+            None,
+            TimestampMs::new(3),
+        )
+        .expect("the interpretation is accepted");
+    let settled = answered(&broker, run, "5", 4);
+    assert_eq!(settled.resource_id, approval.resource_id);
+
+    assert_eq!(
+        broker
+            .pending(approval.resource_id)
+            .expect("read back while its run is connected")
+            .state,
+        PendingState::Resolved
+    );
+    assert!(
+        broker
+            .resource_snapshot()
+            .resources
+            .iter()
+            .any(|resource| resource.resource_id == approval.resource_id
+                && resource.state == PendingState::Resolved),
+        "a snapshot taken while its run is connected carries it settled"
+    );
+
+    broker.close_connection(run);
+    assert_eq!(
+        broker
+            .recorded(approval.resource_id)
+            .expect("the ledger reads")
+            .expect("the ledger holds it")
+            .state,
+        PendingState::Resolved,
+        "the record reads as settled after its run has ended"
+    );
+    let late = answer(&broker, approval.resource_id, "allow", 6)
+        .await
+        .expect_err("a settled resource takes no answer");
+    assert_eq!(
+        late.code(),
+        ErrorCode::QuestionResolved,
+        "a late answer is told the resource ended: {late}"
+    );
+}
+
 /// KR-REQ-12.16: a reverse filesystem or terminal request runs in the agent's own host
 /// environment, under the user the agent runs as.
 #[test]
