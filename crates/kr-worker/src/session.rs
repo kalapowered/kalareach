@@ -998,19 +998,26 @@ impl Session {
             .iter()
             .find(|integration| &integration.command == command)?;
         let root_shell = self.root_identity()?;
-        backends
-            .establish(&crate::broker::commands::EstablishRequest {
-                prompt_generation: params.prompt_generation,
-                typed: &params.argv,
-                arguments,
-                added,
-                integration,
-                executable: &params.executable,
-                cwd: &params.cwd,
-                cwd_revision: params.cwd_revision,
-                root_shell,
-            })
-            .ok()
+        match backends.establish(&crate::broker::commands::EstablishRequest {
+            prompt_generation: params.prompt_generation,
+            typed: &params.argv,
+            arguments,
+            added,
+            integration,
+            executable: &params.executable,
+            cwd: &params.cwd,
+            cwd_revision: params.cwd_revision,
+            root_shell,
+        }) {
+            Ok(backend) => Some(backend),
+            Err(why) => {
+                // The shell is told only that no backend could be established, and the invocation
+                // runs as typed. Why goes to this worker's own diagnostics, where a person looking
+                // into a command that ran without its integration finds it.
+                eprintln!("kr-worker: {command} runs as typed, with no backend: {why}");
+                None
+            }
+        }
     }
 
     /// Sets up the backends an integrated invocation is given before it runs.

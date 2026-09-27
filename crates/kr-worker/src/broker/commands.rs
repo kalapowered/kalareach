@@ -574,6 +574,17 @@ impl CommandBackends {
         let declared = connector
             .integration()
             .ok_or_else(|| format!("no installed connector integrates {command:?}"))?;
+        // The session was created with one package's integration, and only that package's may
+        // launch under it: another that came to integrate the command since, whatever it declares,
+        // is one whose integration the configuration never turned on for this session.
+        if connector.plugin_id() != request.integration.plugin_id {
+            return Err(format!(
+                "{command:?} is integrated here by {}, and this session was created with the \
+                 integration of {}",
+                connector.plugin_id(),
+                request.integration.plugin_id
+            ));
+        }
         if declared.flags != request.integration.flags {
             return Err(format!(
                 "the flags this session integrates {command:?} with are not the ones its installed \
