@@ -2960,3 +2960,260 @@ test.describe('the keyboard', () => {
     expect(duration.split(',').every((value) => value.trim() === '0s')).toBe(true)
   })
 })
+
+/**
+ * Starts recording every transition and animation the engine runs on an element matching
+ * `selector`, inside one, or on anything that contains one. `krFeedbackMotion` returns the record.
+ */
+async function recordMotion(page: Page, selector: string): Promise<void> {
+  await page.evaluate((selector) => {
+    const motion: string[] = []
+    const record = (what: string, target: EventTarget | null) => {
+      if (!(target instanceof Element)) return
+      if (target.closest(selector) === null && target.querySelector(selector) === null) return
+      motion.push(`${what} on ${target.tagName.toLowerCase()}.${String(target.className)}`)
+    }
+    for (const type of ['transitionrun', 'animationstart']) {
+      document.addEventListener(
+        type,
+        (event) => {
+          const name =
+            event instanceof TransitionEvent ? event.propertyName : (event as AnimationEvent).animationName
+          record(`${type} ${name}`, event.target)
+        },
+        true
+      )
+    }
+    ;(window as unknown as { krFeedbackMotion: () => string[] }).krFeedbackMotion = () => {
+      for (const animation of document.getAnimations()) {
+        const effect = animation.effect
+        record('running', effect instanceof KeyframeEffect ? effect.target : null)
+      }
+      return motion
+    }
+  }, selector)
+}
+
+/** What `recordMotion` saw, two frames on, so anything the last change started has started. */
+async function recordedMotion(page: Page): Promise<string[]> {
+  return page.evaluate(
+    () =>
+      new Promise<string[]>((resolve) => {
+        requestAnimationFrame(() => {
+          requestAnimationFrame(() => {
+            resolve((window as unknown as { krFeedbackMotion: () => string[] }).krFeedbackMotion())
+          })
+        })
+      })
+  )
+}
+
+/** How far down a surface is drawn from where it sits, as the engine placed it. */
+async function drawnOffset(locator: Locator): Promise<number> {
+  return locator.evaluate((element) => new DOMMatrixReadOnly(getComputedStyle(element).transform).m42)
+}
+
+/** Takes hold of the open sheet's grip, and answers where the pointer is. */
+async function holdSheet(page: Page): Promise<{ x: number; y: number }> {
+  await page.getByTestId('open-settings').click()
+  await expect(page.getByTestId('sheet')).toHaveAttribute('data-presentation', 'here', {
+    timeout: PRESENTATION_DEADLINE
+  })
+  const box = await page.getByTestId('sheet-grip').boundingBox()
+  if (!box) throw new Error('the sheet has no grip')
+  const at = { x: box.x + box.width / 2, y: box.y + box.height / 2 }
+  await page.mouse.move(at.x, at.y)
+  await page.mouse.down()
+  return at
+}
+
+/**
+ * Lets go of the sheet still: a release velocity comes from the last 100 ms of the pointer, so a
+ * pointer held where it is for longer than that carries none.
+ */
+async function releaseStill(page: Page): Promise<void> {
+  await page.waitForTimeout(150)
+  await page.mouse.up()
+}
+
+// KR-REQ-13.06: section 13's feedback paragraph. Input feedback is immediate, repeated keyboard
+// actions and streamed text take no decorative delay, and gesture motion tracks the finger, can
+// reverse during the movement and respects the preference for reduced motion.
+test.describe('input feedback', () => {
+  test('each key of a repeated burst has changed the text before the next arrives, and nothing moves', async ({
+    page
+  }) => {
+    await openSession(page)
+    const composer = page.getByTestId('composer-input')
+    await composer.click()
+    // The length of the text as each key arrives: a key the page had not yet applied when the
+    // next one came would show as a length that did not move on.
+    await page.evaluate(() => {
+      const field = document.querySelector<HTMLTextAreaElement>('[data-testid="composer-input"]')
+      const lengths: number[] = []
+      field?.addEventListener('keydown', () => lengths.push(field.value.length), true)
+      ;(window as unknown as { krLengths: () => number[] }).krLengths = () => [
+        ...lengths,
+        field?.value.length ?? -1
+      ]
+    })
+    await recordMotion(page, '[data-testid="composer"]')
+
+    // Typed, then one key held so it repeats, then deleted a key at a time.
+    await page.keyboard.type('x'.repeat(30))
+    for (let repeat = 0; repeat < 20; repeat += 1) await page.keyboard.down('y')
+    await page.keyboard.up('y')
+    for (let press = 0; press < 25; press += 1) await page.keyboard.press('Backspace')
+    await expect(composer).toHaveValue(`${'x'.repeat(25)}`)
+
+    const lengths = await page.evaluate(() =>
+      (window as unknown as { krLengths: () => number[] }).krLengths()
+    )
+    const typed = Array.from({ length: 30 }, (_, index) => index)
+    const held = Array.from({ length: 20 }, (_, index) => 30 + index)
+    const deleted = Array.from({ length: 25 }, (_, index) => 50 - index)
+    expect(lengths).toEqual([...typed, ...held, ...deleted, 25])
+    expect(await recordedMotion(page)).toEqual([])
+    await page.screenshot({ path: shot(`feedback-keys-13.06-${test.info().project.name}`) })
+  })
+
+  test('a held arrow key moves through the views one press at a time, with nothing animated', async ({
+    page
+  }) => {
+    await openSession(page)
+    const views = page.getByRole('tablist', { name: 'View' })
+    await views.getByRole('tab', { name: 'Conversation' }).focus()
+    // The view selected as each press arrives.
+    await page.evaluate(() => {
+      const selected: string[] = []
+      document.addEventListener(
+        'keydown',
+        () => {
+          const tab = document.querySelector('[role="tablist"][aria-label="View"] [aria-selected="true"]')
+          selected.push(tab?.textContent ?? '')
+        },
+        true
+      )
+      ;(window as unknown as { krSelected: () => string[] }).krSelected = () => selected
+    })
+    await recordMotion(page, '[role="tablist"][aria-label="View"]')
+
+    for (let repeat = 0; repeat < 4; repeat += 1) await page.keyboard.down('ArrowRight')
+    await page.keyboard.up('ArrowRight')
+
+    expect(await page.evaluate(() => (window as unknown as { krSelected: () => string[] }).krSelected())).toEqual(
+      ['Conversation', 'Terminal', 'Output', 'Conversation']
+    )
+    await expect(views.getByRole('tab', { name: 'Terminal' })).toHaveAttribute('aria-selected', 'true')
+    expect(await recordedMotion(page)).toEqual([])
+  })
+
+  test('streamed text is drawn whole as it arrives, never revealed or faded in', async ({ page }) => {
+    await openSession(page)
+    // Every state the streamed node is drawn in: its text and its opacity, from the moment it is
+    // inserted.
+    await page.evaluate(() => {
+      const drawn: string[] = []
+      const look = () => {
+        const node = document.querySelector<HTMLElement>('[data-node-id="streamed-2"]')
+        if (!node) return
+        let opacity = 1
+        for (let around: Element | null = node; around; around = around.parentElement) {
+          opacity *= Number(getComputedStyle(around).opacity)
+        }
+        drawn.push(`${opacity} ${node.querySelector('.message-content > p')?.textContent ?? ''}`)
+      }
+      new MutationObserver(look).observe(document.body, {
+        subtree: true,
+        childList: true,
+        characterData: true
+      })
+      ;(window as unknown as { krDrawn: () => string[] }).krDrawn = () => drawn
+    })
+    const words = ['kr-arriving', 'text', 'drawn', 'as', 'it', 'comes']
+    const revisions = words.map((_, index) => words.slice(0, index + 1).join(' '))
+    for (const [index, text] of revisions.entries()) {
+      await page.evaluate(
+        ({ revision, text }) => {
+          window.krTestHost?.appendNode({
+            id: 'streamed-2',
+            revision: String(revision),
+            body: { kind: 'message', author: 'agent', text }
+          } as never)
+        },
+        { revision: index + 1, text }
+      )
+      await expect(page.getByText(text, { exact: true })).toBeVisible({
+        timeout: PRESENTATION_DEADLINE
+      })
+    }
+    const drawn = await page.evaluate(() => (window as unknown as { krDrawn: () => string[] }).krDrawn())
+    expect(drawn.length).toBeGreaterThan(0)
+    for (const state of drawn) {
+      const [opacity, ...text] = state.split(' ')
+      expect(opacity).toBe('1')
+      // Each state is a whole revision the host sent, never part of one.
+      expect(revisions).toContain(text.join(' '))
+    }
+  })
+
+  test('the sheet follows the pointer as it is dragged and back, before it is let go', async ({ page }) => {
+    await openSession(page)
+    const sheet = page.getByTestId('sheet')
+    const at = await holdSheet(page)
+
+    await page.mouse.move(at.x, at.y + 90, { steps: 6 })
+    expect(await drawnOffset(sheet)).toBeCloseTo(90, 0)
+    await page.screenshot({ path: shot(`feedback-drag-13.06-${test.info().project.name}`) })
+    // Back up during the same movement, and past where it sits, where it resists.
+    await page.mouse.move(at.x, at.y + 30, { steps: 6 })
+    expect(await drawnOffset(sheet)).toBeCloseTo(30, 0)
+    await page.mouse.move(at.x, at.y - 60, { steps: 6 })
+    const past = await drawnOffset(sheet)
+    expect(past).toBeLessThan(0)
+    expect(past).toBeGreaterThan(-60)
+
+    // Let go short of a dismissal, and it settles back where it sits.
+    await page.mouse.move(at.x, at.y + 20, { steps: 6 })
+    await releaseStill(page)
+    await expect(sheet).toHaveAttribute('data-presentation', 'here', { timeout: PRESENTATION_DEADLINE })
+    expect(await drawnOffset(sheet)).toBeCloseTo(0, 0)
+  })
+})
+
+test.describe('input feedback with reduced motion', () => {
+  test.use({ reducedMotion: 'reduce' })
+
+  // KR-REQ-13.06: nothing moves by itself, and a drag is still the person's own motion.
+  test('the sheet follows the pointer and back, stops at its edge, and nothing springs', async ({ page }) => {
+    await openSession(page)
+    const sheet = page.getByTestId('sheet')
+    const at = await holdSheet(page)
+    await recordMotion(page, '[data-testid="sheet"]')
+
+    await page.mouse.move(at.x, at.y + 90, { steps: 6 })
+    expect(await drawnOffset(sheet)).toBeCloseTo(90, 0)
+    await page.screenshot({ path: shot(`feedback-drag-reduced-13.06-${test.info().project.name}`) })
+    await page.mouse.move(at.x, at.y + 30, { steps: 6 })
+    expect(await drawnOffset(sheet)).toBeCloseTo(30, 0)
+    // Past where it sits it stops dead: stretching past the edge is motion of its own.
+    await page.mouse.move(at.x, at.y - 60, { steps: 6 })
+    expect(await drawnOffset(sheet)).toBeCloseTo(0, 0)
+
+    // Let go short of a dismissal, and it is back where it sits at once.
+    await page.mouse.move(at.x, at.y + 40, { steps: 6 })
+    await releaseStill(page)
+    expect(await drawnOffset(sheet)).toBeCloseTo(0, 0)
+    await expect(sheet).toHaveAttribute('data-presentation', 'here', { timeout: PRESENTATION_DEADLINE })
+    // Nothing travelled by itself: the only motion the surface had was the pointer's.
+    const motion = await recordedMotion(page)
+    expect(motion.filter((entry) => entry.includes('transform'))).toEqual([])
+
+    // A drag far enough still dismisses it, by a fade.
+    await page.mouse.move(at.x, at.y)
+    await page.mouse.down()
+    await page.mouse.move(at.x, at.y + 420, { steps: 6 })
+    await page.mouse.up()
+    await expect(sheet).toBeHidden({ timeout: PRESENTATION_DEADLINE })
+  })
+})
