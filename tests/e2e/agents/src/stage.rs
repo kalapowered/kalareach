@@ -810,21 +810,23 @@ pub struct AgentProcess {
 /// program is never read as this one's. Before the command is typed, the PATH the shell searches is
 /// checked and the session is watched from then to the end of the part; once the agent draws its
 /// first screen, the image every process beneath the shell maps is recorded and checked, and the
-/// launch must have run `expected` in the way its build list names ([`Provenance`]).
+/// launch must have run `expected` in the way its build list names ([`Provenance`]). `between` is
+/// called every few tens of milliseconds while the agent is awaited, for what the part checks
+/// while it waits.
 ///
 /// # Panics
 ///
 /// Panics when the screen already shows `ready`, the agent does not draw it, nothing of the build
 /// runs beneath the shell, or the session searched or ran anything but the build under test, its
-/// runtime, the run's own and the system's.
+/// runtime, the run's own and the system's; and where `between` panics.
 #[must_use]
 pub fn launch(
     run: &Run,
     session: &Session,
-    line: &str,
-    ready: &str,
+    (line, ready): (&str, &str),
     provenance: &Provenance,
     expected: &Expected,
+    between: &dyn Fn(),
 ) -> Vec<AgentProcess> {
     assert!(
         !session
@@ -842,9 +844,21 @@ pub fn launch(
     let typed_at = session.window.mark();
     session.window.type_text(format!("{line}\r").as_bytes());
     let drawn = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        session
-            .window
-            .wait_for_screen(ready, "the agent draws its first screen")
+        let waited = Instant::now();
+        loop {
+            between();
+            let rows = session.window.screen();
+            if rows.iter().any(|row| row.contains(ready)) {
+                return rows;
+            }
+            assert!(
+                waited.elapsed() < LIVENESS,
+                "the agent draws its first screen: its terminal did not show {ready:?} within \
+                 {LIVENESS:?}, and its screen is:\n{}",
+                rows.join("\n")
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }));
     if let Err(panic) = drawn {
         // What the program wrote since its command was typed says why it did not draw, where
@@ -862,6 +876,7 @@ pub fn launch(
     let started = Instant::now();
     let shell = u32::try_from(session.root_shell.pid.get()).expect("a process number");
     loop {
+        between();
         let everything = beneath(run, &session.root_shell, "the agent");
         let found: Vec<AgentProcess> = everything
             .iter()

@@ -520,12 +520,16 @@ pub struct Account {
     /// What marks the line of a conversation file that records the answer to a tool approval:
     /// the command's result, or its refusal.
     pub decision_line: String,
-    /// What marks the line of a conversation file that records a tool call that asks for approval,
-    /// where only some calls do: each of these texts marks one. Then only the lines
-    /// [`Account::decision_line`] marks that answer such a call, tied to it by the call's
-    /// identifier (its `call_id`), count as answers; where the list is empty, every one does.
+    /// What marks a tool call that asks for approval, where only some calls do: each of these
+    /// texts, held once by a call record. Then only the calls that ask and have an answer, tied to
+    /// them by the call's identifier (its `call_id`), count; where the list is empty, every line
+    /// [`Account::decision_line`] marks is one answer.
     #[serde(default)]
     pub decision_calls: Vec<String>,
+    /// What marks the line of a conversation file that records a tool call, one text for each kind
+    /// of call record, where [`Account::decision_calls`] names what asks.
+    #[serde(default)]
+    pub call_lines: Vec<String>,
     /// What marks the line of a conversation file that records a prompt queued behind a running
     /// turn, where the agent writes one.
     #[serde(default)]

@@ -997,10 +997,10 @@ fn start_agent_as(
         let processes = launch(
             stage.run,
             &session,
-            &words.join(" "),
-            &server.ready,
+            (&words.join(" "), &server.ready),
             stage.provenance,
             &Expected::pinned(stage.build),
+            &|| guards_hold_while_waiting(stage),
         );
         // The line that says it listens can come before the server answers requests.
         let listening = std::time::Instant::now();
@@ -1009,6 +1009,7 @@ fn start_agent_as(
                 listening.elapsed() < LIVENESS,
                 "the server answers on port {port}"
             );
+            guards_hold_while_waiting(stage);
             std::thread::sleep(Duration::from_millis(200));
         }
         (session, processes)
@@ -1030,10 +1031,10 @@ fn start_agent_as(
     let processes = launch(
         stage.run,
         &session,
-        &line,
-        ready,
+        (&line, ready),
         stage.provenance,
         &Expected::pinned(stage.build),
+        &|| guards_hold_while_waiting(stage),
     );
     Agent {
         session,
@@ -1067,7 +1068,9 @@ fn serves(port: u16, health: Option<&str>) -> bool {
 /// session's live instances, the one instance's binding as a device reads it, and how many live
 /// bindings hold the package.
 fn detect(stage: &Stage<'_, '_>, session: &Session) -> Shown {
-    let detection = wait_for_detection(&session.remote, stage.runtime, session.session_id);
+    let detection = wait_for_detection(&session.remote, stage.runtime, session.session_id, &|| {
+        guards_hold_while_waiting(stage)
+    });
     shown_from(stage, session, detection)
 }
 
@@ -1159,6 +1162,7 @@ fn end_and_show(stage: &Stage<'_, '_>, agent: &Agent) -> (Launched, Shown) {
         &agent.session.remote,
         stage.runtime,
         agent.session.session_id,
+        &|| guards_hold_while_waiting(stage),
     );
     let shown = shown_from(stage, &agent.session, detection);
     (launched(stage, agent), shown)
@@ -1356,6 +1360,8 @@ impl Logged {
         arguments.extend(switches_of(stage));
         arguments.extend(extra.iter().cloned());
         let first = ready.unwrap_or(&account.ready).to_owned();
+        // The last look before the agent starts.
+        guards_hold(stage);
         let agent = start_agent_as(stage, variables, what, &arguments, &first);
         let mut screen = watch(stage, &agent.session, &first);
         let mut keyboard = keyboard(stage, &agent.session);
@@ -1446,6 +1452,23 @@ impl Logged {
     /// dialog out, before the part goes on.
     fn refuse(&mut self, stage: &Stage<'_, '_>, shown: &str, why: &str) {
         let account = stage.login.expect("a part with a login").account();
+        // The screen is read once more: a key sent after the dialog closed would go to whatever
+        // the agent shows then.
+        self.screen.pump(stage, Duration::from_millis(50));
+        if !self
+            .screen
+            .view
+            .rows()
+            .iter()
+            .any(|row| row.contains(shown))
+        {
+            if let Ok(mut declined) = stage.declined.lock() {
+                declined.push(format!(
+                    "{why}: a dialog showing {shown:?}, which closed before the part refused it"
+                ));
+            }
+            return;
+        }
         let key = if shown == account.approval.shows {
             account.approval.deny.clone()
         } else {
@@ -1466,6 +1489,7 @@ impl Logged {
                 .iter()
                 .any(|row| row.contains(shown))
         {
+            guards_hold_while_waiting(stage);
             self.screen.pump(stage, Duration::from_millis(200));
         }
     }
@@ -1485,6 +1509,7 @@ impl Logged {
                 started.elapsed() < LIVENESS,
                 "{why}: the agent still shows {shown:?} after it was answered"
             );
+            guards_hold_while_waiting(stage);
             self.screen.pump(stage, Duration::from_millis(200));
         }
     }
@@ -1528,6 +1553,7 @@ impl Logged {
                 let mut named = account.approval.names_only(&rows, command);
                 let settling = std::time::Instant::now();
                 while named.is_err() && settling.elapsed() < Duration::from_secs(1) {
+                    guards_hold_while_waiting(stage);
                     self.screen.pump(stage, Duration::from_millis(200));
                     rows = self.screen.view.rows();
                     named = account.approval.names_only(&rows, command);
@@ -2137,11 +2163,10 @@ impl Watch {
         let deadline = std::time::Instant::now() + LIVENESS;
         loop {
             guards_hold_while_waiting(stage);
-            match stage.runtime.block_on(self.view.wait_for(
-                &self.remote,
-                needle,
-                Duration::from_secs(1),
-            )) {
+            match stage
+                .runtime
+                .block_on(self.view.wait_for(&self.remote, needle, GUARD_EVERY))
+            {
                 Ok(rows) => return rows,
                 Err(error) => {
                     assert!(
@@ -2813,10 +2838,10 @@ fn a_running_agent_keeps_its_build_through_an_upgrade_and_the_newer_build_gets_t
         let second_processes = launch(
             stage.run,
             &second_session,
-            &stage.build.command_line(first.port),
-            &newer.ready,
+            (&stage.build.command_line(first.port), &newer.ready),
             stage.provenance,
             &Expected::newer(stage.build, &newer),
+            &|| {},
         );
         let shown_second = detect(stage, &second_session);
         let newer_build = Expected::newer(stage.build, &newer);
@@ -2893,10 +2918,10 @@ fn a_running_agent_keeps_its_build_through_an_upgrade_and_the_newer_build_gets_t
         let relaunched = launch(
             stage.run,
             &first.session,
-            &stage.build.command_line(first.port),
-            &newer.ready,
+            (&stage.build.command_line(first.port), &newer.ready),
             stage.provenance,
             &Expected::newer(stage.build, &newer),
+            &|| {},
         );
         let relaunched_refs: Vec<&AgentProcess> = relaunched.iter().collect();
         let relaunched_agent = executing(&relaunched_refs, &newer_build).unwrap_or_else(|| {
@@ -4186,7 +4211,7 @@ fn decisions(
     stage: &Stage<'_, '_>,
     conversation: &Path,
     after: Option<usize>,
-    (marker, calls): (&str, &[String]),
+    (marker, call_lines, calls): (&str, &[String], &[String]),
     least: usize,
 ) -> usize {
     let count = || {
@@ -4194,8 +4219,7 @@ fn decisions(
         answers(
             &std::fs::read_to_string(conversation).unwrap_or_default(),
             after,
-            marker,
-            calls,
+            (marker, call_lines, calls),
         )
         .unwrap_or_else(|why| panic!("the answers to the approval cannot be counted: {why}"))
     };
@@ -4206,7 +4230,10 @@ fn decisions(
         seen = count();
     }
     loop {
-        std::thread::sleep(Duration::from_secs(1));
+        // A second without a change, the files watched read in the middle of it.
+        std::thread::sleep(GUARD_EVERY);
+        guards_hold_while_waiting(stage);
+        std::thread::sleep(GUARD_EVERY);
         let again = count();
         if again == seen {
             return seen;
@@ -4227,28 +4254,36 @@ fn refuse_locally(
 ) -> bool {
     let account = stage.login.expect("a part with a login").account();
     let dialogs = Logged::dialogs(account);
-    let Some(index) = dialogs
-        .iter()
-        .position(|dialog| rows.iter().any(|row| row.contains(dialog)))
-    else {
-        return false;
+    let showing = |rows: &[String]| {
+        dialogs
+            .iter()
+            .position(|dialog| rows.iter().any(|row| row.contains(dialog)))
     };
-    if let (0, Some(command)) = (index, except) {
-        // A dialog can reach the terminal over more than one update: it is read again, a moment
-        // later, before it is taken for anything but the part's command.
-        let settling = std::time::Instant::now();
-        let mut shown = rows.to_vec();
-        loop {
-            if account.approval.names_only(&shown, command).is_ok() {
-                return false;
-            }
-            if settling.elapsed() >= Duration::from_secs(1) {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(200));
-            shown = window.screen();
-        }
+    if showing(rows).is_none() {
+        return false;
     }
+    // A dialog can reach the terminal over more than one update: the command dialog the part waits
+    // for is read again, a moment later, before it is taken for anything else; and whatever is
+    // refused is what the latest screen shows, since a key sent after a dialog closed would go to
+    // whatever the agent shows then.
+    let settling = std::time::Instant::now();
+    let mut shown = rows.to_vec();
+    let index = loop {
+        let Some(index) = showing(&shown) else {
+            return false;
+        };
+        let awaited = index == 0
+            && except.is_some_and(|command| account.approval.names_only(&shown, command).is_ok());
+        if awaited {
+            return false;
+        }
+        if except.is_none() || index != 0 || settling.elapsed() >= Duration::from_secs(1) {
+            break index;
+        }
+        guards_hold_while_waiting(stage);
+        std::thread::sleep(Duration::from_millis(200));
+        shown = window.screen();
+    };
     let key = if index == 0 {
         account.approval.deny.clone()
     } else {
@@ -4269,6 +4304,7 @@ fn refuse_locally(
             .iter()
             .any(|row| row.contains(dialogs[index]))
     {
+        guards_hold_while_waiting(stage);
         std::thread::sleep(Duration::from_millis(100));
     }
     true
@@ -4430,7 +4466,11 @@ fn a_local_and_a_remote_answer_raced_to_one_approval_resolve_it_once() {
             stage,
             &conversation,
             prompt_at,
-            (&account.decision_line, &account.decision_calls),
+            (
+                &account.decision_line,
+                &account.call_lines,
+                &account.decision_calls,
+            ),
             1,
         );
         one_decision(decided).unwrap_or_else(|why| panic!("one resolution: {why}"));
@@ -4453,13 +4493,22 @@ fn a_local_and_a_remote_answer_raced_to_one_approval_resolve_it_once() {
         // The new connection's own view and keyboard: an attachment belongs to its connection.
         logged.screen = Watch::open(stage, &logged.agent.session);
         logged.keyboard = keyboard(stage, &logged.agent.session);
-        std::thread::sleep(Duration::from_secs(3));
+        // Three seconds for anything typed again to arrive, the files watched read throughout.
+        let settling = std::time::Instant::now();
+        while settling.elapsed() < Duration::from_secs(3) {
+            guards_hold_while_waiting(stage);
+            std::thread::sleep(Duration::from_millis(100));
+        }
         let after_reconnect = executions(&log, &tag);
         let decided_after = decisions(
             stage,
             &conversation,
             prompt_at,
-            (&account.decision_line, &account.decision_calls),
+            (
+                &account.decision_line,
+                &account.call_lines,
+                &account.decision_calls,
+            ),
             0,
         );
         let rows = fresh_rows(stage, &logged.agent.session);
@@ -4544,6 +4593,7 @@ fn a_local_and_a_remote_answer_raced_to_one_approval_resolve_it_once() {
                 denied_at.elapsed() < LIVENESS,
                 "the local terminal's denial closes the second dialog"
             );
+            guards_hold_while_waiting(stage);
             std::thread::sleep(Duration::from_millis(100));
         }
         let device_refused = logged
@@ -4564,7 +4614,11 @@ fn a_local_and_a_remote_answer_raced_to_one_approval_resolve_it_once() {
             stage,
             &conversation,
             prompt_at,
-            (&account.decision_line, &account.decision_calls),
+            (
+                &account.decision_line,
+                &account.call_lines,
+                &account.decision_calls,
+            ),
             decided + 1,
         );
         let control = loser_reached_nothing(executions(&log, &second));
@@ -4582,7 +4636,7 @@ fn a_local_and_a_remote_answer_raced_to_one_approval_resolve_it_once() {
             "loser": { "who": "the local terminal", "typed": account.approval.deny, "receipt": receipt.iter().filter(|row| row.contains("input lease")).collect::<Vec<_>>(), "exit_status": local_status },
             "command": command,
             "executions": { "after_the_race": ran, "after_reconnecting": after_reconnect },
-            "decisions": { "conversation": conversation_id(&conversation), "marked_by": account.decision_line, "answering_calls_marked_by": account.decision_calls, "after_the_race": decided, "after_reconnecting": decided_after, "after_the_control": decided_control },
+            "decisions": { "conversation": conversation_id(&conversation), "marked_by": account.decision_line, "answering_calls_marked_by": account.decision_calls, "calls_marked_by": account.call_lines, "after_the_race": decided, "after_reconnecting": decided_after, "after_the_control": decided_control },
             "replay": { "probe": probe, "typed_again": false, "checker_control_rejected": replay_control.is_err() },
             "resources": snapshot.agent_resources.resources.len(),
             "control": { "what": "a second approval with the local terminal holding the lease: it denied and the device's allow was refused", "breaks_property": true, "command": second_command, "executions": executions(&log, &second), "device_refused": device_refused, "check": control.err() },
@@ -4670,6 +4724,7 @@ fn a_disconnection_after_the_agent_took_a_prompt_leaves_one_reply_and_no_duplica
         // The agent's own record of the prompt is its admission.
         let admitted_at = std::time::Instant::now();
         let conversation = loop {
+            guards_hold_while_waiting(stage);
             while logged.screen.pump_one(stage, Duration::from_millis(5)) {
                 let rows = logged.screen.view.rows();
                 code_seen |= rows.iter().any(|row| row.contains(&code_start));
@@ -4710,6 +4765,7 @@ fn a_disconnection_after_the_agent_took_a_prompt_leaves_one_reply_and_no_duplica
             if closing.elapsed() >= Duration::from_secs(5) {
                 break false;
             }
+            guards_hold_while_waiting(stage);
             std::thread::sleep(Duration::from_millis(10));
         };
         reached |= !reader_stopped;
