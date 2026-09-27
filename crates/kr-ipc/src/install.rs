@@ -64,6 +64,12 @@ pub const CURRENT: &str = "current";
 /// The directory each release is in.
 pub const VERSIONS: &str = "versions";
 
+/// The directory releases are unpacked and checked in.
+pub const STAGING: &str = "staging";
+
+/// The directory releases are moved into to be removed.
+pub const TRASH: &str = "trash";
+
 /// A host executable, by the name it has in every release's `bin/`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Program {
@@ -228,9 +234,11 @@ impl Running {
     /// Works out what a process whose image is `image` runs, and takes the hold when that is a
     /// release of a store.
     ///
-    /// A program under `versions/<release>/bin/` of a directory that holds a store record is that
-    /// release's, and is held. A program under `trash/` or `staging/` of a store is refused: its
-    /// release is being removed, or is not yet installed. Anything else is a build outside a store.
+    /// A program at `versions/<release>/bin/` of a directory that holds a store record is that
+    /// release's, and is held; anywhere else under `versions/` it is refused, since it would run
+    /// from a release without holding it. A program anywhere under `trash/` or `staging/` of a
+    /// store is refused: its release is being removed, or is not yet installed. Anything else is a
+    /// build outside a store.
     ///
     /// # Errors
     ///
@@ -242,6 +250,11 @@ impl Running {
             return Ok(Self::Loose { directory });
         };
         match placed.place {
+            Place::Versions if !placed.in_bin => Err(InstallError::Replaced {
+                path: image.to_path_buf(),
+                reason: "is inside a release of this host's store, and not where a release keeps \
+                         its programs, so it does not start",
+            }),
             Place::Versions => {
                 let release = placed
                     .release_directory_name
@@ -362,39 +375,45 @@ enum Place {
 struct Placed {
     store: Store,
     place: Place,
+    /// The directory directly under the place that the image is in: a release's own directory
+    /// under `versions/`, and whatever an unpacking or a removal made under the others.
     release_directory: PathBuf,
     release_directory_name: std::ffi::OsString,
+    /// Whether the image is directly in the release directory's `bin/`, where a release keeps its
+    /// programs.
+    in_bin: bool,
 }
 
 impl Placed {
-    /// Where `image` is in a store, when it is `<store>/<place>/<release>/bin/<program>` and
-    /// `<store>` holds a store record.
+    /// Where `image` is in a store: anywhere under the `versions/`, `staging/` or `trash/` of a
+    /// directory that holds a store record. The nearest such directory above the image decides.
     fn of(image: &Path) -> Option<Self> {
         if cfg!(windows) {
             return None;
         }
-        let bin = image.parent()?;
-        if bin.file_name()? != OsStr::new("bin") {
-            return None;
+        let mut below = image;
+        for holder in image.ancestors().skip(1) {
+            let place = match holder.file_name().and_then(OsStr::to_str) {
+                Some(VERSIONS) => Some(Place::Versions),
+                Some(STAGING) => Some(Place::Staging),
+                Some(TRASH) => Some(Place::Trash),
+                _ => None,
+            };
+            if let (Some(place), Some(root)) = (place, holder.parent()) {
+                let store = Store::at(root);
+                if store.is_store() {
+                    return Some(Self {
+                        store,
+                        place,
+                        release_directory: below.to_path_buf(),
+                        release_directory_name: below.file_name()?.to_os_string(),
+                        in_bin: image.parent() == Some(below.join("bin").as_path()),
+                    });
+                }
+            }
+            below = holder;
         }
-        let release_directory = bin.parent()?;
-        let holder = release_directory.parent()?;
-        let place = match holder.file_name()?.to_str()? {
-            VERSIONS => Place::Versions,
-            "trash" => Place::Trash,
-            "staging" => Place::Staging,
-            _ => return None,
-        };
-        let store = Store::at(holder.parent()?);
-        if !store.is_store() {
-            return None;
-        }
-        Some(Self {
-            store,
-            place,
-            release_directory: release_directory.to_path_buf(),
-            release_directory_name: release_directory.file_name()?.to_os_string(),
-        })
+        None
     }
 }
 
@@ -574,13 +593,13 @@ impl Store {
     /// Where releases are unpacked and checked.
     #[must_use]
     pub fn staging(&self) -> PathBuf {
-        self.root.join("staging")
+        self.root.join(STAGING)
     }
 
     /// Where a release goes to be removed.
     #[must_use]
     pub fn trash(&self) -> PathBuf {
-        self.root.join("trash")
+        self.root.join(TRASH)
     }
 
     /// Where the roots this store's daemons served are recorded.
@@ -1290,19 +1309,64 @@ mod tests {
         );
     }
 
-    /// A program in a release being installed or removed does not start.
+    /// A program in a release being installed or removed does not start, however deep in the
+    /// staging or the trash it is: an update unpacks under `staging/<run>/<top>/`, and an install
+    /// copies under `staging/<run>/release/`.
     #[test]
     fn a_program_in_the_staging_or_the_trash_does_not_start() {
         let test = test_store();
-        for holder in [test.store.staging(), test.store.trash()] {
-            let image = holder
-                .join("0.1.0+aaaaaaaaaaaa-x")
-                .join("bin")
-                .join(Program::Kr.file_name());
-            assert!(matches!(
-                Running::of_image(&image),
-                Err(InstallError::Replaced { .. })
-            ));
+        let kr = Program::Kr.file_name();
+        for image in [
+            test.store
+                .trash()
+                .join("0.1.0+aaaaaaaaaaaa-x/bin")
+                .join(&kr),
+            test.store.staging().join("run/bin").join(&kr),
+            test.store
+                .staging()
+                .join("run/kalareach-aarch64-apple-darwin-0.1.0+aaaaaaaaaaaa/bin")
+                .join(&kr),
+            test.store.staging().join("run/release/bin").join(&kr),
+            test.store.staging().join(&kr),
+        ] {
+            assert!(
+                matches!(
+                    Running::of_image(&image),
+                    Err(InstallError::Replaced { .. })
+                ),
+                "{}",
+                image.display()
+            );
+        }
+        // A program inside a release but not in its `bin/` would run it without holding it.
+        let one = release("0.1.0+aaaaaaaaaaaa");
+        install(&test.store, &one);
+        let inside = test
+            .store
+            .release_directory(&one)
+            .join("share/bin")
+            .join(&kr);
+        assert!(matches!(
+            Running::of_image(&inside),
+            Err(InstallError::Replaced { .. })
+        ));
+        // The controls: the same layouts without a store record are builds outside a store, and
+        // the release's own program is its release's.
+        let program = test.store.release_directory(&one).join("bin").join(&kr);
+        assert_eq!(
+            Running::of_image(&program).expect("held").release(),
+            Some(&one)
+        );
+        std::fs::remove_file(test.store.record()).expect("the record goes");
+        for image in [
+            test.store.staging().join("run/release/bin").join(&kr),
+            inside,
+        ] {
+            assert!(
+                matches!(Running::of_image(&image), Ok(Running::Loose { .. })),
+                "{}",
+                image.display()
+            );
         }
     }
 }
