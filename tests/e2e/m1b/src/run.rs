@@ -662,7 +662,7 @@ pub const SERVICE_MANAGER_BOUND: Duration = Duration::from_secs(20);
 const OUTPUT_HANDOVER: Duration = Duration::from_secs(5);
 
 /// Runs `command` with nothing on its input and waits at most `within` for it to exit, then at
-/// most [`OUTPUT_HANDOVER`] for its output.
+/// most `OUTPUT_HANDOVER` for its output.
 ///
 /// What it prints is read by threads of its own, so a command that prints more than a pipe holds
 /// cannot stall. One still running at `within` is killed and collected; it is this run's own

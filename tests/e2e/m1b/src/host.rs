@@ -362,7 +362,7 @@ impl<'r> Host<'r> {
     /// sessions it made, their shells and what runs in them, through the record rather than by a
     /// name. A search that does not finish is kept with the run, whose closing check then fails
     /// rather than report a search that did not finish, and it is tried again within
-    /// [`DISCOVERY`] so that the run can still end what a later search finds. A later search that
+    /// `DISCOVERY` so that the run can still end what a later search finds. A later search that
     /// finishes does not clear the earlier failure: what the earlier one missed may since have
     /// left the tree it searched.
     pub fn record_workers(&self) {
