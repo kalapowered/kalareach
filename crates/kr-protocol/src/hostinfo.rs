@@ -319,6 +319,11 @@ pub struct HostDoctorResult {
     /// with its source, so the host answers with them rather than leaving a command to read the
     /// document a second time and reach its own conclusion about the platform's defaults.
     pub configuration: EffectiveConfiguration,
+    /// Every command integration an installed release declares or the configuration names, and
+    /// what a session created now gets of it.
+    ///
+    /// Section 7: diagnostics show the resolved executable, flags, version and integration mode.
+    pub command_integrations: Vec<CommandIntegrationReport>,
 }
 
 impl HostDoctorResult {
@@ -335,6 +340,158 @@ impl HostDoctorResult {
             checks,
             healthy,
             configuration,
+            command_integrations: Vec::new(),
+        }
+    }
+
+    /// The same result, reporting `command_integrations`.
+    #[must_use]
+    pub fn with_command_integrations(
+        mut self,
+        command_integrations: Vec<CommandIntegrationReport>,
+    ) -> Self {
+        self.command_integrations = command_integrations;
+        self
+    }
+}
+
+/// One command integration as `kr doctor` reports it.
+///
+/// Section 7: diagnostics show the resolved executable, flags, version and integration mode. The
+/// executable here is this host's reading of it: the first the command names on the daemon's own
+/// search path, with the version a signed qualification record names for its digest. A session
+/// whose own search path differs can find another, and each launch records the one it ran.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CommandIntegrationReport {
+    /// The package, as `publisher/plugin`.
+    pub plugin_id: String,
+    /// Its installed release, where one is installed.
+    pub version: Nullable<String>,
+    /// The command its release integrates, where the host read one.
+    pub command: Nullable<String>,
+    /// The flags an integrated invocation gets, each one argument element, in order.
+    pub flags: Vec<String>,
+    /// The variables an integrated launch sets, in order.
+    pub variables: Vec<crate::session::EnvironmentVariable>,
+    /// What a session created now gets of it.
+    pub state: CommandIntegrationState,
+    /// Why a session created now could not launch through it on this host, where one could not.
+    pub unavailable: Nullable<CommandIntegrationUnavailable>,
+    /// How an invocation of its command runs in a session created now.
+    pub mode: crate::broker::IntegrationMode,
+    /// The executable the command names first on the daemon's search path, where it names one.
+    pub executable: Nullable<String>,
+    /// The version a signed qualification record names for that executable's digest, where one
+    /// does.
+    pub executable_version: Nullable<String>,
+    /// What else the host knows of why the state is what it is: why an installation is left out
+    /// of the admissions, or why a package could not be read.
+    pub reason: Nullable<String>,
+}
+
+impl CommandIntegrationReport {
+    /// Returns this report with every value of it held to its class.
+    fn withheld_form(&self) -> Self {
+        let class = |field| export::class("CommandIntegrationReport", field);
+        Self {
+            plugin_id: export::carry(class("plugin_id"), &self.plugin_id),
+            version: export::carry_null(class("version"), &self.version),
+            command: export::carry_null(class("command"), &self.command),
+            flags: self
+                .flags
+                .iter()
+                .map(|flag| export::carry(class("flags"), flag))
+                .collect(),
+            variables: self
+                .variables
+                .iter()
+                .map(|variable| crate::session::EnvironmentVariable {
+                    name: export::carry(
+                        export::class("EnvironmentVariable", "name"),
+                        &variable.name,
+                    ),
+                    value: export::carry(
+                        export::class("EnvironmentVariable", "value"),
+                        &variable.value,
+                    ),
+                })
+                .collect(),
+            state: self.state,
+            unavailable: self.unavailable,
+            mode: self.mode,
+            executable: export::carry_null(class("executable"), &self.executable),
+            executable_version: export::carry_null(
+                class("executable_version"),
+                &self.executable_version,
+            ),
+            reason: export::carry_null(class("reason"), &self.reason),
+        }
+    }
+}
+
+/// What a session created now gets of one command integration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandIntegrationState {
+    /// The configuration turns it on and the installed release's integration applies: an
+    /// invocation of its command gets its flags and variables behind a worker-owned backend.
+    On,
+    /// The installed release's integration applies and the configuration does not turn it on: an
+    /// invocation of its command runs as typed.
+    Off,
+    /// The release declares one, and its installation does not hold the owner-confirmed
+    /// `command_integration.launch` grant.
+    NotGranted,
+    /// The installed release declares none.
+    NoneDeclared,
+    /// Installed and left out of the admissions in force: disabled, revoked, not supported here,
+    /// not whole or past a limit.
+    NotAdmitted,
+    /// Admitted, and its package could not be read.
+    Unreadable,
+    /// Another admitted package integrates the same command, so neither does.
+    Conflict,
+    /// The configuration names it and it is not installed in this environment.
+    NotInstalled,
+}
+
+impl CommandIntegrationState {
+    /// Returns the stable wire string.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::On => "on",
+            Self::Off => "off",
+            Self::NotGranted => "not_granted",
+            Self::NoneDeclared => "none_declared",
+            Self::NotAdmitted => "not_admitted",
+            Self::Unreadable => "unreadable",
+            Self::Conflict => "conflict",
+            Self::NotInstalled => "not_installed",
+        }
+    }
+}
+
+/// Why a session created now could not launch through a command integration on this host.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandIntegrationUnavailable {
+    /// This platform establishes no command backend, since it cannot prove a credential file
+    /// closed to other accounts: every invocation runs as typed.
+    Platform,
+    /// No launcher, `kr-hook`, is installed beside this host's worker: every invocation runs as
+    /// typed.
+    NoLauncher,
+}
+
+impl CommandIntegrationUnavailable {
+    /// Returns the stable wire string.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Platform => "platform",
+            Self::NoLauncher => "no_launcher",
         }
     }
 }
@@ -353,6 +510,11 @@ impl export::ForExport for HostDoctorResult {
             checks: self.checks.iter().map(DoctorCheck::withheld_form).collect(),
             healthy: self.healthy,
             configuration: self.configuration.withheld_form(),
+            command_integrations: self
+                .command_integrations
+                .iter()
+                .map(CommandIntegrationReport::withheld_form)
+                .collect(),
         })
     }
 }
@@ -4268,6 +4430,40 @@ pub mod export {
         field("HostDoctorResult", "checks", ContentClass::Structure),
         field("HostDoctorResult", "healthy", ContentClass::Term),
         field("HostDoctorResult", "configuration", ContentClass::Structure),
+        field(
+            "HostDoctorResult",
+            "command_integrations",
+            ContentClass::Structure,
+        ),
+        field("CommandIntegrationReport", "plugin_id", ContentClass::Name),
+        field("CommandIntegrationReport", "version", ContentClass::Name),
+        field("CommandIntegrationReport", "command", ContentClass::Name),
+        field(
+            "CommandIntegrationReport",
+            "flags",
+            ContentClass::CommandLine,
+        ),
+        field(
+            "CommandIntegrationReport",
+            "variables",
+            ContentClass::Structure,
+        ),
+        field("CommandIntegrationReport", "state", ContentClass::Term),
+        field(
+            "CommandIntegrationReport",
+            "unavailable",
+            ContentClass::Term,
+        ),
+        field("CommandIntegrationReport", "mode", ContentClass::Term),
+        field("CommandIntegrationReport", "executable", ContentClass::Path),
+        field(
+            "CommandIntegrationReport",
+            "executable_version",
+            ContentClass::Name,
+        ),
+        field("CommandIntegrationReport", "reason", ContentClass::Message),
+        field("EnvironmentVariable", "name", ContentClass::Name),
+        field("EnvironmentVariable", "value", ContentClass::Variable),
         field("EffectiveValue", "key", ContentClass::Term),
         field("EffectiveValue", "about", ContentClass::Stated),
         field("EffectiveValue", "value", ContentClass::Declared),
@@ -8248,5 +8444,56 @@ mod tests {
             .join("; ");
         assert!(!listed.contains("sk-live-abc123"), "{listed}");
         assert!(listed.contains("[name withheld, 24 bytes]"), "{listed}");
+    }
+
+    /// KR-REQ-07.45, KR-REQ-26.44: a command integration's report leaves the host as its classes
+    /// allow. The owner's own report names the package, the flags, the variables and the
+    /// executable; an export carries each of them as its class and its length, and the state, the
+    /// mode and why none could launch as this build's own words.
+    #[test]
+    fn a_command_integration_report_leaves_as_its_classes_allow() {
+        use export::ForExport as _;
+
+        let report = CommandIntegrationReport {
+            plugin_id: "kalareach/gemini-cli".to_owned(),
+            version: Nullable::some("0.4.0".to_owned()),
+            command: Nullable::some("gemini".to_owned()),
+            flags: vec!["--settings".to_owned()],
+            variables: vec![crate::session::EnvironmentVariable {
+                name: "GEMINI_CLI_NO_RELAUNCH".to_owned(),
+                value: "true".to_owned(),
+            }],
+            state: CommandIntegrationState::On,
+            unavailable: Nullable::some(CommandIntegrationUnavailable::NoLauncher),
+            mode: crate::broker::IntegrationMode::NativeTerminal,
+            executable: Nullable::some("/Users/someone/.local/bin/gemini".to_owned()),
+            executable_version: Nullable::some("0.60.0".to_owned()),
+            reason: Nullable::null(),
+        };
+        let result = HostDoctorResult::new(Vec::new(), EffectiveConfiguration::unread())
+            .with_command_integrations(vec![report.clone()]);
+        assert_eq!(
+            result.command_integrations,
+            [report],
+            "the owner's own report names everything"
+        );
+        let exported =
+            serde_json::to_string(result.for_export().get()).expect("the export serialises");
+        for private in [
+            "kalareach/gemini-cli",
+            "/Users/someone",
+            "GEMINI_CLI_NO_RELAUNCH",
+            "--settings",
+            "0.60.0",
+        ] {
+            assert!(!exported.contains(private), "{private} left in: {exported}");
+        }
+        for word in [
+            r#""state":"on""#,
+            r#""mode":"native_terminal""#,
+            r#""unavailable":"no_launcher""#,
+        ] {
+            assert!(exported.contains(word), "{word} in {exported}");
+        }
     }
 }

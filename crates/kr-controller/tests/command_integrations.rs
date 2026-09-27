@@ -9,6 +9,7 @@
 //! | Row | What proves it |
 //! | --- | --- |
 //! | KR-REQ-12.07 | a session is launched with an entry for each integration installed, confirmed and admitted, on where the configuration turns it on and off where it does not; a create request naming one is refused before anything is reserved |
+//! | KR-REQ-07.45 | the doctor reports each integration: its package, command, flags and variables, what a new session gets of it and why, the mode an invocation runs in, and the executable the daemon's search path names with the version a signed record gives it |
 
 #![cfg(unix)]
 
@@ -400,4 +401,77 @@ async fn kr_req_12_07_a_create_request_that_names_an_integration_is_refused() {
         daemon.launches.try_recv().is_err(),
         "nothing was started for it"
     );
+}
+
+/// The daemon's diagnostics, as `kr doctor` reads them.
+async fn doctor(daemon: &Daemon) -> kr_protocol::hostinfo::HostDoctorResult {
+    let mut client = LocalClient::connect(&daemon.client_endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    client
+        .request(Method::HostDoctor, &())
+        .await
+        .expect("reaches the daemon")
+        .expect("the diagnostics")
+        .to_typed()
+        .expect("the diagnostics decode")
+}
+
+/// KR-REQ-07.45: the doctor reports the installed integration the configuration turns on: its
+/// package and release, its command, its flags and its variables, and why no session created now
+/// could launch through it here, which for this daemon is its worker with no launcher beside it;
+/// so its command runs as typed, on the native terminal. A package the configuration names that is
+/// not installed is reported too, and the check says the configuration asks for what cannot apply.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_07_45_the_doctor_reports_each_integration_and_what_a_new_session_gets() {
+    use kr_protocol::hostinfo::{
+        CommandIntegrationState, CommandIntegrationUnavailable, DoctorStatus,
+    };
+
+    let daemon = daemon(Some(&["kalareach/gemini-cli", "kalareach/claude-code"])).await;
+    let result = doctor(&daemon).await;
+    let reported: Vec<(String, CommandIntegrationState)> = result
+        .command_integrations
+        .iter()
+        .map(|report| (report.plugin_id.clone(), report.state))
+        .collect();
+    assert_eq!(
+        reported,
+        [
+            (
+                "kalareach/claude-code".to_owned(),
+                CommandIntegrationState::NotInstalled
+            ),
+            (
+                "kalareach/gemini-cli".to_owned(),
+                CommandIntegrationState::On
+            ),
+        ]
+    );
+    let gemini = &result.command_integrations[1];
+    assert_eq!(gemini.version.0.as_deref(), Some("0.3.0"));
+    assert_eq!(gemini.command.0.as_deref(), Some("gemini"));
+    assert!(gemini.flags.is_empty());
+    assert_eq!(
+        gemini.variables,
+        [kr_protocol::session::EnvironmentVariable {
+            name: "GEMINI_CLI_NO_RELAUNCH".to_owned(),
+            value: "true".to_owned(),
+        }]
+    );
+    assert_eq!(
+        gemini.unavailable.0,
+        Some(CommandIntegrationUnavailable::NoLauncher),
+        "this daemon's worker has no launcher beside it"
+    );
+    assert_eq!(
+        gemini.mode,
+        kr_protocol::broker::IntegrationMode::NativeTerminal
+    );
+    let check = result
+        .checks
+        .iter()
+        .find(|check| check.id() == "command-integrations")
+        .expect("the command integrations are checked");
+    assert_eq!(check.status, DoctorStatus::Warning);
 }
