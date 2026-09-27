@@ -44,10 +44,22 @@ use kr_worker::runtime::{CLOSURE_NOTICE_TIMEOUT, start_or_record};
 use kr_worker::service::{ServiceBinding, WorkerService};
 use kr_worker::session::SessionConfig;
 
+/// What `--version` says: the release, and the protocol package version this build speaks.
+///
+/// Two builds of one release can speak different protocol versions, and a client refuses a worker
+/// of another one, so the answer names both.
+static VERSION: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!(
+        "{} (protocol {})",
+        env!("CARGO_PKG_VERSION"),
+        kr_protocol::hello::PACKAGE_VERSION
+    )
+});
+
 #[derive(Debug, Parser)]
 #[command(
     name = "kr-worker",
-    version,
+    version = VERSION.as_str(),
     about = "The KalaReach session worker. Started by the host's service manager, never by hand."
 )]
 struct Arguments {

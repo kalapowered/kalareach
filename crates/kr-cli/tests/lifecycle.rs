@@ -199,6 +199,11 @@ fn build() -> BuildId {
 /// Panics when the build has no worker. A demonstration that skipped would report a pass for a
 /// path it never ran: `scripts/end-to-end.sh` builds the worker before it runs this, and a
 /// workspace test run builds it with everything else.
+///
+/// Panics as well when the worker there is of another build: one whose version names another
+/// release or another protocol version. Building this suite alone does not rebuild the worker, so
+/// one an earlier build of this workspace left in the target directory would otherwise be started,
+/// and every test that attaches to it would fail for a reason that has nothing to do with the test.
 fn worker() -> &'static Path {
     static COPIED: OnceLock<PathBuf> = OnceLock::new();
     COPIED.get_or_init(|| {
@@ -216,6 +221,26 @@ fn worker() -> &'static Path {
         );
         let copied = support::command_binaries().join("kr-worker");
         kr_ipc::testing::place_and_start_once(&built, &copied, &["--version"]);
+        let mut asked = std::process::Command::new(&copied);
+        asked
+            .arg("--version")
+            .env_clear()
+            .current_dir(support::command_binaries());
+        let said = output_within(asked, LIVENESS_DEADLINE)
+            .unwrap_or_else(|error| panic!("kr-worker --version {error}"));
+        let said = String::from_utf8_lossy(&said.stdout).trim().to_owned();
+        let this = format!(
+            "kr-worker {} (protocol {})",
+            env!("CARGO_PKG_VERSION"),
+            kr_protocol::hello::PACKAGE_VERSION
+        );
+        assert_eq!(
+            said,
+            this,
+            "the kr-worker at {} is of another build: it says {said:?}, and this suite is {this:?}; \
+             build the worker from this tree with `cargo build -p kr-worker` and run the suite again",
+            built.display()
+        );
         copied
     })
 }
