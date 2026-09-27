@@ -411,7 +411,7 @@ impl LaunchdSupervisor {
 
     /// Returns true when this host has a GUI bootstrap domain to put a job in.
     ///
-    /// Asked within [`SERVICE_MANAGER_BOUND`]: a launchd that does not answer is not one this
+    /// Asked within `SERVICE_MANAGER_BOUND`: a launchd that does not answer is not one this
     /// host can start a worker through either.
     #[must_use]
     pub fn available() -> bool {
@@ -917,7 +917,7 @@ impl SystemdSupervisor {
 
     /// Returns true when this host has a user service manager to ask.
     ///
-    /// Asked within [`SERVICE_MANAGER_BOUND`]: a manager that does not answer is not one this host
+    /// Asked within `SERVICE_MANAGER_BOUND`: a manager that does not answer is not one this host
     /// can start a worker through either.
     #[must_use]
     pub fn available() -> bool {
