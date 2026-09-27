@@ -2590,6 +2590,49 @@ mod tests {
         Lock::take_within(&environment, Duration::ZERO).expect("free once the first lets go");
     }
 
+    /// Holds `file` open with a handle that shares reading and writing but not its deletion, as a
+    /// program that reads each file as it is written does for a moment, and lets go after 300 ms
+    /// on a thread of its own.
+    #[cfg(windows)]
+    fn held_for_a_moment(file: &Path) -> std::thread::JoinHandle<()> {
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        /// Reading and writing are shared; deleting is not.
+        const FILE_SHARE_READ_WRITE: u32 = 0x0001 | 0x0002;
+
+        let holding = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ_WRITE)
+            .open(file)
+            .expect("the file is held");
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            drop(holding);
+        })
+    }
+
+    /// On Windows a definition that another program holds without sharing its deletion while it
+    /// goes back to its place, as a scanner holds a file it has just seen, goes back once that
+    /// program lets go, and ends with that one name: nothing is left beside it under the name it
+    /// was moved to, which would keep it after its own name is replaced or removed.
+    #[cfg(windows)]
+    #[test]
+    fn a_definition_held_while_it_goes_back_ends_with_its_one_name() {
+        let host = kr_ipc::testing::TempHost::create();
+        let path = host.root().join(format!("{LABEL}.plist"));
+        let place = Place::Derived(&path);
+        let aside = path.with_file_name(format!(".{LABEL}.plist.aside.kr-moving"));
+        kr_ipc::paths::write_owner_only_file(&aside, b"what kr wrote\n").expect("writes");
+        let letting_go = held_for_a_moment(&aside);
+        let put = put_back(&aside, &place);
+        letting_go.join().expect("let go");
+        put.expect("goes back once it is let go");
+        assert_eq!(std::fs::read(&path).expect("back"), b"what kr wrote\n");
+        assert!(!aside.exists(), "the name it was moved to is gone");
+        std::fs::remove_file(&path).expect("its own name is removed");
+        assert!(!path.exists() && !aside.exists(), "and nothing keeps it");
+    }
+
     /// Only a regular file is moved aside for a check; it goes back where it was, and never over a
     /// file that took its place meanwhile.
     #[cfg(unix)]

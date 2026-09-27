@@ -345,6 +345,72 @@ fn hold_without_shared_writing(directory: &Path) -> std::fs::File {
         .expect("the directory is held")
 }
 
+/// Holds a file through a handle that shares reading and writing but not its deletion, as a
+/// program that reads each file as it is written does for a moment, and lets go after 300 ms on a
+/// thread of its own.
+#[cfg(windows)]
+fn held_for_a_moment(file: &Path) -> std::thread::JoinHandle<()> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+    let holding = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .open(file)
+        .expect("the file is held");
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        drop(holding);
+    })
+}
+
+/// KR-REQ-14.05 on Windows: a staged file that another program holds without sharing its
+/// deletion while it is published, as a scanner holds a file it has just seen written, is given
+/// its name once that program lets go, and the staged name goes as every publication takes it
+/// away. The file ends with its one name, so replacing or removing that name later leaves nothing
+/// behind under another.
+#[cfg(windows)]
+#[test]
+fn a_file_held_while_it_is_published_ends_with_its_one_name() {
+    let root = tempfile::tempdir().expect("a temporary directory");
+    std::fs::write(root.path().join("staged.part"), b"published").expect("stages the file");
+    let authority =
+        AuthorisedDirectory::open_root(environment(), root.path()).expect("opens the authority");
+    let staged = RelativeName::parse("staged.part").expect("a valid relative name");
+    let published = RelativeName::parse("published.bin").expect("a valid relative name");
+
+    let letting_go = held_for_a_moment(&root.path().join("staged.part"));
+    let publication = authority.link_into(&staged, &authority, &published);
+    let removal = authority.remove(&staged);
+    letting_go.join().expect("let go");
+    publication.expect("published once it is let go");
+    removal.expect("the staged name goes");
+    assert_eq!(read_through(&authority, &published), "published");
+    assert!(
+        !root.path().join("staged.part").exists(),
+        "the staged name is gone"
+    );
+
+    std::fs::write(root.path().join("next.part"), b"next").expect("stages the next file");
+    let next = RelativeName::parse("next.part").expect("a valid relative name");
+    authority
+        .rename_into(&next, &authority, &published)
+        .expect("a later publication replaces it");
+    assert_eq!(read_through(&authority, &published), "next");
+    let mut left: Vec<String> = std::fs::read_dir(root.path())
+        .expect("reads the directory")
+        .map(|entry| {
+            entry
+                .expect("an entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    left.sort();
+    assert_eq!(left, vec!["published.bin".to_owned()], "one name, one file");
+}
+
 /// Reads one file through an authority, which is the only way a test is allowed to reach it.
 fn read_through(authority: &AuthorisedDirectory, name: &RelativeName) -> String {
     use std::io::Read as _;

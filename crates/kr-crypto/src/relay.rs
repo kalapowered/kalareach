@@ -588,6 +588,39 @@ mod tests {
         );
     }
 
+    /// On Windows both keys a relay keeps are refused before anything is made: the relay tier runs
+    /// on Unix hosts, so no seed is written, linked or given a name there, and no later start can
+    /// meet a file a scanner holds.
+    #[cfg(windows)]
+    #[test]
+    fn on_windows_a_relay_key_is_refused_before_anything_is_written() {
+        let parent = tempfile::tempdir().expect("a temporary directory");
+        let directory = parent.path().join("kr-relay");
+        let refusals = [
+            RelayInstanceKeyPair::open(&directory).map(drop),
+            ServiceAdmissionKeyPair::open(&directory).map(drop),
+        ];
+        for refused in refusals {
+            match refused {
+                Err(CryptoError::SecretStore { message }) => assert!(
+                    message.contains("the relay runs on Unix hosts"),
+                    "{message}"
+                ),
+                other => {
+                    panic!("refused as a secret store this platform cannot protect: {other:?}")
+                }
+            }
+        }
+        assert!(!directory.exists(), "no directory was made");
+        assert_eq!(
+            std::fs::read_dir(parent.path())
+                .expect("reads the parent")
+                .count(),
+            0,
+            "and nothing was written beside it"
+        );
+    }
+
     /// The directory a relay's unit names, which `open` creates owner-only on the first start.
     ///
     /// A temporary directory is not it: the system one is world-traversable, and `open` refuses a

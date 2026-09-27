@@ -2453,6 +2453,12 @@ pub fn create_new_owner_only_file(path: &Path, contents: &[u8]) -> Result<()> {
         let _ = std::fs::remove_file(&temporary);
         return Err(error);
     }
+    #[cfg(test)]
+    tests::BEFORE_PUBLISHING.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook(&temporary);
+        }
+    });
     let linked =
         std::fs::hard_link(&temporary, path).map_err(|error| IpcError::io("publish", path, error));
     let _ = std::fs::remove_file(&temporary);
@@ -2678,6 +2684,89 @@ fn home_directory() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What a test does with a new file's temporary name before the file is published.
+    type PublicationHook = Box<dyn FnMut(&Path)>;
+
+    std::thread_local! {
+        /// Called with a new file's temporary name once it is written, before it is given the
+        /// name it is published under, on the thread of the test that set it.
+        pub(super) static BEFORE_PUBLISHING: std::cell::RefCell<Option<PublicationHook>> =
+            std::cell::RefCell::new(None);
+    }
+
+    /// Holds `file` open with a handle that shares reading and writing but not its deletion, as a
+    /// program that reads each file as it is written does for a moment, and lets go after
+    /// `moment` on a thread of its own.
+    #[cfg(windows)]
+    fn held_for_a_moment(file: &Path, moment: std::time::Duration) -> std::thread::JoinHandle<()> {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+        let holding = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(file)
+            .expect("the file is held");
+        std::thread::spawn(move || {
+            std::thread::sleep(moment);
+            drop(holding);
+        })
+    }
+
+    /// The names a directory holds, sorted.
+    #[cfg(windows)]
+    fn names_in(directory: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(directory)
+            .expect("the directory is read")
+            .map(|entry| {
+                entry
+                    .expect("an entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// On Windows a new file that another program holds without sharing its deletion as it is
+    /// published, as a scanner holds a file it has just seen written, is given its name once that
+    /// program lets go, and ends with that one name. No second name is left that would keep the
+    /// file, and meet the same hold, after its own name is replaced or removed.
+    #[cfg(windows)]
+    #[test]
+    fn a_new_file_held_as_it_is_published_ends_with_its_one_name() {
+        let root = temporary_root("held-publication");
+        let target = root.join("identity");
+        let (sender, receiver) = std::sync::mpsc::channel();
+        BEFORE_PUBLISHING.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |temporary: &Path| {
+                let _ = sender.send(held_for_a_moment(
+                    temporary,
+                    std::time::Duration::from_millis(300),
+                ));
+            }));
+        });
+        let published = create_new_owner_only_file(&target, b"published");
+        BEFORE_PUBLISHING.with(|hook| *hook.borrow_mut() = None);
+        receiver
+            .try_recv()
+            .expect("the new file was held as it was published")
+            .join()
+            .expect("and let go");
+        published.expect("the file is published once it is let go");
+        assert_eq!(std::fs::read(&target).expect("reads"), b"published");
+        assert_eq!(names_in(&root), vec!["identity".to_owned()], "one name");
+        std::fs::remove_file(&target).expect("the published name is removed");
+        assert_eq!(
+            names_in(&root),
+            Vec::<String>::new(),
+            "and no other name keeps the file"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
 
     fn temporary_root(name: &str) -> PathBuf {
         let suffix = crate::new_uuid().to_string();
