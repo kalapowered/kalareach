@@ -303,7 +303,7 @@ fn run(profile: &ModelProfile, cache: &Path) -> Result<(), String> {
     let cold = Instant::now();
     let budgets = Budgets::DEFAULTS;
     let initial_cancellation = Cancellation::new();
-    let load_outcome = kr_describe::llama::LlamaRuntime::load(
+    let load_outcome = kr_describe_model::llama::LlamaRuntime::load(
         profile,
         &weights,
         &initial_cancellation,
@@ -720,7 +720,7 @@ fn run(profile: &ModelProfile, cache: &Path) -> Result<(), String> {
 }
 
 fn verify(asset: &Asset, path: &Path) -> Result<(), String> {
-    asset.verify_file(path).map_err(|error| {
+    kr_describe_model::assets::verify_file(asset, path).map_err(|error| {
         format!(
             "{}: {error}\nthe benchmark refuses to run against weights this profile does not name",
             path.display()

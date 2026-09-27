@@ -47,11 +47,13 @@ use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{AddBos, LlamaModel};
 use llama_cpp_2::sampling::LlamaSampler;
 
-use crate::budget::ResidentCost;
-use crate::error::{DescribeError, Result};
-use crate::priority::{Applied, Cancellation, background_current_thread};
-use crate::profile::ModelProfile;
-use crate::runtime::{GenerationRequest, InferenceRuntime, LoadOutcome, Produced, RuntimeHandle};
+use kr_describe::budget::ResidentCost;
+use kr_describe::error::{DescribeError, Result};
+use kr_describe::priority::{Applied, Cancellation, background_current_thread};
+use kr_describe::profile::ModelProfile;
+use kr_describe::runtime::{
+    GenerationRequest, InferenceRuntime, LoadOutcome, Produced, RuntimeHandle,
+};
 
 /// How many tokens one decode batch carries.
 const BATCH_TOKENS: usize = 512;

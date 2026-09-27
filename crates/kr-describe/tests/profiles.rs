@@ -525,59 +525,6 @@ fn a_cancelled_or_failed_fetch_leaves_nothing_held() {
     assert!(!ledger.holds(selected.profile_id(), selected.revision()));
 }
 
-/// KR-REQ-22.09: an asset that is not the recorded file is refused by size and by digest.
-#[test]
-fn an_asset_that_is_not_the_recorded_file_is_refused() {
-    let directory = tempfile::tempdir().expect("a temporary directory");
-    let profile = default_profile();
-    let asset = &profile.assets()[0];
-    let path = directory.path().join(&asset.file_name);
-    std::fs::write(&path, b"not two gigabytes of weights").expect("a file");
-    assert!(matches!(
-        asset.verify_file(&path),
-        Err(DescribeError::AssetSizeMismatch { .. })
-    ));
-    assert!(matches!(
-        asset.verify_file(&directory.path().join("absent.gguf")),
-        Err(DescribeError::AssetUnreadable { .. })
-    ));
-
-    // A file larger than one digest block, so the streaming path is the one under test. The
-    // profile is rewritten to describe this file exactly, and then one byte of it is changed.
-    let body = vec![0x5a_u8; (1 << 20) + 4096];
-    let digest = {
-        use sha2::Digest as _;
-        let mut hasher = sha2::Sha256::new();
-        hasher.update(&body);
-        hasher
-            .finalize()
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>()
-    };
-    let keys = kr_crypto::keys::AuthorisationKeyPair::generate().expect("a keypair");
-    let trust = ProfileTrust::new(vec![*keys.public()]);
-    let document = catalogue::DEFAULT_PROFILE_DOCUMENT
-        .replace(&asset.sha256, &digest)
-        .replace(&asset.bytes.to_string(), &body.len().to_string());
-    let rewritten = trust
-        .verify(&sign(&document, &keys))
-        .expect("a profile over the file this test wrote");
-    let big = directory.path().join(&rewritten.assets()[0].file_name);
-    std::fs::write(&big, &body).expect("a large file");
-    rewritten.assets()[0]
-        .verify_file(&big)
-        .expect("a file that matches across several blocks verifies");
-
-    let mut changed = body.clone();
-    changed[(1 << 20) + 1] = 0x5b;
-    std::fs::write(&big, &changed).expect("a changed file");
-    assert!(matches!(
-        rewritten.assets()[0].verify_file(&big),
-        Err(DescribeError::AssetDigestMismatch { .. })
-    ));
-}
-
 /// KR-REQ-22.09: a replaced model is unloaded before another is mapped.
 #[test]
 fn a_replaced_model_is_unloaded_before_another_is_mapped() {

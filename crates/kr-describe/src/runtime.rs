@@ -1,10 +1,8 @@
 //! The inference seam, and the deterministic runtime the tests drive.
 //!
 //! Everything above this module works in terms of [`InferenceRuntime`], which is a prompt, a
-//! grammar, a bound and a cancellation token. Two things implement it: [`llama::LlamaRuntime`] in a
-//! build with the runtime feature, and [`StubRuntime`] here.
-//!
-//! [`llama::LlamaRuntime`]: crate::llama::LlamaRuntime
+//! grammar, a bound and a cancellation token. Two things implement it: `LlamaRuntime` in
+//! `kr-describe-model`, the crate that holds the model, and [`StubRuntime`] here.
 //!
 //! # Why the tests never download weights
 //!

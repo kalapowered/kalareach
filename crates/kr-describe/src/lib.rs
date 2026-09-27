@@ -3,7 +3,10 @@
 //! Section 22 asks for a small feature with a large number of ways to get it wrong: a shared
 //! CPU-only model that names sessions usefully, on an 8 GiB laptop, without touching the shell's
 //! input path, without claiming anything it cannot verify, and without becoming the reason a
-//! terminal feels slow. This crate is that feature.
+//! terminal feels slow. This crate is that feature, less the model: the llama.cpp runtime, the
+//! check that a downloaded model file is the recorded one and the benchmark live in
+//! `kr-describe-model`, which builds on this crate. A process that links this crate alone links no
+//! inference library, and still names every session.
 //!
 //! | Module | What it owns |
 //! | --- | --- |
@@ -77,8 +80,6 @@ pub mod budget;
 pub mod context;
 pub mod environment;
 pub mod error;
-#[cfg(feature = "llama")]
-pub mod llama;
 pub mod metadata;
 pub mod metrics;
 pub mod output;

@@ -36,32 +36,21 @@
 //!
 //! # What actually protects the weights
 //!
-//! The asset digests. The profile names the size and the SHA-256 of every file,
-//! [`Asset::verify_file`] reads both from one open handle and refuses on either, and a download
-//! that does not match is not used. That is the check that stands between this product and a
-//! substituted model, and it is the same check whatever the profile came from.
-
-use std::fs::File;
-use std::io::Read;
-use std::path::Path;
+//! The asset digests. The profile names the size and the SHA-256 of every file, and the crate that
+//! loads the weights, `kr-describe-model`, reads both from one open handle and refuses on either,
+//! so a download that does not match is not used. That is the check that stands between this
+//! product and a substituted model, and it is the same check whatever the profile came from.
 
 use kr_cbor::CanonicalValue;
 use kr_crypto::sign::SigningTranscript;
 use kr_protocol::scalars::{AuthorisationKey, Signature64};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use crate::budget::ResidentCost;
 use crate::error::{DescribeError, Result};
 
 /// The domain every profile signature is separated by.
 pub const PROFILE_SIGNING_DOMAIN: &str = "kr-describe/profile/1";
-
-/// How many bytes an asset digest reads at a time.
-///
-/// A model file is gigabytes. It is hashed in fixed blocks so verifying one costs a buffer rather
-/// than the file, on the 8 GiB host section 22 keeps supporting.
-const DIGEST_BLOCK_BYTES: usize = 1 << 20;
 
 /// The longest identity string a profile may carry.
 ///
@@ -200,58 +189,6 @@ pub struct Asset {
     pub bytes: u64,
     /// Its SHA-256, lowercase hexadecimal.
     pub sha256: String,
-}
-
-impl Asset {
-    /// Verifies a downloaded file against this asset's recorded size and digest.
-    ///
-    /// The file is opened once and both the size and the digest come from that one handle, so
-    /// there is no window in which the name could be made to reach a different file between the
-    /// two questions. Neither answer is a warning: a file that fails either is not the file this
-    /// profile was qualified against, and nothing loads it.
-    ///
-    /// What this cannot do is hand the caller the handle it verified, so a loader that opens the
-    /// path again is trusting that nothing replaced the file in between. Where the cache is the
-    /// owner's own directory that is the trust the cache already needs.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`DescribeError::AssetSizeMismatch`] or [`DescribeError::AssetDigestMismatch`] when
-    /// the file is not the recorded one, and [`DescribeError::AssetUnreadable`] when it cannot be
-    /// read at all.
-    pub fn verify_file(&self, path: &Path) -> Result<()> {
-        let unreadable = |error: std::io::Error| DescribeError::AssetUnreadable {
-            file: self.file_name.clone(),
-            detail: error.to_string(),
-        };
-        let mut file = File::open(path).map_err(unreadable)?;
-        let found_bytes = file.metadata().map_err(unreadable)?.len();
-        if found_bytes != self.bytes {
-            return Err(DescribeError::AssetSizeMismatch {
-                file: self.file_name.clone(),
-                expected: self.bytes,
-                found: found_bytes,
-            });
-        }
-        let mut hasher = Sha256::new();
-        let mut block = vec![0_u8; DIGEST_BLOCK_BYTES];
-        loop {
-            let read = file.read(&mut block).map_err(unreadable)?;
-            if read == 0 {
-                break;
-            }
-            hasher.update(&block[..read]);
-        }
-        let found = hex_of(&hasher.finalize());
-        if found != self.sha256 {
-            return Err(DescribeError::AssetDigestMismatch {
-                file: self.file_name.clone(),
-                expected: self.sha256.clone(),
-                found,
-            });
-        }
-        Ok(())
-    }
 }
 
 /// The tokenizer and chat template this profile was qualified with.

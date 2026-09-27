@@ -30,7 +30,7 @@ const MODEL_RUNTIMES: &[&str] = &[
 
 /// This workspace's crates that host plugins or run inference.
 const PLUGIN_AND_INFERENCE_CRATES: &[&str] =
-    &["kr-plugin-runtime", "kr-plugin-host", "kr-describe"];
+    &["kr-plugin-runtime", "kr-plugin-host", "kr-describe-model"];
 
 /// Whether `name` is `family` or one of its parts, such as `wasmtime-environ` or `llama-cpp-2`.
 fn of_family(name: &str, family: &str) -> bool {
@@ -242,10 +242,10 @@ fn the_worker_links_no_plugin_runtime_wasm_engine_or_model() {
         "the plugin runtime links its Wasm engine"
     );
     assert!(
-        linked(&packages, "kr-describe")
+        linked(&packages, "kr-describe-model")
             .iter()
             .any(|name| of_family(name, "llama-cpp")),
-        "the description service links its model runtime"
+        "the description model links its runtime"
     );
 }
 

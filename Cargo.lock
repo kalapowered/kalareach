@@ -4523,16 +4523,27 @@ dependencies = [
  "kr-crypto",
  "kr-protocol",
  "kr-worker",
- "llama-cpp-2",
- "llama-cpp-sys-2",
  "rusqlite",
  "serde",
  "serde_json",
- "sha2 0.11.0",
  "sysinfo",
  "tempfile",
  "thiserror 2.0.20",
  "thread-priority",
+]
+
+[[package]]
+name = "kr-describe-model"
+version = "0.1.0"
+dependencies = [
+ "kr-crypto",
+ "kr-describe",
+ "kr-protocol",
+ "llama-cpp-2",
+ "llama-cpp-sys-2",
+ "sha2 0.11.0",
+ "sysinfo",
+ "tempfile",
  "vtparse",
 ]
 

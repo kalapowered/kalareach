@@ -67,7 +67,7 @@ echo "threads pinned to: $threads"
 
 echo "=== build ==="
 profile_args=(--profile "$profile")
-CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}" cargo build --release -p kr-describe --bin kr-describe-bench
+CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}" cargo build --release -p kr-describe-model --bin kr-describe-bench
 
 # The built binary is copied to local storage and run from there, with its working directory there
 # too. A process started from a removable volume is a separate privacy identity on macOS, and the

@@ -232,8 +232,10 @@ a cancellation and a passed deadline simply publish nothing. The store, the pins
 and every deterministic title survive untouched, and the next tick maps the model again. The job
 that was running is not retried; the session's next meaningful change queues another.
 
-The runtime runs inside the host process in this build, so what is restarted is the model rather
-than a process. A failure the library cannot report as an error is a failure of the process it is
+The runtime is a crate of its own, `kr-describe-model`, built on the description service in
+`kr-describe`, which holds no model: a process that links the service alone, as the control daemon
+does, has no inference library anywhere in its dependency graph. The runtime runs inside the process
+that links it, so what is restarted is the model rather than a process. A failure the library cannot report as an error is a failure of the process it is
 in, and the separate inference process that would contain one is named in the qualification matrix
 as work that has not been done.
 

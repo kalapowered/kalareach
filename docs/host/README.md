@@ -1301,23 +1301,18 @@ the `windows` job red on a line no host but Windows could see. The check that wo
 both runs anywhere, needs no linker and no Windows machine:
 
 ```
-cargo clippy --workspace --exclude kr-describe --all-targets \
+cargo clippy --workspace --exclude kr-describe-model --all-targets \
   --target x86_64-pc-windows-gnu -- -D warnings
 ```
 
 It is a strict superset of compiling the four platform crates' libraries for that target: every
-crate, every test target, and `-D warnings`, which is where dead code is reported. `kr-describe` is
-left out because its inference runtime vendors C and C++ sources, and building those for Windows
-needs a Windows C toolchain that a macOS or Linux host has no reason to carry; that crate's Windows
-build is what the `windows` job above compiles natively. `.cargo/config.toml` sets link flags for
-the two MSVC targets alone, so the GNU target takes nothing from them.
-
-The crate that is left out keeps the part of it that does not need those tools:
-
-```
-cargo clippy -p kr-describe --no-default-features --all-targets \
-  --target x86_64-pc-windows-gnu -- -D warnings
-```
+other crate, every test target, and `-D warnings`, which is where dead code is reported.
+`kr-describe-model` is left out because its inference runtime vendors C and C++ sources, and
+building those for Windows needs a Windows C toolchain that a macOS or Linux host has no reason to
+carry; that crate's Windows build is what the `windows` job above compiles natively. The
+description service it builds on, `kr-describe`, holds no model and is checked with the rest.
+`.cargo/config.toml` sets link flags for the two MSVC targets alone, so the GNU target takes nothing
+from them.
 
 What no automated suite here establishes, and a person at this machine has to: a vendor sandbox
 that creates a job of its own running inside the session's job; a child that asks to break away

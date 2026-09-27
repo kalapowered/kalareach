@@ -40,7 +40,8 @@ A Cargo workspace and a pnpm workspace share one tree.
 | `crates/kr-attention` | The attention engine: the rule set, quiet hours and escalation, review and visit acknowledgements, and the feature store they are rebuilt from |
 | `crates/kr-automation` | The automation engine: workflow definitions, runs, causal budgets and admission |
 | `crates/kr-delivery` | The delivery producer: the delivery journal, notification previews, the push outbox and external notification destinations |
-| `crates/kr-describe` | The description service: deterministic session titles, one shared CPU-only inference process per environment, its signed model profiles, the scheduler and resource policy, and the names, pins and provenance store |
+| `crates/kr-describe` | The description service: deterministic session titles, the scheduler and resource policy for one shared CPU-only inference process per environment, its signed model profiles and inference seam, and the names, pins and provenance store, with no model runtime |
+| `crates/kr-describe-model` | The description model: the CPU-only llama.cpp runtime behind that seam, the check that a downloaded model file is the one its profile records, and the `kr-describe-bench` benchmark |
 | `crates/kr-voice` | The voice coordinator: context selection, delegation, the voice grant and the unlocked-screen confirmation |
 | `skills/kalareach-contact` | The installable contact skill: what an agent reads, its tool reference and its installation manifest |
 | `apps/companion` | The Tauri companion application for desktops and phones: the React interface, its native backend in `src-tauri`, the native platform services in `native/platform`, and the iOS and Android sources beside them |
