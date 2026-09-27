@@ -1539,12 +1539,19 @@ valid together. A refusal names the limit it violated and changes nothing about 
 is running at, its epoch included. A session created without a terminal starts at 120x40. A history
 page carries at most 1,000 rows and 1 MiB.
 
-Semantic snapshots have their bounds and nothing yet to spend them: `kr_protocol::semantic` holds
-section 8's three limits (16 MiB across the parts, sixteen levels of depth, twenty thousand nodes),
-the budget a producer spends as it walks a tree, and the continuation a refused node produces, so a
-part that stops short says which limit stopped it and where a reader asks for the rest. The producer
-that walks the tree is the semantic-snapshot task's, and until it exists these bounds are what that
-task has to spend rather than a bound anything is under.
+Semantic snapshots are held to section 8's three limits, which `kr_protocol::semantic` states: 16
+MiB across the parts, sixteen levels of depth and twenty thousand nodes. `agent.snapshot` reads an
+agent's retained history, a flat list of at most 4,096 entries, so its depth is one. A part travels
+in one control frame, so it is cut to what the reader's connection said it receives once the rest
+of the answer is in it, and an entry larger than that on its own is carried with its text cut,
+saying how many bytes it left out. The 16 MiB and the node count are spent by one snapshot's parts
+together: for each reader and instance a connection reads, the worker keeps what the parts of that
+snapshot have carried, and a request from where that reader's last part ended is paid for out of
+what is left, while any other request begins a snapshot. The part that would pass the total ends
+the snapshot with a continuation that names the total, 16 MiB, and the entry it stopped at; asked
+from there, the rest is a snapshot of its own, so a reader that follows every continuation still
+reads the whole history once, in order. An entry's number is never given twice: a history that has
+given its last number refuses the next entry with `RESOURCE_UNAVAILABLE` and records nothing.
 
 ## Action windows and the dispatch lease
 
