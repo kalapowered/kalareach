@@ -353,3 +353,73 @@ async fn an_exact_retry_of_a_refused_declaration_is_given_the_same_refusal_after
         .expect("a completion result");
     assert_eq!(completed.keys, device.keys().public_keys());
 }
+
+/// KR-REQ-24.01: the registry keeps each paired device's public keys and its grant, and the
+/// authority revision a revocation advanced to, durably. A daemon that starts again on the same
+/// environment reads back a kept device's record as its pairing wrote it, keys, key revision and
+/// grant alike, and a revoked device's record with its revocation, at the revision the revocation
+/// moved to; the kept device is admitted on that record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restarted_host_reads_back_every_paired_key_grant_and_revision() {
+    use kr_protocol::sharing::{DeviceRevokeParams, RevocationResult};
+
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let kept = Device::create().await;
+    let kept_record =
+        net_support::pair_with(&host, &kept, &owner, net_support::proposal(VIEWER)).await;
+    assert_eq!(kept_record.public_keys(), Some(kept.keys().public_keys()));
+    let revoked = Device::create().await;
+    let revoked_record =
+        net_support::pair_with(&host, &revoked, &owner, net_support::proposal(OWNER)).await;
+
+    let mut client = host.client().await;
+    let revocation: RevocationResult = net_support::pairing::mutate(
+        host.environment_id,
+        &mut client,
+        Method::DeviceRevoke,
+        &DeviceRevokeParams {
+            device_id: revoked_record.device_id,
+        },
+    )
+    .await
+    .expect("the owner revokes the second device");
+    let record = |host: &Host, device_id| {
+        host.network()
+            .devices()
+            .record_for_device(device_id)
+            .expect("the registry reads")
+            .expect("the device's record")
+    };
+    let revoked_now = record(&host, revoked_record.device_id);
+    assert!(!revoked_now.is_paired());
+    assert_eq!(revoked_now.grant, revoked_record.grant);
+    let revision = host.controller().policy().authority_revision();
+    assert_eq!(revision, revocation.authority_revision);
+    assert!(revision > revoked_record.grant.authority_revision);
+    drop(client);
+
+    let host = host.restart().await;
+    assert_eq!(
+        record(&host, kept_record.device_id),
+        kept_record,
+        "the kept device's keys, key revision and grant come back as the pairing wrote them"
+    );
+    assert_eq!(
+        record(&host, revoked_record.device_id),
+        revoked_now,
+        "and the revoked device's record with its revocation"
+    );
+    assert_eq!(
+        host.controller().policy().authority_revision(),
+        revision,
+        "the revision the revocation advanced to is where the restarted host stands"
+    );
+    let session = net_support::connect(&host, &kept, &kept_record).await;
+    let _: HostInfoResult = session
+        .read(Method::HostInfo, &())
+        .await
+        .expect("the kept device is admitted on the record the registry read back");
+    session.close();
+    host.stop().await;
+}

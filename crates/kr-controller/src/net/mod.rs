@@ -3485,4 +3485,107 @@ pub(crate) mod tests {
         );
         assert_eq!(host.floor.get(), synchronised + 6_000);
     }
+
+    /// KR-REQ-23.18: the host's half of a lost control stream. The transport reports the loss
+    /// through the handler's `control_stream_lost`, and this host withdraws that connection's
+    /// registration: a mutation admitted on it is no longer forwarded to a worker under a dispatch
+    /// lease, while one admitted on a connection whose control stream stands still is, under the
+    /// same worker's lease. The control: before the loss, both are forwarded.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn losing_a_control_stream_stops_the_leases_its_mutations_are_forwarded_under() {
+        use kr_protocol::actor::ActorEnvelope;
+        use kr_protocol::ids::{ActorId, ConnectionId, SessionId};
+        use kr_transport::listener::HostHandler as _;
+        use kr_transport::window::{AcceptedDeadline, DeadlineBound};
+
+        let temp = kr_ipc::testing::TempHost::create();
+        let controller = daemon(&temp).await;
+        let network = super::register(
+            &controller,
+            super::NetworkSetup {
+                settings: super::config::NetworkSettings {
+                    endpoint: kr_transport::config::EndpointConfig {
+                        bind_addr: Some("127.0.0.1:0".parse().expect("a loopback address")),
+                        ..kr_transport::config::EndpointConfig::default()
+                    },
+                    ..super::config::NetworkSettings::default()
+                },
+                secrets: Arc::new(kr_crypto::store::MemoryStore::new()),
+                rendezvous: None,
+            },
+        )
+        .await
+        .expect("the daemon joins the network");
+
+        // Two connections admitted as the listener admits them, at this environment's revision.
+        let revision = controller.leases.authority_revision();
+        let lost = ConnectionId::new(kr_ipc::new_uuid());
+        let kept = ConnectionId::new(kr_ipc::new_uuid());
+        let principal = || ActorId::new("device:test").expect("a principal");
+        for connection_id in [lost, kept] {
+            controller.admitted_table().insert(
+                connection_id,
+                crate::service::AdmittedConnection {
+                    actor_id: principal(),
+                    admitted_revision: revision,
+                },
+            );
+        }
+        // A worker whose control path acknowledged that revision, so a lease to it renews.
+        let session_id = SessionId::new(kr_ipc::new_uuid());
+        let binding = controller.leases.bind(session_id);
+        controller
+            .leases
+            .acknowledge(session_id, binding, revision, None);
+        let actor = |connection_id| ActorEnvelope {
+            actor_id: principal(),
+            ingress: ActorIngress::PairedDevice,
+            device_id: Nullable::null(),
+            grant_id: Nullable::null(),
+            grant_revision: Nullable::some(revision),
+            controller_generation: controller.generation,
+            connection_id,
+        };
+        let accepted = AcceptedDeadline {
+            deadline: controller
+                .clock
+                .now()
+                .checked_add(std::time::Duration::from_secs(60))
+                .expect("a deadline"),
+            bound: DeadlineBound::RequestedTtl,
+        };
+        for connection_id in [lost, kept] {
+            controller
+                .forwarded_deadline(session_id, &actor(connection_id), accepted)
+                .await
+                .expect("forwarded while its control stream stands");
+        }
+
+        network.guard.host.control_stream_lost(lost);
+        // The withdrawal runs on a task of its own.
+        let waited = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while controller.admitted_table().contains_key(&lost) {
+            assert!(
+                std::time::Instant::now() < waited,
+                "the lost connection's registration is withdrawn"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let refused = controller
+            .forwarded_deadline(session_id, &actor(lost), accepted)
+            .await
+            .expect_err("nothing admitted on a lost control stream is forwarded");
+        assert!(
+            matches!(
+                refused,
+                crate::error::ControllerError::PermissionDenied { .. }
+            ),
+            "{refused}"
+        );
+        controller
+            .forwarded_deadline(session_id, &actor(kept), accepted)
+            .await
+            .expect("a connection whose control stream stands is still forwarded");
+        network.shutdown().await;
+    }
 }

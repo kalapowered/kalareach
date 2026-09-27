@@ -1482,3 +1482,136 @@ async fn a_pairing_proposal_naming_a_current_approval_or_question_is_given_no_ch
     }
     host.stop().await;
 }
+
+/// A new candidate's first redemption step for `invitation_id`, dialled at this host as it runs
+/// now, and the host's refusal of it.
+async fn refused_challenge(
+    host: &Host,
+    candidate: &Device,
+    invitation_id: kr_protocol::ids::InvitationId,
+) -> ProtocolError {
+    use kr_protocol::preauth::{PairRedeemParams, PairRedeemResult};
+
+    let candidate = candidate.candidate();
+    let mut addr = iroh::EndpointAddr::new(
+        iroh::PublicKey::from_bytes(host.network().endpoint_id().as_bytes())
+            .expect("a usable endpoint identity"),
+    );
+    for socket in host.network().bound_sockets() {
+        addr = addr.with_ip_addr(socket);
+    }
+    let connection = candidate
+        .endpoint
+        .connect(addr, kr_protocol::hello::ALPN)
+        .await
+        .expect("the candidate reaches the host");
+    let mut unpaired = kr_transport::handshake::connect_unpaired(&connection, candidate.identity)
+        .await
+        .expect("an unpaired connection");
+    let answer = unpaired
+        .call::<_, PairRedeemResult>(
+            Method::PairRedeem,
+            &PairRedeemParams::Challenge { invitation_id },
+        )
+        .await;
+    connection.close(0u32.into(), b"refused");
+    match answer {
+        Err(kr_transport::error::TransportError::Refused(error)) => error,
+        other => panic!("the host refuses the invitation, not {other:?}"),
+    }
+}
+
+/// KR-ACC-015: a consumed invitation stays consumed across a host restart. A direct invitation
+/// redeemed and committed before the restart is still committed after it, and the device it
+/// paired is still paired; one left open is consumed by the restart itself. A candidate that
+/// presents either to the restarted host is refused and pairs nothing, and the restarted host
+/// issues a new invitation as before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_consumed_invitation_stays_consumed_across_a_host_restart() {
+    let owner_keys = keys();
+    let host = Host::start(&owner_keys).await;
+    let environment = host.environment_id;
+    let owner = Signer::OwnerDevice(&owner_keys);
+    let mut client = host.client().await;
+    let committed = calls::invite_direct(
+        environment,
+        &mut client,
+        InviteGrantKind::SessionInvitation,
+        &viewer(),
+        &owner,
+    )
+    .await
+    .expect("an invitation");
+    let device = Device::create().await;
+    let (connection, _candidate, _value) = calls::redeem(&device.candidate(), &committed).await;
+    let confirmed =
+        calls::confirm_candidate(environment, &mut client, committed.invitation_id, &owner)
+            .await
+            .expect("committed");
+    connection.close(0u32.into(), b"paired");
+    let open = calls::invite_direct(
+        environment,
+        &mut client,
+        InviteGrantKind::SessionInvitation,
+        &viewer(),
+        &owner,
+    )
+    .await
+    .expect("an invitation left open");
+    drop(client);
+
+    let host = host.restart().await;
+    let mut client = host.client().await;
+    let status = calls::owner_status(&mut client, committed.invitation_id)
+        .await
+        .expect("the owner's view after the restart");
+    assert!(
+        matches!(
+            status.status,
+            PairStatus::Committed { device_id, .. } if device_id == confirmed.device_id
+        ),
+        "{:?}",
+        status.status
+    );
+    assert!(
+        host.network()
+            .devices()
+            .record_for_device(confirmed.device_id)
+            .expect("the registry reads")
+            .expect("the device's record")
+            .is_paired()
+    );
+    let status = calls::owner_status(&mut client, open.invitation_id)
+        .await
+        .expect("the owner's view after the restart");
+    assert_eq!(
+        status.status,
+        PairStatus::Consumed {
+            reason: PairingConsumedReason::HostRestarted
+        }
+    );
+
+    for invitation_id in [committed.invitation_id, open.invitation_id] {
+        let stranger = Device::create().await;
+        let refused = refused_challenge(&host, &stranger, invitation_id).await;
+        assert_ne!(refused.code, ErrorCode::OutcomeUnknown, "{refused:?}");
+        assert!(
+            host.network()
+                .devices()
+                .record_for_endpoint(stranger.keys().transport.public())
+                .expect("the registry reads")
+                .is_none(),
+            "a candidate presenting a consumed invitation pairs nothing"
+        );
+    }
+    calls::invite_direct(
+        environment,
+        &mut client,
+        InviteGrantKind::SessionInvitation,
+        &viewer(),
+        &owner,
+    )
+    .await
+    .expect("the restarted host issues a new invitation");
+    host.stop().await;
+}

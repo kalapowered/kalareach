@@ -3954,3 +3954,359 @@ async fn a_device_reads_the_questions_and_agent_state_of_a_session_its_grant_rea
     close_session(&mut local, &host, session_id).await;
     daemon.stop().await;
 }
+
+/// Pairs a device whose grant holds `right` alone, over every session, and connects it.
+async fn device_holding(
+    daemon: &RunningDaemon,
+    owner: &DeviceKeys,
+    right: ActionRight,
+) -> (Device, Session) {
+    let device = Device::create(&loopback()).await;
+    let record = pair_with(
+        daemon,
+        &device,
+        owner,
+        proposing(&[right], SessionSelector::Any),
+    )
+    .await;
+    let session = connect(daemon, &device, &record).await;
+    (device, session)
+}
+
+/// The target of a mutation on one session.
+fn on_session(environment_id: EnvironmentId, session_id: SessionId) -> ActionTarget {
+    ActionTarget {
+        environment_id,
+        session_id: Nullable::some(session_id),
+        session_epoch: Nullable::some(kr_protocol::ids::SessionEpoch::V1),
+        application_instance_id: Nullable::null(),
+        agent_binding_revision: Nullable::null(),
+    }
+}
+
+// Ignored by default: this suite starts real processes, and the binary it launches is built by
+// `scripts/end-to-end.sh`, which runs it with `--include-ignored`. A suite that skipped itself
+// silently when that binary was absent would report a pass for something it never ran.
+/// KR-REQ-23.34: each session method needs its own right, at both doors. The owner at the local
+/// socket is served `session.create`, `session.read`, `session.list` and `session.close`. A paired
+/// device is served each of them only under that method's own right: viewing for the read and the
+/// listing, creating for the create and closing for the close. A device holding one of these
+/// rights is refused every method whose right it lacks.
+#[ignore = "launches a worker process; run through scripts/end-to-end.sh"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn each_session_method_needs_its_own_right_at_both_doors() {
+    let host = Host::create();
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let daemon = host.start(loopback(), &owner).await;
+    let environment_id = host.environment_id;
+    let mut local = host.client().await;
+    let listing = kr_protocol::session::SessionListParams {
+        environment_id: Nullable::null(),
+        include_closed: false,
+    };
+
+    // The owner's own door.
+    let created = create(&mut local, &host).await;
+    let session_id = created.session.session_id;
+    let read: SessionReadResult = local
+        .request(Method::SessionRead, &SessionReadParams { session_id })
+        .await
+        .expect("the call reaches the daemon")
+        .expect("the owner reads the session")
+        .to_typed()
+        .expect("decodes");
+    assert_eq!(read.session.session_id, session_id);
+    let listed: kr_protocol::session::SessionListResult = local
+        .request(Method::SessionList, &listing)
+        .await
+        .expect("the call reaches the daemon")
+        .expect("the owner lists the sessions")
+        .to_typed()
+        .expect("decodes");
+    assert!(
+        listed
+            .sessions
+            .iter()
+            .any(|summary| summary.session_id == session_id)
+    );
+
+    // A device for each right, holding that right alone.
+    let (_viewing, viewer) = device_holding(&daemon, &owner, ActionRight::SessionView).await;
+    let (_creating, creator) = device_holding(&daemon, &owner, ActionRight::SessionCreate).await;
+    let (_closing, closer) = device_holding(&daemon, &owner, ActionRight::SessionClose).await;
+
+    // Viewing is the read's and the listing's right.
+    let seen: SessionReadResult = viewer
+        .read(Method::SessionRead, &SessionReadParams { session_id })
+        .await
+        .expect("the viewer reads the session");
+    assert_eq!(seen.session.session_id, session_id);
+    let listed: kr_protocol::session::SessionListResult = viewer
+        .read(Method::SessionList, &listing)
+        .await
+        .expect("the viewer lists the sessions");
+    assert!(
+        listed
+            .sessions
+            .iter()
+            .any(|summary| summary.session_id == session_id)
+    );
+    for other in [&creator, &closer] {
+        let refused = other
+            .read::<_, SessionReadResult>(Method::SessionRead, &SessionReadParams { session_id })
+            .await
+            .expect_err("a device without viewing does not read the session");
+        assert_eq!(refused.code(), ErrorCode::PermissionDenied, "{refused}");
+        let refused = other
+            .read::<_, kr_protocol::session::SessionListResult>(Method::SessionList, &listing)
+            .await
+            .expect_err("a device without viewing does not list the sessions");
+        assert_eq!(refused.code(), ErrorCode::PermissionDenied, "{refused}");
+    }
+
+    // Creating is the create's right.
+    let parameters = create_params(environment_id, host.tree().root());
+    for other in [&viewer, &closer] {
+        let refused = other
+            .mutate(
+                Method::SessionCreate,
+                ActionTarget::environment(environment_id),
+                None,
+                &ParamsValue::empty(),
+                &parameters,
+                DurationMs::new(120_000),
+            )
+            .await
+            .expect_err("a device without creating creates nothing");
+        assert_eq!(refused.code(), ErrorCode::PermissionDenied, "{refused}");
+    }
+    let made: SessionCreateResult = creator
+        .mutate(
+            Method::SessionCreate,
+            ActionTarget::environment(environment_id),
+            None,
+            &ParamsValue::empty(),
+            &parameters,
+            DurationMs::new(120_000),
+        )
+        .await
+        .expect("the creator creates a session")
+        .to_typed()
+        .expect("decodes");
+    let made_id = made.session.session_id;
+    assert_ne!(made_id, session_id);
+
+    // Closing is the close's right.
+    for other in [&viewer, &creator] {
+        assert_eq!(
+            refused_close(other, on_session(environment_id, made_id), made_id).await,
+            ErrorCode::PermissionDenied
+        );
+    }
+    closer
+        .mutate(
+            Method::SessionClose,
+            on_session(environment_id, made_id),
+            None,
+            &ParamsValue::empty(),
+            &SessionCloseParams {
+                session_id: made_id,
+            },
+            DurationMs::new(120_000),
+        )
+        .await
+        .expect("the closer closes the session");
+    close_session(&mut local, &host, made_id).await;
+
+    for session in [viewer, creator, closer] {
+        session.close();
+    }
+    close_session(&mut local, &host, session_id).await;
+    daemon.stop().await;
+}
+
+/// Reads a session's retained history on its worker's own endpoint, from the start.
+async fn retained_history(created: &SessionCreateResult) -> String {
+    let mut on_worker = LocalClient::connect(
+        &kr_ipc::paths::Endpoint::from_path(
+            created
+                .endpoint
+                .as_ref()
+                .cloned()
+                .expect("a live session names its worker"),
+        )
+        .expect("a worker endpoint"),
+        LocalClientKind::Cli,
+        build(),
+    )
+    .await
+    .expect("the local client reaches the worker");
+    let mut from_cursor = U64::ZERO;
+    let mut retained = String::new();
+    loop {
+        let page: kr_protocol::recovery::HistoryPageResult = on_worker
+            .request(
+                Method::HistoryPage,
+                &kr_protocol::recovery::HistoryPageParams {
+                    session_id: created.session.session_id,
+                    from_cursor,
+                    max_bytes: U64::new(256 * 1024),
+                },
+            )
+            .await
+            .expect("the call reaches the worker")
+            .expect("the page is served")
+            .to_typed()
+            .expect("decodes");
+        if page.bytes.as_slice().is_empty() {
+            return retained;
+        }
+        retained.push_str(&String::from_utf8_lossy(page.bytes.as_slice()));
+        from_cursor = page.next_cursor;
+    }
+}
+
+/// Takes the input lease on `attachment_id`.
+async fn acquire(
+    session: &Session,
+    environment_id: EnvironmentId,
+    session_id: SessionId,
+    attachment_id: AttachmentId,
+) -> InputAcquireResult {
+    session
+        .mutate(
+            Method::InputAcquire,
+            on_session(environment_id, session_id),
+            None,
+            &ParamsValue::empty(),
+            &InputAcquireParams {
+                session_id,
+                attachment_id,
+                expected_epoch: Nullable::null(),
+            },
+            DurationMs::new(120_000),
+        )
+        .await
+        .expect("the lease is settled")
+        .to_typed()
+        .expect("a lease")
+}
+
+// Ignored by default: this suite starts real processes, and the binary it launches is built by
+// `scripts/end-to-end.sh`, which runs it with `--include-ignored`. A suite that skipped itself
+// silently when that binary was absent would report a pass for something it never ran.
+/// KR-REQ-23.22: a live reconnect is a new connection identity with a new input stream, and old
+/// raw input is never replayed. The device types on one connection and loses it. The next
+/// connection has an identity of its own; input under the old connection's attachment and lease is
+/// refused there and never reaches the shell, and a new attachment's lease starts an input stream
+/// of its own at sequence zero, which the shell runs.
+#[ignore = "launches a worker process; run through scripts/end-to-end.sh"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reconnect_opens_a_new_input_stream_and_replays_no_input() {
+    use kr_client::transport::ControlTransport as _;
+
+    let host = Host::create();
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let daemon = host.start(loopback(), &owner).await;
+    let environment_id = host.environment_id;
+    let mut local = host.client().await;
+    let created = create(&mut local, &host).await;
+    let session_id = created.session.session_id;
+    let device = Device::create(&loopback()).await;
+    let record = pair(&daemon, &device, &owner).await;
+
+    // The first connection attaches, takes the input lease and types on it.
+    let first = NetworkTransport::connect(
+        &device.endpoint,
+        host_addr_of(&daemon),
+        &device.paired_identity(record.device_id),
+        &host_paired_record(&daemon),
+        SendLimits::default(),
+    )
+    .await
+    .expect("the device connects");
+    let first_connection = first.connection_id();
+    let session = Session::start(Arc::new(first)).expect("a session");
+    let attached = attach(&session, environment_id, session_id).await;
+    let old = acquire(&session, environment_id, session_id, attached.typing).await;
+    let mut events = session.events();
+    session
+        .write_input(&InputWriteParams {
+            session_id,
+            attachment_id: attached.typing,
+            epoch: old.lease.epoch,
+            sequence: kr_protocol::ids::InputSequence::new(0),
+            bytes: kr_protocol::scalars::Bytes::new(MARKER_COMMAND.as_bytes().to_vec()),
+        })
+        .await
+        .expect("the first command is accepted");
+    observe(&session, &mut events, MARKER).await;
+
+    // The connection is lost, and the client carries only its cursors across.
+    let carried = kr_client::reconnect::ClientState::from_session(&session, None).await;
+    session.close();
+    drop(session);
+
+    let second = NetworkTransport::connect(
+        &device.endpoint,
+        host_addr_of(&daemon),
+        &device.paired_identity(record.device_id),
+        &host_paired_record(&daemon),
+        SendLimits::default(),
+    )
+    .await
+    .expect("the device reconnects");
+    assert_ne!(
+        second.connection_id(),
+        first_connection,
+        "a reconnect is a connection identity of its own"
+    );
+    let session = Session::resume(Arc::new(second), carried.cursors).expect("a resumed session");
+
+    // Input under the old connection's attachment and lease carries nothing on this one.
+    let replayed = "printf 'kala%s-replayed\n' reach\n";
+    let refused = session
+        .write_input(&InputWriteParams {
+            session_id,
+            attachment_id: attached.typing,
+            epoch: old.lease.epoch,
+            sequence: kr_protocol::ids::InputSequence::new(1),
+            bytes: kr_protocol::scalars::Bytes::new(replayed.as_bytes().to_vec()),
+        })
+        .await
+        .expect_err("the old connection's input stream is not carried across a reconnect");
+    assert_ne!(refused.code(), ErrorCode::OutcomeUnknown, "{refused}");
+
+    // A new attachment's lease is a new input stream, and it starts at sequence zero.
+    let attached = attach(&session, environment_id, session_id).await;
+    let new = acquire(&session, environment_id, session_id, attached.typing).await;
+    assert!(
+        new.lease.epoch > old.lease.epoch,
+        "the new stream is under a lease of its own"
+    );
+    let mut events = session.events();
+    let written = session
+        .write_input(&InputWriteParams {
+            session_id,
+            attachment_id: attached.typing,
+            epoch: new.lease.epoch,
+            sequence: kr_protocol::ids::InputSequence::new(0),
+            bytes: kr_protocol::scalars::Bytes::new(SECOND_MARKER_COMMAND.as_bytes().to_vec()),
+        })
+        .await
+        .expect("the new stream's first batch is accepted");
+    assert!(written.forwarded_bytes.get() > 0);
+    observe(&session, &mut events, SECOND_MARKER).await;
+
+    // What was refused never reached the shell.
+    let history = retained_history(&created).await;
+    assert!(history.contains(SECOND_MARKER), "{history:?}");
+    assert!(
+        !history.contains("kalareach-replayed"),
+        "input under the old connection's lease ran: {history:?}"
+    );
+
+    session.close();
+    close_session(&mut local, &host, session_id).await;
+    daemon.stop().await;
+}

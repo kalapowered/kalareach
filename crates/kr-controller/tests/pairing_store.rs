@@ -643,6 +643,8 @@ fn concurrent_candidates_never_spend_more_than_the_allowance() {
 /// spent survives it. An open invitation with two spent guesses comes back consumed by the restart
 /// with its two guesses still spent; a cancelled one stays cancelled; a committed one keeps its
 /// commitment and its device.
+///
+/// KR-ACC-015: consumed invitations persist in the registry database across a restart.
 #[test]
 fn a_restart_cancels_unfinished_invitations_and_keeps_what_they_spent() {
     let temp = tempfile::TempDir::new().expect("a directory on the internal disk");
