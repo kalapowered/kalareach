@@ -215,6 +215,62 @@ fn choosing_the_standalone_start_registers_the_task_where_the_user_is_signed_in(
     assert_eq!(chosen_again["task_change"]["change"], "unchanged");
 }
 
+/// A test whose task cannot be removed when it ends fails, rather than passing while it leaves a
+/// task the Task Scheduler could run for the next test on this machine. The removal is refused here
+/// because another holder keeps the lock every change to the task's name takes past its bound.
+#[test]
+fn a_cleanup_that_cannot_remove_its_task_fails_the_test_that_left_it() {
+    let host = Host::create();
+    let definition = host.definition();
+    scheduled::register(&definition).expect("the environment's task is registered");
+    // The lock the Task Scheduler's registration of this name takes, held by another thread.
+    let lock = format!("Global\\{}-registration", definition.name);
+    let (held, holding) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let holder = std::thread::spawn(move || {
+        let _lock = kr_ipc::starter::NamedLock::acquire(&lock, Duration::from_secs(10))
+            .expect("the registration lock is taken");
+        held.send(()).expect("says it holds the lock");
+        let _ = released.recv();
+    });
+    holding.recv().expect("the lock is held");
+    let ended = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        drop(host.removes_its_task());
+    }));
+    release.send(()).expect("lets the lock go");
+    holder.join().expect("the holder ends");
+    scheduled::remove(&definition).expect("the task is removed once the lock is free");
+    assert!(
+        ended.is_err(),
+        "the cleanup that could not remove the task failed the test"
+    );
+}
+
+/// A test whose request for a start cannot be withdrawn when it ends fails, rather than passing
+/// while a starter the Task Scheduler runs later could still take the request. The withdrawal is
+/// refused here because something that is not a withdrawal stands where its marker goes.
+#[test]
+#[ignore = "the cleanup removes this environment's keys from this account's credential store; run \
+            with --ignored where KR_TEST_PLATFORM_SECRET_STORE=1"]
+fn a_cleanup_that_cannot_withdraw_a_request_fails_the_test_that_left_it() {
+    platform_store_allowed();
+    let host = Host::create();
+    let claims = host.environment().start_claims_dir();
+    std::fs::create_dir_all(&claims).expect("the claims directory");
+    let request = kr_ipc::new_uuid();
+    std::fs::write(claims.join(format!("{request}.claim")), b"a request")
+        .expect("a request left for a starter");
+    std::fs::create_dir(claims.join(format!("{request}.taken")))
+        .expect("something stands where the withdrawal's marker goes");
+    let ended = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        drop(host.ends_what_it_started());
+    }));
+    assert!(
+        ended.is_err(),
+        "the cleanup that could not withdraw the request failed the test"
+    );
+}
+
 /// KR-REQ-07.12: a task under the environment's name that is not its own, here another
 /// environment's whose identity shares the prefix, is refused with nothing changed: the task is
 /// exactly as it was, and no choice is written.
