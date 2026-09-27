@@ -14,6 +14,10 @@
 //! `kickstart -p` and not `-k`: the second would restart a job that is already running, which for
 //! a session worker would mean killing a live shell to start another one.
 //!
+//! What a process says on its standard error is kept on every Unix path: a launchd job and a
+//! detached process write it to the job's diagnostics file in the owner-only jobs directory, and a
+//! transient unit's goes to the user's journal.
+//!
 //! launchd keeps a job loaded after its process has exited, until something removes it. So a
 //! worker's job is removed once the worker has ended, by [`retire_worker_job`]: when a closure is
 //! recorded and the kernel then says the worker's process has gone, and, for every job this
@@ -184,6 +188,16 @@ pub fn worker_label(reservation_id: ReservationId) -> String {
 /// Where the definition of the job labelled `label` is written.
 fn job_definition(jobs_directory: &Path, label: &str) -> PathBuf {
     jobs_directory.join(format!("{label}.plist"))
+}
+
+/// Where the process of the job labelled `label` writes its standard error.
+///
+/// A process that fails before it has a connection, or refuses something it can say nowhere else,
+/// has no other place to say why: it has no terminal, and no journal yet. This file is that place,
+/// in the owner-only jobs directory, and it stays after the job has gone so a person can read it.
+#[cfg(unix)]
+fn job_diagnostics(jobs_directory: &Path, label: &str) -> PathBuf {
+    jobs_directory.join(format!("{label}.diagnostics"))
 }
 
 /// What removing an ended worker's job found.
@@ -463,13 +477,8 @@ impl LaunchdSupervisor {
                 "<key>LimitLoadToSessionType</key>{}",
                 plist_string(session_type)
             )),
-            // A worker that fails before it reaches the rendezvous has nowhere else to say why:
-            // it has no terminal, no connection and no journal yet. This file is the one place
-            // that diagnosis can go, and it lives in the owner-only state directory.
             diagnostics = plist_string(
-                &launch
-                    .jobs_directory
-                    .join(format!("{label}.diagnostics"))
+                &job_diagnostics(&launch.jobs_directory, &label)
                     .display()
                     .to_string()
             ),
@@ -1025,6 +1034,10 @@ impl SystemdSupervisor {
 /// falls back to. The child has its own process group and no inherited terminal, so nothing aimed
 /// at this daemon reaches it, and it is reparented to init when this daemon exits. It has no
 /// parent-death signal, and the daemon reconnects to its endpoint rather than to a pipe.
+///
+/// On Unix its standard error goes where a launchd job's does, the job's diagnostics file in the
+/// owner-only jobs directory, so what a process says there on its way out is kept whichever
+/// supervisor started it.
 #[derive(Debug, Default)]
 pub struct DetachedSupervisor;
 
@@ -1055,12 +1068,25 @@ impl WorkerSupervisor for DetachedSupervisor {
 impl DetachedSupervisor {
     /// Starts one process, with whatever login-session environment its launch carries.
     fn spawn(&self, launch: &ServiceLaunch, desktop: &[(String, String)]) -> LaunchOutcome {
-        match detached_command(
+        #[cfg(unix)]
+        let started =
+            open_diagnostics(&launch.jobs_directory, &launch.label).and_then(|diagnostics| {
+                detached_command(
+                    &launch.program,
+                    &launch.arguments,
+                    &launch.working_directory,
+                    desktop,
+                    diagnostics,
+                )
+            });
+        #[cfg(not(unix))]
+        let started = detached_command(
             &launch.program,
             &launch.arguments,
             &launch.working_directory,
             desktop,
-        ) {
+        );
+        match started {
             Ok(child) => settle(child),
             // The spawn itself failed, so no process exists.
             Err(error) => LaunchOutcome::NotStarted {
@@ -1070,12 +1096,58 @@ impl DetachedSupervisor {
     }
 }
 
+/// Opens the diagnostics file of the job labelled `label` for a detached process to write its
+/// standard error to, creating it owner-only where it is absent.
+///
+/// Every write lands at its end, as a launchd job's writes to the same file do. It is opened
+/// without following a link and without waiting on it, and taken only when what was opened is a
+/// regular file of this user's that nobody else can read or write: the mode a file is created with
+/// says nothing about one that was already there.
+#[cfg(unix)]
+fn open_diagnostics(jobs_directory: &Path, label: &str) -> Result<std::fs::File> {
+    use rustix::fs::{Mode, OFlags};
+    use std::os::unix::fs::MetadataExt as _;
+
+    let path = job_diagnostics(jobs_directory, label);
+    let refused = |detail: String| {
+        ControllerError::supervision(format!(
+            "the diagnostics file {} for {label} cannot be written: {detail}",
+            path.display()
+        ))
+    };
+    let opened = rustix::fs::open(
+        &path,
+        OFlags::WRONLY
+            | OFlags::APPEND
+            | OFlags::CREATE
+            | OFlags::NOFOLLOW
+            | OFlags::NONBLOCK
+            | OFlags::CLOEXEC,
+        Mode::RUSR | Mode::WUSR,
+    )
+    .map_err(|error| refused(error.to_string()))?;
+    let file = std::fs::File::from(opened);
+    let about = file
+        .metadata()
+        .map_err(|error| refused(error.to_string()))?;
+    if !about.file_type().is_file()
+        || about.uid() != kr_ipc::paths::current_uid()
+        || about.mode() & 0o077 != 0
+    {
+        return Err(refused(
+            "it is not a file of this user's that only this user can read and write".to_owned(),
+        ));
+    }
+    Ok(file)
+}
+
 #[cfg(unix)]
 fn detached_command(
     program: &Path,
     arguments: &[String],
     working_directory: &Path,
     desktop: &[(String, String)],
+    diagnostics: std::fs::File,
 ) -> Result<u32> {
     use std::os::unix::process::CommandExt as _;
 
@@ -1095,10 +1167,13 @@ fn detached_command(
     // given the selected login session's handles explicitly rather than inheriting whatever the
     // daemon was started with.
     command.envs(desktop.iter().map(|(name, value)| (name, value)));
+    // Its standard error goes to the job's diagnostics file, as a launchd job's does, and not to
+    // the daemon's: a worker outlives the daemon, and what it says on its way out, such as why it
+    // refused to set something up, is read from that file.
     command
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .stderr(diagnostics);
     let child = command.spawn().map_err(|error| {
         ControllerError::supervision(format!("start {}: {error}", program.display()))
     })?;
@@ -2090,5 +2165,133 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
+    }
+
+    /// A process launched as `label` in `host`'s environment through the detached supervisor,
+    /// running `script` in the system's shell.
+    #[cfg(unix)]
+    fn detached_shell(
+        host: &kr_ipc::testing::TempHost,
+        label: &str,
+        script: &str,
+    ) -> LaunchOutcome {
+        DetachedSupervisor::new().start_service(&ServiceLaunch {
+            label: label.to_owned(),
+            program: PathBuf::from("/bin/sh"),
+            arguments: vec!["-c".to_owned(), script.to_owned()],
+            jobs_directory: host.environment().jobs_dir(),
+            working_directory: host.environment().state_dir().to_path_buf(),
+        })
+    }
+
+    /// A worker the detached supervisor starts keeps what it says on its standard error: why it
+    /// refused something reaches the job's diagnostics file, where a launchd job's goes, and is
+    /// there once the worker has ended. Its standard output is not written there.
+    #[cfg(unix)]
+    #[test]
+    fn a_detached_worker_keeps_what_it_says_on_its_standard_error() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let host = kr_ipc::testing::TempHost::create();
+        let label = worker_label(ReservationId::new(kr_ipc::new_uuid()));
+        let reason = "kr-worker: claude runs as typed, with no backend: this host refused it";
+        let outcome = detached_shell(
+            &host,
+            &label,
+            &format!("echo '{reason}' >&2; echo 'said on its standard output'; exit 3"),
+        );
+        assert!(
+            !matches!(outcome, LaunchOutcome::NotStarted { .. }),
+            "the worker was started: {outcome:?}"
+        );
+
+        let diagnostics = job_diagnostics(&host.environment().jobs_dir(), &label);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let said = loop {
+            let said = std::fs::read_to_string(&diagnostics).unwrap_or_default();
+            if said.contains(reason) {
+                break said;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "what the worker said on its standard error was lost: {} holds {said:?}",
+                diagnostics.display()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        assert_eq!(
+            said.trim(),
+            reason,
+            "only what it said on its standard error"
+        );
+        let mode = std::fs::metadata(&diagnostics)
+            .expect("the diagnostics file")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "the diagnostics file is owner-only");
+    }
+
+    /// A diagnostics file that is a link, or that another account could read, is not written
+    /// through, and nothing is started: a process whose standard error went somewhere else would
+    /// say why it failed to whoever put the link there.
+    #[cfg(unix)]
+    #[test]
+    fn a_diagnostics_file_that_is_a_link_or_open_to_others_starts_nothing() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let host = kr_ipc::testing::TempHost::create();
+        let jobs = host.environment().jobs_dir();
+        let elsewhere = host.root().join("elsewhere");
+        std::fs::write(&elsewhere, b"").expect("a file the link names");
+
+        let linked = worker_label(ReservationId::new(kr_ipc::new_uuid()));
+        std::os::unix::fs::symlink(&elsewhere, job_diagnostics(&jobs, &linked)).expect("a link");
+        let open = worker_label(ReservationId::new(kr_ipc::new_uuid()));
+        let widened = job_diagnostics(&jobs, &open);
+        std::fs::write(&widened, b"").expect("a diagnostics file");
+        std::fs::set_permissions(&widened, std::fs::Permissions::from_mode(0o644))
+            .expect("readable by others");
+
+        let marker = host.root().join("started");
+        for label in [&linked, &open] {
+            match detached_shell(&host, label, &format!("touch '{}'", marker.display())) {
+                LaunchOutcome::NotStarted { detail } => {
+                    assert!(detail.contains("diagnostics"), "{detail}");
+                }
+                other => {
+                    panic!("a start whose diagnostics file is {label}'s was not refused: {other:?}")
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(!marker.exists(), "nothing was started");
+        assert_eq!(
+            std::fs::read(&elsewhere).expect("the file the link names"),
+            b"",
+            "nothing was written through the link"
+        );
+    }
+
+    /// A launchd job's definition names the same diagnostics file the detached supervisor writes,
+    /// so the two keep a process's standard error in one place.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_launchd_job_writes_its_standard_error_where_a_detached_process_does() {
+        let host = kr_ipc::testing::TempHost::create();
+        let mut launch = launch();
+        launch.jobs_directory = host.environment().jobs_dir();
+        let service = launch.service();
+        let definition = LaunchdSupervisor::write_job(&service, Some("Background"))
+            .expect("the definition is written");
+        let written = std::fs::read_to_string(&definition).expect("the definition");
+        let diagnostics = job_diagnostics(&service.jobs_directory, &service.label);
+        assert!(
+            written.contains(&format!(
+                "<key>StandardErrorPath</key>{}",
+                plist_string(&diagnostics.display().to_string())
+            )),
+            "the definition names {}: {written}",
+            diagnostics.display()
+        );
     }
 }
