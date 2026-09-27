@@ -24,8 +24,9 @@
 //! does, so a timer is tested by the reading a test passes rather than by waiting for it.
 //!
 //! The process is started with no environment but what the launch names, in the working directory
-//! the launch names, and it is the daemon's own child: nothing in it outlives the daemon, because
-//! its input ends when the daemon does.
+//! the launch names, and it is the daemon's own child. Nothing in it outlives the daemon: its input
+//! ends when the daemon does, and its watchdog looks for the daemon by the start identity it is
+//! given, which covers a control thread that never sees that end.
 
 use std::collections::VecDeque;
 use std::ffi::OsString;
