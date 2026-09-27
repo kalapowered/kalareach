@@ -2359,20 +2359,25 @@ pub mod configuration {
     // Validation and edits
     // ---------------------------------------------------------------------------------------
 
-    /// Returns whether `text` has the shape of a package's identifier: its publisher and its name,
-    /// each lower-case letters, digits, `-` and `.`, joined by one `/`.
+    /// Returns whether `text` has the shape of a package's identifier: its publisher and its name
+    /// joined by one `/`, each a slug as the package contract states it, at most 64 bytes of
+    /// lower-case letters and digits with single `-` or `.` separators between them.
     fn is_package_identifier(text: &str) -> bool {
-        let part = |part: &str| {
-            !part.is_empty()
-                && part.len() <= 64
-                && part.bytes().all(|byte| {
-                    byte.is_ascii_lowercase()
-                        || byte.is_ascii_digit()
-                        || matches!(byte, b'-' | b'.')
+        let slug = |part: &str| {
+            let separator = |byte: &u8| matches!(byte, b'-' | b'.');
+            let bytes = part.as_bytes();
+            bytes.len() <= 64
+                && bytes.first().is_some_and(|byte| !separator(byte))
+                && bytes.last().is_some_and(|byte| !separator(byte))
+                && bytes.iter().all(|byte| {
+                    byte.is_ascii_lowercase() || byte.is_ascii_digit() || separator(byte)
                 })
+                && !bytes
+                    .windows(2)
+                    .any(|pair| separator(&pair[0]) && separator(&pair[1]))
         };
         text.split_once('/')
-            .is_some_and(|(publisher, plugin)| part(publisher) && part(plugin))
+            .is_some_and(|(publisher, plugin)| slug(publisher) && slug(plugin))
     }
 
     /// Checks a document against every rule this schema states.
