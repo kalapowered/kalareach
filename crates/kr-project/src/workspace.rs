@@ -19,8 +19,10 @@
 //!   under the same account, and the preview says so among its limitations rather than leaving the
 //!   user to find out.
 
+use std::convert::Infallible;
 use std::ffi::OsStr;
 use std::io::{Read as _, Write as _};
+use std::ops::ControlFlow;
 
 use kr_protocol::ids::{ChangeSetId, ProjectRepositoryId};
 use kr_protocol::project::{
@@ -1030,7 +1032,14 @@ fn copy_one(
         }
         return Ok(false);
     }
-    if target.rename_into(&temporary, target, &leaf).is_err() {
+    // Nothing about the destination is checked before the rename: the copy replaces whatever the
+    // checkout put there, so there is nothing to check again while the rename waits on Windows.
+    if target
+        .rename_into(&temporary, target, &leaf, || {
+            ControlFlow::<Infallible>::Continue(())
+        })
+        .is_err()
+    {
         // Something this host could not replace is at the name: a directory where the source has a
         // file. The destination keeps whatever it had and the path is named rather than written
         // over.

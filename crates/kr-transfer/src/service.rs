@@ -15,6 +15,7 @@
 //!   Acceptance by the agent is [`TransferService::record_insertion_outcome`] with upstream
 //!   evidence, and nothing else sets it.
 
+use std::ops::ControlFlow;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -1253,11 +1254,29 @@ impl TransferService {
             if let PayloadIntegrity::Altered(detail) = integrity {
                 return self.abandon_publication(row, &detail, now);
             }
-            self.staging.incomplete().rename_into(
+            // The move checks again before every attempt that the incomplete name still holds the
+            // verified object, since on Windows it waits while another program holds the file:
+            // a name something else took meanwhile is not moved, and the publication is abandoned.
+            match self.staging.incomplete().rename_into(
                 &incomplete,
                 self.staging.complete(),
                 &published,
-            )?;
+                || match self.holds(self.staging.incomplete(), &incomplete, identity) {
+                    Ok(Some(_)) => ControlFlow::Continue(()),
+                    Ok(None) => ControlFlow::Break(None),
+                    Err(error) => ControlFlow::Break(Some(error)),
+                },
+            )? {
+                ControlFlow::Continue(()) => {}
+                ControlFlow::Break(Some(error)) => return Err(error),
+                ControlFlow::Break(None) => {
+                    return self.abandon_publication(
+                        row,
+                        "the incomplete name no longer holds the object that was verified",
+                        now,
+                    );
+                }
+            }
             // The name is durable before the record that depends on it. Without this the journal
             // could say `published` while the rename was still only in the page cache.
             self.staging.complete().sync(NameKind::File)?;

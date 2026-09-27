@@ -317,6 +317,29 @@ impl std::fmt::Display for RelativeName {
     }
 }
 
+/// Makes `attempt`, and on Windows makes it again while another program holds what it needs, as
+/// [`kr_flush::retry_while_held`] says, with the caller's `unchanged` run before every attempt.
+///
+/// One that breaks ends the attempts with nothing done, and what it broke with is the answer. The
+/// check and the attempts share the retry's bound.
+fn attempted_while_unchanged<R>(
+    mut unchanged: impl FnMut() -> ControlFlow<R>,
+    mut attempt: impl FnMut() -> std::io::Result<()>,
+) -> std::io::Result<ControlFlow<R>> {
+    let mut refused = None;
+    let made = kr_flush::retry_while_held(|| {
+        if let ControlFlow::Break(refusal) = unchanged() {
+            refused = Some(refusal);
+            return Ok(());
+        }
+        attempt()
+    });
+    match refused {
+        Some(refusal) => Ok(ControlFlow::Break(refusal)),
+        None => made.map(|()| ControlFlow::Continue(())),
+    }
+}
+
 /// Refuses a name with anything to resolve above it.
 fn single_component(name: &RelativeName) -> Result<(), Escape> {
     if name.is_single_component() {
@@ -1106,22 +1129,30 @@ impl AuthorisedDirectory {
         }
     }
 
-    /// Renames a descendant of this directory into a descendant of `destination`.
+    /// Renames a descendant of this directory into a descendant of `destination`, replacing what
+    /// is there.
     ///
     /// Both names have every prefix resolved against their own authorised directory first, so
     /// neither side can be redirected by a link, and the rename itself is one operation relative
     /// to the two authorised handles.
     ///
+    /// On Windows the rename is tried again while another program holds the file it renames or
+    /// the one it replaces, as [`kr_flush::retry_while_held`] says; elsewhere it is made once.
+    /// `unchanged` is the caller's own check of what the rename stands on, run before every
+    /// attempt, since what it looked at can change while the rename waits. One that breaks ends the
+    /// rename with nothing renamed, and what it broke with is the answer.
+    ///
     /// # Errors
     ///
     /// Returns [`Escape::WrongEnvironment`] when the two handles belong to different environments,
     /// the first rule either name breaks, or the rename failure.
-    pub fn rename_into(
+    pub fn rename_into<R>(
         &self,
         name: &RelativeName,
         destination: &Self,
         destination_name: &RelativeName,
-    ) -> Result<(), Escape> {
+        unchanged: impl FnMut() -> ControlFlow<R>,
+    ) -> Result<ControlFlow<R>, Escape> {
         // Two environments are never one filesystem authority, even when they share a disk.
         destination.check_environment(self.environment_id)?;
         // Both names are one component, so the rename is a single operation relative to the two
@@ -1132,16 +1163,17 @@ impl AuthorisedDirectory {
         single_component(destination_name)?;
         check_component(name.as_str())?;
         check_component(destination_name.as_str())?;
-        self.directory
-            .rename(
+        attempted_while_unchanged(unchanged, || {
+            self.directory.rename(
                 name.as_str(),
                 &destination.directory,
                 destination_name.as_str(),
             )
-            .map_err(|error| Escape::Unopenable {
-                component: destination_name.as_str().to_owned(),
-                detail: error.to_string(),
-            })
+        })
+        .map_err(|error| Escape::Unopenable {
+            component: destination_name.as_str().to_owned(),
+            detail: error.to_string(),
+        })
     }
 
     /// Gives a descendant of this directory a name in `destination` that must not exist: a first
@@ -1172,30 +1204,20 @@ impl AuthorisedDirectory {
         name: &RelativeName,
         destination: &Self,
         destination_name: &RelativeName,
-        mut unchanged: impl FnMut() -> ControlFlow<R>,
+        unchanged: impl FnMut() -> ControlFlow<R>,
     ) -> Result<ControlFlow<R>, Escape> {
         destination.check_environment(self.environment_id)?;
         single_component(name)?;
         single_component(destination_name)?;
         check_component(name.as_str())?;
         check_component(destination_name.as_str())?;
-        let mut refused = None;
-        let published = kr_flush::retry_while_held(|| {
-            if let ControlFlow::Break(refusal) = unchanged() {
-                refused = Some(refusal);
-                return Ok(());
-            }
+        attempted_while_unchanged(unchanged, || {
             self.name_without_replacing(name, destination, destination_name)
-        });
-        if let Some(refusal) = refused {
-            return Ok(ControlFlow::Break(refusal));
-        }
-        published
-            .map(|()| ControlFlow::Continue(()))
-            .map_err(|error| Escape::Unopenable {
-                component: destination_name.as_str().to_owned(),
-                detail: error.to_string(),
-            })
+        })
+        .map_err(|error| Escape::Unopenable {
+            component: destination_name.as_str().to_owned(),
+            detail: error.to_string(),
+        })
     }
 
     /// Gives `name`'s file the name `destination_name` in `destination` unless that is taken: a
@@ -3007,7 +3029,12 @@ mod tests {
             file.write_all(b"verified").expect("writes");
         }
         incomplete
-            .rename_into(&name("staged.part"), &complete, &name("published.bin"))
+            .rename_into(
+                &name("staged.part"),
+                &complete,
+                &name("published.bin"),
+                || ControlFlow::<std::convert::Infallible>::Continue(()),
+            )
             .expect("renames");
         assert!(
             !incomplete

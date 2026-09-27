@@ -42,6 +42,7 @@
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::io::Write as _;
+use std::ops::ControlFlow;
 
 use kr_project::{OpenedRepository, RestrictedProfile};
 use kr_protocol::changeset::{
@@ -1897,31 +1898,44 @@ fn install(
                 ));
             }
         };
-        // As late as this platform permits: the last thing before the rename, on the object the
-        // parent handle names rather than on a path resolved earlier.
-        if let Some(conflict) = recheck(profile, repository, &here, &leaf_name, expected, path)? {
-            return Ok(conflict);
-        }
+        // What the rename stands on, checked as late as this platform permits: the last thing
+        // before each attempt at the rename, on the object the parent handle names rather than on
+        // a path resolved earlier. On Windows the rename is tried again while another program
+        // holds either file, and the destination can be edited while it waits, so the check is
+        // made again before every attempt.
         #[cfg(feature = "fault-injection")]
-        if let Some(act) = before_rename
-            && !act(path)
-        {
-            return Ok(Installed::Abandoned);
-        }
-        // The content this host is about to publish has to still be the file it wrote. A name
-        // replaced between the creation and here is a file this host neither wrote nor checked,
-        // and publishing it would put content in the destination that this apply never validated.
-        match staged_directory.open_read(&content, ObjectPolicy::ReadableFile) {
-            Ok(found) if found.identity() == content_identity => {}
-            _ => {
-                return Ok(Installed::Unresolved(
+        let mut before_rename = before_rename;
+        let unchanged = || -> ControlFlow<Result<Installed>> {
+            match recheck(profile, repository, &here, &leaf_name, expected, path) {
+                Ok(None) => {}
+                Ok(Some(conflict)) => return ControlFlow::Break(Ok(conflict)),
+                Err(error) => return ControlFlow::Break(Err(error)),
+            }
+            // A test's fault acts once, before the first attempt.
+            #[cfg(feature = "fault-injection")]
+            if let Some(act) = before_rename.take()
+                && !act(path)
+            {
+                return ControlFlow::Break(Ok(Installed::Abandoned));
+            }
+            // The content this host is about to publish has to still be the file it wrote. A name
+            // replaced between the creation and here is a file this host neither wrote nor
+            // checked, and publishing it would put content in the destination that this apply
+            // never validated.
+            match staged_directory.open_read(&content, ObjectPolicy::ReadableFile) {
+                Ok(found) if found.identity() == content_identity => ControlFlow::Continue(()),
+                _ => ControlFlow::Break(Ok(Installed::Unresolved(
                     "the content this host staged is not the file it wrote any more, so it \
                      published nothing"
                         .to_owned(),
-                ));
+                ))),
             }
+        };
+        if let ControlFlow::Break(stopped) =
+            staged_directory.rename_into(&content, &here, &leaf_name, unchanged)?
+        {
+            return stopped;
         }
-        staged_directory.rename_into(&content, &here, &leaf_name)?;
         here.sync(kr_flush::NameKind::File)?;
         // The content is gone as a temporary: the rename is what published it. What is left is an
         // empty directory of this host's own, and the same cleanup that asks for it to be taken

@@ -1102,20 +1102,24 @@ impl<'destination> DownloadWriter<'destination> {
             Err(error) => ControlFlow::Break(TransferError::from(error)),
         };
         if self.placement.allow_overwrite {
-            if let ControlFlow::Break(refusal) = still_verified() {
-                return Err(refusal);
-            }
             // The user asked for this destination to be replaced. A rename replaces atomically, so
             // there is no moment when the name holds nothing. The handle is closed first, because
             // Windows refuses to replace a name a handle still holds open.
             //
-            // This is the one publish that cannot be undone: between the check above and the
-            // rename there is no read, but there is also nothing to restore if the name were
-            // swapped in that instant, because the file it replaced is the one the user asked to
-            // replace.
+            // This is the one publish that cannot be undone: between the check before an attempt
+            // and the attempt there is no read, but there is also nothing to restore if the name
+            // were swapped in that instant, because the file it replaced is the one the user asked
+            // to replace. The check is made again before every attempt, since on Windows the
+            // rename waits while another program holds either file.
             self.file = None;
-            self.destination
-                .rename_into(&temporary, self.destination, &self.final_name)?;
+            if let ControlFlow::Break(refusal) = self.destination.rename_into(
+                &temporary,
+                self.destination,
+                &self.final_name,
+                still_verified,
+            )? {
+                return Err(refusal);
+            }
         } else {
             // The one portable atomic no-replace publish: it fails when the name is taken, so a
             // file that appeared while the download ran is never overwritten, and the check that

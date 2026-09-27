@@ -149,18 +149,16 @@ impl ObjectStore {
         // that got there first keeps its blob and this one removes its own temporary. **Nothing is
         // removed to make room here**: a valid blob another writer published between the check
         // above and this publication is the content, and unlinking it would take an object a
-        // recorded version names. Nothing is checked again before an attempt either: the name is
-        // the content's digest, so whatever another writer publishes there meanwhile is these
-        // bytes.
+        // recorded version names. Nothing is checked again before an attempt either, a repair's
+        // included: the name is the content's digest, so whatever another writer publishes there
+        // meanwhile is these bytes.
+        let nothing_to_check = || ControlFlow::<Infallible>::Continue(());
         let published = if repair {
-            shelf.rename_into(&temporary, &shelf, &final_name)
+            shelf.rename_into(&temporary, &shelf, &final_name, nothing_to_check)
         } else {
-            shelf
-                .publish_into(&temporary, &shelf, &final_name, || {
-                    ControlFlow::<Infallible>::Continue(())
-                })
-                .map(|_| ())
-        };
+            shelf.publish_into(&temporary, &shelf, &final_name, nothing_to_check)
+        }
+        .map(|_| ());
         // On Windows a first publication took the temporary name already, and this finds nothing.
         let _ = shelf.remove(&temporary);
         match published {

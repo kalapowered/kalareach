@@ -719,9 +719,10 @@ pub fn publish(
 /// On Windows the guarantee is the platform's own rather than a flag's: `MoveFileEx` reports an
 /// error when either name is a directory and the destination exists, and
 /// `MOVEFILE_REPLACE_EXISTING` does not apply to a directory. So renaming a staged repository onto
-/// a name that is taken fails there too. The occupancy check below is the courtesy that gives a
-/// better diagnostic, and [`publish`]'s identity comparison afterwards is the second check rather
-/// than the guarantee. That path has not been executed on Windows in this build.
+/// a name that is taken fails there too. The occupancy check is the courtesy that gives a better
+/// diagnostic, made before every attempt, since the rename is tried again while another program
+/// holds a file inside the tree; [`publish`]'s identity comparison afterwards is the second check
+/// rather than the guarantee.
 #[cfg(unix)]
 fn rename_no_replace(
     from: &AuthorisedDirectory,
@@ -765,19 +766,26 @@ fn rename_no_replace(
     to: &AuthorisedDirectory,
     to_name: &RelativeName,
 ) -> Result<()> {
-    if to.occupied(to_name)? {
-        return Err(ProjectError::Destination {
-            detail: format!(
-                "{} is taken, so nothing was replaced",
-                crate::git::redact(to_name.as_str())
-            )
-            .into(),
-        });
+    let taken = || ProjectError::Destination {
+        detail: format!(
+            "{} is taken, so nothing was replaced",
+            crate::git::redact(to_name.as_str())
+        )
+        .into(),
+    };
+    let unchanged = || {
+        #[cfg(test)]
+        tests::before_attempt();
+        match to.occupied(to_name) {
+            Ok(false) => std::ops::ControlFlow::Continue(()),
+            Ok(true) => std::ops::ControlFlow::Break(taken()),
+            Err(error) => std::ops::ControlFlow::Break(ProjectError::from(error)),
+        }
+    };
+    match from.rename_into(from_name, to, to_name, unchanged)? {
+        std::ops::ControlFlow::Continue(()) => Ok(()),
+        std::ops::ControlFlow::Break(refused) => Err(refused),
     }
-    #[cfg(test)]
-    tests::before_attempt();
-    from.rename_into(from_name, to, to_name)?;
-    Ok(())
 }
 
 /// What an interrupted publication turned out to be.

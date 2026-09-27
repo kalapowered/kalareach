@@ -11,6 +11,8 @@
 
 mod support;
 
+use std::convert::Infallible;
+use std::ops::ControlFlow;
 use std::path::Path;
 
 use kr_protocol::ids::EnvironmentId;
@@ -92,6 +94,11 @@ fn refusal_of(outcome: &Result<(), Escape>) -> &'static str {
         Err(Escape::WrongEnvironment { .. }) => "wrong_environment",
         Err(_) => "unopenable",
     }
+}
+
+/// A caller's check before a rename's attempt that finds nothing it stands on changed.
+fn nothing_changed() -> ControlFlow<Infallible> {
+    ControlFlow::Continue(())
 }
 
 fn environment() -> EnvironmentId {
@@ -361,9 +368,7 @@ fn a_file_held_while_it_is_published_ends_with_its_one_name() {
     let published = RelativeName::parse("published.bin").expect("a valid relative name");
 
     let letting_go = support::held_for_a_moment(&root.path().join("staged.part"));
-    let publication = authority.publish_into(&staged, &authority, &published, || {
-        std::ops::ControlFlow::<std::convert::Infallible>::Continue(())
-    });
+    let publication = authority.publish_into(&staged, &authority, &published, nothing_changed);
     let removal = authority.remove(&staged);
     letting_go.join().expect("let go");
     publication.expect("published once it is let go");
@@ -377,7 +382,7 @@ fn a_file_held_while_it_is_published_ends_with_its_one_name() {
     std::fs::write(root.path().join("next.part"), b"next").expect("stages the next file");
     let next = RelativeName::parse("next.part").expect("a valid relative name");
     authority
-        .rename_into(&next, &authority, &published)
+        .rename_into(&next, &authority, &published, nothing_changed)
         .expect("a later publication replaces it");
     assert_eq!(read_through(&authority, &published), "next");
     let mut left: Vec<String> = std::fs::read_dir(root.path())
@@ -392,6 +397,74 @@ fn a_file_held_while_it_is_published_ends_with_its_one_name() {
         .collect();
     left.sort();
     assert_eq!(left, vec!["published.bin".to_owned()], "one name, one file");
+}
+
+/// KR-REQ-14.05 on Windows: the caller's check of what a rename stands on is made again before
+/// every attempt. While another program holds the destination without sharing its deletion, as a
+/// scanner holds a file it reads, the rename waits; a newer edit saved meanwhile is seen by the
+/// next check, the rename ends with the caller's own refusal, and the edit and the staged file are
+/// both kept. With nothing edited, the same rename replaces the destination once the program lets
+/// go.
+#[cfg(windows)]
+#[test]
+fn a_destination_edited_while_its_held_replacement_waits_is_not_replaced() {
+    let root = tempfile::tempdir().expect("a temporary directory");
+    let destination = root.path().join("notes.txt");
+    let staged = root.path().join("staged.part");
+    std::fs::write(&destination, b"what the check read").expect("the destination");
+    std::fs::write(&staged, b"the replacement").expect("stages the replacement");
+    let authority =
+        AuthorisedDirectory::open_root(environment(), root.path()).expect("opens the authority");
+    let staged_name = RelativeName::parse("staged.part").expect("a valid relative name");
+    let name = RelativeName::parse("notes.txt").expect("a valid relative name");
+    let still = |expected: &'static [u8]| {
+        let destination = destination.clone();
+        move || {
+            if std::fs::read(&destination).expect("reads the destination") == expected {
+                ControlFlow::Continue(())
+            } else {
+                ControlFlow::Break("the destination changed")
+            }
+        }
+    };
+
+    let letting_go = support::held_and_edited(&destination, b"the person's edit");
+    let replaced = authority.rename_into(
+        &staged_name,
+        &authority,
+        &name,
+        still(b"what the check read"),
+    );
+    letting_go.join().expect("let go");
+    assert_eq!(
+        replaced.expect("the rename was asked"),
+        ControlFlow::Break("the destination changed")
+    );
+    assert_eq!(
+        std::fs::read(&destination).expect("reads the destination"),
+        b"the person's edit",
+        "the edit is kept"
+    );
+    assert_eq!(
+        std::fs::read(&staged).expect("reads the staged file"),
+        b"the replacement",
+        "and nothing was renamed"
+    );
+
+    let letting_go = support::held_for_a_moment(&destination);
+    let replaced =
+        authority.rename_into(&staged_name, &authority, &name, still(b"the person's edit"));
+    letting_go.join().expect("let go");
+    assert_eq!(
+        replaced.expect("the rename was asked"),
+        ControlFlow::Continue(())
+    );
+    assert_eq!(
+        std::fs::read(&destination).expect("reads the destination"),
+        b"the replacement",
+        "with nothing changed it replaces the destination once it is let go"
+    );
+    assert!(!staged.exists());
 }
 
 /// Reads one file through an authority, which is the only way a test is allowed to reach it.
@@ -461,7 +534,7 @@ fn a_rename_refuses_two_environments() {
             .expect("opens the authority");
     let name = RelativeName::parse("payload.bin").expect("a valid relative name");
     let refusal = source
-        .rename_into(&name, &elsewhere, &name)
+        .rename_into(&name, &elsewhere, &name, nothing_changed)
         .expect_err("refuses two environments");
     assert!(
         matches!(refusal, Escape::WrongEnvironment { .. }),
@@ -473,7 +546,7 @@ fn a_rename_refuses_two_environments() {
     // The same two names inside one environment do move.
     let same = AuthorisedDirectory::open_root(environment(), &to).expect("opens the authority");
     source
-        .rename_into(&name, &same, &name)
+        .rename_into(&name, &same, &name, nothing_changed)
         .expect("one environment, one authority");
     assert!(to.join("payload.bin").exists());
 }
@@ -1601,7 +1674,7 @@ fn a_replacement_carries_a_windows_list_and_account_through_handles() {
     drop(staged);
 
     authority
-        .rename_into(&staged_name, &authority, &name)
+        .rename_into(&staged_name, &authority, &name, nothing_changed)
         .expect("the copy replaces the destination");
 
     let published = authority

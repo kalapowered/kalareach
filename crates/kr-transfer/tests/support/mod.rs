@@ -39,6 +39,28 @@ pub fn held_for_a_moment(file: &std::path::Path) -> std::thread::JoinHandle<()> 
     })
 }
 
+/// Holds a file as [`held_for_a_moment`] does, and 100 ms in writes `edit` over it in place, as a
+/// person saving the file meanwhile does, before letting go at 300 ms. The holder shares writing,
+/// so the edit is saved while the file is held.
+#[cfg(windows)]
+pub fn held_and_edited(file: &std::path::Path, edit: &'static [u8]) -> std::thread::JoinHandle<()> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+    let holding = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .open(file)
+        .expect("the file is held");
+    let path = file.to_path_buf();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        std::fs::write(&path, edit).expect("the edit is saved while the file is held");
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        drop(holding);
+    })
+}
+
 /// Where the clock starts, so an expiry window is easy to read in a test.
 pub const START_MS: u64 = 1_700_000_000_000;
 
