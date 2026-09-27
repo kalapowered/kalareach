@@ -40,7 +40,19 @@ use kr_worker::broker::connectors::{ConnectorSources, fixture};
 use kr_worker::persistence::JournalHealth;
 
 /// What the program writes the moment it starts, and whether it runs a hook.
+///
+/// Each file it waits for is one its test writes, and it waits for one for at least as long as the
+/// launcher waits at a test's barrier (6000 polls, each at least 20 ms): a test that stops before
+/// it writes the file would otherwise leave its program polling for as long as the machine runs.
 const SCRIPT: &str = r#"report="$REPORT"
+await_file() {
+  polls=0
+  while [ ! -f "$1" ]; do
+    polls=$((polls + 1))
+    [ "$polls" -le 6000 ] || exit 3
+    sleep 0.02
+  done
+}
 {
   echo "pid=$$"
   if [ -n "$KR_REGISTRATION" ] && [ -f "$KR_REGISTRATION" ]; then
@@ -54,16 +66,16 @@ const SCRIPT: &str = r#"report="$REPORT"
   echo "args=$0|$*"
 } > "$report.part" && mv "$report.part" "$report"
 if [ -n "$HOOK" ]; then
-  if [ -n "$WAIT_FOR" ]; then while [ ! -f "$WAIT_FOR" ]; do sleep 0.02; done; fi
+  if [ -n "$WAIT_FOR" ]; then await_file "$WAIT_FOR"; fi
   if [ -n "$NESTED" ]; then
     /bin/bash -c 'printf "%s" "$HOOK_EVENT" | "$HOOK" claude-code hook' > "$report.nested" 2>&1
     echo done > "$report.nested.hooked"
-    if [ -n "$THEN_OWN" ]; then while [ ! -f "$THEN_OWN" ]; do sleep 0.02; done; fi
+    if [ -n "$THEN_OWN" ]; then await_file "$THEN_OWN"; fi
   fi
   printf '%s' "$HOOK_EVENT" | "$HOOK" claude-code hook > "$report.hook" 2>&1
   echo done > "$report.hooked"
   if [ -n "$AGAIN_AFTER" ]; then
-    while [ ! -f "$AGAIN_AFTER" ]; do sleep 0.02; done
+    await_file "$AGAIN_AFTER"
     printf '%s' "$HOOK_EVENT_2" | "$HOOK" claude-code hook > "$report.hook2" 2>&1
     echo done > "$report.hooked2"
   fi
@@ -151,6 +163,32 @@ fn sh(script: &str) -> std::process::Command {
     command
 }
 
+/// When a process started, as `ps` reads it, or nothing when there is no such process.
+///
+/// A process identifier is reused once its process is gone, so a test that means to end a process
+/// it did not start itself ends it only while this still says what it said when the process was
+/// recorded.
+fn started_at(pid: i32) -> Option<String> {
+    let output = std::process::Command::new("ps")
+        .args(["-o", "lstart=", "-p", &pid.to_string()])
+        .output()
+        .expect("ps runs");
+    let started = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    (!started.is_empty()).then_some(started)
+}
+
+/// Whether a process is running, as `ps` reads it: one that has ended and waits to be collected
+/// is not.
+fn running(pid: i32) -> bool {
+    let output = std::process::Command::new("ps")
+        .args(["-o", "state=", "-p", &pid.to_string()])
+        .output()
+        .expect("ps runs");
+    let state = String::from_utf8_lossy(&output.stdout);
+    let state = state.trim();
+    !state.is_empty() && !state.starts_with('Z')
+}
+
 /// Waits until a process is stopped.
 fn wait_stopped(pid: u32) {
     eventually("the process stopped itself", || {
@@ -174,6 +212,8 @@ fn instance_of(report: &BTreeMap<String, String>) -> ApplicationInstanceId {
 
 /// This test process, the root shell of every launch it starts.
 struct Shell {
+    /// The process group every launch this shell starts runs in, ended with the shell.
+    group: LaunchGroup,
     placed: Placed,
     runtime: tokio::runtime::Runtime,
     broker: Arc<Broker>,
@@ -186,6 +226,58 @@ struct Shell {
     view: Option<View>,
     /// The admitted connector's package hash.
     package_digest: kr_protocol::scalars::Digest256,
+}
+
+/// The process group every program a [`Shell`] launches runs in, led by a process of the test's
+/// own that ends the whole group once the test's process has gone.
+///
+/// A launched program can wait for something only its test does, and a test that stops early,
+/// at a panic or because its process was killed, would otherwise leave the program waiting. The
+/// group is ended when the shell is dropped, which a panic's unwinding does too, and the leader
+/// ends it by itself once the test's process is gone, which is how a killed test's programs end.
+/// The leader is collected only after its group has been ended, so until then its identifier, and
+/// with it the group's, can name no other process: ending the group reaches exactly what this
+/// shell launched.
+struct LaunchGroup {
+    leader: std::process::Child,
+}
+
+impl LaunchGroup {
+    fn new() -> Self {
+        use std::os::unix::process::CommandExt as _;
+
+        // The process to watch is named by this process, not read from the shell's own parent: a
+        // test that dies before the shell has looked would leave the shell's parent to be
+        // whoever adopted it.
+        let leader = std::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                r#"while kill -0 "$1" 2>/dev/null; do sleep 1; done; kill -KILL 0"#,
+                "sh",
+                &std::process::id().to_string(),
+            ])
+            .process_group(0)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("the launches' group leader starts");
+        Self { leader }
+    }
+
+    /// The group's identifier, for a launch to join.
+    fn id(&self) -> i32 {
+        i32::try_from(self.leader.id()).expect("a process identifier")
+    }
+}
+
+impl Drop for LaunchGroup {
+    fn drop(&mut self) {
+        let group = rustix::process::Pid::from_child(&self.leader);
+        // The leader is uncollected, so the group exists until this signal ends it.
+        let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+        let _ = self.leader.wait();
+    }
 }
 
 /// A session with one attached view, the way the worker delivers to its clients.
@@ -307,6 +399,7 @@ impl Shell {
         std::fs::create_dir_all(&reports).expect("a directory for reports");
         let package_digest = source.package_digest;
         Self {
+            group: LaunchGroup::new(),
             placed,
             runtime,
             broker,
@@ -577,6 +670,8 @@ impl Shell {
         command.spawn().expect("the launcher starts")
     }
 
+    /// Gives a launch its report's name, the variables of `answer` and `env`, and quiet standard
+    /// streams, and puts it in the process group every launch of this shell runs in.
     fn prepare(
         &self,
         command: &mut std::process::Command,
@@ -589,8 +684,11 @@ impl Shell {
                 command.env(&variable.name, &variable.value);
             }
         }
+        use std::os::unix::process::CommandExt as _;
+
         command
             .env("REPORT", self.reports.join(name))
+            .process_group(self.group.id())
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped());
@@ -711,6 +809,196 @@ fn the_stand_in_program() {
     if let Ok(seconds) = std::env::var(STAND_IN) {
         std::thread::sleep(Duration::from_secs(seconds.parse().unwrap_or(60)));
     }
+}
+
+/// What makes a run of this binary the case whose test stops early: the file it records its
+/// launched program in.
+const STOPS_EARLY: &str = "KR_LAUNCH_STOPS_EARLY";
+
+/// How that case stops: `panic`, or `killed` while it waits for its process to be killed.
+const STOPS_BY: &str = "KR_LAUNCH_STOPS_BY";
+
+/// A launch whose test stops before it lets the program go on: the program waits for a file the
+/// test never writes. Run by the test harness with nothing set, it does nothing;
+/// `a_launched_program_ends_with_a_test_that_stops_early` runs it in a process of its own.
+///
+/// Stopped by a panic, the panic is caught here and this process goes on running, as it does when
+/// one test of a suite fails: the program has to end with its test, not with the process. Stopped
+/// by being killed, it waits for that.
+#[test]
+fn a_launch_whose_test_stops_early() {
+    let Some(record) = std::env::var_os(STOPS_EARLY) else {
+        return;
+    };
+    let record = PathBuf::from(record);
+    let by_panic = std::env::var_os(STOPS_BY).is_some_and(|by| by == "panic");
+    let program = std::sync::atomic::AtomicI32::new(0);
+    let stopped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let shell = Shell::new();
+        let hook = shell.placed.forwarder.display().to_string();
+        let never = shell.placed.host.root().join("never").display().to_string();
+        let answer = shell.establish();
+        let mut launched = shell.launch(
+            &answer,
+            "early",
+            &[
+                ("HOOK", hook.as_str()),
+                ("HOOK_EVENT", SESSION_START),
+                ("WAIT_FOR", never.as_str()),
+            ],
+        );
+        let report = shell.report("early");
+        program.store(
+            report["pid"].parse().expect("the program's process"),
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        let staged = record.with_extension("part");
+        std::fs::write(
+            &staged,
+            format!(
+                "{}\n{}\n",
+                report["pid"],
+                started_at(program.load(std::sync::atomic::Ordering::SeqCst))
+                    .expect("the program is running")
+            ),
+        )
+        .expect("the record is written");
+        std::fs::rename(&staged, &record).expect("the record is complete");
+        assert!(
+            !by_panic,
+            "this test stops before it lets its program go on"
+        );
+        // Killed while it waits here for its program, which waits for a file nobody writes.
+        let _ = launched.wait();
+    }));
+    assert_eq!(stopped.is_err(), by_panic);
+    if by_panic {
+        let started = Instant::now();
+        while running(program.load(std::sync::atomic::Ordering::SeqCst)) {
+            if started.elapsed() > LIVENESS {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let ended = !running(program.load(std::sync::atomic::Ordering::SeqCst));
+        std::fs::write(
+            record.with_extension("verdict"),
+            if ended { "ended" } else { "left" },
+        )
+        .expect("the verdict is written");
+    }
+}
+
+/// A child of a test that is ended and collected when the test stops, whatever it stops at.
+struct Case(std::process::Child);
+
+impl Drop for Case {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// A directory of this test's own, removed when the test stops, whatever it stops at.
+struct Arena(PathBuf);
+
+impl Arena {
+    /// Made in the system's temporary directory under a name of one character, because the socket
+    /// address of a host a case makes beneath it has a length limit that a longer name overruns on
+    /// macOS.
+    fn create() -> Self {
+        for name in "0123456789abcdef".chars() {
+            let directory = std::env::temp_dir().join(name.to_string());
+            if std::fs::create_dir(&directory).is_ok() {
+                return Self(directory);
+            }
+        }
+        panic!("every one-character directory of the temporary directory is taken");
+    }
+}
+
+impl Drop for Arena {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// A program a launch started ends with the test that started it, whether that test stops at a
+/// panic or its process is killed. The program waits for a file its test never writes, as a
+/// stand-in agent of a test that failed early once did for days.
+#[test]
+fn a_launched_program_ends_with_a_test_that_stops_early() {
+    let directory = kr_ipc::testing::TempHost::create();
+    let mut left = Vec::new();
+    for stops_by in ["panic", "killed"] {
+        let record = directory.root().join(stops_by);
+        // Everything the case makes in the system's temporary directory is made under this one,
+        // which this test owns and removes however it stops: a case that is ended before it says
+        // where its tree is leaves nothing this test cannot find. Its name is short, because a
+        // socket address the case makes beneath it has a length limit.
+        let arena = Arena::create();
+        let mut case = Case(
+            std::process::Command::new(std::env::current_exe().expect("this test's own binary"))
+                .args([
+                    "--exact",
+                    "a_launch_whose_test_stops_early",
+                    "--test-threads",
+                    "1",
+                ])
+                .env(STOPS_EARLY, &record)
+                .env(STOPS_BY, stops_by)
+                .env("TMPDIR", &arena.0)
+                .current_dir(directory.root())
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("the case starts"),
+        );
+        // The case places a forwarder of its own, whose first start the system may check.
+        let started = Instant::now();
+        while !record.exists() && case.0.try_wait().expect("readable").is_none() {
+            assert!(
+                started.elapsed() < common::FIRST_START_WITHIN,
+                "the case launched its program within the allowance"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if stops_by == "killed" {
+            let _ = case.0.kill();
+        }
+        let _ = case.0.wait();
+        let text = std::fs::read_to_string(&record).expect("the case recorded its program");
+        let mut lines = text.lines();
+        let pid: i32 = lines
+            .next()
+            .and_then(|pid| pid.parse().ok())
+            .expect("the program's process");
+        let recorded_start = lines.next().expect("when the program started");
+        let started = Instant::now();
+        while running(pid) && started.elapsed() <= LIVENESS {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let mut ended = !running(pid);
+        if stops_by == "panic" {
+            ended &= std::fs::read_to_string(record.with_extension("verdict"))
+                .is_ok_and(|verdict| verdict == "ended");
+        }
+        if !ended {
+            // Left by the case: ended here, so that a failing run leaves nothing behind either, and
+            // only if it is still the process the case recorded.
+            if started_at(pid).as_deref() == Some(recorded_start)
+                && let Some(pid) = rustix::process::Pid::from_raw(pid)
+            {
+                let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+            }
+            left.push(stops_by);
+        }
+    }
+    assert!(
+        left.is_empty(),
+        "a launched program outlived the test that stopped early by: {left:?}"
+    );
 }
 
 /// Starts a program named `claude` that the integration did not launch, as this process's own
@@ -876,7 +1164,7 @@ fn kr_req_05_09_a_refused_launch_runs_the_invocation_as_typed() {
     // The root shell's own child, but one that started before the backend was established.
     let go = shell.placed.host.root().join("go");
     let mut older = sh(&format!(
-        r#"while [ ! -f "$GO" ]; do sleep 0.02; done; export KR_REGISTRATION="$(cat "$GO")"; exec {launch_line}"#
+        r#"polls=0; while [ ! -f "$GO" ]; do polls=$((polls + 1)); [ "$polls" -le 6000 ] || exit 3; sleep 0.02; done; export KR_REGISTRATION="$(cat "$GO")"; exec {launch_line}"#
     ));
     shell.prepare(&mut older, None, "older", &[]);
     with_launch(&mut older);
