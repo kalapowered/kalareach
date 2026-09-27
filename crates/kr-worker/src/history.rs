@@ -311,11 +311,38 @@ impl OutputHistory {
         }
     }
 
+    /// Returns the ranges inside the retained range that nothing retained holds.
+    ///
+    /// Retained output is one run of cursors, and the spool is meant to hold every byte of it that
+    /// the resident window does not. A segment that has gone - deleted from under the session, or
+    /// lost with its disk - leaves a range between its neighbours that nothing holds, and so does a
+    /// newest segment that went after the spool recorded a boundary past it. Each is output this
+    /// host cannot account for, and each is reported rather than read as a quiet stretch: a page
+    /// that reaches one says so, and the archive's own account names it.
+    ///
+    /// It reads the spool's index. A file that goes while the index still names it is found when
+    /// a page reaches it, and is forgotten by the next retention pass.
+    #[must_use]
+    pub fn holes(&self) -> Vec<(u64, u64)> {
+        self.spool
+            .as_ref()
+            .map_or_else(Vec::new, |spool| spool.uncovered(self.resident_start))
+    }
+
     /// Returns how many bytes of output this session retains.
+    ///
+    /// It is what the two layers hold together, counted once. The resident window is normally the
+    /// newest part of what the spool holds, so adding the two would read a session as larger than
+    /// it is; and a range the spool no longer holds is not retained, whatever the distance from
+    /// the oldest cursor to the newest says.
     #[must_use]
     pub fn retained_bytes(&self) -> u64 {
-        self.next_cursor
-            .saturating_sub(self.oldest_retained_cursor())
+        let resident = self.resident.len() as u64;
+        let Some(spool) = self.spool.as_ref() else {
+            return resident;
+        };
+        spool.total_bytes
+            + resident.saturating_sub(spool.covered(self.resident_start, self.next_cursor))
     }
 
     /// Returns when the oldest retained output was last written.
@@ -454,6 +481,11 @@ impl OutputHistory {
         let mut taken = Vec::new();
         let expires_before = retention.expires_before(now_ms).get();
         let mut files_removed = 0;
+        // A segment whose file has gone is not retained, and a pass that counted it would evict
+        // output this session did not need to give up.
+        if let Some(spool) = self.spool.as_mut() {
+            spool.forget_vanished();
+        }
 
         // The age bound first, which is the order section 20 states the three in.
         if age_permitted {
@@ -602,25 +634,20 @@ impl OutputHistory {
     pub fn page(&self, from_cursor: u64, max_bytes: u64) -> Result<HistoryPageResult> {
         let oldest = self.oldest_retained_cursor();
         let limit = max_bytes.clamp(1, MAX_HISTORY_PAGE_BYTES);
-        if self.boundary_unreadable() {
+        let unaccounted = self.boundary_unreadable();
+        let (mut start, mut gap) = if unaccounted {
             // This host recorded where its output got to and cannot read it back, so it does not
             // know what it is missing. A page that reported no gap would be saying there is
             // nothing before this, which is the one thing it cannot say.
-            let bytes = self.read_range(oldest.max(from_cursor), limit)?;
-            let start = oldest.max(from_cursor);
-            return Ok(HistoryPageResult {
-                from_cursor: U64::new(start),
-                next_cursor: U64::new(start + bytes.len() as u64),
-                bytes: Bytes::new(bytes),
-                oldest_retained_cursor: U64::new(oldest),
-                gap: Nullable::some(HistoryGap {
+            (
+                oldest.max(from_cursor),
+                Some(HistoryGap {
                     from_cursor: U64::new(0),
                     to_cursor: U64::new(oldest),
                     cause: Some(HistoryGapCause::SpoolUnavailable),
                 }),
-            });
-        }
-        let (start, gap) = if from_cursor < oldest {
+            )
+        } else if from_cursor < oldest {
             (
                 oldest,
                 Some(HistoryGap {
@@ -632,7 +659,37 @@ impl OutputHistory {
         } else {
             (from_cursor.min(self.next_cursor), None)
         };
-        let bytes = self.read_range(start, limit)?;
+        let bytes = match self.read_held(start, limit)? {
+            Held::Bytes(bytes) => bytes,
+            Held::Missing { to } => match gap.as_mut() {
+                // A host that cannot say where its output got to cannot account for this range
+                // either. The gap it already reports reaches over it, which is what moves the
+                // reader past it rather than asking the same cursor again.
+                Some(reported) if unaccounted => {
+                    reported.to_cursor = U64::new(to);
+                    start = to;
+                    self.read_held(start, limit)?.into_bytes()
+                }
+                // One page carries one gap, and this one already reports the range before the
+                // oldest cursor. The reader asks again from here and is told about this one.
+                Some(_) => Vec::new(),
+                // A range inside the retained range that nothing holds. It is reported with the
+                // cause this host recorded for it, or as a range it cannot account for, and the
+                // page goes on to what comes after it.
+                None => {
+                    gap = Some(HistoryGap {
+                        from_cursor: U64::new(start),
+                        to_cursor: U64::new(to),
+                        cause: Some(
+                            self.cause_of(start)
+                                .unwrap_or(HistoryGapCause::ArchiveIncomplete),
+                        ),
+                    });
+                    start = to;
+                    self.read_held(start, limit)?.into_bytes()
+                }
+            },
+        };
         Ok(HistoryPageResult {
             from_cursor: U64::new(start),
             next_cursor: U64::new(start + bytes.len() as u64),
@@ -642,30 +699,59 @@ impl OutputHistory {
         })
     }
 
-    fn read_range(&self, start: u64, limit: u64) -> Result<Vec<u8>> {
+    /// Reads what this history holds from `start`, up to `limit` bytes.
+    fn read_held(&self, start: u64, limit: u64) -> Result<Held> {
         if start >= self.next_cursor {
-            return Ok(Vec::new());
+            return Ok(Held::Bytes(Vec::new()));
         }
         let available = self.next_cursor - start;
         let wanted = usize::try_from(available.min(limit)).unwrap_or(usize::MAX);
         if start >= self.resident_start {
             let offset = usize::try_from(start - self.resident_start).unwrap_or(usize::MAX);
             let take = wanted.min(self.resident.len().saturating_sub(offset));
-            return Ok(self
-                .resident
-                .iter()
-                .skip(offset)
-                .take(take)
-                .copied()
-                .collect());
+            return Ok(Held::Bytes(
+                self.resident
+                    .iter()
+                    .skip(offset)
+                    .take(take)
+                    .copied()
+                    .collect(),
+            ));
         }
         let Some(spool) = self.spool.as_ref() else {
-            return Ok(Vec::new());
+            // A cursor before the resident window with no spool behind it is before the oldest
+            // retained cursor, which a page reports before it reads anything.
+            return Ok(Held::Missing {
+                to: self.resident_start,
+            });
         };
         // Stop at the resident boundary: the caller pages forward and the next request is served
         // from memory.
         let take = wanted.min(usize::try_from(self.resident_start - start).unwrap_or(usize::MAX));
-        spool.read(start, take)
+        spool.read_at(start, take, self.resident_start)
+    }
+}
+
+/// What a history holds at one cursor.
+#[derive(Debug)]
+enum Held {
+    /// Bytes from the cursor, up to the first range nothing holds.
+    Bytes(Vec<u8>),
+    /// Nothing is held from the cursor up to `to`.
+    Missing {
+        /// The first cursor after the one asked for that something holds, or the end of the range
+        /// that was asked about.
+        to: u64,
+    },
+}
+
+impl Held {
+    /// The bytes, or none for a range nothing holds.
+    fn into_bytes(self) -> Vec<u8> {
+        match self {
+            Self::Bytes(bytes) => bytes,
+            Self::Missing { .. } => Vec::new(),
+        }
     }
 }
 
@@ -718,6 +804,13 @@ struct Segment {
     /// is what the filesystem already keeps, so it is what this reads. Eviction reads the newest
     /// byte rather than the oldest, which is the direction that cannot delete output too early.
     written_at_ms: u64,
+}
+
+impl Segment {
+    /// The cursor after this segment's last byte.
+    const fn end(&self) -> u64 {
+        self.start + self.len
+    }
 }
 
 impl Spool {
@@ -975,27 +1068,128 @@ impl Spool {
         self.segments.front().map(|segment| segment.written_at_ms)
     }
 
-    fn read(&self, start: u64, wanted: usize) -> Result<Vec<u8>> {
-        let mut out = Vec::with_capacity(wanted);
-        let mut cursor = start;
-        while out.len() < wanted {
-            let Some(segment) = self
+    /// Reads what the spool holds from `start`, up to `wanted` bytes and never past `end`.
+    ///
+    /// It stops at the first range it does not hold, so one page never carries bytes from both
+    /// sides of a hole as though they were one run. A cursor inside such a range is answered with
+    /// where the range ends: the next segment the index has, or `end`. A segment whose file has
+    /// gone from under the index, or holds less than the index says, is a range it does not hold.
+    fn read_at(&self, start: u64, wanted: usize, end: u64) -> Result<Held> {
+        let Some(first) = self
+            .segments
+            .iter()
+            .position(|segment| start >= segment.start && start < segment.end())
+        else {
+            let to = self
                 .segments
                 .iter()
-                .find(|segment| cursor >= segment.start && cursor < segment.start + segment.len)
+                .map(|segment| segment.start)
+                .find(|&next| next > start)
+                .map_or(end, |next| next.min(end));
+            return Ok(Held::Missing { to });
+        };
+        let mut out = Vec::with_capacity(wanted);
+        let mut cursor = start;
+        let mut at = first;
+        while out.len() < wanted && cursor < end {
+            // The next segment continues this run only when it starts where the last one ended.
+            let Some(segment) = self
+                .segments
+                .get(at)
+                .filter(|segment| cursor >= segment.start && cursor < segment.end())
             else {
                 break;
             };
             let offset = cursor - segment.start;
-            let take = (segment.len - offset).min((wanted - out.len()) as u64);
-            let chunk = read_file_range(&segment.path, offset, take)?;
-            if chunk.is_empty() {
-                break;
-            }
+            let take = (segment.len - offset)
+                .min((wanted - out.len()) as u64)
+                .min(end - cursor);
+            let chunk = match read_file_range(&segment.path, offset, take) {
+                Ok(chunk) => chunk,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                Err(error) => {
+                    return Err(WorkerError::storage("read an output spool segment", error));
+                }
+            };
             cursor += chunk.len() as u64;
             out.extend_from_slice(&chunk);
+            if (chunk.len() as u64) < take {
+                break;
+            }
+            at += 1;
         }
-        Ok(out)
+        if out.is_empty() {
+            let segment = &self.segments[first];
+            return Ok(Held::Missing {
+                to: segment.end().min(end),
+            });
+        }
+        Ok(Held::Bytes(out))
+    }
+
+    /// Returns the ranges from the oldest segment up to `until` that no segment covers.
+    ///
+    /// The end is the boundary this spool reached, which is what makes a newest segment that has
+    /// gone a range rather than a spool that simply ended earlier.
+    fn uncovered(&self, until: u64) -> Vec<(u64, u64)> {
+        let mut holes = Vec::new();
+        let Some(first) = self.segments.front() else {
+            return holes;
+        };
+        let mut reached = first.start;
+        for segment in &self.segments {
+            if segment.start >= until {
+                break;
+            }
+            if segment.start > reached {
+                holes.push((reached, segment.start));
+            }
+            reached = reached.max(segment.end());
+        }
+        let end = self.next_cursor().min(until);
+        if reached < end {
+            holes.push((reached, end));
+        }
+        holes
+    }
+
+    /// Returns how many bytes of the cursors from `from` to `to` the segments hold.
+    fn covered(&self, from: u64, to: u64) -> u64 {
+        self.segments
+            .iter()
+            .map(|segment| {
+                segment
+                    .end()
+                    .min(to)
+                    .saturating_sub(segment.start.max(from))
+            })
+            .sum()
+    }
+
+    /// Forgets the segments whose files have gone, other than the one being written.
+    ///
+    /// A file that went from under the index is a range this host no longer holds, and counting it
+    /// would make the session look larger than it is: the next capacity pass would evict output it
+    /// did not need to. The range reads as a hole afterwards, as it did to any reader that reached
+    /// it before. The newest segment is left, because its file is open for writing here and what
+    /// became of it is found when a page reaches it.
+    fn forget_vanished(&mut self) {
+        let newest = self.segments.len().saturating_sub(1);
+        let mut position = 0;
+        let mut kept = 0;
+        self.segments.retain(|segment| {
+            let gone = position < newest
+                && matches!(
+                    std::fs::symlink_metadata(&segment.path),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound
+                );
+            position += 1;
+            if !gone {
+                kept += segment.len;
+            }
+            !gone
+        });
+        self.total_bytes = kept;
     }
 }
 
@@ -1158,18 +1352,14 @@ fn append_open(file: &mut std::fs::File, bytes: &[u8]) -> Result<()> {
         .map_err(|error| WorkerError::storage("write an output spool segment", error))
 }
 
-fn read_file_range(path: &Path, offset: u64, len: u64) -> Result<Vec<u8>> {
+/// Reads up to `len` bytes of a segment from `offset`, fewer only where the file ends.
+fn read_file_range(path: &Path, offset: u64, len: u64) -> std::io::Result<Vec<u8>> {
     use std::io::{Read as _, Seek as _, SeekFrom};
 
-    let mut file = std::fs::File::open(path)
-        .map_err(|error| WorkerError::storage("open an output spool segment", error))?;
-    file.seek(SeekFrom::Start(offset))
-        .map_err(|error| WorkerError::storage("seek an output spool segment", error))?;
-    let mut buffer = vec![0_u8; usize::try_from(len).unwrap_or(usize::MAX)];
-    let read = file
-        .read(&mut buffer)
-        .map_err(|error| WorkerError::storage("read an output spool segment", error))?;
-    buffer.truncate(read);
+    let mut file = std::fs::File::open(path)?;
+    file.seek(SeekFrom::Start(offset))?;
+    let mut buffer = Vec::with_capacity(usize::try_from(len).unwrap_or(0));
+    file.take(len).read_to_end(&mut buffer)?;
     Ok(buffer)
 }
 

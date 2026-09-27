@@ -338,6 +338,57 @@ fn a_closed_sessions_retained_output_is_paged_from_its_spool() {
             .iter()
             .any(|resource| resource.kind == "output_spool")
     );
+    // The control for the hole below: a spool whose segments meet reports no range as lost.
+    assert!(
+        !read
+            .incompleteness
+            .iter()
+            .any(|missing| matches!(missing, Incompleteness::HistoryLost { .. })),
+        "{:?}",
+        read.incompleteness
+    );
+}
+
+#[test]
+fn a_hole_inside_a_closed_sessions_retained_output_is_part_of_what_the_archive_reports() {
+    // KR-REQ-24.19. A segment that has gone from the middle of the retained range is a range this
+    // host cannot account for. The archive's own account names it, beside the range before the
+    // oldest cursor, and a reader paging the archive is told the range and given what follows.
+    let (_temp, archive) = host();
+    let session_id = session();
+    let spool = archive.paths().session_spool(session_id);
+    {
+        let mut history = kr_worker::history::OutputHistory::with_spool(
+            8,
+            &spool,
+            kr_worker::history::SpoolLayout::new(8, 1 << 20),
+        )
+        .expect("a spool");
+        for byte in *b"abcd" {
+            history.append(&[byte; 8]);
+        }
+    }
+    std::fs::remove_file(spool.join(format!("{:020}.out", 8))).expect("removes a middle segment");
+
+    let read = archive.archive(session_id).expect("reads the archive");
+    assert!(
+        read.incompleteness.contains(&Incompleteness::HistoryLost {
+            from_cursor: 8,
+            to_cursor: 16
+        }),
+        "the hole is part of the account: {:?}",
+        read.incompleteness
+    );
+    assert!(!read.is_complete());
+    let page = archive.history_page(session_id, 8, 4096).expect("a page");
+    let gap = page.gap.0.expect("the missing range is a gap");
+    assert_eq!((gap.from_cursor.get(), gap.to_cursor.get()), (8, 16));
+    assert_eq!(gap.cause, Some(HistoryGapCause::ArchiveIncomplete));
+    assert_eq!(page.from_cursor.get(), 16);
+    assert_eq!(
+        page.bytes.as_slice(),
+        [[b'c'; 8], [b'd'; 8]].concat().as_slice()
+    );
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -1264,6 +1264,152 @@ fn a_spool_that_retention_emptied_still_says_where_its_output_got_to() {
     std::fs::remove_dir_all(&directory).ok();
 }
 
+/// The file one spool segment is kept in, named by the cursor it starts at.
+fn segment_file(directory: &std::path::Path, start: u64) -> std::path::PathBuf {
+    directory.join(format!("{start:020}.out"))
+}
+
+/// Writes four eight-byte segments, `a` to `d`, covering cursors 0 to 32.
+fn four_segments(directory: &std::path::Path) -> kr_worker::history::OutputHistory {
+    let mut history =
+        kr_worker::history::OutputHistory::with_spool(4, directory, SpoolLayout::new(8, 1 << 20))
+            .expect("a spool");
+    for byte in *b"abcd" {
+        history.append(&[byte; 8]);
+    }
+    history
+}
+
+#[test]
+fn a_missing_middle_segment_reads_as_a_gap_and_the_page_goes_on_to_the_next() {
+    // KR-REQ-24.19 and 20.21. A segment inside the retained range that has gone is a range this
+    // host cannot account for. A reader asking for it is told so, with a cause, and is given what
+    // comes after it, rather than an empty page at the same cursor that it would ask for again.
+    let directory = std::env::temp_dir().join(format!("kr-persist-hole-{}", kr_ipc::new_uuid()));
+    drop(four_segments(&directory));
+    std::fs::remove_file(segment_file(&directory, 8)).expect("removes the middle segment");
+
+    let reopened = kr_worker::history::OutputHistory::read_spool(&directory, SpoolLayout::DEFAULT)
+        .expect("reads what is left");
+    // A page that starts before the hole stops at it.
+    let before = reopened.page(0, 64).expect("a page");
+    assert_eq!(before.bytes.as_slice(), &[b'a'; 8]);
+    assert_eq!(before.next_cursor.get(), 8);
+    assert!(!before.gap.is_present());
+    // A page at the hole reports it and goes on to the next segment this host holds.
+    let at = reopened.page(8, 64).expect("a page");
+    let gap = at
+        .gap
+        .0
+        .unwrap_or_else(|| panic!("the missing range is a gap: {at:?}"));
+    assert_eq!((gap.from_cursor.get(), gap.to_cursor.get()), (8, 16));
+    assert_eq!(gap.cause, Some(HistoryGapCause::ArchiveIncomplete));
+    assert_eq!(at.from_cursor.get(), 16);
+    assert_eq!(
+        at.bytes.as_slice(),
+        [[b'c'; 8], [b'd'; 8]].concat().as_slice()
+    );
+    assert_eq!(at.next_cursor.get(), 32);
+    // What this host retains is what it holds, not the distance from the oldest cursor.
+    assert_eq!(reopened.retained_bytes(), 24);
+    assert_eq!(reopened.holes(), vec![(8, 16)]);
+    std::fs::remove_dir_all(&directory).ok();
+}
+
+#[test]
+fn a_segment_that_goes_under_an_open_index_reads_as_a_gap_rather_than_an_error() {
+    // The same hole, made while the session still has its spool open: the index names the
+    // segment, and the file behind it has gone.
+    let directory =
+        std::env::temp_dir().join(format!("kr-persist-hole-open-{}", kr_ipc::new_uuid()));
+    let mut history = four_segments(&directory);
+    std::fs::remove_file(segment_file(&directory, 8)).expect("removes the middle segment");
+    let at = history.page(8, 64).expect("a page rather than an error");
+    let gap = at
+        .gap
+        .0
+        .unwrap_or_else(|| panic!("the missing range is a gap: {at:?}"));
+    assert_eq!((gap.from_cursor.get(), gap.to_cursor.get()), (8, 16));
+    assert_eq!(gap.cause, Some(HistoryGapCause::ArchiveIncomplete));
+    assert_eq!(at.from_cursor.get(), 16);
+    assert_eq!(&at.bytes.as_slice()[..8], &[b'c'; 8]);
+    // The next retention pass forgets the segment, so the session is no longer counted as holding
+    // it and the account names the range.
+    assert_eq!(history.retained_bytes(), 32, "the index still names it");
+    let taken = history.apply_retention(OutputRetention::DEFAULT, 32, kr_ipc::now_ms(), true);
+    assert!(taken.is_empty(), "nothing was over any bound");
+    assert_eq!(history.retained_bytes(), 24);
+    assert_eq!(history.holes(), vec![(8, 16)]);
+    std::fs::remove_dir_all(&directory).ok();
+}
+
+#[test]
+fn a_missing_newest_segment_reads_as_a_gap_up_to_the_recorded_boundary() {
+    // A hole at the end is visible only against the boundary the spool recorded, which an
+    // eviction writes before it deletes anything.
+    let directory =
+        std::env::temp_dir().join(format!("kr-persist-hole-end-{}", kr_ipc::new_uuid()));
+    {
+        let mut history = four_segments(&directory);
+        let taken = history.apply_retention(
+            OutputRetention::new(
+                std::time::Duration::from_secs(7 * 24 * 60 * 60),
+                1 << 30,
+                24,
+            ),
+            32,
+            kr_ipc::now_ms(),
+            true,
+        );
+        assert_eq!(
+            taken.len(),
+            1,
+            "the oldest segment went and the boundary was written"
+        );
+    }
+    std::fs::remove_file(segment_file(&directory, 24)).expect("removes the newest segment");
+    let reopened = kr_worker::history::OutputHistory::read_spool(&directory, SpoolLayout::DEFAULT)
+        .expect("reads what is left");
+    assert_eq!(
+        reopened.next_cursor(),
+        32,
+        "the boundary says where the output reached"
+    );
+    let page = reopened.page(24, 64).expect("a page");
+    let gap = page
+        .gap
+        .0
+        .unwrap_or_else(|| panic!("the missing range is a gap: {page:?}"));
+    assert_eq!((gap.from_cursor.get(), gap.to_cursor.get()), (24, 32));
+    assert!(page.bytes.is_empty());
+    assert_eq!(page.next_cursor.get(), 32);
+    assert_eq!(reopened.holes(), vec![(24, 32)]);
+    std::fs::remove_dir_all(&directory).ok();
+}
+
+#[test]
+fn a_contiguous_spool_pages_from_end_to_end_with_no_gap() {
+    // The control for the three above: nothing is missing, so nothing is reported missing.
+    let directory =
+        std::env::temp_dir().join(format!("kr-persist-contiguous-{}", kr_ipc::new_uuid()));
+    drop(four_segments(&directory));
+    let reopened = kr_worker::history::OutputHistory::read_spool(&directory, SpoolLayout::DEFAULT)
+        .expect("reads the spool");
+    let mut cursor = 0;
+    let mut read = Vec::new();
+    while cursor < reopened.next_cursor() {
+        let page = reopened.page(cursor, 12).expect("a page");
+        assert!(!page.gap.is_present(), "no gap at {cursor}");
+        assert_eq!(page.from_cursor.get(), cursor);
+        read.extend_from_slice(page.bytes.as_slice());
+        cursor = page.next_cursor.get();
+    }
+    assert_eq!(read.len(), 32);
+    assert_eq!(reopened.retained_bytes(), 32);
+    assert!(reopened.holes().is_empty());
+    std::fs::remove_dir_all(&directory).ok();
+}
+
 #[test]
 fn a_clock_this_host_cannot_prove_stops_the_age_bound_and_not_the_caps() {
     // KR-REQ-20.20 against section 9's collection rule: removing output because it is seven days

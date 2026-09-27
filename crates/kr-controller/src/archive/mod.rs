@@ -16,11 +16,10 @@
 //! * **A lost or corrupt journal produces an explicit incomplete archive.** Not an error, and not
 //!   an empty success: [`Archive::incompleteness`] names what is missing, so a reader is told the
 //!   record has holes rather than reading continuity into it. It names a missing or unreadable
-//!   store, a missing closure or summary, a lost range of output, an interval durable writing was
-//!   lost, and a recovery pass that did not run. It does not name a *hole* inside the retained
-//!   range: the spool reader stops where no segment covers the cursor it was asked for, so a
-//!   middle segment that has gone returns no bytes, no gap and the same cursor, and the aggregate
-//!   check reads the oldest cursor and the boundary rather than the continuity between them.
+//!   store, a missing closure or summary, a lost range of output - before the oldest cursor, or
+//!   inside the retained range where a segment has gone - an interval durable writing was lost,
+//!   and a recovery pass that did not run. A reader paging across a hole is told the range and
+//!   given what follows it.
 //! * **Privacy mode is the worker's, not the archive's.** A store recovered here is not checked
 //!   for an unfinished privacy cleanup, and a content read is not held while one is owed, so a
 //!   host that crashed between recording privacy mode and removing what it was asked to remove
@@ -80,7 +79,7 @@ pub enum Incompleteness {
     ClosureMissing,
     /// No session summary survived, so the archive cannot say what the session was.
     SummaryMissing,
-    /// Retained output was evicted or its spool is gone.
+    /// Retained output was evicted, its spool is gone, or a range inside it is not held.
     HistoryLost {
         /// The first cursor that is missing.
         from_cursor: u64,
@@ -876,6 +875,15 @@ impl ArchiveService {
             archive.incompleteness.push(Incompleteness::HistoryLost {
                 from_cursor: 0,
                 to_cursor: archive.oldest_retained_cursor,
+            });
+        }
+        // What lies between the oldest cursor and the boundary is continuous only when the
+        // segments meet. A range no segment covers is output this host cannot account for,
+        // whatever took it, and it is reported beside the range before the oldest cursor.
+        for (from_cursor, to_cursor) in history.holes() {
+            archive.incompleteness.push(Incompleteness::HistoryLost {
+                from_cursor,
+                to_cursor,
             });
         }
         archive.retained.push(RetainedResource {

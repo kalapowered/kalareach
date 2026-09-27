@@ -2386,11 +2386,15 @@ has evicted everything writes down where its output got to before it deletes wha
 a session reopened over an empty directory continues its cursor and reports the range that went
 rather than starting again at nought.
 
-What a page cannot yet report is a hole *inside* the retained range. The reader asks which segment
-covers the cursor it was given; a middle segment that has gone leaves that cursor covered by
-nothing, and the page comes back empty rather than as a gap. Segment continuity is not checked,
-and the archive's own completeness check reads the oldest cursor and the boundary rather than what
-is between them.
+A hole *inside* the retained range is reported too. A range between two segments that nothing
+holds - a segment deleted from under the session or lost with its disk, or a newest segment gone
+past the boundary the spool recorded - reads as missing: a page stops before it, and a page at it
+returns the range as a gap, with the cause this host recorded for it or `archive_incomplete`, and
+goes on to the bytes after it. A segment file that goes while the session has its spool open is
+found the same way when a page reaches it, and the next retention pass forgets it, so the session
+is no longer counted as holding it. A session's retained bytes are what its segments and its
+resident window hold together, counted once, and the archive's own account names every hole
+beside the range before the oldest cursor.
 
 Removing output because it is old is expiry-based collection, so section 9's rule applies: a host
 that cannot prove its wall clock does not do it. The caps still apply, because they are about
