@@ -117,6 +117,12 @@ pub enum BrokerError {
     /// A launch intent was refused.
     #[error("{0}")]
     Launch(#[from] kr_protocol::broker::LaunchRefusal),
+    /// Something this broker counts has run out, and it refuses rather than count round.
+    #[error("{detail}")]
+    ResourceUnavailable {
+        /// What ran out.
+        detail: String,
+    },
 }
 
 impl BrokerError {
@@ -180,6 +186,7 @@ impl BrokerError {
             Self::LedgerUnavailable { .. } | Self::StoreFault { .. } => {
                 ErrorCode::StorageUnavailable
             }
+            Self::ResourceUnavailable { .. } => ErrorCode::ResourceUnavailable,
             Self::Launch(refusal) => match refusal {
                 kr_protocol::broker::LaunchRefusal::ForegroundChanged
                 | kr_protocol::broker::LaunchRefusal::PromptMoved => ErrorCode::DraftConflict,
@@ -194,6 +201,14 @@ impl BrokerError {
     #[must_use]
     pub fn to_protocol_error(&self) -> ProtocolError {
         ProtocolError::new(self.code(), self.to_string())
+    }
+}
+
+impl From<crate::broker::semantic::Exhausted> for BrokerError {
+    fn from(exhausted: crate::broker::semantic::Exhausted) -> Self {
+        Self::ResourceUnavailable {
+            detail: exhausted.to_string(),
+        }
     }
 }
 

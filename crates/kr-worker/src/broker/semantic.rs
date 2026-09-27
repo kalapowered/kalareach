@@ -20,6 +20,14 @@
 //! encodes to, against the allowance the caller gives, which is at most section 8's 16 MiB: a
 //! part read over a connection is given what is left of that connection's control frame once the
 //! rest of the answer is in it.
+//!
+//! One snapshot is bounded across its parts too. Section 8's 16 MiB and twenty thousand nodes are
+//! spent by every part of it together, so a part is paid for out of what the parts before it left
+//! ([`SnapshotCarried`]). The part that would pass the total ends the snapshot with a continuation
+//! that names the total, and what a reader asks for from there is a snapshot of its own.
+//!
+//! An entry's number is its identity to every reader, so no number is given twice: a log that has
+//! given the last one refuses the next entry ([`Exhausted`]).
 
 use std::collections::VecDeque;
 
@@ -27,7 +35,8 @@ use kr_protocol::agent::AgentSnapshotEntry;
 use kr_protocol::ids::StreamCursor;
 use kr_protocol::scalars::{TimestampMs, U64};
 use kr_protocol::semantic::{
-    MAX_SEMANTIC_SNAPSHOT_BYTES, SemanticBudget, SemanticContinuation, SemanticLimit,
+    MAX_SEMANTIC_SNAPSHOT_BYTES, MAX_SEMANTIC_TREE_NODES, SemanticBudget, SemanticContinuation,
+    SemanticLimit,
 };
 
 /// How many semantic entries one instance's log retains.
@@ -101,6 +110,67 @@ pub struct Replay {
     /// It is inclusive, because the node it names is the first one that was left out. A reader
     /// that passed it back as a consumed cursor would skip it.
     pub resume_at: Option<StreamCursor>,
+    /// What this snapshot's parts have carried, this one included, when a later part continues it.
+    ///
+    /// `None` when this part is the snapshot's last: nothing was left out, or the parts together
+    /// reached section 8's total, and what is asked for from the continuation is a snapshot of its
+    /// own.
+    pub carried: Option<SnapshotCarried>,
+}
+
+/// What the parts of one snapshot have carried so far.
+///
+/// Section 8 bounds a semantic snapshot at 16 MiB of encoded content and twenty thousand nodes
+/// across every part of it, so each part is paid for out of what the parts before it left, not out
+/// of a fresh allowance of its own.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SnapshotCarried {
+    /// How many entries the parts carried.
+    pub nodes: u64,
+    /// What those entries encode to, in bytes.
+    pub bytes: u64,
+}
+
+impl SnapshotCarried {
+    /// What a snapshot has carried before its first part.
+    pub const NOTHING: Self = Self { nodes: 0, bytes: 0 };
+
+    /// Returns the limit of section 8's that one more entry of `bytes` would pass, after what this
+    /// snapshot's earlier parts and `part` have carried.
+    fn refuses(self, part: &SemanticBudget, bytes: u64) -> Option<SemanticLimit> {
+        if self.nodes.saturating_add(part.nodes()) >= MAX_SEMANTIC_TREE_NODES {
+            return Some(SemanticLimit::Nodes);
+        }
+        match self.bytes.saturating_add(part.bytes()).checked_add(bytes) {
+            Some(total) if total <= MAX_SEMANTIC_SNAPSHOT_BYTES => None,
+            _ => Some(SemanticLimit::Bytes),
+        }
+    }
+
+    /// Returns what the snapshot has carried once `part` is added to it.
+    fn with(self, part: &SemanticBudget) -> Self {
+        Self {
+            nodes: self.nodes.saturating_add(part.nodes()),
+            bytes: self.bytes.saturating_add(part.bytes()),
+        }
+    }
+}
+
+/// A log that has given every entry number it has.
+///
+/// A reader knows an entry by its number, and a continuation names the next entry by it, so a log
+/// at the end of its numbering refuses the next entry rather than give a number twice. The last
+/// number it gives is one below the largest there is, because the number after an entry is where
+/// the next one would start.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Exhausted;
+
+impl std::fmt::Display for Exhausted {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(
+            "this history has given every entry number it has, and it gives none of them twice",
+        )
+    }
 }
 
 /// An entry that a part cannot carry even on its own and without its text.
@@ -210,14 +280,19 @@ impl SemanticLog {
     }
 
     /// Appends one observed entry and returns its cursor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Exhausted`] when this log has given its last entry number, and records nothing.
     pub fn append(
         &mut self,
         kind: impl Into<String>,
         text: impl Into<String>,
         at: TimestampMs,
-    ) -> StreamCursor {
+    ) -> Result<StreamCursor, Exhausted> {
+        let following = self.next.checked_add(1).ok_or(Exhausted)?;
         let cursor = StreamCursor::new(self.next);
-        self.next = self.next.saturating_add(1);
+        self.next = following;
         self.entries.push_back((
             cursor,
             AgentSnapshotEntry {
@@ -233,7 +308,7 @@ impl SemanticLog {
                 self.first_retained = StreamCursor::new(evicted.get().saturating_add(1));
             }
         }
-        cursor
+        Ok(cursor)
     }
 
     /// Returns the earliest cursor this log still holds.
@@ -248,19 +323,29 @@ impl SemanticLog {
         StreamCursor::new(self.next)
     }
 
+    /// Returns true when this log has given every entry number it has ([`Exhausted`]).
+    #[must_use]
+    pub const fn is_exhausted(&self) -> bool {
+        self.next.checked_add(1).is_none()
+    }
+
     /// Replays everything after the cursor an adapter consumed, in a part whose entries encode to
-    /// at most `max_bytes`.
+    /// at most `max_bytes`, of a snapshot whose earlier parts carried `carried`.
     ///
     /// `from` is the last cursor the adapter checkpointed; the replay starts after it. A `from`
     /// this log no longer holds is a gap: the answer starts at what is retained and says so,
     /// because the alternative is a shorter answer that reads as a complete one.
     ///
-    /// Each entry the filter admits is paid for at what it encodes to, and section 8's limit
-    /// bounds the allowance: a caller can ask for less than 16 MiB and never for more. An entry
-    /// that does not fit what is left ends the part, and the continuation names it, so the next
-    /// part starts with it. An entry that does not fit even as the first of its part is carried
-    /// with its text cut at a character boundary, saying how many bytes it left out, so that no
-    /// entry ends every part at itself.
+    /// Each entry the filter admits is paid for at what it encodes to, twice over. The part pays
+    /// out of its allowance, which section 8's limit bounds: a caller can ask for less than 16 MiB
+    /// and never for more. An entry that does not fit what is left of it ends the part, and the
+    /// continuation names it, so the next part starts with it; one that does not fit even as the
+    /// first of its part is carried with its text cut at a character boundary, saying how many
+    /// bytes it left out, so that no entry ends every part at itself. The snapshot pays out of
+    /// section 8's total, less what its earlier parts carried. An entry that would pass the total
+    /// ends the snapshot, and the continuation names the total and the entry, which the next
+    /// snapshot starts with; the snapshot's own first entry has the whole total to itself, which
+    /// is more than any part carries, so the part's rule decides it.
     ///
     /// # Errors
     ///
@@ -270,6 +355,7 @@ impl SemanticLog {
         from: Option<StreamCursor>,
         filter: &dyn HistoryFilter,
         max_bytes: u64,
+        carried: SnapshotCarried,
     ) -> Result<Replay, Uncarried> {
         let requested = from.map_or(1, |cursor| cursor.get().saturating_add(1));
         let history_gap = requested < self.first_retained.get();
@@ -282,6 +368,7 @@ impl SemanticLog {
         let mut consumed = from.unwrap_or_else(|| StreamCursor::new(0));
         let mut continuation = None;
         let mut resume_at = None;
+        let mut ended = false;
         for (cursor, entry) in &self.entries {
             if cursor.get() < start {
                 continue;
@@ -290,7 +377,21 @@ impl SemanticLog {
                 withheld += 1;
                 continue;
             }
-            let carried = match budget.admit(1, encoded_bytes(entry)) {
+            let bytes = encoded_bytes(entry);
+            let first_of_snapshot = carried == SnapshotCarried::NOTHING && entries.is_empty();
+            if !first_of_snapshot && let Some(limit) = carried.refuses(&budget, bytes) {
+                continuation = Some(SemanticContinuation {
+                    limit,
+                    limit_value: U64::new(limit.value()),
+                    from_node: U64::new(cursor.get()),
+                    nodes: U64::new(budget.nodes()),
+                    bytes: U64::new(budget.bytes()),
+                });
+                resume_at = Some(*cursor);
+                ended = true;
+                break;
+            }
+            let admitted = match budget.admit(1, bytes) {
                 Ok(()) => entry.clone(),
                 // The first entry of its part, so nothing has been spent: the whole allowance is
                 // there for it, and it is carried cut rather than left to start the next part too.
@@ -310,9 +411,10 @@ impl SemanticLog {
                     break;
                 }
             };
-            entries.push(carried);
+            entries.push(admitted);
             consumed = *cursor;
         }
+        let carried = (continuation.is_some() && !ended).then(|| carried.with(&budget));
         Ok(Replay {
             entries,
             continuation,
@@ -320,6 +422,7 @@ impl SemanticLog {
             withheld,
             consumed,
             resume_at,
+            carried,
         })
     }
 
@@ -328,7 +431,8 @@ impl SemanticLog {
     /// A restart does not keep the entries: they are the live parser's, and section 24 says a
     /// rebuilt range shows a history gap for anything unavailable. What it does keep is the
     /// numbering, so a new entry never takes a cursor an adapter has already checkpointed past,
-    /// and everything before the resume point is a gap rather than a silently empty answer.
+    /// and everything before the resume point is a gap rather than a silently empty answer. A
+    /// checkpoint at the last number there is leaves the log with none to give ([`Exhausted`]).
     pub const fn resume_after(&mut self, consumed: StreamCursor) {
         let next = consumed.get().saturating_add(1);
         if next > self.next {
@@ -345,9 +449,15 @@ mod tests {
     fn log(count: u64) -> SemanticLog {
         let mut log = SemanticLog::new();
         for index in 1..=count {
-            log.append("message", format!("entry {index}"), TimestampMs::new(index));
+            said(&mut log, format!("entry {index}"), index);
         }
         log
+    }
+
+    /// Appends one message at `at`, which every log these tests write has numbers left for.
+    fn said(log: &mut SemanticLog, text: impl Into<String>, at: u64) -> StreamCursor {
+        log.append("message", text, TimestampMs::new(at))
+            .expect("the log has numbers left")
     }
 
     struct EverythingAdmitted;
@@ -360,8 +470,13 @@ mod tests {
 
     /// Replays with section 8's whole allowance, which every entry these tests write fits.
     fn whole(log: &SemanticLog, from: Option<StreamCursor>, filter: &dyn HistoryFilter) -> Replay {
-        log.replay(from, filter, MAX_SEMANTIC_SNAPSHOT_BYTES)
-            .expect("every entry fits a part of its own")
+        log.replay(
+            from,
+            filter,
+            MAX_SEMANTIC_SNAPSHOT_BYTES,
+            SnapshotCarried::NOTHING,
+        )
+        .expect("every entry fits a part of its own")
     }
 
     /// An entry is paid for at what it encodes to, not at the length of its text: a part with room
@@ -373,7 +488,12 @@ mod tests {
         let first = log.entries[0].1.clone();
         let allowance = encoded_bytes(&first) + ("entry 2".len() + "entry 3".len()) as u64;
         let part = log
-            .replay(None, &EverythingAdmitted, allowance)
+            .replay(
+                None,
+                &EverythingAdmitted,
+                allowance,
+                SnapshotCarried::NOTHING,
+            )
             .expect("the first entry fits");
         assert_eq!(part.entries, [first], "the first entry and no more");
         let continuation = part.continuation.expect("the part says where it stopped");
@@ -391,12 +511,17 @@ mod tests {
         const ALLOWANCE: u64 = 1_000;
         let large = "€".repeat(2_000);
         let mut log = SemanticLog::new();
-        log.append("message", "said before", TimestampMs::new(1));
-        log.append("message", large.clone(), TimestampMs::new(2));
-        log.append("message", "said after", TimestampMs::new(3));
+        said(&mut log, "said before", 1);
+        said(&mut log, large.clone(), 2);
+        said(&mut log, "said after", 3);
 
         let before = log
-            .replay(None, &EverythingAdmitted, ALLOWANCE)
+            .replay(
+                None,
+                &EverythingAdmitted,
+                ALLOWANCE,
+                SnapshotCarried::NOTHING,
+            )
             .expect("a part");
         assert_eq!(before.entries.len(), 1);
         assert_eq!(before.entries[0].text, "said before");
@@ -404,7 +529,12 @@ mod tests {
         assert_eq!(before.resume_at, Some(StreamCursor::new(2)));
 
         let cut = log
-            .replay(Some(StreamCursor::new(1)), &EverythingAdmitted, ALLOWANCE)
+            .replay(
+                Some(StreamCursor::new(1)),
+                &EverythingAdmitted,
+                ALLOWANCE,
+                SnapshotCarried::NOTHING,
+            )
             .expect("a part");
         assert_eq!(cut.entries.len(), 1, "the large entry is a part of its own");
         let entry = &cut.entries[0];
@@ -427,7 +557,12 @@ mod tests {
         assert_eq!(cut.resume_at, Some(StreamCursor::new(3)));
 
         let after = log
-            .replay(Some(cut.consumed), &EverythingAdmitted, ALLOWANCE)
+            .replay(
+                Some(cut.consumed),
+                &EverythingAdmitted,
+                ALLOWANCE,
+                SnapshotCarried::NOTHING,
+            )
             .expect("a part");
         assert_eq!(after.entries.len(), 1);
         assert_eq!(after.entries[0].text, "said after");
@@ -440,7 +575,7 @@ mod tests {
     fn an_entry_that_does_not_fit_without_its_text_is_refused() {
         let log = log(1);
         let refused = log
-            .replay(None, &EverythingAdmitted, 8)
+            .replay(None, &EverythingAdmitted, 8, SnapshotCarried::NOTHING)
             .expect_err("no entry fits eight bytes");
         assert_eq!(refused.node, 1);
         assert_eq!(refused.allowance, 8);
@@ -465,7 +600,7 @@ mod tests {
     fn an_evicted_range_rebuilds_with_a_visible_history_gap() {
         let mut log = SemanticLog::new();
         for index in 1..=(MAX_RETAINED_ENTRIES as u64 + 10) {
-            log.append("message", format!("entry {index}"), TimestampMs::new(index));
+            said(&mut log, format!("entry {index}"), index);
         }
         assert!(log.first_retained().get() > 1);
 
@@ -522,11 +657,11 @@ mod tests {
         // stepped backwards leaves them.
         let large = "x".repeat(9 * 1024 * 1024);
         let mut log = SemanticLog::new();
-        log.append("message", large.clone(), TimestampMs::new(1_000));
-        log.append("message", large.clone(), TimestampMs::new(2_500));
-        log.append("message", large.clone(), TimestampMs::new(1_500));
-        log.append("message", large, TimestampMs::new(3_000));
-        log.append("message", "said before, last", TimestampMs::new(1_200));
+        said(&mut log, large.clone(), 1_000);
+        said(&mut log, large.clone(), 2_500);
+        said(&mut log, large.clone(), 1_500);
+        said(&mut log, large, 3_000);
+        said(&mut log, "said before, last", 1_200);
         let filter = reaching_back_to(2_000);
 
         let first = whole(&log, None, &filter);
@@ -552,19 +687,163 @@ mod tests {
         assert!(nothing.continuation.is_none());
     }
 
-    /// An entry number is never given twice, at the end of the numbering as anywhere else.
+    /// An entry number is never given twice, at the end of the numbering as anywhere else: the
+    /// log gives the last number it has and refuses the entries after it, recording nothing, and
+    /// a reader that consumed the last entry is given nothing again.
     #[test]
     fn an_entry_number_is_never_given_twice_at_the_end_of_the_numbering() {
         let mut log = SemanticLog::new();
         log.resume_after(StreamCursor::new(u64::MAX - 2));
-        let numbers: Vec<u64> = (0..3_u64)
-            .map(|index| {
-                log.append("message", format!("entry {index}"), TimestampMs::new(index))
-                    .get()
-            })
+        let given: Vec<Result<StreamCursor, Exhausted>> = (0..3_u64)
+            .map(|index| log.append("message", format!("entry {index}"), TimestampMs::new(index)))
             .collect();
-        let distinct: std::collections::BTreeSet<&u64> = numbers.iter().collect();
-        assert_eq!(distinct.len(), numbers.len(), "numbers given: {numbers:?}");
+        assert_eq!(
+            given,
+            [
+                Ok(StreamCursor::new(u64::MAX - 1)),
+                Err(Exhausted),
+                Err(Exhausted)
+            ],
+            "the last number, then refusals"
+        );
+        let replayed = whole(
+            &log,
+            Some(StreamCursor::new(u64::MAX - 2)),
+            &EverythingAdmitted,
+        );
+        assert_eq!(replayed.entries.len(), 1, "a refused entry is not recorded");
+        let after = whole(
+            &log,
+            Some(StreamCursor::new(u64::MAX - 1)),
+            &EverythingAdmitted,
+        );
+        assert!(
+            after.entries.is_empty(),
+            "and the last one is not given again"
+        );
+
+        let mut spent = SemanticLog::new();
+        spent.resume_after(StreamCursor::new(u64::MAX));
+        assert_eq!(
+            spent.append("message", "more", TimestampMs::new(1)),
+            Err(Exhausted),
+            "a checkpoint at the last number leaves none to give"
+        );
+    }
+
+    /// The control: ordinary numbering is what it was, one after another from one, and from one
+    /// past a resumed checkpoint.
+    #[test]
+    fn entries_are_numbered_one_after_another() {
+        let mut log = SemanticLog::new();
+        let numbers: Vec<u64> = (1..=3)
+            .map(|at| said(&mut log, "entry", at).get())
+            .collect();
+        assert_eq!(numbers, [1, 2, 3]);
+        let mut resumed = SemanticLog::new();
+        resumed.resume_after(StreamCursor::new(40));
+        assert_eq!(said(&mut resumed, "entry", 1).get(), 41);
+        assert_eq!(resumed.next_cursor(), StreamCursor::new(42));
+    }
+
+    /// A part is paid for out of what the snapshot's earlier parts left of section 8's total, not
+    /// out of a fresh total of its own: an entry that would pass it ends the snapshot with a
+    /// continuation that names the total and the entry, even with the part's own allowance to
+    /// spare, and the part says the snapshot has ended.
+    #[test]
+    fn a_part_is_paid_for_out_of_what_the_earlier_parts_left() {
+        let log = log(3);
+        let entry = encoded_bytes(&log.entries[0].1);
+        let nearly_spent = SnapshotCarried {
+            nodes: 7,
+            bytes: MAX_SEMANTIC_SNAPSHOT_BYTES - entry + 1,
+        };
+        let part = log
+            .replay(
+                None,
+                &EverythingAdmitted,
+                MAX_SEMANTIC_SNAPSHOT_BYTES,
+                nearly_spent,
+            )
+            .expect("a part");
+        assert!(part.entries.is_empty(), "the first entry passes the total");
+        let continuation = part.continuation.expect("the part says where it stopped");
+        assert_eq!(continuation.limit, SemanticLimit::Bytes);
+        assert_eq!(continuation.limit_value.get(), MAX_SEMANTIC_SNAPSHOT_BYTES);
+        assert_eq!(continuation.from_node.get(), 1);
+        assert_eq!(part.resume_at, Some(StreamCursor::new(1)));
+        assert_eq!(part.carried, None, "the snapshot has ended");
+
+        let room_for_one = SnapshotCarried {
+            nodes: 7,
+            bytes: MAX_SEMANTIC_SNAPSHOT_BYTES - entry,
+        };
+        let part = log
+            .replay(
+                None,
+                &EverythingAdmitted,
+                MAX_SEMANTIC_SNAPSHOT_BYTES,
+                room_for_one,
+            )
+            .expect("a part");
+        assert_eq!(part.entries.len(), 1, "exactly the total fits");
+        assert_eq!(
+            part.continuation
+                .expect("the next passes it")
+                .limit_value
+                .get(),
+            MAX_SEMANTIC_SNAPSHOT_BYTES
+        );
+        assert_eq!(part.carried, None);
+    }
+
+    /// A part cut by its own allowance says what the snapshot has carried with it, so the next
+    /// part is paid for out of what is left; a part that carries the rest says the snapshot ended.
+    #[test]
+    fn a_part_cut_by_its_allowance_says_what_the_snapshot_has_carried() {
+        let log = log(3);
+        let first = encoded_bytes(&log.entries[0].1);
+        let earlier = SnapshotCarried {
+            nodes: 2,
+            bytes: 100,
+        };
+        let part = log
+            .replay(None, &EverythingAdmitted, first, earlier)
+            .expect("a part");
+        assert_eq!(part.entries.len(), 1);
+        assert_eq!(
+            part.carried,
+            Some(SnapshotCarried {
+                nodes: 3,
+                bytes: 100 + first
+            })
+        );
+        let rest = log
+            .replay(
+                Some(part.consumed),
+                &EverythingAdmitted,
+                MAX_SEMANTIC_SNAPSHOT_BYTES,
+                part.carried.expect("the snapshot continues"),
+            )
+            .expect("a part");
+        assert_eq!(rest.entries.len(), 2);
+        assert!(rest.continuation.is_none());
+        assert_eq!(rest.carried, None, "the snapshot is whole");
+    }
+
+    /// The snapshot's own first entry has the whole total to itself, so one larger than the total
+    /// is carried cut in its part, as it always was, rather than ending every snapshot at itself.
+    #[test]
+    fn a_snapshots_first_entry_is_decided_by_its_part() {
+        let mut log = SemanticLog::new();
+        let large = "x".repeat(usize::try_from(MAX_SEMANTIC_SNAPSHOT_BYTES).expect("fits") + 10);
+        said(&mut log, large, 1);
+        let part = log
+            .replay(None, &EverythingAdmitted, 1_000, SnapshotCarried::NOTHING)
+            .expect("a part");
+        assert_eq!(part.entries.len(), 1, "carried, cut");
+        assert!(part.entries[0].omitted_text_bytes.get() > 0);
+        assert!(part.continuation.is_none());
     }
 
     #[test]

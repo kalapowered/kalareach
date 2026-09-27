@@ -130,7 +130,7 @@ pub use crate::broker::listener::{
 };
 pub use crate::broker::methods::{
     ActionInFlight, AnswerInFlight, Caller, MarkedAnswer, MutationAdmission, MutationInFlight,
-    PendingTransmission, RegisteredAction, Responsible, TakenMutation, UpstreamBody,
+    PendingTransmission, RegisteredAction, Responsible, SnapshotPart, TakenMutation, UpstreamBody,
     UpstreamDispatch, UpstreamOutcome, UpstreamRequest, command, subject,
 };
 pub use crate::broker::process::{
@@ -141,7 +141,9 @@ pub use crate::broker::profiles::{
     ForegroundMark, LaunchIntent, LaunchReservation, ProfileStore, RegisteredLaunch,
     RegistrationRefused, new_profile_id,
 };
-pub use crate::broker::semantic::{GrantLowerBound, HistoryFilter, Replay, SemanticLog};
+pub use crate::broker::semantic::{
+    Exhausted, GrantLowerBound, HistoryFilter, Replay, SemanticLog, SnapshotCarried,
+};
 pub use crate::broker::tokens::{Invocation, TokenStore};
 pub use crate::broker::volatile::{RecoveryGeneration, VolatileState, VolatileTransition};
 
@@ -3488,7 +3490,8 @@ impl Broker {
     ///
     /// # Errors
     ///
-    /// Returns [`BrokerError::UnknownSubject`] when this broker holds no such instance.
+    /// Returns [`BrokerError::UnknownSubject`] when this broker holds no such instance, and
+    /// [`BrokerError::ResourceUnavailable`] when its history has given every entry number it has.
     pub fn observe(
         &self,
         application_instance_id: ApplicationInstanceId,
@@ -3501,11 +3504,16 @@ impl Broker {
             .instances
             .get_mut(&application_instance_id)
             .ok_or_else(|| unknown_instance(application_instance_id))?;
-        Ok(instance.semantic.append(kind, text, now))
+        instance
+            .semantic
+            .append(kind, text, now)
+            .map_err(BrokerError::from)
     }
 
     /// Replays what an adapter has not consumed, through the actor's own history filter, in a
     /// part whose entries encode to at most `max_bytes` ([`SemanticLog::replay`]).
+    ///
+    /// An adapter's replay is not a part of a snapshot, so nothing is carried before it.
     ///
     /// # Errors
     ///
@@ -3519,6 +3527,29 @@ impl Broker {
         filter: &dyn crate::broker::semantic::HistoryFilter,
         max_bytes: u64,
     ) -> Result<crate::broker::semantic::Replay> {
+        self.replay_part(
+            application_instance_id,
+            from,
+            filter,
+            max_bytes,
+            crate::broker::semantic::SnapshotCarried::NOTHING,
+        )
+    }
+
+    /// Replays one part of a snapshot whose earlier parts carried `carried`
+    /// ([`SemanticLog::replay`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`Broker::replay`] does.
+    pub(crate) fn replay_part(
+        &self,
+        application_instance_id: ApplicationInstanceId,
+        from: Option<StreamCursor>,
+        filter: &dyn crate::broker::semantic::HistoryFilter,
+        max_bytes: u64,
+        carried: crate::broker::semantic::SnapshotCarried,
+    ) -> Result<crate::broker::semantic::Replay> {
         let state = self.state();
         let instance = state
             .instances
@@ -3526,7 +3557,7 @@ impl Broker {
             .ok_or_else(|| unknown_instance(application_instance_id))?;
         instance
             .semantic
-            .replay(from, filter, max_bytes)
+            .replay(from, filter, max_bytes, carried)
             .map_err(|uncarried| BrokerError::InvalidArgument(uncarried.to_string()))
     }
 

@@ -36,7 +36,7 @@ use kr_protocol::semantic::{SemanticContinuation, SemanticLimit};
 
 use crate::broker::arbitration::Claim;
 use crate::broker::error::{BrokerError, Result};
-use crate::broker::semantic::HistoryFilter;
+use crate::broker::semantic::{HistoryFilter, SnapshotCarried};
 use crate::broker::tokens::Invocation;
 use crate::broker::{Broker, DispatchAdmission};
 
@@ -885,6 +885,19 @@ impl RegisteredAction {
     }
 }
 
+/// One part of an `agent.snapshot`, and what its snapshot has carried.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SnapshotPart {
+    /// The answer.
+    pub result: AgentSnapshotResult,
+    /// What the snapshot's parts have carried, this one included, when a later part continues it.
+    ///
+    /// `None` when this part is the snapshot's last: nothing was left out, or the parts together
+    /// reached section 8's total, and what is asked for from the continuation is a snapshot of its
+    /// own.
+    pub carried: Option<SnapshotCarried>,
+}
+
 /// What a caller presents for an agent mutation.
 #[derive(Clone, Debug)]
 pub struct Caller {
@@ -916,23 +929,43 @@ impl Broker {
     }
 
     /// Answers `agent.snapshot`, filtered by the actor's own history filter, in an answer that
-    /// encodes to at most `max_answer_bytes`.
-    ///
-    /// The answer is measured before its first entry with everything in it that varies at its
-    /// widest, and what is left is the part's allowance, so a part cut to it is an answer inside
-    /// the bound whatever its counters and continuation turn out to be.
+    /// encodes to at most `max_answer_bytes`, as the first part of a snapshot: nothing was carried
+    /// before it ([`Broker::agent_snapshot_part`]).
     ///
     /// # Errors
     ///
-    /// Returns [`BrokerError::UnknownSubject`] when the instance is not one this worker serves,
-    /// and [`BrokerError::InvalidArgument`] when the bound cannot carry the answer with no entry
-    /// in it, or an entry of this history even with no text.
+    /// Returns what [`Broker::agent_snapshot_part`] does.
     pub fn agent_snapshot(
         &self,
         params: &AgentSnapshotParams,
         filter: &dyn HistoryFilter,
         max_answer_bytes: usize,
     ) -> Result<AgentSnapshotResult> {
+        self.agent_snapshot_part(params, filter, max_answer_bytes, SnapshotCarried::NOTHING)
+            .map(|part| part.result)
+    }
+
+    /// Answers one part of an `agent.snapshot` whose earlier parts carried `carried`, filtered by
+    /// the actor's own history filter, in an answer that encodes to at most `max_answer_bytes`.
+    ///
+    /// The answer is measured before its first entry with everything in it that varies at its
+    /// widest, and what is left is the part's allowance, so a part cut to it is an answer inside
+    /// the bound whatever its counters and continuation turn out to be. Section 8's total is spent
+    /// by the parts together: this one is paid for out of what `carried` left of it, and says what
+    /// the snapshot has carried with it when a later part continues it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::UnknownSubject`] when the instance is not one this worker serves,
+    /// and [`BrokerError::InvalidArgument`] when the bound cannot carry the answer with no entry
+    /// in it, or an entry of this history even with no text.
+    pub fn agent_snapshot_part(
+        &self,
+        params: &AgentSnapshotParams,
+        filter: &dyn HistoryFilter,
+        max_answer_bytes: usize,
+        carried: SnapshotCarried,
+    ) -> Result<SnapshotPart> {
         self.check_subject(&params.subject)?;
         let binding = self.binding_state(params.subject.application_instance_id)?;
         let bound = u64::try_from(max_answer_bytes).unwrap_or(u64::MAX);
@@ -950,18 +983,22 @@ impl Broker {
             .as_ref()
             .and_then(|node| node.get().checked_sub(1))
             .map(StreamCursor::new);
-        let replay = self.replay(
+        let replay = self.replay_part(
             params.subject.application_instance_id,
             from,
             filter,
             allowance,
+            carried,
         )?;
-        Ok(AgentSnapshotResult {
-            binding,
-            entries: replay.entries,
-            continuation: Nullable::from(replay.continuation),
-            history_gap: replay.history_gap,
-            withheld_entries: U64::new(replay.withheld),
+        Ok(SnapshotPart {
+            result: AgentSnapshotResult {
+                binding,
+                entries: replay.entries,
+                continuation: Nullable::from(replay.continuation),
+                history_gap: replay.history_gap,
+                withheld_entries: U64::new(replay.withheld),
+            },
+            carried: replay.carried,
         })
     }
 

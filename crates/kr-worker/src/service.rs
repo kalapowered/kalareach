@@ -5235,19 +5235,30 @@ impl WorkerService {
     /// One part travels in one control frame, so a part is cut to what this connection said it
     /// can receive once the rest of the answer is in it, and a continuation says where the next
     /// part starts. An entry larger than that on its own is carried with its text cut.
+    ///
+    /// Section 8's 16 MiB bounds one snapshot across its parts, so a part that continues a
+    /// snapshot this connection is reading for this caller is paid for out of what the snapshot's
+    /// earlier parts left ([`SemanticSnapshots`]).
     fn agent_snapshot(
         &self,
-        state: &ConnectionState,
+        state: &mut ConnectionState,
         params: &ParamsValue,
         caller: &Caller,
     ) -> Result<ParamsValue> {
         let params: kr_protocol::agent::AgentSnapshotParams = parse(params)?;
         let filter = Self::history_of(caller, Method::AgentSnapshot, "an agent snapshot")?;
-        encode(
-            &self
-                .broker
-                .agent_snapshot(&params, &filter, Self::frame_bytes(state))?,
-        )
+        let reading = SnapshotReading {
+            reader: SnapshotReader::of(caller),
+            application_instance_id: params.subject.application_instance_id,
+        };
+        let carried = state
+            .semantic_snapshots
+            .carried_before(&reading, params.from_node.as_ref().map(|node| node.get()));
+        let part =
+            self.broker
+                .agent_snapshot_part(&params, &filter, Self::frame_bytes(state), carried)?;
+        state.semantic_snapshots.after(reading, &part);
+        encode(&part.result)
     }
 
     /// Returns the history filter a caller reads `method` through, or the refusal it gets instead.
@@ -6386,6 +6397,8 @@ pub struct ConnectionState {
     pub pending_statement: Option<crate::attention_fence::Statement>,
     /// The screen a new subscription is drawn before live output resumes.
     pub restoration: Option<JoinedScreen>,
+    /// The semantic snapshots this connection is part-way through reading.
+    semantic_snapshots: SemanticSnapshots,
     /// The delivery task this connection owns, cancelled when the connection goes.
     delivery: Option<Delivery>,
     /// The host-issued principal this connection acts under.
@@ -6443,6 +6456,7 @@ impl ConnectionState {
             pending_report: Vec::new(),
             pending_statement: None,
             restoration: None,
+            semantic_snapshots: SemanticSnapshots::default(),
             delivery: None,
             actor_id: ActorId::new(format!("local:{}", peer.uid))
                 .unwrap_or_else(|_| ActorId::new("local").expect("a valid principal")),
@@ -6492,6 +6506,85 @@ impl ConnectionState {
         self.next_request += 1;
         RequestId::new(self.next_request)
     }
+}
+
+/// The semantic snapshots one connection is part-way through reading.
+///
+/// Section 8 bounds a semantic snapshot at 16 MiB across its parts, and a reader asks for each
+/// part with no more than the node it starts at, so what the earlier parts carried is kept here
+/// until the snapshot ends. A request that asks from exactly where this connection's last part for
+/// that reader and instance ended continues that snapshot and is paid for out of what it has left;
+/// any other request begins a snapshot. The control daemon's connection carries many readers'
+/// reads, so each reader is kept apart. There is at most one entry for each reader and instance,
+/// and every entry goes with the connection.
+#[derive(Debug, Default)]
+struct SemanticSnapshots {
+    reading: std::collections::BTreeMap<SnapshotReading, Reading>,
+}
+
+impl SemanticSnapshots {
+    /// Returns what the snapshot a request from `from_node` continues has carried, or nothing
+    /// when the request begins a snapshot.
+    fn carried_before(
+        &self,
+        reading: &SnapshotReading,
+        from_node: Option<u64>,
+    ) -> crate::broker::SnapshotCarried {
+        match (from_node, self.reading.get(reading)) {
+            (Some(node), Some(held)) if node == held.next_node => held.carried,
+            _ => crate::broker::SnapshotCarried::NOTHING,
+        }
+    }
+
+    /// Keeps where the snapshot `part` belongs to continues, or lets it go when `part` ended it.
+    fn after(&mut self, reading: SnapshotReading, part: &crate::broker::SnapshotPart) {
+        match (part.carried, part.result.continuation.as_ref()) {
+            (Some(carried), Some(continuation)) => {
+                self.reading.insert(
+                    reading,
+                    Reading {
+                        next_node: continuation.from_node.get(),
+                        carried,
+                    },
+                );
+            }
+            _ => {
+                self.reading.remove(&reading);
+            }
+        }
+    }
+}
+
+/// Whose snapshot of which instance one read belongs to.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct SnapshotReading {
+    reader: SnapshotReader,
+    application_instance_id: kr_protocol::ids::ApplicationInstanceId,
+}
+
+/// Who reads a snapshot: the principal, and the grant and device it reads under.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct SnapshotReader {
+    actor_id: ActorId,
+    grant_id: Option<kr_protocol::ids::GrantId>,
+    device_id: Option<kr_protocol::ids::DeviceId>,
+}
+
+impl SnapshotReader {
+    fn of(caller: &Caller) -> Self {
+        Self {
+            actor_id: caller.actor_id.clone(),
+            grant_id: caller.grant_id.as_ref().copied(),
+            device_id: caller.device(),
+        }
+    }
+}
+
+/// Where a snapshot's next part starts, and what its parts have carried.
+#[derive(Clone, Copy, Debug)]
+struct Reading {
+    next_node: u64,
+    carried: crate::broker::SnapshotCarried,
 }
 
 /// The task delivering a connection's subscription, and how it is told a newer one replaced it.

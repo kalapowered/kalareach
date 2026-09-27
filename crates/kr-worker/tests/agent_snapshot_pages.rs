@@ -12,7 +12,7 @@
 //!
 //! | Row | What proves it |
 //! | --- | --- |
-//! | KR-REQ-08.72 | `a_history_larger_than_the_frame_is_read_in_parts_that_each_fit`, `an_entry_larger_than_the_frame_is_carried_cut`, `a_snapshot_whose_parts_pass_the_total_is_cut_at_it` |
+//! | KR-REQ-08.72 | `a_history_larger_than_the_frame_is_read_in_parts_that_each_fit`, `an_entry_larger_than_the_frame_is_carried_cut`, `a_snapshot_whose_parts_pass_the_total_is_cut_at_it`, `two_readers_on_one_connection_each_spend_a_total_of_their_own` |
 //! | KR-REQ-23.39 | `a_history_that_fits_one_frame_answers_whole_with_no_continuation`, `a_narrowed_part_counts_what_it_withheld_and_spends_nothing_on_it`, `a_snapshot_under_the_total_is_read_in_parts_that_never_name_it` |
 
 use std::sync::Arc;
@@ -613,4 +613,108 @@ async fn a_snapshot_under_the_total_is_read_in_parts_that_never_name_it() {
         from = Some(continuation.from_node.get());
     }
     assert_eq!(read, said, "every entry once, in the order it was said");
+}
+
+/// Another paired device, under a grant of its own.
+fn second_device() -> ActorEnvelope {
+    ActorEnvelope {
+        actor_id: ActorId::new("device:another-test-phone").expect("an actor"),
+        device_id: Nullable::some(DeviceId::new(Uuid::from_bytes([19; 16]))),
+        grant_id: Nullable::some(GrantId::new(Uuid::from_bytes([18; 16]))),
+        ..device()
+    }
+}
+
+/// Forwards one device's read of a part as the daemon does, and holds the answer to the usual
+/// frame.
+async fn forwarded_part(
+    daemon: &mut LocalClient,
+    host: &Host,
+    actor: &ActorEnvelope,
+    from_node: Option<u64>,
+    request_id: u64,
+) -> AgentSnapshotResult {
+    let read = ControlFrame::ForwardedRead(Box::new(ForwardedRequest {
+        request: Request {
+            request_id: RequestId::new(request_id),
+            method: Method::AgentSnapshot.into(),
+            method_version: MethodVersion::V1,
+            params: ParamsValue::from_typed(&params(host, from_node)).expect("encodes"),
+        },
+        authority_deadline_boot_ms: Nullable::some(U64::new(
+            kr_ipc::clock::boot_elapsed_ms() + 30_000,
+        )),
+        actor: actor.clone(),
+        history: Some(reaching_back_to(0)),
+    }));
+    let outcome = within("the worker's answer", async {
+        daemon
+            .writer()
+            .write_message(&read)
+            .await
+            .expect("writes the read");
+        loop {
+            match daemon.recv().await.expect("the worker answers") {
+                ControlFrame::Response(response) => return response.outcome,
+                ControlFrame::Notification(_) | ControlFrame::Event(_) => {}
+                other => panic!("the worker answered {other:?}"),
+            }
+        }
+    })
+    .await;
+    let Outcome::Ok(answer) = outcome else {
+        panic!("the device reads the snapshot: {outcome:?}");
+    };
+    fits(&answer, USUAL_FRAME);
+    answer.to_typed().expect("the snapshot decodes")
+}
+
+/// KR-REQ-08.72: the daemon's one connection carries many readers' reads, and each reader's
+/// snapshot spends a total of its own. Two devices read the same history part by part, in turns,
+/// on that connection, and each one's first snapshot carries sixteen entries and ends at the
+/// total, as one reader's alone does: neither reader's parts are paid for out of the other's
+/// total, and neither begins its snapshot again because the other read in between.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_readers_on_one_connection_each_spend_a_total_of_their_own() {
+    let host = host().await;
+    let said = converse_millions(&host, 20);
+    let total = kr_protocol::semantic::MAX_SEMANTIC_SNAPSHOT_BYTES;
+    let readers = [device(), second_device()];
+
+    let mut daemon = daemon(&host, ReceiveLimits::default()).await;
+    let mut read: [Vec<String>; 2] = [Vec::new(), Vec::new()];
+    let mut from: [Option<u64>; 2] = [None, None];
+    let mut ended: [bool; 2] = [false, false];
+    let mut request_id = 100;
+    while ended.iter().any(|done| !done) {
+        for (index, reader) in readers.iter().enumerate() {
+            if ended[index] {
+                continue;
+            }
+            request_id += 1;
+            let part = forwarded_part(&mut daemon, &host, reader, from[index], request_id).await;
+            read[index].extend(part.entries.iter().map(|entry| entry.text.clone()));
+            let continuation = part
+                .continuation
+                .0
+                .expect("a history larger than the total continues past the first snapshot");
+            if continuation.limit_value.get() == total {
+                ended[index] = true;
+            } else {
+                from[index] = Some(continuation.from_node.get());
+            }
+            assert!(
+                read[index].len() <= 16,
+                "reader {index} read {} entries in one snapshot",
+                read[index].len()
+            );
+        }
+    }
+    for (index, entries) in read.iter().enumerate() {
+        assert_eq!(
+            entries,
+            &said[..16],
+            "reader {index}'s first snapshot carries the first sixteen"
+        );
+    }
 }

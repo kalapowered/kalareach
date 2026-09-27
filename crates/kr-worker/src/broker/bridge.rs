@@ -742,7 +742,9 @@ impl crate::broker::Broker {
     ///
     /// # Errors
     ///
-    /// Returns [`BrokerError::UnknownSubject`] when this broker holds no such instance.
+    /// Returns [`BrokerError::UnknownSubject`] when this broker holds no such instance, and
+    /// [`BrokerError::ResourceUnavailable`] when its history has given every entry number it has,
+    /// before anything about the observation is decided.
     pub fn observe_bridge(
         &self,
         application_instance_id: ApplicationInstanceId,
@@ -751,6 +753,12 @@ impl crate::broker::Broker {
         now: TimestampMs,
     ) -> Result<(ThreadChange, StreamCursor)> {
         let mut state = self.state();
+        if instance_of(&mut state, application_instance_id)?
+            .semantic
+            .is_exhausted()
+        {
+            return Err(crate::broker::semantic::Exhausted.into());
+        }
         let thread = match observation.event {
             ObservedEvent::ThreadStarted
             | ObservedEvent::ThreadContinued
@@ -771,9 +779,10 @@ impl crate::broker::Broker {
                 .bridge
                 .remember_request(request.clone(), observation.thread.clone());
         }
-        let cursor = instance
-            .semantic
-            .append(observation.event.kind(), observation.summary(), now);
+        let cursor =
+            instance
+                .semantic
+                .append(observation.event.kind(), observation.summary(), now)?;
         Ok((thread, cursor))
     }
 
