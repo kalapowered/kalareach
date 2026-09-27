@@ -248,7 +248,7 @@ pub struct Remapped {
 /// there is nowhere for a per-session model to be recorded.
 ///
 /// It is a record, not an owner. Replacing an entry returns the entry it replaced so its owner can
-/// release the weights, and [`crate::service::DescriptionService::ensure_mapped`] is the caller
+/// release the weights, and [`crate::service::DescriptionService`] is the caller
 /// that does: it unloads its runtime first and maps second.
 #[derive(Debug, Default)]
 pub struct ModelMapping {
