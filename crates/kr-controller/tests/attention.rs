@@ -798,6 +798,9 @@ async fn a_question_answered_inside_a_backlog_owes_nothing_when_the_store_catche
 /// KR-REQ-25.01: a notification the session printed with nothing attached to take it is an
 /// untrusted notice, routed by the owner's notification policy, told to the owner in the
 /// session's words, and never an approval.
+///
+/// KR-REQ-19.05: a notification a terminal printed reaches the host as untrusted data, never as an
+/// approval.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_notification_becomes_an_untrusted_notice_and_never_an_approval() {
     let one = worker().await;

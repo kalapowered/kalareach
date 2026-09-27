@@ -749,6 +749,9 @@ fn an_enormous_parameter_is_bounded_before_the_grid_sees_it() {
 }
 
 /// Shell-integration sequences produce untrusted observations rather than authority.
+///
+/// KR-REQ-19.05: what a shell prints about its directory, its prompt and its terminal is an
+/// observation the host records as data, and carries no authority.
 #[test]
 fn shell_integration_produces_untrusted_observations() {
     let mut engine = Engine::new(EngineConfig::default()).expect("engine");

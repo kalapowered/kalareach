@@ -31,6 +31,8 @@ use support::{
     write,
 };
 
+/// KR-REQ-19.05: a repository's own configuration is untrusted data: every helper it plants is
+/// neutralised, and none runs while the host reads the repository's status or refreshes a review.
 #[test]
 fn no_planted_helper_runs_during_a_status_or_a_review_refresh() {
     let fixture = Fixture::create();
@@ -94,6 +96,8 @@ fn no_planted_helper_runs_during_a_status_or_a_review_refresh() {
     );
 }
 
+/// KR-REQ-19.05: cloning or adopting a repository runs nothing its content planted, and a clone
+/// copies none of its hooks.
 #[test]
 fn no_planted_helper_runs_during_a_clone_of_the_planted_repository_or_an_adoption_of_it() {
     let fixture = Fixture::with_brokers(installed_broker());
@@ -162,6 +166,8 @@ fn no_planted_helper_runs_during_a_clone_of_the_planted_repository_or_an_adoptio
     );
 }
 
+/// KR-REQ-19.05: a repository whose configuration names a helper this host cannot neutralise is
+/// refused as untrusted rather than taken into the registry, and nothing runs before the refusal.
 #[test]
 fn a_repository_whose_configuration_names_a_remote_helper_is_refused_rather_than_adopted() {
     let fixture = Fixture::create();
