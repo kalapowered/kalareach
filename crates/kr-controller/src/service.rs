@@ -4236,21 +4236,30 @@ impl Controller {
             .ok_or_else(|| {
                 ControllerError::supervision("the first admissions for this worker are empty")
             })?;
-        Ok((
-            WorkerLaunchSpec {
-                session_id: reservation.session_id,
-                session_epoch: SessionEpoch::V1,
-                environment_id: self.paths.environment_id(),
-                display_number: reservation.display_number,
-                create,
-                shell_package,
-                controller_public_key: *self.identity.public_key(),
-                controller_generation: self.generation,
-                release: self.release.clone(),
-                plugins,
-            },
-            admissions,
-        ))
+        let mut specification = WorkerLaunchSpec {
+            session_id: reservation.session_id,
+            session_epoch: SessionEpoch::V1,
+            environment_id: self.paths.environment_id(),
+            display_number: reservation.display_number,
+            create,
+            shell_package,
+            controller_public_key: *self.identity.public_key(),
+            controller_generation: self.generation,
+            release: self.release.clone(),
+            plugins,
+        };
+        // The specification is one control frame. Integrations it cannot carry are left out, the
+        // largest first, and named for the doctor: the session starts without them.
+        for plugin_id in
+            crate::catalogue::integrations::fit_launch_specification(&mut specification)
+        {
+            self.note_admissions(format!(
+                "session {} was launched without the command integration of {plugin_id}: the \
+                 session's integrations are more than its launch specification carries",
+                reservation.session_id
+            ));
+        }
+        Ok((specification, admissions))
     }
 
     /// The command integrations a session launched with `admissions` gets: one for each

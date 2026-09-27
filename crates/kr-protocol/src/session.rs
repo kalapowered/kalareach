@@ -241,6 +241,8 @@ pub struct CommandIntegration {
     /// The command name this integration applies to, as typed.
     pub command: String,
     /// The flags the agent needs, added to an interactive invocation.
+    ///
+    /// An entry that is off carries none: nothing is added under it.
     pub flags: Vec<String>,
     /// Whether the user has enabled it. A disabled integration changes nothing.
     pub enabled: bool,

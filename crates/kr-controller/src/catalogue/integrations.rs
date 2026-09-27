@@ -76,11 +76,17 @@ pub fn entries(reading: &Reading, enabled: &[String]) -> Vec<CommandIntegration>
                 return None;
             }
             let plugin_id = connector.plugin_id();
+            let on = enabled.iter().any(|named| named == plugin_id.as_str());
             Some(CommandIntegration {
-                enabled: enabled.iter().any(|named| named == plugin_id.as_str()),
+                enabled: on,
                 plugin_id,
                 command: integration.command.clone(),
-                flags: integration.flags.clone(),
+                // An entry that is off adds nothing, so it carries nothing to add.
+                flags: if on {
+                    integration.flags.clone()
+                } else {
+                    Vec::new()
+                },
             })
         })
         .collect();
@@ -100,8 +106,29 @@ pub const MAX_REPORTED_FLAG_BYTES: usize = 256 * 1024;
 pub fn fit_launch_specification(
     specification: &mut kr_protocol::worker::WorkerLaunchSpec,
 ) -> Vec<kr_protocol::ids::PluginId> {
-    let _ = specification;
-    Vec::new()
+    let codec = kr_protocol::frame::FrameCodec::new(kr_protocol::frame::StreamKind::Control);
+    let fits = |specification: &kr_protocol::worker::WorkerLaunchSpec| {
+        codec
+            .encode_message(&kr_protocol::envelope::ControlFrame::LaunchSpec(Box::new(
+                specification.clone(),
+            )))
+            .is_ok()
+    };
+    let mut omitted = Vec::new();
+    while !fits(specification) {
+        let entries = &mut specification.create.launch_profile.command_integrations;
+        let largest = entries
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, entry)| entry.flags.iter().map(String::len).sum::<usize>())
+            .map(|(index, _)| index);
+        let Some(largest) = largest else {
+            // What does not fit without any integration is not theirs to make fit.
+            break;
+        };
+        omitted.push(entries.remove(largest).plugin_id);
+    }
+    omitted
 }
 
 /// What the doctor reads of this host beside its admissions.
@@ -273,9 +300,24 @@ pub fn report(
         };
         reports.insert(plugin_id.clone(), (report, None));
     }
+    let mut reported_flag_bytes = 0usize;
     reports
         .into_values()
         .map(|(mut report, connector)| {
+            let flag_bytes: usize = report.flags.iter().map(String::len).sum();
+            if reported_flag_bytes + flag_bytes > MAX_REPORTED_FLAG_BYTES {
+                let said = format!(
+                    "its {} flags, {flag_bytes} bytes, are more than this report carries",
+                    report.flags.len()
+                );
+                report.flags.clear();
+                report.reason = Nullable::some(match report.reason.0.take() {
+                    Some(reason) => format!("{reason}; {said}"),
+                    None => said,
+                });
+            } else {
+                reported_flag_bytes += flag_bytes;
+            }
             if report.state == CommandIntegrationState::On {
                 report.unavailable = Nullable(if !host.backends {
                     Some(CommandIntegrationUnavailable::Platform)

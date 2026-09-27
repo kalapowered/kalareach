@@ -388,13 +388,15 @@ choose one, which is what `kr new` without `--desktop` or `--headless` uses. `co
 names the installed packages, as `publisher/plugin`, whose command integration a session applies:
 the host fills a session's integrations in when the session is launched, one entry for each
 admitted package whose integration applies there, on where this list names the package and off
-where it does not, and a create request that names one is refused. A profile's list replaces the
-host's, and an empty list turns every integration off at that level. `kr plugin integration enable`
-and `disable` edit the host's list, and the change reaches the sessions created afterwards.
-`kr doctor` reports each integration: what a new session gets of it and why, the mode its command
-runs in, the flags and variables it adds, and the executable the daemon's own search path resolves
-the command to, with the version a signed qualification record gives that executable. A session
-whose own search path differs can find another; each launch records the one it ran.
+where it does not, and a create request that names one is refused. An entry that is off carries no
+flags. Where a session's entries are more than one launch message carries, the largest are left out
+and the doctor's catalogue check names each one. A profile's list replaces the host's, and an empty
+list turns every integration off at that level. `kr plugin integration enable` and `disable` edit
+the host's list, and the change reaches the sessions created afterwards. `kr doctor` reports each
+integration: what a new session gets of it and why, the mode its command runs in, the flags and
+variables it adds, and the executable the daemon's own search path resolves the command to, with
+the version a signed qualification record gives that executable. A session whose own search path
+differs can find another; each launch records the one it ran.
 
 The document the sleep setting used to live in, `power.json`, is not read. A copy found beside the
 configuration is reported by `kr doctor` in one line and ignored.
