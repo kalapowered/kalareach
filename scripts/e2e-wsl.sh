@@ -49,28 +49,50 @@ set -euo pipefail
 # OS user's environment names. Every one of those inputs is mirrored into a directory of this run's
 # own, the installed helper is asked where it then reads an account token (which lies directly in
 # the runtime root) and where it publishes the identity it allocates on a first use (which lies
-# directly in the state root), and each answer is mapped back through the input it came from. A
-# root the product names outside every mirrored input is the same absolute path here as it is in
-# the distribution this one was copied from, and is taken as it stands.
+# directly in the state root), and each answer is mapped back through the input it came from. What
+# is removed is the exact value that input holds, followed by the plain path the helper named below
+# its mirror. Every root the product derives on Linux lies inside one of those inputs, so an answer
+# outside every mirror, or one whose part below its mirror is not a plain path, stops the run
+# before anything is removed. Nothing is read back through a step that could change it unseen: the
+# probe is made in a directory whose name is a plain path, the helper's answer is taken as it
+# wrote it, a listing of names ends each one with a NUL byte, and a name read through a command
+# substitution keeps any newline at its end.
 #
 # **Which storage.** A directory that is not there was not inherited, and is left alone. A
 # directory that is there is removed only when the whole of it -- the directory and everything
 # under it -- is on the filesystem the image carries, which is the one the root of this
 # distribution is on. Anything else -- a symbolic link out to storage shared between
-# distributions, a bind mount of somewhere else at its top or at any directory inside it -- is not
-# this copy's to remove and not something a copy can be made independent of, so the run stops
-# before it removes anything and says which path it was.
+# distributions, a mount of other storage at its top or at any directory inside it -- is not this
+# copy's to remove and not something a copy can be made independent of, so the run stops before it
+# removes anything and says which path it was. The test is by device, so a bind mount of another
+# directory of the same filesystem is not told apart from the directory it covers.
 #
-# The program runs inside the distribution, with the installed helper as its first argument and the
-# root of the image as its second, which inside a distribution is `/`. It makes its probe under
-# TMPDIR. The self-test below runs the same program on this host, with a stand-in for the helper
-# and a tree of its own for the image.
+# The program runs inside the distribution. Its arguments are the installed helper, the root of the
+# image (`/` inside a distribution) and the directory its probe is made in. The self-test below runs
+# the same program on this host, with a stand-in for the helper and a tree of its own for the image.
 # shellcheck disable=SC2016  # the program is expanded where it runs, not here
 inherited_reset='
     set -e
     helper="$1"
     image="$2"
-    probe="$(mktemp -d "${TMPDIR:-/tmp}/kr-acc-probe.XXXXXX")"
+    parent="$3"
+    # Every path this program reads back from another program lies under its probe, so the probe
+    # is made in a directory whose name is a plain path: nothing in it can split, cut short or
+    # escape what is read back.
+    case "$parent" in
+      /*) ;;
+      *)
+        echo "the probe directory $parent is not an absolute path" >&2
+        exit 1
+        ;;
+    esac
+    case "$parent" in
+      *[!A-Za-z0-9._/-]*)
+        echo "the probe directory $parent is not a plain path, so nothing is read back from under it" >&2
+        exit 1
+        ;;
+    esac
+    probe="$(mktemp -d "$parent/kr-acc-probe.XXXXXX")"
     # Each mirror is owner-only, because a mirror can become a root the product creates its files
     # in directly, and the product refuses a root anyone else can read.
     #
@@ -86,8 +108,10 @@ inherited_reset='
       eval "configured_$index=\$value"
       eval "export $name=\"\$probe/\$index\""
     done
-    token="$("$helper" --json account token show | tr -d " \n\r" |
-      sed -n "s/.*\"path\":\"\([^\"]*\)\".*/\1/p")"
+    # The value is read as the helper wrote it, with nothing taken out of it. A path the document
+    # had to escape keeps its backslash, which the plain-path rule below refuses.
+    token="$("$helper" --json account token show |
+      sed -n "s/.*\"path\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p")"
     [ -n "$token" ] || {
       echo "the helper did not say where it reads an account token, so its runtime root is not known" >&2
       exit 1
@@ -95,14 +119,23 @@ inherited_reset='
     # This has no daemon to reach and fails once it has allocated the identity, which is the part
     # being read here.
     "$helper" list >/dev/null 2>&1 || true
-    marker="$(find "$probe" -type f -printf "%d %p\n" | sort -n | head -n 1 | cut -d" " -f2-)"
+    # The shallowest file the helper made, read from a listing that ends each record with a NUL
+    # byte, and through an x that keeps any newline at the end of its name.
+    marker="$(find "$probe" -type f -printf "%d %p\0" | sort -z -n | head -z -n 1 |
+      cut -z -d" " -f2- | tr -d "\000"; printf x)"
+    marker="${marker%x}"
     [ -n "$marker" ] || {
       echo "the helper published no identity of its own, so its state root is not known" >&2
       exit 1
     }
     image_device="$(stat -c %d "$image")"
-    for named in "$(dirname "$token")" "$(dirname "$marker")"; do
-      real="$named"
+    for named in "${token%/*}" "${marker%/*}"; do
+      # What is removed is the exact value an input holds, followed by the plain path the helper
+      # named below the mirror of that input. A path outside every mirror, or one whose part below
+      # its mirror is not a plain path, is not one this run can map back exactly, so the run stops
+      # before it removes anything.
+      real=""
+      below=""
       mapped=0
       while [ "$mapped" -lt "$index" ]; do
         mapped=$((mapped + 1))
@@ -110,10 +143,21 @@ inherited_reset='
         case "$named" in
           "$mirror" | "$mirror"/*)
             eval "value=\$configured_$mapped"
-            real="$value${named#"$mirror"}"
+            below="${named#"$mirror"}"
+            real="$value$below"
             ;;
         esac
       done
+      [ -n "$real" ] || {
+        echo "the helper named $named, which is outside every directory this run mirrored" >&2
+        exit 1
+      }
+      case "$below" in
+        *[!A-Za-z0-9._/-]* | */. | */./* | */.. | */../* | *//*)
+          echo "the helper named $named, and what lies below the directory this run mirrored is not a plain path" >&2
+          exit 1
+          ;;
+      esac
       # What the path leads to, not what it says: a component of it may be a link somewhere else.
       # A command substitution drops every newline at the end of what it reads, and a name can end
       # in one, so an x follows the answer and only the newline readlink adds is taken off with it.
@@ -160,8 +204,9 @@ shared with the distribution this one was copied from" >&2
 # The self-test runs the program above on this host, against trees of its own, and checks what it
 # removed and what it left. A stand-in answers for the installed helper: it names the roots the way
 # the product names them on Linux and publishes an identity the way a first use does. Every root a
-# case names lies inside that case's own tree, and the program is given no other environment, so
-# nothing outside the tree can be named, let alone removed.
+# case configures lies inside that case's own tree, and the program is given no other environment.
+# The program removes nothing but a configured root, or a plain path below one, so nothing outside
+# the tree can be removed.
 self_test_work=""
 self_test_passed=0
 self_test_failed=0
@@ -173,14 +218,16 @@ self_test_cleanup() {
   fi
 }
 
-# Runs the removal for one case, with the image it names and the environment it gives. The probe is
-# made in the case's own directory.
+# Runs the removal for one case, with the image and the probe directory it names and the environment
+# it gives. TMPDIR names the probe directory too, so whatever the helper or a tool makes in a
+# temporary directory stays in the case's tree.
 self_test_reset() {
-  local directory="$1" image="$2"
-  shift 2
-  mkdir -p "$directory/tmp" &&
-    env -i PATH="$PATH" TMPDIR="$directory/tmp" "$@" \
-      /bin/sh -c "$inherited_reset" sh "$self_test_work/helper" "$image" >"$directory/said" 2>&1
+  local directory="$1" image="$2" parent="$3"
+  shift 3
+  mkdir -p "$directory" "$parent" &&
+    env -i PATH="$PATH" TMPDIR="$parent" "$@" \
+      /bin/sh -c "$inherited_reset" sh "$self_test_work/helper" "$image" "$parent" \
+      >"$directory/said" 2>&1
 }
 
 # An ordinary installation, found through HOME and XDG_RUNTIME_DIR, is removed whole, and what lies
@@ -193,7 +240,8 @@ self_test_ordinary_tree() {
   printf x >"$state/sessions/one" || return 1
   printf x >"$d/home/.local/state/beside/kept" || return 1
   printf x >"$d/run/kalareach/account-token" || return 1
-  self_test_reset "$d" "$self_test_work" HOME="$d/home" XDG_RUNTIME_DIR="$d/run" || return 1
+  self_test_reset "$d" "$self_test_work" "$d/tmp" HOME="$d/home" XDG_RUNTIME_DIR="$d/run" ||
+    return 1
   [ ! -e "$state" ] && [ ! -e "$d/run/kalareach" ] && [ -f "$d/home/.local/state/beside/kept" ]
 }
 
@@ -205,7 +253,8 @@ self_test_newline_name() {
   mkdir -p "$state/$inner" || return 1
   printf x >"$state/$inner/one" || return 1
   printf x >"$state/"$'journal\ncontinued' || return 1
-  self_test_reset "$d" "$self_test_work" HOME="$d/home" KR_RUNTIME_DIR="$d/run" || return 1
+  self_test_reset "$d" "$self_test_work" "$d/tmp" HOME="$d/home" KR_RUNTIME_DIR="$d/run" ||
+    return 1
   [ ! -e "$state" ]
 }
 
@@ -215,7 +264,7 @@ self_test_ordinary_root() {
   mkdir -p "$d/state/sessions" "$d/state-beside" || return 1
   printf x >"$d/state/sessions/one" || return 1
   printf x >"$d/state-beside/kept" || return 1
-  self_test_reset "$d" "$self_test_work" \
+  self_test_reset "$d" "$self_test_work" "$d/tmp" \
     HOME="$d/home" KR_STATE_DIR="$d/state" KR_RUNTIME_DIR="$d/run" || return 1
   [ ! -e "$d/state" ] && [ -f "$d/state-beside/kept" ]
 }
@@ -228,9 +277,41 @@ self_test_newline_root() {
   mkdir -p "$root/sessions" "$d/state" || return 1
   printf x >"$root/sessions/one" || return 1
   printf x >"$d/state/kept" || return 1
-  self_test_reset "$d" "$self_test_work" \
+  self_test_reset "$d" "$self_test_work" "$d/tmp" \
     HOME="$d/home" KR_STATE_DIR="$root" KR_RUNTIME_DIR="$d/run" || return 1
   [ ! -e "$root" ] && [ -f "$d/state/kept" ]
+}
+
+# A probe directory whose name is not a plain path is refused before anything is read back from
+# under it, and nothing is removed. This one holds a newline, which a listing that ended each name
+# with one would split into a name above the probe.
+self_test_unplain_probe() {
+  local d="$self_test_work/${FUNCNAME[0]}"
+  local parent="$d/parent/name"$'\n'"999"
+  local state="$d/home/.local/state/kalareach"
+  mkdir -p "$parent" "$state" || return 1
+  printf x >"$d/parent/kept" || return 1
+  printf x >"$state/registry" || return 1
+  if self_test_reset "$d" "$self_test_work" "$parent" HOME="$d/home" KR_RUNTIME_DIR="$d/run"; then
+    return 1
+  fi
+  grep -q -F -e "is not a plain path, so nothing is read back from under it" "$d/said" &&
+    [ -f "$d/parent/kept" ] && [ -f "$state/registry" ]
+}
+
+# A root the helper names outside every directory the run mirrored is refused, and nothing there is
+# removed. Every root the product derives on Linux lies inside one of them, so a root outside them
+# is one this run cannot tell belongs to the copy.
+self_test_unmirrored_root() {
+  local d="$self_test_work/${FUNCNAME[0]}"
+  mkdir -p "$d/outside/run" || return 1
+  printf x >"$d/outside/run/kept" || return 1
+  if self_test_reset "$d" "$self_test_work" "$d/tmp" \
+    HOME="$d/home" STAND_IN_RUNTIME_ROOT="$d/outside/run"; then
+    return 1
+  fi
+  grep -q -F -e "which is outside every directory this run mirrored" "$d/said" &&
+    [ -f "$d/outside/run/kept" ]
 }
 
 # A root that is a link is resolved: what it leads to is removed, and the link is left.
@@ -239,7 +320,7 @@ self_test_link_root() {
   mkdir -p "$d/elsewhere/state/sessions" || return 1
   printf x >"$d/elsewhere/state/sessions/one" || return 1
   ln -s "$d/elsewhere/state" "$d/state" || return 1
-  self_test_reset "$d" "$self_test_work" \
+  self_test_reset "$d" "$self_test_work" "$d/tmp" \
     HOME="$d/home" KR_STATE_DIR="$d/state" KR_RUNTIME_DIR="$d/run" || return 1
   [ ! -e "$d/elsewhere/state" ] && [ -L "$d/state" ]
 }
@@ -263,7 +344,7 @@ self_test_other_storage() {
   fi
   mkdir -p "$state" || return 1
   printf x >"$state/registry" || return 1
-  if self_test_reset "$d" "$other" HOME="$d/home" KR_RUNTIME_DIR="$d/run"; then
+  if self_test_reset "$d" "$other" "$d/tmp" HOME="$d/home" KR_RUNTIME_DIR="$d/run"; then
     return 1
   fi
   grep -q -F -e "leads to $state, which is on storage this image does not carry" "$d/said" &&
@@ -292,7 +373,7 @@ self_test_mount_inside() {
       shift
       exec "$@"' sh "$state/mounted" \
     env -i PATH="$PATH" TMPDIR="$d/tmp" HOME="$d/home" KR_RUNTIME_DIR="$d/run" \
-    /bin/sh -c "$inherited_reset" sh "$self_test_work/helper" "$self_test_work" \
+    /bin/sh -c "$inherited_reset" sh "$self_test_work/helper" "$self_test_work" "$d/tmp" \
     >"$d/said" 2>&1 || status=$?
   if [ "$status" = 90 ]; then
     echo "  the mount could not be made: $(cat "$d/said")"
@@ -336,8 +417,11 @@ self_test() {
   cat >"$self_test_work/helper" <<'STAND_IN' || return 2
 #!/bin/sh
 # Stands in for the installed helper. It names the roots the way the product names them on Linux,
-# says where it reads an account token, and publishes an identity the way a first use does.
-if [ -n "${KR_RUNTIME_DIR-}" ]; then
+# says where it reads an account token, and publishes an identity the way a first use does. A case
+# can give it a runtime root of its own, as a product that read one from somewhere else would.
+if [ -n "${STAND_IN_RUNTIME_ROOT-}" ]; then
+  runtime="$STAND_IN_RUNTIME_ROOT"
+elif [ -n "${KR_RUNTIME_DIR-}" ]; then
   runtime="$KR_RUNTIME_DIR"
 elif [ -n "${XDG_RUNTIME_DIR-}" ]; then
   runtime="$XDG_RUNTIME_DIR/kalareach"
@@ -376,6 +460,10 @@ STAND_IN
     "an ordinary configured root is removed, and the directory beside it is left"
   self_test_case self_test_newline_root \
     "a configured root whose name ends in a newline is removed, and the name without it is left"
+  self_test_case self_test_unplain_probe \
+    "a probe directory whose name is not a plain path is refused, and nothing is removed"
+  self_test_case self_test_unmirrored_root \
+    "a root named outside every mirrored directory is refused, and nothing is removed"
   self_test_case self_test_link_root \
     "a root that is a link is resolved, and what it leads to is removed"
   self_test_case self_test_other_storage \
@@ -661,9 +749,9 @@ clear_inherited_installation() {
   local distribution="$1"
   echo "  $distribution: removing the installation it inherited from the distribution it was copied from"
   # The image of a distribution is the whole of it, so the storage it carries is the filesystem its
-  # root is on.
+  # root is on. The probe is made in the distribution's own /tmp.
   wsl.exe -d "$distribution" -u "$linux_user" --exec /bin/sh -lc "$inherited_reset" \
-    sh "$helper_path" / ||
+    sh "$helper_path" / /tmp ||
     fail "$distribution could not be given an installation of its own"
   # The leftovers this acceptance itself put in the distribution that was copied. The file it
   # writes a daemon identifier into would otherwise name a process in that other distribution.
