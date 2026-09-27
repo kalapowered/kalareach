@@ -904,7 +904,8 @@ impl Logged {
         ready: Option<&str>,
     ) -> Self {
         login_holds(stage, variables);
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        keychain_readable_in_a_session(stage, variables);
+        let mut logged = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             Self::reach_composer(stage, variables, what, part, extra, ready)
         }))
         .unwrap_or_else(|panic| {
@@ -912,7 +913,21 @@ impl Logged {
                 "{LOGIN_UNPROVEN} the agent did not reach its composer with it: {}",
                 panic_text(&*panic)
             )
-        })
+        });
+        // The composer's own screen says so where the agent found no login, before any turn.
+        let account = stage.login.expect("a part with a login").account();
+        let rows = logged.screen.view.rows();
+        if let Some(shown) = account
+            .signed_out
+            .iter()
+            .find(|text| rows.iter().any(|row| row.contains(text.as_str())))
+        {
+            panic!(
+                "{LOGIN_UNPROVEN} the agent's composer shows {shown:?} before any turn:\n{}",
+                rows.join("\n")
+            );
+        }
+        logged
     }
 
     /// [`Logged::start`] without its checks.
@@ -1016,6 +1031,58 @@ impl Logged {
             std::panic::resume_unwind(panic)
         })
     }
+}
+
+/// For an agent whose login is a login keychain item: whether a session made as the agent's own can
+/// read its default keychain, before the agent starts. The agent itself runs `security
+/// show-keychain-info` and takes exit status 36, user interaction not allowed, as a keychain it
+/// cannot take its login from; the same command runs here, at the prompt of a session with the
+/// agent's variables, with its output discarded, and only its status is read. The session is
+/// closed again before the agent's own opens.
+fn keychain_readable_in_a_session(stage: &Stage<'_, '_>, variables: &[(String, String)]) {
+    let account = stage.login.expect("a part with a login").account();
+    if !account.login_keychain {
+        return;
+    }
+    let session = open_session(
+        stage.host,
+        stage.owner,
+        stage.runtime,
+        stage.shell,
+        variables,
+        "a session that reads its default keychain",
+    );
+    // The status comes back as 1000 more than itself, so the line that shows it is not the
+    // command's own echo.
+    session.window.type_text(
+        b"/usr/bin/security show-keychain-info >/dev/null 2>&1; echo kr-keychain-probe-$(( $? + 1000 ))\r",
+    );
+    let rows = session.window.wait_for_screen(
+        "kr-keychain-probe-1",
+        "the session says how its keychain answered",
+    );
+    let status = rows
+        .iter()
+        .find_map(|row| {
+            let at = row.find("kr-keychain-probe-1")?;
+            row[at + "kr-keychain-probe-".len()..]
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+                .parse::<i64>()
+                .ok()
+        })
+        .map(|shown| shown - 1000);
+    session.window.type_text(b"exit\r");
+    let mut session = session;
+    let _ = session.window.exit_code(LIVENESS);
+    session.remote.close();
+    assert!(
+        status == Some(0),
+        "{LOGIN_UNPROVEN} in a session made as the agent's own, `security show-keychain-info` \
+         exits {status:?}, where the agent's own check takes 36 (user interaction not allowed) as \
+         a keychain it cannot read its login from"
+    );
 }
 
 /// Checks, where the build list names the agent's status command, that the login holds: the
