@@ -1216,12 +1216,18 @@ mod platform {
         /// exactly the definition; one that is not, or that cannot be read back, has its change
         /// undone, and the refusal says whether it was.
         ///
+        /// The Task Scheduler changes a task by its name alone, and offers no change that holds
+        /// only while the task is what was looked at, so an edit something other than this host
+        /// makes between the look and the change is not refused. The definition is written before
+        /// the look, so what comes between the two is the Task Scheduler's command starting.
+        ///
         /// # Errors
         ///
         /// Returns what went wrong: a foreign task, a registration the Task Scheduler refused, or
         /// a task that did not read back as the one registered.
         pub fn set_up(&self) -> Result<TaskChange, TaskError> {
             let definition = self.definition;
+            let written = Written::definition(definition, &definition.xml())?;
             let (found, exported) = read(definition)?;
             let change = match found {
                 Standing::Foreign(foreign) => return Err(TaskError::Foreign(foreign)),
@@ -1229,11 +1235,11 @@ mod platform {
                     return Ok(TaskChange::Unchanged);
                 }
                 Standing::Owned(_) => {
-                    create(definition, &definition.xml(), true)?;
+                    written.register(definition, true)?;
                     TaskChange::Repaired { prior: exported }
                 }
                 Standing::Absent => {
-                    if let Err(error) = create(definition, &definition.xml(), false) {
+                    if let Err(error) = written.register(definition, false) {
                         // A creation refused because the name was taken meanwhile, by something
                         // that does not take this lock, leaves that task as it is and says whose
                         // it is. Otherwise the creation's own failure stands, a look that fails
@@ -1246,6 +1252,7 @@ mod platform {
                     TaskChange::Registered
                 }
             };
+            drop(written);
             super::settle(&definition.name, change, standing(definition), |change| {
                 self.undo(change)
             })
@@ -1256,7 +1263,9 @@ mod platform {
         ///
         /// A task of the same name that is not this environment's is refused and left as it is.
         /// Removing a task leaves every process it started running: only ending a run would end
-        /// them, and this host never ends one.
+        /// them, and this host never ends one. The Task Scheduler removes a task by its name alone,
+        /// so an edit something other than this host makes between the look and the removal is
+        /// not refused; nothing is done between the two but starting the Task Scheduler's command.
         ///
         /// # Errors
         ///
@@ -1287,28 +1296,34 @@ mod platform {
         /// refused.
         pub fn undo(&self, change: &TaskChange) -> Result<(), TaskError> {
             let definition = self.definition;
+            // A task to put back has its definition written before the look, as a setup does.
+            let written = match change {
+                TaskChange::Repaired { prior } | TaskChange::Removed { prior } => {
+                    Some(Written::definition(definition, prior)?)
+                }
+                TaskChange::Unchanged | TaskChange::Registered => None,
+            };
             let found = standing(definition)?;
             if let Standing::Foreign(foreign) = found {
                 return Err(TaskError::Foreign(foreign));
             }
-            match change {
-                TaskChange::Unchanged => Ok(()),
-                TaskChange::Registered => match found {
-                    Standing::Owned(_) => delete(definition),
+            let Some(written) = written else {
+                // Nothing to put back: an unchanged task stays, and a registered one goes.
+                return match (change, found) {
+                    (TaskChange::Registered, Standing::Owned(_)) => delete(definition),
                     _ => Ok(()),
-                },
-                TaskChange::Repaired { prior } | TaskChange::Removed { prior } => {
-                    create(definition, prior, matches!(found, Standing::Owned(_)))?;
-                    match standing(definition)? {
-                        Standing::Owned(_) => Ok(()),
-                        Standing::Foreign(foreign) => Err(TaskError::Foreign(foreign)),
-                        Standing::Absent => Err(TaskError::ReadBack {
-                            name: definition.name.clone(),
-                            found: super::ReadBack::Gone,
-                            undone: false,
-                        }),
-                    }
-                }
+                };
+            };
+            written.register(definition, matches!(found, Standing::Owned(_)))?;
+            drop(written);
+            match standing(definition)? {
+                Standing::Owned(_) => Ok(()),
+                Standing::Foreign(foreign) => Err(TaskError::Foreign(foreign)),
+                Standing::Absent => Err(TaskError::ReadBack {
+                    name: definition.name.clone(),
+                    found: super::ReadBack::Gone,
+                    undone: false,
+                }),
             }
         }
     }
@@ -1362,47 +1377,64 @@ mod platform {
         registration(definition)?.undo(change)
     }
 
-    /// Registers `xml` under `definition`'s name, through the Task Scheduler.
-    ///
-    /// `replace` says the task under the name is this environment's own, found so under the
-    /// registration lock, and is replaced. Otherwise the name was free when it was looked at, and
-    /// the creation takes it only if it still is: a definition given as XML without `/F` is
-    /// registered as a new task and refused when the name is held, so a task something else made
-    /// in the meantime is never replaced.
-    fn create(definition: &TaskDefinition, xml: &str, replace: bool) -> Result<(), TaskError> {
-        let file = definition
-            .working_directory
-            .join(format!("{}.xml", definition.name));
-        let mut bytes = vec![0xff, 0xfe];
-        bytes.extend(xml.encode_utf16().flat_map(u16::to_le_bytes));
-        kr_ipc::paths::write_owner_only_file(&file, &bytes).map_err(|error| {
-            TaskError::Unwritten(format!(
-                "write the definition of {}: {error}",
-                definition.name
-            ))
-        })?;
-        let file_text = file.display().to_string();
-        let mut arguments = vec!["/Create", "/TN", &definition.name, "/XML", &file_text];
-        if replace {
-            arguments.push("/F");
-        }
-        let created = schtasks_within(Asked::Register, &arguments);
-        let _ = std::fs::remove_file(&file);
-        let output = created?;
-        if !output.status.success() {
-            return Err(refused(
-                Asked::Register,
-                &format!("the Task Scheduler did not register {}", definition.name),
-                &output,
-            ));
-        }
-        Ok(())
+    /// A definition written for the Task Scheduler to read, as UTF-16, in the environment's
+    /// owner-only state directory, and removed again when this is dropped.
+    struct Written {
+        file: std::path::PathBuf,
     }
 
-    /// Registers `definition` through the Task Scheduler, as [`create`] does.
+    impl Written {
+        /// Writes `xml` for `definition`'s task.
+        fn definition(definition: &TaskDefinition, xml: &str) -> Result<Self, TaskError> {
+            let file = definition
+                .working_directory
+                .join(format!("{}.xml", definition.name));
+            let mut bytes = vec![0xff, 0xfe];
+            bytes.extend(xml.encode_utf16().flat_map(u16::to_le_bytes));
+            kr_ipc::paths::write_owner_only_file(&file, &bytes).map_err(|error| {
+                TaskError::Unwritten(format!(
+                    "write the definition of {}: {error}",
+                    definition.name
+                ))
+            })?;
+            Ok(Self { file })
+        }
+
+        /// Registers what was written under `definition`'s name, through the Task Scheduler.
+        ///
+        /// `replace` says the task under the name is this environment's own, found so under the
+        /// registration lock, and is replaced. Otherwise the name was free when it was looked at, and
+        /// the creation takes it only if it still is: a definition given as XML without `/F` is
+        /// registered as a new task and refused when the name is held, so a task something else made
+        /// in the meantime is never replaced.
+        fn register(&self, definition: &TaskDefinition, replace: bool) -> Result<(), TaskError> {
+            let file_text = self.file.display().to_string();
+            let mut arguments = vec!["/Create", "/TN", &definition.name, "/XML", &file_text];
+            if replace {
+                arguments.push("/F");
+            }
+            let output = schtasks_within(Asked::Register, &arguments)?;
+            if !output.status.success() {
+                return Err(refused(
+                    Asked::Register,
+                    &format!("the Task Scheduler did not register {}", definition.name),
+                    &output,
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    impl Drop for Written {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.file);
+        }
+    }
+
+    /// Registers `definition` through the Task Scheduler, as [`Written::register`] does.
     #[cfg(test)]
     pub(super) fn create_task(definition: &TaskDefinition, replace: bool) -> Result<(), TaskError> {
-        create(definition, &definition.xml(), replace)
+        Written::definition(definition, &definition.xml())?.register(definition, replace)
     }
 
     /// Removes the task under `definition`'s name, which the caller found to be this environment's

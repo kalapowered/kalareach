@@ -1193,7 +1193,11 @@ privilege. It has no trigger, runs its instances in parallel, has no time limit 
 priority, and its one action runs this installation's `kr-controller` as the environment's starter.
 Its description carries the
 environment's full identifier, and the principal and the description together say whose it is: a
-task under the name that is not this environment's own is never replaced or removed. `kr new` runs
+task under the name that is not this environment's own when kr looks at it is never replaced or
+removed. The Task Scheduler changes a task by its name alone and cannot be asked to change one only
+while it is what was looked at, so an edit another program or the user makes in the moment between
+kr's look and its change is not refused; kr writes what it registers before it looks, so nothing
+comes between the two but the Task Scheduler's command starting. `kr new` runs
 it when no daemon answers, having left a request its starter takes once, and the starter starts the
 daemon, so the daemon and every process it starts are outside the command's jobs. The starter gives
 the daemon a console of its own that shows no window, and the console programs the daemon runs share
