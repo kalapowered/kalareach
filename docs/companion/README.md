@@ -59,21 +59,45 @@ window can go no further. On a phone with larger text they wrap onto a second li
 
 Take control is the only way in, and its label says it is a takeover. The view asks the session for
 its one input lease, which takes the keys from whoever held them, and a window in the history comes
-back to the live screen. While the session answers, the view says it is asking. Once
-it has control, the program gets the wheel on both platforms, as wheel events at the session's cell
-under the pointer, one turn for each row of scrolling, in the encoding the program chose, and only
-while the program reports the mouse. A wheel never becomes arrow keys. On the phone a one-finger drag
-turns the wheel the same way, once for each row the finger crosses, at the cell under the finger, and
-the terminal keys and the field's named keys go to the program; while the view watches, the keys are
-disabled and the field keeps its own. When the program is not using the wheel, control mode says so
-and points to Look around, which gives control back at once. Control also ends when another view
-takes it, when the program starts reading keys in a form the view does not send, or when the session
-refuses the view's input, and the view goes back to view mode with a sentence on why. Every write under a
-lease carries its number in the view's input stream, and after a refused write the view writes under
-that lease no more: taking control again starts a new one. A view declares a terminal profile of its
-own, which the host has not qualified, so it is always drawn a projection, and the host takes it to
-send the ordinary encoding of keys: a program that has turned on an enhanced keyboard protocol keeps
-control from it, and the view says why.
+back to the live screen. While the session answers, the view says it is asking. Once it has control,
+the program gets the wheel on both platforms, as wheel events at the session's cell under the
+pointer, one turn for each row of scrolling, in the encoding the program chose, and only while the
+program reports the mouse. A wheel never becomes arrow keys. On the phone a one-finger drag turns
+the wheel the same way, once for each row the finger crosses, at the cell under the finger, and the
+terminal keys go to the program; while the view watches, they are disabled. When the program is not
+using the wheel, control mode says so and points to Look around, which gives control back at once.
+Control also ends when another view takes it, when the program starts reading keys in a form the
+view does not send, or when the session refuses the view's input, and the view goes back to view
+mode with a sentence on why. Every write under a lease carries its number in the view's input
+stream, and after a refused write the view writes under that lease no more: taking control again
+starts a new one. A view declares a terminal profile of its own, which the host has not qualified,
+so it is always drawn a projection. The host's keyboard table gives that profile the encodings the
+view's keys can be spelled in on every platform: the ordinary encoding, `modifyOtherKeys` at level 1
+or 2, and the Kitty keyboard protocol's disambiguation and event types. A program that asks for
+more, such as the Kitty protocol's report of every key as an escape code, keeps control from the
+view, and the view says why.
+
+The page names each key as its platform reported it: the key, the character it makes with nothing
+held where the platform says so (Chromium's keyboard layout map, or else the key itself while
+neither Shift, Caps Lock, AltGraph nor Option is held), the keypad key it is, the modifiers, the
+locks, and whether it went down, repeated or came up. Native code spells the key through the
+client's shared encoder in the encoding the program negotiated, and spells a release only for a
+press it wrote in an encoding that reports releases. What an input method, dictation or a software
+keyboard commits goes as text, once, when it is committed, and never as keys made up for it. A paste
+goes as a paste, bracketed when the program asked for that. A chord with Command or the Windows key
+stays the platform's, and so do Control-Shift-C and Control-Shift-V off Apple platforms. A key, text
+or paste that cannot reach the program as it reads keys now, or before the view holds the session's
+screen, does not go: control stays, and the mode's sentence says why until an input does go. The
+page sends each input once native code has answered the one before, so inputs reach the program in
+the order the person made them.
+
+On the desktop the program's keyboard is an invisible field at the cursor's cell, where an input
+method opens its candidates, and what the input method composes is drawn there in the session's
+colours until it is committed. The field comes next after the mode button in keyboard order, a click
+on the terminal that selects nothing puts the focus in it, and the terminal shows a focus ring while
+it has the focus. Tab and Shift-Tab go to the program. Control-Tab and Control-Shift-Tab move the
+focus to the next control or the one before, and stop at the first and the last. When control ends
+with the focus in the field, the focus goes to the mode button.
 
 A drag belongs to the view it began in: taking control, the view ending or the session changing
 ends it without sending what it had not sent. The page never decides where the window is. Native
@@ -86,16 +110,20 @@ A session fits a window as narrow as 320 px. Its actions move below its title, i
 and at the same size, a long name or directory wraps whole, and the terminal's badges and footer
 controls wrap inside the terminal.
 
-While a phone shows the terminal, the composer under it folds into the terminal's bar. The mode,
-the zoom and, in view mode, the four moves take one or two rows. The status takes two lines, one
-for the warnings and where the window is and one for what the mode does and how the host presents
-the view, each cut short until More shows all of it; a screen reader reads all of it either way.
-Then come the terminal keys, and the text field as one line with Send beside it. Attachments are
-added in the conversation. While a software keyboard covers part of the session, the bar gives
-way to the terminal, its keys and the field, and the field sits on the keyboard's top edge. The
-terminal keeps at least four rows at its default size in any case: when the composer needs more
-room than is left, it scrolls from the bottom, so the field stays in view. The host is told the
-grid the terminal's surface shows.
+While a phone shows the terminal, the composer under it folds into the terminal's bar. The mode, the
+zoom and, in view mode, the four moves take one or two rows. The status takes two lines, one for the
+warnings and where the window is and one for what the mode does and how the host presents the view,
+each cut short until More shows all of it; a screen reader reads all of it either way. Then come the
+terminal keys, and the text field as one line with Send beside it. Attachments are added in the
+conversation. While the view controls the program, the field is the program's keyboard, in the same
+place and at the same size: the draft waits for control to end, Send goes with it, and the field
+says Type to the program where a placeholder would. A tap on a terminal key is the key's press and
+its release, with the modifiers the row holds for it, and it leaves the focus in the field, so the
+software keyboard stays up; a key typed on a hardware keyboard takes the row's modifiers too. While
+a software keyboard covers part of the session, the bar gives way to the terminal, its keys and the
+field, and the field sits on the keyboard's top edge. The terminal keeps at least four rows at its
+default size in any case: when the composer needs more room than is left, it scrolls from the
+bottom, so the field stays in view. The host is told the grid the terminal's surface shows.
 
 A selection in either raw view takes the session's own selection colours, except on iOS, which
 draws its own highlight over a page's selection. On the desktop a copy gives the selected pieces as

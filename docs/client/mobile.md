@@ -124,13 +124,17 @@ failures, and offers nothing to decide. Elapsed time is reported as elapsed time
   input each WebView already maps to them. `capture` opens the camera; an image filter opens the
   photo library; no filter opens the file browser.
 - **The accessory row** carries the keys a software keyboard buries: escape, tab, control, alt, the
-  arrows, home, end and the punctuation a shell needs. A modifier has three states — off, held for
-  one key, held — and says which one it is in rather than leaving it to a colour.
-- **A hardware keyboard** goes through the same translation, so the row and the keyboard cannot
-  disagree about what Control-C is. A chord with the platform's own modifier is left to the
-  platform.
+  arrows, home, end and the punctuation a shell needs. A modifier has three states (off, held for
+  one key, and held) and says which one it is in rather than leaving it to a colour. A tap on a key
+  is its press and its release, and leaves the focus where it was.
+- **A hardware keyboard** is named the same way as the row, and native code spells both in the
+  encoding the program reads, so the row and the keyboard cannot disagree about what Control-C is.
+  A chord with the platform's own modifier is left to the platform.
 - **The software keyboard** is measured rather than guessed: the difference between the visual and
-  the layout viewport is exactly what is covered, and the composer sits above it.
+  the layout viewport is exactly what is covered, and the composer sits above it. While the raw
+  terminal controls its program, what the software keyboard types goes to the program: its text as
+  text, and its Enter and Backspace as keys. The field holds one invisible character between edits,
+  so a Backspace always has something to delete.
 
 ## The raw terminal
 
