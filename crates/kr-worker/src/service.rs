@@ -5914,11 +5914,6 @@ struct Recovered {
     shown: std::collections::BTreeSet<kr_protocol::ids::PendingResourceId>,
 }
 
-/// Who one request is served as.
-///
-/// A local caller is the operating-system identity the socket authenticated. A forwarded caller is
-/// whoever the control daemon authenticated somewhere else, and the daemon vouches for four things
-/// this worker cannot establish for itself: the principal, the ingress the request entered the host
 /// Where a mutation's answer came from.
 ///
 /// The value is the same either way. What differs is what producing it means: performing the
@@ -5954,6 +5949,12 @@ enum Answered {
         receiver: tokio::sync::oneshot::Receiver<crate::fence::driver::LaunchAnswer>,
     },
 }
+
+/// Who one request is served as.
+///
+/// A local caller is the operating-system identity the socket authenticated. A forwarded caller is
+/// whoever the control daemon authenticated somewhere else, and the daemon vouches for four things
+/// this worker cannot establish for itself: the principal, the ingress the request entered the host
 /// by, the grant it was checked against and the authority revision it was checked at.
 #[derive(Clone, Debug)]
 pub struct Caller {
