@@ -309,7 +309,7 @@ the reason. Two intervals are decided here instead, because section 10 gives nei
 
 ## Vectors
 
-`fixtures/pairing/` holds three documents, regenerated with
+`fixtures/pairing/` holds four documents, regenerated with
 `cargo run -p kr-pairing --bin kr-pairing-vectors` and checked in continuous integration with
 `--check`:
 
@@ -318,12 +318,18 @@ the reason. Two intervals are decided here instead, because section 10 gives nei
 | `transcript.json` | The context and its hash, both role identities, `T` for two fixed library messages, the five HKDF keys, both confirmation tags, four bundle additional-data cases, the `pair.finish` message and tag, and the verification value |
 | `direct.json` | The transcript `D`, its digest, the secret proof over it and the direct verification value |
 | `codes.json` | The alphabet, the accepted and rejected parsing cases, and both QR payload encodings |
+| `bundles.json` | A host and a client key bundle, each signed by its own device's authorisation key over the bundle and `T`: the bundle, its canonical encoding, the signing input, the signature and the signed bundle's encoding; and four substitutions a verifier must refuse, each with the refusal it gets: a proposed grant changed after signing, a key-purpose declaration changed under the same key, a bundle offered to another attempt, and a signature replayed from another transcript |
 
 SPAKE2 draws fresh randomness per attempt, so the two library messages and the shared key are fixed
 literals rather than the output of an exchange; everything else is derived from them exactly as a
-real attempt derives it. `packages/protocol/test/pairing.test.ts` recomputes all of it with the Node
-runtime's own SHA-256, HMAC-SHA256 and HKDF-SHA256 and this repository's own TypeScript codec, so a
-value that drifts in one language fails in both.
+real attempt derives it. The bundles' device keys come from fixed seeds, and Ed25519 signs
+deterministically, so their signatures are fixed as well; nothing pairs with those keys.
+`packages/protocol/test/pairing.test.ts` recomputes the transcript, direct and code vectors with the
+Node runtime's own SHA-256, HMAC-SHA256 and HKDF-SHA256 and this repository's own TypeScript codec,
+so a value that drifts in one language fails in both. The signed bundles are checked in Rust, by
+`crates/kr-pairing/tests/fixtures.rs`: each signature verifies over its published signing input
+under the authorisation key its device declares and not under the other device's, and each
+substitution is refused the way the vector says.
 
 ## Release manifest
 
