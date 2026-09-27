@@ -38,6 +38,103 @@ pub struct Server {
     pub arguments: Vec<String>,
     /// Text its terminal shows once it serves.
     pub ready: String,
+    /// A path the server answers with status 200 once it serves requests, which can be later than
+    /// the text says so.
+    #[serde(default)]
+    pub health: Option<String>,
+}
+
+/// Whose home an agent runs with in the parts that need its login.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountHome {
+    /// The run's own, so none of the person's agent directories changes: the login is a keychain
+    /// item the run's home may search, or a variable.
+    Run,
+    /// The person's, where the agent keeps its login in files of its own.
+    Person,
+}
+
+/// A permission dialog the agent raises before it runs a command, and the keys that answer it.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Approval {
+    /// Text the dialog shows.
+    pub shows: String,
+    /// What allows the command once.
+    pub allow: String,
+    /// What refuses it.
+    pub deny: String,
+}
+
+/// How the parts that need the person's vendor login run the agent. Nothing here is a credential:
+/// a login is named by its kind and where it lives, and a variable by its name.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Account {
+    /// The login's kind, as the record names it, such as `vendor subscription login`.
+    pub login: String,
+    /// Where the login lives, by kind, such as `login keychain item`.
+    pub stored: String,
+    /// Whose home the agent runs with.
+    pub home: AccountHome,
+    /// Whether the run's home searches the person's login keychain, borrowed: the run never
+    /// creates or deletes a keychain for it.
+    #[serde(default)]
+    pub login_keychain: bool,
+    /// The variable the login is, taken from the harness's own environment, where it is one.
+    #[serde(default)]
+    pub variable: Option<String>,
+    /// Arguments typed after the command in these parts, such as a model.
+    #[serde(default)]
+    pub arguments: Vec<String>,
+    /// The budget these parts' turns are charged to: one per vendor login.
+    pub budget: String,
+    /// The most turns the budget allows.
+    pub turns: u64,
+    /// The agent's own directories in the person's home, relative to it, listed before and after
+    /// each part that runs there.
+    #[serde(default)]
+    pub directories: Vec<String>,
+    /// Whether the agent stops at the first part after which a file it had in those directories
+    /// was rewritten rather than appended to.
+    #[serde(default)]
+    pub stop_on_rewrite: bool,
+    /// Where the agent keeps its conversations, relative to the home it runs with.
+    pub conversations: String,
+    /// What marks the line of a conversation file that holds a prompt the person sent.
+    pub prompt_line: String,
+    /// Text the agent's first screen shows with the login.
+    pub ready: String,
+    /// Inputs typed first, each waited on by its screen text, to reach the composer.
+    #[serde(default)]
+    pub prepare: Vec<Keys>,
+    /// Text the screen shows while the composer waits for a prompt.
+    pub composer: String,
+    /// What submits a prompt typed in the composer.
+    pub submit: String,
+    /// What empties the composer without submitting it.
+    pub clear: String,
+    /// What marks the line of a conversation file that holds one of the agent's replies.
+    pub reply_line: String,
+    /// Text the screen shows while a turn runs.
+    pub busy: String,
+    /// A slash command that calls no model and changes no conversation, and the text it shows.
+    pub slash: Keys,
+    /// What closes the slash command's screen.
+    pub dismiss: String,
+    /// The key that interrupts a running turn, and the text the agent shows once it stopped.
+    pub interrupt: Keys,
+    /// Whether a prompt entered while a turn runs steers that turn, rather than waiting for it.
+    #[serde(default)]
+    pub steers: bool,
+    /// The dialog the agent raises before it runs a shell command.
+    pub approval: Approval,
+    /// The arguments that resume a saved conversation, with `{conversation}` for its identifier.
+    pub resume: Vec<String>,
+    /// How an image is given at the composer: `paste`, its absolute path as a terminal pastes it,
+    /// or a template with `{path}`.
+    pub image: String,
 }
 
 /// A newer build of the same application, installed beside the pinned one, for the upgrade case.
@@ -55,6 +152,65 @@ pub struct Newer {
     pub sha256: String,
     /// Text its first screen shows.
     pub ready: String,
+}
+
+/// One action the package's manifest declares, as a part uses it: the declaration as the manifest
+/// states it, read for its identifier, its effect, how it is carried out and its parameters.
+#[derive(Clone, Debug, Deserialize)]
+pub struct Action {
+    /// The action's identifier.
+    pub id: String,
+    /// Its effect class, such as `observe` or `upstream.prompt`.
+    pub effect: String,
+    /// How it is carried out, with its `type`, such as `presentation`.
+    pub implementation: serde_json::Value,
+    /// Its parameter declarations, under `parameters`.
+    #[serde(default)]
+    pub parameters: serde_json::Value,
+}
+
+impl Action {
+    /// Whether the host carries it out itself by redrawing the package's document: an
+    /// observation.
+    #[must_use]
+    pub fn presentation(&self) -> bool {
+        self.effect == "observe" && self.implementation["type"] == "presentation"
+    }
+
+    /// Whether it acts on the upstream agent.
+    #[must_use]
+    pub fn upstream(&self) -> bool {
+        self.effect.starts_with("upstream.")
+    }
+
+    /// Parameters the declaration accepts: each text parameter `text`, each choice its first
+    /// choice, so a refusal says something about the route and not about the parameters.
+    #[must_use]
+    pub fn well_formed(&self, text: &str) -> serde_json::Value {
+        let mut parameters = serde_json::Map::new();
+        for declared in self.parameters["parameters"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            let Some(name) = declared["name"].as_str() else {
+                continue;
+            };
+            let kind = &declared["kind"];
+            match kind["type"].as_str() {
+                Some("text") => {
+                    parameters.insert(name.to_owned(), serde_json::json!(text));
+                }
+                Some("choice") => {
+                    if let Some(first) = kind["choices"][0]["id"].as_str() {
+                        parameters.insert(name.to_owned(), serde_json::json!(first));
+                    }
+                }
+                _ => {}
+            }
+        }
+        serde_json::Value::Object(parameters)
+    }
 }
 
 /// How a launch of the build reaches its pinned file.
@@ -79,9 +235,9 @@ pub enum Launch {
 pub struct Build {
     /// The connector package qualified against this build, as `publisher/plugin`.
     pub package: String,
-    /// The actions the package's manifest registers, by identifier.
+    /// The actions the package's manifest declares.
     #[serde(default)]
-    pub actions: Vec<String>,
+    pub actions: Vec<Action>,
     /// The application, as the record names it.
     pub application: String,
     /// The version the package's table is pinned to.
@@ -130,6 +286,16 @@ pub struct Build {
     /// A newer build for the upgrade case, where one is named.
     #[serde(default)]
     pub newer: Option<Newer>,
+    /// How the parts that need the person's vendor login run the agent, where the person approved
+    /// one for it; why not, where not.
+    #[serde(default)]
+    pub account: Option<Account>,
+    /// Why the parts that need a login do not run, where the build has no `account`.
+    #[serde(default)]
+    pub no_account: Option<String>,
+    /// Why the upgrade part has no newer build, where the build has no `newer`.
+    #[serde(default)]
+    pub no_newer: Option<String>,
 }
 
 impl Build {
