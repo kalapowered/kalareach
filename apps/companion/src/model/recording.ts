@@ -69,10 +69,15 @@ export function recorded(recording: Recording, screen: TerminalScreen, atMs: num
   const dimensions = { columns: count(screen.window.columns), rows: count(screen.window.rows) }
   if (dimensions.columns === 0 || dimensions.rows === 0) return recording
   const text = screenText(screen)
+  // Two underline styles a player draws alike draw the same text, and the screen is still new.
+  const restyled = placedPieces(screen).some(
+    (piece) => !PLAYED_UNDERLINES.includes(piece.rendition.underline)
+  )
   const last = recording.frames.at(-1)
   if (
     last !== undefined &&
     last.text === text &&
+    last.restyled === restyled &&
     last.dimensions.columns === dimensions.columns &&
     last.dimensions.rows === dimensions.rows
   ) {
@@ -85,9 +90,7 @@ export function recorded(recording: Recording, screen: TerminalScreen, atMs: num
     text,
     bytes,
     dimensions,
-    restyled: placedPieces(screen).some(
-      (piece) => !PLAYED_UNDERLINES.includes(piece.rendition.underline)
-    ),
+    restyled,
     cursor: placedCursor(screen) !== null
   }
   let frames = [...recording.frames, frame]

@@ -301,6 +301,19 @@ describe('the recording the raw view keeps (KR-REQ-25.08)', () => {
     ])
   })
 
+  it('keeps a screen whose only change is an underline a player draws as a single one, and declares it', () => {
+    const single: CellRendition = { ...PLAIN, underline: 'single' }
+    const curly: CellRendition = { ...PLAIN, underline: 'curly' }
+    let recording = recorded(emptyRecording(), screenOf(10, 1, [[piece(0, 'wavy', 4, single)]]), 0)
+    recording = recorded(recording, screenOf(10, 1, [[piece(0, 'wavy', 4, curly)]]), 10)
+    expect(recording.frames).toHaveLength(2)
+    expect(recordingExport(recording)?.omissions).toContainEqual({
+      kind: 'underline_styles',
+      detail: 'Curly, dotted and dashed underlines, which play back as single ones',
+      count: 1
+    })
+  })
+
   it('counts its bound in bytes, and keeps no screen larger than the whole bound', () => {
     // Each of these is under the bound in UTF-16 units and over half of it in bytes.
     const wide = (mark: string) => screenOf(10, 1, [[piece(0, mark.repeat(1_500_000), 10)]])
