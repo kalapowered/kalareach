@@ -39,6 +39,12 @@
 //! tested — `a_pooled_connection_taken_away_costs_a_connection_and_never_a_second_request` and
 //! `a_request_the_service_read_is_never_sent_again`.
 //!
+//! For the same reason a connection that could not be established is tried once more, on a new
+//! one: the connect deadline ran out, or the connection was refused, reset or closed while it was
+//! being established, and nothing of the request had been written. Once, and within what is left
+//! of the total deadline. A certificate or TLS protocol failure and a name that does not resolve
+//! are the same the second time, so they are not tried again.
+//!
 //! # What a failure means
 //!
 //! The distinction this transport keeps is whether the request may have been carried out.
@@ -462,27 +468,42 @@ impl HttpService {
         let limit = self.limits.of(target.path());
         let named = crate::shown!("{}{}", self.origin.clone(), Shown::route(target.path()));
 
-        let mut request = self.client.request(method, target);
-        if let Some((content_type, bytes)) = body {
-            request = request
-                .header(reqwest::header::CONTENT_TYPE, content_type)
-                .body(bytes.to_vec());
-        }
-        for (name, value) in headers {
-            // A header value can be a token, so neither the name's value nor the value itself
-            // reaches this error.
-            let name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
-                .map_err(|_| refused("a request header name is not one this client can send"))?;
-            let value = reqwest::header::HeaderValue::from_str(value)
-                .map_err(|_| refused("a request header value is not one this client can send"))?;
-            request = request.header(name, value);
-        }
+        // One connection, and a second only when the connector itself failed in a way a new
+        // connection can end differently ([`connection_may_be_replaced`]): that is before any byte
+        // of the request was written, so the request goes again without having left. The second
+        // is given what is left of the total deadline, so the whole exchange keeps to it.
+        let started = tokio::time::Instant::now();
+        let mut replaced = false;
+        let mut response = loop {
+            let mut request = self.client.request(method.clone(), target.clone());
+            if let Some((content_type, bytes)) = body {
+                request = request
+                    .header(reqwest::header::CONTENT_TYPE, content_type)
+                    .body(bytes.to_vec());
+            }
+            for (name, value) in headers {
+                // A header value can be a token, so neither the name's value nor the value itself
+                // reaches this error.
+                let name =
+                    reqwest::header::HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
+                        refused("a request header name is not one this client can send")
+                    })?;
+                let value = reqwest::header::HeaderValue::from_str(value).map_err(|_| {
+                    refused("a request header value is not one this client can send")
+                })?;
+                request = request.header(name, value);
+            }
+            if replaced {
+                request = request.timeout(self.deadlines.total.saturating_sub(started.elapsed()));
+            }
 
-        self.entered(ExchangePhase::Connect);
-        let mut response = request
-            .send()
-            .await
-            .map_err(|error| failure(&named, phase_of(&error), &error))?;
+            self.entered(ExchangePhase::Connect);
+            match request.send().await {
+                Ok(response) => break response,
+                Err(error) if !replaced && connection_may_be_replaced(&error) => replaced = true,
+                Err(error) => return Err(failure(&named, phase_of(&error), &error)),
+            }
+        };
         let status = response.status().as_u16();
         // The head is in hand, so what remains of the exchange is the body.
         self.entered(ExchangePhase::Answer);
@@ -864,6 +885,53 @@ fn phase_of(error: &reqwest::Error) -> ExchangePhase {
     }
 }
 
+/// Whether a failed send may be met with one new connection.
+///
+/// Only a failure the connector itself reported qualifies, because the connector runs before a
+/// byte of the request is written: nothing left, so nothing can have run, and section 23 lets a
+/// request whose dispatch never happened go again. Of those, the ones a new connection can end
+/// differently: this client's connect deadline running out, and a connection refused, reset or
+/// closed while it was being established, which is what a path that loses a handshake's larger
+/// packets or a network that dropped for a moment looks like. A certificate or TLS protocol
+/// failure is the same on a new connection, and so is a name that does not resolve, so each stops
+/// at once.
+fn connection_may_be_replaced(error: &reqwest::Error) -> bool {
+    if !error.is_connect() {
+        return false;
+    }
+    let mut transient = error.is_timeout();
+    let mut cause: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(error);
+    while let Some(failed) = cause {
+        if failed.is::<rustls::Error>() {
+            return false;
+        }
+        if let Some(io) = failed.downcast_ref::<std::io::Error>() {
+            // A TLS failure travels inside an I/O error, whose own source skips it.
+            if io
+                .get_ref()
+                .is_some_and(|inner| inner.is::<rustls::Error>())
+            {
+                return false;
+            }
+            transient |= matches!(
+                io.kind(),
+                std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::NotConnected
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::NetworkUnreachable
+                    | std::io::ErrorKind::HostUnreachable
+                    | std::io::ErrorKind::NetworkDown
+            );
+        }
+        cause = failed.source();
+    }
+    transient
+}
+
 /// What one exchange's failure means, in the only terms that matter to a caller.
 ///
 /// Two things: whether the request may have been carried out, and where the exchange was. A failure
@@ -1032,6 +1100,9 @@ mod tests {
         },
         /// Accept the connection and never speak TLS, so establishing it never finishes.
         AcceptAndStall,
+        /// Stall the first connection as [`Self::AcceptAndStall`] does, and answer on every later
+        /// one as [`Self::Answer`] does.
+        StallTheFirstConnection { status: u16, body: Vec<u8> },
     }
 
     /// Which certificate the loopback gateway presents.
@@ -1242,27 +1313,38 @@ mod tests {
             let Ok((stream, _)) = listener.accept().await else {
                 return;
             };
-            *saw.connections.lock().expect("the record") += 1;
+            let connection = {
+                let mut connections = saw.connections.lock().expect("the record");
+                *connections += 1;
+                *connections
+            };
             saw.changed.notify_waiters();
             let acceptor = acceptor.clone();
             let behaviour = behaviour.clone();
             let saw = Arc::clone(&saw);
             tokio::spawn(async move {
-                let _ = answer(stream, acceptor, behaviour, Arc::clone(&saw)).await;
+                let _ = answer(stream, acceptor, behaviour, connection, Arc::clone(&saw)).await;
                 *saw.closed.lock().expect("the record") += 1;
                 saw.changed.notify_waiters();
             });
         }
     }
 
-    /// Serves one connection: every request it carries, in the behaviour's own terms.
+    /// Serves one connection, the `connection`-th this gateway accepted: every request it carries,
+    /// in the behaviour's own terms.
     async fn answer(
         stream: TcpStream,
         acceptor: TlsAcceptor,
         behaviour: Behaviour,
+        connection: usize,
         saw: Arc<Saw>,
     ) -> io::Result<()> {
-        if matches!(behaviour, Behaviour::AcceptAndStall) {
+        let stalls = match &behaviour {
+            Behaviour::AcceptAndStall => true,
+            Behaviour::StallTheFirstConnection { .. } => connection == 1,
+            _ => false,
+        };
+        if stalls {
             // Connected at the transport and never at TLS, which is establishment that never
             // finishes rather than a connection that was refused.
             std::future::pending::<()>().await;
@@ -1313,7 +1395,9 @@ mod tests {
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
         match behaviour {
-            Behaviour::Answer { status, body } | Behaviour::CloseWhenIdle { status, body, .. } => {
+            Behaviour::Answer { status, body }
+            | Behaviour::CloseWhenIdle { status, body, .. }
+            | Behaviour::StallTheFirstConnection { status, body } => {
                 write_answer(stream, *status, body, &[]).await?;
             }
             Behaviour::WithHeaders {
@@ -1738,6 +1822,11 @@ mod tests {
             .expect_err("a certificate for another name");
         assert_eq!(code(&error), ErrorCode::UpstreamUnavailable);
         assert!(gateway.received().is_empty(), "nothing was sent");
+        assert_eq!(
+            gateway.connections(),
+            1,
+            "a certificate is the same on a new connection"
+        );
     }
 
     #[tokio::test]
@@ -1758,6 +1847,11 @@ mod tests {
             .expect_err("an untrusted authority");
         assert_eq!(code(&error), ErrorCode::UpstreamUnavailable);
         assert!(gateway.received().is_empty(), "nothing was sent");
+        assert_eq!(
+            gateway.connections(),
+            1,
+            "an authority is the same on a new connection"
+        );
     }
 
     /* ---------------------------------------------------------------------- */
@@ -2314,17 +2408,111 @@ mod tests {
         let error = call.await.expect_err("the connect deadline");
         let advanced = tokio::time::Instant::now() - from;
 
-        // The connection was accepted at the transport and never spoke TLS, so nothing of the
-        // request was written, and that is the one class that says so.
+        // Each connection was accepted at the transport and never spoke TLS, so nothing of the
+        // request was written, and that is the one class that says so. The first ran out and one
+        // more was tried, and that one ran out too.
         assert_eq!(code(&error), ErrorCode::UpstreamUnavailable);
         assert_eq!(
             ExchangePhase::of(&error),
             Some(ExchangePhase::Connect),
             "{error}"
         );
-        assert!(advanced <= deadlines.connect + CLOCK_GRAIN, "{advanced:?}");
+        assert!(
+            advanced <= deadlines.connect * 2 + CLOCK_GRAIN * 2,
+            "{advanced:?}"
+        );
+
+        // Back on the ordinary clock, the gateway is waited on for what it saw rather than asked
+        // at once: the second connection was made before its deadline ran out.
+        tokio::time::resume();
+        gateway
+            .until("the second connection", |gateway| {
+                gateway.connections() >= 2
+            })
+            .await;
         assert!(gateway.received().is_empty(), "nothing was sent");
-        assert_eq!(gateway.connections(), 1, "one attempt, not several");
+        assert_eq!(gateway.connections(), 2, "one more attempt, and no third");
+    }
+
+    /// Section 23: a request whose dispatch never happened may go again. A connection that never
+    /// finished being established had nothing of the request written to it, so the request goes
+    /// on a new one, once, and the service is asked once.
+    #[tokio::test]
+    async fn a_connection_that_never_finishes_being_established_is_replaced_once() {
+        let gateway = Gateway::start(Behaviour::StallTheFirstConnection {
+            status: 200,
+            body: b"{\"ok\":true}".to_vec(),
+        })
+        .await;
+        let deadlines = HttpDeadlines {
+            connect: UNDER_TEST,
+            read: OUT_OF_REACH,
+            total: OUT_OF_REACH,
+        };
+        let transport = gateway.deadlined(deadlines);
+        let url = gateway.url("/api/mailbox/deliver");
+        let mut call = Box::pin(transport.post_json(&url, b"{\"delivery\":1}", &[]));
+
+        tokio::select! {
+            biased;
+            () = gateway.until("the first connection", |gateway| gateway.connections() >= 1) => {}
+            outcome = &mut call => panic!("the first connection never finishes: {outcome:?}"),
+        }
+
+        // The clock is moved past the first connection's deadline and then runs as it ordinarily
+        // does, so the second connection's handshake and its request take real time and are held
+        // to nothing but deadlines a day away.
+        tokio::time::pause();
+        tokio::time::advance(deadlines.connect + CLOCK_GRAIN).await;
+        tokio::time::resume();
+
+        let answer = call.await.expect("the answer, on the second connection");
+        assert_eq!(answer.status, 200);
+        assert_eq!(
+            gateway.connections(),
+            2,
+            "one more connection, and one only"
+        );
+        let received = gateway.received();
+        assert_eq!(received.len(), 1, "the service was asked once");
+        assert_eq!(received[0].body, b"{\"delivery\":1}");
+    }
+
+    /// The second connection is given what is left of the total deadline, not a deadline of its
+    /// own, so the whole exchange still ends within it.
+    #[tokio::test]
+    async fn a_second_connection_is_given_what_is_left_of_the_total_deadline() {
+        let gateway = Gateway::start(Behaviour::AcceptAndStall).await;
+        let deadlines = HttpDeadlines {
+            connect: UNDER_TEST,
+            read: OUT_OF_REACH,
+            total: UNDER_TEST + UNDER_TEST / 2,
+        };
+        let transport = gateway.deadlined(deadlines);
+        let url = gateway.url("/api/mailbox/read");
+        let mut call = Box::pin(transport.post_json(&url, b"{}", &[]));
+
+        tokio::select! {
+            biased;
+            () = gateway.until("the connection it accepted", |gateway| gateway.connections() >= 1)
+                => {}
+            outcome = &mut call => panic!("this gateway never finishes a handshake: {outcome:?}"),
+        }
+
+        tokio::time::pause();
+        let from = tokio::time::Instant::now();
+        call.await.expect_err("the total deadline");
+        let advanced = tokio::time::Instant::now() - from;
+        assert!(advanced <= deadlines.total + CLOCK_GRAIN, "{advanced:?}");
+
+        tokio::time::resume();
+        gateway
+            .until("the second connection", |gateway| {
+                gateway.connections() >= 2
+            })
+            .await;
+        assert!(gateway.received().is_empty(), "nothing was sent");
+        assert_eq!(gateway.connections(), 2, "one more attempt, and no third");
     }
 
     #[tokio::test]
