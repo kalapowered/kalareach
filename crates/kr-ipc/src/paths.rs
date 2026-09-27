@@ -2856,23 +2856,36 @@ mod tests {
             std::cell::RefCell::new(None);
     }
 
-    /// Holds `file` open with a handle that shares reading and writing but not its deletion, as a
-    /// program that reads each file as it is written does for a moment, and lets go after
-    /// `moment` on a thread of its own.
+    /// Opens `file` with a handle that shares reading and writing but not its deletion, as a
+    /// program that reads each file as it is written holds it.
     #[cfg(windows)]
-    fn held_for_a_moment(file: &Path, moment: std::time::Duration) -> std::thread::JoinHandle<()> {
+    fn hold(file: &Path) -> std::fs::File {
         use std::os::windows::fs::OpenOptionsExt as _;
         use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
 
-        let holding = std::fs::OpenOptions::new()
+        std::fs::OpenOptions::new()
             .read(true)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
             .open(file)
-            .expect("the file is held");
-        std::thread::spawn(move || {
-            std::thread::sleep(moment);
-            drop(holding);
-        })
+            .expect("the file is held")
+    }
+
+    /// Counts the renames refused as held on this thread while the guard stands, and lets go of
+    /// what `holding` holds at the first of them, so the rename made again finds the file free.
+    #[cfg(windows)]
+    fn let_go_at_the_first_refusal(
+        holding: std::rc::Rc<std::cell::RefCell<Option<std::fs::File>>>,
+    ) -> (
+        std::rc::Rc<std::cell::Cell<u32>>,
+        kr_flush::testing::AfterHeldRefusal,
+    ) {
+        let refusals = std::rc::Rc::new(std::cell::Cell::new(0));
+        let counted = std::rc::Rc::clone(&refusals);
+        let hook = kr_flush::testing::after_held_refusal(move || {
+            counted.set(counted.get() + 1);
+            drop(holding.borrow_mut().take());
+        });
+        (refusals, hook)
     }
 
     /// The names a directory holds, sorted.
@@ -2901,23 +2914,24 @@ mod tests {
     fn a_new_file_held_as_it_is_published_ends_with_its_one_name() {
         let root = temporary_root("held-publication");
         let target = root.join("identity");
-        let (sender, receiver) = std::sync::mpsc::channel();
+        let holding = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let held = std::rc::Rc::clone(&holding);
         BEFORE_PUBLISHING.with(|hook| {
             *hook.borrow_mut() = Some(Box::new(move |temporary: &Path| {
-                let _ = sender.send(held_for_a_moment(
-                    temporary,
-                    std::time::Duration::from_millis(300),
-                ));
+                *held.borrow_mut() = Some(hold(temporary));
             }));
         });
+        let (refusals, guard) = let_go_at_the_first_refusal(std::rc::Rc::clone(&holding));
         let published = create_new_owner_only_file(&target, b"published");
+        drop(guard);
         BEFORE_PUBLISHING.with(|hook| *hook.borrow_mut() = None);
-        receiver
-            .try_recv()
-            .expect("the new file was held as it was published")
-            .join()
-            .expect("and let go");
+        drop(holding.borrow_mut().take());
         published.expect("the file is published once it is let go");
+        assert_eq!(
+            refusals.get(),
+            1,
+            "refused once while the new file was held, and given its name once it was let go"
+        );
         assert_eq!(std::fs::read(&target).expect("reads"), b"published");
         assert_eq!(names_in(&root), vec!["identity".to_owned()], "one name");
         std::fs::remove_file(&target).expect("the published name is removed");
@@ -2938,10 +2952,13 @@ mod tests {
         let root = temporary_root("held-replacement");
         let target = root.join("descriptor.kr");
         write_owner_only_file(&target, b"first").expect("writes");
-        let letting_go = held_for_a_moment(&target, std::time::Duration::from_millis(300));
+        let holding = std::rc::Rc::new(std::cell::RefCell::new(Some(hold(&target))));
+        let (refusals, guard) = let_go_at_the_first_refusal(std::rc::Rc::clone(&holding));
         let replaced = write_owner_only_file(&target, b"second");
-        letting_go.join().expect("let go");
+        drop(guard);
+        drop(holding.borrow_mut().take());
         replaced.expect("replaced once it is let go");
+        assert_eq!(refusals.get(), 1, "refused once while it was held");
         assert_eq!(std::fs::read(&target).expect("reads"), b"second");
         assert_eq!(names_in(&root), vec!["descriptor.kr".to_owned()]);
         std::fs::remove_dir_all(&root).ok();

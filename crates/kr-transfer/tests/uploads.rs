@@ -1306,6 +1306,30 @@ fn a_payload_rewritten_in_place_is_invalidated_rather_than_published() {
     assert_publication_invalidated(&harness, transfer_id, recovery);
 }
 
+/// KR-REQ-24.09 on Windows: a payload rewritten in place while its held move into place waits is
+/// read again before the next attempt, since it keeps its identity, and the publication is
+/// invalidated rather than made.
+#[cfg(windows)]
+#[test]
+fn a_payload_rewritten_while_its_held_move_waits_is_invalidated() {
+    let harness = Harness::create();
+    let bytes = pattern(64);
+    let (transfer_id, staged) = interrupted_publication(&harness, &bytes, "notes.bin", None);
+    let rewritten = staged.clone();
+    let (refusals, guard) = support::at_the_first_refusal(support::hold(&staged), move |holding| {
+        rewrite_in_place(&rewritten, 64);
+        drop(holding);
+    });
+    let recovery = harness.service.recover().expect("recovers");
+    drop(guard);
+    assert_eq!(
+        refusals.get(),
+        1,
+        "the move was refused once while the payload was held"
+    );
+    assert_publication_invalidated(&harness, transfer_id, recovery);
+}
+
 /// KR-REQ-24.09: a publication whose payload reached its published name before the journal caught
 /// up is invalidated too, when the bytes under that name are not the ones that were verified.
 ///

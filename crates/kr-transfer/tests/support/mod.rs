@@ -20,45 +20,40 @@ use kr_protocol::transfer::{
 use kr_transfer::store::Limits;
 use kr_transfer::{ManualClock, Result, TransferService};
 
-/// Holds a file through a handle that shares reading and writing but not its deletion, as a
-/// program that reads each file as it is written does for a moment, and lets go after 300 ms on a
-/// thread of its own.
+/// Opens `file` with a handle that shares reading and writing but not its deletion, as a program
+/// that reads each file as it is written holds it.
 #[cfg(windows)]
-pub fn held_for_a_moment(file: &std::path::Path) -> std::thread::JoinHandle<()> {
+pub fn hold(file: &std::path::Path) -> std::fs::File {
     use std::os::windows::fs::OpenOptionsExt as _;
     use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
 
-    let holding = std::fs::OpenOptions::new()
+    std::fs::OpenOptions::new()
         .read(true)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
         .open(file)
-        .expect("the file is held");
-    std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(300));
-        drop(holding);
-    })
+        .expect("the file is held")
 }
 
-/// Holds a file as [`held_for_a_moment`] does, and 100 ms in writes `edit` over it in place, as a
-/// person saving the file meanwhile does, before letting go at 300 ms. The holder shares writing,
-/// so the edit is saved while the file is held.
+/// Counts the renames refused as held on this thread while the guard stands. At the first of them,
+/// `meanwhile` is given the hold, and lets go of it when it drops it.
 #[cfg(windows)]
-pub fn held_and_edited(file: &std::path::Path, edit: &'static [u8]) -> std::thread::JoinHandle<()> {
-    use std::os::windows::fs::OpenOptionsExt as _;
-    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
-
-    let holding = std::fs::OpenOptions::new()
-        .read(true)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-        .open(file)
-        .expect("the file is held");
-    let path = file.to_path_buf();
-    std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        std::fs::write(&path, edit).expect("the edit is saved while the file is held");
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        drop(holding);
-    })
+pub fn at_the_first_refusal(
+    holding: std::fs::File,
+    meanwhile: impl FnOnce(std::fs::File) + 'static,
+) -> (
+    std::rc::Rc<std::cell::Cell<u32>>,
+    kr_flush::testing::AfterHeldRefusal,
+) {
+    let refusals = std::rc::Rc::new(std::cell::Cell::new(0));
+    let counted = std::rc::Rc::clone(&refusals);
+    let mut first = Some((holding, meanwhile));
+    let hook = kr_flush::testing::after_held_refusal(move || {
+        counted.set(counted.get() + 1);
+        if let Some((holding, meanwhile)) = first.take() {
+            meanwhile(holding);
+        }
+    });
+    (refusals, hook)
 }
 
 /// Where the clock starts, so an expiry window is easy to read in a test.

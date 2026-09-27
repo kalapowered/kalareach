@@ -29,6 +29,8 @@ thiserror.workspace = true
 rustix = { workspace = true, features = ["fs"] }
 
 [dev-dependencies]
+# The tests act exactly when a held rename was refused, through the retry's own seam.
+kr-flush = { workspace = true, features = ["testing"] }
 # The package tests drive a built shell in a real pseudo-terminal and check its proof against the
 # transcript this contract defines.
 hmac.workspace = true

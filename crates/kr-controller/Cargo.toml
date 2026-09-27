@@ -71,6 +71,8 @@ rustix = { workspace = true, features = ["fs", "process"] }
 exacl.workspace = true
 
 [dev-dependencies]
+# The tests act exactly when a held rename was refused, through the retry's own seam.
+kr-flush = { workspace = true, features = ["testing"] }
 # This crate's own tests, with the pause above compiled in.
 kr-controller = { path = ".", features = ["testing"] }
 # The keys and expiry a catalogue suite test signs a generation of its own with, through the

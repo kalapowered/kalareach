@@ -463,8 +463,6 @@ pub(crate) fn write_atomically(path: &Path, bytes: &[u8], default_mode: u32) -> 
                 // every attempt, through the copy's own handle, which the rename leaves open.
                 let mut refused = None;
                 let renamed = kr_flush::retry_while_held(|| {
-                    #[cfg(test)]
-                    tests::before_attempt();
                     if let Some(error) = refusal(&file) {
                         refused = Some(error);
                         return Ok(());
@@ -539,46 +537,45 @@ pub(crate) fn another_group(directory: &Path) -> Option<u32> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    /// What a test does before an attempt at a replacement's rename.
-    type AttemptHook = Box<dyn FnMut()>;
-
-    std::thread_local! {
-        /// The hook the test running on this thread set, if any.
-        static BEFORE_ATTEMPT: std::cell::RefCell<Option<AttemptHook>> =
-            const { std::cell::RefCell::new(None) };
-    }
-
-    /// Runs what the test on this thread does before an attempt at a replacement's rename.
-    pub(super) fn before_attempt() {
-        BEFORE_ATTEMPT.with(|hook| {
-            if let Some(hook) = hook.borrow_mut().as_mut() {
-                hook();
-            }
-        });
-    }
-
-    /// Holds `file` open with a handle that shares reading and writing but not its deletion, as a
-    /// program that reads each file as it is written does for a moment, and lets go after 300 ms
-    /// on a thread of its own.
+    /// Opens `file` with a handle that shares reading and writing but not its deletion, as a
+    /// program that reads each file as it is written holds it.
     #[cfg(windows)]
-    fn held_for_a_moment(file: &Path) -> std::thread::JoinHandle<()> {
+    pub(crate) fn hold(file: &Path) -> std::fs::File {
         use std::os::windows::fs::OpenOptionsExt as _;
 
         /// Reading and writing are shared; deleting is not.
         const FILE_SHARE_READ_WRITE: u32 = 0x0001 | 0x0002;
 
-        let holding = std::fs::OpenOptions::new()
+        std::fs::OpenOptions::new()
             .read(true)
             .share_mode(FILE_SHARE_READ_WRITE)
             .open(file)
-            .expect("the file is held");
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(300));
-            drop(holding);
-        })
+            .expect("the file is held")
+    }
+
+    /// Counts the renames refused as held on this thread while the guard stands. At the first of
+    /// them, `meanwhile` is given the hold, and lets go of it when it drops it.
+    #[cfg(windows)]
+    pub(crate) fn at_the_first_refusal(
+        holding: std::fs::File,
+        meanwhile: impl FnOnce(std::fs::File) + 'static,
+    ) -> (
+        std::rc::Rc<std::cell::Cell<u32>>,
+        kr_flush::testing::AfterHeldRefusal,
+    ) {
+        let refusals = std::rc::Rc::new(std::cell::Cell::new(0));
+        let counted = std::rc::Rc::clone(&refusals);
+        let mut first = Some((holding, meanwhile));
+        let hook = kr_flush::testing::after_held_refusal(move || {
+            counted.set(counted.get() + 1);
+            if let Some((holding, meanwhile)) = first.take() {
+                meanwhile(holding);
+            }
+        });
+        (refusals, hook)
     }
 
     /// The names a directory holds.
@@ -599,10 +596,11 @@ mod tests {
         let directory = tempfile::tempdir().expect("a directory");
         let document = directory.path().join("settings.json");
         write_atomically(&document, b"first", PRIVATE).expect("creates it");
-        let letting_go = held_for_a_moment(&document);
+        let (refusals, guard) = at_the_first_refusal(hold(&document), drop);
         let replaced = write_atomically(&document, b"second", PRIVATE);
-        letting_go.join().expect("let go");
+        drop(guard);
         replaced.expect("replaced once it is let go");
+        assert_eq!(refusals.get(), 1, "refused once while it was held");
         assert_eq!(std::fs::read(&document).expect("reads it"), b"second");
         assert_eq!(names_in(directory.path()), ["settings.json"]);
     }
@@ -616,27 +614,21 @@ mod tests {
         let directory = tempfile::tempdir().expect("a directory");
         let document = directory.path().join("settings.json");
         write_atomically(&document, b"first", PRIVATE).expect("creates it");
-        let letting_go = held_for_a_moment(&document);
         let granted = document.clone();
-        let mut attempts = 0;
-        BEFORE_ATTEMPT.with(|hook| {
-            *hook.borrow_mut() = Some(Box::new(move || {
-                attempts += 1;
-                if attempts == 2 {
-                    // Somebody grants everyone reading while the first attempt is refused.
-                    let output = std::process::Command::new("icacls.exe")
-                        .arg(&granted)
-                        .args(["/grant", "*S-1-1-0:(R)"])
-                        .output()
-                        .expect("icacls starts");
-                    assert!(output.status.success(), "icacls: {output:?}");
-                }
-            }));
+        let (refusals, guard) = at_the_first_refusal(hold(&document), move |holding| {
+            // Somebody grants everyone reading while the first attempt is refused.
+            let output = std::process::Command::new("icacls.exe")
+                .arg(&granted)
+                .args(["/grant", "*S-1-1-0:(R)"])
+                .output()
+                .expect("icacls starts");
+            assert!(output.status.success(), "icacls: {output:?}");
+            drop(holding);
         });
         let written = write_atomically(&document, b"second", PRIVATE);
-        BEFORE_ATTEMPT.with(|hook| *hook.borrow_mut() = None);
-        letting_go.join().expect("let go");
+        drop(guard);
         let refused = written.expect_err("refused once the document's access changed");
+        assert_eq!(refusals.get(), 1);
         assert!(
             matches!(refused, ControllerError::PermissionDenied { ref detail }
                 if detail.contains("another owner or access-control list")),

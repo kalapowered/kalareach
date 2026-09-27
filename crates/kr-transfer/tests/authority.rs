@@ -367,11 +367,13 @@ fn a_file_held_while_it_is_published_ends_with_its_one_name() {
     let staged = RelativeName::parse("staged.part").expect("a valid relative name");
     let published = RelativeName::parse("published.bin").expect("a valid relative name");
 
-    let letting_go = support::held_for_a_moment(&root.path().join("staged.part"));
+    let (refusals, guard) =
+        support::at_the_first_refusal(support::hold(&root.path().join("staged.part")), drop);
     let publication = authority.publish_into(&staged, &authority, &published, nothing_changed);
+    drop(guard);
     let removal = authority.remove(&staged);
-    letting_go.join().expect("let go");
     publication.expect("published once it is let go");
+    assert_eq!(refusals.get(), 1, "refused once while it was held");
     removal.expect("the staged name goes");
     assert_eq!(read_through(&authority, &published), "published");
     assert!(
@@ -428,14 +430,21 @@ fn a_destination_edited_while_its_held_replacement_waits_is_not_replaced() {
         }
     };
 
-    let letting_go = support::held_and_edited(&destination, b"the person's edit");
+    let edited = destination.clone();
+    let (refusals, guard) =
+        support::at_the_first_refusal(support::hold(&destination), move |holding| {
+            // The person saves while the first attempt is refused; the holder shares writing.
+            std::fs::write(&edited, b"the person's edit").expect("the edit is saved");
+            drop(holding);
+        });
     let replaced = authority.rename_into(
         &staged_name,
         &authority,
         &name,
         still(b"what the check read"),
     );
-    letting_go.join().expect("let go");
+    drop(guard);
+    assert_eq!(refusals.get(), 1);
     assert_eq!(
         replaced.expect("the rename was asked"),
         ControlFlow::Break("the destination changed")
@@ -451,10 +460,11 @@ fn a_destination_edited_while_its_held_replacement_waits_is_not_replaced() {
         "and nothing was renamed"
     );
 
-    let letting_go = support::held_for_a_moment(&destination);
+    let (refusals, guard) = support::at_the_first_refusal(support::hold(&destination), drop);
     let replaced =
         authority.rename_into(&staged_name, &authority, &name, still(b"the person's edit"));
-    letting_go.join().expect("let go");
+    drop(guard);
+    assert_eq!(refusals.get(), 1);
     assert_eq!(
         replaced.expect("the rename was asked"),
         ControlFlow::Continue(())

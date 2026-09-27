@@ -815,7 +815,7 @@ fn a_held_destination_is_replaced_once_it_is_let_go() {
             },
         )
         .expect("opens the source");
-    let letting_go = support::held_for_a_moment(&held);
+    let (refusals, guard) = support::at_the_first_refusal(support::hold(&held), drop);
     let published = kr_transfer::publish_transfer(
         &harness.service,
         &harness.actor,
@@ -828,8 +828,9 @@ fn a_held_destination_is_replaced_once_it_is_let_go() {
             allow_overwrite: true,
         },
     );
-    letting_go.join().expect("let go");
+    drop(guard);
     published.expect("replaced once it is let go");
+    assert_eq!(refusals.get(), 1, "refused once while it was held");
     assert_eq!(std::fs::read(&held).expect("reads the destination"), bytes);
     assert_eq!(
         std::fs::read_dir(destination_tree.path())
@@ -837,6 +838,75 @@ fn a_held_destination_is_replaced_once_it_is_let_go() {
             .count(),
         1,
         "no temporary file is left behind"
+    );
+}
+
+/// KR-REQ-14.16 on Windows: a download written again in place while its held replacement of the
+/// destination waits keeps its identity, so its bytes are read again before the next attempt: the
+/// publication refuses them, and the destination keeps the user's earlier file.
+#[cfg(windows)]
+#[test]
+fn a_download_written_again_while_its_replacement_waits_is_not_published() {
+    let harness = Harness::create();
+    let bytes = pattern(2048);
+    let handle = harness.publish(&bytes, "application/octet-stream", "notes.bin");
+    let destination_tree = source_tree();
+    let held = destination_tree.path().join("notes.bin");
+    std::fs::write(&held, b"the user's earlier file").expect("the destination is there");
+    let destination =
+        AuthorisedDirectory::open_root(harness.environment_id(), destination_tree.path())
+            .expect("opens the destination");
+    let begun = harness
+        .service
+        .download_begin(
+            &harness.actor,
+            &DownloadBeginParams {
+                environment_id: harness.environment_id(),
+                resume_transfer_id: Nullable::null(),
+                source: Nullable::some(DownloadSource::Attachment {
+                    transfer_id: handle.transfer_id,
+                }),
+                device_id: Nullable::null(),
+            },
+        )
+        .expect("opens the source");
+    let directory = destination_tree.path().to_path_buf();
+    let (refusals, guard) = support::at_the_first_refusal(support::hold(&held), move |holding| {
+        use std::io::Write as _;
+
+        // The staged download is the one other file in the destination; it is written again in
+        // place, with other bytes of the same length.
+        let staged = std::fs::read_dir(&directory)
+            .expect("reads the destination")
+            .map(|entry| entry.expect("an entry").path())
+            .find(|path| path.file_name().is_some_and(|name| name != "notes.bin"))
+            .expect("the staged download");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&staged)
+            .and_then(|mut file| file.write_all(&vec![b'x'; 2048]))
+            .expect("the staged download is written again");
+        drop(holding);
+    });
+    let published = kr_transfer::publish_transfer(
+        &harness.service,
+        &harness.actor,
+        &destination,
+        &DownloadPlacement {
+            transfer_id: begun.transfer_id,
+            destination_name: "notes.bin".to_owned(),
+            byte_len: U64::new(bytes.len() as u64),
+            content_digest: digest(&bytes),
+            allow_overwrite: true,
+        },
+    );
+    drop(guard);
+    let refused = published.expect_err("bytes written again are not published");
+    assert_eq!(refusals.get(), 1);
+    assert_eq!(refused.code(), ErrorCode::AttachmentIntegrity, "{refused}");
+    assert_eq!(
+        std::fs::read(&held).expect("reads the destination"),
+        b"the user's earlier file"
     );
 }
 

@@ -1401,8 +1401,6 @@ impl Installer {
         };
         let mut taken = false;
         kr_flush::retry_while_held(|| {
-            #[cfg(test)]
-            tests::before_attempt();
             if path.exists() {
                 taken = true;
                 return Ok(());
@@ -1982,45 +1980,6 @@ mod tests {
         }
     }
 
-    /// What a test does before an attempt at moving a record onto its new name.
-    type AttemptHook = Box<dyn FnMut()>;
-
-    std::thread_local! {
-        /// The hook the test running on this thread set, if any.
-        static BEFORE_ATTEMPT: std::cell::RefCell<Option<AttemptHook>> =
-            const { std::cell::RefCell::new(None) };
-    }
-
-    /// Runs what the test on this thread does before an attempt at moving a record.
-    pub(super) fn before_attempt() {
-        BEFORE_ATTEMPT.with(|hook| {
-            if let Some(hook) = hook.borrow_mut().as_mut() {
-                hook();
-            }
-        });
-    }
-
-    /// Holds `file` open with a handle that shares reading and writing but not its deletion, as a
-    /// program that reads each file as it is written does for a moment, and lets go after 300 ms
-    /// on a thread of its own.
-    #[cfg(windows)]
-    fn held_for_a_moment(file: &Path) -> std::thread::JoinHandle<()> {
-        use std::os::windows::fs::OpenOptionsExt as _;
-
-        /// Reading and writing are shared; deleting is not.
-        const FILE_SHARE_READ_WRITE: u32 = 0x0001 | 0x0002;
-
-        let holding = std::fs::OpenOptions::new()
-            .read(true)
-            .share_mode(FILE_SHARE_READ_WRITE)
-            .open(file)
-            .expect("the file is held");
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(300));
-            drop(holding);
-        })
-    }
-
     /// A user record installed and then given the name an earlier build gave it, with the name
     /// this build gives it free.
     #[cfg(windows)]
@@ -2049,10 +2008,14 @@ mod tests {
         let params = params(AgentTarget::Codex, InstallScope::User);
         let (modern, legacy) = record_under_its_earlier_name(&installer, &params);
         let kept = std::fs::read(&legacy).expect("the record");
-        let letting_go = held_for_a_moment(&legacy);
+        let (refusals, guard) = crate::catalogue::files::tests::at_the_first_refusal(
+            crate::catalogue::files::tests::hold(&legacy),
+            drop,
+        );
         let moved = installer.migrate_records(&params);
-        letting_go.join().expect("let go");
+        drop(guard);
         moved.expect("moved once it is let go");
+        assert_eq!(refusals.get(), 1, "refused once while it was held");
         assert!(!legacy.exists(), "the earlier name is gone");
         assert_eq!(std::fs::read(&modern).expect("the record"), kept);
     }
@@ -2068,22 +2031,19 @@ mod tests {
         let params = params(AgentTarget::Codex, InstallScope::User);
         let (modern, legacy) = record_under_its_earlier_name(&installer, &params);
         let kept = std::fs::read(&legacy).expect("the record");
-        let letting_go = held_for_a_moment(&legacy);
         let written = modern.clone();
-        let mut attempts = 0;
-        BEFORE_ATTEMPT.with(|hook| {
-            *hook.borrow_mut() = Some(Box::new(move || {
-                attempts += 1;
-                if attempts == 2 {
-                    std::fs::write(&written, b"another writer's record")
-                        .expect("another writer takes the name meanwhile");
-                }
-            }));
-        });
+        let (refusals, guard) = crate::catalogue::files::tests::at_the_first_refusal(
+            crate::catalogue::files::tests::hold(&legacy),
+            move |holding| {
+                std::fs::write(&written, b"another writer's record")
+                    .expect("another writer takes the name meanwhile");
+                drop(holding);
+            },
+        );
         let moved = installer.migrate_records(&params);
-        BEFORE_ATTEMPT.with(|hook| *hook.borrow_mut() = None);
-        letting_go.join().expect("let go");
+        drop(guard);
         moved.expect("both are left alone");
+        assert_eq!(refusals.get(), 1);
         assert_eq!(std::fs::read(&legacy).expect("the earlier record"), kept);
         assert_eq!(
             std::fs::read(&modern).expect("the other writer's record"),

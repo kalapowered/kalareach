@@ -39,6 +39,8 @@ windows-sys = { workspace = true, features = ["Win32_Security_Authorization", "W
 testing = []
 
 [dev-dependencies]
+# The tests act exactly when a held rename was refused, through the retry's own seam.
+kr-flush = { workspace = true, features = ["testing"] }
 kr-ipc = { workspace = true, features = ["testing"] }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 

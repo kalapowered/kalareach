@@ -1008,8 +1008,6 @@ fn replace(path: &Path, expected: &str, contents: &str) -> std::io::Result<()> {
         // hold the file for a moment and the rename is tried again while it does, so the check is
         // made again before every attempt: the person can save the file while the rename waits.
         kr_flush::retry_while_held(|| {
-            #[cfg(test)]
-            tests::before_attempt();
             if read_or_empty(&target)? != expected
                 || identity.is_some_and(|identity| stable_identity(&target) != Some(identity))
             {
@@ -1103,43 +1101,42 @@ fn read_or_empty(path: &Path) -> std::io::Result<String> {
 mod tests {
     use super::*;
 
-    /// What a test does before an attempt at a startup file's replacement.
-    type AttemptHook = Box<dyn FnMut()>;
-
-    std::thread_local! {
-        /// The hook the test running on this thread set, if any.
-        static BEFORE_ATTEMPT: std::cell::RefCell<Option<AttemptHook>> =
-            const { std::cell::RefCell::new(None) };
-    }
-
-    /// Runs what the test on this thread does before an attempt at a replacement's rename.
-    pub(super) fn before_attempt() {
-        BEFORE_ATTEMPT.with(|hook| {
-            if let Some(hook) = hook.borrow_mut().as_mut() {
-                hook();
-            }
-        });
-    }
-
-    /// Holds `file` open with a handle that shares reading and writing but not its deletion, as a
-    /// program that reads each file as it is written does for a moment, and lets go after 300 ms
-    /// on a thread of its own.
+    /// Opens `file` with a handle that shares reading and writing but not its deletion, as a
+    /// program that reads each file as it is written holds it.
     #[cfg(windows)]
-    fn held_for_a_moment(file: &Path) -> std::thread::JoinHandle<()> {
+    fn hold(file: &Path) -> std::fs::File {
         use std::os::windows::fs::OpenOptionsExt as _;
 
         /// Reading and writing are shared; deleting is not.
         const FILE_SHARE_READ_WRITE: u32 = 0x0001 | 0x0002;
 
-        let holding = std::fs::OpenOptions::new()
+        std::fs::OpenOptions::new()
             .read(true)
             .share_mode(FILE_SHARE_READ_WRITE)
             .open(file)
-            .expect("the file is held");
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(300));
-            drop(holding);
-        })
+            .expect("the file is held")
+    }
+
+    /// Counts the renames refused as held on this thread while the guard stands. At the first of
+    /// them, `meanwhile` is given the hold, and lets go of it when it drops it.
+    #[cfg(windows)]
+    fn at_the_first_refusal(
+        holding: std::fs::File,
+        meanwhile: impl FnOnce(std::fs::File) + 'static,
+    ) -> (
+        std::rc::Rc<std::cell::Cell<u32>>,
+        kr_flush::testing::AfterHeldRefusal,
+    ) {
+        let refusals = std::rc::Rc::new(std::cell::Cell::new(0));
+        let counted = std::rc::Rc::clone(&refusals);
+        let mut first = Some((holding, meanwhile));
+        let hook = kr_flush::testing::after_held_refusal(move || {
+            counted.set(counted.get() + 1);
+            if let Some((holding, meanwhile)) = first.take() {
+                meanwhile(holding);
+            }
+        });
+        (refusals, hook)
     }
 
     /// The names a directory holds.
@@ -1166,14 +1163,15 @@ mod tests {
         let root = tempfile::tempdir().expect("a directory");
         let profile = root.path().join("profile.ps1");
         std::fs::write(&profile, "Set-Alias ll Get-ChildItem\n").expect("writes");
-        let letting_go = held_for_a_moment(&profile);
+        let (refusals, guard) = at_the_first_refusal(hold(&profile), drop);
         let replaced = replace(
             &profile,
             "Set-Alias ll Get-ChildItem\n",
             "Set-Alias ll Get-ChildItem\n# the entry\n",
         );
-        letting_go.join().expect("let go");
+        drop(guard);
         replaced.expect("replaced once it is let go");
+        assert_eq!(refusals.get(), 1, "refused once while it was held");
         assert_eq!(
             std::fs::read_to_string(&profile).expect("reads"),
             "Set-Alias ll Get-ChildItem\n# the entry\n"
@@ -1190,31 +1188,25 @@ mod tests {
         let root = tempfile::tempdir().expect("a directory");
         let profile = root.path().join("profile.ps1");
         std::fs::write(&profile, "Set-Alias ll Get-ChildItem\n").expect("writes");
-        let letting_go = held_for_a_moment(&profile);
         let edited = profile.clone();
-        let mut attempts = 0;
-        BEFORE_ATTEMPT.with(|hook| {
-            *hook.borrow_mut() = Some(Box::new(move || {
-                attempts += 1;
-                if attempts == 2 {
-                    use std::io::Write as _;
+        let (refusals, guard) = at_the_first_refusal(hold(&profile), move |holding| {
+            use std::io::Write as _;
 
-                    // The person's editor saves while the first attempt is refused.
-                    std::fs::OpenOptions::new()
-                        .append(true)
-                        .open(&edited)
-                        .and_then(|mut file| file.write_all(b"Set-Alias g git\n"))
-                        .expect("the person saves an edit");
-                }
-            }));
+            // The person's editor saves while the first attempt is refused.
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&edited)
+                .and_then(|mut file| file.write_all(b"Set-Alias g git\n"))
+                .expect("the person saves an edit");
+            drop(holding);
         });
         let replaced = replace(
             &profile,
             "Set-Alias ll Get-ChildItem\n",
             "Set-Alias ll Get-ChildItem\n# the entry\n",
         );
-        BEFORE_ATTEMPT.with(|hook| *hook.borrow_mut() = None);
-        letting_go.join().expect("let go");
+        drop(guard);
+        assert_eq!(refusals.get(), 1);
         let refused = replaced.expect_err("the file changed while the replacement waited");
         assert!(
             refused.to_string().contains("the startup file changed"),

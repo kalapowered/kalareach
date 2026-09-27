@@ -40,6 +40,8 @@ windows-sys = { workspace = true, features = ["Win32_Security_Authorization"] }
 rustix = { workspace = true, features = ["fs", "mount"] }
 
 [dev-dependencies]
+# The tests act exactly when a held rename was refused, through the retry's own seam.
+kr-flush = { workspace = true, features = ["testing"] }
 # The tests read a file identity the way the service does, through an opened directory.
 cap-fs-ext.workspace = true
 cap-std.workspace = true

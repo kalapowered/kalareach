@@ -46,6 +46,8 @@ windows-sys = { workspace = true, features = [
 ] }
 
 [dev-dependencies]
+# The tests act exactly when a held rename was refused, through the retry's own seam.
+kr-flush = { workspace = true, features = ["testing"] }
 kr-ipc = { workspace = true, features = ["testing"] }
 # The recovery tests put the journal into the state a crash leaves, which means writing the rows a
 # dying daemon would have left rather than asking the service to pretend.

@@ -43,6 +43,8 @@ tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-th
 tokio-util.workspace = true
 
 [dev-dependencies]
+# The tests act exactly when a held rename was refused, through the retry's own seam.
+kr-flush = { workspace = true, features = ["testing"] }
 # The Windows start and pairing tests register a test environment's scheduled task and host a
 # daemon that starts its workers through it.
 kr-controller = { workspace = true, features = ["testing"] }

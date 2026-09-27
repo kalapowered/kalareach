@@ -129,6 +129,8 @@ pub fn retry_while_held_until(
                 Err(error) if held(&error) => error,
                 answer => return answer,
             };
+            #[cfg(feature = "testing")]
+            testing::held_refusal();
             let left = deadline.saturating_duration_since(Instant::now());
             if !left.is_zero() {
                 std::thread::sleep(pause.min(left));
@@ -172,6 +174,61 @@ pub fn publish_without_replacing(from: &Path, to: &Path) -> std::io::Result<()> 
     #[cfg(not(windows))]
     {
         std::fs::hard_link(from, to)
+    }
+}
+
+/// What the tests of a store that renames through [`retry_while_held`] use to act at the one
+/// moment a held rename cannot be reached from outside: after an attempt was refused because
+/// another program holds what it needs, and before the next.
+///
+/// Compiled only with this crate's `testing` feature, which a store enables for its own tests and
+/// never in a build it ships.
+#[cfg(feature = "testing")]
+pub mod testing {
+    use std::cell::RefCell;
+
+    /// What a test does after one of its renames was refused as held.
+    type Hook = Box<dyn FnMut()>;
+
+    std::thread_local! {
+        /// The hook the test running on this thread set, if any.
+        static AFTER_HELD_REFUSAL: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    /// Runs `hook` on this thread each time a rename that [`super::retry_while_held`] makes is
+    /// refused because another program holds what it needs, before the rename is tried again,
+    /// until the returned guard is dropped. A rename runs on its caller's thread, so a test's
+    /// hook sees only its own renames.
+    #[must_use = "the hook is removed when the guard is dropped"]
+    pub fn after_held_refusal(hook: impl FnMut() + 'static) -> AfterHeldRefusal {
+        AFTER_HELD_REFUSAL.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+        AfterHeldRefusal(())
+    }
+
+    /// Removes the hook [`after_held_refusal`] set, when it is dropped.
+    #[derive(Debug)]
+    pub struct AfterHeldRefusal(());
+
+    impl Drop for AfterHeldRefusal {
+        fn drop(&mut self) {
+            AFTER_HELD_REFUSAL.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+
+    /// Runs the hook the test on this thread set, if any. It is taken out while it runs, so a
+    /// rename it makes itself does not run it again.
+    #[cfg(windows)]
+    pub(crate) fn held_refusal() {
+        let taken = AFTER_HELD_REFUSAL.with(|slot| slot.borrow_mut().take());
+        if let Some(mut hook) = taken {
+            hook();
+            AFTER_HELD_REFUSAL.with(|slot| {
+                let mut slot = slot.borrow_mut();
+                if slot.is_none() {
+                    *slot = Some(hook);
+                }
+            });
+        }
     }
 }
 
