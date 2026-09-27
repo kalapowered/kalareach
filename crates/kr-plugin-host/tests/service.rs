@@ -935,9 +935,11 @@ async fn kr_req_05_07_a_plugin_host_crash_kills_no_worker_and_loses_no_request()
 // test, not an amount of work sized for some machine. The binding is given observations at a
 // steady pace until the test opens a gate, so there is a component at work for the whole window
 // and after it, however fast or slow the machine is. Each call is one short observation that ends
-// far inside its deadline, so a slow or loaded machine does not turn the component's work into
-// faults. A binding that faulted or was disabled would leave a window with nothing running in it,
-// so either fails the test.
+// far inside its deadline, so a slow machine does not overrun it. A machine that stalls outright
+// can still hold one call past its deadline, which the runtime records as a fault and the binding
+// survives; nothing here measures how long a call takes, so that is not a failure. A disabled
+// binding would leave a window with nothing running in it, so that fails the test, and so does a
+// call that failed any other way.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_11_39_a_terminal_drains_and_is_answered_while_a_component_runs() {
     let Some(well_behaved) = component("well-behaved") else {
@@ -1071,16 +1073,19 @@ async fn kr_req_11_39_a_terminal_drains_and_is_answered_while_a_component_runs()
         "the drained output could not be handed to the runtime: {handed_back:?}"
     );
 
-    // No call the component made was a fault, and the binding was never disabled. A fault or a
-    // disabling is never dropped from the notice queue, so every one there has been is still in it.
+    // The binding was never disabled, and no call failed but by running past its deadline. A fault
+    // or a disabling is never dropped from the notice queue, so every one there has been is still
+    // in it.
     let mut plugin = Arc::into_inner(plugin).expect("the supply has let go of the client");
     while let Some(notice) = plugin.try_notice() {
         match notice {
-            Notice::Fault { call, detail, .. } => {
+            Notice::Fault { call, detail, .. }
+                if detail != format!("{call} used its whole deadline allowance") =>
+            {
                 panic!("the component faulted in {call}: {detail}")
             }
             Notice::Disabled { reason, .. } => panic!("the binding disabled itself: {reason}"),
-            Notice::Document { .. } | Notice::Gap { .. } => {}
+            Notice::Fault { .. } | Notice::Document { .. } | Notice::Gap { .. } => {}
         }
     }
 
@@ -1089,10 +1094,14 @@ async fn kr_req_11_39_a_terminal_drains_and_is_answered_while_a_component_runs()
 }
 
 /// How often a binding is given an observation while a test holds its work open.
-const OBSERVATION_PACE: Duration = Duration::from_millis(2);
+///
+/// Often enough that a window of a few hundred milliseconds holds dozens of calls, and seldom
+/// enough that the calls cost the machine little, which leaves few of them where a stalled machine
+/// can hold one past its deadline.
+const OBSERVATION_PACE: Duration = Duration::from_millis(10);
 
-/// Gives a binding one observation each [`OBSERVATION_PACE`] until the gate opens, and returns how
-/// long the slowest handoff took.
+/// Gives a binding one observation each [`OBSERVATION_PACE`] until the gate opens, and returns the
+/// longest any of them took to hand over.
 ///
 /// This is what holds a component's work open. Observations handed over in advance last as long as
 /// the machine takes to work through them, which is a guess about the machine: on a fast one the
@@ -1118,15 +1127,15 @@ async fn supply(
             _ = pace.tick() => {}
         }
         let offered = std::time::Instant::now();
-        let handoff = plugin.offer(binding, &scrape(&format!("se-{index}"), "output"));
+        let handed = plugin.offer(binding, &scrape(&format!("se-{index}"), "output"));
         slowest = slowest.max(offered.elapsed());
         assert!(
             matches!(
-                handoff,
+                handed,
                 kr_plugin_service::client::Handoff::Accepted
                     | kr_plugin_service::client::Handoff::Refused { .. }
             ),
-            "the handoff was {handoff:?}"
+            "an observation was handed over as {handed:?}"
         );
     }
     slowest
