@@ -343,6 +343,16 @@ impl Keypad {
         }
     }
 
+    /// The unshifted character of the main key the Kitty protocol converts a text key to, which
+    /// names it in a report whatever the layout makes it type: the decimal key is `.` even where it
+    /// types a comma (kitty's `convert_kp_key_to_normal_key`).
+    fn main_character(self) -> Option<char> {
+        match self {
+            Self::Decimal(_) => Some('.'),
+            _ => self.text(),
+        }
+    }
+
     /// The main key it stands for where the keypad is not told apart, or `None` for the centre
     /// key, which has a spelling of its own, and for a digit out of range.
     fn main_key(self) -> Option<Key> {
@@ -621,10 +631,11 @@ pub fn release_reported(press: KeyEvent, encoding: KeyboardEncoding) -> bool {
 /// Spells the release of the key `press` put down, with `modifiers` and `locks` as they are when it
 /// comes up.
 ///
-/// The key is the press's: which key it is does not change because a modifier came up first, so a
-/// Control-I whose Control is released before its I is still the I key's release. The modifiers and
-/// locks are the release's own, as the protocol reports them. An encoding that reports no releases
-/// gets nothing, which is the caller's instruction to send nothing.
+/// The key is the press's, named as the press named it: which key it is does not change because a
+/// modifier came up first, or because Shift or Caps Lock came on while it was held, so a Control-I
+/// whose Control is released before its I is still the I key's release. The modifiers and locks are
+/// the release's own, as the protocol reports them. An encoding that reports no releases gets
+/// nothing, which is the caller's instruction to send nothing.
 ///
 /// # Errors
 ///
@@ -643,13 +654,9 @@ pub fn release(
     if flags & KeyboardEncoding::KITTY_EVENT_TYPES == 0 {
         return Ok(Vec::new());
     }
-    let released = KeyEvent {
-        modifiers,
-        locks,
-        kind: KeyEventKind::Press,
-        ..press
-    };
-    kitty_sequence(resolved(released, flags), Some(3))
+    let press = resolved(press, flags);
+    let code = kitty_code(press)?;
+    Ok(kitty_report(code, press.key, modifiers, locks, Some(3)))
 }
 
 /// Refuses Kitty flags this encoder does not produce.
@@ -688,11 +695,13 @@ fn legacy(
             event.modifiers,
             modify_other_keys,
         )),
-        Key::Enter => Ok(control_or_plain(
+        // Level one reports Return with any modifier, as xterm does.
+        Key::Enter => Ok(special_key(
             b'\r',
+            13,
             event.modifiers,
             modify_other_keys,
-            13,
+            !event.modifiers.is_empty(),
         )),
         Key::Tab => {
             if modify_other_keys >= 2 && !event.modifiers.is_empty() {
@@ -702,33 +711,41 @@ fn legacy(
             }
             if event.modifiers.shift {
                 if event.modifiers.control || event.modifiers.alt {
-                    // The ordinary encoding has one back-tab and no room for a second modifier on
-                    // it. Sending it anyway would tell the application Shift-Tab when the person
-                    // held Control as well.
+                    // The ordinary encoding and level one have one back-tab and no room for a
+                    // second modifier on it. Sending it anyway would tell the application Shift-Tab
+                    // when the person held Control as well.
                     return Err(Unsupported::NotExpressible {
                         what: "Shift together with another modifier on Tab",
                     });
                 }
                 return Ok(b"\x1b[Z".to_vec());
             }
-            Ok(control_or_plain(
+            // Level one reports Control and Alt on Tab, as xterm does.
+            Ok(special_key(
                 b'\t',
+                9,
                 event.modifiers,
                 modify_other_keys,
-                9,
+                !event.modifiers.is_empty(),
             ))
         }
-        Key::Backspace => Ok(control_or_plain(
-            0x7f,
-            event.modifiers,
-            modify_other_keys,
+        // Control makes the backarrow key send the other of DEL and BS, as xterm's does, and level
+        // one leaves Backspace to that.
+        Key::Backspace => Ok(special_key(
+            if event.modifiers.control { 0x08 } else { 0x7f },
             127,
-        )),
-        Key::Escape => Ok(control_or_plain(
-            0x1b,
             event.modifiers,
             modify_other_keys,
+            false,
+        )),
+        // Escape is a control character already, so level one leaves Shift or Control on its own
+        // to it, and reports Alt, or Shift and Control together, as xterm does.
+        Key::Escape => Ok(special_key(
+            0x1b,
             27,
+            event.modifiers,
+            modify_other_keys,
+            event.modifiers.alt || (event.modifiers.shift && event.modifiers.control),
         )),
         Key::Arrow(arrow) => Ok(cursor_key(arrow, event.modifiers, application)),
         Key::Home => Ok(edit_key(b'H', event.modifiers, application)),
@@ -790,13 +807,14 @@ fn legacy_character(character: char, modifiers: Modifiers, modify_other_keys: u8
     // from `@` to `~`, which are the ones a control chord can also reach, plus Space, whose shifted
     // form is a space and says nothing. Below that range a shifted key produces a byte no unshifted
     // key produces, so it is sent as that byte, and an encoder that reported it would tell an
-    // application about a chord no terminal reports. Level one reports only the chords the ordinary
-    // encoding has no spelling for at all.
+    // application about a chord no terminal reports. Level one reports only Control on a key X11
+    // has no control character for: Shift is already in the character, and xterm leaves Alt, with
+    // Shift or without, to its escape prefix at that level.
     let ambiguous_when_shifted = character == ' ' || ('\u{40}'..='\u{7f}').contains(&character);
     let reported = if modify_other_keys >= 2 {
         modifiers.control || modifiers.alt || (modifiers.shift && ambiguous_when_shifted)
     } else {
-        modify_other_keys > 0 && (modifiers.control || (modifiers.alt && modifiers.shift))
+        modify_other_keys > 0 && modifiers.control
     };
     if reported {
         return modify_other_keys_report(u32::from(character), modifiers);
@@ -810,12 +828,25 @@ fn legacy_character(character: char, modifiers: Modifiers, modify_other_keys: u8
     bytes
 }
 
-/// Spells a key that already has a control byte, reporting it instead at level two.
-fn control_or_plain(byte: u8, modifiers: Modifiers, modify_other_keys: u8, code: u32) -> Vec<u8> {
-    if modify_other_keys >= 2 && !modifiers.is_empty() {
-        return modify_other_keys_report(code, modifiers);
-    }
-    if modify_other_keys > 0 && (modifiers.control || modifiers.shift) {
+/// Spells Return, Tab, Backspace or Escape, whose byte is a control character, outside the Kitty
+/// protocol.
+///
+/// Level two reports the key, as `code`, with any modifier; level one only where
+/// `reported_at_level_one` says xterm does. Otherwise it is `byte`, with Alt as the escape prefix,
+/// and Shift and Control have nowhere else to go.
+fn special_key(
+    byte: u8,
+    code: u32,
+    modifiers: Modifiers,
+    modify_other_keys: u8,
+    reported_at_level_one: bool,
+) -> Vec<u8> {
+    let reported = match modify_other_keys {
+        0 => false,
+        1 => reported_at_level_one,
+        _ => !modifiers.is_empty(),
+    };
+    if reported {
         return modify_other_keys_report(code, modifiers);
     }
     let mut bytes = Vec::new();
@@ -952,10 +983,11 @@ fn resolved(event: KeyEvent, flags: u8) -> KeyEvent {
         != 0;
     match event.key {
         Key::Keypad(keypad) if !told_apart && !matches!(keypad, Keypad::Separator(_)) => {
+            // The key types what it types, and is named by the main key it converts to.
             match keypad.main_key() {
                 Some(main) => KeyEvent {
                     key: main,
-                    base: keypad.text(),
+                    base: keypad.main_character(),
                     ..event
                 },
                 None => event,
@@ -1115,25 +1147,42 @@ fn kitty_control(key: char) -> Vec<u8> {
 /// release, `None` for a press, whose type is the default and is left out.
 fn kitty_sequence(event: KeyEvent, event_type: Option<u8>) -> Result<Vec<u8>, Unsupported> {
     let code = kitty_code(event)?;
+    Ok(kitty_report(
+        code,
+        event.key,
+        event.modifiers,
+        event.locks,
+        event_type,
+    ))
+}
+
+/// The protocol's report of `key`, named by `code`, with `modifiers` and `locks` held.
+fn kitty_report(
+    code: u32,
+    key: Key,
+    modifiers: Modifiers,
+    locks: Locks,
+    event_type: Option<u8>,
+) -> Vec<u8> {
     // The modifier bits plus one, with the locks beside them.
-    let parameter = u16::from(event.modifiers.parameter()) + event.locks.kitty_bits();
-    let suffix = kitty_suffix(event.key);
+    let parameter = u16::from(modifiers.parameter()) + locks.kitty_bits();
+    let suffix = kitty_suffix(key);
     if let Some(event_type) = event_type {
         // The event type travels in the modifier field's second part, so the modifier parameter is
         // always present when one is reported, even when nothing was held.
-        return Ok(format!("\x1b[{code};{parameter}:{event_type}{suffix}").into_bytes());
+        return format!("\x1b[{code};{parameter}:{event_type}{suffix}").into_bytes();
     }
     if parameter == 1 {
         // A key whose suffix is a letter needs no number: `CSI A` is the canonical spelling and
         // the parameter's default is the only value it could have. One that ends in a tilde does
         // need it, because the number is which key it is.
-        return Ok(if suffix == '~' || suffix == 'u' {
+        return if suffix == '~' || suffix == 'u' {
             format!("\x1b[{code}{suffix}").into_bytes()
         } else {
             format!("\x1b[{suffix}").into_bytes()
-        });
+        };
     }
-    Ok(format!("\x1b[{code};{parameter}{suffix}").into_bytes())
+    format!("\x1b[{code};{parameter}{suffix}").into_bytes()
 }
 
 /// The final byte the Kitty protocol uses for this key.
@@ -1568,6 +1617,105 @@ mod tests {
         // A key with no legacy spelling is reported at either level.
         let control_semicolon = KeyEvent::with(Key::Char(';'), Modifiers::control());
         assert_eq!(spelled(control_semicolon, LEVEL_ONE), b"\x1b[27;5;59~");
+    }
+
+    /// KR-REQ-08.59: `modifyOtherKeys` level 1 spells Escape, Backspace, Return and Tab as xterm
+    /// does. Escape keeps its byte with Shift or Control alone, and is reported with Alt or with both
+    /// of them. Backspace is never reported, and Control makes it the other of DEL and BS, as xterm's
+    /// backarrow key does in the ordinary encoding too. Return and Tab are reported with any
+    /// modifier, except Shift alone on Tab, which is the back-tab. Level 2 reports all four.
+    #[test]
+    fn level_one_spells_escape_backspace_return_and_tab_as_xterm_does() {
+        let shift = Modifiers::shift();
+        let control = Modifiers::control();
+        let all = Modifiers {
+            shift: true,
+            alt: true,
+            control: true,
+            superkey: false,
+        };
+        let cases: [(Key, Modifiers, &[u8]); 24] = [
+            (Key::Escape, Modifiers::NONE, b"\x1b"),
+            (Key::Escape, shift, b"\x1b"),
+            (Key::Escape, control, b"\x1b"),
+            (Key::Escape, CONTROL_SHIFT, b"\x1b[27;6;27~"),
+            (Key::Escape, ALT, b"\x1b[27;3;27~"),
+            (Key::Escape, SHIFT_ALT, b"\x1b[27;4;27~"),
+            (Key::Escape, CONTROL_ALT, b"\x1b[27;7;27~"),
+            (Key::Escape, all, b"\x1b[27;8;27~"),
+            (Key::Backspace, Modifiers::NONE, b"\x7f"),
+            (Key::Backspace, shift, b"\x7f"),
+            (Key::Backspace, control, b"\x08"),
+            (Key::Backspace, CONTROL_SHIFT, b"\x08"),
+            (Key::Backspace, ALT, b"\x1b\x7f"),
+            (Key::Backspace, CONTROL_ALT, b"\x1b\x08"),
+            (Key::Enter, Modifiers::NONE, b"\r"),
+            (Key::Enter, shift, b"\x1b[27;2;13~"),
+            (Key::Enter, control, b"\x1b[27;5;13~"),
+            (Key::Enter, ALT, b"\x1b[27;3;13~"),
+            (Key::Enter, CONTROL_ALT, b"\x1b[27;7;13~"),
+            (Key::Tab, Modifiers::NONE, b"\t"),
+            (Key::Tab, shift, b"\x1b[Z"),
+            (Key::Tab, control, b"\x1b[27;5;9~"),
+            (Key::Tab, ALT, b"\x1b[27;3;9~"),
+            (Key::Tab, CONTROL_ALT, b"\x1b[27;7;9~"),
+        ];
+        for (pressed, held, expected) in cases {
+            assert_eq!(
+                spelled(KeyEvent::with(pressed, held), LEVEL_ONE),
+                expected,
+                "{pressed:?} with {held:?}"
+            );
+        }
+        // The back-tab has no room for a second modifier at level 1, as in the ordinary encoding.
+        assert_eq!(
+            key(KeyEvent::with(Key::Tab, CONTROL_SHIFT), LEVEL_ONE),
+            Err(Unsupported::NotExpressible {
+                what: "Shift together with another modifier on Tab"
+            })
+        );
+        // The ordinary encoding's Backspace is the same, Control making the other byte.
+        assert_eq!(
+            spelled(KeyEvent::with(Key::Backspace, control), LEGACY),
+            b"\x08"
+        );
+        assert_eq!(
+            spelled(KeyEvent::with(Key::Backspace, CONTROL_ALT), LEGACY),
+            b"\x1b\x08"
+        );
+        // Level 2 reports each of them with any modifier.
+        for (pressed, code) in [
+            (Key::Escape, 27),
+            (Key::Backspace, 127),
+            (Key::Enter, 13),
+            (Key::Tab, 9),
+        ] {
+            for (held, parameter) in [(shift, 2), (ALT, 3), (control, 5)] {
+                assert_eq!(
+                    spelled(KeyEvent::with(pressed, held), LEVEL_TWO),
+                    format!("\x1b[27;{parameter};{code}~").into_bytes(),
+                    "{pressed:?} with {held:?}"
+                );
+            }
+        }
+    }
+
+    /// KR-REQ-08.59: at level 1, Alt on an ordinary key is the escape prefix, with Shift or without:
+    /// xterm leaves a bare Alt to its meta handling there, and reports it only at level 2. Control
+    /// with Alt still reports a chord X11 has no character for.
+    #[test]
+    fn level_one_leaves_alt_on_an_ordinary_key_to_the_escape_prefix() {
+        assert_eq!(spelled(on('c', 'c', ALT), LEVEL_ONE), b"\x1bc");
+        assert_eq!(spelled(on('c', 'C', SHIFT_ALT), LEVEL_ONE), b"\x1bC");
+        assert_eq!(spelled(on('1', '!', SHIFT_ALT), LEVEL_ONE), b"\x1b!");
+        assert_eq!(
+            spelled(on('1', '1', CONTROL_ALT), LEVEL_ONE),
+            b"\x1b[27;7;49~"
+        );
+        assert_eq!(
+            spelled(on('c', 'C', SHIFT_ALT), LEVEL_TWO),
+            b"\x1b[27;4;67~"
+        );
     }
 
     /// KR-REQ-08.59: Control and a character is what X11 makes of it, which is what xterm sends,
@@ -2095,6 +2243,31 @@ mod tests {
         );
     }
 
+    /// KR-REQ-08.59: a release keeps the key its press established. A Control-C whose platform
+    /// reported no unshifted character is still the C key when Shift or Caps Lock comes on before it
+    /// comes up: the release takes its modifiers and locks from the moment it happens, never its
+    /// identity. A press that had no code has no release either.
+    #[test]
+    fn a_release_keeps_the_key_its_press_established() {
+        let control_c = KeyEvent::with(Key::Char('c'), Modifiers::control());
+        assert_eq!(spelled(control_c, BOTH), b"\x1b[99;5u");
+        assert_eq!(
+            release(control_c, Modifiers::shift(), Locks::NONE, BOTH).expect("encodes"),
+            b"\x1b[99;2:3u"
+        );
+        assert_eq!(
+            release(control_c, CONTROL_SHIFT, Locks::NONE, BOTH).expect("encodes"),
+            b"\x1b[99;6:3u"
+        );
+        assert_eq!(
+            release(control_c, Modifiers::control(), CAPS, BOTH).expect("encodes"),
+            b"\x1b[99;69:3u"
+        );
+        let unknown = KeyEvent::with(Key::Char('C'), CONTROL_SHIFT);
+        assert!(key(unknown, BOTH).is_err());
+        assert!(release(unknown, Modifiers::NONE, Locks::NONE, BOTH).is_err());
+    }
+
     /// KR-REQ-08.59: an encoding that reports no releases gets nothing for one, never a press.
     #[test]
     fn a_release_under_an_encoding_without_releases_is_nothing() {
@@ -2332,6 +2505,30 @@ mod tests {
             release(end, Modifiers::NONE, Locks::NONE, EVENTS).expect("encodes"),
             b"\x1b[1;1:3F"
         );
+    }
+
+    /// KR-REQ-08.59: without disambiguation the Kitty protocol names a keypad key by the main key it
+    /// converts it to, whatever the layout makes it type: a decimal key that makes a comma is `.` in
+    /// a report, its repeat and its release, and still types its comma. Told apart, it is the keypad's
+    /// own decimal key.
+    #[test]
+    fn a_decimal_key_that_makes_a_comma_is_the_period_key_in_a_report() {
+        let comma = |held| locked(keypad(Keypad::Decimal(','), held), NUM);
+        assert_eq!(spelled(comma(Modifiers::NONE), EVENTS), b",");
+        let control = comma(Modifiers::control());
+        assert_eq!(spelled(control, EVENTS), b"\x1b[46;133u");
+        assert_eq!(spelled(repeated(control), EVENTS), b"\x1b[46;133:2u");
+        assert!(release_reported(control, EVENTS));
+        assert_eq!(
+            release(control, Modifiers::control(), NUM, EVENTS).expect("encodes"),
+            b"\x1b[46;133:3u"
+        );
+        assert_eq!(
+            spelled(keypad(Keypad::Decimal(','), Modifiers::control()), EVENTS),
+            b".",
+            "the period key's legacy spelling with Control"
+        );
+        assert_eq!(spelled(control, BOTH), b"\x1b[57409;133u");
     }
 
     /// KR-REQ-08.59: F13 upwards have the Kitty protocol's codes and no ordinary spelling.
