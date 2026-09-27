@@ -471,6 +471,7 @@ impl Controller {
             inhibitor: Mutex::new(Inhibitor::new()),
             demand_scan: Mutex::new(DemandScan::default()),
             finalising: Mutex::new(()),
+            handover: super::host::Handover::default(),
             _lock: lock,
         });
         // Bound before anything can reach the module: from here on a workflow's grant is decided

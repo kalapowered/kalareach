@@ -256,6 +256,11 @@ async fn run(
         result = client_task => result??,
         result = chunk_task => result?,
         result = tokio::signal::ctrl_c() => result?,
+        // An update of this host, which a daemon of the new release replaces this one for. Like
+        // any other stop, it stops no session: the workers belong to the service manager.
+        () = controller.handed_over() => {
+            println!("kr-controller: stopped: an update of this host replaces this daemon");
+        }
     }
     Ok(())
 }

@@ -222,6 +222,47 @@ impl Registry {
         Self::prepare(connection, environment_id)
     }
 
+    /// Opens an environment's registry to read it as it is: without creating it, migrating it or
+    /// settling anything recorded in it.
+    ///
+    /// What an update of the host reads while it holds an environment whose daemon has stopped.
+    /// The registry is that daemon's, and a reader neither brings it to its own schema nor writes
+    /// anything to it: what it finds is exactly what the daemon left.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when there is no registry, when it cannot
+    /// be opened for reading, or when its schema is not the one this build reads.
+    pub fn open_read_only(
+        path: impl AsRef<std::path::Path>,
+        environment_id: EnvironmentId,
+    ) -> Result<Self> {
+        let connection = Connection::open_with_flags(
+            path.as_ref(),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(ControllerError::registry)?;
+        let recorded: Option<i64> = connection
+            .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+            .optional()
+            .map_err(ControllerError::registry)?;
+        if recorded != Some(SCHEMA_VERSION) {
+            return Err(ControllerError::registry(format!(
+                "the registry's schema is {}, and this build reads version {SCHEMA_VERSION} \
+                 without migrating it",
+                recorded.map_or_else(
+                    || "not recorded".to_owned(),
+                    |version| format!("version {version}")
+                )
+            )));
+        }
+        Ok(Self {
+            connection,
+            environment_id,
+            current_process: kr_ipc::identity::current_process,
+        })
+    }
+
     /// Opens a registry that already exists, to read what it records and nothing else.
     ///
     /// Nothing is created, brought forward, repaired or settled, and nothing is written, not even
@@ -2647,5 +2688,59 @@ mod tests {
             "a refusal changes nothing"
         );
         drop(writer);
+    }
+
+    /// An update reads an environment's registry exactly as its daemon left it: nothing is created,
+    /// migrated or written, and a registry of a schema this build would have to migrate is refused
+    /// rather than read.
+    #[test]
+    fn a_registry_is_read_as_its_daemon_left_it() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let path = directory.path().join("registry.sqlite3");
+        assert!(
+            Registry::open_read_only(&path, environment()).is_err(),
+            "no registry is created by a reader"
+        );
+        assert!(!path.exists());
+        {
+            let mut registry = Registry::open(&path, environment()).expect("a registry");
+            registry.advance_generation().expect("a generation");
+            registry
+                .reserve(
+                    &ActorId::new("local:test").expect("an actor"),
+                    Uuid::from_bytes([1; 16]),
+                    Digest256::from_bytes([2; 32]),
+                    b"intent",
+                    TimestampMs::new(0),
+                )
+                .expect("a reservation");
+        }
+        let before = std::fs::read(&path).expect("the registry's bytes");
+        let mut read = Registry::open_read_only(&path, environment()).expect("read as it is");
+        assert_eq!(
+            read.reservations_in(LaunchPhase::Reserved)
+                .expect("reads")
+                .len(),
+            1
+        );
+        assert_eq!(read.generation().expect("reads").get(), 1);
+        assert!(
+            read.advance_generation().is_err(),
+            "nothing is written through a reader"
+        );
+        drop(read);
+        assert_eq!(std::fs::read(&path).expect("the registry's bytes"), before);
+
+        // The control: the same registry recorded at an earlier schema is refused by the reader,
+        // where the daemon's own open would bring it forward.
+        {
+            let connection = Connection::open(&path).expect("opens");
+            connection
+                .execute("UPDATE schema_version SET version = 4", [])
+                .expect("an earlier schema");
+        }
+        let refused =
+            Registry::open_read_only(&path, environment()).expect_err("an earlier schema");
+        assert!(refused.to_string().contains("version 4"), "{refused}");
     }
 }

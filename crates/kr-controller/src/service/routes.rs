@@ -738,6 +738,18 @@ impl Controller {
                     Err(error) => Err(error),
                 }
             }
+            // Only the owner at this machine replaces what the host runs.
+            Method::HostUpdateHandover => {
+                if is_owners_own_socket(actor_id) {
+                    self.update_handover(mutation).await
+                } else {
+                    Err(ControllerError::PermissionDenied {
+                        detail: "only the owner at this machine hands its control daemon over to \
+                                 an update"
+                            .to_owned(),
+                    })
+                }
+            }
             _ => Err(ControllerError::InvalidArgument(format!(
                 "{} is not a mutation this daemon serves",
                 method.as_str()

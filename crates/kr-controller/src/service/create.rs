@@ -46,6 +46,9 @@ impl Controller {
         mutation: &MutationRequest,
         carried: crate::authority::AdmittedMutation,
     ) -> Result<ParamsValue> {
+        // Through the gate first, and counted until this create has settled: a daemon making way
+        // for an update of the host starts nothing new, and waits for what it has started.
+        let _under_way = self.handover.admit()?;
         let create: SessionCreateParams = parse(&mutation.params)?;
         // Before the reservation, because this is a request that can never be served rather than
         // one this environment happens to have no room for. The palette travels to the worker in
