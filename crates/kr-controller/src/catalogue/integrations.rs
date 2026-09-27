@@ -13,10 +13,10 @@
 //! reaches the sessions created after it; the worker establishes a backend only while the package
 //! an entry names still integrates its command with the entry's flags.
 //!
-//! The doctor reports the same reading: each integration an admitted release declares or the
-//! configuration names, what a session created now gets of it and why, the mode its command runs
-//! in, and the executable the daemon's own search path names for the command, with the version a
-//! signed qualification record gives that executable's digest.
+//! The doctor reports the same reading: each integration an admitted release declares and each
+//! package the configuration names, what a session created now gets of it and why, the mode its
+//! command runs in, and the executable the daemon's own search path names for the command, with
+//! the version a signed qualification record gives that executable's digest.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -178,13 +178,15 @@ impl Declared {
     }
 }
 
-/// Every command integration an admitted release declares or the configuration names, as the
-/// doctor reports it, in package order.
+/// Every command integration an admitted release declares, and every package the configuration
+/// names, as the doctor reports it, in package order. An installation the admissions leave out is
+/// reported where the configuration names it: a new session gets nothing of it either way.
 ///
 /// `reading` is the admissions in force as a worker reads them, none where they could not be
-/// computed; `left_out` the installations those admissions leave out, and why; `enabled` the
-/// packages the configuration in force turns on. It resolves each command on the daemon's search
-/// path and reads each executable found, so it belongs on a thread that may block.
+/// computed, which leaves every package the configuration names unknown; `left_out` the
+/// installations those admissions leave out, and why; `enabled` the packages the configuration in
+/// force turns on. It resolves each command on the daemon's search path and reads each executable
+/// found, so it belongs on a thread that may block.
 #[must_use]
 pub fn report(
     reading: Option<&Reading>,
@@ -277,6 +279,18 @@ pub fn report(
     }
     for plugin_id in enabled {
         if reports.contains_key(plugin_id) {
+            continue;
+        }
+        // With no admissions read, nothing says whether it is installed.
+        if reading.is_none() {
+            let report = described(
+                plugin_id,
+                None,
+                CommandIntegrationState::Unknown,
+                None,
+                None,
+            );
+            reports.insert(plugin_id.clone(), (report, None));
             continue;
         }
         let report = match left_out
@@ -413,7 +427,7 @@ pub fn check(reports: &[CommandIntegrationReport], enabled: &[String]) -> Doctor
             TITLE,
             DoctorStatus::NotApplicable,
             Sentence::new().stated(
-                "no installed release declares a command integration, and the configuration \
+                "no admitted release declares a command integration, and the configuration \
                  turns on none",
             ),
             None,
@@ -454,7 +468,8 @@ pub fn check(reports: &[CommandIntegrationReport], enabled: &[String]) -> Doctor
     )
 }
 
-/// The check when the installed packages could not be read in time.
+/// The check when the admissions in force could not be computed, or the packages they admit not
+/// read, within the doctor's bounds.
 #[must_use]
 pub fn unread_check() -> DoctorCheck {
     DoctorCheck::new(
@@ -462,8 +477,8 @@ pub fn unread_check() -> DoctorCheck {
         "The command integrations new sessions apply",
         DoctorStatus::Warning,
         Sentence::new().stated(
-            "the installed packages could not be read in time, so the command integrations are \
-             not reported",
+            "the admissions in force could not be computed, or the packages they admit not read, \
+             so what a new session gets of each command integration is not known",
         ),
         None,
     )

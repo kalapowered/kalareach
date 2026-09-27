@@ -8397,12 +8397,14 @@ impl Controller {
         Ok(HostDoctorResult::new(checks, effective).with_command_integrations(integrations))
     }
 
-    /// Every command integration an admitted release declares or the configuration names, with
-    /// the doctor's check of them, read from the admissions in force by a worker's own rules.
+    /// Every command integration an admitted release declares, and every package the configuration
+    /// names, with the doctor's check of them, read from the admissions in force by a worker's own
+    /// rules.
     ///
     /// The executable is looked for on this daemon's own search path, the one the native bridge
-    /// reads, and read to find the version a signed record names for it. None is reported where the
-    /// packages cannot be read in time, and the check says so.
+    /// reads, and read to find the version a signed record names for it. Where the admissions
+    /// cannot be computed or their packages read, each package the configuration names is reported
+    /// unknown, and the check says why.
     async fn command_integration_report(
         &self,
         enabled: Vec<String>,
@@ -8411,6 +8413,7 @@ impl Controller {
         Vec<kr_protocol::hostinfo::CommandIntegrationReport>,
     ) {
         let snapshot = self.current_snapshot(tokio::time::Instant::now()).await;
+        let unread = snapshot.is_none();
         let host = crate::catalogue::integrations::Host {
             search_path: std::env::var_os("PATH")
                 .map(|path| std::env::split_paths(&path).collect())
@@ -8440,11 +8443,22 @@ impl Controller {
             })
         };
         match tokio::time::timeout(DOCTOR_READS, reported).await {
+            // Admissions that could not be computed say nothing of what is installed.
+            Ok(Ok(reports)) if unread => (crate::catalogue::integrations::unread_check(), reports),
             Ok(Ok(reports)) => (
                 crate::catalogue::integrations::check(&reports, &enabled),
                 reports,
             ),
-            Ok(Err(_)) | Err(_) => (crate::catalogue::integrations::unread_check(), Vec::new()),
+            // With nothing read there is nothing to resolve, so this does not block.
+            Ok(Err(_)) | Err(_) => (
+                crate::catalogue::integrations::unread_check(),
+                crate::catalogue::integrations::report(
+                    None,
+                    &[],
+                    &enabled,
+                    &crate::catalogue::integrations::Host::default(),
+                ),
+            ),
         }
     }
 

@@ -393,10 +393,13 @@ flags. Where a session's entries are more than one launch message carries, the l
 and the doctor's catalogue check names each one. A profile's list replaces the host's, and an empty
 list turns every integration off at that level. `kr plugin integration enable` and `disable` edit
 the host's list, and the change reaches the sessions created afterwards. `kr doctor` reports each
-integration: what a new session gets of it and why, the mode its command runs in, the flags and
-variables it adds, and the executable the daemon's own search path resolves the command to, with
-the version a signed qualification record gives that executable. A session whose own search path
-differs can find another; each launch records the one it ran.
+integration an admitted release declares and each package the list names: what a new session gets
+of it and why, the mode its command runs in, the flags and variables it adds, and the executable
+the daemon's own search path resolves the command to, with the version a signed qualification
+record gives that executable. An installation the admissions leave out is reported only where the
+list names it, and where the admissions cannot be computed each listed package is reported as
+unknown. A session whose own search path differs can find another; each launch records the one it
+ran.
 
 The document the sleep setting used to live in, `power.json`, is not read. A copy found beside the
 configuration is reported by `kr doctor` in one line and ignored.

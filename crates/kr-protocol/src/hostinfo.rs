@@ -319,8 +319,8 @@ pub struct HostDoctorResult {
     /// with its source, so the host answers with them rather than leaving a command to read the
     /// document a second time and reach its own conclusion about the platform's defaults.
     pub configuration: EffectiveConfiguration,
-    /// Every command integration an installed release declares or the configuration names, and
-    /// what a session created now gets of it.
+    /// Every command integration an admitted release declares, and every package the
+    /// configuration names, with what a session created now gets of each.
     ///
     /// Section 7: diagnostics show the resolved executable, flags, version and integration mode.
     pub command_integrations: Vec<CommandIntegrationReport>,
@@ -434,16 +434,16 @@ impl CommandIntegrationReport {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum CommandIntegrationState {
-    /// The configuration turns it on and the installed release's integration applies: an
+    /// The configuration turns it on and the admitted release's integration applies: an
     /// invocation of its command gets its flags and variables behind a worker-owned backend.
     On,
-    /// The installed release's integration applies and the configuration does not turn it on: an
+    /// The admitted release's integration applies and the configuration does not turn it on: an
     /// invocation of its command runs as typed.
     Off,
     /// The release declares one, and its installation does not hold the owner-confirmed
     /// `command_integration.launch` grant.
     NotGranted,
-    /// The installed release declares none.
+    /// The configuration names it, and the admitted release declares none.
     NoneDeclared,
     /// Installed and left out of the admissions in force: disabled, revoked, not supported here,
     /// not whole or past a limit.
@@ -454,8 +454,8 @@ pub enum CommandIntegrationState {
     Conflict,
     /// The configuration names it and it is not installed in this environment.
     NotInstalled,
-    /// The configuration names it, and the admissions in force could not be read, so what a new
-    /// session gets of it is not known.
+    /// The configuration names it, and the admissions in force could not be computed or their
+    /// packages read, so what a new session gets of it is not known.
     Unknown,
 }
 
