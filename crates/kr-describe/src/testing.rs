@@ -457,9 +457,12 @@ pub fn stub_main() -> i32 {
     if let Some(raw) = script.raw {
         return run_raw(raw, &script);
     }
-    let Some(runtime_dir) = flag(&arguments, "--runtime-dir") else {
-        eprintln!("usage: kr-describe-stub --runtime-dir <directory>");
-        return 64;
+    let (runtime_dir, daemon) = match crate::serve::arguments(&arguments) {
+        Ok(read) => read,
+        Err(error) => {
+            eprintln!("kr-describe-stub: {error}");
+            return 64;
+        }
     };
     let catalogue = match Catalogue::builtin() {
         Ok(catalogue) => catalogue,
@@ -470,8 +473,9 @@ pub fn stub_main() -> i32 {
     };
     let options = Options {
         build: stub_build(),
-        runtime_dir: PathBuf::from(runtime_dir),
+        runtime_dir,
         catalogue,
+        daemon,
     };
     let input = Wedging::reading(std::io::stdin(), script.wedge_input_after);
     let output = Wedging::writing(std::io::stdout(), script.wedge_output_from);
@@ -480,9 +484,10 @@ pub fn stub_main() -> i32 {
 
 /// Runs a stub daemon, which a test ends to see its description process go with it.
 ///
-/// It drives the description service over a child of its own - this executable, serving a job that
-/// runs until it is cancelled - until that job is in the child, prints the child's start identity
-/// on its own output as one line, and then waits to be ended.
+/// It drives the description service over a child of its own - this executable, following the
+/// script after `--child-script` - until the job it queues is in the child, or with `--until
+/// published` until that job's description is published, prints the child's start identity on
+/// its own output as one line, and then waits to be ended.
 fn run_daemon(arguments: &[String]) -> i32 {
     use crate::context::{ContextBinding, ContextSignal};
     use crate::environment::{EnvironmentKind, ExecutionEnvironment, build_target};
@@ -505,15 +510,13 @@ fn run_daemon(arguments: &[String]) -> i32 {
         eprintln!("usage: kr-describe-stub --daemon --runtime-dir <directory>");
         return 64;
     };
-    let child = Script {
-        generate_until_cancelled: true,
-        ..Script::default()
-    };
+    let child = flag(arguments, "--child-script").unwrap_or_default();
+    let published = flag(arguments, "--until").as_deref() == Some("published");
     let launch = Launch {
         program,
         arguments: vec!["--runtime-dir".into(), runtime_dir.clone().into()],
         working_directory: runtime_dir.clone(),
-        environment: vec![(SCRIPT_VARIABLE.into(), child.to_env().into())],
+        environment: vec![(SCRIPT_VARIABLE.into(), child.into())],
         models: runtime_dir,
     };
     let service = DescriptionService::new(
@@ -561,9 +564,12 @@ fn run_daemon(arguments: &[String]) -> i32 {
         {
             return 70;
         }
-        if driver.service().in_flight() == 1
-            && let Some(identity) = driver.identity()
-        {
+        let there = if published {
+            driver.service().counts().published == 1
+        } else {
+            driver.service().in_flight() == 1
+        };
+        if there && let Some(identity) = driver.identity() {
             let line = serde_json::to_string(identity).unwrap_or_default();
             let mut output = std::io::stdout();
             if writeln!(output, "{line}")
@@ -575,7 +581,7 @@ fn run_daemon(arguments: &[String]) -> i32 {
             stop_for_good();
         }
         if Instant::now() >= until {
-            eprintln!("kr-describe-stub: the job did not reach the child in time");
+            eprintln!("kr-describe-stub: the job did not get where it was to go in time");
             return 70;
         }
         driver.wait(Duration::from_millis(50));

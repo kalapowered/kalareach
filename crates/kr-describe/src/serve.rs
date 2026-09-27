@@ -12,8 +12,10 @@
 //!   answers each piece of work it is given.
 //! * **The watchdog** ends the process when the control thread has spent longer than
 //!   [`CONTROL_BOUND_MS`] on one request, which is a control thread stuck writing to a daemon that
-//!   is not reading, and when a load or a job is [`OVERDUE_GRACE_MS`] past its deadline, which is a
-//!   model that did not stop. No end of this process depends on the daemon alone.
+//!   is not reading; when a load or a job is [`OVERDUE_GRACE_MS`] past its deadline, which is a
+//!   model that did not stop; and when the daemon that started it has ended, by its start
+//!   identity, whether or not the control thread saw its input end. No end of this process
+//!   depends on the daemon alone.
 //!
 //! # One process per environment
 //!
@@ -36,6 +38,7 @@ use std::sync::mpsc::{Receiver, TrySendError};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
+use kr_protocol::identity::ProcessStartIdentity;
 use kr_protocol::scalars::{Bytes, Nullable, U64};
 
 use crate::environment::build_target;
@@ -58,6 +61,12 @@ pub const LOCK_FILE: &str = "describe-inference.lock";
 
 /// How often the watchdog looks.
 const WATCH_INTERVAL: Duration = Duration::from_millis(100);
+
+/// How often the watchdog asks whether the daemon that started this process is still there.
+const DAEMON_LOOK_EVERY: u32 = 10;
+
+/// The argument a daemon passes its own start identity in, as JSON.
+pub const DAEMON_IDENTITY_ARGUMENT: &str = "--daemon-identity";
 
 /// How often a load waiting for the lock tries it again.
 const LOCK_RETRY: Duration = Duration::from_millis(50);
@@ -160,6 +169,8 @@ pub struct Options {
     pub runtime_dir: PathBuf,
     /// The profiles this build ships, which a load is looked up in.
     pub catalogue: Catalogue,
+    /// The start identity of the daemon that started this process, when it said.
+    pub daemon: Option<ProcessStartIdentity>,
 }
 
 /// How a description process ends.
@@ -169,7 +180,7 @@ pub enum Exit {
     Ended,
     /// A frame from the daemon was not one of this wire.
     WireBroken,
-    /// An answer could not be written: nothing is reading them.
+    /// The daemon has gone: an answer could not be written, or the daemon's process has ended.
     DaemonGone,
     /// The control thread spent too long on one request.
     ControlStalled,
@@ -206,6 +217,37 @@ impl Exit {
             _ => None,
         }
     }
+}
+
+/// Reads the arguments a description process is started with: `--runtime-dir <directory>`, and
+/// the daemon's start identity after [`DAEMON_IDENTITY_ARGUMENT`] when the daemon gave it.
+///
+/// # Errors
+///
+/// Returns what is wrong with them.
+pub fn arguments(
+    given: &[String],
+) -> std::result::Result<(PathBuf, Option<ProcessStartIdentity>), String> {
+    let mut runtime_dir = None;
+    let mut daemon = None;
+    let mut given = given.iter();
+    while let Some(name) = given.next() {
+        let value = given
+            .next()
+            .ok_or_else(|| format!("{name} needs a value"))?;
+        match name.as_str() {
+            "--runtime-dir" => runtime_dir = Some(PathBuf::from(value)),
+            DAEMON_IDENTITY_ARGUMENT => {
+                daemon = Some(
+                    serde_json::from_str(value)
+                        .map_err(|error| format!("{name} is not a start identity: {error}"))?,
+                );
+            }
+            other => return Err(format!("{other} is not an argument of this process")),
+        }
+    }
+    let runtime_dir = runtime_dir.ok_or_else(|| "--runtime-dir is required".to_owned())?;
+    Ok((runtime_dir, daemon))
 }
 
 /// Serves requests from `input` with `model` until the input ends, answering on `output`.
@@ -261,9 +303,10 @@ pub fn run<M: Model>(
     }
     {
         let shared = shared.clone();
+        let daemon = options.daemon.clone();
         std::thread::Builder::new()
             .name("describe-watchdog".to_owned())
-            .spawn(move || watchdog(&shared))
+            .spawn(move || watchdog(&shared, daemon.as_ref()))
             .expect("the watchdog starts");
     }
     let mut applied: Option<Applied> = None;
@@ -666,10 +709,23 @@ fn resolve(
     Ok((profile.clone(), placed))
 }
 
-/// Ends the process when the control thread is stuck on one request or work is overdue.
-fn watchdog(shared: &Shared) {
+/// Ends the process when the control thread is stuck on one request, work is overdue, or the
+/// daemon that started it has gone.
+fn watchdog(shared: &Shared, daemon: Option<&ProcessStartIdentity>) {
+    let mut looks: u32 = 0;
     while !shared.returned.load(Ordering::Acquire) {
         std::thread::sleep(WATCH_INTERVAL);
+        // The end of the input is how the process usually learns its daemon has gone. A control
+        // thread that never sees that end, stuck inside a read, would leave the process and its
+        // model behind, so the daemon is also looked for by its own start identity.
+        looks = looks.wrapping_add(1);
+        if let Some(daemon) = daemon
+            && looks.is_multiple_of(DAEMON_LOOK_EVERY)
+            && kr_ipc::identity::process_state(daemon) == kr_ipc::identity::ProcessState::Ended
+        {
+            eprintln!("kr-describe: the daemon that started this process has gone, so it ends");
+            std::process::exit(Exit::DaemonGone.code());
+        }
         let now = shared.stamp();
         let since = shared.control_since.load(Ordering::Acquire);
         if since != 0 && now.saturating_sub(since) > CONTROL_BOUND_MS {

@@ -40,6 +40,7 @@ use kr_protocol::scalars::U64;
 
 use crate::error::Result;
 use crate::resource::HostConditions;
+use crate::serve::DAEMON_IDENTITY_ARGUMENT;
 use crate::service::{
     Answered, DescriptionService, Instruction, Outcome, ProcessEnd, UnloadReason,
 };
@@ -167,6 +168,9 @@ pub struct Driver {
     started: u64,
     background: Option<Background>,
     until_ms: Option<u64>,
+    /// This daemon's own start identity, as JSON, which each process is given so its watchdog can
+    /// tell when the daemon has gone.
+    identity: Option<String>,
 }
 
 impl Driver {
@@ -187,6 +191,9 @@ impl Driver {
             started: 0,
             background: None,
             until_ms: None,
+            identity: kr_ipc::identity::current_process_start_identity()
+                .ok()
+                .and_then(|identity| serde_json::to_string(&identity).ok()),
         }
     }
 
@@ -377,8 +384,12 @@ impl Driver {
         if self.process.is_some() {
             return Ok(());
         }
-        let mut child = Command::new(&self.launch.program)
-            .args(&self.launch.arguments)
+        let mut command = Command::new(&self.launch.program);
+        command.args(&self.launch.arguments);
+        if let Some(identity) = &self.identity {
+            command.arg(DAEMON_IDENTITY_ARGUMENT).arg(identity);
+        }
+        let mut child = command
             .current_dir(&self.launch.working_directory)
             .env_clear()
             .envs(

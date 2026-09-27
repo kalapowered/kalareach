@@ -276,7 +276,10 @@ The daemon holds the process to its bounds, and ends it outright when it breaks 
 
 The process holds itself to them as well, so no end depends on the daemon alone. Its watchdog ends
 it when its control thread has spent two seconds on one request, which is a daemon that stopped
-reading its answers, and when a load or a job runs two seconds past its deadline. Before its first
+reading its answers, and when a load or a job runs two seconds past its deadline. The daemon passes
+its own start identity when it starts the process, and once a second the watchdog asks whether that
+daemon is still running: a control thread stuck inside a read never sees its input end, and the
+process still goes when its daemon does. Before its first
 load it takes the environment's lock, `describe-inference.lock` in the runtime directory, and keeps
 it until it exits, so a process a replacement daemon starts loads nothing until the old one has
 gone.

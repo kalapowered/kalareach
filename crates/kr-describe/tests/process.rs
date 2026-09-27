@@ -506,6 +506,7 @@ fn a_job_runs_with_the_limits_sent_and_the_loaded_profiles_sampler() {
                     build: "kr-describe-tests/0".to_owned(),
                     runtime_dir: runtime,
                     catalogue: Catalogue::builtin().expect("the catalogue"),
+                    daemon: None,
                 },
                 recording,
                 Input(read, Vec::new()),

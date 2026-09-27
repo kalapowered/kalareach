@@ -5,18 +5,19 @@
 //! lock before its first load. It ends when its input ends, which is the daemon going, and its
 //! watchdog ends it when it is stuck; `kr_describe::serve` is the whole of how it serves.
 
-use std::path::PathBuf;
-
 use kr_describe::profile::catalogue::Catalogue;
-use kr_describe::serve::{Options, run};
+use kr_describe::serve::{DAEMON_IDENTITY_ARGUMENT, Options, arguments, run};
 use kr_describe_model::llama::Llama;
 
 fn main() {
-    let arguments: Vec<String> = std::env::args().skip(1).collect();
-    let runtime_dir = match arguments.as_slice() {
-        [flag, directory] if flag == "--runtime-dir" => PathBuf::from(directory),
-        _ => {
-            eprintln!("usage: kr-describe-inference --runtime-dir <directory>");
+    let given: Vec<String> = std::env::args().skip(1).collect();
+    let (runtime_dir, daemon) = match arguments(&given) {
+        Ok(read) => read,
+        Err(error) => {
+            eprintln!(
+                "kr-describe-inference: {error}\nusage: kr-describe-inference --runtime-dir \
+                 <directory> [{DAEMON_IDENTITY_ARGUMENT} <identity>]"
+            );
             std::process::exit(64);
         }
     };
@@ -32,6 +33,7 @@ fn main() {
             build: format!("kr-describe-inference/{}", env!("CARGO_PKG_VERSION")),
             runtime_dir,
             catalogue,
+            daemon,
         },
         Llama::new(),
         std::io::stdin(),

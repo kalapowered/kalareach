@@ -694,16 +694,26 @@ fn a_cancellation_reaches_the_process_during_a_load_and_a_decode() {
     );
 }
 
-/// KR-REQ-22.21: the description process goes when its daemon dies, with a job inside it: its
-/// input ends, and it ends. The control is the same process while its daemon lives.
-#[test]
-fn the_process_goes_when_its_daemon_dies() {
-    let placed = Placed::stub();
+/// Starts a stub daemon whose description process follows `child`, and returns it with that
+/// process's start identity once the daemon's job has got as far as `until` says: `sent`, or
+/// `published`.
+fn stub_daemon(
+    placed: &Placed,
+    child: &Script,
+    until: &str,
+) -> (
+    std::process::Child,
+    kr_protocol::identity::ProcessStartIdentity,
+) {
     let runtime = placed.directory("runtime");
     let mut daemon = std::process::Command::new(placed.program())
         .arg("--daemon")
         .arg("--runtime-dir")
         .arg(&runtime)
+        .arg("--child-script")
+        .arg(child.to_env())
+        .arg("--until")
+        .arg(until)
         .current_dir(&runtime)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -718,8 +728,37 @@ fn the_process_goes_when_its_daemon_dies() {
         let _ = tell.send(line);
     });
     let line = heard.recv_timeout(REAL).expect("the child's identity");
-    let identity: kr_protocol::identity::ProcessStartIdentity =
-        serde_json::from_str(line.trim()).expect("an identity");
+    let identity = serde_json::from_str(line.trim()).expect("an identity");
+    (daemon, identity)
+}
+
+/// Ends a stub daemon, and says whether its description process then went within ten seconds.
+fn the_process_goes_with(
+    mut daemon: std::process::Child,
+    identity: &kr_protocol::identity::ProcessStartIdentity,
+) -> bool {
+    daemon.kill().expect("the daemon is ended");
+    daemon.wait().expect("the daemon is collected");
+    let give_up = Instant::now() + Duration::from_secs(10);
+    while kr_ipc::identity::process_state(identity) != kr_ipc::identity::ProcessState::Ended {
+        if Instant::now() >= give_up {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    true
+}
+
+/// KR-REQ-22.21: the description process goes when its daemon dies, with a job inside it: its
+/// input ends, and it ends. The control is the same process while its daemon lives.
+#[test]
+fn the_process_goes_when_its_daemon_dies() {
+    let placed = Placed::stub();
+    let child = Script {
+        generate_until_cancelled: true,
+        ..Script::default()
+    };
+    let (daemon, identity) = stub_daemon(&placed, &child, "sent");
 
     // The control: while the daemon lives, its description process runs.
     std::thread::sleep(Duration::from_millis(500));
@@ -728,15 +767,41 @@ fn the_process_goes_when_its_daemon_dies() {
         kr_ipc::identity::ProcessState::Running
     );
 
-    daemon.kill().expect("the daemon is ended");
-    daemon.wait().expect("the daemon is collected");
-    let give_up = Instant::now() + Duration::from_secs(10);
-    while kr_ipc::identity::process_state(&identity) != kr_ipc::identity::ProcessState::Ended {
-        assert!(
-            Instant::now() < give_up,
-            "the description process outlived its daemon: {identity:?}"
+    assert!(
+        the_process_goes_with(daemon, &identity),
+        "the description process outlived its daemon: {identity:?}"
+    );
+}
+
+/// KR-REQ-22.21: an idle description process whose control thread is stuck inside a read goes when
+/// its daemon dies. The end of its input never reaches that thread, so the watchdog looks for the
+/// daemon by the start identity the daemon passed it. The controls are the same stuck process while
+/// its daemon lives, which runs on, and an idle process that reads, which goes when its input ends.
+#[test]
+fn an_idle_process_stuck_inside_a_read_goes_when_its_daemon_dies() {
+    for (child, what) in [
+        (
+            Script {
+                wedge_input_after: Some(3),
+                ..Script::default()
+            },
+            "stuck inside a read",
+        ),
+        (Script::default(), "reading"),
+    ] {
+        let placed = Placed::stub();
+        let (daemon, identity) = stub_daemon(&placed, &child, "published");
+        // Longer than the watchdog takes to look for the daemon.
+        std::thread::sleep(Duration::from_millis(1_500));
+        assert_eq!(
+            kr_ipc::identity::process_state(&identity),
+            kr_ipc::identity::ProcessState::Running,
+            "{what}: an idle process runs on while its daemon lives"
         );
-        std::thread::sleep(Duration::from_millis(20));
+        assert!(
+            the_process_goes_with(daemon, &identity),
+            "{what}: the description process outlived its daemon: {identity:?}"
+        );
     }
 }
 
