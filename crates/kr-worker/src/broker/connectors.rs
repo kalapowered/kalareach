@@ -697,10 +697,11 @@ pub mod fixture {
     ];
     use crate::broker::bridge::BridgeSurface;
 
-    /// The command Claude Code's integration resolves.
+    /// The command Claude Code's released integration resolves.
     pub const COMMAND: &str = "claude";
 
-    /// The flag and value that load the package's channel, each one element.
+    /// The flag and value that load the package's channel, each one element, as Claude Code's
+    /// released integration declares them.
     pub const FLAGS: [&str; 2] = [
         "--dangerously-load-development-channels",
         "plugin:kalareach-channels@skills-dir",
@@ -715,6 +716,25 @@ pub mod fixture {
     const PLUGIN: &[u8] =
         include_bytes!("../../../../fixtures/bridges/claude-code/plugin-manifest.json");
     const QODER_FLAGS: &[u8] = include_bytes!("../../../../fixtures/bridges/qoder-cli/flags.json");
+
+    /// The manifests of the released Claude Code, Gemini CLI and Qoder CLI packages, as core pins
+    /// them: the test packages declare the command integrations these declare.
+    const RELEASED_CLAUDE_CODE: &[u8] = include_bytes!(
+        "../../../../fixtures/plugins/released/kalareach/claude-code/0.4.0/plugin.json"
+    );
+    const RELEASED_GEMINI_CLI: &[u8] = include_bytes!(
+        "../../../../fixtures/plugins/released/kalareach/gemini-cli/0.4.0/plugin.json"
+    );
+    const RELEASED_QODER_CLI: &[u8] = include_bytes!(
+        "../../../../fixtures/plugins/released/kalareach/qoder-cli/0.4.0/plugin.json"
+    );
+
+    /// The `command_integration` member of a released package's manifest.
+    fn released_integration(manifest: &[u8]) -> serde_json::Value {
+        let manifest: serde_json::Value =
+            serde_json::from_slice(manifest).expect("the pinned manifest is JSON");
+        manifest["command_integration"].clone()
+    }
 
     /// The example declarative package the committed development catalogue publishes: a manifest,
     /// a presentation and two assets, and no connector table.
@@ -817,7 +837,8 @@ pub mod fixture {
     }
 
     impl Shape {
-        /// Claude Code's package: its channel's two flags, and its native bridge in place.
+        /// Claude Code's package: the released integration, its channel's two flags, and its
+        /// native bridge in place.
         #[must_use]
         pub fn claude_code() -> Self {
             Self {
@@ -825,43 +846,40 @@ pub mod fixture {
                 display_name: "Claude Code",
                 executable: COMMAND,
                 directory: &[],
-                integration: Some(declaration(COMMAND, &FLAGS, &[])),
+                integration: Some(released_integration(RELEASED_CLAUDE_CODE)),
                 native_bridge: true,
                 component: false,
             }
         }
 
-        /// A Gemini CLI package whose integration sets `GEMINI_CLI_NO_RELAUNCH=true` and adds
-        /// `flags`, with no bridge in place.
+        /// A Gemini CLI package whose integration is the released one, which sets
+        /// `GEMINI_CLI_NO_RELAUNCH=true`, with `flags` in place of the flags it declares (none),
+        /// and no bridge in place.
         #[must_use]
         pub fn gemini_cli(flags: &[&str]) -> Self {
+            let mut integration = released_integration(RELEASED_GEMINI_CLI);
+            integration["flags"] = serde_json::json!(flags);
             Self {
                 plugin_name: "gemini-cli",
                 display_name: "Gemini CLI",
                 executable: "gemini",
                 directory: &[],
-                integration: Some(declaration(
-                    "gemini",
-                    flags,
-                    &[("GEMINI_CLI_NO_RELAUNCH", "true")],
-                )),
+                integration: Some(integration),
                 native_bridge: false,
                 component: false,
             }
         }
 
-        /// A Qoder CLI package whose integration adds the two launch elements core pins, which
-        /// register the forwarder's hook, with no bridge in place.
+        /// A Qoder CLI package whose integration is the released one, which adds the two launch
+        /// elements core pins to register the forwarder's hook, with no bridge in place.
         #[must_use]
         pub fn qoder_cli() -> Self {
-            let flags = qoder_flags();
-            let flags: Vec<&str> = flags.iter().map(String::as_str).collect();
             Self {
                 plugin_name: "qoder-cli",
                 display_name: "Qoder CLI",
                 executable: "qodercli",
                 directory: &[],
-                integration: Some(declaration("qodercli", &flags, &[])),
+                integration: Some(released_integration(RELEASED_QODER_CLI)),
                 native_bridge: false,
                 component: false,
             }
