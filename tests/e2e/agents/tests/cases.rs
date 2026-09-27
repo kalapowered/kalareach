@@ -4504,14 +4504,17 @@ fn slash_commands_interrupts_queued_prompts_and_steering_each_work_from_a_device
             "the agent says the turn stopped",
         );
         let _ = logged.wait_idle(stage, "the composer is back after the interrupt");
-        // A prompt entered while a turn runs, which waits for it.
+        // A prompt entered while a turn runs, which waits for it. The turns entered into are long
+        // enough that a fast model is still writing when the second prompt arrives: at a low effort
+        // one model wrote a count to 400 in under two seconds.
         let (queued_question, queued_sum) = sum_question();
         let queued_done = format!("DONE-{upper}-Q");
         logged.submit(
             stage,
             &format!(
-                "Without using any tool or file, count from 1 to 400 in your reply, one number per \
-                 line, then write {queued_done} on a line of its own, and nothing else. ({mark}-q)"
+                "Without using any tool or file, count from 1 to 1000 in your reply, one number \
+                 per line, then write {queued_done} on a line of its own, and nothing else. \
+                 ({mark}-q)"
             ),
             "a turn to queue behind",
         );
@@ -4627,7 +4630,7 @@ fn slash_commands_interrupts_queued_prompts_and_steering_each_work_from_a_device
             logged.submit(
                 stage,
                 &format!(
-                    "Without using any tool or file, count from 1 to 400 in your reply, one number \
+                    "Without using any tool or file, count from 1 to 2000 in your reply, one number \
                      per line, then write {steered_done} on a line of its own, and nothing else. \
                      ({mark}-s)"
                 ),
