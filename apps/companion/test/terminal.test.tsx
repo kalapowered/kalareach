@@ -1390,6 +1390,34 @@ describe("the desktop's keys reach the program while the view controls it (KR-RE
     }
   })
 
+  it('leaves the focus alone when control ends after the person put it on a control outside the view and let it go', async () => {
+    const person = userEvent.setup()
+    const restore = laidOut()
+    const elsewhere = document.body.appendChild(document.createElement('button'))
+    try {
+      const { port, controls } = fakeHost()
+      open(port)
+      await screen.findByTestId('palette-provenance')
+      await takeControl(person, controls)
+      programKeyboard()?.focus()
+      elsewhere.focus()
+      elsewhere.blur()
+      expect(document.body).toHaveFocus()
+      act(() => {
+        controls.terminalViews[0]?.loseControl()
+      })
+      await waitFor(() => {
+        expect(programKeyboard()).toBeNull()
+      })
+      await settle()
+      expect(screen.getByRole('button', { name: 'Take control' })).not.toHaveFocus()
+      expect(document.body).toHaveFocus()
+    } finally {
+      elsewhere.remove()
+      restore()
+    }
+  })
+
   it('sends every input of an opening one at a time, the next once the last is answered', async () => {
     const person = userEvent.setup()
     const restore = laidOut()

@@ -439,7 +439,7 @@ export function MobileSession({
   // is no place to leave it. While a software keyboard is up the bar holding the mode button is
   // hidden, and the focus goes there once it is back.
   const terminalEnded = terminal?.state === 'ended'
-  const focusedInComposer = useFocusWhenControlEnds({
+  useFocusWhenControlEnds({
     state: terminalEnded ? 'ended' : (control?.state ?? 'none'),
     heldFor: (element) =>
       element?.closest('.m-accessory') != null ||
@@ -695,7 +695,6 @@ export function MobileSession({
           className="m-composer-body"
           onFocus={(event) => {
             lastFocused.current = event.target
-            focusedInComposer(event)
           }}
         >
           {pane === 'terminal' ? (

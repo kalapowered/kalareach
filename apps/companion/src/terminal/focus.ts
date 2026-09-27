@@ -7,15 +7,17 @@
  * nowhere, or on a control that can no longer be used. It goes where the person can go on instead:
  * to the mode button, which takes control again, or, once the view has ended, to Attach again.
  *
- * Only a change of the view's state owes the move: focus the person takes away themselves, as with a
- * press on the terminal that selects its text, is theirs. The destination may not take the focus at
- * once: a disabled button takes none, and on a phone the bar holding the mode button is hidden while
- * a software keyboard is up, which the keyboard's own field going makes it leave. So the move is owed
+ * Only a change of the view's state owes the move, and only when the change finds the focus on one
+ * of the view's controls that can no longer take it, or nowhere after it was last on one of them. A
+ * press on the terminal that selects its text owes nothing by itself, and focus the person has put
+ * on any other control on the page stays theirs. The destination may not take the focus at once: a
+ * disabled button takes none, and on a phone the bar holding the mode button is hidden while a
+ * software keyboard is up, which the keyboard's own field going makes it leave. So the move is owed
  * until the destination can take it. Focus the person puts on any other control first settles it,
  * and so does the destination leaving the page with its view.
  */
 
-import { useEffect, useLayoutEffect, useRef, type FocusEvent } from 'react'
+import { useLayoutEffect, useRef } from 'react'
 
 /** Whether `element` can take the focus now: in the page, enabled, and shown. */
 function takesFocus(element: Element): boolean {
@@ -27,8 +29,7 @@ function takesFocus(element: Element): boolean {
 /**
  * Moves the focus that a change of the view's `state` takes from the view's controls to
  * `destination()`, as soon as it can take it. `heldFor` says whether an element is one of those
- * controls: the program keyboard, a terminal key, the mode button. Returns the focus listener for
- * the part of the page they are in, which remembers where the focus last was.
+ * controls: the program keyboard, a terminal key, the mode button.
  */
 export function useFocusWhenControlEnds({
   state,
@@ -39,7 +40,8 @@ export function useFocusWhenControlEnds({
   readonly state: string
   readonly heldFor: (element: Element | null) => boolean
   readonly destination: () => HTMLElement | null
-}): (event: FocusEvent) => void {
+}): void {
+  // Where on the page the focus last was, which says whose it was once it is nowhere.
   const last = useRef<Element | null>(null)
   const previous = useRef(state)
   const owed = useRef(false)
@@ -48,14 +50,17 @@ export function useFocusWhenControlEnds({
     holds.current = heldFor
   })
 
-  // Focus the person puts on any other control settles the move, whenever it happens.
-  useEffect(() => {
-    const settle = (event: Event) => {
-      if (owed.current && !holds.current(event.target as Element | null)) owed.current = false
+  // Every focus on the page is remembered, and focus put on any other control settles the move,
+  // whenever it happens.
+  useLayoutEffect(() => {
+    const focused = (event: FocusEvent) => {
+      const target = event.target instanceof Element ? event.target : null
+      last.current = target
+      if (owed.current && !holds.current(target)) owed.current = false
     }
-    document.addEventListener('focusin', settle, true)
+    document.addEventListener('focusin', focused, true)
     return () => {
-      document.removeEventListener('focusin', settle, true)
+      document.removeEventListener('focusin', focused, true)
     }
   }, [])
 
@@ -87,7 +92,4 @@ export function useFocusWhenControlEnds({
       owed.current = false
     }
   })
-  return (event) => {
-    last.current = event.target
-  }
 }

@@ -337,7 +337,7 @@ export function RawTerminal({
   // Focus that the program's keyboard or the mode button held when control or the view ends goes to
   // the mode button, which takes control again, or once the view has ended to Attach again: a field
   // that has gone, or a button that is disabled, is no place to leave it.
-  const focusedInView = useFocusWhenControlEnds({
+  useFocusWhenControlEnds({
     state: ended ? 'ended' : (control?.state ?? 'none'),
     heldFor: (element) => element?.matches('[data-program-keyboard]') === true || element?.id === modeButtonId,
     destination: () => document.getElementById(ended ? attachAgainId : modeButtonId)
@@ -553,7 +553,7 @@ export function RawTerminal({
   }
 
   return (
-    <section className="raw-terminal" data-testid="raw-terminal" data-mode={mode} onFocus={focusedInView}>
+    <section className="raw-terminal" data-testid="raw-terminal" data-mode={mode}>
       <header className="terminal-heading">
         <span className="row">
           <Badge tone={control?.state === 'controlling' ? 'accent' : 'neutral'} data-testid="terminal-mode">

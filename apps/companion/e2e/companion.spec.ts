@@ -965,6 +965,30 @@ test.describe("the program's keyboard", () => {
     expect(await page.getByLabel('Type to the program').inputValue()).toBe('​')
   })
 
+  test("the desktop's focus stays where the person left it after the program's keyboard, when control ends", async ({
+    page
+  }) => {
+    await openSession(page)
+    await page.getByRole('tab', { name: 'Terminal' }).click()
+    await expect(page.getByTestId('terminal-surface')).toContainText('$ cargo test -p kr-client')
+    await takeControl(page)
+    await page.getByLabel('Type to the program').focus()
+    // The person puts the focus on a control outside the view, and lets it go.
+    await page.evaluate(() => {
+      const elsewhere = document.body.appendChild(document.createElement('button'))
+      elsewhere.textContent = 'Elsewhere'
+      elsewhere.focus()
+      elsewhere.blur()
+    })
+    await page.evaluate(() => {
+      window.krTestHost?.terminalViews.at(-1)?.loseControl()
+    })
+    await expect(page.getByLabel('Type to the program')).toHaveCount(0)
+    await expect(page.getByRole('button', { name: 'Take control' })).toBeEnabled()
+    await expect(page.getByRole('button', { name: 'Take control' })).not.toBeFocused()
+    expect(await page.evaluate(() => document.activeElement === document.body)).toBe(true)
+  })
+
   test("the phone's focus goes to the mode button once a software keyboard has gone, when control ends under it", async ({
     page
   }) => {
