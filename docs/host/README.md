@@ -1476,12 +1476,12 @@ cannot meet is a failure, because a run that could not establish these results h
 them.
 
 `scripts/e2e-wsl.sh --self-test` checks that removal on any Linux host, against trees of its own.
-An installation is removed whole and nothing beside it is touched; a name that holds a newline, and
-a root whose own name ends in one, are handled as the names they are; and a root that leads to
-storage the image does not carry, or holds a mount of such storage, is refused before anything is
-removed. The mount needs a namespace of the self-test's own, which root has and a user namespace
-gives. Where the host allows neither, the self-test says that case was not run rather than passing
-it.
+An installation is removed whole and nothing beside it is touched, and a name that holds a newline,
+or a root whose own name ends in one, is handled as the name it is. The removal is refused before
+anything goes when the helper names a root outside the directories the run mirrored, when a root
+leads to storage the image does not carry, and when a root holds a mount of such storage. The mount
+needs a namespace of the self-test's own, which root has and a user namespace gives. Where the host
+allows neither, the self-test says that case was not run rather than passing it.
 
 ## Who may type
 

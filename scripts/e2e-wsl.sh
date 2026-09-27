@@ -414,6 +414,14 @@ self_test() {
   fi
   self_test_work="$(mktemp -d "${TMPDIR:-/tmp}/kr-wsl-self-test.XXXXXX")" || return 2
   trap self_test_cleanup EXIT
+  # Each case makes its probe below this directory, and the removal refuses a probe directory whose
+  # name is not a plain path, so every case would fail for that one reason.
+  case "$self_test_work" in
+    *[!A-Za-z0-9._/-]*)
+      echo "self-test: $self_test_work is not a plain path; set TMPDIR to a directory that is" >&2
+      return 2
+      ;;
+  esac
   cat >"$self_test_work/helper" <<'STAND_IN' || return 2
 #!/bin/sh
 # Stands in for the installed helper. It names the roots the way the product names them on Linux,
