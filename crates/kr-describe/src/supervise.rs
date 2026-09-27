@@ -174,9 +174,6 @@ pub struct Driver {
     started: u64,
     background: Option<Background>,
     until_ms: Option<u64>,
-    /// This daemon's own start identity, as JSON, which each process is given so its watchdog can
-    /// tell when the daemon has gone.
-    identity: Option<String>,
 }
 
 impl Driver {
@@ -197,9 +194,6 @@ impl Driver {
             started: 0,
             background: None,
             until_ms: None,
-            identity: kr_ipc::identity::current_process_start_identity()
-                .ok()
-                .and_then(|identity| serde_json::to_string(&identity).ok()),
         }
     }
 
@@ -383,9 +377,11 @@ impl Driver {
 
     /// Starts the process when there is none, and says hello.
     ///
-    /// The two threads that carry its frames start first, each waiting to be handed its end of the
-    /// pipes, so a thread that cannot start leaves no process behind. From the spawn on, nothing
-    /// fails without the process being killed and collected.
+    /// The process is given this daemon's start identity, read afresh for each start, and none is
+    /// started without it: its watchdog is what ends it when the daemon goes and its input does
+    /// not tell it. The two threads that carry its frames start next, each waiting to be handed its
+    /// end of the pipes, so a thread that cannot start leaves no process behind. From the spawn
+    /// on, nothing fails without the process being killed and collected.
     fn start(
         &mut self,
         now: Reading,
@@ -394,6 +390,13 @@ impl Driver {
         if self.process.is_some() {
             return Ok(());
         }
+        let identity = daemon_identity().map_err(|detail| {
+            eprintln!(
+                "kr-describe: this daemon's start identity could not be read, so no description \
+                 process is started: {detail}"
+            );
+            ProcessEnd::CouldNotStart
+        })?;
         let tag = self.tag.wrapping_add(1);
         let (requests, pending) = std::sync::mpsc::sync_channel::<Vec<u8>>(REQUESTS_HELD);
         let (give_input, take_input) = std::sync::mpsc::sync_channel::<ChildStdin>(1);
@@ -437,12 +440,10 @@ impl Driver {
                 }
             }
         })?;
-        let mut command = Command::new(&self.launch.program);
-        command.args(&self.launch.arguments);
-        if let Some(identity) = &self.identity {
-            command.arg(DAEMON_IDENTITY_ARGUMENT).arg(identity);
-        }
-        let mut child = command
+        let mut child = Command::new(&self.launch.program)
+            .args(&self.launch.arguments)
+            .arg(DAEMON_IDENTITY_ARGUMENT)
+            .arg(&identity)
             .current_dir(&self.launch.working_directory)
             .env_clear()
             .envs(
@@ -757,4 +758,15 @@ fn start_thread(
             eprintln!("kr-describe: the {name} thread could not be started: {error}");
             ProcessEnd::CouldNotStart
         })
+}
+
+/// Returns this daemon's start identity as JSON, for the description process it starts.
+fn daemon_identity() -> std::result::Result<String, String> {
+    #[cfg(feature = "testing")]
+    if crate::testing::identity_lookup_refused() {
+        return Err("the query was refused, as a test asked".to_owned());
+    }
+    let identity =
+        kr_ipc::identity::current_process_start_identity().map_err(|error| error.to_string())?;
+    serde_json::to_string(&identity).map_err(|error| error.to_string())
 }

@@ -63,10 +63,24 @@ pub(crate) fn thread_start_refused(name: &str) -> bool {
 }
 
 thread_local! {
+    /// Whether a driver on this thread fails to read its own start identity next.
+    static IDENTITY_REFUSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
     /// What runs the next time the service on this thread decides what a job that did not finish
     /// comes to.
     static AT_DECISION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
+}
+
+/// Makes the next reading of its own start identity, by a driver on this thread, fail as a query
+/// the operating system would not answer.
+pub fn refuse_identity_lookup() {
+    IDENTITY_REFUSED.with(|refused| refused.set(true));
+}
+
+/// Returns whether the reading of the daemon's start identity is to fail, which it does once.
+pub(crate) fn identity_lookup_refused() -> bool {
+    IDENTITY_REFUSED.with(|refused| refused.replace(false))
 }
 
 /// Runs `hook` the next time the service on this thread has decided what a job that did not
@@ -113,7 +127,8 @@ pub struct Script {
     /// A process that does not serve through [`crate::serve::run`] at all.
     pub raw: Option<Raw>,
     /// Whether the process leaves a file named [`STARTED_PREFIX`] and its identifier in its
-    /// runtime directory as it starts, so a test can tell whether it was ever started.
+    /// runtime directory as it starts, holding the daemon's start identity it was given as JSON, so
+    /// a test can tell whether it was ever started and what it was told.
     pub mark_start: bool,
 }
 
@@ -517,7 +532,8 @@ pub fn stub_main() -> i32 {
     };
     if script.mark_start {
         let mark = runtime_dir.join(format!("{STARTED_PREFIX}{}", std::process::id()));
-        if let Err(error) = std::fs::write(&mark, b"") {
+        let given = serde_json::to_string(&daemon).unwrap_or_default();
+        if let Err(error) = std::fs::write(&mark, given) {
             eprintln!(
                 "kr-describe-stub: {} could not be written: {error}",
                 mark.display()

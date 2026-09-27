@@ -29,7 +29,9 @@ use kr_describe::store::DescriptionStore;
 use kr_describe::supervise::{
     ANSWER_GRACE_MS, CANCEL_MS, Driver, HANDSHAKE_MS, Launch, READER_THREAD, Report, WRITER_THREAD,
 };
-use kr_describe::testing::{Raw, SCRIPT_VARIABLE, STARTED_PREFIX, Script, refuse_thread_start};
+use kr_describe::testing::{
+    Raw, SCRIPT_VARIABLE, STARTED_PREFIX, Script, refuse_identity_lookup, refuse_thread_start,
+};
 use kr_describe::time::Reading;
 use kr_describe::wire::LoadEnd;
 use kr_protocol::ids::{SessionEpoch, SessionId};
@@ -89,6 +91,11 @@ impl Rig {
 
     /// How many processes have marked their start in the runtime directory.
     fn processes_started(&self) -> usize {
+        self.marks().len()
+    }
+
+    /// What each process that marked its start was told of its daemon's start identity.
+    fn marks(&self) -> Vec<Option<kr_protocol::identity::ProcessStartIdentity>> {
         std::fs::read_dir(self.placed.directory("runtime"))
             .expect("the runtime directory")
             .filter_map(Result::ok)
@@ -98,7 +105,11 @@ impl Rig {
                     .to_string_lossy()
                     .starts_with(STARTED_PREFIX)
             })
-            .count()
+            .map(|entry| {
+                let given = std::fs::read_to_string(entry.path()).expect("a mark");
+                serde_json::from_str(&given).expect("an identity, or none")
+            })
+            .collect()
     }
 
     /// Turns at `now` until `done` holds, waiting for the process in real time between turns.
@@ -1421,4 +1432,67 @@ fn a_frame_thread_that_cannot_start_leaves_no_process_behind() {
         );
         assert_eq!(rig.processes_started(), 1, "{thread}");
     }
+}
+
+/// A daemon that cannot read its own start identity starts no description process: without it, a
+/// process whose control thread is stuck could outlive the daemon. The load ends failed with
+/// nothing to end. The control is the next start, past the restart delay, which reads the identity
+/// afresh, passes it, and publishes.
+#[test]
+fn a_daemon_that_cannot_read_its_own_identity_starts_no_process() {
+    let mut rig = Rig::new(&Script {
+        mark_start: true,
+        ..Script::default()
+    });
+    queue(rig.service(), &session(1), Priority::Ordinary, at(0));
+    refuse_identity_lookup();
+    let reports = rig.driver.turn(&roomy(), at(3_000)).expect("a turn");
+    assert!(
+        !reports
+            .iter()
+            .any(|report| matches!(report, Report::Started { .. })),
+        "{reports:?}"
+    );
+    let ended = outcomes(&reports);
+    assert!(
+        ended.contains(&&Outcome::ProcessEnded {
+            why: ProcessEnd::CouldNotStart
+        }),
+        "{reports:?}"
+    );
+    assert!(
+        ended.iter().any(|outcome| matches!(
+            outcome,
+            Outcome::LoadEnded {
+                why: LoadEnd::Failed,
+                ..
+            }
+        )),
+        "{reports:?}"
+    );
+    assert_eq!(rig.driver.pid(), None);
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(rig.processes_started(), 0, "a process was started");
+
+    // The control: the next start reads the identity afresh and passes it on.
+    let reports = rig.until(
+        &roomy(),
+        at(3_000 + RESTART_FIRST_MS),
+        "the description",
+        |reports, _| a_job_ended(reports),
+    );
+    assert!(matches!(reports[0], Report::Started { .. }), "{reports:?}");
+    assert!(
+        outcomes(&reports)
+            .iter()
+            .any(|outcome| matches!(outcome, Outcome::Published { .. })),
+        "{reports:?}"
+    );
+    assert_eq!(
+        rig.marks(),
+        vec![Some(
+            kr_ipc::identity::current_process_start_identity().expect("this process's identity")
+        )],
+        "the process was told this daemon's start identity"
+    );
 }
