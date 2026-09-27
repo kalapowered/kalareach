@@ -470,3 +470,83 @@ text Neovim writes after the sequence lands on the cells the sequence's second h
 shows the first emoji and then the text. tmux and GNU screen count per codepoint and agree with the
 grid on every sample. The Neovim case asserts what the profile defines and records both readings as
 a known difference.
+
+## The fault harness's fixtures
+
+`tests/faults`, the `kr-faults` crate, keeps three kinds of fixture under `fixtures/faults/`. Each
+is a JSON file named by its `name` field, and its suite refuses a file of another format or another
+name. The suites are part of the workspace, so the `rust` group runs them on Linux and macOS, and
+their keyed tests reach the report like any other.
+
+### Restore corpora
+
+`fixtures/faults/restore/*.json`, format `kalareach.restore-corpus/1`: an application's output,
+write by write, each `{"text": ...}` where the bytes are text and `{"hex": ...}` where they are not.
+A corpus stores no expectation. `tests/faults/tests/restore.rs` feeds it to a session one byte at a
+time and attaches a client of the session's size and one of another size at every point, and the
+expectation is the session's own screen at the next pause.
+
+### Traces
+
+`fixtures/faults/traces/*.json`, format `kalareach.trace/1`: an ordering race written as the steps
+that reproduce it. The header gives the session's `columns` and `rows` and the wall clock at the
+start, `wall_ms`. The replayer opens a session in the test's process on a simulated timeline and
+plays its peers from the steps: the application, whose output goes through the read loop's own
+entry, and named clients, which attach and subscribe as the worker's service subscribes one. No step
+waits on a clock. A step that moves time says by how much, and a timer that falls due fires in that
+step, so a race happens in the same order on every run.
+
+| Step (`do`) | Fields | What happens |
+| --- | --- | --- |
+| `output` | `text` or `hex` | The application writes, and the session reads it as one read |
+| `settle` | | The application pauses, and the session settles its screen |
+| `attach` | `client`, `form` (`direct` or `projected`) | A client of the session's size, or of another size, attaches; the screen it is restored to is checked at once |
+| `detach` | `client` | The client detaches |
+| `acquire` | `client`, optional `expect` (`closed_open_paste`, `discarded_bytes`) | The client takes the input lease |
+| `input` | `client`, `text` or `hex`, optional `refused` | The client types under the lease it took last; `refused` is the protocol code the session answers with |
+| `take_input` | `expect`, a list of batches | The terminal's writer takes what is queued: `{"batch": "input", "client", "text", "paste": ["opens"]}`, `{"batch": "reply", "text"}` or `{"batch": "lease_changed"}` |
+| `advance` | `ms` | Every clock moves on |
+| `suspend` | `ms` | The machine sleeps: the continuous and wall clocks move and the active clock does not |
+| `step_wall` | `ms`, negative to go back | The wall clock alone moves |
+| `time_service` | `synchronised` | The platform's time service starts or stops disciplining the wall clock |
+| `observe_time` | `expect`, of `suspended`, `rebooted` and `rolled_back` | The session looks at its clocks and says what moved |
+| `revalidated` | | What a discontinuity affected has been rechecked |
+| `validity` | `object` (`name` and `within_boot_ms`, `utc_ms` or `owner_grant`), `expect` | The time contract decides the object: `valid`, `expired: continuous_deadline`, `expired: trusted_utc_deadline`, `unproven` or `revalidation owed` |
+| `holds` | `client` | The client holds the session's screen and performed nothing while it was drawn one |
+| `screen` | `active`, `lines`, optional `other` | The session's own screen reads so, trailing blanks dropped |
+| `effects` | `client`, `expect` | Every side effect the client's terminal has performed from the live stream: `bell`, `clipboard write: <content>` and so on |
+
+A trace that fails names the file, the step and what was found. `kr_faults::trace::minimise` cuts a
+failing trace down to the fewest steps that still fail at the same step. The steps after that one go
+at once, and delta debugging then removes each run of earlier steps the failure does not need. The
+smaller trace is the one to keep once the race is fixed, with a test of its own in
+`tests/faults/tests/traces.rs`; the suite checks that every kept trace has one. The suite also
+contradicts each expectation of every kept trace, one at a time, and the replay must then stop at
+that step.
+
+The format is written down here so that a repository that scripts this one as a peer can keep its
+traces in the same format.
+
+### Journals
+
+`fixtures/faults/journals/*.json`, format `kalareach.journal/1`: a worker's receipt journal as SQL
+(`sql`, the statements in order) at the schema version of the build that wrote it
+(`schema_version`). Its `fault` is applied when the SQL is made into a file, because no SQL can
+state a damaged page or a torn log.
+
+| `fault.kind` | What is done to the file | What it stands for |
+| --- | --- | --- |
+| `none` | Nothing | A stored state, such as a dispatch marker with no answer |
+| `root_page_overwritten` | The `table`'s root page is overwritten | Damage that stays |
+| `log_cut_in_last_frame` | The product's journal accepts action `accept`, the database and its log are copied while it still holds them, and the copy of the log is cut inside its last frame | A crash inside a commit |
+
+`tests/faults/tests/journals.rs` opens each through a worker's session, which recovers what it
+finds, and through the journal's own openers that read or recover a closed session's journal. Each
+is also made as its control, the same file without its fault, which must open cleanly at this
+build's schema version. The suite checks that each file's SQL makes a store that reads back as
+exactly that SQL.
+
+A fixture's SQL is never rewritten. When the schema moves on, opening an old fixture is a test of
+the migration. To add one, add its recipe to the suite's list and run the ignored test
+`write_the_stored_state_of_each_new_fixture`. It writes each listed fixture that is not kept yet
+from the current build, and replaces the boot each record names with a fixed value.
