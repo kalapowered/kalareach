@@ -132,6 +132,8 @@ struct Stage<'a, 'r> {
     /// The local dates `{date}` stands for in the build list's paths: the day the part started and
     /// the next.
     dates: &'a [String],
+    /// When the part chose its mark: no file written before then can hold it.
+    started: std::time::SystemTime,
     /// What each probe that stands in for the vendor's model service found the agent offer its
     /// model: the tools' kinds and names, which say what of the person's own it loaded.
     offered: &'a std::sync::Mutex<Vec<serde_json::Value>>,
@@ -145,6 +147,7 @@ struct Shared<'a> {
     held: &'a std::sync::atomic::AtomicBool,
     declined: &'a std::sync::Mutex<Vec<String>>,
     dates: &'a [String],
+    started: std::time::SystemTime,
     offered: &'a std::sync::Mutex<Vec<serde_json::Value>>,
 }
 
@@ -664,6 +667,7 @@ fn staged(
         }
     };
     let runtime = runtime();
+    let started = std::time::SystemTime::now();
     let mark = nonce();
     let dates = local_dates();
     let directories = login
@@ -755,6 +759,7 @@ fn staged(
                 held: &held,
                 declined: &declined,
                 dates: &dates,
+                started,
                 offered: &offered,
             },
             guards.as_ref(),
@@ -1231,6 +1236,7 @@ fn run_part(
         held,
         declined,
         dates,
+        started,
         offered,
     }: Shared<'_>,
     guards: Option<&Guards>,
@@ -1296,6 +1302,7 @@ fn run_part(
                 held,
                 declined,
                 dates,
+                started,
                 offered,
                 guards,
             };
@@ -2574,8 +2581,20 @@ fn image_input(account: &Account, file: &Path) -> String {
     }
 }
 
-/// The lines of the files under `roots` that hold both `needle` and `marker`, by file.
-fn conversation_lines(roots: &[PathBuf], needle: &str, marker: &str) -> Vec<(PathBuf, usize)> {
+/// The lines of the files under `roots` that hold both `needle` and `marker`, by file. Only files
+/// written since `since`, when the part chose the mark a needle carries, are read: an agent's
+/// directory of the day can hold hundreds of megabytes of the person's own conversations, and
+/// reading them all at every look would take seconds. A file whose time cannot be read is read.
+fn conversation_lines(
+    roots: &[PathBuf],
+    needle: &str,
+    marker: &str,
+    since: std::time::SystemTime,
+) -> Vec<(PathBuf, usize)> {
+    // File times are coarse on some file systems, and the clock may step a little.
+    let since = since
+        .checked_sub(Duration::from_secs(2))
+        .unwrap_or(std::time::UNIX_EPOCH);
     let mut found = Vec::new();
     let mut pending = roots.to_vec();
     while let Some(path) = pending.pop() {
@@ -2583,6 +2602,12 @@ fn conversation_lines(roots: &[PathBuf], needle: &str, marker: &str) -> Vec<(Pat
             if let Ok(entries) = std::fs::read_dir(&path) {
                 pending.extend(entries.flatten().map(|entry| entry.path()));
             }
+            continue;
+        }
+        if std::fs::metadata(&path)
+            .and_then(|metadata| metadata.modified())
+            .is_ok_and(|modified| modified < since)
+        {
             continue;
         }
         let Ok(bytes) = std::fs::read(&path) else {
@@ -4201,8 +4226,13 @@ fn first_line_with(file: &Path, after: Option<usize>, needles: &[&str]) -> Optio
 }
 
 /// The conversation file under `roots` whose prompt lines hold `needle`, where exactly one does.
-fn conversation_of(roots: &[PathBuf], needle: &str, marker: &str) -> Option<PathBuf> {
-    match conversation_lines(roots, needle, marker).as_slice() {
+fn conversation_of(
+    roots: &[PathBuf],
+    needle: &str,
+    marker: &str,
+    since: std::time::SystemTime,
+) -> Option<PathBuf> {
+    match conversation_lines(roots, needle, marker, since).as_slice() {
         [(file, _)] => Some(file.clone()),
         _ => None,
     }
@@ -4214,7 +4244,7 @@ fn recorded(stage: &Stage<'_, '_>, roots: &[PathBuf], needle: &str, marker: &str
     let started = std::time::Instant::now();
     loop {
         guards_hold_while_waiting(stage);
-        if let Some(file) = conversation_of(roots, needle, marker) {
+        if let Some(file) = conversation_of(roots, needle, marker, stage.started) {
             return file;
         }
         assert!(
@@ -5049,13 +5079,14 @@ fn a_local_and_a_remote_answer_raced_to_one_approval_resolve_it_once() {
         let ran = executions(&log, &tag);
         loser_reached_nothing(ran).unwrap_or_else(|why| panic!("one resolution: {why}"));
         let conversations = conversation_roots(stage);
-        let conversation = conversation_of(&conversations, &mark, &account.prompt_line)
-            .unwrap_or_else(|| {
-                panic!(
-                    "one conversation under {} holds the command",
-                    listed(&conversations)
-                )
-            });
+        let conversation =
+            conversation_of(&conversations, &mark, &account.prompt_line, stage.started)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "one conversation under {} holds the command",
+                        listed(&conversations)
+                    )
+                });
         let prompt_at = first_line_with(&conversation, None, &[&mark, &account.prompt_line]);
         let decided = decisions(
             stage,
@@ -5337,7 +5368,9 @@ fn a_disconnection_after_the_agent_took_a_prompt_leaves_one_reply_and_no_duplica
                 code_seen |= rows.iter().any(|row| row.contains(&code_start));
                 reached |= code_seen || marks(&rows) > marks_before;
             }
-            if let Some(file) = conversation_of(&conversations, &mark, &account.prompt_line) {
+            if let Some(file) =
+                conversation_of(&conversations, &mark, &account.prompt_line, stage.started)
+            {
                 break file;
             }
             assert!(
@@ -5558,14 +5591,15 @@ fn a_second_process_on_the_same_saved_conversation_is_another_execution_not_merg
         );
         let _ = first.answered(stage, &sum, "session A is answered");
         let _ = first.wait_idle(stage, "session A is back at its composer");
-        let conversation = conversation_of(&conversations, &mark, &account.prompt_line)
-            .map(|file| conversation_id(&file))
-            .unwrap_or_else(|| {
-                panic!(
-                    "one conversation under {} holds the code",
-                    listed(&conversations)
-                )
-            });
+        let conversation =
+            conversation_of(&conversations, &mark, &account.prompt_line, stage.started)
+                .map(|file| conversation_id(&file))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "one conversation under {} holds the code",
+                        listed(&conversations)
+                    )
+                });
         let resume: Vec<String> = account
             .resume
             .iter()
@@ -5849,6 +5883,56 @@ fn kill_and_wait(processes: &[ProcessStartIdentity]) -> bool {
         std::thread::sleep(Duration::from_millis(50));
     }
     true
+}
+
+/// The conversation search reads only files written since the part chose its mark: one written
+/// before, even one that holds the needle, is not read, and one written since is.
+#[test]
+fn a_conversation_search_reads_only_files_written_since_the_part_began() {
+    let root = std::env::temp_dir().join(format!("kr-conversations-{}", nonce()));
+    let day = root.join("2026").join("09").join("27");
+    std::fs::create_dir_all(&day).expect("a day's directory");
+    let old = day.join("old.jsonl");
+    std::fs::write(&old, "{\"role\":\"user\",\"text\":\"kr0123\"}\n").expect("an old file");
+    let an_hour_ago = std::time::SystemTime::now() - Duration::from_secs(3600);
+    std::fs::File::options()
+        .write(true)
+        .open(&old)
+        .and_then(|file| file.set_times(std::fs::FileTimes::new().set_modified(an_hour_ago)))
+        .expect("the old file's time");
+    let since = std::time::SystemTime::now() - Duration::from_secs(60);
+    assert_eq!(
+        conversation_lines(
+            std::slice::from_ref(&root),
+            "kr0123",
+            "\"role\":\"user\"",
+            since
+        ),
+        Vec::<(PathBuf, usize)>::new(),
+        "a file written before the part began is not read"
+    );
+    let new = day.join("new.jsonl");
+    std::fs::write(&new, "{\"role\":\"user\",\"text\":\"kr0123\"}\n").expect("a new file");
+    assert_eq!(
+        conversation_lines(
+            std::slice::from_ref(&root),
+            "kr0123",
+            "\"role\":\"user\"",
+            since
+        ),
+        vec![(new.clone(), 1)]
+    );
+    assert_eq!(
+        conversation_lines(
+            std::slice::from_ref(&root),
+            "kr0123",
+            "\"role\":\"user\"",
+            std::time::UNIX_EPOCH
+        ),
+        vec![(new, 1), (old, 1)],
+        "from the start of time both are read"
+    );
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
