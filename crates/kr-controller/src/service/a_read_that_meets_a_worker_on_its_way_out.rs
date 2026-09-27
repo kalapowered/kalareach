@@ -67,6 +67,8 @@ pub(super) struct Scripted {
     names: std::sync::Mutex<Option<SessionId>>,
     /// The answer it gave each close, by the close's action, as its journal keeps it.
     answered: std::sync::Mutex<BTreeMap<ActionId, ParamsValue>>,
+    /// Every generation a daemon presented to it, in the order they came.
+    generations: std::sync::Mutex<Vec<kr_protocol::ids::ControllerGeneration>>,
 }
 
 /// Where a scripted worker goes: at the next read it is sent.
@@ -92,7 +94,16 @@ impl Scripted {
             describes_its_close: AtomicBool::new(true),
             names: std::sync::Mutex::new(None),
             answered: std::sync::Mutex::new(BTreeMap::new()),
+            generations: std::sync::Mutex::new(Vec::new()),
         })
+    }
+
+    /// Whether a daemon speaking for `generation` has presented it to this worker.
+    fn presented(&self, generation: kr_protocol::ids::ControllerGeneration) -> bool {
+        self.generations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&generation)
     }
 
     /// Has this worker accept a close as a worker built before the description does: with no
@@ -327,6 +338,13 @@ fn serve_scripted(
                 let (mut reader, mut writer) = split(connection, StreamKind::Control);
                 let connection_id = ConnectionId::new(kr_ipc::new_uuid());
                 while let Ok(frame) = reader.read_message::<ControlFrame>().await {
+                    if let ControlFrame::GenerationToken(token) = &frame {
+                        script
+                            .generations
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push(token.generation);
+                    }
                     let handshake = fake::handshake(
                         &frame,
                         &identity,
@@ -1267,4 +1285,43 @@ async fn an_acceptance_that_describes_another_session_is_not_kept() {
         .expect_err("no description of this session reached the daemon");
     assert_eq!(refused.code(), ErrorCode::ResourceUnavailable, "{refused}");
     world.serving.abort();
+}
+
+/// A worker whose reservation this host fenced is not reached again by a daemon that starts: the
+/// daemon neither challenges it nor presents its generation to it, and the worker stays out of
+/// the directory, as recovery leaves such a worker. The control: a worker whose reservation stands
+/// is reached and admitted as before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_daemon_that_starts_does_not_reach_a_worker_whose_reservation_is_fenced() {
+    for fenced in [true, false] {
+        let script = Scripted::new();
+        let world = reported_late(&script).await;
+        if fenced {
+            let mut registry = world.controller.registry.lock().await;
+            let reservation = registry
+                .reservation_for_session(world.session_id)
+                .expect("the registry answers")
+                .expect("the create's reservation");
+            registry
+                .fence(reservation.reservation_id)
+                .expect("fences the reservation");
+        }
+        let world = restarted(world).await;
+        let reached = script.presented(world.controller.generation);
+        let admitted = world
+            .controller
+            .directory
+            .lock()
+            .await
+            .get(world.session_id)
+            .is_some();
+        if fenced {
+            assert!(!reached, "the daemon that started did not reach the worker");
+            assert!(!admitted, "and the worker stays out of its directory");
+        } else {
+            assert!(reached, "the daemon that started reached the worker");
+            assert!(admitted, "and admitted it");
+        }
+        world.serving.abort();
+    }
 }
