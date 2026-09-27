@@ -40,6 +40,9 @@ serde_json.workspace = true
 kr-crypto.workspace = true
 kr-ipc = { workspace = true, features = ["testing"] }
 tokio.workspace = true
+# The kill stage signals the processes it started and collects how each ended.
+libc.workspace = true
+rustix = { workspace = true, features = ["process"] }
 
 [lints]
 workspace = true
