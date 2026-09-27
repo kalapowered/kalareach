@@ -647,6 +647,200 @@ async fn kr_req_23_40_the_five_mutations_carry_the_registrys_rights_and_check_th
     );
 }
 
+/// KR-REQ-12.04: what the broker observes of an agent is bound to the exact instance, the
+/// upstream execution that owns it, the session and the turn.
+///
+/// * The instance: two instances in one session each read back only what was observed of them,
+///   and an instance this worker does not hold is neither observed nor read.
+/// * The session: a read or a mutation naming the same instance under another session is refused.
+/// * The execution owner: a conversation one instance owns cannot be selected by another, and a
+///   request observed before the owner changed is not interpreted after it, while one observed
+///   after it is, in the new source generation.
+/// * The turn: the binding reports the turn the upstream said is running, an operation naming
+///   another turn is refused, the one naming it carries it to the upstream, and a change of owner
+///   leaves no turn running for a later operation to name.
+#[tokio::test]
+async fn kr_req_12_04_an_observation_is_bound_to_its_instance_owner_session_and_turn() {
+    let upstream = std::sync::Arc::new(RecordingUpstream::default());
+    let broker = agent_broker_with(std::sync::Arc::clone(&upstream));
+    let other = ApplicationInstanceId::new(Uuid::from_bytes([4; 16]));
+    broker
+        .register_instance(other, IntegrationMode::Gateway, None, None)
+        .expect("a second instance in the same session");
+    let snapshot = |session_id: SessionId, application_instance_id: ApplicationInstanceId| {
+        broker.agent_snapshot(
+            &AgentSnapshotParams {
+                subject: subject(session_id, application_instance_id),
+                from_node: Nullable::null(),
+            },
+            &GrantLowerBound {
+                from: StreamCursor::new(1),
+            },
+            kr_protocol::limits::MAX_CONTROL_FRAME_LEN,
+        )
+    };
+    let texts = |application_instance_id: ApplicationInstanceId| -> Vec<String> {
+        snapshot(session(), application_instance_id)
+            .expect("the read succeeds")
+            .entries
+            .into_iter()
+            .map(|entry| entry.text)
+            .collect()
+    };
+
+    // The instance.
+    broker
+        .observe(
+            instance(),
+            "message",
+            "said by the first",
+            TimestampMs::new(2),
+        )
+        .expect("observed");
+    broker
+        .observe(other, "message", "said by the second", TimestampMs::new(3))
+        .expect("observed");
+    assert_eq!(texts(instance()), ["said by the first"]);
+    assert_eq!(texts(other), ["said by the second"]);
+    let absent = ApplicationInstanceId::new(Uuid::from_bytes([6; 16]));
+    assert!(matches!(
+        broker.observe(
+            absent,
+            "message",
+            "said by nobody here",
+            TimestampMs::new(4)
+        ),
+        Err(BrokerError::UnknownSubject { .. })
+    ));
+    assert!(matches!(
+        snapshot(session(), absent),
+        Err(BrokerError::UnknownSubject { .. })
+    ));
+
+    // The session.
+    let elsewhere = SessionId::new(Uuid::from_bytes([8; 16]));
+    assert!(snapshot(elsewhere, instance()).is_err());
+    assert!(
+        broker
+            .agent_capabilities(&AgentCapabilitiesParams {
+                subject: subject(elsewhere, instance()),
+            })
+            .is_err()
+    );
+    let foreign = broker
+        .agent_prompt(
+            &caller(),
+            &AgentPromptParams {
+                target: AgentMutationTarget {
+                    subject: subject(elsewhere, instance()),
+                    binding_revision: AgentBindingRevision::new(1),
+                },
+                draft_id: Nullable::null(),
+                text: Nullable::some(PromptText::new("hello").expect("valid")),
+            },
+            false,
+            TimestampMs::new(5),
+        )
+        .await
+        .expect_err("a mutation naming another session is refused");
+    assert_eq!(foreign.code(), ErrorCode::StaleSession);
+
+    // The turn.
+    let running = AgentTurnId::new("turn-1").expect("valid");
+    broker
+        .set_turn(instance(), Some(running.clone()))
+        .expect("the upstream said a turn is running");
+    let bound = broker
+        .agent_capabilities(&AgentCapabilitiesParams {
+            subject: subject(session(), instance()),
+        })
+        .expect("the read succeeds")
+        .binding;
+    assert_eq!(bound.turn_id, Nullable::some(running.clone()));
+    let steer = |turn_id: &AgentTurnId, revision: u64| AgentSteerParams {
+        target: target(revision),
+        turn_id: turn_id.clone(),
+        text: PromptText::new("try the other file").expect("valid"),
+    };
+    let another = AgentTurnId::new("turn-2").expect("valid");
+    let refused = broker
+        .agent_steer(&caller(), &steer(&another, 1), TimestampMs::new(6))
+        .await
+        .expect_err("a turn that is not running is refused");
+    assert_eq!(refused.code(), ErrorCode::DraftConflict);
+    assert!(
+        upstream.submitted().is_empty(),
+        "nothing was carried for it"
+    );
+    broker
+        .agent_steer(&caller(), &steer(&running, 1), TimestampMs::new(7))
+        .await
+        .expect("the steer applies to the turn that is running");
+    let carried = upstream.submitted();
+    assert_eq!(carried.len(), 1);
+    assert_eq!(carried[0].application_instance_id, instance());
+    assert_eq!(
+        carried[0].turn_id.as_ref(),
+        Some(&running),
+        "the turn travels with the operation"
+    );
+
+    // The execution owner.
+    let conversation = kr_protocol::ids::AgentThreadId::new("conversation-1").expect("valid");
+    let before = broker
+        .forward_native(
+            GatewayConnectionId::new(1),
+            br#"{"id":21,"method":"session/request_permission"}"#,
+            TimestampMs::new(8),
+        )
+        .expect("forwarded")
+        .1
+        .expect("it expects a response");
+    let revision = broker
+        .advance_binding(instance(), Some(conversation.clone()), TimestampMs::new(9))
+        .expect("the instance selects a conversation");
+    assert_eq!(revision, AgentBindingRevision::new(2));
+    assert!(matches!(
+        broker.advance_binding(other, Some(conversation.clone()), TimestampMs::new(10)),
+        Err(BrokerError::Launch(
+            kr_protocol::broker::LaunchRefusal::ConversationAlreadyLive {
+                application_instance_id
+            }
+        )) if application_instance_id == instance()
+    ));
+    assert!(matches!(
+        broker.interpret(
+            binding(),
+            before.resource_id,
+            projection(),
+            None,
+            TimestampMs::new(11),
+        ),
+        Err(BrokerError::PreconditionFailed { .. })
+    ));
+    let after = offered(&broker, "22", 12);
+    assert!(after.source_generation.get() > 1, "{after:?}");
+    assert_eq!(after.application_instance_id, instance());
+
+    // The owner changed, so no turn is running: one named from before is refused at the new
+    // revision rather than sent.
+    let moved = broker
+        .agent_capabilities(&AgentCapabilitiesParams {
+            subject: subject(session(), instance()),
+        })
+        .expect("the read succeeds")
+        .binding;
+    assert_eq!(moved.binding_revision, AgentBindingRevision::new(2));
+    assert_eq!(moved.thread_id, Nullable::some(conversation));
+    assert_eq!(moved.turn_id, Nullable::null());
+    let late = broker
+        .agent_steer(&caller(), &steer(&running, 2), TimestampMs::new(13))
+        .await
+        .expect_err("the turn ended with the owner");
+    assert_eq!(late.code(), ErrorCode::DraftConflict);
+    assert_eq!(upstream.submitted().len(), 1, "nothing more was carried");
+}
+
 /// KR-REQ-23.40: `agent.approval.respond` answers the exact pending resource, with a decision the
 /// request actually offered, once.
 #[tokio::test]
