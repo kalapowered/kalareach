@@ -7,6 +7,7 @@
 //! revocation names the device by its identifier and takes every grant the device holds with it.
 
 use kr_client::shown;
+use kr_client::shown::Shown;
 use kr_ipc::paths::HostPaths;
 use kr_protocol::ids::DeviceId;
 use kr_protocol::method::Method;
@@ -20,7 +21,9 @@ use kr_protocol::error::ErrorCode;
 use crate::cli::{DeviceCommand, DeviceListArguments, DeviceRevokeArguments};
 use crate::daemon::{Daemon, identifier};
 use crate::error::{CliError, Result};
+use crate::output::{self, Asked, Document, Line, Request, closed, left};
 use crate::report::{self, Completion};
+use crate::stdout_line;
 
 /// Runs one `kr device` command and prints its result.
 ///
@@ -48,16 +51,16 @@ async fn list(paths: &HostPaths, arguments: &DeviceListArguments, json: bool) ->
         )
         .await?;
     if json {
-        report::print_json(&report::answer(&listed)?);
+        output::document(&list_document(&listed));
         return Ok(());
     }
     if listed.devices.is_empty() {
-        println!("no paired devices");
+        output::say(&Shown::said("no paired devices"));
     }
     for device in &listed.devices {
-        println!("{}", line(device));
+        output::line(&line(device));
     }
-    println!(
+    output::say(&shown!(
         "authority revision {}{}",
         listed.authority_revision,
         if listed.feed_stale {
@@ -65,7 +68,7 @@ async fn list(paths: &HostPaths, arguments: &DeviceListArguments, json: bool) ->
         } else {
             ""
         }
-    );
+    ));
     Ok(())
 }
 
@@ -116,11 +119,13 @@ async fn revoke(
         .await?;
     let pending = pending(device, &revoked);
     match (&pending, json) {
-        (None, true) => report::print_json(&report::answer(&revoked)?),
-        (Some(error), true) => report::print_json(&report::answer_that_failed(&revoked, error)?),
-        (None, false) => print!("{}", revocation(device, &revoked)),
+        (None, true) => output::document(&revocation_document(&revoked)),
+        (Some(error), true) => {
+            output::document(&report::with_failure(revocation_document(&revoked), error))
+        }
+        (None, false) => output::lines(&revocation(device, &revoked)),
         (Some(error), false) => {
-            print!("{}", revocation(device, &revoked));
+            output::lines(&revocation(device, &revoked));
             report::failed(error);
         }
     }
@@ -147,6 +152,133 @@ fn pending(device: DeviceId, revoked: &RevocationResult) -> Option<CliError> {
     })
 }
 
+/// The paired devices, for a script, in the shape the protocol answers them: the name each device
+/// gave itself is shown to the person who asked for the list.
+fn list_document(listed: &DeviceListResult) -> Document {
+    Document::new()
+        .with(
+            "devices",
+            listed
+                .devices
+                .iter()
+                .map(|device| {
+                    Document::new()
+                        .with("device_id", closed(&device.device_id))
+                        .with(
+                            "display_name",
+                            Asked::text(Request::Devices, &device.display_name),
+                        )
+                        .with("grant_id", closed(&device.grant_id))
+                        .with("paired_at_ms", closed(&device.paired_at_ms))
+                        .with(
+                            "acknowledged_revision",
+                            closed(&device.acknowledged_revision),
+                        )
+                        .with("acknowledged_at_ms", closed(&device.acknowledged_at_ms))
+                        .with("revoked", device.revoked)
+                        .with("keys", closed(&device.keys))
+                        .with("manages_host", device.manages_host)
+                })
+                .collect::<Vec<_>>(),
+        )
+        .with("authority_revision", closed(&listed.authority_revision))
+        .with(
+            "feed_synchronised_at_ms",
+            closed(&listed.feed_synchronised_at_ms),
+        )
+        .with("feed_stale", listed.feed_stale)
+        .with("ok", true)
+}
+
+/// A revocation, for a script, in the shape the protocol answers it: the actors and the methods of
+/// the actions it names are what the host recorded for the person revoking, and a worker's detail
+/// is the host's sentence, said as its class and length.
+fn revocation_document(revoked: &RevocationResult) -> Document {
+    Document::new()
+        .with("authority_revision", closed(&revoked.authority_revision))
+        .with("revoked_grants", closed(&revoked.revoked_grants))
+        .with(
+            "barrier",
+            Document::new()
+                .with(
+                    "authority_revision",
+                    closed(&revoked.barrier.authority_revision),
+                )
+                .with(
+                    "workers",
+                    revoked
+                        .barrier
+                        .workers
+                        .iter()
+                        .map(|worker| {
+                            Document::new()
+                                .with("session_id", closed(&worker.session_id))
+                                .with("state", closed(&worker.state))
+                                .with(
+                                    "acknowledged_revision",
+                                    closed(&worker.acknowledged_revision),
+                                )
+                                .with(
+                                    "rejected_actions",
+                                    worker
+                                        .rejected_actions
+                                        .iter()
+                                        .map(|action| {
+                                            Document::new()
+                                                .with(
+                                                    "actor_id",
+                                                    Asked::text(
+                                                        Request::Devices,
+                                                        &action.actor_id.to_string(),
+                                                    ),
+                                                )
+                                                .with("action_id", closed(&action.action_id))
+                                        })
+                                        .collect::<Vec<_>>(),
+                                )
+                                .with(
+                                    "possibly_executed",
+                                    worker
+                                        .possibly_executed
+                                        .iter()
+                                        .map(|action| {
+                                            Document::new()
+                                                .with("action_id", closed(&action.action_id))
+                                                .with(
+                                                    "actor_id",
+                                                    Asked::text(
+                                                        Request::Devices,
+                                                        &action.actor_id.to_string(),
+                                                    ),
+                                                )
+                                                .with(
+                                                    "method",
+                                                    Asked::text(
+                                                        Request::Devices,
+                                                        action.method.as_str(),
+                                                    ),
+                                                )
+                                                .with("state", closed(&action.state))
+                                        })
+                                        .collect::<Vec<_>>(),
+                                )
+                                .with("omitted_actions", closed(&worker.omitted_actions))
+                                .with("names_pending", closed(&worker.names_pending))
+                                .with(
+                                    "detail",
+                                    crate::shown::exported(
+                                        "WorkerBarrier",
+                                        "detail",
+                                        &worker.detail,
+                                    ),
+                                )
+                        })
+                        .collect::<Vec<_>>(),
+                ),
+        )
+        .with("ok", true)
+}
+
 /// What a revocation did, as lines for a person: the grants it took, and how far each affected
 /// session's worker has got in fencing what the device could still have been doing.
 ///
@@ -154,72 +286,80 @@ fn pending(device: DeviceId, revoked: &RevocationResult) -> Option<CliError> {
 /// evidence is not all here: names the host has not received yet, actions the worker could hold
 /// no name for, or anything else the host says about it. Every action a worker could not show did
 /// not run before the revocation reached it is named too.
-fn revocation(device: DeviceId, revoked: &RevocationResult) -> String {
+fn revocation(device: DeviceId, revoked: &RevocationResult) -> Vec<Line> {
     let grants = revoked.revoked_grants.len();
     let barrier = &revoked.barrier;
-    let mut text = if barrier.holds() {
-        format!(
-            "Revoked device {device} and {grants} grant{}, at authority revision {}.\n",
+    let mut lines = vec![if barrier.holds() {
+        stdout_line!(
+            "Revoked device {} and {} grant{}, at authority revision {}.",
+            device,
+            grants,
             if grants == 1 { "" } else { "s" },
             revoked.authority_revision
         )
     } else {
-        format!(
-            "The revocation of device {device} is pending, at authority revision {}: {grants} \
-             grant{} revoked, and it is complete only when these sessions' workers fence it.\n",
+        stdout_line!(
+            "The revocation of device {} is pending, at authority revision {}: {} grant{} \
+             revoked, and it is complete only when these sessions' workers fence it.",
+            device,
             revoked.authority_revision,
+            grants,
             if grants == 1 { "" } else { "s" }
         )
-    };
+    }];
     if barrier.workers.is_empty() {
-        text.push_str("No session's worker was affected.\n");
+        lines.push(stdout_line!("No session's worker was affected."));
     } else if barrier.holds() {
-        text.push_str("Every affected session's worker has fenced it.\n");
+        lines.push(stdout_line!(
+            "Every affected session's worker has fenced it."
+        ));
     }
     for worker in &barrier.workers {
         let names_pending = worker.names_pending.get();
         let omitted = worker.omitted_actions.get();
         if !worker.state.holds() || !worker.detail.is_empty() || names_pending > 0 || omitted > 0 {
-            text.push_str(&format!(
-                "  session {}: {}{}\n",
-                worker.session_id,
-                worker.state.as_str(),
-                if worker.detail.is_empty() {
-                    String::new()
-                } else {
-                    format!(" ({})", worker.detail)
-                }
-            ));
+            lines.push(if worker.detail.is_empty() {
+                stdout_line!("  session {}: {}", worker.session_id, worker.state.as_str())
+            } else {
+                stdout_line!(
+                    "  session {}: {} ({})",
+                    worker.session_id,
+                    worker.state.as_str(),
+                    crate::shown::exported("WorkerBarrier", "detail", &worker.detail)
+                )
+            });
         }
         if names_pending > 0 {
-            text.push_str(&format!(
-                "  session {}: {names_pending} action name{} not reached this host yet\n",
+            lines.push(stdout_line!(
+                "  session {}: {} action name{} not reached this host yet",
                 worker.session_id,
+                names_pending,
                 if names_pending == 1 { " has" } else { "s have" }
             ));
         }
         if omitted > 0 {
-            text.push_str(&format!(
-                "  session {}: {omitted} affected action{} could not be named\n",
+            lines.push(stdout_line!(
+                "  session {}: {} affected action{} could not be named",
                 worker.session_id,
+                omitted,
                 if omitted == 1 { "" } else { "s" }
             ));
         }
         for action in &worker.possibly_executed {
-            text.push_str(&format!(
-                "  session {}: action {} ({}) may have run before the revocation, and is {}\n",
+            lines.push(stdout_line!(
+                "  session {}: action {} ({}) may have run before the revocation, and is {}",
                 worker.session_id,
                 action.action_id,
-                action.method.as_str(),
-                report::wire_name(&action.state)
+                Asked::text(Request::Devices, action.method.as_str()),
+                crate::shown::wire_word(action.state)
             ));
         }
     }
-    text
+    lines
 }
 
-/// One device as a line for a person.
-fn line(device: &DeviceSummary) -> String {
+/// One device as a line for a person: the name it gave itself is shown to the person who asked.
+fn line(device: &DeviceSummary) -> Line {
     let standing = if device.revoked {
         "revoked"
     } else if device.manages_host {
@@ -228,12 +368,15 @@ fn line(device: &DeviceSummary) -> String {
         "paired"
     };
     let acknowledged = device.acknowledged_revision.as_ref().map_or_else(
-        || "no acknowledgement yet".to_owned(),
-        |revision| format!("acknowledged revision {revision}"),
+        || Shown::said("no acknowledgement yet"),
+        |revision| shown!("acknowledged revision {}", *revision),
     );
-    format!(
-        "{}  {standing:<8} {}  {acknowledged}",
-        device.device_id, device.display_name
+    stdout_line!(
+        "{}  {} {}  {}",
+        device.device_id,
+        left(8, &standing),
+        Asked::text(Request::Devices, &device.display_name),
+        acknowledged
     )
 }
 
@@ -247,6 +390,72 @@ mod tests {
     use kr_protocol::scalars::{CanonicalSet, Nullable, U64, Uuid};
 
     use super::*;
+
+    /// KR-REQ-23.25: text planted in every leaf of a device list and a revocation that can hold
+    /// free text reaches their documents and lines only as a device's own name and the actors and
+    /// methods a revocation names; a worker's detail is said as its class and length, and every
+    /// other leaf is what the protocol encodes.
+    #[test]
+    fn planted_text_in_devices_shows_only_where_it_was_asked_for() {
+        use crate::output::planted::{
+            only_asked, only_asked_lines, planted, planted_text, same_encoding,
+        };
+
+        let mut shown = std::collections::BTreeSet::new();
+        for listed in planted::<DeviceListResult>() {
+            let document = list_document(&listed);
+            shown.extend(only_asked("kr device list", &document));
+            same_encoding(
+                "kr device list",
+                &document,
+                &serde_json::to_value(&listed).expect("the list encodes"),
+                &[],
+                &["ok"],
+            );
+            only_asked_lines(
+                "kr device list",
+                &listed.devices.iter().map(line).collect::<Vec<_>>(),
+            );
+        }
+        let device = DeviceId::new(Uuid::from_bytes([1; 16]));
+        for revoked in planted::<RevocationResult>() {
+            let document = revocation_document(&revoked);
+            shown.extend(only_asked("kr device revoke", &document));
+            same_encoding(
+                "kr device revoke",
+                &document,
+                &serde_json::to_value(&revoked).expect("the revocation encodes"),
+                &["barrier.workers[].detail"],
+                &["ok"],
+            );
+            assert_eq!(
+                document.json()["barrier"]["workers"][0]["detail"],
+                serde_json::json!(format!(
+                    "[message withheld, {} bytes]",
+                    planted_text().len()
+                ))
+            );
+            only_asked_lines("kr device revoke", &revocation(device, &revoked));
+        }
+        for asked in [
+            "devices[].display_name",
+            "barrier.workers[].rejected_actions[].actor_id",
+            "barrier.workers[].possibly_executed[].actor_id",
+        ] {
+            assert!(
+                shown.contains(asked),
+                "{asked} shows what was asked for: {shown:?}"
+            );
+        }
+    }
+
+    /// The lines a revocation prints, as a person reads them.
+    fn written(lines: Vec<Line>) -> String {
+        lines
+            .iter()
+            .map(|line| format!("{}\n", line.text()))
+            .collect()
+    }
 
     fn worker(byte: u8, state: BarrierState, detail: &str) -> WorkerBarrier {
         WorkerBarrier {
@@ -282,10 +491,10 @@ mod tests {
             method: kr_protocol::method::Method::InputWrite.into(),
             state: ReceiptState::Accepted,
         });
-        let text = revocation(
+        let text = written(revocation(
             device,
             &revoked(vec![pending, worker(4, BarrierState::Acknowledged, "")]),
-        );
+        ));
         assert!(
             text.contains("is pending, at authority revision 4"),
             "{text}"
@@ -294,9 +503,10 @@ mod tests {
             !text.contains("Revoked device"),
             "a pending revocation is no success: {text}"
         );
+        // Why it is pending is the host's sentence, said as its class and length.
         assert!(
             text.contains(&format!(
-                "session {}: pending (the worker has not answered yet)",
+                "session {}: pending ([message withheld, 31 bytes])",
                 SessionId::new(Uuid::from_bytes([2; 16]))
             )),
             "{text}"
@@ -343,11 +553,11 @@ mod tests {
         let mut unnamed = worker(6, BarrierState::Ended, "");
         unnamed.omitted_actions = U64::new(1);
         let quiet = worker(7, BarrierState::Acknowledged, "");
-        let text = revocation(device, &revoked(vec![late, unnamed, quiet]));
+        let text = written(revocation(device, &revoked(vec![late, unnamed, quiet])));
         let session = |byte| SessionId::new(Uuid::from_bytes([byte; 16])).to_string();
         assert!(
             text.contains(&format!(
-                "session {}: acknowledged (a page of names is still to come)",
+                "session {}: acknowledged ([message withheld, 32 bytes])",
                 session(5)
             )),
             "{text}"
@@ -379,12 +589,15 @@ mod tests {
     #[test]
     fn a_revocation_every_worker_fenced_says_so() {
         let device = DeviceId::new(Uuid::from_bytes([1; 16]));
-        let text = revocation(device, &revoked(vec![worker(2, BarrierState::Ended, "")]));
+        let text = written(revocation(
+            device,
+            &revoked(vec![worker(2, BarrierState::Ended, "")]),
+        ));
         assert!(
             text.contains("Every affected session's worker has fenced it."),
             "{text}"
         );
-        let text = revocation(device, &revoked(Vec::new()));
+        let text = written(revocation(device, &revoked(Vec::new())));
         assert!(text.contains("No session's worker was affected."), "{text}");
     }
 }

@@ -466,6 +466,47 @@ impl<T: Into<Held>> From<Vec<T>> for Held {
     }
 }
 
+/// A protocol value that holds no text that arrived: every text leaf in it is a word of a closed
+/// set, an identifier or a digest by its type, and every other leaf a number or a switch.
+///
+/// Such a value is written as the protocol encodes it, which keeps a document's shape what a
+/// script reading the protocol expects. Every claim is in this file, and a test plants text in
+/// every leaf of each claimed type's schema that could hold it and finds none.
+pub trait Closed: serde::Serialize {}
+
+/// A closed value, as the protocol encodes it.
+#[must_use]
+pub fn closed(value: &impl Closed) -> Held {
+    Held::plain(serde_json::to_value(value).unwrap_or(serde_json::Value::Null))
+}
+
+impl<T: Closed> Closed for kr_protocol::scalars::Nullable<T> {}
+impl<T: Closed> Closed for Vec<T> {}
+impl<T: Closed + Ord> Closed for kr_protocol::scalars::CanonicalSet<T> {}
+impl Closed for kr_protocol::scalars::U64 {}
+impl Closed for kr_protocol::scalars::TimestampMs {}
+impl Closed for kr_protocol::scalars::Digest256 {}
+impl Closed for kr_protocol::ids::ActionId {}
+impl Closed for kr_protocol::ids::AuthorityRevision {}
+impl Closed for kr_protocol::ids::DeviceId {}
+impl Closed for kr_protocol::ids::GrantId {}
+impl Closed for kr_protocol::ids::SessionId {}
+impl Closed for kr_protocol::action::BarrierState {}
+impl Closed for kr_protocol::receipt::ReceiptState {}
+impl Closed for kr_protocol::pairing::DevicePublicKeys {}
+impl Closed for kr_protocol::pairing::ProposedGrant {}
+impl Closed for kr_protocol::invitation::PairingApproval {}
+impl Closed for kr_protocol::ids::AttemptId {}
+impl Closed for kr_protocol::ids::ConfirmationId {}
+impl Closed for kr_protocol::ids::InvitationId {}
+impl Closed for kr_protocol::scalars::KeyId {}
+impl Closed for kr_protocol::ids::PairingEventSequence {}
+impl Closed for kr_protocol::invitation::InviteGrantKind {}
+impl Closed for kr_protocol::invitation::InviteModeKind {}
+impl Closed for kr_protocol::pairing::ConfirmationChannel {}
+impl Closed for kr_protocol::pairing::DevicePlatform {}
+impl Closed for kr_protocol::pairing::PairingConsumedReason {}
+
 /// One `--json` document: keys of this program's own, each holding a [`Held`] value.
 #[derive(Default)]
 pub struct Document {
@@ -567,6 +608,25 @@ pub fn lines(lines: &[Line]) {
     for each in lines {
         line(each);
     }
+}
+
+/// Writes one composed line on `writer`: the controlling terminal a command asks its person at,
+/// opened as itself rather than as standard output.
+///
+/// # Errors
+///
+/// Returns the failure to write.
+pub fn write_line(writer: &mut impl std::io::Write, line: &Line) -> std::io::Result<()> {
+    writeln!(writer, "{}", line.text)
+}
+
+/// Writes a composed prompt on `writer`, with no end of line, for the answer to follow it.
+///
+/// # Errors
+///
+/// Returns the failure to write.
+pub fn write_prompt(writer: &mut impl std::io::Write, prompt: &Line) -> std::io::Result<()> {
+    write!(writer, "{}", prompt.text)
 }
 
 /// Writes one machine-readable document on standard output.
@@ -807,6 +867,43 @@ mod tests {
                 Shown::said(MARKER)
             )],
         );
+    }
+
+    /// Each type claimed closed holds no text that arrived: the marker cannot be planted in it.
+    #[test]
+    fn every_type_claimed_closed_holds_no_text() {
+        use planted::assert_closed;
+
+        assert_closed::<kr_protocol::scalars::U64>();
+        assert_closed::<kr_protocol::scalars::TimestampMs>();
+        assert_closed::<kr_protocol::scalars::Digest256>();
+        assert_closed::<kr_protocol::ids::ActionId>();
+        assert_closed::<kr_protocol::ids::AuthorityRevision>();
+        assert_closed::<kr_protocol::ids::DeviceId>();
+        assert_closed::<kr_protocol::ids::GrantId>();
+        assert_closed::<kr_protocol::ids::SessionId>();
+        assert_closed::<kr_protocol::action::BarrierState>();
+        assert_closed::<kr_protocol::receipt::ReceiptState>();
+        assert_closed::<kr_protocol::pairing::DevicePublicKeys>();
+        assert_closed::<kr_protocol::pairing::ProposedGrant>();
+        assert_closed::<kr_protocol::invitation::PairingApproval>();
+        assert_closed::<kr_protocol::ids::AttemptId>();
+        assert_closed::<kr_protocol::ids::ConfirmationId>();
+        assert_closed::<kr_protocol::ids::InvitationId>();
+        assert_closed::<kr_protocol::scalars::KeyId>();
+        assert_closed::<kr_protocol::ids::PairingEventSequence>();
+        assert_closed::<kr_protocol::invitation::InviteGrantKind>();
+        assert_closed::<kr_protocol::invitation::InviteModeKind>();
+        assert_closed::<kr_protocol::pairing::ConfirmationChannel>();
+        assert_closed::<kr_protocol::pairing::DevicePlatform>();
+        assert_closed::<kr_protocol::pairing::PairingConsumedReason>();
+    }
+
+    /// The negative control: a type with a leaf of free text fails the claim's check.
+    #[test]
+    #[should_panic(expected = "is claimed closed and holds text")]
+    fn a_type_with_free_text_fails_the_closed_check() {
+        planted::assert_closed::<kr_protocol::session::SurvivingResource>();
     }
 
     /// A tool's structured result is the document, and nothing else.

@@ -252,15 +252,33 @@ fn text(schema: &Value) -> Value {
     }
 }
 
-/// An example of each pattern the protocol's schema uses.
+/// An example of each pattern the protocol's schema uses. A pattern that admits the marker holds it,
+/// with a colon after it where the pattern admits no space: such a field can hold text that
+/// arrived. Every other pattern is an identifier's, a digest's or an origin's, and holds an example.
 fn pattern_example(pattern: &str) -> Value {
     let example = match pattern {
+        "^[^\\u0000-\\u001f\\u007f]{1,128}$" | "^[^\\u0000-\\u001f\\u007f-\\u009f]+$" => {
+            return Value::from(planted_text());
+        }
+        "^[!-~]{1,253}$" | "^[!#-\\[\\]-~]+$" => return Value::from(format!("{MARKER}:planted")),
+        "^[A-Za-z0-9_-]+$" => MARKER,
         "^(0|[1-9][0-9]*)$" => "7",
         "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$" => {
             "0e1f9a2b-3c4d-4e5f-8a9b-0c1d2e3f4a5b"
         }
         "^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$" => "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
         "^([A-Za-z0-9_-]{4})*([A-Za-z0-9_-][AQgw]|[A-Za-z0-9_-]{2}[AEIMQUYcgkosw048])?$" => "AAAA",
+        "^[A-Za-z0-9_-]{32}$" => "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "^[A-Za-z0-9_-]{85}[AQgw]$" => {
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        }
+        "^[a-z0-9_]+(\\.[a-z0-9_]+)*$" => "desktop.screen_capture",
+        "^https://([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*|\\[[0-9a-f:]+\\])(:[1-9][0-9]{0,4})?$" => {
+            "https://rendezvous.example"
+        }
+        "^[1-9A-HJ-NP-Za-km-z]{4}-[1-9A-HJ-NP-Za-km-z]{3}-[1-9A-HJ-NP-Za-km-z]{3}$" => {
+            "4XkP-Qm7-Zr2"
+        }
         other => panic!("the planted values have no example of the pattern {other}"),
     };
     Value::from(example)
@@ -270,6 +288,23 @@ fn pattern_example(pattern: &str) -> Value {
 fn example(name: &str) -> Option<Value> {
     let _ = name;
     None
+}
+
+/// Holds a claim that `T` is closed: no value of it this builds holds the marker anywhere.
+///
+/// # Panics
+///
+/// Panics, naming the type and the path, where one does.
+pub(crate) fn assert_closed<T: JsonSchema + DeserializeOwned + serde::Serialize>() {
+    for value in planted::<T>() {
+        let encoded = serde_json::to_value(&value).unwrap_or(Value::Null);
+        let found = marked(&encoded);
+        assert!(
+            found.is_empty(),
+            "{} is claimed closed and holds text at {found:?}",
+            std::any::type_name::<T>()
+        );
+    }
 }
 
 /// Every place in `value` whose text holds the marker, as a path of keys and `[]` for list elements.
@@ -338,6 +373,77 @@ pub(crate) fn only_asked_or_host_text(
         );
     }
     found
+}
+
+/// Holds a document to the protocol's encoding of the value it renders: the same keys and the same
+/// leaves everywhere, but at `reduced`, the leaves a reducer, a validator or a path's spelling says
+/// in its own words, which only have to be there, and at `added`, the keys the document adds.
+///
+/// # Panics
+///
+/// Panics, naming the path, where the document and the encoding part.
+pub(crate) fn same_encoding(
+    label: &str,
+    document: &Document,
+    encoded: &Value,
+    reduced: &[&str],
+    added: &[&str],
+) {
+    fn compare(
+        label: &str,
+        written: &Value,
+        encoded: &Value,
+        path: &str,
+        reduced: &[&str],
+        added: &[&str],
+    ) {
+        if reduced.contains(&path) {
+            return;
+        }
+        match (written, encoded) {
+            (Value::Object(written), Value::Object(encoded)) => {
+                for key in written.keys() {
+                    let inner = joined(path, key);
+                    assert!(
+                        encoded.contains_key(key) || added.contains(&inner.as_str()),
+                        "{label}: the document adds {inner}, which the protocol does not encode"
+                    );
+                }
+                for (key, value) in encoded {
+                    let inner = joined(path, key);
+                    let Some(held) = written.get(key) else {
+                        panic!("{label}: the document leaves out {inner}");
+                    };
+                    compare(label, held, value, &inner, reduced, added);
+                }
+            }
+            (Value::Array(written), Value::Array(encoded)) => {
+                assert_eq!(
+                    written.len(),
+                    encoded.len(),
+                    "{label}: {path} has another length"
+                );
+                let inner = format!("{path}[]");
+                for (held, value) in written.iter().zip(encoded) {
+                    compare(label, held, value, &inner, reduced, added);
+                }
+            }
+            _ => assert_eq!(
+                written, encoded,
+                "{label}: {path} is not what the protocol encodes"
+            ),
+        }
+    }
+
+    fn joined(path: &str, key: &str) -> String {
+        if path.is_empty() {
+            key.to_owned()
+        } else {
+            format!("{path}.{key}")
+        }
+    }
+
+    compare(label, &document.json(), encoded, "", reduced, added);
 }
 
 /// Holds lines to their rule: the marker shows only inside asked content.

@@ -51,7 +51,7 @@ use kr_protocol::invitation::{
 use kr_protocol::method::Method;
 use kr_protocol::pairing::{
     ConfirmationChannel, DevicePlatform, PairStatus, PairingConsumedReason, ProposedGrant,
-    RendezvousOrigin, group_verification_value,
+    RendezvousOrigin,
 };
 use kr_protocol::preauth::{PairStatusParams, PairStatusResult};
 use kr_protocol::scalars::{CanonicalSet, Nullable};
@@ -59,7 +59,9 @@ use kr_protocol::scalars::{CanonicalSet, Nullable};
 use crate::bind::{self, Membership};
 use crate::cli::{PairCancelArguments, PairCommand, PairInvitationArguments, PairInviteArguments};
 use crate::error::{CliError, Result};
+use crate::output::{self, Asked, Document, Line, Request, closed};
 use crate::resolve::{self, ATTACHMENT_VARIABLE, SESSION_VARIABLE};
+use crate::stdout_line;
 
 /// How often the command asks again while an owner device has not confirmed yet.
 pub const OWNER_DEVICE_POLL: Duration = Duration::from_secs(1);
@@ -123,12 +125,13 @@ async fn invite(
     let answer = confirmed(&mut client, target, subject, &ceremony, &effect, build_id).await?;
     let invited: PairInviteResult = decode(&answer)?;
     if json {
-        print_json(&invitation_document(&invited));
+        output::document(&invitation_document(&invited));
     } else {
-        print!(
-            "{}",
-            describe_invitation(&invited, kr_ipc::now_ms().get(), true)?
-        );
+        output::lines(&describe_invitation(
+            &invited,
+            kr_ipc::now_ms().get(),
+            true,
+        )?);
     }
     Ok(())
 }
@@ -181,22 +184,23 @@ async fn approve(
     .await?;
     let paired: PairConfirmResult = decode(&answer)?;
     if json {
-        print_json(&serde_json::json!({
-            "ok": true,
-            "invitation_id": invitation_id.to_string(),
-            "device_id": paired.device_id.to_string(),
-            "grant_id": paired.grant_id.to_string(),
-            "device_name": candidate.device_name.as_str(),
-            "platform": platform_name(&candidate),
-        }));
+        output::document(
+            &Document::new()
+                .with("ok", true)
+                .with("invitation_id", output::said(&invitation_id))
+                .with("device_id", closed(&paired.device_id))
+                .with("grant_id", closed(&paired.grant_id))
+                .with("device_name", device_name(&candidate))
+                .with("platform", crate::shown::platform(candidate.platform)),
+        );
     } else {
-        println!(
+        output::line(&stdout_line!(
             "Paired {} ({}) as device {}, with grant {}.",
-            candidate.device_name.as_str(),
-            platform_name(&candidate),
+            device_name(&candidate),
+            crate::shown::platform(candidate.platform),
             paired.device_id,
             paired.grant_id
-        );
+        ));
     }
     Ok(())
 }
@@ -246,20 +250,13 @@ async fn status(
 
 fn report_status(invitation_id: InvitationId, result: &PairStatusResult, json: bool) -> Result<()> {
     if json {
-        let mut document = serde_json::to_value(result).map_err(|error| {
-            CliError::Other(shown!(
-                "the status could not be written: {}",
-                Shown::json(&error)
-            ))
-        })?;
-        document["ok"] = serde_json::json!(true);
-        document["invitation_id"] = serde_json::json!(invitation_id.to_string());
-        print_json(&document);
+        output::document(&status_document(invitation_id, result));
     } else {
-        print!(
-            "{}",
-            describe_status(invitation_id, result, kr_ipc::now_ms().get())
-        );
+        output::lines(&describe_status(
+            invitation_id,
+            result,
+            kr_ipc::now_ms().get(),
+        ));
     }
     Ok(())
 }
@@ -309,24 +306,28 @@ impl Ceremony<'_> {
     fn confirm_at(&self, terminal: &mut Terminal) -> Result<()> {
         match self {
             Self::Issue { .. } => {
-                terminal.say(
+                terminal.say(&stdout_line!(
                     "This host has no owner yet. The device that answers this invitation becomes \
-                     its first owner, with every right over this host until it is revoked.\n",
-                )?;
-                let typed =
-                    terminal.ask(&format!("Type {ISSUE_WORD} to issue the invitation: "))?;
+                     its first owner, with every right over this host until it is revoked."
+                ))?;
+                let typed = terminal.ask(&stdout_line!(
+                    "Type {} to issue the invitation: ",
+                    ISSUE_WORD
+                ))?;
                 if typed.trim() != ISSUE_WORD {
                     return Err(not_confirmed("the invitation was not issued"));
                 }
             }
             Self::Approve { candidate } => {
-                terminal.say(&format!(
+                terminal.say(&stdout_line!(
                     "{} ({}) answered this invitation, and becomes this host's first owner if you \
-                     approve it.\n",
-                    candidate.device_name.as_str(),
-                    platform_name(candidate)
+                     approve it.",
+                    device_name(candidate),
+                    crate::shown::platform(candidate.platform)
                 ))?;
-                let typed = terminal.ask("Type the verification value the new device shows: ")?;
+                let typed = terminal.ask(&stdout_line!(
+                    "Type the verification value the new device shows: "
+                ))?;
                 if !same_value(&typed, &candidate.verification_value) {
                     return Err(not_confirmed(
                         "that is not the verification value this host sees, so the device was not \
@@ -499,9 +500,9 @@ impl Terminal {
         })
     }
 
-    fn say(&mut self, text: &str) -> Result<()> {
-        self.output
-            .write_all(text.as_bytes())
+    /// Writes one line.
+    fn say(&mut self, line: &Line) -> Result<()> {
+        output::write_line(&mut self.output, line)
             .and_then(|()| self.output.flush())
             .map_err(|error| {
                 CliError::Terminal(shown!(
@@ -512,8 +513,15 @@ impl Terminal {
     }
 
     /// Writes `prompt` and reads one line.
-    fn ask(&mut self, prompt: &str) -> Result<String> {
-        self.say(prompt)?;
+    fn ask(&mut self, prompt: &Line) -> Result<String> {
+        output::write_prompt(&mut self.output, prompt)
+            .and_then(|()| self.output.flush())
+            .map_err(|error| {
+                CliError::Terminal(shown!(
+                    "the terminal could not be written: {}",
+                    Shown::io(&error)
+                ))
+            })?;
         let mut line = String::new();
         (&mut self.input)
             .take(MAX_TYPED_LINE)
@@ -636,88 +644,215 @@ fn remaining(until_ms: u64, now_ms: u64) -> Shown {
     }
 }
 
-fn platform_name(candidate: &PairCandidateView) -> String {
-    serde_json::to_value(candidate.platform)
-        .ok()
-        .and_then(|value| value.as_str().map(str::to_owned))
-        .unwrap_or_default()
+/// The name a device gave itself, which the person pairing it is shown.
+fn device_name(candidate: &PairCandidateView) -> Asked {
+    Asked::text(Request::Devices, candidate.device_name.as_str())
 }
 
 /// Describes an issued invitation for a person, with its QR code when `draw` says to.
 ///
+/// The code, the QR text and the QR code drawn from it are the invitation the person asked for.
+///
 /// # Errors
 ///
 /// Returns an error when the invitation's QR text is too long for a QR code.
-pub fn describe_invitation(invited: &PairInviteResult, now_ms: u64, draw: bool) -> Result<String> {
-    let mut text = format!(
-        "Invitation {}, open {}.\n",
+pub fn describe_invitation(
+    invited: &PairInviteResult,
+    now_ms: u64,
+    draw: bool,
+) -> Result<Vec<Line>> {
+    let mut lines = vec![stdout_line!(
+        "Invitation {}, open {}.",
         invited.invitation_id,
         remaining(invited.expires_at_ms.get(), now_ms)
-    );
+    )];
     let qr = match &invited.entry {
         InviteEntry::Code {
             rendezvous_origin,
             code,
             qr_text,
         } => {
-            text.push_str(&format!(
-                "Code: {}  at {}\nEnter the code on the new device, or scan this QR code with it:\n",
-                code.as_str(),
-                rendezvous_origin.as_str()
+            lines.push(stdout_line!(
+                "Code: {}  at {}",
+                Asked::text(Request::Invitation, code.as_str()),
+                Shown::address(rendezvous_origin.as_str())
+            ));
+            lines.push(stdout_line!(
+                "Enter the code on the new device, or scan this QR code with it:"
             ));
             qr_text
         }
         InviteEntry::Direct { qr_text } => {
-            text.push_str("Scan this QR code with the new device, on this network:\n");
+            lines.push(stdout_line!(
+                "Scan this QR code with the new device, on this network:"
+            ));
             qr_text
         }
     };
     if draw {
         for line in qr_lines(qr.as_str())? {
-            text.push_str(&line);
-            text.push('\n');
+            lines.push(stdout_line!("{}", Asked::text(Request::Invitation, &line)));
         }
     }
-    text.push_str(&format!(
-        "When the new device shows its verification value, approve it with:\n  kr pair confirm {}\n",
-        invited.invitation_id
+    lines.push(stdout_line!(
+        "When the new device shows its verification value, approve it with:"
     ));
-    Ok(text)
+    lines.push(stdout_line!("  kr pair confirm {}", invited.invitation_id));
+    Ok(lines)
 }
 
-fn invitation_document(invited: &PairInviteResult) -> serde_json::Value {
-    let mut document = serde_json::json!({
-        "ok": true,
-        "invitation_id": invited.invitation_id.to_string(),
-        "expires_at_ms": invited.expires_at_ms.get(),
-    });
+/// An issued invitation, for a script: its code and its QR text are the invitation the person
+/// asked for, and the origin it is reserved at is said as an address.
+fn invitation_document(invited: &PairInviteResult) -> Document {
+    let document = Document::new()
+        .with("ok", true)
+        .with("invitation_id", output::said(&invited.invitation_id))
+        .with("expires_at_ms", invited.expires_at_ms.get());
     match &invited.entry {
         InviteEntry::Code {
             rendezvous_origin,
             code,
             qr_text,
-        } => {
-            document["mode"] = serde_json::json!("code");
-            document["code"] = serde_json::json!(code.as_str());
-            document["rendezvous_origin"] = serde_json::json!(rendezvous_origin.as_str());
-            document["qr_text"] = serde_json::json!(qr_text.as_str());
-        }
-        InviteEntry::Direct { qr_text } => {
-            document["mode"] = serde_json::json!("direct");
-            document["qr_text"] = serde_json::json!(qr_text.as_str());
-        }
+        } => document
+            .with("mode", "code")
+            .with("code", Asked::text(Request::Invitation, code.as_str()))
+            .with(
+                "rendezvous_origin",
+                Shown::address(rendezvous_origin.as_str()),
+            )
+            .with(
+                "qr_text",
+                Asked::text(Request::Invitation, qr_text.as_str()),
+            ),
+        InviteEntry::Direct { qr_text } => document.with("mode", "direct").with(
+            "qr_text",
+            Asked::text(Request::Invitation, qr_text.as_str()),
+        ),
     }
-    document
+}
+
+/// An invitation's status, for a script, in the shape the protocol answers it: the name a device
+/// gave itself is shown to the person pairing it, an origin is said as an address, and a
+/// verification value is said only when it is one.
+fn status_document(invitation_id: InvitationId, result: &PairStatusResult) -> Document {
+    let status = match &result.status {
+        PairStatus::Open {
+            remaining_confirmations,
+            expires_at_ms,
+        } => Document::new().with(
+            "open",
+            Document::new()
+                .with("remaining_confirmations", *remaining_confirmations)
+                .with("expires_at_ms", closed(expires_at_ms)),
+        ),
+        PairStatus::Locked {
+            attempt_id,
+            expires_at_ms,
+        } => Document::new().with(
+            "locked",
+            Document::new()
+                .with("attempt_id", closed(attempt_id))
+                .with("expires_at_ms", closed(expires_at_ms)),
+        ),
+        PairStatus::AwaitingApproval {
+            attempt_id,
+            verification_value,
+            expires_at_ms,
+        } => Document::new().with(
+            "awaiting_approval",
+            Document::new()
+                .with("attempt_id", closed(attempt_id))
+                .with(
+                    "verification_value",
+                    crate::shown::verification_digits(verification_value),
+                )
+                .with("expires_at_ms", closed(expires_at_ms)),
+        ),
+        PairStatus::Committed {
+            device_id,
+            grant_id,
+        } => Document::new().with(
+            "committed",
+            Document::new()
+                .with("device_id", closed(device_id))
+                .with("grant_id", closed(grant_id)),
+        ),
+        PairStatus::Consumed { reason } => {
+            Document::new().with("consumed", Document::new().with("reason", closed(reason)))
+        }
+    };
+    let owner = result.owner.0.as_ref().map(|view| {
+        Document::new()
+            .with("mode", closed(&view.mode))
+            .with(
+                "rendezvous_origin",
+                view.rendezvous_origin
+                    .as_ref()
+                    .map(|origin| Shown::address(origin.as_str())),
+            )
+            .with("remaining_confirmations", view.remaining_confirmations)
+            .with("grant_kind", closed(&view.grant_kind))
+            .with("proposed_grant", closed(&view.proposed_grant))
+            .with(
+                "candidate",
+                view.candidate.as_ref().map(|candidate| {
+                    Document::new()
+                        .with("device_name", device_name(candidate))
+                        .with("platform", closed(&candidate.platform))
+                        .with("keys", closed(&candidate.keys))
+                        .with(
+                            "verification_value",
+                            crate::shown::verification_digits(&candidate.verification_value),
+                        )
+                }),
+            )
+            .with("approval", closed(&view.approval))
+            .with(
+                "event",
+                view.event.as_ref().map(|event| {
+                    Document::new()
+                        .with("sequence", closed(&event.sequence))
+                        .with("invitation_id", closed(&event.invitation_id))
+                        .with("mode", closed(&event.mode))
+                        .with("device_id", closed(&event.device_id))
+                        .with("grant_id", closed(&event.grant_id))
+                        .with("grant_kind", closed(&event.grant_kind))
+                        .with(
+                            "device_name",
+                            Asked::text(Request::Devices, event.device_name.as_str()),
+                        )
+                        .with("platform", closed(&event.platform))
+                        .with(
+                            "verification_value",
+                            crate::shown::verification_digits(&event.verification_value),
+                        )
+                        .with("confirmation_id", closed(&event.confirmation_id))
+                        .with("channel", closed(&event.channel))
+                        .with("signer_key_id", closed(&event.signer_key_id))
+                        .with("first_owner", event.first_owner)
+                        .with("committed_at_ms", closed(&event.committed_at_ms))
+                }),
+            )
+    });
+    Document::new()
+        .with("status", status)
+        .with("owner", owner)
+        .with("ok", true)
+        .with("invitation_id", output::said(&invitation_id))
 }
 
 /// Describes where an invitation has reached, for a person.
-fn describe_status(invitation_id: InvitationId, result: &PairStatusResult, now_ms: u64) -> String {
+fn describe_status(
+    invitation_id: InvitationId,
+    result: &PairStatusResult,
+    now_ms: u64,
+) -> Vec<Line> {
     let state = match &result.status {
         PairStatus::Open {
             remaining_confirmations,
             expires_at_ms,
         } => {
-            let open = format!("open {}", remaining(expires_at_ms.get(), now_ms));
+            let open = remaining(expires_at_ms.get(), now_ms);
             // Only a code can be guessed at, so only a code invitation has an allowance to show.
             let code = result
                 .owner
@@ -725,14 +860,16 @@ fn describe_status(invitation_id: InvitationId, result: &PairStatusResult, now_m
                 .as_ref()
                 .is_none_or(|view| view.mode == InviteModeKind::Code);
             if code {
-                format!(
-                    "{open}, with {remaining_confirmations} wrong codes allowed before it closes"
+                shown!(
+                    "open {}, with {} wrong codes allowed before it closes",
+                    open,
+                    *remaining_confirmations
                 )
             } else {
-                open
+                shown!("open {}", open)
             }
         }
-        PairStatus::Locked { expires_at_ms, .. } => format!(
+        PairStatus::Locked { expires_at_ms, .. } => shown!(
             "a device has proved the code and is finishing, open {}",
             remaining(expires_at_ms.get(), now_ms)
         ),
@@ -740,37 +877,37 @@ fn describe_status(invitation_id: InvitationId, result: &PairStatusResult, now_m
             verification_value,
             expires_at_ms,
             ..
-        } => format!(
+        } => shown!(
             "a device is waiting for approval, open {}; its verification value is {}",
             remaining(expires_at_ms.get(), now_ms),
-            group_verification_value(verification_value)
+            crate::shown::verification_value(verification_value)
         ),
         PairStatus::Committed {
             device_id,
             grant_id,
-        } => format!("paired as device {device_id}, with grant {grant_id}"),
-        PairStatus::Consumed { reason } => format!("ended: {}", ended_because(*reason)),
+        } => shown!("paired as device {}, with grant {}", *device_id, *grant_id),
+        PairStatus::Consumed { reason } => shown!("ended: {}", ended_because(*reason)),
     };
-    let mut text = format!("Invitation {invitation_id}: {state}.\n");
+    let mut lines = vec![stdout_line!("Invitation {}: {}.", invitation_id, state)];
     if let Some(candidate) = result
         .owner
         .0
         .as_ref()
         .and_then(|view| view.candidate.0.as_ref())
     {
-        text.push_str(&format!(
-            "The device is {} ({}).\n",
-            candidate.device_name.as_str(),
-            platform_name(candidate)
+        lines.push(stdout_line!(
+            "The device is {} ({}).",
+            device_name(candidate),
+            crate::shown::platform(candidate.platform)
         ));
     }
     if matches!(result.status, PairStatus::AwaitingApproval { .. }) {
-        text.push_str(&format!(
-            "Check the new device shows the same value, then approve it with:\n  kr pair confirm \
-             {invitation_id}\n"
+        lines.push(stdout_line!(
+            "Check the new device shows the same value, then approve it with:"
         ));
+        lines.push(stdout_line!("  kr pair confirm {}", invitation_id));
     }
-    text
+    lines
 }
 
 const fn ended_because(reason: PairingConsumedReason) -> &'static str {
@@ -828,13 +965,6 @@ fn refused(code: ErrorCode, message: impl Into<Shown>) -> CliError {
 
 fn not_confirmed(message: &'static str) -> CliError {
     refused(ErrorCode::OwnerConfirmationRequired, Shown::said(message))
-}
-
-fn print_json(value: &serde_json::Value) {
-    println!(
-        "{}",
-        serde_json::to_string_pretty(value).unwrap_or_else(|_| "{}".to_owned())
-    );
 }
 
 #[cfg(test)]
@@ -932,7 +1062,12 @@ mod tests {
                 qr_text: QrText::new(text.as_str()).expect("QR text"),
             },
         };
-        let shown = describe_invitation(&invited, now, true).expect("a description");
+        let shown = describe_invitation(&invited, now, true)
+            .expect("a description")
+            .iter()
+            .map(|line| line.text().to_owned())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(
             shown.contains("Code: 4XkP-Qm7-Zr2  at https://reach.kala.to"),
             "{shown}"
@@ -944,10 +1079,45 @@ mod tests {
         );
         let drawn = qr_lines(text.as_str()).expect("a QR code");
         assert!(drawn.iter().all(|line| shown.contains(line.as_str())));
-        let document = invitation_document(&invited);
+        let document = invitation_document(&invited).json();
         assert_eq!(document["mode"], "code");
         assert_eq!(document["code"], "4XkP-Qm7-Zr2");
         assert_eq!(document["rendezvous_origin"], "https://reach.kala.to");
+    }
+
+    /// KR-REQ-23.25: text planted in every leaf of an invitation's status that can hold free text
+    /// reaches its document and its lines only as the name a device gave itself; an origin is
+    /// said as an address and a verification value only when it is one. Every other leaf is what
+    /// the protocol encodes.
+    #[test]
+    fn planted_text_in_a_status_shows_only_as_a_device_name() {
+        use crate::output::planted::{only_asked, only_asked_lines, planted, same_encoding};
+
+        let invitation_id = InvitationId::new(Uuid::from_bytes([9; 16]));
+        let mut shown = std::collections::BTreeSet::new();
+        for result in planted::<PairStatusResult>() {
+            let document = status_document(invitation_id, &result);
+            shown.extend(only_asked("kr pair status", &document));
+            same_encoding(
+                "kr pair status",
+                &document,
+                &serde_json::to_value(&result).expect("the status encodes"),
+                &[
+                    "status.awaiting_approval.verification_value",
+                    "owner.rendezvous_origin",
+                    "owner.candidate.verification_value",
+                    "owner.event.verification_value",
+                ],
+                &["ok", "invitation_id"],
+            );
+            only_asked_lines(
+                "kr pair status",
+                &describe_status(invitation_id, &result, 0),
+            );
+        }
+        for asked in ["owner.candidate.device_name", "owner.event.device_name"] {
+            assert!(shown.contains(asked), "{asked} shows what was asked for");
+        }
     }
 
     /// A QR code is drawn square, black on white, inside its quiet zone: every line is as wide as
@@ -992,7 +1162,11 @@ mod tests {
             },
             owner: kr_protocol::scalars::Nullable::null(),
         };
-        let shown = describe_status(invitation_id, &waiting, now);
+        let shown = describe_status(invitation_id, &waiting, now)
+            .iter()
+            .map(|line| line.text().to_owned())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(shown.contains("f3c1 46fd"), "{shown}");
         assert!(!shown.contains("f3c146fd"), "{shown}");
         assert_eq!(

@@ -176,6 +176,20 @@ pub fn verification_value(text: &str) -> VerificationValue {
     })
 }
 
+/// Returns what a pairing's verification value says in a document: its eight hexadecimal digits as
+/// they arrived, when that is what they are. Any other text is replaced, as
+/// [`verification_value`] replaces it.
+#[must_use]
+pub fn verification_digits(text: &str) -> Shown {
+    if text.len() == kr_protocol::pairing::VERIFICATION_VALUE_LEN
+        && text.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        shown!("{}", Checked(text.to_owned()))
+    } else {
+        Shown::said("[a verification value this build does not read]")
+    }
+}
+
 impl fmt::Display for VerificationValue {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.0)
