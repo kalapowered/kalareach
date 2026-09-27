@@ -1553,8 +1553,9 @@ impl Controller {
     /// clock the worker reads.
     ///
     /// This is the last thing this host decides before the mutation is forwarded, so the admission
-    /// it was accepted under is asked here, after the lease: the connection and the revision it
-    /// was admitted at are the ones `actor` carries.
+    /// it was accepted under is asked here: before the lease is taken, so a mutation whose
+    /// admission has lapsed renews nothing, and again after it, since taking the lease can wait.
+    /// The connection and the revision it was admitted at are the ones `actor` carries.
     ///
     /// # Errors
     ///
@@ -1567,6 +1568,23 @@ impl Controller {
         actor: &kr_protocol::actor::ActorEnvelope,
         accepted: AcceptedDeadline,
     ) -> Result<kr_protocol::scalars::U64> {
+        let admitted_revision =
+            actor
+                .grant_revision
+                .0
+                .ok_or_else(|| ControllerError::PermissionDenied {
+                    detail: "this request carries no authority revision it was admitted at"
+                        .to_owned(),
+                })?;
+        let admitted = crate::authority::AdmittedMutation {
+            connection_id: actor.connection_id,
+            admitted_revision,
+            deadline: Some(accepted.deadline),
+        };
+        // A mutation whose admission no longer stands renews nothing. Losing a control stream
+        // withdraws its connection's registration, and a mutation still on its way from that
+        // connection must not extend the lease the worker holds.
+        self.check_registration(&admitted)?;
         let lease: Option<ContinuousInstant> = match self.dispatch_lease(session_id, actor).await {
             Ok(lease) => lease,
             // A worker that has not installed the revision in force has no lease to renew. Asking
@@ -1584,19 +1602,7 @@ impl Controller {
         // and the lease where they were, so only this refuses the forward while it is owed; a
         // registration withdrawn or replaced meanwhile, and a deadline that has passed, refuse it
         // as well. A worker already holding a forwarded mutation decides it under its own lease.
-        let admitted_revision =
-            actor
-                .grant_revision
-                .0
-                .ok_or_else(|| ControllerError::PermissionDenied {
-                    detail: "this request carries no authority revision it was admitted at"
-                        .to_owned(),
-                })?;
-        self.check_registration(&crate::authority::AdmittedMutation {
-            connection_id: actor.connection_id,
-            admitted_revision,
-            deadline: Some(accepted.deadline),
-        })?;
+        self.check_registration(&admitted)?;
         crate::service::remaining_deadline(
             &*self.shared_clock,
             &*self.clock,
@@ -3488,9 +3494,10 @@ pub(crate) mod tests {
 
     /// KR-REQ-23.18: the host's half of a lost control stream. The transport reports the loss
     /// through the handler's `control_stream_lost`, and this host withdraws that connection's
-    /// registration: a mutation admitted on it is no longer forwarded to a worker under a dispatch
-    /// lease, while one admitted on a connection whose control stream stands still is, under the
-    /// same worker's lease. The control: before the loss, both are forwarded.
+    /// registration: a mutation admitted on it is no longer forwarded to a worker and renews no
+    /// dispatch lease, while one admitted on a connection whose control stream stands is still
+    /// forwarded, and renews the same worker's lease. The control: before the loss, both are
+    /// forwarded.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn losing_a_control_stream_stops_the_leases_its_mutations_are_forwarded_under() {
         use kr_protocol::actor::ActorEnvelope;
@@ -3571,6 +3578,13 @@ pub(crate) mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
+        // The lease as the kept connection's forward left it. The clock moves on, so a renewal from
+        // here would give the lease a later deadline.
+        let held = controller
+            .leases
+            .current_lease(session_id)
+            .expect("the forwards above left the worker a lease");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         let refused = controller
             .forwarded_deadline(session_id, &actor(lost), accepted)
             .await
@@ -3582,10 +3596,23 @@ pub(crate) mod tests {
             ),
             "{refused}"
         );
+        assert_eq!(
+            controller.leases.current_lease(session_id),
+            Some(held),
+            "a mutation from a lost control stream renewed the worker's lease"
+        );
         controller
             .forwarded_deadline(session_id, &actor(kept), accepted)
             .await
             .expect("a connection whose control stream stands is still forwarded");
+        let renewed = controller
+            .leases
+            .current_lease(session_id)
+            .expect("the kept connection's forward holds a lease");
+        assert!(
+            renewed.deadline > held.deadline,
+            "and it renews the lease: {held:?} then {renewed:?}"
+        );
         network.shutdown().await;
     }
 }
