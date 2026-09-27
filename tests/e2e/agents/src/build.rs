@@ -82,7 +82,7 @@ pub struct Account {
     /// creates or deletes a keychain for it.
     #[serde(default)]
     pub login_keychain: bool,
-    /// The variable the login is, taken from the harness's own environment, where it is one.
+    /// The variable the login is, where it is one: the harness hands its value over on a pipe.
     #[serde(default)]
     pub variable: Option<String>,
     /// Arguments typed after the command in these parts, such as a model.
@@ -117,6 +117,9 @@ pub struct Account {
     pub clear: String,
     /// What marks the line of a conversation file that holds one of the agent's replies.
     pub reply_line: String,
+    /// What marks the line of a conversation file that records the answer to a tool approval:
+    /// the command's result, or its refusal.
+    pub decision_line: String,
     /// Text the screen shows while a turn runs.
     pub busy: String,
     /// A slash command that calls no model and changes no conversation, and the text it shows.

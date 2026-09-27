@@ -2784,6 +2784,64 @@ fn executions(log: &Path, mark: &str) -> usize {
         .unwrap_or(0)
 }
 
+/// Whether one approval was resolved once: the agent's own conversation records one answer to it.
+fn one_decision(decisions: usize) -> Result<(), String> {
+    if decisions == 1 {
+        Ok(())
+    } else {
+        Err(format!(
+            "the conversation records {decisions} answer(s) to the approval, where one resolution \
+             records one"
+        ))
+    }
+}
+
+/// How many lines of `conversation` after the line `after` record an answer to a tool approval,
+/// once the count has held for a second: the agent writes its record of an answer when the
+/// command's result or refusal is back, which can be after its screen has moved on. Waits until
+/// the count reaches `least`.
+fn decisions(conversation: &Path, after: Option<usize>, marker: &str, least: usize) -> usize {
+    let count = || {
+        std::fs::read_to_string(conversation)
+            .map(|text| {
+                text.lines()
+                    .skip(after.map_or(0, |line| line + 1))
+                    .filter(|line| line.contains(marker))
+                    .count()
+            })
+            .unwrap_or(0)
+    };
+    let started = std::time::Instant::now();
+    let mut seen = count();
+    while seen < least && started.elapsed() < LIVENESS {
+        std::thread::sleep(Duration::from_millis(200));
+        seen = count();
+    }
+    loop {
+        std::thread::sleep(Duration::from_secs(1));
+        let again = count();
+        if again == seen {
+            return seen;
+        }
+        seen = again;
+    }
+}
+
+/// Whether the composer shows either answer typed again before `probe`, which was typed into an
+/// empty composer: an answer the host replayed after a reconnection lands there first.
+fn replayed(rows: &[String], probe: &str, answers: &[&str]) -> Result<(), String> {
+    let Some(row) = rows.iter().find(|row| row.contains(probe)) else {
+        return Err(format!("the composer does not show {probe}"));
+    };
+    let before = row[..row.find(probe).unwrap_or(0)].trim_end();
+    match answers.iter().find(|answer| before.ends_with(**answer)) {
+        Some(answer) => Err(format!(
+            "the composer shows {answer:?} before the probe, typed again: {row}"
+        )),
+        None => Ok(()),
+    }
+}
+
 /// KR-REQ-12.32, case 3, part 3: with the person's login, the agent raises its approval dialog for
 /// a shell command that appends a marker to a log, and the paired device, holding the input lease,
 /// and the local terminal answer it at the same moment: the device allows, the local terminal
@@ -2835,6 +2893,17 @@ fn a_local_and_a_remote_answer_raced_to_one_approval_resolve_it_once() {
         );
         let ran = executions(&log, &mark);
         loser_reached_nothing(ran).unwrap_or_else(|why| panic!("one resolution: {why}"));
+        let conversations = login_home(stage).join(&account.conversations);
+        let conversation = conversation_of(&conversations, &mark, &account.prompt_line)
+            .unwrap_or_else(|| {
+                panic!(
+                    "one conversation under {} holds the command",
+                    conversations.display()
+                )
+            });
+        let prompt_at = first_line_with(&conversation, None, &[&mark, &account.prompt_line]);
+        let decided = decisions(&conversation, prompt_at, &account.decision_line, 1);
+        one_decision(decided).unwrap_or_else(|why| panic!("one resolution: {why}"));
         let snapshot = events_snapshot(
             &logged.agent.session.remote,
             stage.runtime,
@@ -2853,12 +2922,37 @@ fn a_local_and_a_remote_answer_raced_to_one_approval_resolve_it_once() {
             .unwrap_or_else(|why| panic!("the device reconnects: {why}"));
         std::thread::sleep(Duration::from_secs(3));
         let after_reconnect = executions(&log, &mark);
+        let decided_after = decisions(&conversation, prompt_at, &account.decision_line, 0);
         let rows = fresh_rows(stage, &logged.agent.session);
         assert!(
-            after_reconnect == ran && !rows.iter().any(|row| row.contains(&account.approval.shows)),
-            "after the device reconnects the command has run {after_reconnect} time(s), as before, \
-             and no approval is pending:\n{}",
+            after_reconnect == ran
+                && decided_after == decided
+                && !rows.iter().any(|row| row.contains(&account.approval.shows)),
+            "after the device reconnects the command has run {after_reconnect} time(s) and the \
+             conversation records {decided_after} answer(s), as before, and no approval is \
+             pending:\n{}",
             rows.join("\n")
+        );
+        // Neither answer is typed again: a probe typed into the empty composer shows nothing
+        // before it but the composer's own prompt.
+        let probe = format!("zq{mark}");
+        logged.type_text(stage, &probe);
+        let probed = logged.wait_for(stage, &probe, "the probe reaches the composer");
+        let answers = [
+            account.approval.allow.as_str(),
+            account.approval.deny.as_str(),
+        ];
+        replayed(&probed, &probe, &answers)
+            .unwrap_or_else(|why| panic!("nothing is typed again after reconnecting: {why}"));
+        logged.type_text(stage, &account.clear);
+        let replay_control = replayed(
+            &[format!("> {}{probe}", account.approval.allow)],
+            &probe,
+            &answers,
+        );
+        assert!(
+            replay_control.is_err(),
+            "the replay check rejects an answer typed again before the probe"
         );
         // The control: the local terminal attaches again and holds the lease; a second approval,
         // the local terminal denies and the device's allow is refused; the same check fails.
@@ -2904,6 +2998,12 @@ fn a_local_and_a_remote_answer_raced_to_one_approval_resolve_it_once() {
             &account.composer,
             "the agent is back at its composer after the denial",
         );
+        let decided_control = decisions(
+            &conversation,
+            prompt_at,
+            &account.decision_line,
+            decided + 1,
+        );
         let control = loser_reached_nothing(executions(&log, &second));
         assert!(
             control.is_err() && device_refused.is_some(),
@@ -2916,6 +3016,8 @@ fn a_local_and_a_remote_answer_raced_to_one_approval_resolve_it_once() {
             "winner": { "who": "the paired device, which held the input lease", "typed": account.approval.allow },
             "loser": { "who": "the local terminal", "typed": account.approval.deny, "receipt": receipt.iter().filter(|row| row.contains("input lease")).collect::<Vec<_>>(), "exit_status": local_status },
             "executions": { "after_the_race": ran, "after_reconnecting": after_reconnect },
+            "decisions": { "conversation": conversation_id(&conversation), "marked_by": account.decision_line, "after_the_race": decided, "after_reconnecting": decided_after, "after_the_control": decided_control },
+            "replay": { "probe": probe, "typed_again": false, "checker_control_rejected": replay_control.is_err() },
             "resources": snapshot.agent_resources.resources.len(),
             "control": { "what": "a second approval with the local terminal holding the lease: it denied and the device's allow was refused", "breaks_property": true, "executions": executions(&log, &second), "device_refused": device_refused, "check": control.err() },
         });
@@ -3205,6 +3307,20 @@ fn a_second_process_on_the_same_saved_conversation_is_another_execution_not_merg
                 .map(|process| json!({ "pid": process.identity.pid.get(), "command": process.command }))
                 .collect::<Vec<_>>()
         };
+        // Each execution's live processes are its own: none is the other's.
+        let identities = |logged: &Logged| {
+            logged
+                .agent
+                .every_process()
+                .into_iter()
+                .map(|process| process.identity.clone())
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        let (owners_a, owners_b) = (identities(&first), identities(&second));
+        assert!(
+            !owners_a.is_empty() && !owners_b.is_empty() && owners_a.is_disjoint(&owners_b),
+            "sessions A and B run on processes of their own: A {owners_a:?}, B {owners_b:?}"
+        );
         let evidence = json!({
             "account": account_evidence(stage, first.turns + second.turns),
             "conversation": conversation,
