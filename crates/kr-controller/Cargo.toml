@@ -85,6 +85,9 @@ kr-crypto.workspace = true
 kr-ipc = { workspace = true, features = ["testing"] }
 kr-term.workspace = true
 kr-transfer.workspace = true
+# The connector packages a test publishes and installs are the worker's own test packages, so the
+# integrations a session is given are read from the packages a worker reads.
+kr-worker = { workspace = true, features = ["testing"] }
 # Certificates a test issues for a loopback TLS server of its own, so a rendezvous request, the
 # room's WebSocket and mail submission are checked against a real handshake.
 rcgen.workspace = true
