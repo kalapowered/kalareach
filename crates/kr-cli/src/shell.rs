@@ -71,12 +71,30 @@ pub struct EntryReport {
     pub change: Option<Change>,
 }
 
+/// The store this kr is a release of, where it is one.
+fn installed_store() -> Option<kr_ipc::install::Store> {
+    kr_ipc::install::this_process()
+        .ok()
+        .and_then(kr_ipc::install::Running::store)
+        .cloned()
+}
+
 /// Reads the packages this installation has.
+///
+/// A kr of an installed release reads the current release's packages, through the store's
+/// `current`: those are the packages a new session is started with, whichever release this kr
+/// is. Anywhere else, the packages the build writes, or those [`PACKAGE_ROOT_VARIABLE`] names.
 ///
 /// # Errors
 ///
 /// Returns a configuration failure when a package's manifest cannot be read.
 pub fn packages() -> Result<PackageSet> {
+    if let Some(store) = installed_store() {
+        let root = store.stable_shells();
+        return PackageSet::discover(&root).map_err(|fault| {
+            CliError::ShellIntegrationUnsupported(crate::shown::package_fault(&fault, &root))
+        });
+    }
     let default = default_package_root();
     PackageSet::installed(&default).map_err(|fault| {
         // The root the package set read, as it chose it: the variable when it is set.
@@ -112,6 +130,42 @@ pub fn selected<'a>(set: &'a PackageSet, shell: Option<&str>) -> Result<Vec<&'a 
             kind.as_str()
         ))
     })
+}
+
+/// The file a startup entry sources on a host installed as a store of releases: the shell's
+/// entry in the current release, `current/shells/<shell>/<entry>`, by the name the package gives
+/// its own entry. `None` anywhere else, where the entry sources the package's own file.
+///
+/// The file only calls the running shell's own bridge builtin, so a shell of any release the host
+/// keeps reads it: a shell of the release a session started from runs its own release's
+/// integration, and an entry written once keeps working across every update, since `current`
+/// follows the update and the file stays where the entry names it.
+///
+/// # Errors
+///
+/// Returns a configuration failure when the current release has no such file, which would leave
+/// the entry sourcing nothing.
+fn stable_entry(package: &ShellPackage) -> Result<Option<std::path::PathBuf>> {
+    let Some(store) = installed_store() else {
+        return Ok(None);
+    };
+    let own = package.startup_entry();
+    let Some(name) = own.file_name() else {
+        return Ok(None);
+    };
+    let stable = store
+        .stable_shells()
+        .join(package.kind().as_str())
+        .join(name);
+    if !stable.is_file() {
+        return Err(CliError::ShellIntegrationUnsupported(shown!(
+            "the current release has no {} startup entry at {}, which the startup file of an \
+             installed host sources",
+            package.kind().as_str(),
+            Shown::root(&stable)
+        )));
+    }
+    Ok(Some(stable))
 }
 
 /// Reports one package without changing anything.
@@ -172,7 +226,7 @@ pub fn install(
     nsh_bypass: bool,
     dry_run: bool,
 ) -> Result<ShellReport> {
-    let package_entry = package.startup_entry();
+    let package_entry = stable_entry(package)?.unwrap_or_else(|| package.startup_entry());
     // The entry each file gets is the entry for that file: `.profile` is read by shells that are
     // not this one, and its entry says so.
     let bodies = layout

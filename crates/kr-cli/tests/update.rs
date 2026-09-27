@@ -1266,6 +1266,114 @@ fn only_the_current_release_s_kr_updates_the_host() {
     );
 }
 
+/// Writes a zsh package into a release's `shells/`, as a build installs one, and the release's
+/// stable entry for zsh beside it: the file a store's startup entries source.
+fn write_zsh_package(shells: &Path) {
+    use kr_shell_integration::contract::qualification::ShellKind;
+    use kr_shell_integration::host::package::{
+        CURRENT_BASENAME, MANIFEST_BASENAME, PackageManifest, PackageShell, PackageStartupEntry,
+    };
+
+    let package = shells.join("zsh").join("test-1");
+    std::fs::create_dir_all(package.join("startup")).expect("the package's directory");
+    let manifest = PackageManifest {
+        identity: "test-1".to_owned(),
+        shell: PackageShell {
+            kind: ShellKind::Zsh,
+            executable: package.join("bin/zsh"),
+            upstream_version: "5.9".to_owned(),
+            editor_abi: "zle-5.9".to_owned(),
+            integration_version: "1".to_owned(),
+            patches: Vec::new(),
+            modules: Vec::new(),
+        },
+        startup_entry: PackageStartupEntry {
+            file: "startup/kr-zshrc.zsh".to_owned(),
+        },
+    };
+    std::fs::write(
+        package.join(MANIFEST_BASENAME),
+        serde_json::to_string(&manifest).expect("the record encodes"),
+    )
+    .expect("the identity record");
+    std::fs::write(shells.join("zsh").join(CURRENT_BASENAME), "test-1\n").expect("current");
+    let entry = "if builtin kr-bridge status 2>/dev/null; then builtin kr-bridge activated; fi\n";
+    std::fs::write(package.join("startup/kr-zshrc.zsh"), entry).expect("the package's entry");
+    std::fs::write(shells.join("zsh").join("kr-zshrc.zsh"), entry).expect("the stable entry");
+}
+
+/// A kr of an installed release writes a startup entry that sources the current release's entry
+/// through the store's `current`, which every update leaves in place; a kr outside a store sources
+/// the package's own file.
+#[test]
+fn a_store_s_startup_entry_sources_the_current_release_s_entry() {
+    let host = Host::create();
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
+    let directory = host.put(&one);
+    host.switch(one.name());
+    let shells = directory.join("shells");
+    write_zsh_package(&shells);
+    let home = host.scratch("home");
+    let output = host
+        .command(
+            &host.store.stable(Program::Kr),
+            &["shell", "install", "--shell", "zsh"],
+        )
+        .env("HOME", &home)
+        .stdin(Stdio::null())
+        .output()
+        .expect("kr runs");
+    assert!(
+        output.status.success(),
+        "kr shell install: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let written = std::fs::read_to_string(home.join(".zshrc")).expect("the entry is written");
+    let stable = host.store.stable_shells().join("zsh").join("kr-zshrc.zsh");
+    assert!(
+        written.contains(&stable.display().to_string()),
+        "the entry sources the stable file: {written}"
+    );
+    assert!(
+        !written.contains("versions"),
+        "the entry names no release's own directory: {written}"
+    );
+
+    // The control: outside a store, the same packages give an entry that sources the package's
+    // own file.
+    let home = host.scratch("home-outside");
+    let output = Command::new(support::kr())
+        .args(["shell", "install", "--shell", "zsh"])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", &home)
+        .env("KR_RUNTIME_DIR", host.tree.paths().runtime_root())
+        .env("KR_STATE_DIR", host.tree.paths().state_root())
+        .env(
+            kr_shell_integration::host::package::PACKAGE_ROOT_VARIABLE,
+            &shells,
+        )
+        .current_dir(host.tree.root())
+        .stdin(Stdio::null())
+        .output()
+        .expect("kr runs");
+    assert!(
+        output.status.success(),
+        "kr shell install: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let written = std::fs::read_to_string(home.join(".zshrc")).expect("the entry is written");
+    assert!(
+        written.contains(
+            &shells
+                .join("zsh/test-1/startup/kr-zshrc.zsh")
+                .display()
+                .to_string()
+        ),
+        "{written}"
+    );
+}
+
 /* -------------------------------------------------------------------------------------------- */
 /* What a release has to be                                                                      */
 /* -------------------------------------------------------------------------------------------- */

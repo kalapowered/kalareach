@@ -906,7 +906,7 @@ pub fn software(info: &HostInfoResult) -> Vec<kr_protocol::hostinfo::SoftwareCom
     use kr_protocol::hostinfo::export::{BuildIdentity, ContentClass, Sentence, Stated};
 
     let controller = info.build_id.to_string();
-    vec![
+    let mut components = vec![
         kr_protocol::hostinfo::SoftwareComponent {
             component: Stated::new("kr"),
             version: Sentence::new().stated(env!("CARGO_PKG_VERSION")),
@@ -936,7 +936,19 @@ pub fn software(info: &HostInfoResult) -> Vec<kr_protocol::hostinfo::SoftwareCom
                 .stated(" ")
                 .stated(std::env::consts::ARCH),
         },
-    ]
+    ];
+    // A kr of an installed release names that release, as each of its programs does in its build.
+    if let Some(build) = kr_ipc::install::this_process()
+        .ok()
+        .filter(|running| running.release().is_some())
+        .and_then(|_| BuildIdentity::parse(crate::build_id().as_str()))
+    {
+        components.push(kr_protocol::hostinfo::SoftwareComponent {
+            component: Stated::new("installed release"),
+            version: Sentence::new().identifier(&build),
+        });
+    }
+    components
 }
 
 /// The content-bearing diagnostic export, built only when the person selected it.

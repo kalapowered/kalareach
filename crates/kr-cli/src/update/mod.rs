@@ -357,8 +357,9 @@ impl Updated {
     pub fn lines(&self) -> Vec<Shown> {
         if self.checked_only {
             return vec![shown!(
-                "release {} can replace {} now: it is checked, and no live session runs at a \
-                 level it does not retain",
+                "release {} checks as a release for this host, and no live session that answered \
+                 runs at a level it does not retain; kr host update --archive installs it in \
+                 place of {}",
                 crate::shown::release(&self.target),
                 crate::shown::release(&self.source)
             )];
