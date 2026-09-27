@@ -277,11 +277,17 @@ impl DescriptionStore {
         Ok(u64::from(self.pinned(session_id)?.is_some()))
     }
 
-    /// Records a generated description with its provenance.
+    /// Records a generated description with its provenance, unless the session has a pin.
     ///
     /// A session with a pin is refused here as well as at validation. The check is duplicated on
     /// purpose: validation is about a result that was in flight while somebody pinned a name, and
     /// this is about the store never holding a generated title for a session a person has named.
+    ///
+    /// The pin check and the write are one statement. A pin is written through another connection
+    /// (the daemon answers a rename while a description is being published), and a check followed
+    /// by a separate write would let that pin commit between the two. One statement holds the
+    /// store's write lock from the check to the write, so a pin that commits first stops the write
+    /// and one that commits after it finds the description already there.
     ///
     /// # Errors
     ///
@@ -292,15 +298,14 @@ impl DescriptionStore {
         description: &GeneratedDescription,
         now_wall_ms: u64,
     ) -> Result<Published> {
-        if self.pinned(session_id)?.is_some() {
-            return Ok(Published::NamePinned);
-        }
-        self.connection
+        let written = self
+            .connection
             .execute(
                 "INSERT INTO describe_generated (
                      session_id, title, activity, context_revision, cursor_from, cursor_to,
                      profile_id, profile_revision, privacy_generation, produced_at_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
+                 WHERE NOT EXISTS (SELECT 1 FROM describe_pins WHERE session_id = ?1)
                  ON CONFLICT(session_id) DO UPDATE SET
                      title = excluded.title,
                      activity = excluded.activity,
@@ -331,7 +336,12 @@ impl DescriptionStore {
                 ],
             )
             .map_err(store_error)?;
-        Ok(Published::Recorded)
+        // The statement writes one row, or none when the session has a pin.
+        Ok(if written == 0 {
+            Published::NamePinned
+        } else {
+            Published::Recorded
+        })
     }
 
     /// Returns a session's generated description, when it has one.

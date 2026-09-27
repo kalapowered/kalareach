@@ -1176,6 +1176,146 @@ fn a_pinned_name_is_never_overwritten_by_generated_text() {
     assert_eq!(label.title.as_str(), "Release prep");
 }
 
+/// Opens a second connection to a store on disk that holds a pin in a write transaction it has not
+/// committed, which is where a pin written by another connection is while a publication races it.
+fn a_pin_not_yet_committed(root: &std::path::Path, session_id: &SessionId) -> rusqlite::Connection {
+    let other = rusqlite::Connection::open(root.join("descriptions.sqlite3"))
+        .expect("a second connection to the same store");
+    other
+        .execute_batch("BEGIN IMMEDIATE")
+        .expect("the second connection takes the write lock");
+    other
+        .execute(
+            "INSERT INTO describe_pins (session_id, title, pinned_by, pinned_at_ms)
+             VALUES (?1, 'Release prep', 'local:501', 1700000000000)",
+            [session_id.to_string()],
+        )
+        .expect("a pin, not yet committed");
+    other
+}
+
+/// KR-REQ-22.19 and KR-REQ-24.14: a pin that another connection commits while a publication is
+/// waiting for the store is never overwritten, however the two interleave.
+///
+/// The second connection holds its pin in an open write transaction, and a thread publishes
+/// meanwhile. A publication that read the pin and then wrote in a second statement has already
+/// read "no pin" by the time the pin commits, and writes over it. One statement that writes only
+/// where no pin exists waits for the pin's transaction and then writes nothing.
+#[test]
+fn a_pin_committed_while_a_publication_waits_is_never_overwritten() {
+    let directory = tempfile::tempdir().expect("a directory on the internal disk");
+    let description =
+        validate(&well_formed(2), &produced_under(), &expectation(2)).expect("a description");
+    for seed in 1..=10_u8 {
+        let store = DescriptionStore::open(directory.path()).expect("a store");
+        let other = a_pin_not_yet_committed(directory.path(), &session(seed));
+        let publishing = {
+            let description = description.clone();
+            std::thread::spawn(move || {
+                let published = store.publish(&session(seed), &description, 1_700_000_000_001);
+                (store, published)
+            })
+        };
+        // Long enough for the publication to reach the store and wait on the pin's transaction.
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        other.execute_batch("COMMIT").expect("the pin is committed");
+        let (store, published) = publishing.join().expect("the publishing thread");
+        assert_eq!(
+            published.expect("the publication is answered"),
+            Published::NamePinned,
+            "a pin committed while the publication waited must stop it"
+        );
+        assert!(
+            store.generated(&session(seed)).expect("a read").is_none(),
+            "the store holds generated text for a session a person has named"
+        );
+    }
+
+    // The control: the same publication with no pin anywhere is recorded.
+    let store = DescriptionStore::open(directory.path()).expect("a store");
+    assert_eq!(
+        store
+            .publish(&session(99), &description, 1_700_000_000_001)
+            .expect("a publication"),
+        Published::Recorded
+    );
+    assert!(store.generated(&session(99)).expect("a read").is_some());
+}
+
+/// KR-REQ-22.19: a job whose publication loses the race to a pin is refused as pinned, and the
+/// queue records no success for it.
+#[test]
+fn a_publication_that_loses_the_race_to_a_pin_records_no_success() {
+    let directory = tempfile::tempdir().expect("a directory on the internal disk");
+    let behaviour = SharedBehaviour::new();
+    let mut service = DescriptionService::new(
+        HostPlacement {
+            environment: native(1),
+            data_access: None,
+            target: MAC.to_owned(),
+        },
+        built_in(),
+        MetGates::default(),
+        ResourceSettings::default(),
+        DescriptionStore::open(directory.path()).expect("a store"),
+        stub_factory(&behaviour),
+    );
+    queue_one(
+        &mut service,
+        &session(1),
+        "kalareach",
+        Priority::Ordinary,
+        at(0),
+    );
+    let other = a_pin_not_yet_committed(directory.path(), &session(1));
+    let committing = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        other.execute_batch("COMMIT").expect("the pin is committed");
+    });
+    let tick = service.tick(&roomy(), at(3_000)).expect("a tick");
+    committing.join().expect("the committing thread");
+    assert_eq!(
+        tick,
+        Tick::Rejected {
+            session_id: session(1),
+            rejection: Rejection::NamePinned,
+        }
+    );
+    assert!(
+        service
+            .store()
+            .generated(&session(1))
+            .expect("a read")
+            .is_none()
+    );
+    assert_eq!(
+        service
+            .standing(&session(1), at(3_000))
+            .last_success_wall_ms,
+        None,
+        "a refused publication is not a success"
+    );
+
+    // The control: with no pin, the same job publishes and records its success.
+    queue_one(
+        &mut service,
+        &session(2),
+        "kalareach",
+        Priority::Ordinary,
+        at(40_000),
+    );
+    assert!(matches!(
+        service.tick(&roomy(), at(43_000)).expect("a tick"),
+        Tick::Published { .. }
+    ));
+    assert!(
+        service
+            .standing(&session(2), at(43_000))
+            .last_success_wall_ms
+            .is_some()
+    );
+}
+
 /// KR-REQ-22.20: generated text is labelled, and there is no path from it to a status or a
 /// permission.
 ///

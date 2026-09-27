@@ -85,6 +85,16 @@ pub enum PublishGate {
     Cancelled,
     /// The whole-job deadline was exceeded.
     DeadlineExceeded,
+    /// The session's name is pinned, so the store recorded nothing.
+    NamePinned,
+}
+
+/// Why a write through a job's token recorded nothing.
+enum NotWritten {
+    /// The session has a pin.
+    NamePinned,
+    /// The store refused the write.
+    Store(crate::DescribeError),
 }
 
 impl DescriptionFence {
@@ -182,15 +192,21 @@ impl DescriptionFence {
         // token itself: a cancellation that arrives while the row is being written waits for it and
         // is told it was too late, rather than returning to its caller over a description it did
         // not stop. Nothing is removed here, because the row a removal would take is the session's
-        // only generated description and an earlier job published it.
-        match cancellation
-            .publish_unless_cancelled(|| store.publish(session_id, description, wall_ms))
-        {
-            None => Ok(PublishGate::Cancelled),
-            Some(written) => {
-                written?;
-                Ok(PublishGate::Allowed)
+        // only generated description and an earlier job published it. A pin that stops the write
+        // is a write that recorded nothing, so the token goes back to cancellable, as it does for a
+        // write the store refused.
+        let written = cancellation.publish_unless_cancelled(|| {
+            match store.publish(session_id, description, wall_ms) {
+                Ok(crate::store::Published::Recorded) => Ok(()),
+                Ok(crate::store::Published::NamePinned) => Err(NotWritten::NamePinned),
+                Err(error) => Err(NotWritten::Store(error)),
             }
+        });
+        match written {
+            None => Ok(PublishGate::Cancelled),
+            Some(Ok(())) => Ok(PublishGate::Allowed),
+            Some(Err(NotWritten::NamePinned)) => Ok(PublishGate::NamePinned),
+            Some(Err(NotWritten::Store(error))) => Err(error),
         }
     }
 }
@@ -610,6 +626,46 @@ mod tests {
         let record = store.generated(&session).expect("record").expect("some");
         assert_eq!(record.title.as_str(), "sample title");
         assert_eq!(record.activity.as_str(), "sample activity");
+    }
+
+    #[test]
+    fn publish_under_lock_reports_a_pinned_name_and_leaves_the_job_cancellable() {
+        let store = DescriptionStore::in_memory().expect("store");
+        let fence = DescriptionFence::new();
+        let session = sample_session(1);
+        store
+            .pin(
+                &session,
+                &Title::new("Release prep").expect("title"),
+                "local:501",
+                900,
+            )
+            .expect("pin");
+        let desc = sample_description(PrivacyGeneration::INITIAL);
+        let cancellation = Cancellation::new();
+        let clock = JobClock::by_hand();
+
+        let gate = fence
+            .publish_under_lock(
+                &store,
+                &session,
+                &desc,
+                1000,
+                PrivacyGeneration::INITIAL,
+                PrivacyGeneration::INITIAL,
+                &cancellation,
+                &clock,
+                0,
+                5000,
+            )
+            .expect("gate");
+
+        assert_eq!(gate, PublishGate::NamePinned);
+        assert!(store.generated(&session).expect("record").is_none());
+        assert!(
+            cancellation.cancel(),
+            "nothing was published, so the job can still be cancelled"
+        );
     }
 
     #[test]

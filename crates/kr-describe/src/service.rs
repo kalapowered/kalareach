@@ -982,6 +982,12 @@ impl DescriptionService {
             }
             PublishGate::Cancelled => Ok(Tick::Cancelled { session_id }),
             PublishGate::DeadlineExceeded => Ok(Tick::DeadlineExceeded { session_id }),
+            // A pin committed after validation read none. Nothing was recorded, so nothing is a
+            // success: the queue's last success stays where it was.
+            PublishGate::NamePinned => Ok(Tick::Rejected {
+                session_id,
+                rejection: Rejection::NamePinned,
+            }),
             PublishGate::Fenced => Ok(Tick::Rejected {
                 session_id,
                 rejection: Rejection::LateGeneration {
