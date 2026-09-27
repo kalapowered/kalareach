@@ -39,6 +39,8 @@ function ended(kind: FailureKind, tries_left: number | null): AttemptState {
 }
 
 describe('pairing with a host', () => {
+  // KR-REQ-10.11: the code field turns off autocapitalisation and autocorrection, and takes the code
+  // with its case exactly as typed.
   it('starts at the code field, focused, and takes a code exactly as typed', async () => {
     start()
     expect(await screen.findByRole('heading', { name: 'Pair with a host' })).toBeInTheDocument()
