@@ -680,10 +680,17 @@ fn staged(
         .filter(|login| login.account.home == AccountHome::Person)
         .map(|login| snapshot(&login.person_home, &directories, HASH_LIMIT));
     if let Some(before) = person.as_ref().filter(|before| !before.whole()) {
+        // Counted by directory: an entry's own name can be the person's, and this text goes into
+        // the record.
         panic!(
             "part {part}: the person's agent directories could not be read whole before it \
-             started, so it does not start: {}",
-            before.unread().join("; ")
+             started, so it does not start: entries that could not be read, by directory: {}",
+            before
+                .unread_by_root()
+                .iter()
+                .map(|(root, count)| format!("{} ({count})", root.display()))
+                .collect::<Vec<_>>()
+                .join(", ")
         );
     }
     // The person's files no part may change, and those their own programs also write, as the part
