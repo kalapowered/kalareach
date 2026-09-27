@@ -18,16 +18,21 @@
 //! | KR-REQ-20.13 | `kr_req_20_13_a_mailbox_counts_the_declared_bucket_rather_than_the_plaintext` |
 //! | KR-REQ-09.24 | `kr_req_09_24_an_item_acknowledged_twice_is_answered_the_same_way`, `kr_req_09_24_a_repeated_state_notification_replaces_the_one_it_supersedes`, `kr_req_09_24_a_mailbox_is_served_only_to_the_key_that_claimed_it` |
 //! | KR-REQ-23.50 | `kr_req_23_50_a_credential_for_another_gateway_is_refused_by_the_service` |
+//! | KR-REQ-23.57 | `kr_req_23_57_a_delivery_the_mailbox_finished_late_goes_once_more_and_is_stored_once`, `kr_req_23_57_a_delivery_the_mailbox_finished_late_twice_comes_back_as_that_answer` |
 //!
 //! Those rows' acceptance owners are elsewhere; what these legs add is the half nothing had
 //! before, which is that the contract holds against a deployment rather than against a mock.
 
 use std::future::Future;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use kr_client::services::mailbox::{
-    MAILBOX_READ_PATH, MailboxAnswer, MailboxClaimAnswer, MailboxClient, MailboxDeliveryState,
+    MAILBOX_DELIVER_PATH, MAILBOX_READ_PATH, MailboxAnswer, MailboxClaimAnswer, MailboxClient,
+    MailboxDeliveryState,
 };
+use kr_client::services::relay::ServiceSigner;
+use kr_client::services::{ServiceFuture, ServiceHttp, ServiceHttpAnswer};
 use kr_crypto::envelope::{PairedSenders, ReplayLedger, open_delivered_envelope, seal_envelope};
 use kr_crypto::keys::StoredEnvelopeKeyPair;
 use kr_crypto::sealed::answer_mailbox_claim;
@@ -138,13 +143,26 @@ impl Mailboxes {
         recipient: &StoredEnvelopeKey,
         envelope: &SealedEnvelope,
     ) -> kr_client::Result<kr_client::services::MailboxDelivery> {
-        {
-            let mut used = self.used.lock().expect("the mailboxes this leg used");
-            if !used.contains(recipient) {
-                used.push(*recipient);
-            }
-        }
+        self.record(recipient);
         self.writing.deliver(recipient, envelope).await
+    }
+
+    /// Notes one mailbox this leg delivers to, so the leg gives back what it stored there.
+    fn record(&self, recipient: &StoredEnvelopeKey) {
+        let mut used = self.used.lock().expect("the mailboxes this leg used");
+        if !used.contains(recipient) {
+            used.push(*recipient);
+        }
+    }
+
+    /// A client that delivers as a peer does, through `transport` rather than straight to the
+    /// deployment, signing with a key of its own.
+    fn writing_through(&self, transport: &Arc<LateMailbox>) -> MailboxClient {
+        MailboxClient::new(
+            self.deployment.origin().clone(),
+            Arc::clone(transport) as Arc<dyn ServiceHttp>,
+            RunKey::installation() as Arc<dyn ServiceSigner>,
+        )
     }
 
     /// The key pair for one of this leg's mailboxes.
@@ -202,6 +220,79 @@ impl Mailboxes {
                 .map_err(|error| format!("a mailbox could not be acknowledged: {error}"))?;
         }
         Err("a mailbox still held items after every read this leg is allowed".to_owned())
+    }
+}
+
+/// What a route answers when the mailbox it asked had not answered by the route's deadline, word
+/// for word as the deployment writes it: the outcome not known, and when to send it again.
+const NOT_FINISHED: &[u8] = br#"{"ok":false,"error":{"code":"SERVICE_UNAVAILABLE","message":"The mailbox did not finish answering that request, and what became of it is not known. Send it again shortly.","retryAfterSeconds":2}}"#;
+
+/// The deployment's transport with a mailbox in front of it that answers too late.
+///
+/// For the next `stalls` deliveries it carries the delivery to the deployment, which stores it,
+/// and hands back the route's answer to a mailbox that had not answered by its deadline in place
+/// of the deployment's own: what a device sees when its mailbox stores an item after the route
+/// stopped waiting for it. Everything else passes through as it came.
+#[derive(Debug)]
+struct LateMailbox {
+    through: Arc<dyn ServiceHttp>,
+    /// How many more deliveries are answered too late.
+    stalls: AtomicUsize,
+    /// How many deliveries have reached the deployment through it.
+    deliveries: AtomicUsize,
+}
+
+impl LateMailbox {
+    fn stalling(through: Arc<dyn ServiceHttp>, stalls: usize) -> Arc<Self> {
+        Arc::new(Self {
+            through,
+            stalls: AtomicUsize::new(stalls),
+            deliveries: AtomicUsize::new(0),
+        })
+    }
+
+    fn deliveries(&self) -> usize {
+        self.deliveries.load(Ordering::SeqCst)
+    }
+}
+
+impl ServiceHttp for LateMailbox {
+    fn post_json<'a>(
+        &'a self,
+        url: &'a str,
+        body: &'a [u8],
+        headers: &'a [(&'a str, &'a str)],
+    ) -> ServiceFuture<'a, ServiceHttpAnswer> {
+        Box::pin(async move {
+            let answer = self.through.post_json(url, body, headers).await?;
+            if !url.ends_with(MAILBOX_DELIVER_PATH) {
+                return Ok(answer);
+            }
+            self.deliveries.fetch_add(1, Ordering::SeqCst);
+            let late = self
+                .stalls
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                    left.checked_sub(1)
+                })
+                .is_ok();
+            Ok(if late {
+                ServiceHttpAnswer {
+                    status: 503,
+                    body: NOT_FINISHED.to_vec(),
+                }
+            } else {
+                answer
+            })
+        })
+    }
+
+    fn post_bytes<'a>(
+        &'a self,
+        url: &'a str,
+        body: &'a [u8],
+        headers: &'a [(&'a str, &'a str)],
+    ) -> ServiceFuture<'a, ServiceHttpAnswer> {
+        self.through.post_bytes(url, body, headers)
     }
 }
 
@@ -802,6 +893,81 @@ async fn kr_req_09_24_a_mailbox_is_served_only_to_the_key_that_claimed_it() {
         );
 
         "an unclaimed mailbox is served to nobody who cannot answer its challenge, and once the recipient has answered it a peer that knows the key it is addressed by can neither read it nor delete from it".to_owned()
+    })
+    .await;
+}
+
+/// KR-REQ-23.57: a delivery answered that the mailbox did not finish answering it goes once more
+/// after the delay the route stated, and is stored once.
+///
+/// A delivery is safe to send again: the mailbox keys it by its envelope identifier and answers a
+/// repeat with the first delivery's position. The transport in front of the deployment carries the
+/// first delivery through, so the deployment stores it, and hands back the route's answer to a
+/// mailbox that had not answered by its deadline, as a route does when its mailbox stores an item
+/// after it stopped waiting. The client sends the same delivery once more, and the deployment
+/// answers it as a repeat of the first.
+#[tokio::test]
+async fn kr_req_23_57_a_delivery_the_mailbox_finished_late_goes_once_more_and_is_stored_once() {
+    leg(|mailboxes| async move {
+        let late = LateMailbox::stalling(mailboxes.deployment.transport(), 1);
+        let writer = mailboxes.writing_through(&late);
+        let (_, envelope) =
+            mailboxes.sealed_to(&mailboxes.recipient, b"a reference to state", None);
+        mailboxes.record(mailboxes.recipient.public());
+
+        let delivery = writer
+            .deliver(mailboxes.recipient.public(), &envelope)
+            .await
+            .expect("the delivery, answered the second time it went");
+        assert_eq!(late.deliveries(), 2, "once more, and once only");
+        assert_eq!(
+            delivery.state,
+            MailboxDeliveryState::Duplicate,
+            "the first delivery stored it"
+        );
+
+        let page = mailboxes
+            .reading
+            .read_as(&mailboxes.recipient, None)
+            .await
+            .expect("the recipient reads its own mailbox");
+        assert_eq!(page.items.len(), 1, "stored once");
+        assert_eq!(page.items[0].sequence, delivery.sequence, "at the first delivery's position");
+        assert_eq!(page.items[0].envelope, envelope);
+
+        "a delivery answered that the mailbox did not finish goes once more after the delay the route stated, is answered as a repeat of the first, and is stored once".to_owned()
+    })
+    .await;
+}
+
+/// KR-REQ-23.57: the second send is the last. A delivery answered both times that the mailbox did
+/// not finish answering comes back to the caller as that answer, and the item the deployment
+/// stored is in the mailbox once.
+#[tokio::test]
+async fn kr_req_23_57_a_delivery_the_mailbox_finished_late_twice_comes_back_as_that_answer() {
+    leg(|mailboxes| async move {
+        let late = LateMailbox::stalling(mailboxes.deployment.transport(), 2);
+        let writer = mailboxes.writing_through(&late);
+        let (_, envelope) =
+            mailboxes.sealed_to(&mailboxes.recipient, b"a reference to state", None);
+        mailboxes.record(mailboxes.recipient.public());
+
+        let error = writer
+            .deliver(mailboxes.recipient.public(), &envelope)
+            .await
+            .expect_err("the second answer is the answer");
+        assert_eq!(error.code(), ErrorCode::ServiceCapacity);
+        assert_eq!(late.deliveries(), 2, "never a third send");
+
+        let page = mailboxes
+            .reading
+            .read_as(&mailboxes.recipient, None)
+            .await
+            .expect("the recipient reads its own mailbox");
+        assert_eq!(page.items.len(), 1, "stored once");
+        assert_eq!(page.items[0].envelope, envelope);
+
+        "a delivery answered twice that the mailbox did not finish is sent twice, never a third time, comes back to the caller as that answer, and is stored once".to_owned()
     })
     .await;
 }
