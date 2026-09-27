@@ -186,7 +186,7 @@ fn quoted(path: &Path) -> Result<String> {
 ///
 /// # Errors
 ///
-/// Returns whatever [`prepare`] would have refused the invocation for.
+/// Returns whatever `prepare` would have refused the invocation for.
 #[cfg(any(test, feature = "git-fixtures"))]
 pub fn profile_text(confinement: &Confinement) -> Result<String> {
     Ok(prepare(confinement)?.profile)

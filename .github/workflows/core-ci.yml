@@ -134,8 +134,8 @@ jobs:
             -p kr-crypto -p kr-delivery -p kr-describe -p kr-describe-model -p kr-e2e-agents \
             -p kr-e2e-m1b -p kr-flush -p kr-hook -p kr-ipc -p kr-pairing -p kr-perf \
             -p kr-plugin-catalogue -p kr-plugin-host -p kr-plugin-runtime -p kr-plugin-sdk \
-            -p kr-plugin-service -p kr-privacy-integration -p kr-protocol -p kr-shell-integration \
-            -p kr-sync-integration -p kr-transport -p kr-worker
+            -p kr-plugin-service -p kr-privacy-integration -p kr-project -p kr-protocol \
+            -p kr-shell-integration -p kr-sync-integration -p kr-transport -p kr-worker
           cargo doc --locked --no-deps -p kr-client --no-default-features
 
       # The project service encloses every Git invocation in a boundary the kernel applies, and what
