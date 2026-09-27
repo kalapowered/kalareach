@@ -161,6 +161,12 @@ struct Guards {
     changed: std::sync::Mutex<Option<String>>,
     /// Whether the watcher still reads them.
     watching: std::sync::atomic::AtomicBool,
+    /// Whether what the part started has been ended on a change, which happens once.
+    tripped: std::sync::atomic::AtomicBool,
+    /// The process groups of the probes that run, each its own group, ended at a change.
+    probes: std::sync::Mutex<Vec<i32>>,
+    /// The agent's processes and its server's, as each launch found them, ended at a change.
+    agents: std::sync::Mutex<Vec<ProcessStartIdentity>>,
 }
 
 impl Guards {
@@ -194,23 +200,51 @@ impl Guards {
     fn changed(&self) -> Option<String> {
         self.changed.lock().ok().and_then(|changed| changed.clone())
     }
+
+    /// Records `what` changed and, the first time, ends everything the part started: each probe's
+    /// process group that runs, the agent's processes and its server's, and every process the run
+    /// recorded, its host among them, so the agent does nothing more. Nothing here waits on the
+    /// provenance sampler.
+    fn trip(&self, what: String, run: &Run) {
+        if let Ok(mut changed) = self.changed.lock() {
+            changed.get_or_insert(what);
+        }
+        if self.tripped.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        let groups = self
+            .probes
+            .lock()
+            .map(|groups| groups.clone())
+            .unwrap_or_default();
+        for group in groups {
+            if let Some(group) = rustix::process::Pid::from_raw(group) {
+                let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+            }
+        }
+        let agents = self
+            .agents
+            .lock()
+            .map(|agents| agents.clone())
+            .unwrap_or_default();
+        for identity in &agents {
+            signal(identity, rustix::process::Signal::KILL);
+        }
+        run.end_everything();
+    }
 }
 
 /// How often the watcher reads the files a part watches.
 const GUARD_WATCH: Duration = Duration::from_millis(250);
 
 /// Reads the files the part watches every [`GUARD_WATCH`] while it runs, from a thread of its own,
-/// so a change is seen whatever the part's own steps wait on: at the first change it records what
-/// changed and ends everything the part started, the agent's own processes among them, so the
-/// agent does nothing more; the part then stops on it at its next step, and its outcome says so.
-fn watch_guards(guards: &Guards, provenance: &Provenance, run: &Run, needles: &[&str]) {
+/// so a change is seen whatever the part's own steps wait on: at the first change it ends
+/// everything the part started ([`Guards::trip`]); the part then stops on it at its next step,
+/// and its outcome says so.
+fn watch_guards(guards: &Guards, run: &Run, needles: &[&str]) {
     while guards.watching.load(std::sync::atomic::Ordering::SeqCst) {
         if let Some(what) = guards.change(needles) {
-            if let Ok(mut changed) = guards.changed.lock() {
-                changed.get_or_insert(what);
-            }
-            hand_over(provenance, run);
-            run.end_everything();
+            guards.trip(what, run);
             return;
         }
         std::thread::sleep(GUARD_WATCH);
@@ -259,9 +293,8 @@ fn guards_hold(stage: &Stage<'_, '_>) {
     }
     let root = stage.run.root().display().to_string();
     if let Some(what) = guards.change(&[stage.mark, root.as_str()]) {
-        if let Ok(mut changed) = guards.changed.lock() {
-            changed.get_or_insert(what.clone());
-        }
+        // Whichever look sees a change first ends what the part started, before the part stops.
+        guards.trip(what.clone(), stage.run);
         panic!("{GUARD_CHANGED} {what}");
     }
 }
@@ -432,6 +465,9 @@ fn staged(
             read_at: std::sync::Mutex::new(None),
             changed: std::sync::Mutex::new(None),
             watching: std::sync::atomic::AtomicBool::new(false),
+            tripped: std::sync::atomic::AtomicBool::new(false),
+            probes: std::sync::Mutex::new(Vec::new()),
+            agents: std::sync::Mutex::new(Vec::new()),
         });
     let run = Run::start(&format!("part {part}"));
     let root = run.root().to_path_buf();
@@ -623,7 +659,8 @@ fn staged(
     let mut stop = watched_stop;
     if let Some(what) = &guard_change {
         stop.push(format!(
-            "{GUARD_CHANGED} {what}; everything the part started was ended when it was seen"
+            "{GUARD_CHANGED} {what}; the probe that ran, the agent's processes and everything the \
+             run recorded were ended when it was seen"
         ));
     }
     if let Err(left) = &writers {
@@ -904,7 +941,7 @@ fn run_part(
                 .watching
                 .store(true, std::sync::atomic::Ordering::SeqCst);
             let root_text = root_text.as_str();
-            scope.spawn(move || watch_guards(guards, provenance, run, &[mark, root_text]));
+            scope.spawn(move || watch_guards(guards, run, &[mark, root_text]));
         }
         let ending = {
             let _watching = StopWatching(guards);
@@ -1083,6 +1120,7 @@ fn start_agent_as(
             &Expected::pinned(stage.build),
             &|| guards_hold(stage),
         );
+        register_for_guards(stage, &processes);
         // The line that says it listens can come before the server answers requests.
         let listening = std::time::Instant::now();
         while !serves(port, server.health.as_deref()) {
@@ -1117,11 +1155,19 @@ fn start_agent_as(
         &Expected::pinned(stage.build),
         &|| guards_hold(stage),
     );
+    register_for_guards(stage, &processes);
     Agent {
         session,
         processes,
         server,
         port,
+    }
+}
+
+/// Gives the watcher of the person's files the processes a launch found, which it ends at a change.
+fn register_for_guards(stage: &Stage<'_, '_>, processes: &[AgentProcess]) {
+    if let Some(mut agents) = stage.guards.and_then(|guards| guards.agents.lock().ok()) {
+        agents.extend(processes.iter().map(|process| process.identity.clone()));
     }
 }
 
@@ -1837,7 +1883,7 @@ fn login_holds(stage: &Stage<'_, '_>, variables: &[(String, String)]) {
             )
             .current_dir(stage.run.work())
             .stdin(std::process::Stdio::null());
-        let output = output_within(command, LIVENESS)?;
+        let output = probe_output(stage, command)?;
         let accepted = match &probe.accepted {
             Some(block) => Some(
                 std::fs::read_to_string(login.person_home.join(&block.file))
@@ -1923,6 +1969,75 @@ fn login_holds(stage: &Stage<'_, '_>, variables: &[(String, String)]) {
     }
     // The probes may not have changed anything of the person's either.
     guards_hold(stage);
+}
+
+/// Runs one probe in a process group of its own, which a change to the person's files ends at once
+/// ([`Guards::trip`]) and which is ended whole once the probe returns, and returns its output. Where
+/// it does not end within [`LIVENESS`], its group is ended and that is the answer.
+fn probe_output(
+    stage: &Stage<'_, '_>,
+    mut command: std::process::Command,
+) -> Result<std::process::Output, String> {
+    use std::io::Read;
+    use std::os::unix::process::CommandExt;
+    command
+        .process_group(0)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("could not start: {error}"))?;
+    let group = i32::try_from(child.id()).map_err(|_| "a process number too large".to_owned())?;
+    if let Some(mut probes) = stage.guards.and_then(|guards| guards.probes.lock().ok()) {
+        probes.push(group);
+    }
+    let read = |pipe: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut bytes);
+            }
+            bytes
+        })
+    };
+    let stdout = read(
+        child
+            .stdout
+            .take()
+            .map(|pipe| Box::new(pipe) as Box<dyn Read + Send>),
+    );
+    let stderr = read(
+        child
+            .stderr
+            .take()
+            .map(|pipe| Box::new(pipe) as Box<dyn Read + Send>),
+    );
+    let started = std::time::Instant::now();
+    let ended = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) if started.elapsed() < LIVENESS => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Ok(None) => break Err(format!("it did not finish within {LIVENESS:?}")),
+            Err(error) => break Err(format!("it could not be waited for: {error}")),
+        }
+    };
+    // The group goes whole, whatever became of the probe: nothing it started outlives it.
+    if let Some(pid) = rustix::process::Pid::from_raw(group) {
+        let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+    }
+    let _ = child.wait();
+    if let Some(mut probes) = stage.guards.and_then(|guards| guards.probes.lock().ok()) {
+        probes.retain(|running| *running != group);
+    }
+    let status = ended?;
+    Ok(std::process::Output {
+        status,
+        stdout: stdout.join().unwrap_or_default(),
+        stderr: stderr.join().unwrap_or_default(),
+    })
 }
 
 /// The servers the person's configuration names, where the build list says where: each section
@@ -4507,6 +4622,10 @@ fn a_local_and_a_remote_answer_raced_to_one_approval_resolve_it_once() {
             "the part's command, {} characters, would not fit on one line of the agent's dialog",
             command.len()
         );
+        // From the prompt on the part must refuse nothing: a request besides the one it answers,
+        // which a code tool's one call can make, would be one the count of answers could not tell
+        // apart.
+        let refused_before = refusals(stage);
         logged.submit(
             stage,
             &format!(
@@ -4516,11 +4635,13 @@ fn a_local_and_a_remote_answer_raced_to_one_approval_resolve_it_once() {
             "an approval-gated command",
         );
         // Only the model asks for a tool, so the dialog says the vendor answered; it is answered
-        // only when it asks to run the part's command and nothing else. From here on the part must
-        // refuse nothing: a second request, which a code tool's one call can make, would be one
-        // the count of answers could not tell apart.
+        // only when it asks to run the part's command and nothing else.
         let _ = logged.approval_for(stage, &command, "the agent asks for approval");
-        let refused_before = refusals(stage);
+        assert_eq!(
+            refusals(stage),
+            refused_before,
+            "one resolution: the agent asked for something else before the part's command"
+        );
         // The race: the local terminal denies and, at once, the device, which holds the lease,
         // allows. The local key is written to its terminal first; the lease decides.
         logged
