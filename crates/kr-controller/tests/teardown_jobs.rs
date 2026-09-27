@@ -207,7 +207,7 @@ fn a_job_registered_for_another_environment_of_a_tree_goes_with_it() {
 }
 
 /// A job the tree's test did not register is never touched: one registered for another tree stays
-/// registered when this one goes.
+/// registered when this one goes, while this tree's own job goes with it.
 #[test]
 #[cfg_attr(
     target_os = "linux",
@@ -217,13 +217,54 @@ fn a_job_registered_for_another_environment_of_a_tree_goes_with_it() {
 )]
 fn a_job_registered_for_another_tree_is_left_alone() {
     let other = kr_ipc::testing::TempHost::create();
-    let job = register(&other.environment());
+    let theirs = register(&other.environment());
+    let tree = teardown::Tree::create();
+    let ours = register(&tree.environment());
+    assert!(registered(&theirs.0), "{} was registered", theirs.0);
+    assert!(registered(&ours.0), "{} was registered", ours.0);
+
+    drop(tree);
+    assert!(
+        registered(&theirs.0),
+        "{} was taken away by a tree it was not registered for",
+        theirs.0
+    );
+    assert!(
+        !registered(&ours.0),
+        "{} is still registered after the tree it was registered for has gone",
+        ours.0
+    );
+}
+
+/// A user manager that does not answer leaves the tree's units not established as gone, which
+/// fails the test holding the tree, rather than passing for a manager with nothing to remove.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "needs a user service manager for this account (`systemctl --user`), which a hosted CI \
+            runner's account does not have; it runs with --ignored on a Linux host whose account \
+            has one"]
+fn a_manager_that_does_not_answer_leaves_the_trees_units_not_established_as_gone() {
+    let tree = teardown::Tree::create();
+    let job = register(&tree.environment());
     assert!(registered(&job.0), "{} was registered", job.0);
 
-    drop(teardown::Tree::create());
+    // The system's own program that answers nothing and fails, in place of the manager's tool.
+    let left = teardown::remove_units_through(&tree, std::path::Path::new("/bin/false"));
+    assert!(
+        left.iter().any(|what| what.contains("could not be listed")),
+        "a manager that did not answer was counted as one with nothing to remove: {left:?}"
+    );
     assert!(
         registered(&job.0),
-        "{} was taken away by a tree it was not registered for",
+        "{} went although the manager was never asked to remove it",
+        job.0
+    );
+
+    // The manager that answers takes it away with the tree.
+    drop(tree);
+    assert!(
+        !registered(&job.0),
+        "{} is still registered after the tree it was registered for has gone",
         job.0
     );
 }

@@ -186,9 +186,11 @@ impl Drop for Tree {
                  to new ones"
             ));
         }
-        let ended = end_what_the_daemon_started(&tree, launched);
-        unresolved.extend(ended.unresolved);
-        if unresolved.is_empty() && ended.jobs_left.is_empty() {
+        unresolved.extend(end_what_the_daemon_started(&tree.environment(), launched));
+        // Then every job registered for the tree. A worker still inside one did not complete its
+        // own closure, is reported above, and is ended by its service manager as the job goes.
+        let jobs_left = remove_jobs(&tree);
+        if unresolved.is_empty() && jobs_left.is_empty() {
             return;
         }
         // Kept first, so nothing the lines below do can let the tree go.
@@ -199,7 +201,7 @@ impl Drop for Tree {
                 "could not establish that what this test started has ended: {what}"
             ));
         }
-        for job in &ended.jobs_left {
+        for job in &jobs_left {
             say(format_args!(
                 "a job registered for this test is still registered: {job}"
             ));
@@ -210,11 +212,11 @@ impl Drop for Tree {
         ));
         // A job left registered outlives the test, so the test fails; one already failing has
         // said so, and a second panic would end the whole run instead.
-        if !ended.jobs_left.is_empty() && !std::thread::panicking() {
+        if !jobs_left.is_empty() && !std::thread::panicking() {
             panic!(
                 "this test left {} jobs registered with the service manager: {}",
-                ended.jobs_left.len(),
-                ended.jobs_left.join("; ")
+                jobs_left.len(),
+                jobs_left.join("; ")
             );
         }
     }
@@ -271,20 +273,12 @@ impl WorkerSupervisor for Closable {
     }
 }
 
-/// What ending a tree's processes and jobs left behind.
-#[derive(Debug, Default)]
-pub struct Ending {
-    /// What could not be established as ended.
-    pub unresolved: Vec<String>,
-    /// The jobs registered for the tree that are still registered, or that could not be
-    /// established as gone.
-    pub jobs_left: Vec<String>,
-}
-
-/// Ends every process the daemon of `tree` started that is still running, `launched` among them,
-/// and removes every job registered for `tree`, and says what of that it could not establish.
-pub fn end_what_the_daemon_started(tree: &TempHost, launched: Vec<ProcessStartIdentity>) -> Ending {
-    let environment = &tree.environment();
+/// Ends every process the daemon of `environment` started that is still running, `launched` among
+/// them, and returns what it could not establish as ended.
+pub fn end_what_the_daemon_started(
+    environment: &EnvironmentPaths,
+    launched: Vec<ProcessStartIdentity>,
+) -> Vec<String> {
     let mut unresolved = Vec::new();
 
     // What was started. A launch recorded as under way records its process within moments, so the
@@ -340,14 +334,8 @@ pub fn end_what_the_daemon_started(tree: &TempHost, launched: Vec<ProcessStartId
         wait_for_the_end(&mut started, closure);
     }
 
-    // The jobs registered for the tree go next. A worker still inside one did not complete its own
-    // closure, is reported below, and is ended by its service manager as the job goes.
-    let jobs_left = remove_jobs(tree);
     if started.is_empty() {
-        return Ending {
-            unresolved,
-            jobs_left,
-        };
+        return unresolved;
     }
 
     // What is still running did not complete its own closure. A signal goes only to this test
@@ -386,10 +374,7 @@ pub fn end_what_the_daemon_started(tree: &TempHost, launched: Vec<ProcessStartId
                 .map(|(_, what)| format!("{what} was signalled and has not ended")),
         );
     }
-    Ending {
-        unresolved,
-        jobs_left,
-    }
+    unresolved
 }
 
 /// Waits at most `bound` for the kernel to say that each process has ended, and keeps the ones it
@@ -654,14 +639,29 @@ fn finish_bounded(command: &mut Command) -> Result<(ExitStatus, String), String>
         .stderr(Stdio::null())
         .spawn()
         .map_err(|error| format!("{command:?} could not be started: {error}"))?;
+    // What it prints is read while it runs: a tool that fills its pipe waits for a reader before it
+    // can end, and one read only afterwards would be reported as not finishing. A tool ended below
+    // closes its pipe, which ends the reading as well.
+    let printed = child.stdout.take().map(|mut stdout| {
+        let (read, printed) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut text = String::new();
+            let _ = std::io::Read::read_to_string(&mut stdout, &mut text);
+            let _ = read.send(text);
+        });
+        printed
+    });
     let deadline = Instant::now() + TOOL_BOUND;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                let mut printed = String::new();
-                if let Some(mut stdout) = child.stdout.take() {
-                    let _ = std::io::Read::read_to_string(&mut stdout, &mut printed);
-                }
+                // Read to its end once the pipe closes, which is when the tool ends unless
+                // something it started still holds the pipe; that is waited for until the bound,
+                // or for [`PATIENCE`] where less of it is left.
+                let left = deadline.saturating_duration_since(Instant::now());
+                let printed = printed
+                    .and_then(|printed| printed.recv_timeout(left.max(PATIENCE)).ok())
+                    .unwrap_or_default();
                 return Ok((status, printed));
             }
             Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
@@ -810,22 +810,40 @@ const JOB_LABEL_PATTERNS: [&str; 2] = ["kr-worker-*.service", "kr-plugin-host-*.
 /// Stops every systemd user unit with a label this host gives a job whose working directory is
 /// inside `tree`, clears what the manager keeps of it, and returns each unit that is still loaded
 /// afterwards or that could not be established as gone.
+#[cfg(target_os = "linux")]
+fn remove_jobs(tree: &TempHost) -> Vec<String> {
+    remove_units_through(tree, std::path::Path::new("systemctl"))
+}
+
+/// Does what [`remove_jobs`] does, asking the user manager through `systemctl`, and returns each
+/// unit still loaded afterwards and each question the manager did not answer.
 ///
 /// A transient unit is collected once its process has ended, but one whose process is still
 /// running outlives the test and the tree its program was in. A unit is this tree's when the
 /// directory it runs in is inside the tree, which the host sets for every job it starts; a unit
-/// that runs anywhere else is never touched. A host with no user service manager has no unit to
-/// remove.
+/// that runs anywhere else is never touched. An account with no user manager running has no unit
+/// to remove, and that is read from where every user manager listens, its private socket in the
+/// runtime directory, rather than from a question that fails: a manager that is there and does not
+/// answer leaves every unit it may hold not established as gone.
 #[cfg(target_os = "linux")]
-fn remove_jobs(tree: &TempHost) -> Vec<String> {
+pub fn remove_units_through(tree: &TempHost, systemctl: &std::path::Path) -> Vec<String> {
     let mut left = Vec::new();
-    if !run_bounded(systemctl().args(["show", "--property=Version", "--value"]))
-        .is_ok_and(|status| status.success())
+    let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") else {
+        return left;
+    };
+    if !std::path::Path::new(&runtime)
+        .join("systemd/private")
+        .exists()
     {
         return left;
     }
+    let manager = || {
+        let mut command = Command::new(systemctl);
+        command.arg("--user");
+        command
+    };
     let listed = match run_bounded_output(
-        systemctl()
+        manager()
             .args([
                 "list-units",
                 "--all",
@@ -851,7 +869,7 @@ fn remove_jobs(tree: &TempHost) -> Vec<String> {
         return left;
     }
     let shown = match run_bounded_output(
-        systemctl()
+        manager()
             .args(["show", "--property=Id,WorkingDirectory"])
             .args(&units),
     ) {
@@ -890,9 +908,9 @@ fn remove_jobs(tree: &TempHost) -> Vec<String> {
         }
         // Stopping the unit ends the process in it, which the manager does as its parent, and a
         // unit that failed is kept listed until it is reset.
-        let stopped = run_bounded(systemctl().args(["stop", unit]));
-        let reset = run_bounded(systemctl().args(["reset-failed", unit]));
-        match unit_gone(unit) {
+        let stopped = run_bounded(manager().args(["stop", unit]));
+        let reset = run_bounded(manager().args(["reset-failed", unit]));
+        match unit_gone(&manager, unit) {
             Ok(true) => {}
             Ok(false) => left.push(format!(
                 "the systemd unit {unit} is still loaded after it was stopped ({stopped:?}) and \
@@ -904,26 +922,14 @@ fn remove_jobs(tree: &TempHost) -> Vec<String> {
     left
 }
 
-/// A command put to this user's service manager.
+/// Whether the user manager `manager` asks no longer has `unit`, given at most [`PATIENCE`] to
+/// collect it, or why that could not be established.
 #[cfg(target_os = "linux")]
-fn systemctl() -> Command {
-    let mut command = Command::new("systemctl");
-    command.arg("--user");
-    command
-}
-
-/// Whether this user's service manager no longer has `unit`, given at most [`PATIENCE`] to collect
-/// it, or why that could not be established.
-#[cfg(target_os = "linux")]
-fn unit_gone(unit: &str) -> Result<bool, String> {
+fn unit_gone(manager: &dyn Fn() -> Command, unit: &str) -> Result<bool, String> {
     let deadline = Instant::now() + PATIENCE;
     loop {
-        let state = run_bounded_output(systemctl().args([
-            "show",
-            "--property=LoadState",
-            "--value",
-            unit,
-        ]))?;
+        let state =
+            run_bounded_output(manager().args(["show", "--property=LoadState", "--value", unit]))?;
         if state.trim() == "not-found" {
             return Ok(true);
         }
