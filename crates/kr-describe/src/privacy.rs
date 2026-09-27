@@ -299,8 +299,9 @@ impl InFlight {
 /// A cancellation made through this handle is a caller's, and it outlasts anything the service
 /// decides for reasons of its own: a job a caller cancelled is never queued again, not even one a
 /// pause had already stopped. The service closes the handle at the moment it decides what a job
-/// that did not finish comes to ([`Self::close`]), so a cancellation either arrives first and is
-/// honoured, or arrives after and finds nothing running.
+/// that did not finish comes to, so a cancellation either arrives first and is honoured, or
+/// arrives after and finds nothing running. Only the service starts, finishes and closes a job
+/// here, and the job's token never leaves it: this handle is the one way to cancel from outside.
 #[derive(Clone, Debug, Default)]
 pub struct RunningJob {
     held: Arc<Mutex<Option<Running>>>,
@@ -324,7 +325,7 @@ impl RunningJob {
 
     /// Records that a session's job has started, and returns its cancellation token.
     #[must_use]
-    pub fn started(&self, session_id: SessionId) -> Cancellation {
+    pub(crate) fn started(&self, session_id: SessionId) -> Cancellation {
         let cancellation = Cancellation::new();
         if let Ok(mut held) = self.held.lock() {
             *held = Some(Running {
@@ -337,7 +338,7 @@ impl RunningJob {
     }
 
     /// Records that the running job has finished.
-    pub fn finished(&self) {
+    pub(crate) fn finished(&self) {
         if let Ok(mut held) = self.held.lock() {
             *held = None;
         }
@@ -350,20 +351,6 @@ impl RunningJob {
             held.as_ref()
                 .is_some_and(|running| running.session_id == *session_id)
         })
-    }
-
-    /// Returns the cancellation token for the running job when it is this session's.
-    #[must_use]
-    pub fn cancellation(&self, session_id: &SessionId) -> Option<Cancellation> {
-        let Ok(held) = self.held.lock() else {
-            return None;
-        };
-        match held.as_ref() {
-            Some(running) if running.session_id == *session_id => {
-                Some(running.cancellation.clone())
-            }
-            _ => None,
-        }
     }
 
     /// Cancels the running job when it is this session's, and says whether it stopped one.
@@ -389,7 +376,7 @@ impl RunningJob {
     /// The service calls this when it decides what a job that did not finish comes to. From then on
     /// a cancellation finds nothing running and says so, so no caller is told it stopped a job that
     /// is then queued again.
-    pub fn close(&self, session_id: &SessionId) -> bool {
+    pub(crate) fn close(&self, session_id: &SessionId) -> bool {
         let mut held = self
             .held
             .lock()

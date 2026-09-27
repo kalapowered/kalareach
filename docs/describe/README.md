@@ -313,9 +313,11 @@ pause keeps its place in the queue. A cancellation and a passed deadline publish
 A process that exits, breaks the wire or is ended for breaking a bound takes the model with it and
 nothing else. The store, the pins, the provenance, every session and every deterministic title
 survive. The job it was running is queued again once, with its aging position, and if the next
-process fails it as well it is not retried. A job somebody cancelled is never queued again, even
-when its process ends before the cancellation is answered, and even when a pause had already stopped
-it: a retry would run it under a new token that nobody had cancelled. The moment the service decides
+process fails it as well it is not retried. A job a caller or privacy mode cancelled is never
+queued again, even when its process ends before the cancellation is answered, and even when a pause
+had already stopped it: a retry would run it under a new token that nobody had cancelled. The
+service's handle on the running job is the one way to cancel it from outside, and the job's token
+never leaves the service. The moment the service decides
 what a job that did not finish comes to is the moment a cancellation stops counting, so a
 cancellation that comes first is honoured, and one that comes after finds nothing running and says
 so. The next load waits a second after the first failure,

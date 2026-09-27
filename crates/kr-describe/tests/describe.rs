@@ -529,22 +529,43 @@ fn a_result_that_arrives_past_its_deadline_publishes_nothing() {
     ));
 }
 
-/// A running job exposes its cancellation token and can be cancelled through the shared handle or service.
+/// A running job can be cancelled from another thread through the service's shared handle, which
+/// says which session's job is running; the job's token itself never leaves the service. Once the
+/// job's outcome is complete the handle holds nothing, and a cancellation finds nothing to stop.
 #[test]
-fn a_running_job_can_be_cancelled_from_owning_thread_or_shared_handle() {
-    let running = RunningJob::new();
-    let session_id = session(1);
-    let cancellation = running.started(session_id);
-    assert!(running.is_running(&session_id));
-    assert!(!running.cancellation(&session_id).unwrap().is_cancelled());
-
-    assert!(running.cancel(&session_id));
-    assert!(cancellation.is_cancelled());
-    assert!(running.cancellation(&session_id).unwrap().is_cancelled());
-
-    running.finished();
-    assert!(!running.is_running(&session_id));
-    assert!(running.cancellation(&session_id).is_none());
+fn a_running_job_can_be_cancelled_through_the_shared_handle() {
+    let mut service = service();
+    queue_one(
+        &mut service,
+        &session(1),
+        "kalareach",
+        Priority::Ordinary,
+        at(0),
+    );
+    let (id, _, request) = dispatch_one(&mut service, at(3_000));
+    let running = service.running_job().clone();
+    assert!(running.is_running(&session(1)));
+    assert!(!running.is_running(&session(2)));
+    assert!(
+        !running.cancel(&session(2)),
+        "a session with nothing running has nothing to cancel"
+    );
+    let elsewhere = running.clone();
+    assert!(
+        std::thread::spawn(move || elsewhere.cancel(&session(1)))
+            .join()
+            .expect("the other thread")
+    );
+    assert_eq!(
+        service
+            .finished(id, produced(&request), at(3_200))
+            .expect("the answer"),
+        Outcome::Cancelled {
+            session_id: session(1)
+        }
+    );
+    assert!(!running.is_running(&session(1)));
+    assert!(!running.cancel(&session(1)));
 }
 
 /// KR-PERF-009: the paused case is driven on a host that is otherwise admitting inference.
