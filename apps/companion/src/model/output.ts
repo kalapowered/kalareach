@@ -65,10 +65,14 @@ export function atOldest(window: OutputWindow): boolean {
   return first !== undefined && window.oldest !== null && BigInt(first.from) <= BigInt(window.oldest)
 }
 
-/** Whether the window reaches where the output ended when the host last answered. */
+/**
+ * Whether the window reaches where the output ended when the host last answered. A window that
+ * holds nothing, once the host has said where its output ends, is at that end.
+ */
 export function atEnd(window: OutputWindow): boolean {
   const last = window.pages.at(-1)
-  return last !== undefined && window.end !== null && BigInt(last.next) >= BigInt(window.end)
+  if (last === undefined) return window.end !== null
+  return window.end !== null && BigInt(last.next) >= BigInt(window.end)
 }
 
 /** Records what one answer said about the output as a whole. */

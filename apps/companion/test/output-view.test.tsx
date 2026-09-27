@@ -280,6 +280,11 @@ describe('the retained output (KR-REQ-13.15)', () => {
     await waitFor(() => {
       expect(held()).toEqual([])
     })
+    // With the pages gone the browser puts the scroller back at the top, which is a scroll.
+    act(() => {
+      scrollTo(0, 200)
+    })
+    expect(screen.getByTestId('output-scroll')).toHaveAttribute('data-following', 'true')
     controls.records.appendOutput(SESSION_MAIN, 'written once it had all gone\r\n')
     await waitFor(() => {
       expect(screen.getByTestId('output-scroll').textContent).toContain('written once it had all gone')

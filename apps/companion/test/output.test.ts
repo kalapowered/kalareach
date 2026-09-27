@@ -115,6 +115,11 @@ describe('the window over retained output (KR-REQ-13.15)', () => {
     expect(withNewer(window, page(260, 'c'), { oldest: '100', end: '300', gap: null })).toBe(window)
   })
 
+  it('is at the live end when it holds nothing and the host has said where the output ends', () => {
+    expect(atEnd(emptyOutput())).toBe(false)
+    expect(atEnd({ ...emptyOutput(), end: '300' })).toBe(true)
+  })
+
   it('records where the reader is, and nothing at the live end', () => {
     const window = withNewer(emptyOutput(), page(100, 'a'), answer)
     expect(placed(window, false, { from: '100', offset: 12 }).anchor).toEqual({ from: '100', offset: 12 })
