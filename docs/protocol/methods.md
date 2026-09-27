@@ -27,6 +27,7 @@ links to its document.
 | `delivery.destination.secret.set` | write | `local_ipc` | Keep the credential an external notification destination sends with in this host's secret store, under the destination's identifier. It is never answered back, and it goes when the destination does. | [Delivery: Credentials](../delivery/README.md) |
 | `privacy.set` | write | `local_ipc` | Turn privacy mode on or off for this environment, at the host itself: a paired device reads where it stands and changes nothing about the host. The change is recorded, and the generation advanced, before any subsystem is touched; the answer says where it stands. | [Host: Privacy mode](../host/README.md) |
 | `privacy.status` | read | `local_ipc`, `paired_device` | Where privacy mode stands: its generation, whether its last change has taken effect, what each session still owes, what is kept and what had already left this host. | [Host: Privacy mode](../host/README.md) |
+| `host.update.handover` | write | `local_ipc` | Make way for another installed release: close this control daemon's gate to new sessions, let the creates it started settle, say how it was started, and stop when told to. No session stops. | [Host updates: The handover](../host/updates.md) |
 
 ## Pairing
 

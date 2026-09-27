@@ -390,6 +390,34 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
         );
     }
 
+    // Section 26 ¶4 has a host inventory its live workers before it replaces a control daemon, and
+    // defer the replacement when one of them could not be spoken to; the daemon being replaced
+    // must first stop starting sessions and let the ones it is starting settle, or a worker could
+    // start while it is being inventoried. Section 23 names no method for that, so this build adds
+    // the one step the updating release asks of the running daemon: close its gate, settle, say how
+    // it was started, and stop. It is the owner's act at this machine, like any change to what the
+    // host runs: served on the local socket alone and asking for host management.
+    let updates = [("host.update.handover", EffectClass::Write)];
+    for (name, effect) in updates {
+        let entry = lookup(name).unwrap_or_else(|| panic!("{name} is missing from the registry"));
+        assert_eq!(entry.effect, effect, "{name} carries its own effect class");
+        assert_eq!(
+            entry.group,
+            MethodGroup::HostAndEnvironment,
+            "{name} changes what this host runs"
+        );
+        assert_eq!(
+            entry.ingress,
+            &[ActorIngress::LocalIpc],
+            "{name} is the owner's alone"
+        );
+        assert_eq!(
+            entry.required_rights,
+            &[RequiredRight::right(ActionRight::HostManage)],
+            "{name} asks for host management and nothing else"
+        );
+    }
+
     // Section 15 ¶12 requires the provider and the selected context scope to be shown before voice
     // starts, and section 23's voice row names no read that can answer that: `voice.context` names
     // a voice session, and by the time `voice.start` answers, the metered provider session exists.
@@ -547,6 +575,7 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
             + environments.len()
             + delivery.len()
             + privacy.len()
+            + updates.len()
             + policy.len()
             + voice.len()
             + owner.len()

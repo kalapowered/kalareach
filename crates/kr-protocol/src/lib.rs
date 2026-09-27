@@ -72,6 +72,7 @@
 //! | [`hostinfo`] | Host and environment reads, and read-only diagnostics |
 //! | [`privacy`] | Privacy mode: its switch, its report and the generation each worker is told |
 //! | [`worker`] | Worker descriptors, the startup rendezvous, the verify challenge and the generation token |
+//! | [`update`] | Host updates: what a release is, compatibility levels and the control daemon's handover |
 //! | [`schema`] | Deterministic JSON Schema and method-table generation |
 //! | [`vectors`] | The cross-language vectors under `fixtures/service` and `fixtures/push` |
 //! | [`wire`] | Reading a message: byte rules, then its schema, then its type |
@@ -166,6 +167,7 @@ pub mod sharing;
 pub mod skill;
 pub mod sync;
 pub mod transfer;
+pub mod update;
 pub mod vectors;
 pub mod voice;
 pub mod wire;

@@ -421,6 +421,14 @@ methods! {
     doc: "Where privacy mode stands: its generation, whether its last change has taken effect, \
           what each session still owes, what is kept and what had already left this host.";
 
+    HostUpdateHandover = "host.update.handover", HostAndEnvironment,
+    effect: Write, ingress: [LocalIpc], rights: [req(HostManage)], selectors: [Host, Environment],
+    history: NotApplicable, capability: NO_CAPABILITY, freshness: ActionWindow,
+    confirmation: None, idempotency: ACTION,
+    doc: "Make way for another installed release: close this control daemon's gate to new \
+          sessions, let the creates it started settle, say how it was started, and stop when \
+          told to. No session stops.";
+
     // ----- Pairing --------------------------------------------------------------------------
     PairInvite = "pair.invite", Pairing,
     effect: Write, ingress: [LocalIpc], rights: [req(HostManage)], selectors: [Host, Invitation],
