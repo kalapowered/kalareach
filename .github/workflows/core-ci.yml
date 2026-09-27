@@ -122,7 +122,9 @@ jobs:
       # Documentation is built with warnings refused, so a link that resolves to nothing, or to an
       # item its reader cannot see, fails here rather than going unnoticed. These are the crates
       # whose documentation builds without one. The client library is built a second time without
-      # its default features, as a phone builds it.
+      # its default features, as a phone builds it. The macos and windows jobs document the same
+      # crates for their own platforms, whose code this build does not read, so a crate added here
+      # is added to both.
       - name: Documentation without warnings
         if: ${{ !cancelled() }}
         env:
@@ -780,6 +782,24 @@ jobs:
           path: ${{ env.KR_TEST_ARTIFACTS_DIR }}
           if-no-files-found: ignore
 
+      # The rust job's documentation step for this platform's own code: a doc comment on an item
+      # only Windows compiles is read by this build and no other. The crates are that step's. It
+      # comes last because a step that fails here stops every later step that has no condition.
+      - name: Documentation without warnings
+        if: ${{ !cancelled() }}
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: >-
+          cargo doc --locked --no-deps
+          -p companion-platform -p companion-tauri -p kr-attention -p kr-automation
+          -p kr-backup-integration -p kr-cbor -p kr-changeset -p kr-client -p kr-conformance
+          -p kr-crypto -p kr-delivery -p kr-describe -p kr-describe-model -p kr-e2e-agents
+          -p kr-e2e-m1b -p kr-flush -p kr-hook -p kr-ipc -p kr-pairing -p kr-perf
+          -p kr-plugin-catalogue -p kr-plugin-host -p kr-plugin-runtime -p kr-plugin-sdk
+          -p kr-plugin-service -p kr-privacy-integration -p kr-project -p kr-protocol
+          -p kr-shell-integration -p kr-sync-integration -p kr-term -p kr-transfer -p kr-transport
+          -p kr-voice -p kr-worker
+
   shell-packages:
     name: shell-packages
     runs-on: ubuntu-24.04
@@ -1240,6 +1260,24 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 30
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      # The rust job's documentation step for this platform's own code: a doc comment on an item
+      # only macOS compiles is read by this build and no other. The crates are that step's.
+      - name: Documentation without warnings
+        if: ${{ !cancelled() }}
+        timeout-minutes: 9
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: |
+          cargo doc --locked --no-deps \
+            -p companion-platform -p companion-tauri -p kr-attention -p kr-automation \
+            -p kr-backup-integration -p kr-cbor -p kr-changeset -p kr-client -p kr-conformance \
+            -p kr-crypto -p kr-delivery -p kr-describe -p kr-describe-model -p kr-e2e-agents \
+            -p kr-e2e-m1b -p kr-flush -p kr-hook -p kr-ipc -p kr-pairing -p kr-perf \
+            -p kr-plugin-catalogue -p kr-plugin-host -p kr-plugin-runtime -p kr-plugin-sdk \
+            -p kr-plugin-service -p kr-privacy-integration -p kr-project -p kr-protocol \
+            -p kr-shell-integration -p kr-sync-integration -p kr-term -p kr-transfer \
+            -p kr-transport -p kr-voice -p kr-worker
 
       # The workspace's tests, less what this runner cannot run, each left out by name here:
       #
