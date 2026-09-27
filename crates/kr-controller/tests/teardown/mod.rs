@@ -14,15 +14,22 @@
 //! harness before the tree is dropped.
 //!
 //! Nothing is signalled by a number the test does not hold. A worker is asked to close its session
-//! through its own endpoint and ends itself; a launchd job is removed by launchd; and a signal goes
-//! only to a process this test process started and has not collected, whose number nothing else
-//! can be given until it is collected. A worker that none of these reaches is reported, and the
-//! tree is kept rather than removed from under it.
+//! through its own endpoint and ends itself; a job is removed by its service manager; and a signal
+//! goes only to a process this test process started and has not collected, whose number nothing
+//! else can be given until it is collected. A worker that none of these reaches is reported, and
+//! the tree is kept rather than removed from under it.
 //!
 //! What was started is read from two places: what the tree's supervisor launched, and the daemon's
 //! registry, whose launch records hold the process identity of everything it started, whatever
 //! became of the reservation afterwards, and whose worker table holds the workers that reported
 //! themselves ready. The registry is read without writing to it, both in one read transaction.
+//!
+//! Every job registered for the tree goes before the tree does, whoever registered it: a job its
+//! service manager keeps outlives the test, and once the tree is gone it names a program nothing
+//! can find. A launchd job is known by its definition, which is written into the jobs directory of
+//! one of the tree's environments, and a systemd unit by the directory it runs in, which is inside
+//! the tree. A job still registered once the tree has tried to remove it fails the test, and the
+//! tree is kept. A job registered for anything else is never looked at.
 //!
 //! Suites in other crates include this module by its path rather than keep a copy of their own.
 
@@ -179,8 +186,9 @@ impl Drop for Tree {
                  to new ones"
             ));
         }
-        unresolved.extend(end_what_the_daemon_started(&tree.environment(), launched));
-        if unresolved.is_empty() {
+        let ended = end_what_the_daemon_started(&tree, launched);
+        unresolved.extend(ended.unresolved);
+        if unresolved.is_empty() && ended.jobs_left.is_empty() {
             return;
         }
         // Kept first, so nothing the lines below do can let the tree go.
@@ -191,10 +199,24 @@ impl Drop for Tree {
                 "could not establish that what this test started has ended: {what}"
             ));
         }
+        for job in &ended.jobs_left {
+            say(format_args!(
+                "a job registered for this test is still registered: {job}"
+            ));
+        }
         say(format_args!(
             "the host tree has been kept at {}",
             root.display()
         ));
+        // A job left registered outlives the test, so the test fails; one already failing has
+        // said so, and a second panic would end the whole run instead.
+        if !ended.jobs_left.is_empty() && !std::thread::panicking() {
+            panic!(
+                "this test left {} jobs registered with the service manager: {}",
+                ended.jobs_left.len(),
+                ended.jobs_left.join("; ")
+            );
+        }
     }
 }
 
@@ -249,12 +271,20 @@ impl WorkerSupervisor for Closable {
     }
 }
 
-/// Ends every process the daemon of `environment` started that is still running, `launched` among
-/// them, and returns what it could not establish as ended.
-pub fn end_what_the_daemon_started(
-    environment: &EnvironmentPaths,
-    launched: Vec<ProcessStartIdentity>,
-) -> Vec<String> {
+/// What ending a tree's processes and jobs left behind.
+#[derive(Debug, Default)]
+pub struct Ending {
+    /// What could not be established as ended.
+    pub unresolved: Vec<String>,
+    /// The jobs registered for the tree that are still registered, or that could not be
+    /// established as gone.
+    pub jobs_left: Vec<String>,
+}
+
+/// Ends every process the daemon of `tree` started that is still running, `launched` among them,
+/// and removes every job registered for `tree`, and says what of that it could not establish.
+pub fn end_what_the_daemon_started(tree: &TempHost, launched: Vec<ProcessStartIdentity>) -> Ending {
+    let environment = &tree.environment();
     let mut unresolved = Vec::new();
 
     // What was started. A launch recorded as under way records its process within moments, so the
@@ -310,12 +340,14 @@ pub fn end_what_the_daemon_started(
         wait_for_the_end(&mut started, closure);
     }
 
-    // launchd's job definitions go next. A worker still inside one did not complete its own
-    // closure, is reported below, and is ended by launchd as the job goes.
-    #[cfg(target_os = "macos")]
-    unresolved.extend(remove_launchd_jobs(environment));
+    // The jobs registered for the tree go next. A worker still inside one did not complete its own
+    // closure, is reported below, and is ended by its service manager as the job goes.
+    let jobs_left = remove_jobs(tree);
     if started.is_empty() {
-        return unresolved;
+        return Ending {
+            unresolved,
+            jobs_left,
+        };
     }
 
     // What is still running did not complete its own closure. A signal goes only to this test
@@ -354,7 +386,10 @@ pub fn end_what_the_daemon_started(
                 .map(|(_, what)| format!("{what} was signalled and has not ended")),
         );
     }
-    unresolved
+    Ending {
+        unresolved,
+        jobs_left,
+    }
 }
 
 /// Waits at most `bound` for the kernel to say that each process has ended, and keeps the ones it
@@ -678,65 +713,231 @@ fn say(line: std::fmt::Arguments<'_>) {
     let _ = writeln!(std::io::stderr(), "{line}");
 }
 
-/// Removes every launchd job whose definition the daemon wrote into this environment from each of
-/// this user's domains that has it loaded, and says what it could not establish as removed.
+/// Removes every launchd job whose definition is in the jobs directory of one of `tree`'s
+/// environments from each of this user's domains that has it loaded, and returns each job that is
+/// still loaded afterwards or that could not be established as removed.
 ///
 /// A job the daemon bootstrapped can stay loaded after its worker has ended, and a test that starts
-/// its workers through launchd would then leave one behind on every run. The definitions are this
-/// environment's own, each named after its job's label. Removing a job ends the process in it,
-/// which launchd does as the process's parent.
+/// its workers through launchd would then leave one behind on every run. Every environment in the
+/// tree is looked at, not only the one it was created with, and each definition is named after its
+/// job's label. Removing a job ends the process in it, which launchd does as the process's parent.
 #[cfg(target_os = "macos")]
-fn remove_launchd_jobs(environment: &EnvironmentPaths) -> Vec<String> {
-    let mut unresolved = Vec::new();
-    let entries = match std::fs::read_dir(environment.jobs_dir()) {
-        Ok(entries) => entries,
-        // No job was ever defined here.
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return unresolved,
-        Err(error) => {
-            unresolved.push(format!("the job definitions could not be listed: {error}"));
-            return unresolved;
+fn remove_jobs(tree: &TempHost) -> Vec<String> {
+    let mut left = Vec::new();
+    let environments = tree.paths().state_root().join("environments");
+    for environment in listed(&environments, &mut left) {
+        if !environment.is_dir() {
+            continue;
         }
-    };
-    let uid = kr_ipc::paths::current_uid();
-    for entry in entries {
-        let path = match entry {
-            Ok(entry) => entry.path(),
-            Err(error) => {
-                unresolved.push(format!("a job definition could not be read: {error}"));
+        for definition in listed(&environment.join("jobs"), &mut left) {
+            if definition
+                .extension()
+                .is_none_or(|extension| extension != "plist")
+            {
                 continue;
             }
+            let Some(label) = definition.file_stem().and_then(|stem| stem.to_str()) else {
+                left.push(format!("{} names no label", definition.display()));
+                continue;
+            };
+            left.extend(remove_launchd_job(label));
+        }
+    }
+    left
+}
+
+/// Removes the launchd job `label` from each of this user's domains that has it loaded, and says
+/// where it is still loaded afterwards or could not be established as removed.
+#[cfg(target_os = "macos")]
+fn remove_launchd_job(label: &str) -> Vec<String> {
+    let mut left = Vec::new();
+    let uid = kr_ipc::paths::current_uid();
+    for domain in [format!("gui/{uid}"), format!("user/{uid}")] {
+        let target = format!("{domain}/{label}");
+        match loaded(&target) {
+            Ok(false) => continue,
+            Ok(true) => {}
+            Err(error) => {
+                left.push(error);
+                continue;
+            }
+        }
+        let removal = run_bounded(Command::new("/bin/launchctl").arg("bootout").arg(&target));
+        match loaded(&target) {
+            Ok(false) => {}
+            Ok(true) => left.push(format!(
+                "the launchd job {target} is still loaded after its removal ({removal:?})"
+            )),
+            Err(error) => left.push(error),
+        }
+    }
+    left
+}
+
+/// Returns the entries of `directory`, none where it does not exist, and says in `left` what could
+/// not be read: a definition that cannot be listed is a job that cannot be established as removed.
+#[cfg(target_os = "macos")]
+fn listed(directory: &std::path::Path, left: &mut Vec<String>) -> Vec<std::path::PathBuf> {
+    let entries = match std::fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(error) => {
+            left.push(format!(
+                "{} could not be listed: {error}",
+                directory.display()
+            ));
+            return Vec::new();
+        }
+    };
+    let mut paths = Vec::new();
+    for entry in entries {
+        match entry {
+            Ok(entry) => paths.push(entry.path()),
+            Err(error) => left.push(format!(
+                "an entry of {} could not be read: {error}",
+                directory.display()
+            )),
+        }
+    }
+    paths
+}
+
+/// The units this host starts a job as: its labels, `kr-worker-<reservation>` and
+/// `kr-plugin-host-<reservation>`, as systemd names a service.
+#[cfg(target_os = "linux")]
+const JOB_LABEL_PATTERNS: [&str; 2] = ["kr-worker-*.service", "kr-plugin-host-*.service"];
+
+/// Stops every systemd user unit with a label this host gives a job whose working directory is
+/// inside `tree`, clears what the manager keeps of it, and returns each unit that is still loaded
+/// afterwards or that could not be established as gone.
+///
+/// A transient unit is collected once its process has ended, but one whose process is still
+/// running outlives the test and the tree its program was in. A unit is this tree's when the
+/// directory it runs in is inside the tree, which the host sets for every job it starts; a unit
+/// that runs anywhere else is never touched. A host with no user service manager has no unit to
+/// remove.
+#[cfg(target_os = "linux")]
+fn remove_jobs(tree: &TempHost) -> Vec<String> {
+    let mut left = Vec::new();
+    if !run_bounded(systemctl().args(["show", "--property=Version", "--value"]))
+        .is_ok_and(|status| status.success())
+    {
+        return left;
+    }
+    let listed = match run_bounded_output(
+        systemctl()
+            .args([
+                "list-units",
+                "--all",
+                "--plain",
+                "--no-legend",
+                "--type=service",
+            ])
+            .args(JOB_LABEL_PATTERNS),
+    ) {
+        Ok(listed) => listed,
+        Err(error) => {
+            left.push(format!(
+                "the user manager's units could not be listed: {error}"
+            ));
+            return left;
+        }
+    };
+    let units: Vec<&str> = listed
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .collect();
+    if units.is_empty() {
+        return left;
+    }
+    let shown = match run_bounded_output(
+        systemctl()
+            .args(["show", "--property=Id,WorkingDirectory"])
+            .args(&units),
+    ) {
+        Ok(shown) => shown,
+        Err(error) => {
+            left.push(format!(
+                "the user manager's units could not be read: {error}"
+            ));
+            return left;
+        }
+    };
+    // The tree as it was named and as the kernel resolves it, since a daemon may hand a unit
+    // either spelling.
+    let roots: Vec<std::path::PathBuf> = [
+        Some(tree.root().to_path_buf()),
+        tree.root().canonicalize().ok(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    for described in shown.split("\n\n") {
+        let property = |name: &str| {
+            described
+                .lines()
+                .find_map(|line| line.strip_prefix(name)?.strip_prefix('='))
         };
-        if path
-            .extension()
-            .is_none_or(|extension| extension != "plist")
+        let (Some(unit), Some(directory)) = (property("Id"), property("WorkingDirectory")) else {
+            continue;
+        };
+        if directory.is_empty()
+            || !roots
+                .iter()
+                .any(|root| std::path::Path::new(directory).starts_with(root))
         {
             continue;
         }
-        let Some(label) = path.file_stem().and_then(|stem| stem.to_str()) else {
-            unresolved.push(format!("{} names no label", path.display()));
-            continue;
-        };
-        for domain in [format!("gui/{uid}"), format!("user/{uid}")] {
-            let target = format!("{domain}/{label}");
-            match loaded(&target) {
-                Ok(false) => continue,
-                Ok(true) => {}
-                Err(error) => {
-                    unresolved.push(error);
-                    continue;
-                }
-            }
-            let removal = run_bounded(Command::new("/bin/launchctl").arg("bootout").arg(&target));
-            match loaded(&target) {
-                Ok(false) => {}
-                Ok(true) => unresolved.push(format!(
-                    "the launchd job {target} is still loaded after its removal ({removal:?})"
-                )),
-                Err(error) => unresolved.push(error),
-            }
+        // Stopping the unit ends the process in it, which the manager does as its parent, and a
+        // unit that failed is kept listed until it is reset.
+        let stopped = run_bounded(systemctl().args(["stop", unit]));
+        let reset = run_bounded(systemctl().args(["reset-failed", unit]));
+        match unit_gone(unit) {
+            Ok(true) => {}
+            Ok(false) => left.push(format!(
+                "the systemd unit {unit} is still loaded after it was stopped ({stopped:?}) and \
+                 reset ({reset:?})"
+            )),
+            Err(error) => left.push(error),
         }
     }
-    unresolved
+    left
+}
+
+/// A command put to this user's service manager.
+#[cfg(target_os = "linux")]
+fn systemctl() -> Command {
+    let mut command = Command::new("systemctl");
+    command.arg("--user");
+    command
+}
+
+/// Whether this user's service manager no longer has `unit`, given at most [`PATIENCE`] to collect
+/// it, or why that could not be established.
+#[cfg(target_os = "linux")]
+fn unit_gone(unit: &str) -> Result<bool, String> {
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        let state = run_bounded_output(systemctl().args([
+            "show",
+            "--property=LoadState",
+            "--value",
+            unit,
+        ]))?;
+        if state.trim() == "not-found" {
+            return Ok(true);
+        }
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Only launchd and systemd keep a job of this kind, so elsewhere there is nothing to remove.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn remove_jobs(_tree: &TempHost) -> Vec<String> {
+    Vec::new()
 }
 
 /// Whether launchd has `target` loaded: yes, no, or why that could not be established. launchd
