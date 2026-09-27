@@ -67,15 +67,171 @@ pub struct Approval {
     pub deny: String,
 }
 
-/// A command that says whether a login holds without calling a model, and what its output holds
-/// when it does.
+/// A command the agent answers without calling a model, and what its answer must hold and must not
+/// hold: whether its login holds, or that it loads nothing of the person's own.
+///
+/// Where the arguments hold `{stub}`, it is the address of a stub on this machine that stands in for
+/// the vendor's model service: the command sends the agent's first request there, the stub keeps
+/// only the names of the tools the request offers and answers it with an error, and those names,
+/// one per line, are the answer. No model is called and no login is sent.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Status {
-    /// The arguments typed after the command.
+pub struct Probe {
+    /// The arguments typed after the command, before the account's switches.
     pub arguments: Vec<String>,
-    /// Text the output holds, spaces aside, when the login holds.
-    pub shows: String,
+    /// Texts the answer holds, each of them, spaces aside.
+    #[serde(default)]
+    pub shows: Vec<String>,
+    /// Lines the answer holds, each a whole line, with every run of spaces read as one space.
+    #[serde(default)]
+    pub lines: Vec<String>,
+    /// Texts the answer must not hold, compared without regard to case; `{servers}` stands for
+    /// each server the person's configuration names.
+    #[serde(default)]
+    pub lacks: Vec<String>,
+    /// Where the answer is JSON, `lacks` is checked in every string of it but those that begin
+    /// with this: the one block the part accepts holds them.
+    #[serde(default)]
+    pub lacks_outside: Option<String>,
+}
+
+impl Probe {
+    /// Whether the answer `text` holds each of [`Probe::shows`], spaces aside, each of
+    /// [`Probe::lines`] whole, runs of spaces read as one, and none of [`Probe::lacks`], compared
+    /// without regard to case, `{servers}` standing for each of `servers`; where the answer is JSON
+    /// and [`Probe::lacks_outside`] names a block the part accepts, the strings that begin with it
+    /// are not searched. Says only which text was found or missed, never the answer.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first text the answer misses or holds against the probe.
+    pub fn check(&self, text: &str, servers: &[String]) -> Result<(), String> {
+        let squeezed: String = text
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect();
+        for wanted in &self.shows {
+            let wanted: String = wanted
+                .chars()
+                .filter(|character| !character.is_whitespace())
+                .collect();
+            if !squeezed.contains(&wanted) {
+                return Err(format!("it does not say {wanted:?}"));
+            }
+        }
+        let one_spaced = |line: &str| line.split_whitespace().collect::<Vec<_>>().join(" ");
+        let lines: Vec<String> = text.lines().map(one_spaced).collect();
+        for wanted in &self.lines {
+            let wanted = one_spaced(wanted);
+            if !lines.contains(&wanted) {
+                return Err(format!("it has no line {wanted:?}"));
+            }
+        }
+        let lacks: Vec<String> = self
+            .lacks
+            .iter()
+            .flat_map(|lack| {
+                if lack == "{servers}" {
+                    servers.to_vec()
+                } else {
+                    vec![lack.clone()]
+                }
+            })
+            .map(|lack| lack.to_lowercase())
+            .collect();
+        let searched: Vec<String> = match &self.lacks_outside {
+            Some(accepted) => {
+                let value: serde_json::Value = serde_json::from_str(text)
+                    .map_err(|error| format!("its answer is not JSON: {error}"))?;
+                let mut strings = Vec::new();
+                let mut pending = vec![&value];
+                while let Some(value) = pending.pop() {
+                    match value {
+                        serde_json::Value::String(string)
+                            if !string.starts_with(accepted.as_str()) =>
+                        {
+                            strings.push(string.to_lowercase());
+                        }
+                        serde_json::Value::Array(items) => pending.extend(items),
+                        serde_json::Value::Object(members) => pending.extend(members.values()),
+                        _ => {}
+                    }
+                }
+                strings
+            }
+            None => vec![text.to_lowercase()],
+        };
+        for lack in &lacks {
+            if searched.iter().any(|string| string.contains(lack.as_str())) {
+                return Err(format!("it holds {lack:?}"));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Where the person's own configuration names the servers the agent would start, each of which
+/// the part switches off by name: the file, relative to the person's home, the table whose
+/// sections name them, and the words that switch one off, with `{name}` for its name.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServerSwitches {
+    /// The configuration file.
+    pub file: String,
+    /// The table whose sections each name a server.
+    pub table: String,
+    /// The words that switch one server off.
+    pub switch: Vec<String>,
+}
+
+impl ServerSwitches {
+    /// The servers a configuration file's `text` names: each section header `[<table>.<name>...]`,
+    /// the name quoted or bare, once each, in the order they first appear.
+    #[must_use]
+    pub fn names_in(&self, text: &str) -> Vec<String> {
+        let prefix = format!("[{}.", self.table);
+        let mut names = Vec::new();
+        for line in text.lines() {
+            let line = line.trim();
+            let Some(rest) = line.strip_prefix(&prefix) else {
+                continue;
+            };
+            let name: String = if let Some(quoted) = rest.strip_prefix('"') {
+                quoted
+                    .chars()
+                    .take_while(|character| *character != '"')
+                    .collect()
+            } else {
+                rest.chars()
+                    .take_while(|character| {
+                        character.is_ascii_alphanumeric() || "_-".contains(*character)
+                    })
+                    .collect()
+            };
+            if !name.is_empty() && !names.contains(&name) {
+                names.push(name);
+            }
+        }
+        names
+    }
+}
+
+/// Each of `entries`, and where one has `{date}`, one for each of `dates` in its place.
+#[must_use]
+pub fn with_dates(entries: &[String], dates: &[String]) -> Vec<String> {
+    entries
+        .iter()
+        .flat_map(|entry| {
+            if entry.contains("{date}") {
+                dates
+                    .iter()
+                    .map(|date| entry.replace("{date}", date))
+                    .collect()
+            } else {
+                vec![entry.clone()]
+            }
+        })
+        .collect()
 }
 
 /// A directory of the run's own the agent keeps its configuration, history and conversations in,
@@ -117,11 +273,29 @@ pub struct Account {
     /// The command that says whether the login holds, where the agent has one. Where it has none,
     /// a part learns it from whether the agent reaches its composer and from `signed_out`.
     #[serde(default)]
-    pub status: Option<Status>,
-    /// The command that says, without calling a model, that the agent loads no server of the
-    /// person's own, and what its output holds when it loads none.
+    pub status: Option<Probe>,
+    /// The commands that say, without calling a model, that the agent loads nothing of the
+    /// person's own: no server, hook, plugin or skill.
     #[serde(default)]
-    pub isolated: Option<Status>,
+    pub isolated: Vec<Probe>,
+    /// Switches the agent's configuration is given in these parts, after its arguments, and on
+    /// every probe: `{work}` is the working directory.
+    #[serde(default)]
+    pub switches: Vec<String>,
+    /// Where the person's configuration names servers, each of which is switched off by name.
+    #[serde(default)]
+    pub server_switches: Option<ServerSwitches>,
+    /// Files of the person's home the agent's own use may change, such as a login it refreshes:
+    /// whether each changed is recorded, and nothing stops on it.
+    #[serde(default)]
+    pub recorded: Vec<String>,
+    /// Files of the person's home the agent appends lines to, from which the lines holding the
+    /// part's mark are removed after it, and listed.
+    #[serde(default)]
+    pub line_files: Vec<String>,
+    /// The key that queues a prompt behind a running turn, where it is not the submit key.
+    #[serde(default)]
+    pub queue_key: Option<String>,
     /// Files that would load the person's own settings, hooks or servers into the agent, none of
     /// which may exist before it starts: `{config}` names the configuration directory of the run's
     /// own and `{work}` the working directory.
@@ -154,7 +328,9 @@ pub struct Account {
     /// The most turns the budget allows.
     pub turns: u64,
     /// The agent's own directories in the person's home, relative to it, listed before and after
-    /// each part that runs there.
+    /// each part that runs there. `{date}` is a local date as [`Account::conversations`] says. One
+    /// that ends in `/*` is listed for the files directly in it, not for what its directories
+    /// hold, which the list names on their own where a part writes there.
     #[serde(default)]
     pub directories: Vec<String>,
     /// Whether the agent stops at the first part after which a file it had in those directories
@@ -162,7 +338,9 @@ pub struct Account {
     #[serde(default)]
     pub stop_on_rewrite: bool,
     /// Where the agent keeps its conversations, relative to its configuration directory where it
-    /// has one, and to the home it runs with otherwise.
+    /// has one, and to the home it runs with otherwise. `{date}` is a local date as `YYYY/MM/DD`:
+    /// the day the part starts, and the next, since a session started after midnight files under
+    /// the day it starts.
     pub conversations: String,
     /// What marks the line of a conversation file that holds a prompt the person sent.
     pub prompt_line: String,
@@ -171,7 +349,8 @@ pub struct Account {
     /// Inputs typed first, each waited on by its screen text, to reach the composer.
     #[serde(default)]
     pub prepare: Vec<Keys>,
-    /// Text the screen shows while the composer waits for a prompt.
+    /// Text the screen shows while the composer waits for a prompt; an agent that shows it while
+    /// a turn runs too is taken to wait only once [`Account::busy`] is gone.
     pub composer: String,
     /// What submits a prompt typed in the composer.
     pub submit: String,
@@ -179,20 +358,36 @@ pub struct Account {
     pub clear: String,
     /// What marks the line of a conversation file that holds one of the agent's replies.
     pub reply_line: String,
-    /// Text the agent's screen shows at the start of each of its replies.
-    pub reply_mark: String,
+    /// Text the agent's screen shows at the start of each of its replies, and nowhere else, where
+    /// it has such a mark. Where it has none, a part that must see a reply begin asks for one
+    /// that begins with the part's code in upper case, which only the model writes.
+    #[serde(default)]
+    pub reply_mark: Option<String>,
     /// What marks the line of a conversation file that records the answer to a tool approval:
     /// the command's result, or its refusal.
     pub decision_line: String,
+    /// What marks the line of a conversation file that records a tool call that asks for approval,
+    /// where only some calls do: each of these texts marks one. Then only the lines
+    /// [`Account::decision_line`] marks that answer such a call, tied to it by the call's
+    /// identifier (its `call_id`), count as answers; where the list is empty, every one does.
+    #[serde(default)]
+    pub decision_calls: Vec<String>,
     /// What marks the line of a conversation file that records a prompt queued behind a running
     /// turn, where the agent writes one.
     #[serde(default)]
     pub queued_line: Option<String>,
-    /// Text the screen shows while a turn runs.
+    /// What marks the line of a conversation file that starts a turn, where the agent writes one:
+    /// a prompt that waited for a turn starts one of its own, and a prompt that steered one joins
+    /// it without another starting.
+    #[serde(default)]
+    pub turn_line: Option<String>,
+    /// Text the screen shows while a turn runs. The composer waits for a prompt while the screen
+    /// shows [`Account::composer`] and not this.
     pub busy: String,
     /// A slash command that calls no model and changes no conversation, and the text it shows.
     pub slash: Keys,
-    /// What closes the slash command's screen.
+    /// What closes the slash command's screen; nothing, where it leaves none to close.
+    #[serde(default)]
     pub dismiss: String,
     /// The key that interrupts a running turn, and the text the agent shows once it stopped.
     pub interrupt: Keys,
@@ -459,4 +654,107 @@ pub fn quote(word: &str) -> String {
         return word.to_owned();
     }
     format!("'{}'", word.replace('\'', "'\\''"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn probe(shows: &[&str], lines: &[&str], lacks: &[&str], outside: Option<&str>) -> Probe {
+        let owned = |texts: &[&str]| texts.iter().map(|text| (*text).to_owned()).collect();
+        Probe {
+            arguments: Vec::new(),
+            shows: owned(shows),
+            lines: owned(lines),
+            lacks: owned(lacks),
+            lacks_outside: outside.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn a_probe_needs_each_text_and_whole_line_and_none_of_what_it_must_lack() {
+        let servers = vec!["pushary".to_owned(), "dtt".to_owned()];
+        let answer =
+            "hooks        stable   false\nplugins   stable  false\nLogged in using ChatGPT\n";
+        assert_eq!(
+            probe(
+                &["Logged in using ChatGPT"],
+                &["hooks stable false"],
+                &["{servers}"],
+                None
+            )
+            .check(answer, &servers),
+            Ok(())
+        );
+        assert_eq!(
+            probe(&[], &["hooks stable false"], &[], None).check("my_hooks stable false\n", &[]),
+            Err("it has no line \"hooks stable false\"".to_owned()),
+            "a line is whole, not a line's end"
+        );
+        assert_eq!(
+            probe(&["loggedIn\":true"], &[], &[], None).check("{\"loggedIn\": true}", &[]),
+            Ok(()),
+            "a text is found with spaces aside"
+        );
+        assert_eq!(
+            probe(&[], &[], &["{servers}"], None).check("uses DTT here", &servers),
+            Err("it holds \"dtt\"".to_owned()),
+            "what it must lack is compared without regard to case"
+        );
+    }
+
+    #[test]
+    fn a_json_answer_is_searched_outside_the_one_block_it_accepts() {
+        let servers = vec!["pushary".to_owned()];
+        let accepted = probe(&[], &[], &["{servers}"], Some("# AGENTS.md instructions"));
+        let inside =
+            r##"[{"content":[{"text":"# AGENTS.md instructions ask pushary"},{"text":"cwd"}]}]"##;
+        assert_eq!(accepted.check(inside, &servers), Ok(()));
+        let outside =
+            r##"[{"content":[{"text":"# AGENTS.md instructions"},{"text":"a pushary tool"}]}]"##;
+        assert_eq!(
+            accepted.check(outside, &servers),
+            Err("it holds \"pushary\"".to_owned())
+        );
+        assert!(
+            accepted
+                .check("not json", &servers)
+                .is_err_and(|why| why.starts_with("its answer is not JSON")),
+            "an answer that is not JSON is not taken as lacking anything"
+        );
+    }
+
+    #[test]
+    fn servers_are_named_by_their_section_headers_once_each() {
+        let switches = ServerSwitches {
+            file: ".codex/config.toml".to_owned(),
+            table: "mcp_servers".to_owned(),
+            switch: Vec::new(),
+        };
+        let text = "[mcp_servers.peekaboo]\ncommand = \"x\"\n[mcp_servers.\"with.dot\"]\n[mcp_servers.slack]\n[mcp_servers.slack.env]\n[projects.\"/p\"]\n";
+        assert_eq!(
+            switches.names_in(text),
+            vec![
+                "peekaboo".to_owned(),
+                "with.dot".to_owned(),
+                "slack".to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn a_date_in_a_path_stands_for_each_date() {
+        let dates = vec!["2026/09/27".to_owned(), "2026/09/28".to_owned()];
+        assert_eq!(
+            with_dates(
+                &[".codex/sessions/{date}".to_owned(), ".codex/*".to_owned()],
+                &dates
+            ),
+            vec![
+                ".codex/sessions/2026/09/27".to_owned(),
+                ".codex/sessions/2026/09/28".to_owned(),
+                ".codex/*".to_owned()
+            ]
+        );
+    }
 }

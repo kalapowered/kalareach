@@ -73,6 +73,8 @@ pub mod account;
 #[cfg(unix)]
 pub mod build;
 #[cfg(unix)]
+pub mod conversation;
+#[cfg(unix)]
 pub mod detect;
 #[cfg(unix)]
 pub mod keychain;
@@ -84,6 +86,8 @@ pub mod outcome;
 pub mod provenance;
 #[cfg(unix)]
 pub mod stage;
+#[cfg(unix)]
+pub mod stub;
 
 /// The variable naming the JSON file that describes the build under test.
 pub const BUILD_VARIABLE: &str = "KR_AGENTS_BUILD";
