@@ -418,11 +418,15 @@ main {
     border-color var(--state) ease;
 }
 
-/* The switch stays 34 px wide and is pressable at the platform's minimum. */
+/*
+ * The switch stays 34 px wide and is pressable at the platform's minimum. The press area is placed
+ * against the switch's padding box, which is 32 by 18 px inside its border, so a press anywhere
+ * across a target centred on the switch lands on it.
+ */
 .switch-control::after {
   content: '';
   position: absolute;
-  inset: calc((20px - var(--target)) / 2) calc((34px - var(--target)) / 2);
+  inset: calc((18px - var(--target)) / 2) calc((32px - var(--target)) / 2);
 }
 
 .switch-control[aria-checked='true'] {

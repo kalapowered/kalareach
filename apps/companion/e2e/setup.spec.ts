@@ -219,6 +219,49 @@ test.describe('the first-start assistant', () => {
     await capture(page, 'setup-host-03.28')
   })
 
+  // KR-REQ-13.19: a switch is drawn smaller than a finger, and a press anywhere across a target of
+  // the platform's size around it still lands on it, at the desktop's token and at 44 and 48 px.
+  test('takes a press across the full target around each switch', async ({ page }) => {
+    await openSetup(page)
+    await step(page, 'host')
+    const switches = page.getByRole('switch')
+    await expect(switches.first()).toBeVisible()
+    const shortOf = (size: number): Promise<string[]> =>
+      switches.evaluateAll((controls, target) => {
+        const short: string[] = []
+        for (const control of controls) {
+          control.scrollIntoView({ block: 'center', inline: 'center' })
+          const box = control.getBoundingClientRect()
+          const x = box.left + box.width / 2
+          const y = box.top + box.height / 2
+          const edge = target / 2 - 0.5
+          const points: readonly (readonly [number, number, string])[] = [
+            [x, y - edge, 'top'],
+            [x, y + edge, 'bottom'],
+            [x - edge, y, 'left'],
+            [x + edge, y, 'right']
+          ]
+          for (const [px, py, side] of points) {
+            const hit = document.elementFromPoint(px, py)
+            if (!hit || !control.contains(hit)) {
+              short.push(`${control.getAttribute('aria-label') ?? ''} at its ${side} edge`)
+            }
+          }
+        }
+        return short
+      }, size)
+    const own = await page.evaluate(() =>
+      parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--target'))
+    )
+    expect.soft(await shortOf(own), `the switches at ${own} px`).toEqual([])
+    for (const target of [44, 48]) {
+      await page.evaluate((size) => {
+        document.documentElement.style.setProperty('--target', `${size}px`)
+      }, target)
+      expect.soft(await shortOf(target), `the switches at ${target} px`).toEqual([])
+    }
+  })
+
   test('keeps the path readable on a narrow window', async ({ page }) => {
     await openSetup(page)
     await step(page, 'permissions')
