@@ -1,6 +1,6 @@
 //! Narrowing an answer to what the device's grant admits.
 
-use kr_protocol::envelope::{ControlFrame, Outcome, ParamsValue, Request, Response};
+use kr_protocol::envelope::{ControlFrame, Outcome, ParamsValue, Response};
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::ids::RequestId;
 use kr_protocol::session::SessionListResult;
@@ -199,63 +199,6 @@ impl RemoteConnection {
                 ProtocolError::new(ErrorCode::InvalidArgument, error.to_string()),
             ),
         }
-    }
-
-    /// Narrows a session worker's answer to `question.read` to what this device's grant admits.
-    ///
-    /// A question is session content: what an application asked, the context it gave and the
-    /// answer once there is one. The method table puts it under the grant's history scope for
-    /// current resources: a question the grant names is admitted however early it was asked, and
-    /// any other only when it was asked at or after the moment the grant reaches back to, so a
-    /// grant that retains no history and names no question admits none. A read that named one
-    /// question the scope does not reach is refused, as a change-set version captured before the
-    /// lower bound is, rather than answered as if the question did not exist. An answer that is not
-    /// a question read is refused too: nothing here passes on what it could not narrow.
-    pub(super) fn narrow_questions(&self, request: &Request, answer: ControlFrame) -> ControlFrame {
-        let ControlFrame::Response(Response {
-            request_id,
-            outcome: Outcome::Ok(value),
-        }) = answer
-        else {
-            return answer;
-        };
-        let Ok(read) = value.to_typed::<kr_protocol::question::QuestionReadResult>() else {
-            return failure(
-                request_id,
-                ProtocolError::new(
-                    ErrorCode::ResourceUnavailable,
-                    "the session's worker answered this question read with something else",
-                ),
-            );
-        };
-        let scope = &self.device.grant.history;
-        let admitted = |question: &kr_protocol::question::Question| {
-            scope.named_questions.contains(&question.question_id)
-                || scope
-                    .lower_bound_ms
-                    .0
-                    .is_some_and(|bound| question.created_at_ms.get() >= bound.get())
-        };
-        let named = request
-            .params
-            .to_typed::<kr_protocol::question::QuestionReadParams>()
-            .is_ok_and(|params| params.question_id.is_present());
-        if named && !read.questions.iter().all(admitted) {
-            return failure(
-                request_id,
-                ProtocolError::new(
-                    ErrorCode::PermissionDenied,
-                    "this question was asked before the moment this device's grant reaches back \
-                     to, and the grant does not name it",
-                ),
-            );
-        }
-        encoded(
-            request_id,
-            &kr_protocol::question::QuestionReadResult {
-                questions: read.questions.into_iter().filter(admitted).collect(),
-            },
-        )
     }
 }
 

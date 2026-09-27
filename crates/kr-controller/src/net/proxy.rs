@@ -190,6 +190,12 @@ pub struct WorkerProxy {
     /// worker ends the link a frame it cannot read arrived on. So a worker that did not say so is
     /// sent no scope, and it refuses the reads a scope narrows by itself.
     reads_history_scopes: bool,
+    /// Whether the worker said, in the same answer, that it holds a question read to the scope the
+    /// read carries.
+    ///
+    /// A worker of an earlier build reads a scope and still answers a question read with every
+    /// question it holds, so a question read with a scope goes only to a worker that says this.
+    holds_question_reads: bool,
 }
 
 /// Whom this link owes an answer, and whether it can still give one.
@@ -273,6 +279,8 @@ impl WorkerProxy {
         let (reader, writer, acknowledgement) = client.into_halves();
         let reads_history_scopes =
             kr_protocol::local::reads_history_scopes(&acknowledgement.capabilities);
+        let holds_question_reads =
+            kr_protocol::local::holds_question_reads_to_scopes(&acknowledgement.capabilities);
         let waiters: Arc<std::sync::Mutex<Waiters>> =
             Arc::new(std::sync::Mutex::new(Waiters::default()));
         let reader = tokio::spawn(read_loop(
@@ -290,6 +298,7 @@ impl WorkerProxy {
             reader,
             next_request: AtomicU64::new(1),
             reads_history_scopes,
+            holds_question_reads,
         }))
     }
 
@@ -347,11 +356,14 @@ impl WorkerProxy {
     ///
     /// `history` is the history scope of the grant the read was decided under, which the worker
     /// holds what it retains to. It goes only to a worker that said, in its answer to this link's
-    /// hello, that it reads one.
+    /// hello, that it reads one. A question read with one goes only to a worker that also said it
+    /// holds a question read to it: the worker is the one place its answer is narrowed, and a
+    /// worker that does not would answer with every question it holds.
     ///
     /// # Errors
     ///
-    /// As [`Self::forward_mutation`].
+    /// As [`Self::forward_mutation`], and `UNSUPPORTED_CAPABILITY` for a question read with a
+    /// scope to a worker that does not hold one to it, before anything is sent.
     pub async fn forward_read(
         &self,
         request: &Request,
@@ -359,6 +371,17 @@ impl WorkerProxy {
         authority_deadline_boot_ms: Nullable<U64>,
         history: Option<&HistoryScope>,
     ) -> Result<Response> {
+        if history.is_some()
+            && request.method == Method::QuestionRead.into()
+            && !self.holds_question_reads
+        {
+            return Err(ControllerError::Refused {
+                code: kr_protocol::error::ErrorCode::UnsupportedCapability,
+                detail: "this session's worker is of a build that does not hold a question read \
+                         to the grant it is made under, so it is not asked"
+                    .to_owned(),
+            });
+        }
         let request_id = self.next_request_id();
         let mut forwarded = request.clone();
         forwarded.request_id = request_id;

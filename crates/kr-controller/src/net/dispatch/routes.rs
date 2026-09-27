@@ -68,13 +68,13 @@ pub(super) enum DeviceRead {
     Receipt,
     /// Forwarded to the worker of the session the read names, under this device's envelope and
     /// with its grant's history scope, and answered there by the rules the worker holds a paired
-    /// device's envelope to: the state recovery reads, raw input, and the agent reads. The worker
-    /// holds the two that carry retained content, an agent's snapshot and an approval's record,
-    /// to that scope through section 10's shared filter.
+    /// device's envelope to: the state recovery reads, raw input, the questions and the agent
+    /// reads. The worker holds the three that carry retained content, the questions, an agent's
+    /// snapshot and an approval's record, to that scope through section 10's shared filter, and
+    /// its answer is the device's: this daemon keeps no second filter to disagree with it. A
+    /// question read goes only to a worker that says it holds one to the scope
+    /// ([`super::super::proxy::WorkerProxy::forward_read`]).
     Worker,
-    /// `question.read`: forwarded like [`Self::Worker`], and the answer narrowed to the grant's
-    /// history scope ([`RemoteConnection::narrow_questions`]).
-    Questions,
     /// The automation group's read. A device is shown the workflows that act under the grant it
     /// holds, their runs and receipts, and the budgets and alerts of the chains those runs belong
     /// to; a workflow under another grant is not this device's to see.
@@ -139,8 +139,8 @@ impl DeviceRead {
             | Method::AgentCapabilities
             | Method::AgentSnapshot
             | Method::AgentCommands
-            | Method::AgentApprovalInspect => Self::Worker,
-            Method::QuestionRead => Self::Questions,
+            | Method::AgentApprovalInspect
+            | Method::QuestionRead => Self::Worker,
             Method::WorkflowRead => Self::Workflow,
             Method::VoiceContext | Method::VoicePrepare => Self::Voice,
             Method::PairStatus | Method::OwnerConfirmationPending => Self::Pairing,
@@ -322,10 +322,6 @@ impl RemoteConnection {
                 None => self.proxied_read(request, entry, validated, &decided).await,
             },
             DeviceRead::Worker => self.proxied_read(request, entry, validated, &decided).await,
-            DeviceRead::Questions => {
-                let answer = self.proxied_read(request, entry, validated, &decided).await;
-                self.narrow_questions(request, answer)
-            }
             DeviceRead::Workflow => {
                 self.controller
                     .automation()
