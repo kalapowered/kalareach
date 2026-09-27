@@ -122,18 +122,22 @@ impl PrivacyState {
         self.now().private
     }
 
-    /// Admits one delivery exchange, a send or a question about one, when privacy mode is off.
+    /// Admits one delivery exchange, a send or a question about one, whose work was admitted under
+    /// `admitted_under`: only while privacy mode is off and that generation is the one in force.
     ///
     /// Never while privacy mode is on, whatever any subsystem's own fence says: the state is
     /// published before the delivery outbox is driven, and a fence a store refused is still being
-    /// retried. The admission is held until the exchange ends.
+    /// retried. Never for work of an earlier generation either, even once privacy mode is off
+    /// again: a notice privacy mode drew a line under is not sent, and nothing is asked about it.
+    /// Both are read under the one guard the admission then holds until the exchange ends.
     #[must_use]
-    pub fn admit_send(&self) -> Option<SendAdmission<'_>> {
+    pub fn admit_send(&self, admitted_under: PrivacyGeneration) -> Option<SendAdmission<'_>> {
         let held = self
             .published
             .read()
             .unwrap_or_else(PoisonError::into_inner);
-        (!held.private).then_some(SendAdmission { _held: held })
+        (!held.private && held.generation == admitted_under)
+            .then_some(SendAdmission { _held: held })
     }
 
     /// Returns whether a result produced under `produced_under` may be published.
@@ -337,6 +341,9 @@ struct Inner {
     owed: BTreeMap<Subsystem, Owed>,
     cleanup: Backoff,
     obligations: BTreeMap<SessionId, PrivacyGeneration>,
+    /// Obligations held here whose durable write failed, with the store's reason, until a retry
+    /// writes them.
+    unrecorded: BTreeMap<SessionId, Unavailable>,
     sessions: BTreeMap<SessionId, SessionProgress>,
 }
 
@@ -372,6 +379,7 @@ impl EnvironmentPrivacy {
                 owed: BTreeMap::new(),
                 cleanup: Backoff::default(),
                 obligations,
+                unrecorded: BTreeMap::new(),
                 sessions: BTreeMap::new(),
             }),
             state,
@@ -439,14 +447,17 @@ impl EnvironmentPrivacy {
         );
         owing.sort_unstable();
         owing.dedup();
-        inner.record.enable(generation, &owing, now_ms)?;
+        // The record and the backup fence are one step for backup production: both happen inside
+        // one hold of the backup store, which every backup production decision takes, so none is
+        // decided after the boundary is recorded and before the backup service stops at it. A
+        // record that fails changes nothing there; a fence that fails leaves the readiness guard
+        // withholding production, and the steps below try it again.
+        let record = &mut inner.record;
+        let _raised = self.backup.raise_fence_recorded(generation, now_ms, || {
+            record.enable(generation, &owing, now_ms)
+        })?;
         inner.mode = mode;
         inner.changed_at_ms = now_ms;
-        // Backup production closes before anything here can wait: its fence goes up now, before
-        // the state is published and before the delivery outbox is held for the rest of the
-        // steps. A fence it refuses leaves its readiness guard withholding production instead,
-        // and the steps below try it again.
-        let _raised = self.backup.privacy(now_ms).fence(generation);
         self.state.publish(Published {
             generation,
             private: true,
@@ -519,6 +530,25 @@ impl EnvironmentPrivacy {
     /// is finished. With it off, each release still owed is attempted again.
     pub fn tick(&self, now_ms: TimestampMs) -> Report {
         let mut inner = self.inner();
+        // An obligation held here whose write failed is written again, whatever else is owed.
+        let unrecorded: Vec<SessionId> = inner.unrecorded.keys().copied().collect();
+        for session_id in unrecorded {
+            let Some(generation) = inner.obligations.get(&session_id).copied() else {
+                inner.unrecorded.remove(&session_id);
+                continue;
+            };
+            match inner.record.oblige(session_id, generation, now_ms) {
+                Ok(()) => {
+                    inner.unrecorded.remove(&session_id);
+                }
+                Err(error) => {
+                    inner.unrecorded.insert(
+                        session_id,
+                        Unavailable::new(format!("its obligation could not be recorded: {error}")),
+                    );
+                }
+            }
+        }
         if inner.mode.is_enabled() {
             let due: Vec<Subsystem> = inner
                 .owed
@@ -567,8 +597,16 @@ impl EnvironmentPrivacy {
             answer.generation == generation && answer.enabled && answer.completion.is_complete()
         });
         if enabled && !settled && !inner.obligations.contains_key(&session_id) {
-            inner.record.oblige(session_id, generation, now_ms)?;
+            // Held here first, so a write that fails still keeps the session owed: it counts
+            // against completion and disabling, with the store's reason, until a retry writes it.
             inner.obligations.insert(session_id, generation);
+            if let Err(error) = inner.record.oblige(session_id, generation, now_ms) {
+                inner.unrecorded.insert(
+                    session_id,
+                    Unavailable::new(format!("its obligation could not be recorded: {error}")),
+                );
+                return Err(error);
+            }
         }
         Ok(())
     }
@@ -641,6 +679,7 @@ impl EnvironmentPrivacy {
         if current && completion.is_complete() && inner.obligations.contains_key(&session_id) {
             inner.record.discharge(session_id, generation)?;
             inner.obligations.remove(&session_id);
+            inner.unrecorded.remove(&session_id);
         }
         let progress = inner.sessions.entry(session_id).or_default();
         if progress.reach == Reach::Unknown {
@@ -925,6 +964,9 @@ impl EnvironmentPrivacy {
         for (name, reason) in unavailable {
             owed.push(format!("{name}: {reason}"));
         }
+        for (session_id, reason) in &inner.unrecorded {
+            owed.push(format!("session {session_id}: {reason}"));
+        }
         for (session_id, generation) in &inner.obligations {
             let reach = inner
                 .sessions
@@ -1002,6 +1044,12 @@ impl EnvironmentPrivacy {
     /// Builds the report.
     fn report(&self, inner: &Inner, now_ms: TimestampMs) -> Report {
         let (mut outstanding, mut unavailable) = self.daemon_completion(inner, now_ms).into_parts();
+        for (session_id, reason) in &inner.unrecorded {
+            unavailable.push((
+                "sessions",
+                Unavailable::new(format!("session {session_id}: {reason}")),
+            ));
+        }
         let obligations = obligations(inner);
         for obligation in &obligations {
             match &obligation.standing {
@@ -1199,6 +1247,11 @@ impl Record {
         std::fs::create_dir_all(state_dir).map_err(ControllerError::registry)?;
         let connection =
             Connection::open(state_dir.join(PRIVACY_RECORD)).map_err(ControllerError::registry)?;
+        // Another reader of the record holds it for a moment at most; a write waits that long
+        // rather than refusing the change.
+        connection
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(ControllerError::registry)?;
         // Every change is one transaction, and it is on the disk before the change is reported:
         // a boundary lost to a power failure would be one no restart could see.
         connection
@@ -1821,7 +1874,12 @@ mod tests {
         assert!(report.enabled);
         assert_eq!(report.generation, PrivacyGeneration::new(1));
         assert!(host.privacy.state().is_private());
-        assert!(host.privacy.state().admit_send().is_none());
+        assert!(
+            host.privacy
+                .state()
+                .admit_send(PrivacyGeneration::new(1))
+                .is_none()
+        );
         let (generation, enabled): (i64, i64) = refuse
             .query_row(
                 "SELECT generation, enabled FROM privacy_record WHERE id = 0",
@@ -2134,7 +2192,12 @@ mod tests {
         assert!(!report.enabled);
         assert_eq!(report.generation, PrivacyGeneration::new(2));
         assert!(report.completion.is_complete(), "{:?}", report.completion);
-        assert!(host.privacy.state().admit_send().is_some());
+        assert!(
+            host.privacy
+                .state()
+                .admit_send(PrivacyGeneration::new(2))
+                .is_some()
+        );
         assert_eq!(host.backup.fenced_at().expect("a read"), None);
         assert!(!host.delivery_is_fenced());
         let admitted = host.admit(2).expect("backup production starts again");
@@ -2356,7 +2419,7 @@ mod tests {
     fn a_send_admitted_before_privacy_mode_finishes_first_and_none_is_admitted_after() {
         let state = PrivacyState::default();
         let admission = state
-            .admit_send()
+            .admit_send(PrivacyGeneration::INITIAL)
             .expect("admitted while privacy mode is off");
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         std::thread::scope(|scope| {
@@ -2378,7 +2441,10 @@ mod tests {
                 .recv_timeout(std::time::Duration::from_secs(30))
                 .expect("and goes ahead once it has ended");
         });
-        assert!(state.admit_send().is_none(), "nothing is admitted after");
+        assert!(
+            state.admit_send(PrivacyGeneration::new(1)).is_none(),
+            "nothing is admitted after"
+        );
         assert!(!state.accepts_result(PrivacyGeneration::INITIAL));
     }
 
@@ -2711,7 +2777,10 @@ mod tests {
         assert!(!host.delivery_is_fenced());
         assert_eq!(host.backup.fenced_at().expect("a read"), Some(1));
         assert!(
-            host.privacy.state().admit_send().is_none(),
+            host.privacy
+                .state()
+                .admit_send(PrivacyGeneration::new(1))
+                .is_none(),
             "no delivery exchange is admitted while the fence is retried"
         );
 
@@ -2792,5 +2861,161 @@ mod tests {
             .describe(session(2), &facts, whole, host.privacy.state().now())
             .expect("a read");
         assert_eq!(pinned.title, "Release prep");
+    }
+
+    /// An exchange for work of an earlier generation is not admitted once privacy mode has come
+    /// and gone: a question paused before its admission, across an enabling and a disabling, finds
+    /// the generation it was admitted under is no longer the one in force.
+    #[test]
+    fn an_exchange_for_work_of_an_earlier_generation_is_not_admitted_after_privacy_came_and_went() {
+        let state = PrivacyState::default();
+        let admitted_under = state.now().generation;
+        state.publish(Published {
+            generation: PrivacyGeneration::new(1),
+            private: true,
+        });
+        state.publish(Published {
+            generation: PrivacyGeneration::new(2),
+            private: false,
+        });
+        assert!(
+            state.admit_send(admitted_under).is_none(),
+            "work privacy mode drew a line under is not sent or asked about"
+        );
+        assert!(state.admit_send(PrivacyGeneration::new(2)).is_some());
+        assert!(
+            state.admit_send(PrivacyGeneration::new(3)).is_none(),
+            "nor is work of a generation not yet recorded"
+        );
+    }
+
+    /// An obligation whose write the store refuses is still owed: it keeps the report from saying
+    /// complete and privacy mode from being turned off, with the store's reason, through the
+    /// worker's end, until a retry writes it.
+    #[test]
+    fn an_obligation_the_store_refused_is_still_owed_and_written_on_a_retry() {
+        let host = Host::open();
+        host.privacy
+            .enable(&[], at(0))
+            .expect("privacy mode is enabled");
+        let record = Connection::open(host.root.path().join(PRIVACY_RECORD)).expect("the record");
+        record
+            .execute_batch(
+                "CREATE TRIGGER refuse_the_obligation BEFORE INSERT ON privacy_obligations
+                 BEGIN SELECT RAISE(ABORT, 'this store refused the obligation'); END;",
+            )
+            .expect("the store will refuse the obligation");
+        let refused = host
+            .privacy
+            .note_session_live(session(5), at(10))
+            .expect_err("the obligation could not be written");
+        assert!(
+            refused.to_string().contains("refused the obligation"),
+            "{refused}"
+        );
+        let report = host.privacy.report_now(at(20));
+        assert!(
+            unavailable(&report, "sessions")
+                .iter()
+                .any(|reason| reason.contains("refused the obligation")),
+            "{:?}",
+            report.completion
+        );
+        assert!(
+            host.privacy.disable(at(30)).is_err(),
+            "the session still owes"
+        );
+
+        // Its worker ends before anything is written; the obligation is still owed.
+        host.privacy.note_session_ended(session(5));
+        assert!(!host.privacy.report_now(at(40)).completion.is_complete());
+
+        record
+            .execute_batch("DROP TRIGGER refuse_the_obligation")
+            .expect("the store accepts the obligation");
+        let report = host.privacy.tick(at(50));
+        assert!(
+            unavailable(&report, "sessions")
+                .iter()
+                .all(|reason| !reason.contains("refused the obligation"))
+        );
+        assert_eq!(report.obligations.len(), 1);
+        assert_eq!(report.obligations[0].standing, Standing::WorkerEnded);
+        let written: i64 = record
+            .query_row("SELECT COUNT(*) FROM privacy_obligations", [], |row| {
+                row.get(0)
+            })
+            .expect("a count");
+        assert_eq!(written, 1, "the retry wrote it down");
+    }
+
+    /// The record and the backup fence are one step for backup production. With the record's
+    /// write held back by another reader, an enabling waits inside the backup's own hold, and a
+    /// backup production decision made meanwhile waits too, and then finds the fence up.
+    #[test]
+    fn a_backup_decision_made_while_the_record_is_written_waits_and_finds_the_fence_up() {
+        let host = Host::open();
+        let publication = host.publication_on_the_wire(1);
+        let holder = Connection::open(host.root.path().join(PRIVACY_RECORD)).expect("the record");
+        holder
+            .execute_batch("BEGIN EXCLUSIVE")
+            .expect("the record is held");
+        std::thread::scope(|scope| {
+            let enabling = scope.spawn(|| host.privacy.enable(&[], at(10)));
+            // Wait until the backup store is held: a read of it that does not come back in half a
+            // second is waiting for the enabling, which holds it while its record is held back.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the enabling never held the store"
+                );
+                let (read_tx, read_rx) = std::sync::mpsc::channel();
+                let backup = &host.backup;
+                scope.spawn(move || {
+                    let _ = backup.fenced_at();
+                    let _ = read_tx.send(());
+                });
+                if read_rx
+                    .recv_timeout(std::time::Duration::from_millis(500))
+                    .is_err()
+                {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let (answered_tx, answered_rx) = std::sync::mpsc::channel();
+            let backup = &host.backup;
+            scope.spawn(move || {
+                let answered =
+                    backup.note_published(publication, PrivacyGeneration::INITIAL, at(20));
+                let _ = answered_tx.send(answered);
+            });
+            assert!(
+                answered_rx
+                    .recv_timeout(std::time::Duration::from_millis(300))
+                    .is_err(),
+                "a backup decision waits while the boundary is being recorded"
+            );
+            holder
+                .execute_batch("COMMIT")
+                .expect("the record is let go");
+            let report = enabling
+                .join()
+                .expect("the enabling finishes")
+                .expect("privacy mode is enabled");
+            assert!(report.enabled);
+            let answered = answered_rx
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .expect("the decision is made")
+                .expect("the answer is recorded");
+            assert_eq!(
+                answered,
+                Publication::RetainedArtifact {
+                    privacy_generation: 0
+                },
+                "it was decided after the backup service stopped at the boundary"
+            );
+        });
     }
 }
