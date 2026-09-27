@@ -3764,7 +3764,7 @@ mod tests {
         assert!(
             drop_ins.iter().all(|drop_in| notes[0]
                 .as_str()
-                .is_some_and(|note| note.contains(&drop_in.display().to_string()))),
+                .is_some_and(|note| note.contains(&kr_client::shown::spelled(drop_in)))),
             "{notes}"
         );
     }
