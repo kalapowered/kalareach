@@ -271,6 +271,19 @@ fn line(workspace: &WorkspaceSummary) -> Line {
 mod tests {
     use super::*;
 
+    /// KR-REQ-23.25: planted text in a workspace's lines shows only where the person asked for it:
+    /// its label and its path; a preview's base is said only when it is a revision, and what the
+    /// host says a preview cannot promise as its class and its length.
+    #[test]
+    fn planted_text_in_workspace_lines_shows_only_where_it_was_asked_for() {
+        for workspace in crate::output::planted::planted::<WorkspaceSummary>() {
+            crate::output::planted::only_asked_lines("kr workspace list", &[line(&workspace)]);
+        }
+        for inclusion in crate::output::planted::planted::<InclusionPreview>() {
+            crate::output::planted::only_asked_lines("kr workspace create", &preview(&inclusion));
+        }
+    }
+
     #[test]
     fn a_class_not_named_is_left_out() {
         let named = policy(&[InclusionArgument::DirtyFiles]);

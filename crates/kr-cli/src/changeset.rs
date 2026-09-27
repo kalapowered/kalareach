@@ -270,3 +270,20 @@ fn details(version: &ChangeSetVersionRecord) -> Vec<Line> {
     }
     lines
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// KR-REQ-23.25: planted text in a version's lines shows only where the person asked for it:
+    /// its label and each path; its base is said only when it is a revision, and what the host
+    /// says it cannot promise as its class and its length.
+    #[test]
+    fn planted_text_in_version_lines_shows_only_where_it_was_asked_for() {
+        for version in crate::output::planted::planted::<ChangeSetVersionRecord>() {
+            let mut lines = vec![version_words(&version)];
+            lines.extend(details(&version));
+            crate::output::planted::only_asked_lines("kr changeset show", &lines);
+        }
+    }
+}

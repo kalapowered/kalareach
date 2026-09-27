@@ -520,6 +520,22 @@ fn repo_line(catalogue: &CatalogueSummary) -> Line {
 mod tests {
     use super::*;
 
+    /// KR-REQ-23.25: planted text in a plugin's or a repository's line shows only where the person
+    /// asked for it: the plugin, its version and its repository, and a repository's metadata
+    /// location without user information, a query or a fragment.
+    #[test]
+    fn planted_text_in_plugin_lines_shows_only_where_it_was_asked_for() {
+        for plugin in crate::output::planted::planted::<PluginSummary>() {
+            crate::output::planted::only_asked_lines("kr plugin list", &[line(&plugin)]);
+        }
+        for catalogue in crate::output::planted::planted::<CatalogueSummary>() {
+            crate::output::planted::only_asked_lines(
+                "kr plugin repo list",
+                &[repo_line(&catalogue)],
+            );
+        }
+    }
+
     fn summary(admission: Nullable<PluginAdmission>) -> PluginSummary {
         PluginSummary {
             plugin_id: PluginId::new("kalareach/example-declarative").expect("a package"),

@@ -434,6 +434,24 @@ mod tests {
 
     use super::*;
 
+    /// KR-REQ-23.25: planted text in a change's lines shows only where the person asked for it:
+    /// each path; a digest is said only when it is one, and the host's own account of an apply as
+    /// its class and its length.
+    #[test]
+    fn planted_text_in_diff_lines_shows_only_where_it_was_asked_for() {
+        for entry in crate::output::planted::planted::<DiffEntry>() {
+            crate::output::planted::only_asked_lines("kr diff", &[entry_line(&entry)]);
+        }
+        for applied in crate::output::planted::planted::<DiffApplyResult>() {
+            for revert in [false, true] {
+                crate::output::planted::only_asked_lines(
+                    "kr diff apply",
+                    &outcome(&applied, revert),
+                );
+            }
+        }
+    }
+
     fn version(number: u64) -> VersionRef {
         VersionRef {
             change_set_id: ChangeSetId::new(Uuid::from_bytes([5; 16])),

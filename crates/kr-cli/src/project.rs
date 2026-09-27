@@ -308,6 +308,15 @@ mod tests {
 
     use super::*;
 
+    /// KR-REQ-23.25: planted text in a repository's line shows only where the person asked for it:
+    /// its label and its path.
+    #[test]
+    fn planted_text_in_a_repository_line_shows_only_where_it_was_asked_for() {
+        for project in crate::output::planted::planted::<ProjectSummary>() {
+            crate::output::planted::only_asked_lines("kr project list", &[line(&project)]);
+        }
+    }
+
     fn environment() -> EnvironmentId {
         EnvironmentId::new(Uuid::from_bytes([3; 16]))
     }
