@@ -2057,12 +2057,27 @@ mod windows {
         fn elevated(token: &TokenHandle) -> bool {
             use windows_sys::Win32::Security::{TOKEN_ELEVATION, TokenElevation};
 
-            let buffer = token
-                .information(TokenElevation, std::mem::size_of::<TOKEN_ELEVATION>())
-                .expect("the token's elevation");
-            // SAFETY: the buffer holds a `TOKEN_ELEVATION` the kernel wrote, aligned for it.
-            unsafe { std::ptr::read(buffer.as_ptr().cast::<TOKEN_ELEVATION>()) }.TokenIsElevated
-                != 0
+            // The class has one length, and a buffer of any other is refused as the wrong length,
+            // so it is read into the structure itself rather than into a rounded-up buffer.
+            let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
+            let mut returned: u32 = 0;
+            // SAFETY: the token is open for querying, `elevation` is a live `TOKEN_ELEVATION` of
+            // exactly the length given, and `returned` is a live out parameter.
+            let read = unsafe {
+                GetTokenInformation(
+                    token.0,
+                    TokenElevation,
+                    std::ptr::from_mut(&mut elevation).cast(),
+                    u32::try_from(std::mem::size_of::<TOKEN_ELEVATION>()).unwrap_or(0),
+                    &raw mut returned,
+                )
+            };
+            assert!(
+                read != 0,
+                "the token's elevation: {}",
+                std::io::Error::last_os_error()
+            );
+            elevation.TokenIsElevated != 0
         }
 
         /// KR-REQ-24.01: a process whose new objects are owned by its user, as a shell of Git for
