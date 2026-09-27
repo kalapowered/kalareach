@@ -4198,6 +4198,9 @@ async fn acquire(
 // Ignored by default: this suite starts real processes, and the binary it launches is built by
 // `scripts/end-to-end.sh`, which runs it with `--include-ignored`. A suite that skipped itself
 // silently when that binary was absent would report a pass for something it never ran.
+/// KR-REQ-09.20: a client's reconnect acquires a new input stream identity, and the keystrokes the
+/// old stream carried are never replayed.
+///
 /// KR-REQ-23.22: a live reconnect is a new connection identity with a new input stream, and old
 /// raw input is never replayed. The device types on one connection and loses it. The next
 /// connection has an identity of its own; input under the old connection's attachment and lease is

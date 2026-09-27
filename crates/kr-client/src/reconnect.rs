@@ -150,6 +150,8 @@ mod tests {
 
     /// KR-REQ-23.22: what a client carries across a disconnect reports input the old connection left
     /// unacknowledged as uncertain, and holds no input of its own to send again.
+    ///
+    /// KR-REQ-09.20: a reconnect discards unsent keystrokes and says delivery was uncertain.
     #[test]
     fn unacknowledged_input_is_reported_and_never_resent() {
         let mut lane = InputLane::new(
@@ -170,6 +172,7 @@ mod tests {
         assert!(state.cursors.is_empty());
     }
 
+    /// KR-REQ-09.20: a client shows an interruption only when delivery was uncertain.
     #[test]
     fn a_fully_acknowledged_lane_is_not_an_interruption() {
         let mut lane = InputLane::new(

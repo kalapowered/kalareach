@@ -268,6 +268,9 @@ mod tests {
     /// KR-REQ-23.22: an input lane belongs to one connection. Closing it reports what was left
     /// unacknowledged, and the lane for a new connection is built for that connection alone, with no
     /// position carried across from the old one.
+    ///
+    /// KR-REQ-09.20: a client's input stream is its connection, its lease epoch and an increasing
+    /// sequence, and a reconnect opens a new one that resends nothing.
     #[test]
     fn a_reconnect_starts_a_new_lane_and_replays_nothing() {
         let mut lane = InputLane::new(connection(1), InputLeaseEpoch::new(4));
@@ -287,6 +290,7 @@ mod tests {
         assert_eq!(fresh.lease_epoch(), InputLeaseEpoch::new(5));
     }
 
+    /// KR-REQ-09.20: input the host acknowledged whole leaves nothing uncertain to report.
     #[test]
     fn fully_acknowledged_input_is_not_an_interruption() {
         let mut lane = InputLane::new(connection(1), InputLeaseEpoch::new(1));
@@ -295,6 +299,8 @@ mod tests {
         assert!(!lane.close().delivery_uncertain());
     }
 
+    /// KR-REQ-09.20: the acknowledgement position a client keeps for its connection only moves
+    /// forward.
     #[test]
     fn an_acknowledgement_never_moves_backwards() {
         let mut lane = InputLane::new(connection(1), InputLeaseEpoch::new(1));
