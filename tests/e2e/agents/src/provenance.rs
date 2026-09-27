@@ -492,6 +492,19 @@ impl Provenance {
             .collect()
     }
 
+    /// [`Provenance::identified`], where no look holds the record now; `None` where one does, so a
+    /// caller that may not wait, such as a stop on a guarded change, never waits on a look.
+    #[must_use]
+    pub fn identified_now(&self) -> Option<Vec<ProcessStartIdentity>> {
+        match self.seen.try_lock() {
+            Ok(seen) => Some(seen.identified.keys().cloned().collect()),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                Some(poisoned.into_inner().identified.keys().cloned().collect())
+            }
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        }
+    }
+
     /// Why a look did not find every process beneath the sessions, for the run's closing check to
     /// fail on as well.
     #[must_use]

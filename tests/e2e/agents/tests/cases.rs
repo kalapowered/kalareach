@@ -161,12 +161,20 @@ struct Guards {
     changed: std::sync::Mutex<Option<String>>,
     /// Whether the watcher still reads them.
     watching: std::sync::atomic::AtomicBool,
-    /// Whether what the part started has been ended on a change, which happens once.
-    tripped: std::sync::atomic::AtomicBool,
-    /// The process groups of the probes that run, each its own group, ended at a change.
-    probes: std::sync::Mutex<Vec<i32>>,
+    /// The probes that run and whether a change has stopped the part, under one lock, so a probe
+    /// is either ended by the stop or refused by it, and its group is never signalled once its
+    /// leader has been reaped.
+    registry: std::sync::Mutex<Registry>,
     /// The agent's processes and its server's, as each launch found them, ended at a change.
     agents: std::sync::Mutex<Vec<ProcessStartIdentity>>,
+}
+
+/// The probes a part runs, each by its process group, whose leader stays unreaped while it is
+/// listed, and whether a change has stopped the part.
+#[derive(Default)]
+struct Registry {
+    tripped: bool,
+    probes: Vec<i32>,
 }
 
 impl Guards {
@@ -202,33 +210,48 @@ impl Guards {
     }
 
     /// Records `what` changed and, the first time, ends everything the part started: each probe's
-    /// process group that runs, the agent's processes and its server's, and every process the run
-    /// recorded, its host among them, so the agent does nothing more. Nothing here waits on the
-    /// provenance sampler.
-    fn trip(&self, what: String, run: &Run) {
+    /// process group that runs, under the registry's lock; then, from one reading of the process
+    /// table, every process beneath the run's recorded processes, the agent's and its server's, and
+    /// those the provenance sampler has identified where its record can be read without waiting,
+    /// with those roots themselves, twice, so a child started meanwhile goes too; then everything
+    /// the run recorded, its host among them. Nothing here waits on the sampler.
+    fn trip(&self, what: String, run: &Run, provenance: &Provenance) {
         if let Ok(mut changed) = self.changed.lock() {
             changed.get_or_insert(what);
         }
-        if self.tripped.swap(true, std::sync::atomic::Ordering::SeqCst) {
-            return;
-        }
-        let groups = self
-            .probes
-            .lock()
-            .map(|groups| groups.clone())
-            .unwrap_or_default();
-        for group in groups {
-            if let Some(group) = rustix::process::Pid::from_raw(group) {
-                let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+        {
+            let mut registry = self
+                .registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if registry.tripped {
+                return;
+            }
+            registry.tripped = true;
+            for group in &registry.probes {
+                if let Some(group) = rustix::process::Pid::from_raw(*group) {
+                    let _ =
+                        rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+                }
             }
         }
-        let agents = self
-            .agents
-            .lock()
-            .map(|agents| agents.clone())
-            .unwrap_or_default();
-        for identity in &agents {
-            signal(identity, rustix::process::Signal::KILL);
+        let mut roots: Vec<ProcessStartIdentity> = run
+            .owned()
+            .into_iter()
+            .map(|owned| owned.identity)
+            .collect();
+        roots.extend(
+            self.agents
+                .lock()
+                .map(|agents| agents.clone())
+                .unwrap_or_default(),
+        );
+        roots.extend(provenance.identified_now().unwrap_or_default());
+        for _ in 0..2 {
+            for identity in tree_of(&roots) {
+                signal(&identity, rustix::process::Signal::KILL);
+            }
+            std::thread::sleep(Duration::from_millis(50));
         }
         run.end_everything();
     }
@@ -241,14 +264,43 @@ const GUARD_WATCH: Duration = Duration::from_millis(250);
 /// so a change is seen whatever the part's own steps wait on: at the first change it ends
 /// everything the part started ([`Guards::trip`]); the part then stops on it at its next step,
 /// and its outcome says so.
-fn watch_guards(guards: &Guards, run: &Run, needles: &[&str]) {
+fn watch_guards(guards: &Guards, run: &Run, provenance: &Provenance, needles: &[&str]) {
     while guards.watching.load(std::sync::atomic::Ordering::SeqCst) {
         if let Some(what) = guards.change(needles) {
-            guards.trip(what, run);
+            guards.trip(what, run, provenance);
             return;
         }
         std::thread::sleep(GUARD_WATCH);
     }
+}
+
+/// `roots` and every process beneath them, from one reading of the process table, each by the
+/// start the kernel reports for its number now; a process that ended meanwhile is left out. Where
+/// the table cannot be read, the roots alone.
+fn tree_of(roots: &[ProcessStartIdentity]) -> Vec<ProcessStartIdentity> {
+    let Ok(table) = kr_e2e_m1b::run::process_table() else {
+        return roots.to_vec();
+    };
+    let mut found = roots.to_vec();
+    let mut under: Vec<u32> = roots
+        .iter()
+        .filter_map(|root| u32::try_from(root.pid.get()).ok())
+        .collect();
+    let mut seen = std::collections::BTreeSet::new();
+    while let Some(parent) = under.pop() {
+        for entry in table.iter().filter(|entry| entry.parent == parent) {
+            if !seen.insert(entry.pid) {
+                continue;
+            }
+            if let kr_ipc::identity::ProcessQuery::Present(identity) =
+                kr_ipc::identity::query_process(entry.pid)
+            {
+                found.push(identity);
+            }
+            under.push(entry.pid);
+        }
+    }
+    found
 }
 
 /// Stops the watcher of a part's files when the part's own steps end, however they end.
@@ -294,7 +346,7 @@ fn guards_hold(stage: &Stage<'_, '_>) {
     let root = stage.run.root().display().to_string();
     if let Some(what) = guards.change(&[stage.mark, root.as_str()]) {
         // Whichever look sees a change first ends what the part started, before the part stops.
-        guards.trip(what.clone(), stage.run);
+        guards.trip(what.clone(), stage.run, stage.provenance);
         panic!("{GUARD_CHANGED} {what}");
     }
 }
@@ -465,8 +517,7 @@ fn staged(
             read_at: std::sync::Mutex::new(None),
             changed: std::sync::Mutex::new(None),
             watching: std::sync::atomic::AtomicBool::new(false),
-            tripped: std::sync::atomic::AtomicBool::new(false),
-            probes: std::sync::Mutex::new(Vec::new()),
+            registry: std::sync::Mutex::new(Registry::default()),
             agents: std::sync::Mutex::new(Vec::new()),
         });
     let run = Run::start(&format!("part {part}"));
@@ -659,8 +710,8 @@ fn staged(
     let mut stop = watched_stop;
     if let Some(what) = &guard_change {
         stop.push(format!(
-            "{GUARD_CHANGED} {what}; the probe that ran, the agent's processes and everything the \
-             run recorded were ended when it was seen"
+            "{GUARD_CHANGED} {what}; when it was seen, the part ended the probe that ran, every \
+             process beneath the run's and the agent's processes and those processes themselves"
         ));
     }
     if let Err(left) = &writers {
@@ -941,7 +992,7 @@ fn run_part(
                 .watching
                 .store(true, std::sync::atomic::Ordering::SeqCst);
             let root_text = root_text.as_str();
-            scope.spawn(move || watch_guards(guards, run, &[mark, root_text]));
+            scope.spawn(move || watch_guards(guards, run, provenance, &[mark, root_text]));
         }
         let ending = {
             let _watching = StopWatching(guards);
@@ -1971,9 +2022,13 @@ fn login_holds(stage: &Stage<'_, '_>, variables: &[(String, String)]) {
     guards_hold(stage);
 }
 
-/// Runs one probe in a process group of its own, which a change to the person's files ends at once
-/// ([`Guards::trip`]) and which is ended whole once the probe returns, and returns its output. Where
-/// it does not end within [`LIVENESS`], its group is ended and that is the answer.
+/// Runs one probe in a process group of its own and returns its output. The probe is listed with
+/// the watcher of the person's files while it runs, so a change ends its group at once
+/// ([`Guards::trip`]); one that starts after a change is ended and refused. Its leader is reaped
+/// only once it is off the list, and its group is ended whole first, while the leader's number
+/// still names it, so no signal can reach a group that took that number since. Where it does not
+/// end within [`LIVENESS`], or its output stays open past five seconds after it ended, that is the
+/// answer.
 fn probe_output(
     stage: &Stage<'_, '_>,
     mut command: std::process::Command,
@@ -1989,17 +2044,38 @@ fn probe_output(
         .spawn()
         .map_err(|error| format!("could not start: {error}"))?;
     let group = i32::try_from(child.id()).map_err(|_| "a process number too large".to_owned())?;
-    if let Some(mut probes) = stage.guards.and_then(|guards| guards.probes.lock().ok()) {
-        probes.push(group);
+    let pid = rustix::process::Pid::from_raw(group).ok_or("a process number of zero")?;
+    let end_group = || {
+        let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+    };
+    // Listed, or, after a change, ended at once and refused.
+    let tripped = stage.guards.is_some_and(|guards| {
+        let mut registry = guards
+            .registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if registry.tripped {
+            true
+        } else {
+            registry.probes.push(group);
+            false
+        }
+    });
+    if tripped {
+        end_group();
+        let _ = child.wait();
+        return Err("a file of the person's changed before it could run".to_owned());
     }
     let read = |pipe: Option<Box<dyn Read + Send>>| {
+        let (sent, received) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let mut bytes = Vec::new();
             if let Some(mut pipe) = pipe {
                 let _ = pipe.read_to_end(&mut bytes);
             }
-            bytes
-        })
+            let _ = sent.send(bytes);
+        });
+        received
     };
     let stdout = read(
         child
@@ -2015,8 +2091,15 @@ fn probe_output(
     );
     let started = std::time::Instant::now();
     let ended = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Ok(status),
+        // Whether the leader has ended, read without reaping it, so its number stays its own.
+        let exited = rustix::process::waitid(
+            rustix::process::WaitId::Pid(pid),
+            rustix::process::WaitIdOptions::EXITED
+                | rustix::process::WaitIdOptions::NOHANG
+                | rustix::process::WaitIdOptions::NOWAIT,
+        );
+        match exited {
+            Ok(Some(_)) => break Ok(()),
             Ok(None) if started.elapsed() < LIVENESS => {
                 std::thread::sleep(Duration::from_millis(20));
             }
@@ -2024,19 +2107,33 @@ fn probe_output(
             Err(error) => break Err(format!("it could not be waited for: {error}")),
         }
     };
-    // The group goes whole, whatever became of the probe: nothing it started outlives it.
-    if let Some(pid) = rustix::process::Pid::from_raw(group) {
-        let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+    // The group goes whole while its leader is unreaped, and comes off the list under the same
+    // lock a stop takes; only then is the leader reaped.
+    {
+        let registry = stage.guards.map(|guards| {
+            guards
+                .registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        });
+        end_group();
+        if let Some(mut registry) = registry {
+            registry.probes.retain(|listed| *listed != group);
+        }
     }
-    let _ = child.wait();
-    if let Some(mut probes) = stage.guards.and_then(|guards| guards.probes.lock().ok()) {
-        probes.retain(|running| *running != group);
-    }
-    let status = ended?;
+    let status = child
+        .wait()
+        .map_err(|error| format!("it could not be reaped: {error}"))?;
+    ended?;
+    let collect = |received: std::sync::mpsc::Receiver<Vec<u8>>| {
+        received
+            .recv_timeout(Duration::from_secs(5))
+            .map_err(|_| "it ended and its output stayed open past five seconds".to_owned())
+    };
     Ok(std::process::Output {
         status,
-        stdout: stdout.join().unwrap_or_default(),
-        stderr: stderr.join().unwrap_or_default(),
+        stdout: collect(stdout)?,
+        stderr: collect(stderr)?,
     })
 }
 
