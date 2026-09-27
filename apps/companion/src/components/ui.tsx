@@ -482,7 +482,10 @@ export type SheetPresentation = 'arriving' | 'here' | 'leaving'
  * the pointer; on release a critically damped spring takes over with the velocity the finger had,
  * and it can be caught again mid-flight.
  *
- * With reduced motion it does not travel at all: it cross-fades, and the drag still dismisses it.
+ * With reduced motion nothing moves by itself: it cross-fades in and out. A drag is still the
+ * person's own motion, so the surface follows the finger and back, but it stops dead at its edge
+ * rather than stretching past it, goes back at once when let go short of a dismissal, and fades
+ * where a dismissal leaves it.
  */
 export function Sheet({
   open,
@@ -551,8 +554,9 @@ export function Sheet({
     setAtRest(false)
 
     if (reduced) {
-      // No travel: the surface cross-fades where it is, and is taken away once the fade is over.
-      place(0)
+      // No travel: the surface cross-fades, arriving where it sits and leaving from wherever a
+      // drag left it, and is taken away once the fade is over.
+      if (open) place(0)
       sheet.style.opacity = open ? '1' : '0'
       const handle = setTimeout(() => {
         // A finger that landed during the fade owns the surface now, and the release will say
@@ -687,9 +691,10 @@ export function Sheet({
             tracker.current.add(event.clientY, event.timeStamp)
             const height = sheet.offsetHeight || 1
             const raw = start.offset + (event.clientY - start.pointer)
-            // Upward is past the boundary: it resists rather than stopping. With reduced motion
-            // the surface does not travel at all, and the gesture still decides.
-            if (!reduced) place(raw < 0 ? -rubberband(-raw, height) : raw)
+            // Upward is past the boundary: it resists rather than stopping. With reduced motion it
+            // still follows the finger, which is the person's own motion, and stops at the edge,
+            // since stretching past it is motion of the surface's own.
+            place(raw >= 0 ? raw : reduced ? 0 : -rubberband(-raw, height))
           }}
           onPointerUp={(event) => {
             const start = dragStart.current

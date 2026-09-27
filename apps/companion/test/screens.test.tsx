@@ -969,6 +969,64 @@ describe('the sheet', () => {
     }
   })
 
+  // KR-REQ-13.06: with reduced motion nothing moves by itself, and a drag is still the person's
+  // own motion: the surface follows the finger and back, stops dead at its edge rather than
+  // stretching past it, goes back at once when let go short of a dismissal, and fades where a
+  // dismissal leaves it.
+  it('follows the finger with reduced motion, with nothing springing and nothing past its edge', async () => {
+    vi.stubGlobal('matchMedia', (query: string) => ({
+      matches: query.includes('prefers-reduced-motion'),
+      media: query,
+      onchange: null,
+      addEventListener: () => undefined,
+      removeEventListener: () => undefined,
+      addListener: () => undefined,
+      removeListener: () => undefined,
+      dispatchEvent: () => false
+    }))
+    try {
+      start({ view: 'session', sessionId: SESSION_MAIN, pane: 'semantic' })
+      await userEvent.click(await screen.findByTestId('open-settings'))
+      const sheet = await screen.findByTestId('sheet')
+      await waitFor(() => {
+        expect(sheet).toHaveAttribute('data-presentation', 'here')
+      })
+      const grip = screen.getByTestId('sheet-grip')
+
+      grip.dispatchEvent(gesture('pointerdown', 200, 1_000))
+      grip.dispatchEvent(gesture('pointermove', 290, 1_016))
+      expect(sheet.style.transform).toBe('translate3d(0, 90px, 0)')
+      // Back up during the same drag, and past the edge, where it stops rather than stretching.
+      grip.dispatchEvent(gesture('pointermove', 230, 1_032))
+      expect(sheet.style.transform).toBe('translate3d(0, 30px, 0)')
+      grip.dispatchEvent(gesture('pointermove', 120, 1_048))
+      expect(sheet.style.transform).toBe('translate3d(0, 0px, 0)')
+      // Let go short of a dismissal: back where it sits at once, with nothing to wait for.
+      grip.dispatchEvent(gesture('pointermove', 240, 1_064))
+      grip.dispatchEvent(gesture('pointerup', 240, 1_400))
+      expect(sheet.style.transform).toBe('translate3d(0, 0px, 0)')
+      await waitFor(() => {
+        expect(sheet).toHaveAttribute('data-presentation', 'here')
+      })
+
+      // A dismissal fades the surface where the finger left it.
+      grip.dispatchEvent(gesture('pointerdown', 200, 2_000))
+      grip.dispatchEvent(gesture('pointermove', 260, 2_016))
+      grip.dispatchEvent(gesture('pointermove', 900, 2_032))
+      grip.dispatchEvent(gesture('pointerup', 900, 2_048))
+      await waitFor(() => {
+        expect(sheet).toHaveAttribute('data-presentation', 'leaving')
+      })
+      expect(sheet.style.transform).toBe('translate3d(0, 700px, 0)')
+      expect(sheet.style.opacity).toBe('0')
+      await waitFor(() => {
+        expect(screen.queryByTestId('sheet')).toBeNull()
+      })
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
   it('dismisses on a downward flick', async () => {
     start({ view: 'session', sessionId: SESSION_MAIN, pane: 'semantic' })
     await userEvent.click(await screen.findByTestId('open-settings'))

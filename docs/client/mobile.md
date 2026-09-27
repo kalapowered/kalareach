@@ -181,8 +181,9 @@ no confirmed outcome, and ends by saying that nothing was sent again.
 - Transitions of 120 to 200 ms; navigation does not animate at all, and neither does streamed text
   or a repeated key.
 - A sheet is dragged one to one with the finger, decides on the velocity at release, and can be
-  caught and reversed mid-flight. With reduced motion it does not travel: it cross-fades, and the
-  gesture still dismisses it.
+  caught and reversed mid-flight. With reduced motion nothing moves by itself: it cross-fades in
+  and out, follows the finger during a drag without stretching past its edge, and goes back at once
+  when let go short of a dismissal.
 
 ## Push, keys and audio, with no interface running
 

@@ -315,8 +315,10 @@ Three rules run through the motion:
 
 The one gesture is the settings sheet. It tracks the pointer one to one, resists past its own edge,
 decides from the velocity at release, and can be caught and reversed mid-flight, because it runs on
-a critically damped spring that starts from the value on the screen. With reduced motion it
-cross-fades instead, and the same drag still dismisses it.
+a critically damped spring that starts from the value on the screen. With reduced motion nothing
+moves by itself: it cross-fades in and out. A drag is still the person's own motion, so the sheet
+follows the pointer and back, stops dead at its edge rather than stretching past it, goes back at
+once when let go short of a dismissal, and fades where a dismissal leaves it.
 
 ## Running it
 
