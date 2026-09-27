@@ -545,7 +545,8 @@ pub fn install(
 /// Copies, checks, seals and admits the release at `tree`, and makes it current.
 ///
 /// The same release already in `versions/`, as an install stopped before its switch leaves it, is
-/// made current as it is: its manifest, signatures and all, is the one just checked.
+/// made current as it is once it checks as whole: its manifest, signatures and all, is the one
+/// just checked, and every file it holds is what that manifest lists.
 #[cfg(unix)]
 fn stage_tree(
     store: &Store,
@@ -574,6 +575,7 @@ fn stage_tree(
                 crate::shown::release(&manifest.release)
             )));
         }
+        release::readmit(store, &manifest)?;
     } else {
         release::seal(&staged, &manifest)?;
     }
@@ -824,7 +826,7 @@ fn stage_archive(
     }
     if store.release_directory(&manifest.release).exists() {
         // Staged by an update that waited: it is used again when it is the same release, which
-        // its manifest says, signatures and all.
+        // its manifest says, signatures and all, and it is still whole.
         let kept = release::manifest_document(&store.release_directory(&manifest.release))?;
         if kept != document {
             return Err(CliError::Other(shown!(
@@ -832,6 +834,7 @@ fn stage_archive(
                 crate::shown::release(&manifest.release)
             )));
         }
+        release::readmit(store, &manifest)?;
         return Ok(manifest);
     }
     release::seal(&staged, &manifest)?;
