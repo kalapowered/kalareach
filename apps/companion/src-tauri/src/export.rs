@@ -224,10 +224,10 @@ enum Phase {
 /// application-program commands, privacy messages and start-of-strings are never on it: the view
 /// draws with none, and each carries a payload something interprets.
 ///
-/// Inside a sequence, a control character is carried out where it is met and the sequence goes
-/// on, a cancel or a new escape abandons it, and an eight-bit control abandons it and is read as
-/// it would be anywhere, as a terminal does each. So what is kept is read by the terminal that
-/// plays it as exactly the sequence it was kept as.
+/// Inside a sequence, a C0 control or a delete is handled where it is met, as it is anywhere, and
+/// the sequence goes on; a cancel or a new escape abandons the sequence; and an eight-bit control
+/// abandons it and is read as it would be anywhere. A terminal does the same with each, so what is
+/// kept is read by the terminal that plays it as exactly the sequence it was kept as.
 ///
 /// It is one recogniser for the whole recording, because a terminal does not restart at a frame
 /// boundary: `ESC ]5` at the end of one frame and `2;c;…` at the start of the next is one
@@ -384,10 +384,9 @@ impl Stripper {
             // A second escape abandons the first and introduces a new sequence.
             '\u{1b}' => self.phase = Phase::Escape,
             _ if is_cancel(character) => {}
-            // A terminal ignores a delete inside an escape, and carries out any other C0 control
-            // where it meets it; the escape goes on.
-            '\u{7f}' => self.phase = Phase::Escape,
-            '\u{0}'..='\u{1f}' => {
+            // A C0 control or a delete is handled where it is met, as it is outside an escape: a
+            // terminal carries out the one and ignores the other, and the escape goes on.
+            '\u{0}'..='\u{1f}' | '\u{7f}' => {
                 self.phase = Phase::Escape;
                 self.control(character, out);
             }
@@ -414,10 +413,9 @@ impl Stripper {
             // A new escape abandons the sequence, and so does a cancel; a terminal acts on neither.
             '\u{1b}' => self.phase = Phase::Escape,
             _ if is_cancel(character) => self.phase = Phase::Text,
-            // A terminal ignores a delete inside a sequence, and carries out any other C0 control
-            // where it meets it; the sequence goes on.
-            '\u{7f}' => {}
-            '\u{0}'..='\u{1f}' => self.control(character, out),
+            // A C0 control or a delete is handled where it is met, as it is outside a sequence: a
+            // terminal carries out the one and ignores the other, and the sequence goes on.
+            '\u{0}'..='\u{1f}' | '\u{7f}' => self.control(character, out),
             // An eight-bit control abandons the sequence and is read as it would be anywhere.
             '\u{80}'..='\u{9f}' => {
                 self.phase = Phase::Text;
@@ -495,14 +493,16 @@ impl Stripper {
 
     /// What the recording does not carry, once every frame has been folded in.
     ///
-    /// A sequence still open at the end is one the terminal never completed. Nothing held back is
-    /// replayed, and the removal is declared like any other.
+    /// A sequence still open at the end, a lone escape included, is one the terminal never
+    /// completed. Nothing held back is replayed, and the removal is declared like any other.
     fn finish(&mut self) -> Vec<Omission> {
         match self.phase {
             Phase::Removed | Phase::RemovedEscape => self.note(self.removing),
             Phase::Osc | Phase::OscEscape => self.finish_osc(),
-            Phase::ControlSequence | Phase::EscapeIntermediate => self.note(TERMINAL_CONTROL),
-            Phase::Text | Phase::Escape => {}
+            Phase::ControlSequence | Phase::EscapeIntermediate | Phase::Escape => {
+                self.note(TERMINAL_CONTROL);
+            }
+            Phase::Text => {}
         }
         self.removed
             .iter()
@@ -1095,10 +1095,26 @@ mod tests {
     }
 
     #[test]
-    fn a_control_sequence_left_open_at_the_end_is_declared_rather_than_replayed() {
-        for (body, omissions) in at_every_split("x\u{1b}[?100") {
-            assert_eq!(body, "x");
-            assert_eq!(kinds(&omissions), [("terminal_control", 1)]);
+    fn a_sequence_or_an_escape_left_open_at_the_end_is_declared_rather_than_replayed() {
+        for open in ["x\u{1b}[?100", "x\u{1b}(", "x\u{1b}"] {
+            for (body, omissions) in at_every_split(open) {
+                assert_eq!(body, "x");
+                assert_eq!(kinds(&omissions), [("terminal_control", 1)], "{open:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_delete_inside_an_escape_or_a_sequence_is_declared_and_the_sequence_goes_on() {
+        // A terminal ignores a delete there, so the colour is still a colour and the report still
+        // a report; the delete is removed as it is anywhere else, and said so.
+        for (body, omissions) in at_every_split("\u{1b}[3\u{7f}1mx\u{1b}\u{7f}[6ny\u{1b}(\u{7f}0z")
+        {
+            assert_eq!(body, "\u{1b}[31mxyz");
+            assert_eq!(
+                kinds(&omissions),
+                [("terminal_control", 4), ("terminal_query", 1)]
+            );
         }
     }
 
