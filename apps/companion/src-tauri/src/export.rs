@@ -224,10 +224,15 @@ enum Phase {
 /// application-program commands, privacy messages and start-of-strings are never on it: the view
 /// draws with none, and each carries a payload something interprets.
 ///
-/// Inside a sequence, a C0 control or a delete is handled where it is met, as it is anywhere, and
-/// the sequence goes on; a cancel or a new escape abandons the sequence; and an eight-bit control
-/// abandons it and is read as it would be anywhere. A terminal does the same with each, so what is
-/// kept is read by the terminal that plays it as exactly the sequence it was kept as.
+/// Inside an escape or a control sequence, a C0 control or a delete is handled where it is met, as
+/// it is anywhere, and the sequence goes on. A cancel, a new escape or an eight-bit control
+/// abandons the sequence, and so does a character that cannot follow an escape; the character is
+/// then read as it would be anywhere. A terminal does the same with each, so what is kept is read
+/// by the terminal that plays it as exactly the sequence it was kept as.
+///
+/// Every character is written out, held until its sequence is decided, or left out and declared.
+/// An abandoned sequence is declared too, though a terminal would do nothing with it, so nothing
+/// is ever left out silently.
 ///
 /// It is one recogniser for the whole recording, because a terminal does not restart at a frame
 /// boundary: `ESC ]5` at the end of one frame and `2;c;…` at the start of the next is one
@@ -288,18 +293,28 @@ impl Stripper {
         }
     }
 
-    /// Ends the held operating-system command, which is removed and declared.
-    fn finish_osc(&mut self) {
-        let held = std::mem::take(&mut self.held);
+    /// Leaves out whatever is held, declares it by what it is, and goes back to text.
+    ///
+    /// A string ends at its terminator. Any sequence can also be abandoned, by a cancel, a new
+    /// escape, an eight-bit control or a character that cannot follow an escape, or still be open
+    /// when the recording ends. A terminal does nothing with an abandoned sequence, but the
+    /// recording leaves it out all the same, and says so: nothing is left out silently.
+    fn leave_out(&mut self) {
+        let kind = match self.phase {
+            Phase::Text => None,
+            Phase::Escape | Phase::EscapeIntermediate | Phase::ControlSequence => {
+                Some(TERMINAL_CONTROL)
+            }
+            Phase::Osc | Phase::OscEscape => Some(Self::osc_kind(&self.held)),
+            Phase::Removed | Phase::RemovedEscape => Some(self.removing),
+        };
+        if let Some(kind) = kind {
+            self.note(kind);
+        }
         self.phase = Phase::Text;
-        self.note(Self::osc_kind(&held));
-    }
-
-    /// Abandons the operating-system command being held, as a terminal does when a string
-    /// sequence is cancelled.
-    fn cancel(&mut self) {
         self.held.clear();
-        self.phase = Phase::Text;
+        self.sequence.clear();
+        self.overlong = false;
     }
 
     /// Folds one frame of recorded output in, and returns what may be replayed.
@@ -313,45 +328,32 @@ impl Stripper {
                     self.in_sequence(character, &mut out);
                 }
                 Phase::Osc => match character {
-                    '\u{7}' | ST => self.finish_osc(),
+                    // A bell or the string terminator ends it, and a cancel abandons it.
+                    '\u{7}' | ST => self.leave_out(),
+                    _ if is_cancel(character) => self.leave_out(),
                     '\u{1b}' => self.phase = Phase::OscEscape,
-                    _ if is_cancel(character) => self.cancel(),
                     _ => {
                         if self.held.len() < MAX_HELD_SEQUENCE {
                             self.held.push(character);
                         }
                     }
                 },
-                Phase::OscEscape => {
-                    // The string ends at its terminator. Any other escape inside it abandons the
-                    // string and starts a new sequence, which is decided on like any other.
-                    self.finish_osc();
-                    if character != '\\' {
-                        self.escape(character, &mut out);
-                    }
-                }
                 Phase::Removed => match character {
                     // A device-control string and its neighbours end at the string terminator and
                     // at nothing else: a bell inside one is part of its payload.
-                    ST => {
-                        self.note(self.removing);
-                        self.phase = Phase::Text;
-                    }
+                    ST => self.leave_out(),
+                    _ if is_cancel(character) => self.leave_out(),
                     '\u{1b}' => self.phase = Phase::RemovedEscape,
-                    _ if is_cancel(character) => self.phase = Phase::Text,
                     _ => {}
                 },
-                Phase::RemovedEscape => {
-                    if is_cancel(character) {
-                        self.phase = Phase::Text;
-                    } else {
-                        // The string ends, at its terminator or abandoned for a new sequence, which
-                        // is decided on like any other. The removal is declared either way.
-                        self.note(self.removing);
-                        self.phase = Phase::Text;
-                        if character != '\\' {
-                            self.escape(character, &mut out);
-                        }
+                Phase::OscEscape | Phase::RemovedEscape => {
+                    // The string ends at its terminator. Any other escape inside it abandons the
+                    // string and is a new escape, and what follows it is read as it would be after
+                    // any escape.
+                    self.leave_out();
+                    if character != '\\' {
+                        self.phase = Phase::Escape;
+                        self.escape(character, &mut out);
                     }
                 }
             }
@@ -373,65 +375,64 @@ impl Stripper {
         }
     }
 
-    /// The character after an escape, wherever the escape was met.
+    /// The character after a held escape, wherever the escape was met.
     fn escape(&mut self, character: char, out: &mut String) {
-        self.phase = Phase::Text;
         match character {
             '[' => self.start_sequence(Phase::ControlSequence, "\u{1b}["),
             ']' => self.start_osc(),
             'P' => self.start_removed(DEVICE_CONTROL),
             'X' | '^' | '_' => self.start_removed(OTHER_STRING),
-            // A second escape abandons the first and introduces a new sequence.
-            '\u{1b}' => self.phase = Phase::Escape,
-            _ if is_cancel(character) => {}
-            // A C0 control or a delete is handled where it is met, as it is outside an escape: a
-            // terminal carries out the one and ignores the other, and the escape goes on.
-            '\u{0}'..='\u{1f}' | '\u{7f}' => {
-                self.phase = Phase::Escape;
-                self.control(character, out);
-            }
             ' '..='/' => {
                 self.start_sequence(Phase::EscapeIntermediate, "\u{1b}");
                 self.hold(character);
             }
             // An escape and one character. The view draws with none of them, and one asks the
             // terminal to identify itself.
-            '0'..='~' => self.note(if character == 'Z' {
-                TERMINAL_QUERY
-            } else {
-                TERMINAL_CONTROL
-            }),
-            // An eight-bit control, or a character no escape takes, abandons the escape and is read
-            // as it would be outside one.
-            _ => self.text(character, out),
+            '0'..='~' => {
+                self.phase = Phase::Text;
+                self.note(if character == 'Z' {
+                    TERMINAL_QUERY
+                } else {
+                    TERMINAL_CONTROL
+                });
+            }
+            _ => self.interrupt(character, out),
         }
     }
 
-    /// One character inside a held control sequence or escape.
+    /// One character inside a held control sequence or escape with intermediates.
     fn in_sequence(&mut self, character: char, out: &mut String) {
-        match character {
-            // A new escape abandons the sequence, and so does a cancel; a terminal acts on neither.
-            '\u{1b}' => self.phase = Phase::Escape,
-            _ if is_cancel(character) => self.phase = Phase::Text,
-            // A C0 control or a delete is handled where it is met, as it is outside a sequence: a
-            // terminal carries out the one and ignores the other, and the sequence goes on.
-            '\u{0}'..='\u{1f}' | '\u{7f}' => self.control(character, out),
-            // An eight-bit control abandons the sequence and is read as it would be anywhere.
-            '\u{80}'..='\u{9f}' => {
-                self.phase = Phase::Text;
-                self.text(character, out);
-            }
-            _ => {
-                self.hold(character);
-                let finals = if self.phase == Phase::ControlSequence {
-                    '@'..='~'
-                } else {
-                    '0'..='~'
-                };
-                if finals.contains(&character) {
-                    self.finish_sequence(out);
-                }
-            }
+        if character.is_control() {
+            self.interrupt(character, out);
+            return;
+        }
+        self.hold(character);
+        let finals = if self.phase == Phase::ControlSequence {
+            '@'..='~'
+        } else {
+            '0'..='~'
+        };
+        if finals.contains(&character) {
+            self.finish_sequence(out);
+        }
+    }
+
+    /// A control, or a character that cannot follow an escape, met while an escape or a control
+    /// sequence is held.
+    ///
+    /// A C0 control or a delete is handled where it is met, as it is anywhere, and what is held
+    /// goes on: a terminal carries out the one and ignores the other. A new escape, a cancel, an
+    /// eight-bit control or any other character abandons what is held, as it does in a terminal,
+    /// and what was held is left out and declared; the character is then read as it would be
+    /// anywhere, except a cancel, which is spent on what it cancelled.
+    fn interrupt(&mut self, character: char, out: &mut String) {
+        if character.is_ascii_control() && character != '\u{1b}' && !is_cancel(character) {
+            self.control(character, out);
+            return;
+        }
+        self.leave_out();
+        if !is_cancel(character) {
+            self.text(character, out);
         }
     }
 
@@ -496,14 +497,7 @@ impl Stripper {
     /// A sequence still open at the end, a lone escape included, is one the terminal never
     /// completed. Nothing held back is replayed, and the removal is declared like any other.
     fn finish(&mut self) -> Vec<Omission> {
-        match self.phase {
-            Phase::Removed | Phase::RemovedEscape => self.note(self.removing),
-            Phase::Osc | Phase::OscEscape => self.finish_osc(),
-            Phase::ControlSequence | Phase::EscapeIntermediate | Phase::Escape => {
-                self.note(TERMINAL_CONTROL);
-            }
-            Phase::Text => {}
-        }
+        self.leave_out();
         self.removed
             .iter()
             .map(|(kind, count)| Omission {
@@ -814,23 +808,13 @@ mod tests {
     }
 
     #[test]
-    fn a_cancelled_sequence_removes_nothing_and_keeps_what_follows() {
-        let cast = asciicast(
-            dimensions(),
-            1,
-            "s-1",
-            &[Frame {
-                at_ms: 0,
-                text: "a\u{1b}]52;c;partial\u{18}kept text".into(),
-            }],
-            Vec::new(),
-        )
-        .expect("a valid recording");
-        assert!(
-            cast.body.contains("kept text"),
-            "a terminal abandons a cancelled sequence and resumes; so does this"
-        );
-        assert!(!cast.body.contains("partial"));
+    fn a_cancelled_sequence_is_left_out_and_declared_and_what_follows_is_kept() {
+        // A terminal abandons a cancelled sequence and resumes; so does this, and says what it
+        // left out.
+        for (body, omissions) in at_every_split("a\u{1b}]52;c;partial\u{18}kept text") {
+            assert_eq!(body, "akept text");
+            assert_eq!(kinds(&omissions), [("clipboard_write", 1)]);
+        }
     }
 
     #[test]
@@ -981,6 +965,96 @@ mod tests {
         assert!(cast.omissions.is_empty());
     }
 
+    /// What the recogniser writes for `frames`, fed one after another, and what it declares.
+    fn filtered(frames: &[&str]) -> (String, Vec<Omission>) {
+        let mut stripper = Stripper::new();
+        let written: String = frames.iter().map(|frame| stripper.feed(frame)).collect();
+        (written, stripper.finish())
+    }
+
+    /// Whether `text` holds nothing but printable text, the four controls a line is drawn with,
+    /// and whole control sequences the view draws with.
+    fn drawing_only(text: &str) -> bool {
+        let mut rest = text;
+        while let Some(character) = rest.chars().next() {
+            let length = match character {
+                '\u{1b}' | '\u{9b}' => {
+                    let introducer = if character == '\u{1b}' {
+                        "\u{1b}["
+                    } else {
+                        "\u{9b}"
+                    };
+                    let Some(body) = rest.strip_prefix(introducer) else {
+                        return false;
+                    };
+                    let Some(end) = body.find(|each: char| ('@'..='~').contains(&each)) else {
+                        return false;
+                    };
+                    let length = introducer.len() + end + 1;
+                    if control_sequence(&rest[..length]).is_err() {
+                        return false;
+                    }
+                    length
+                }
+                '\u{8}' | '\t' | '\n' | '\r' => 1,
+                _ if character.is_control() => return false,
+                _ => character.len_utf8(),
+            };
+            rest = &rest[length..];
+        }
+        true
+    }
+
+    /// KR-REQ-25.25: whatever a recording is handed, it writes nothing but the view's drawing, and
+    /// what it leaves out it declares. Every string of up to four characters drawn from those that
+    /// steer the recogniser reaches every state it has and leaves by every way out of it; each is
+    /// fed whole and split in two at every point, and a split changes nothing.
+    #[test]
+    fn every_input_writes_only_the_view_s_drawing_and_declares_whatever_it_leaves_out() {
+        // Text, a parameter, a separator, a private marker, an intermediate, the introducers and
+        // the string terminator's second character, a colour's final and a report's, escape, bell,
+        // cancel, return, null, delete, the eight-bit control sequence introducer, string
+        // terminator and next line, and a character outside ASCII.
+        const STEERING: [char; 21] = [
+            'x', '6', ';', '?', ' ', '[', ']', 'P', '\\', 'm', 'n', '\u{1b}', '\u{7}', '\u{18}',
+            '\r', '\u{0}', '\u{7f}', '\u{9b}', '\u{9c}', '\u{85}', 'é',
+        ];
+        let mut longest = vec![String::new()];
+        let mut inputs = Vec::new();
+        for _ in 0..4 {
+            longest = longest
+                .iter()
+                .flat_map(|prefix| {
+                    STEERING.iter().map(move |next| {
+                        let mut input = prefix.clone();
+                        input.push(*next);
+                        input
+                    })
+                })
+                .collect();
+            inputs.extend(longest.iter().cloned());
+        }
+        for input in &inputs {
+            let (written, declared) = filtered(&[input.as_str()]);
+            assert!(drawing_only(&written), "{input:?} wrote {written:?}");
+            // Nothing is ever added, so a shorter recording has left something out.
+            if written.chars().count() < input.chars().count() {
+                assert!(
+                    !declared.is_empty(),
+                    "{input:?} left something out silently: {written:?}"
+                );
+            }
+            for (split, _) in input.char_indices().skip(1) {
+                let (left, right) = input.split_at(split);
+                assert_eq!(
+                    filtered(&[left, right]),
+                    (written.clone(), declared.clone()),
+                    "{input:?} split at {split}"
+                );
+            }
+        }
+    }
+
     /// KR-REQ-25.25: a cursor-position report and a device-attributes query each make the terminal
     /// that plays the recording answer into its input, so neither is replayed, and both are
     /// declared as the questions they are.
@@ -1079,18 +1153,28 @@ mod tests {
     }
 
     #[test]
-    fn a_malformed_or_abandoned_control_sequence_replays_nothing() {
+    fn a_malformed_or_abandoned_control_sequence_replays_nothing_and_is_declared() {
         // A parameter after an intermediate, and a character no sequence holds, are malformed and
         // removed whole. An eight-bit introducer abandons the sequence before it, as a cancel
-        // does, and a terminal would have acted on neither.
+        // does; a terminal would have acted on neither, and both are declared all the same.
         for (body, omissions) in
             at_every_split("a\u{1b}[1$2mb\u{1b}[3é1mc\u{1b}[6\u{9b}cd\u{1b}[31\u{18}e")
         {
             assert_eq!(body, "abcde");
             assert_eq!(
                 kinds(&omissions),
-                [("terminal_control", 2), ("terminal_query", 1)]
+                [("terminal_control", 4), ("terminal_query", 1)]
             );
+        }
+    }
+
+    #[test]
+    fn an_escape_before_a_character_that_cannot_follow_one_is_declared() {
+        // The escape is abandoned and the character is text, as a terminal reads it; the escape
+        // is left out, and so declared.
+        for (body, omissions) in at_every_split("x\u{1b}éy\u{1b}\u{85}z") {
+            assert_eq!(body, "xéyz");
+            assert_eq!(kinds(&omissions), [("terminal_control", 3)]);
         }
     }
 
@@ -1132,8 +1216,11 @@ mod tests {
         // A terminal treats the second escape as the start of a new sequence, so this is one
         // clipboard write with a discarded escape in front of it.
         for (body, omissions) in at_every_split("a\u{1b}\u{1b}]52;c;c2VjcmV0\u{7}b") {
-            assert!(!body.contains("c2VjcmV0"));
-            assert_eq!(omissions[0].kind, "clipboard_write");
+            assert_eq!(body, "ab");
+            assert_eq!(
+                kinds(&omissions),
+                [("terminal_control", 1), ("clipboard_write", 1)]
+            );
         }
     }
 
@@ -1285,19 +1372,14 @@ mod tests {
 
     #[test]
     fn a_cancel_after_an_escape_inside_a_removed_string_still_cancels() {
-        let cast = asciicast(
-            dimensions(),
-            1,
-            "s-1",
-            &[Frame {
-                at_ms: 0,
-                text: "\u{1b}]52;c;partial\u{1b}\u{18}kept text".into(),
-            }],
-            Vec::new(),
-        )
-        .expect("a valid recording");
-        assert!(cast.body.contains("kept text"));
-        assert!(!cast.body.contains("partial"));
+        // The escape ends the string and begins an escape of its own, which the cancel abandons.
+        for (body, omissions) in at_every_split("\u{1b}]52;c;partial\u{1b}\u{18}kept text") {
+            assert_eq!(body, "kept text");
+            assert_eq!(
+                kinds(&omissions),
+                [("clipboard_write", 1), ("terminal_control", 1)]
+            );
+        }
     }
 
     #[test]
