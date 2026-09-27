@@ -600,8 +600,8 @@ pub struct NativeGateway {
 ///
 /// The process has not been told where to connect, so it has done nothing anyone depends on, and
 /// it is ended at once rather than given a grace period. It is waited for so that it is gone, not
-/// merely signalled, when the launch returns. On Windows its job is ended with it, which ends
-/// anything it started in the meantime.
+/// merely signalled, when the launch returns. What it started in the meantime is ended with it:
+/// on Windows by its job, and elsewhere by the process group it leads ([`end_started`]).
 fn stop_started(mut child: std::process::Child, started: &ProcessStartIdentity) {
     #[cfg(windows)]
     if let Some(job) = crate::windows::job::agent_job(started) {
@@ -610,7 +610,25 @@ fn stop_started(mut child: std::process::Child, started: &ProcessStartIdentity) 
     }
     #[cfg(not(windows))]
     let _ = started;
-    // A process that has already exited cannot be killed, and that is the outcome wanted.
+    end_started(&mut child);
+}
+
+/// Ends a process this host started and has not collected, with everything in the process group
+/// it leads, and collects it.
+///
+/// On Unix an agent leads a process group of its own from its start ([`start_agent`]), and what it
+/// forks stays in that group unless it leaves it on purpose. The group is ended before the agent is
+/// collected: until then the agent's identifier is still its own, so the group's is too, and the
+/// signal cannot reach a group that took the number later. A process that has already exited
+/// cannot be signalled, and that is the outcome wanted.
+fn end_started(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    if let Some(group) = i32::try_from(child.id())
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+    {
+        let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+    }
     let _ = child.kill();
     let _ = child.wait();
 }
@@ -620,7 +638,9 @@ fn stop_started(mut child: std::process::Child, started: &ProcessStartIdentity) 
 /// On Windows the agent is started in a job of its own, joined before it runs, and the job is kept
 /// for the broker: a Windows process keeps naming a parent after that parent exits, so the broker
 /// places a caller under an agent by what the agent's job holds rather than by a walk up the
-/// parents. Elsewhere the broker walks the parents, and the agent is started as it is.
+/// parents. Elsewhere the broker walks the parents, and the agent is started leading a process
+/// group of its own, which holds what it forks, so that a launch that fails after the start ends
+/// all of it ([`end_started`]).
 fn start_agent(
     command: &mut std::process::Command,
     program: &str,
@@ -634,7 +654,11 @@ fn start_agent(
         (child, job)
     };
     #[cfg(not(windows))]
-    let mut child = command.spawn().map_err(could_not_start)?;
+    let mut child = {
+        #[cfg(unix)]
+        std::os::unix::process::CommandExt::process_group(command, 0);
+        command.spawn().map_err(could_not_start)?
+    };
     let started = match kr_ipc::identity::started_process_identity(child.id()) {
         Ok(started) => started,
         Err(error) => {
@@ -642,8 +666,7 @@ fn start_agent(
             // identity later, so it is stopped now, while the handle still names it.
             #[cfg(windows)]
             let _ = job.terminate(1);
-            let _ = child.kill();
-            let _ = child.wait();
+            end_started(&mut child);
             return Err(BrokerError::ledger(format!(
                 "the started process cannot be read, so it was stopped: {error}"
             )));
