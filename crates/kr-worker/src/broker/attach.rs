@@ -601,7 +601,7 @@ pub struct NativeGateway {
 /// The process has not been told where to connect, so it has done nothing anyone depends on, and
 /// it is ended at once rather than given a grace period. It is waited for so that it is gone, not
 /// merely signalled, when the launch returns. What it started in the meantime is ended with it:
-/// on Windows by its job, and elsewhere by the process group it leads ([`end_started`]).
+/// on Windows by its job, and elsewhere as [`end_started`] finds it.
 fn stop_started(mut child: std::process::Child, started: &ProcessStartIdentity) {
     #[cfg(windows)]
     if let Some(job) = crate::windows::job::agent_job(started) {
@@ -613,24 +613,79 @@ fn stop_started(mut child: std::process::Child, started: &ProcessStartIdentity) 
     end_started(&mut child);
 }
 
-/// Ends a process this host started and has not collected, with everything in the process group
-/// it leads, and collects it.
+/// Ends a process this host started and has not collected, with what it forked, and collects it.
 ///
-/// On Unix an agent leads a process group of its own from its start ([`start_agent`]), and what it
-/// forks stays in that group unless it leaves it on purpose. The group is ended before the agent is
-/// collected: until then the agent's identifier is still its own, so the group's is too, and the
-/// signal cannot reach a group that took the number later. A process that has already exited
-/// cannot be signalled, and that is the outcome wanted.
+/// On Unix the agent stays in this worker's process group, which is the boundary the platform's
+/// service manager ends with the worker's job, so it is not given a group of its own. What it forked
+/// is found by parentage instead ([`frozen_descendants`]) and ended by the identity it was found
+/// with, and the agent is ended through its handle and collected last: until then its identifier
+/// is still its own. A process that has already exited cannot be signalled, and that is the
+/// outcome wanted.
 fn end_started(child: &mut std::process::Child) {
     #[cfg(unix)]
-    if let Some(group) = i32::try_from(child.id())
-        .ok()
-        .and_then(rustix::process::Pid::from_raw)
-    {
-        let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+    for forked in frozen_descendants(child.id()) {
+        if kr_ipc::identity::process_state(&forked) == kr_ipc::identity::ProcessState::Running {
+            signal(forked.pid.get(), rustix::process::Signal::KILL);
+        }
     }
     let _ = child.kill();
     let _ = child.wait();
+}
+
+/// Returns every process `pid` forked that is still in this worker's process group, each one
+/// stopped as it is found.
+///
+/// The process itself is stopped first, so it forks nothing more while its children are looked
+/// for, and so is each child found, before its own children are looked for; a pass over the group
+/// that finds nothing new ends the search. A child is one whose parent, read from the kernel and
+/// checked by start identity, is a process already found. A process that left the group on purpose,
+/// or whose parent had already exited when it was looked for, is not found.
+#[cfg(unix)]
+fn frozen_descendants(pid: u32) -> Vec<ProcessStartIdentity> {
+    signal(u64::from(pid), rustix::process::Signal::STOP);
+    let Ok(started) = kr_ipc::identity::process_start_identity(pid) else {
+        return Vec::new();
+    };
+    let Ok(group) = u32::try_from(rustix::process::getpgrp().as_raw_nonzero().get()) else {
+        return Vec::new();
+    };
+    let mut found = vec![started];
+    while let Ok(members) = kr_ipc::identity::processes_in_group(group) {
+        let before = found.len();
+        for member in members {
+            if member == std::process::id()
+                || found
+                    .iter()
+                    .any(|known| known.pid.get() == u64::from(member))
+            {
+                continue;
+            }
+            let Ok(identity) = kr_ipc::identity::process_start_identity(member) else {
+                continue;
+            };
+            let forked = crate::questions::binding::parent_of(&identity)
+                .is_some_and(|parent| found.iter().any(|known| known.matches(&parent)));
+            if forked {
+                signal(u64::from(member), rustix::process::Signal::STOP);
+                found.push(identity);
+            }
+        }
+        if found.len() == before {
+            break;
+        }
+    }
+    found.split_off(1)
+}
+
+/// Sends one signal to one process, where the identifier can name one.
+#[cfg(unix)]
+fn signal(pid: u64, signal: rustix::process::Signal) {
+    if let Some(pid) = i32::try_from(pid)
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+    {
+        let _ = rustix::process::kill_process(pid, signal);
+    }
 }
 
 /// Starts the agent `command` names and reads back what the kernel started.
@@ -638,9 +693,8 @@ fn end_started(child: &mut std::process::Child) {
 /// On Windows the agent is started in a job of its own, joined before it runs, and the job is kept
 /// for the broker: a Windows process keeps naming a parent after that parent exits, so the broker
 /// places a caller under an agent by what the agent's job holds rather than by a walk up the
-/// parents. Elsewhere the broker walks the parents, and the agent is started leading a process
-/// group of its own, which holds what it forks, so that a launch that fails after the start ends
-/// all of it ([`end_started`]).
+/// parents. Elsewhere the broker walks the parents, and the agent is started as it is, in this
+/// worker's process group.
 fn start_agent(
     command: &mut std::process::Command,
     program: &str,
@@ -654,11 +708,7 @@ fn start_agent(
         (child, job)
     };
     #[cfg(not(windows))]
-    let mut child = {
-        #[cfg(unix)]
-        std::os::unix::process::CommandExt::process_group(command, 0);
-        command.spawn().map_err(could_not_start)?
-    };
+    let mut child = command.spawn().map_err(could_not_start)?;
     let started = match kr_ipc::identity::started_process_identity(child.id()) {
         Ok(started) => started,
         Err(error) => {

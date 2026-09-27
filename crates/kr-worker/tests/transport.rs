@@ -2413,6 +2413,19 @@ fn ends(process: &ProcessStartIdentity) -> bool {
     }
 }
 
+/// Returns the process group one process is in, as `ps` reads it.
+#[cfg(unix)]
+fn process_group_of(pid: u32) -> u32 {
+    let output = std::process::Command::new("ps")
+        .args(["-o", "pgid=", "-p", &pid.to_string()])
+        .output()
+        .expect("ps runs");
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse()
+        .expect("ps names a process group")
+}
+
 /// Stops a process this test recorded, whatever became of it.
 #[cfg(unix)]
 fn stop_recorded(process: &ProcessStartIdentity) {
@@ -2485,8 +2498,10 @@ async fn kr_req_12_02_a_failed_launch_stops_what_its_process_forked() {
     let _ = std::fs::remove_dir_all(&directory);
 }
 
-/// KR-REQ-12.02, the control: a launch that succeeds leaves its process, and what that process
-/// forked, running.
+/// KR-REQ-12.02 and KR-REQ-07.61, the control: a launch that succeeds leaves its process, and what
+/// that process forked, running, and in the launching worker's own process group. That group is
+/// the boundary a service manager ends with the worker's job, so a backend that left it would
+/// outlive a worker that died.
 #[cfg(unix)]
 #[tokio::test]
 async fn kr_req_12_02_a_successful_launch_leaves_what_its_process_forked_running() {
@@ -2519,6 +2534,11 @@ async fn kr_req_12_02_a_successful_launch_leaves_what_its_process_forked_running
         kr_ipc::identity::process_state(&launched.process),
         kr_ipc::identity::process_state(&forked),
     );
+    let worker_group = process_group_of(std::process::id());
+    let groups = (
+        process_group_of(u32::try_from(launched.process.pid.get()).expect("a process")),
+        process_group_of(u32::try_from(forked.pid.get()).expect("a process")),
+    );
     let _ = launched.child.kill();
     let _ = launched.child.wait();
     stop_recorded(&forked);
@@ -2529,6 +2549,11 @@ async fn kr_req_12_02_a_successful_launch_leaves_what_its_process_forked_running
             kr_ipc::identity::ProcessState::Running
         ),
         "the backend and what it forked are running after the launch"
+    );
+    assert_eq!(
+        groups,
+        (worker_group, worker_group),
+        "and both are in the launching worker's own process group"
     );
     let _ = std::fs::remove_dir_all(&directory);
 }
