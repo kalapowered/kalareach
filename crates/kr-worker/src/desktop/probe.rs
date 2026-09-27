@@ -58,7 +58,7 @@ use super::capability::{CAPABILITY_VERSION, facility_identity};
 /// Reading a file the person authorised this context to read.
 ///
 /// This is a capability in the same shared namespace as the five
-/// [`capabilities`](kr_protocol::desktop::capabilities) the platform queries answer, and it has no
+/// [`capabilities`] the platform queries answer, and it has no
 /// constant beside them because nothing that reads the platform alone can produce it: the only
 /// evidence for it is the read itself. On macOS the permission behind it is Full Disk Access where
 /// the nominated file is in a location the platform protects, and nothing at all where it is not,

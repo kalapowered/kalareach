@@ -383,7 +383,7 @@ impl AttentionFence {
     /// timer that woke it.
     ///
     /// The timer may not count time the machine spent asleep and the continuous clock does, so it
-    /// wakes at least every [`LEASE_POLL`] to look again, and a wait that spans a suspension ends
+    /// wakes at least every `LEASE_POLL` to look again, and a wait that spans a suspension ends
     /// soon after the machine resumes rather than a whole lease later.
     pub async fn until_leases_end(&self, covered: Option<u64>) {
         loop {

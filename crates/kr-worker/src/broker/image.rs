@@ -284,7 +284,7 @@ pub type VerifiedFiles = Mutex<BTreeSet<FileIdentity>>;
 ///
 /// The link is opened again after each reading. When it names another identity then (the process
 /// exec'd, or the file's metadata moved while it was read), the reading is taken again through the
-/// newly opened file, at most [`IMAGE_ATTEMPTS`] times, and only a reading that held still decides:
+/// newly opened file, at most `IMAGE_ATTEMPTS` times, and only a reading that held still decides:
 /// an upgrade during a check passes by its content, and a process that exec'd other code is refused.
 ///
 /// The check proves what the process executed when it was read. A process can exec after that and
@@ -424,7 +424,7 @@ impl OpenedImage {
 /// macOS compares the code-directory hash the kernel keeps for the process's main executable with
 /// the ones the hashed file's own signature carries. The hash is read before and after the start
 /// check; two readings that differ (an exec between them) are taken again, at most
-/// [`IMAGE_ATTEMPTS`] times, and only equal readings decide.
+/// `IMAGE_ATTEMPTS` times, and only equal readings decide.
 ///
 /// The check proves what the process executed when it was read. A process can exec after that and
 /// before its bridge is admitted; the next bridge is checked again.

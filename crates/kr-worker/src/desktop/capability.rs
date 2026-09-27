@@ -696,7 +696,7 @@ fn runnable(path: &std::path::Path) -> bool {
 /// timestamps.
 ///
 /// The work is bounded twice over. The file is read a block at a time, so identifying it costs one
-/// block of memory whatever its size, and the read stops once more than [`MAX_IDENTIFIED`] bytes
+/// block of memory whatever its size, and the read stops once more than `MAX_IDENTIFIED` bytes
 /// have been taken, so it reads at most that much plus the block that crossed the line. A file
 /// with more than that in it has no identity here, and neither has one that cannot be read: both
 /// are answered as the facility this host could not identify rather than as a facility described

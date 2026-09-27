@@ -18,7 +18,7 @@
 //! | what does this session own? | input the session accepted, output it produced and a command the shell's integration reported starting, which is where a new process usually comes from | the same sweep, for everything that comes from none of them |
 //! | is the desktop still there? | nothing this host can subscribe to | the same sweep. The reading is this worker's own environment, so a check ten times a second answered from the same values each time |
 //!
-//! The same marks tell the adoption watch ([`crate::broker::adoption`]) when to look at the
+//! On Unix the same marks tell the adoption watch, in [`crate::broker`], when to look at the
 //! terminal's foreground for a program the integration did not launch. It keeps a clock only while
 //! it has something to look at, and says what that leaves out.
 //!

@@ -9,7 +9,7 @@
 //!
 //! This module is that posture, and the three signals it is made of.
 //!
-//! * **A fault is detected.** [`JournalHealth::note_fault`] records what failed, classified from
+//! * **A fault is detected.** [`JournalHealth`] records what failed, classified from
 //!   the store's own answer rather than from a message, and the condition becomes
 //!   [`JournalCondition::Faulted`]. Nothing durable is claimed from that moment.
 //! * **Rich work is fenced.** [`DurabilityPosture`] is what a subsystem asks before it starts

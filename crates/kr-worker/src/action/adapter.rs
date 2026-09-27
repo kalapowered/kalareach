@@ -39,7 +39,7 @@ pub trait TimeAdapter: Send + Sync + fmt::Debug {
 /// `ntp_adjtime(2)` is the same interface on macOS, Linux and the BSDs: the status word carries
 /// which discipline is running, the maximum and estimated error bound how wrong the clock may be,
 /// and the call's return value is the time state. The bit values below are that shared model's,
-/// which is what lets this classifier run anywhere; [`tests::the_status_bits_match_this_platform`]
+/// which is what lets this classifier run anywhere; the test `the_status_bits_match_this_platform`
 /// checks them against this platform's own headers.
 pub mod unix_model {
     /// The phase-locked loop is disciplining the clock.

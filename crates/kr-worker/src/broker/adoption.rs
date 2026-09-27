@@ -481,8 +481,8 @@ pub async fn watch(adoptions: Arc<Adoptions>, runtime: Weak<crate::runtime::Sess
 /// The watch starts as if it had just been marked, because a shell that has just started can run a
 /// program from its startup files before anything is typed. It looks at once when `activity` is
 /// marked, on each [`WATCH_INTERVAL`] while a command has the terminal, while a program it adopted
-/// is still to be ended and while an identification is under way, and otherwise at the pace
-/// [`Pace`] keeps.
+/// is still to be ended and while an identification is under way, and otherwise less often the
+/// longer it has had no reason to look, from [`WATCH_INTERVAL`] up to [`IDLE_LOOK`] apart.
 ///
 /// A look reads `group` alone while the root shell has the terminal. When a command has it, `read`
 /// gives the look the rest, and each process in the command's group is identified on a thread of

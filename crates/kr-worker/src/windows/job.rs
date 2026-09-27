@@ -21,7 +21,7 @@
 //! `JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK` is set, so a child that asks to be created outside the
 //! job is refused rather than granted. This is not the same question as nesting: a vendor sandbox
 //! that creates a job of its own nests inside this one, which Windows 8 and later support, and
-//! that child job's limits apply on top of these rather than instead of them. [S48]
+//! that child job's limits apply on top of these rather than instead of them. \[S48\]
 //!
 //! **What is deliberately outside it.** A GUI resource that has to outlive the session is created
 //! through the desktop broker, which starts it outside this job and records it as an external

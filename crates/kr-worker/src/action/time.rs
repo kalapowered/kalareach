@@ -67,6 +67,8 @@ pub trait ActiveClock: Send + Sync + std::fmt::Debug {
 /// it is not this clock at all. What is is `QueryUnbiasedInterruptTime`, the counter beside the one
 /// [`kr_ipc::clock`] reads: the biased one includes suspended time and the unbiased one does not,
 /// and the pair of them is the detector.
+///
+/// [`Instant`]: std::time::Instant
 #[derive(Clone, Debug)]
 pub struct SystemActiveClock {
     #[cfg(not(windows))]
