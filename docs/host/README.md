@@ -2365,12 +2365,12 @@ brings such a journal to the current schema once, in one transaction, while the 
 is stopped and no worker can hold it. Whether a worker may still hold one is read from the
 registry's worker rows and closures, with the registry read as it is (`Registry::open_to_read`,
 which reads the file alone as immutable, writes nothing, not even beside it, and refuses a registry
-whose write-ahead log still holds writes), and from the descriptor; a source it cannot read, the
-registry included, refuses the journal. It checks the version and every object against the statement
-one of those builds ran to make it, reads every row as the running host reads it, names anything it
-cannot read, and leaves a refused journal exactly as it was; a failure after it has begun changing
-the journal goes back with its transaction. Code reads one current schema after migration or import,
-and there is no branch anywhere that reads two.
+whose write-ahead log still holds writes or that is reached through a link), and from the
+descriptor; a source it cannot read, the registry included, refuses the journal. It checks the
+version and every object against the statement one of those builds ran to make it, reads every row
+as the running host reads it, names anything it cannot read, and leaves a refused journal exactly as
+it was; a failure after it has begun changing the journal goes back with its transaction. Code reads
+one current schema after migration or import, and there is no branch anywhere that reads two.
 
 ## Retained output, and what eviction leaves behind
 

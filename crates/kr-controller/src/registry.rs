@@ -229,23 +229,47 @@ impl Registry {
     /// and shared-memory files, so the file is read as immutable instead, which makes neither. That
     /// reads the file alone, so a registry whose log holds writes the file has not taken in, or
     /// whose rollback journal is waiting to be rolled back, is refused rather than read as it was
-    /// before them. The registry is refused, too, unless it records exactly the schema version this
-    /// build reads and holds the tables the workers and the closures are read from: one that lost
-    /// either would otherwise read as recording no worker at all, and that is the one answer a
+    /// before them. So is a registry reached through a link at its own name: SQLite follows the
+    /// link and keeps the log beside the file it reaches, where a log looked for beside the link
+    /// would not be. (A link among the directories above it changes nothing: the log is beside the
+    /// file either way.) The registry is refused, too, unless it records exactly the schema version
+    /// this build reads and holds the tables the workers and the closures are read from: one that
+    /// lost either would otherwise read as recording no worker at all, and that is the one answer a
     /// question about who may still hold a session's stores must never get by accident. The
     /// explicit journal import reads its evidence through this, while it holds the environment's
     /// singleton lock, so nothing writes the registry while it is read.
     ///
     /// # Errors
     ///
-    /// Returns [`ControllerError::RegistryUnavailable`] when the file is not there or cannot be
-    /// opened, when a write-ahead log or a rollback journal beside it holds anything, when it
-    /// records another schema version or none, and when a table it is read from is missing.
+    /// Returns [`ControllerError::RegistryUnavailable`] when the file is not there, is not a file
+    /// or cannot be opened, when a write-ahead log or a rollback journal beside it holds anything,
+    /// when it records another schema version or none, and when a table it is read from is
+    /// missing.
     pub fn open_to_read(
         path: impl AsRef<std::path::Path>,
         environment_id: EnvironmentId,
     ) -> Result<Self> {
         let path = path.as_ref();
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(ControllerError::RegistryUnavailable {
+                    detail: "this registry is a link, and it is read only as the file itself, \
+                             beside which its write-ahead log is kept"
+                        .to_owned(),
+                });
+            }
+            Ok(metadata) if !metadata.is_file() => {
+                return Err(ControllerError::RegistryUnavailable {
+                    detail: "this registry is not a file".to_owned(),
+                });
+            }
+            Ok(_) => {}
+            Err(error) => {
+                return Err(ControllerError::RegistryUnavailable {
+                    detail: format!("this registry could not be looked at: {error}"),
+                });
+            }
+        }
         for (suffix, what) in [
             ("-wal", "write-ahead log"),
             ("-journal", "rollback journal"),
@@ -2588,5 +2612,40 @@ mod tests {
             immutable_uri(std::path::Path::new("/state/a b/r?e#g%1\\x.sqlite3")).as_deref(),
             Some("file:///state/a b/r%3fe%23g%251\\x.sqlite3?immutable=1")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_registry_reached_through_a_link_is_refused_rather_than_read_without_its_log() {
+        // SQLite follows a link at the database's own name and keeps its write-ahead log beside
+        // the file the link reaches, so a log looked for beside the link is not the one that holds
+        // the writes. A registry reached that way is refused, and nothing changes.
+        let directory = tempfile::tempdir().expect("a directory");
+        let actual = directory.path().join("actual.sqlite3");
+        Registry::open(&actual, environment())
+            .expect("a registry")
+            .adopt_worker(&worker_row(1, 4_001))
+            .expect("records a worker");
+        let link = directory.path().join("registry.sqlite3");
+        std::os::unix::fs::symlink(&actual, &link).expect("links the registry");
+        // A writer that has not finished: its log, beside the file the link reaches, holds a
+        // worker the file does not.
+        let writer = Connection::open(&actual).expect("a writer");
+        writer
+            .pragma_update(None, "wal_autocheckpoint", 0)
+            .expect("no checkpoint");
+        writer
+            .execute("DELETE FROM workers", [])
+            .expect("the log holds a change");
+        let held = files_in(directory.path());
+        let refused = Registry::open_to_read(&link, environment())
+            .expect_err("a registry reached through a link is refused");
+        assert!(refused.to_string().contains("link"), "{refused}");
+        assert_eq!(
+            files_in(directory.path()),
+            held,
+            "a refusal changes nothing"
+        );
+        drop(writer);
     }
 }
