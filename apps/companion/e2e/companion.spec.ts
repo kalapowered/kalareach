@@ -2317,6 +2317,8 @@ test.describe('a session in a window 320 px wide', () => {
 
   interface Placed {
     readonly name: string
+    /** Whether it is a tab, which is drawn inside its switch's frame and pressed across the target. */
+    readonly tab: boolean
     readonly left: number
     readonly right: number
     readonly top: number
@@ -2332,6 +2334,7 @@ test.describe('a session in a window 320 px wide', () => {
         const box = button.getBoundingClientRect()
         return {
           name: button.textContent ?? '',
+          tab: button.getAttribute('role') === 'tab',
           left: box.left,
           right: box.right,
           top: box.top,
@@ -2551,7 +2554,7 @@ test.describe('a session in a window 320 px wide', () => {
         ...(await placed(page.locator('.session-header'))),
         ...(await placed(page.locator('.terminal-footer')))
       ]
-      for (const control of controls.filter((each) => !['Conversation', 'Terminal'].includes(each.name))) {
+      for (const control of controls.filter((each) => !each.tab)) {
         expect.soft(control.height, `${control.name}'s height at ${target} px`).toBeGreaterThanOrEqual(target - 0.1)
         expect.soft(control.width, `${control.name}'s width at ${target} px`).toBeGreaterThanOrEqual(target - 0.1)
         expect.soft(control.right, `${control.name} inside the window at ${target} px`).toBeLessThanOrEqual(321)

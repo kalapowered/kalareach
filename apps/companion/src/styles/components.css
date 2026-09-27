@@ -323,8 +323,14 @@ main {
   text-underline-offset: 3px;
 }
 
+/*
+ * Where the tabs do not fit on one line, a narrow window with larger text, the last ones go to the
+ * next, with room between the lines for each tab's press area.
+ */
 .segmented {
   display: inline-flex;
+  flex-wrap: wrap;
+  row-gap: 8px;
   padding: 3px;
   border: 1px solid var(--line);
   border-radius: 7px;
