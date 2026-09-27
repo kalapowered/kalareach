@@ -971,7 +971,7 @@ async fn a_duplicate_returns_the_retained_receipt_and_lost_authority_returns_not
 
 /// KR-REQ-07.55: a worker's acceptance of a close carries its own description of the session,
 /// taken as the close is admitted, and an exact retry is answered from the journal with that same
-/// acceptance, the description included.
+/// acceptance, the description included, after the session has moved on to its closure.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_close_is_accepted_with_the_sessions_own_description_and_a_retry_returns_it() {
     let host = host().await;
@@ -994,6 +994,26 @@ async fn a_close_is_accepted_with_the_sessions_own_description_and_a_retry_retur
         member(&accepted, "session"),
         Some(&described),
         "the acceptance carries the session as its own worker describes it, closing"
+    );
+
+    // The acceptance is delivered and the closure runs to its end, so the session is no longer
+    // what the acceptance described: a retry answered from the session would say so.
+    client
+        .confirm_delivery(mutation.action_id)
+        .await
+        .expect("the delivery is confirmed");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        host.service.runtime().wait_closed(),
+    )
+    .await
+    .expect("the closure finishes");
+    assert_ne!(
+        ParamsValue::from_typed(&host.service.runtime().session().summary())
+            .expect("the description encodes")
+            .into_value(),
+        described,
+        "the session has moved on"
     );
 
     let Outcome::Ok(again) = send_mutation(&mut client, mutation).await else {

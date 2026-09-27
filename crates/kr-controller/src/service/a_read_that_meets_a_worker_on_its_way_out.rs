@@ -69,6 +69,8 @@ pub(super) struct Scripted {
     answered: std::sync::Mutex<BTreeMap<ActionId, ParamsValue>>,
     /// Every generation a daemon presented to it, in the order they came.
     generations: std::sync::Mutex<Vec<kr_protocol::ids::ControllerGeneration>>,
+    /// How many connections it has accepted.
+    connections: AtomicUsize,
 }
 
 /// Where a scripted worker goes: at the next read it is sent.
@@ -95,7 +97,13 @@ impl Scripted {
             names: std::sync::Mutex::new(None),
             answered: std::sync::Mutex::new(BTreeMap::new()),
             generations: std::sync::Mutex::new(Vec::new()),
+            connections: AtomicUsize::new(0),
         })
+    }
+
+    /// How many connections this worker has accepted, from any daemon.
+    fn connections(&self) -> usize {
+        self.connections.load(Ordering::Acquire)
     }
 
     /// Whether a daemon speaking for `generation` has presented it to this worker.
@@ -334,6 +342,7 @@ fn serve_scripted(
             let identity = Arc::clone(&identity);
             let endpoint_text = endpoint_text.clone();
             let script = Arc::clone(&script);
+            script.connections.fetch_add(1, Ordering::AcqRel);
             tokio::spawn(async move {
                 let (mut reader, mut writer) = split(connection, StreamKind::Control);
                 let connection_id = ConnectionId::new(kr_ipc::new_uuid());
@@ -541,6 +550,18 @@ async fn replaced(world: Silent, descriptor: bool) -> Silent {
 /// had stopped waiting for the report does: nothing has read the worker since, and the
 /// reservation the create made is the registry's record of it.
 async fn reported_late(script: &Arc<Scripted>) -> Silent {
+    reported(script, true).await
+}
+
+/// The same daemon stopped part way through recording the worker's report: the registry holds the
+/// worker's row and its descriptor is published, as they are before a daemon admits the worker,
+/// and the daemon never reached the worker. They are all a daemon that starts has to go by.
+async fn recorded_unreached(script: &Arc<Scripted>) -> Silent {
+    reported(script, false).await
+}
+
+/// A daemon the scripted worker reported to, which admitted the worker or stopped just before.
+async fn reported(script: &Arc<Scripted>, admitted: bool) -> Silent {
     let temp = kr_ipc::testing::TempHost::create();
     let environment = temp.environment();
     let environment_id = temp.environment_id();
@@ -618,18 +639,60 @@ async fn reported_late(script: &Arc<Scripted>) -> Silent {
         dimensions: INVISIBLE_DEFAULT_DIMENSIONS,
         session: Box::new(script.answer(session_id).session),
     };
-    controller
-        .record_ready(reservation.reservation_id, &claim, &report)
-        .await
-        .expect("records the worker from its report");
+    let worker = if admitted {
+        controller
+            .record_ready(reservation.reservation_id, &claim, &report)
+            .await
+            .expect("records the worker from its report");
+        controller
+            .directory
+            .lock()
+            .await
+            .get(session_id)
+            .cloned()
+            .expect("the report admits the worker")
+    } else {
+        // What recording the report writes before the daemon admits the worker: the worker's row,
+        // with its key and the live phase, and its descriptor.
+        controller
+            .registry
+            .lock()
+            .await
+            .record_worker(
+                reservation.reservation_id,
+                &WorkerRecord {
+                    session_id,
+                    display_number: reservation.display_number,
+                    public_key: claim.worker_public_key,
+                    process_identity: claim.process_start_identity.clone(),
+                    endpoint: report.endpoint.clone(),
+                    profile: WorkerProfile::HeadlessUser,
+                    state: SessionState::Live,
+                    acknowledged_revision: AuthorityRevision::new(0),
+                },
+            )
+            .expect("records the worker");
+        let descriptor = kr_protocol::worker::WorkerDescriptor {
+            session_id,
+            session_epoch: SessionEpoch::V1,
+            environment_id,
+            display_number: reservation.display_number,
+            boot_identity: claim.boot_identity.clone(),
+            process_start_identity: claim.process_start_identity.clone(),
+            protocol_version: kr_protocol::hello::PROTOCOL_VERSION,
+            endpoint: report.endpoint.clone(),
+            worker_public_key: claim.worker_public_key,
+            worker_profile: WorkerProfile::HeadlessUser,
+            published_at_ms: kr_ipc::now_ms(),
+        };
+        kr_ipc::descriptor::publish(&environment, &descriptor)
+            .expect("publishes the worker's descriptor");
+        crate::directory::KnownWorker {
+            descriptor,
+            endpoint,
+        }
+    };
     fake::acknowledged(&controller, session_id);
-    let worker = controller
-        .directory
-        .lock()
-        .await
-        .get(session_id)
-        .cloned()
-        .expect("the report admits the worker");
     let actor = crate::service::local_actor(
         kr_protocol::ids::ActorId::new("local:test").expect("a principal"),
         ConnectionId::new(kr_ipc::new_uuid()),
@@ -1287,15 +1350,18 @@ async fn an_acceptance_that_describes_another_session_is_not_kept() {
     world.serving.abort();
 }
 
-/// A worker whose reservation this host fenced is not reached again by a daemon that starts: the
-/// daemon neither challenges it nor presents its generation to it, and the worker stays out of
-/// the directory, as recovery leaves such a worker. The control: a worker whose reservation stands
-/// is reached and admitted as before.
+/// A worker whose reservation this host fenced is not reached by a daemon that starts: the daemon
+/// does not even connect to it, presents it no generation, and leaves it out of the directory, as
+/// recovery leaves such a worker. The control: a worker whose reservation stands is reached and
+/// admitted as before.
+///
+/// The daemon before the restart recorded the worker and stopped before it admitted it, so it
+/// never reached the worker, and every connection the worker accepts is the new daemon's.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_daemon_that_starts_does_not_reach_a_worker_whose_reservation_is_fenced() {
     for fenced in [true, false] {
         let script = Scripted::new();
-        let world = reported_late(&script).await;
+        let world = recorded_unreached(&script).await;
         if fenced {
             let mut registry = world.controller.registry.lock().await;
             let reservation = registry
@@ -1306,7 +1372,13 @@ async fn a_daemon_that_starts_does_not_reach_a_worker_whose_reservation_is_fence
                 .fence(reservation.reservation_id)
                 .expect("fences the reservation");
         }
+        assert_eq!(
+            script.connections(),
+            0,
+            "nothing reached the worker before the restart"
+        );
         let world = restarted(world).await;
+        let connections = script.connections();
         let reached = script.presented(world.controller.generation);
         let admitted = world
             .controller
@@ -1316,10 +1388,17 @@ async fn a_daemon_that_starts_does_not_reach_a_worker_whose_reservation_is_fence
             .get(world.session_id)
             .is_some();
         if fenced {
-            assert!(!reached, "the daemon that started did not reach the worker");
+            assert_eq!(
+                connections, 0,
+                "the daemon that started did not even connect to the worker"
+            );
+            assert!(!reached, "it presented the worker no generation");
             assert!(!admitted, "and the worker stays out of its directory");
         } else {
-            assert!(reached, "the daemon that started reached the worker");
+            assert!(
+                reached,
+                "the daemon that started reached the worker and presented it its generation"
+            );
             assert!(admitted, "and admitted it");
         }
         world.serving.abort();
