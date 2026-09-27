@@ -691,8 +691,8 @@
 
 /*
  * One line of the field's own text, never less than the platform's target: larger text grows it.
- * It takes the width Send leaves, so the two share a line: the field gives up width before Send
- * does. The room kept for the composer under the terminal is counted from these sizes.
+ * It takes the width Send leaves beside it. The room kept for the composer's line, under the
+ * terminal and on a short session, is counted from these sizes.
  */
 .m-composer-line textarea {
   flex: 1 1 0;
