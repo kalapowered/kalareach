@@ -1209,7 +1209,7 @@ impl Spool {
             }
             if rotate {
                 let path = self.directory.join(format!("{cursor:020}.out"));
-                match open_segment(&path) {
+                match open_segment(&path, true) {
                     Ok(file) => {
                         self.open_segment = Some((path.clone(), file));
                         self.segments.push_back(Segment {
@@ -1255,11 +1255,15 @@ impl Spool {
         };
         let path = segment.path.clone();
         let counted = segment.len;
+        // A segment that holds bytes is opened again only where it still is. Creating it again
+        // would put the next bytes at the start of an empty file, where a reader of the cursors
+        // the index gives the segment would find them in place of what was there.
+        let holds_bytes = counted > 0 || segment.uncertain > 0;
         // Borrowed separately from the segment, because the handle lives beside the index rather
         // than inside it: a segment that is evicted takes its entry, not this handle.
         let handle = match self.open_segment.as_mut() {
             Some((open, file)) if *open == path => file,
-            _ => match open_segment(&path) {
+            _ => match open_segment(&path, !holds_bytes) {
                 Ok(file) => {
                     self.open_segment = Some((path.clone(), file));
                     &mut self
@@ -1324,16 +1328,8 @@ impl Spool {
         let may_cut = !self.refuse_cut;
         #[cfg(not(test))]
         let may_cut = true;
-        let (kept, uncertain) = match self.open_segment.as_mut() {
-            Some((_, file))
-                if may_cut
-                    && file.set_len(counted).is_ok()
-                    && file
-                        .metadata()
-                        .is_ok_and(|metadata| metadata.len() == counted) =>
-            {
-                (0, 0)
-            }
+        let (kept, uncertain) = match self.open_segment.as_ref() {
+            Some((path, _)) if may_cut && cut_back(path, counted) => (0, 0),
             Some((_, file)) => match file.metadata() {
                 Ok(metadata) => (metadata.len().saturating_sub(counted).min(attempted), 0),
                 Err(_) => (0, attempted),
@@ -1708,27 +1704,24 @@ impl Spool {
     /// A file that went from under the index is a range this host no longer holds, and counting it
     /// would make the session look larger than it is: the next capacity pass would evict output it
     /// did not need to. The range reads as a hole afterwards, as it did to any reader that reached
-    /// it before. The newest segment is no exception: a handle open on a file that has gone writes
-    /// to nothing any reader can reach, so it is dropped, and the next byte starts a new segment.
+    /// it before. The newest segment is no exception, and the handle it is written through goes
+    /// first: where the platform keeps a removed file until its last handle closes, as Windows
+    /// does, the file is still there while this spool holds it open, and would be counted as held.
+    /// The next write opens the newest segment again, and only where it still is; one that has gone
+    /// is forgotten here, and the next byte starts a new segment.
     fn forget_vanished(&mut self) {
-        let open = self.open_segment.as_ref().map(|(path, _)| path.clone());
+        self.open_segment = None;
         let mut kept = 0;
-        let mut dropped_open = false;
         self.segments.retain(|segment| {
             let gone = matches!(
                 std::fs::symlink_metadata(&segment.path),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound
             );
-            if gone {
-                dropped_open |= open.as_ref() == Some(&segment.path);
-            } else {
+            if !gone {
                 kept += segment.len + segment.uncertain;
             }
             !gone
         });
-        if dropped_open {
-            self.open_segment = None;
-        }
         self.total_bytes = kept;
     }
 }
@@ -1818,11 +1811,27 @@ fn create_owner_only(directory: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(directory)
 }
 
-fn open_segment(path: &Path) -> std::io::Result<std::fs::File> {
+/// Opens a segment to append to it, creating it only when `create` says so.
+fn open_segment(path: &Path, create: bool) -> std::io::Result<std::fs::File> {
     std::fs::OpenOptions::new()
-        .create(true)
+        .create(create)
         .append(true)
         .open(path)
+}
+
+/// Cuts a segment back to `len` bytes, and says whether its file now holds exactly that many.
+///
+/// It opens a handle of its own to do it: the one the spool appends through may add to a file
+/// and not shorten it, which is what a Windows handle opened to append is.
+fn cut_back(path: &Path, len: u64) -> bool {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .and_then(|file| {
+            file.set_len(len)?;
+            file.metadata()
+        })
+        .is_ok_and(|metadata| metadata.len() == len)
 }
 
 fn append_open(file: &mut std::fs::File, bytes: &[u8]) -> std::io::Result<()> {

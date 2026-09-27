@@ -2402,15 +2402,19 @@ to before it deletes what supports that, so a session reopened over an empty dir
 its cursor and reports the range that went rather than starting again at nought. The boundary it
 writes is where the session's output reached, including output the spool did not take.
 
-A hole *inside* the retained range is reported too. A range between two segments that nothing
-holds - a segment deleted from under the session or lost with its disk, or a newest segment gone
-past the boundary the spool recorded - reads as missing: a page stops before it, and a page at it
-returns the range as a gap, with the cause this host recorded for it or `archive_incomplete`, and
-goes on to the bytes after it. A segment file that goes while the session has its spool open is
-found the same way when a page reaches it, and the next retention pass forgets it, so the session
-is no longer counted as holding it. A session's retained bytes are what its segments and its
-resident window hold together, counted once, and the archive's own account names every hole
-beside the range before the oldest cursor.
+A hole *inside* the retained range is reported too. A range between two segments that nothing holds,
+whether a segment deleted from under the session or lost with its disk or a newest segment gone past
+the boundary the spool recorded, reads as missing: a page stops before it, and a page at it returns
+the range as a gap, with the cause this host recorded for it or `archive_incomplete`, and goes on to
+the bytes after it. A segment file that goes while the session has its spool open is found the same
+way when a page reaches it, and the next retention pass forgets it, so the session is no longer
+counted as holding it. That pass first lets go of the handle the newest segment is written through,
+because Windows keeps a removed file until its last handle closes, and the next write opens the
+segment again only where it still is: a segment that has gone is never made again, empty, under its
+old name, and the spool stops at that cursor until the next pass forgets it and writes what the
+resident window kept into a new segment. A session's retained bytes are what its segments and its
+resident window hold together, counted once, and the archive's own account names every hole beside
+the range before the oldest cursor.
 
 Removing output because it is old is expiry-based collection, so section 9's rule applies: a host
 that cannot prove its wall clock does not do it. The caps still apply, because they are about

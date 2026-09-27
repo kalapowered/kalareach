@@ -2214,6 +2214,60 @@ fn a_newest_segment_that_goes_under_an_open_index_is_forgotten_and_the_next_byte
 }
 
 #[test]
+fn a_segment_that_goes_between_two_writes_is_not_made_again_and_what_followed_it_is_kept() {
+    // A pass lets go of the handle the newest segment is written through, so the next write opens
+    // the segment again. One whose file has gone in between is not made again: an empty file at
+    // its name would put the next bytes where the index says earlier ones are. The spool stops at
+    // that cursor instead, and the next pass forgets the segment and writes what the resident
+    // window kept into a new one.
+    let directory =
+        std::env::temp_dir().join(format!("kr-persist-reopened-{}", kr_ipc::new_uuid()));
+    let mut history = kr_worker::history::OutputHistory::with_spool(
+        64,
+        &directory,
+        SpoolLayout::new(64, 1 << 20),
+    )
+    .expect("a spool");
+    history.append(b"aaaa");
+    history.apply_retention(
+        OutputRetention::DEFAULT,
+        history.retained_bytes(),
+        kr_ipc::now_ms(),
+        true,
+    );
+    std::fs::remove_file(segment_file(&directory, 0)).expect("removes the segment");
+    history.append(b"bbbb");
+    assert!(
+        !segment_file(&directory, 0).exists(),
+        "the segment that went was not made again"
+    );
+    let (at, reason) = history
+        .suspended()
+        .expect("the spool stopped where the segment went");
+    assert_eq!(at, 4);
+    assert!(reason.contains("could not be opened"), "{reason}");
+
+    history.apply_retention(
+        OutputRetention::DEFAULT,
+        history.retained_bytes(),
+        kr_ipc::now_ms(),
+        true,
+    );
+    assert!(
+        history.suspended().is_none(),
+        "the next pass took output again"
+    );
+    let reopened = kr_worker::history::OutputHistory::read_spool(&directory, SpoolLayout::DEFAULT)
+        .expect("reads the directory alone");
+    assert_eq!(
+        reopened.page(4, 64).expect("a page").bytes.as_slice(),
+        b"bbbb",
+        "what followed the segment that went is kept"
+    );
+    std::fs::remove_dir_all(&directory).ok();
+}
+
+#[test]
 fn a_position_past_output_the_spool_did_not_take_is_written_down_by_the_next_pass() {
     // Privacy mode's output is not retained, and the cursor still moves past it. A spool reopened
     // over the directory has to continue from there rather than reuse those cursors, so the next
