@@ -370,6 +370,15 @@ pub struct Session {
     /// snapshot of the same attachment keeps that moment, so replacing a subscription never moves
     /// what the view reaches. It goes with the attachment.
     live_views: BTreeMap<AttachmentId, u64>,
+    /// The attachments made under a grant: by every caller but the local owner, whichever socket
+    /// it came in on.
+    ///
+    /// An authority revision fences what those attachments were admitted to do, and an attachment
+    /// identifier is the only thing the input lease records about who holds it. The local owner's
+    /// attachments are not in here, because its authority is the operating-system identity the
+    /// socket authenticated and no revision replaces that. An attachment leaves it wherever it
+    /// leaves the session ([`Session::detach`]), the empty-prompt gesture included.
+    granted_attachments: std::collections::BTreeSet<AttachmentId>,
     /// The attachments the host would serve directly and is holding in projected mode.
     ///
     /// Section 8: a transition into live byte forwarding must use a parser-ground boundary with no
@@ -628,6 +637,7 @@ impl Session {
             content_scopes: std::collections::BTreeMap::new(),
             resource_views: BTreeMap::new(),
             live_views: BTreeMap::new(),
+            granted_attachments: std::collections::BTreeSet::new(),
             // Bound before the shell starts, from the desktop the create request recorded, or
             // from the login session this worker is in where the request recorded none. A desktop
             // that has already gone by now is a session that never had one, and the watch says so
@@ -1509,6 +1519,23 @@ impl Session {
         self.content_scopes.insert(attachment_id, scope);
     }
 
+    /// Records that an attachment was made under a grant, so an authority revision or the grant's
+    /// own expiry fences what it was admitted to do.
+    pub fn note_granted_attachment(&mut self, attachment_id: AttachmentId) {
+        self.granted_attachments.insert(attachment_id);
+    }
+
+    /// Returns true while an attachment made under a grant is still this session's.
+    #[must_use]
+    pub fn holds_granted_attachment(&self, attachment_id: AttachmentId) -> bool {
+        self.granted_attachments.contains(&attachment_id)
+    }
+
+    /// Forgets that an attachment was made under a grant, because it has left the session.
+    fn forget_granted_attachment(&mut self, attachment_id: AttachmentId) {
+        self.granted_attachments.remove(&attachment_id);
+    }
+
     /// Returns how much of the screen one attachment's caller may be shown.
     ///
     /// An attachment with no recorded scope is drawn the whole screen. That is the local case: a
@@ -1968,6 +1995,7 @@ impl Session {
         self.content_scopes.remove(&attachment_id);
         self.resource_views.remove(&attachment_id);
         self.live_views.remove(&attachment_id);
+        self.forget_granted_attachment(attachment_id);
         // Undelivered input from the removed attachment goes with it; nothing is replayed. A paste
         // it had open is closed first, so the application is not left inside a bracketed paste
         // whose source has gone.

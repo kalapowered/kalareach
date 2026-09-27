@@ -183,14 +183,6 @@ pub struct WorkerService {
     /// mutation; it does not cover a read or a subscription already running on a connection that
     /// was authorised a moment before its authority was withdrawn. This is what covers those.
     admitted: Mutex<std::collections::BTreeMap<ConnectionId, Registration>>,
-    /// The attachments made under a grant: by every caller but the local owner, whichever socket
-    /// it came in on.
-    ///
-    /// An authority revision fences what those attachments were admitted to do, and an attachment
-    /// identifier is the only thing the input lease records about who holds it. The local owner's
-    /// attachments are not in here, because its authority is the operating-system identity the
-    /// socket authenticated and no revision replaces that.
-    granted_attachments: Mutex<std::collections::BTreeSet<AttachmentId>>,
     /// The session's questions, and the sources bound to them.
     questions: Arc<crate::questions::Questions>,
     /// The session's journal file, which the attention sources are read from.
@@ -279,16 +271,15 @@ impl WorkerService {
         &self.broker
     }
 
-    /// Whether this service still counts `attachment_id` among the attachments made under a
-    /// grant, for the host crates' own tests: an entry holds no lease, so nothing else shows one
-    /// that outlived its attachment.
+    /// Whether the session still counts `attachment_id` among the attachments made under a grant,
+    /// for the host crates' own tests: an entry holds no lease, so nothing else shows one that
+    /// outlived its attachment.
     #[cfg(feature = "testing")]
     #[must_use]
     pub fn holds_granted_attachment(&self, attachment_id: AttachmentId) -> bool {
-        self.granted_attachments
-            .lock()
-            .expect("the granted attachment set is not poisoned")
-            .contains(&attachment_id)
+        self.runtime
+            .session()
+            .holds_granted_attachment(attachment_id)
     }
 
     /// Sets up the backends an integrated invocation is given before it runs, on this session's
@@ -414,7 +405,6 @@ impl WorkerService {
             dispatch: Mutex::new(()),
             connections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             admitted: Mutex::new(std::collections::BTreeMap::new()),
-            granted_attachments: Mutex::new(std::collections::BTreeSet::new()),
             questions,
             journal_path: binding.journal_path,
             attention_reader: Mutex::new(None),
@@ -1542,7 +1532,6 @@ impl WorkerService {
             let _ = session.detach(attachment_id);
             // The fence this detach moved, and any terminator it produced, reach the writer here.
             self.runtime.flush_locked(&mut session);
-            self.forget_granted_attachment(attachment_id);
         }
         // A window that outlived its connection could first-admit a request through a connection
         // that no longer exists, so the connection's windows go when it does, and so does its
@@ -2603,38 +2592,6 @@ impl WorkerService {
         })
     }
 
-    /// Forgets an attachment that has gone, so the set holds only attachments that exist.
-    ///
-    /// Every way this service ends an attachment comes through here: its own detach, its
-    /// connection going, and a withdrawal taking it back. A set that only grew would keep one entry
-    /// per attachment made under a grant for as long as this worker ran. The one removal that does
-    /// not is the detach gesture at an empty root prompt, which the session makes itself when the
-    /// root editor's reader asks for it; what that leaves goes the next time the set is read or
-    /// added to ([`Self::granted_attachments`]).
-    fn forget_granted_attachment(&self, attachment_id: AttachmentId) {
-        self.granted_attachments
-            .lock()
-            .expect("the granted attachment set is not poisoned")
-            .remove(&attachment_id);
-    }
-
-    /// The attachments made under a grant, holding only attachments `session` still has.
-    ///
-    /// Whatever reads the set or adds to it takes it through here, so an attachment the session
-    /// let go of without this service, as the empty-prompt gesture does, is gone from the set
-    /// before anything is decided on it or added beside it.
-    fn granted_attachments(
-        &self,
-        session: &Session,
-    ) -> std::sync::MutexGuard<'_, std::collections::BTreeSet<AttachmentId>> {
-        let mut granted = self
-            .granted_attachments
-            .lock()
-            .expect("the granted attachment set is not poisoned");
-        granted.retain(|held| session.attachment_capabilities(*held).is_some());
-        granted
-    }
-
     /// Takes the input lease away from a caller acting under a grant, with whatever it had not
     /// delivered.
     ///
@@ -2661,7 +2618,7 @@ impl WorkerService {
         if only.is_some_and(|named| named != holder) {
             return;
         }
-        let granted = self.granted_attachments(session).contains(&holder);
+        let granted = session.holds_granted_attachment(holder);
         if !granted {
             return;
         }
@@ -2753,7 +2710,6 @@ impl WorkerService {
             let _ = session.detach(attachment_id);
             // The fence this detach moved, and any terminator it produced, reach the writer here.
             self.runtime.flush_locked(&mut session);
-            self.forget_granted_attachment(attachment_id);
         }
         // Last, and never before the latch above. Nobody is left to read the recovery this
         // connection was paging, and a first page still being cut for it finds the latch set and
@@ -5600,7 +5556,7 @@ impl WorkerService {
                     session.narrow_content(attachment_id, filter.screen_scope());
                     // And what the attachment was admitted to do ends with the authority behind
                     // it: a revision or the grant's own expiry takes its input lease away.
-                    self.granted_attachments(session).insert(attachment_id);
+                    session.note_granted_attachment(attachment_id);
                 }
                 state.add_attachment(attachment_id);
                 Ok((encode(&result)?, AfterEffect::None))
@@ -5624,11 +5580,11 @@ impl WorkerService {
                 self.runtime.flush_locked(session);
                 // Whatever the result, the attachment is no longer the session's: the session either
                 // never had it or removed it before the geometry succession that can fail, and
-                // nothing puts a removed attachment back. So this connection and the fence stop
-                // holding it before the result is looked at, or a failed succession would leave
-                // both naming an attachment the session no longer has.
+                // nothing puts a removed attachment back. So this connection stops holding it
+                // before the result is looked at, or a failed succession would leave it naming an
+                // attachment the session no longer has. The session let go of it as one made under
+                // a grant when it removed it.
                 state.remove_attachment(attachment_id);
-                self.forget_granted_attachment(attachment_id);
                 let result = outcome?;
                 Ok((encode(&result)?, AfterEffect::None))
             }
