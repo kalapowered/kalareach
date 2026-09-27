@@ -1574,6 +1574,111 @@ fn a_publication_answered_after_the_line_is_an_artifact_and_never_a_new_one() {
     }
 }
 
+/// The caller's record of the privacy boundary and the fence are one step for backup production.
+/// An answer that arrives once the record is written, and before the fence is up, waits for the
+/// fence and is then an artifact; a record that fails changes nothing here.
+#[test]
+fn an_answer_between_the_callers_record_and_the_fence_waits_and_finds_the_fence_up() {
+    let environment = Environment::open();
+    let producer = Producer::generate();
+    environment
+        .service()
+        .enrol_writer(producer.writer.key_id(), archive_id(), TimestampMs::new(1))
+        .expect("the writer is enrolled");
+    let objects = [stage(1, "a.cbor", b"one")];
+    let sealed = producer.seal(1, &objects);
+    let admitted = environment
+        .service()
+        .admit(
+            &sealed,
+            &objects,
+            producer.writer.key_id(),
+            TimestampMs::new(5_000),
+        )
+        .expect("the generation is admitted");
+    environment
+        .service()
+        .note_dispatched(admitted.sequence, EXECUTOR, TimestampMs::new(5_100))
+        .expect("the upload is in flight");
+    let publication = dispatch_publication(
+        environment.service(),
+        admitted.sequence,
+        BackupGeneration::new(1),
+        TimestampMs::new(5_300),
+    );
+
+    let (recorded_tx, recorded_rx) = std::sync::mpsc::channel();
+    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+    std::thread::scope(|scope| {
+        // Owned here, so a failed assertion lets the paused record finish rather than wait.
+        let go_tx = go_tx;
+        let service = environment.service();
+        let fencing = scope.spawn(move || {
+            service.raise_fence_recorded(PrivacyGeneration::new(1), TimestampMs::new(6_000), || {
+                // The caller's record is written; the fence has not gone up yet.
+                let _ = recorded_tx.send(());
+                let _ = go_rx.recv();
+                Ok::<(), &str>(())
+            })
+        });
+        recorded_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the record is written");
+        let (answered_tx, answered_rx) = std::sync::mpsc::channel();
+        scope.spawn(move || {
+            let answered = service.note_published(
+                publication,
+                PrivacyGeneration::INITIAL,
+                TimestampMs::new(6_500),
+            );
+            let _ = answered_tx.send(answered);
+        });
+        assert!(
+            answered_rx
+                .recv_timeout(std::time::Duration::from_millis(300))
+                .is_err(),
+            "no backup decision falls between the record and the fence"
+        );
+        go_tx.send(()).expect("the paused record goes on");
+        fencing
+            .join()
+            .expect("the fencing finishes")
+            .expect("the record was written")
+            .expect("the fence goes up");
+        let answered = answered_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the decision is made")
+            .expect("the answer is recorded");
+        assert_eq!(
+            answered,
+            Publication::RetainedArtifact {
+                privacy_generation: 0
+            },
+            "decided after this host stopped at the boundary"
+        );
+    });
+    assert_eq!(environment.service().fenced_at().expect("a read"), Some(1));
+
+    // A record that fails returns its own error, and the service is as it was.
+    let untouched = Environment::open();
+    let refused = untouched.service().raise_fence_recorded(
+        PrivacyGeneration::new(1),
+        TimestampMs::new(6_000),
+        || Err("the record was refused"),
+    );
+    assert!(matches!(refused, Err("the record was refused")));
+    assert_eq!(untouched.service().fenced_at().expect("a read"), None);
+    assert_eq!(untouched.service().unready(), None);
+    assert!(
+        untouched
+            .service()
+            .outstanding_work()
+            .expect("a read")
+            .failed_steps
+            .is_empty()
+    );
+}
+
 #[test]
 fn a_fence_is_recorded_durably_and_a_restart_comes_back_fenced() {
     let root = tempfile::tempdir().expect("a disposable directory on the internal disk");
