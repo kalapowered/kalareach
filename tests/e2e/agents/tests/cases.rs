@@ -3026,8 +3026,27 @@ fn outline(conversation: &Path, from: Option<usize>, needles: &[(&str, &str)]) -
                 .filter(|(_, needle)| line.contains(needle))
                 .map(|(label, _)| *label)
                 .collect();
+            // The end of what the agent wrote, from the part's own test conversation, which is
+            // where a closing word it was asked for would be.
+            let tail = serde_json::from_str::<serde_json::Value>(line)
+                .ok()
+                .filter(|value| value["type"] == "assistant")
+                .and_then(|value| {
+                    value["message"]["content"].as_array().map(|blocks| {
+                        blocks
+                            .iter()
+                            .filter_map(|block| block["text"].as_str())
+                            .collect::<String>()
+                    })
+                })
+                .map(|text| {
+                    let chars: Vec<char> = text.chars().collect();
+                    let from = chars.len().saturating_sub(40);
+                    format!(" ...{:?}", chars[from..].iter().collect::<String>())
+                })
+                .unwrap_or_default();
             format!(
-                "{index} {kind}{}",
+                "{index} {kind}{}{tail}",
                 if held.is_empty() {
                     String::new()
                 } else {
@@ -3222,8 +3241,7 @@ fn slash_commands_interrupts_queued_prompts_and_steering_each_work_from_a_device
             stage,
             &format!(
                 "Without using any tool or file, count from 1 to 400 in your reply, one number per \
-                 line, then write the word DONE, a hyphen, the code {mark} in upper case and -Q, \
-                 and nothing else. ({mark}-q)"
+                 line, then write {queued_done} on a line of its own, and nothing else. ({mark}-q)"
             ),
             "a turn to queue behind",
         );
@@ -3326,8 +3344,8 @@ fn slash_commands_interrupts_queued_prompts_and_steering_each_work_from_a_device
                 stage,
                 &format!(
                     "Without using any tool or file, count from 1 to 400 in your reply, one number \
-                     per line, then write the word DONE, a hyphen, the code {mark} in upper case \
-                     and -S, and nothing else. ({mark}-s)"
+                     per line, then write {steered_done} on a line of its own, and nothing else. \
+                     ({mark}-s)"
                 ),
                 "a turn to steer",
             );
