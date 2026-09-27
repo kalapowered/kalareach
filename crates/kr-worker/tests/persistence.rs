@@ -2444,11 +2444,12 @@ struct EarlierHistoryGap {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_full_journal_fences_a_rich_mutation_while_raw_input_keeps_flowing() {
-    // KR-ACC-028, for the parts this suite can drive: the journal is filled while the input lease
-    // is live and an application is reading from the terminal; the bytes the person types still
-    // reach it and the interrupt still interrupts it, while a rich mutation and the answer to a
-    // pending decision are refused before anything is dispatched, and nothing is left behind for
-    // a replay to find.
+    // KR-ACC-028: the journal is filled while the input lease is live and an application is
+    // reading from the terminal and answering it; the bytes the person types still reach it and
+    // the interrupt still interrupts it, while a rich mutation and the answer to a pending
+    // decision are refused before anything is dispatched, and nothing is left behind for a replay
+    // to find. Then the store is given room again and recovers, and nothing the fence refused is
+    // dispatched afterwards: what was refused stays refused until it is asked for again.
     let host = host_running(
         "stty -echo; trap 'printf \"kr-interrupted.\\n\"' INT; printf 'kr-ready.\\n'; \
          while :; do if IFS= read -r line; then printf 'kr-got:%s\\n' \"$line\"; fi; done",
@@ -2650,6 +2651,113 @@ async fn a_full_journal_fences_a_rich_mutation_while_raw_input_keeps_flowing() {
                 .admits(WorkClass::NativeTerminal)
         );
     }
+
+    // The store is given room again, as a disk that was cleared is, and the next maintenance pass
+    // recovers it: the interval durable writing was lost is written down first, and rich work is
+    // admitted again.
+    {
+        let mut session = host.runtime.session();
+        session
+            .journal_mut()
+            .expect("a journal")
+            .release_size_cap()
+            .expect("the store can grow again");
+    }
+    host.service.recover_storage_now();
+    {
+        let session = host.runtime.session();
+        assert!(
+            session.durability_posture().admits(WorkClass::RichMutation),
+            "the store recovered"
+        );
+        assert!(
+            !session
+                .journal()
+                .expect("a journal")
+                .recovery_gaps()
+                .expect("reads the gaps")
+                .is_empty(),
+            "the interval durable writing was lost is written down"
+        );
+    }
+
+    // Nothing the fence refused is dispatched now that the store could take it. The refused
+    // attach has no receipt and made no attachment, and the refused answer decided nothing:
+    // KR-ACC-028's "never replay volatile requests" holds across the recovery, not only during
+    // the fault.
+    {
+        let mut session = host.runtime.session();
+        assert_eq!(
+            session.attachments().len(),
+            1,
+            "the refused attach made no attachment"
+        );
+        let caller = ActorId::new(format!("local:{}", kr_ipc::paths::current_uid()))
+            .expect("the local caller");
+        assert!(
+            session
+                .journal_mut()
+                .expect("a journal")
+                .read(caller, action_id)
+                .expect("reads")
+                .is_none(),
+            "the refused mutation was not replayed into the recovered store"
+        );
+    }
+    let (after, _) = host
+        .service
+        .questions()
+        .read_own(
+            &asker,
+            &kr_protocol::question::QuestionReadOwnParams {
+                session_id: host.session_id,
+                question_id: asked.question.question_id,
+                caller_token: asked.caller_token.clone(),
+                wait_ms: Nullable::null(),
+            },
+            now(),
+        )
+        .expect("the agent reads its question");
+    assert_eq!(
+        after.question.state,
+        kr_protocol::question::QuestionState::Pending,
+        "the refused answer was not replayed either"
+    );
+
+    // Work asked for again is admitted as new work, which is the only way it reaches the host.
+    let admitted: kr_protocol::attachment::SessionAttachResult = client
+        .mutate(
+            Method::SessionAttach,
+            ActionId::new(kr_ipc::new_uuid()),
+            target(&host),
+            &attach_params(host.session_id),
+        )
+        .await
+        .expect("reaches the worker")
+        .map(|value| value.to_typed().expect("decodes"))
+        .expect("the recovered store takes rich work again");
+    assert_ne!(
+        admitted.attachment.attachment_id,
+        attachment.attachment.attachment_id
+    );
+    // And the application still answers what is typed.
+    let written: kr_protocol::input::InputWriteResult = client
+        .request(
+            Method::InputWrite,
+            &kr_protocol::input::InputWriteParams {
+                session_id: host.session_id,
+                attachment_id: attachment.attachment.attachment_id,
+                epoch: lease.lease.epoch,
+                sequence: kr_protocol::ids::InputSequence::new(4),
+                bytes: kr_protocol::scalars::Bytes::new(b"kr-typed-4\n".to_vec()),
+            },
+        )
+        .await
+        .expect("reaches the worker")
+        .map(|value| value.to_typed().expect("decodes"))
+        .expect("the terminal takes input after the recovery");
+    assert_eq!(written.sequence.get(), 4);
+    produced(&host.runtime, b"kr-got:kr-typed-4").await;
 }
 
 /// KR-REQ-07.57: with the journal unreadable, the interrupt and the close still work, the close
@@ -2848,9 +2956,9 @@ async fn a_condition_the_store_already_reported_fences_rich_work_before_the_next
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_history_page_is_bounded_by_the_cursor_and_the_range_it_names() {
-    // KR-REQ-23.48 for `history.page`. The row also covers `events.subscribe`,
-    // `events.snapshot` and `action.read`, and present view authority over the subject; those
-    // belong to this host's own suites rather than being claimed here.
+    // KR-REQ-23.48 for `history.page`'s cursor and range. The row's other reads -
+    // `events.subscribe`, `events.snapshot` and `action.read` - and present view authority over
+    // their subject are proved in `tests/recovery_reads.rs`.
     let host = host().await;
     let mut client = cli(&host).await;
     {
