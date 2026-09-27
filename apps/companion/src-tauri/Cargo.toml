@@ -23,6 +23,12 @@ path = "src/main.rs"
 name = "navigation"
 harness = false
 
+# Opens a real window whose page listens for the host's events the way the interface does, so it
+# has its own main thread too.
+[[test]]
+name = "host_events"
+harness = false
+
 [build-dependencies]
 tauri-build = { workspace = true, features = [] }
 
