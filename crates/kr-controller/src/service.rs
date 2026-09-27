@@ -445,6 +445,9 @@ pub struct Controller {
     /// reconciliation this daemon does on its own both reach that point for the same session, so
     /// the two steps are one transaction.
     finalising: Mutex<()>,
+    /// This daemon's side of an update of the host: its gate to new sessions, the creates under
+    /// way, and whether it has been told to stop.
+    handover: host::Handover,
     _lock: SingletonLock,
 }
 
@@ -737,3 +740,8 @@ mod the_debt_pass;
 /// the tick that takes a session for ended only when the registry shows its launch is over.
 #[cfg(test)]
 mod a_change_that_waits_for_its_store;
+
+/// A daemon making way for an update: its gate to new sessions, the creates it waits for, and
+/// the stop, through its own door.
+#[cfg(test)]
+mod making_way_for_an_update;

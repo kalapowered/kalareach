@@ -1,9 +1,11 @@
-//! The host's own reads and records: host information, the environments, the doctor, agent tools.
+//! The host's own reads and records: host information, the environments, the doctor, agent tools,
+//! and the handover by which this daemon makes way for another installed release.
 
 use std::path::Path;
 use std::sync::Arc;
 
 use kr_protocol::envelope::{MutationRequest, ParamsValue};
+use kr_protocol::error::ErrorCode;
 use kr_protocol::hello::PROTOCOL_VERSION;
 use kr_protocol::hostinfo::export::{ContentClass, Sentence};
 use kr_protocol::hostinfo::{
@@ -14,6 +16,10 @@ use kr_protocol::identity::WorkerProfile;
 use kr_protocol::ids::ActorId;
 use kr_protocol::method::Method;
 use kr_protocol::scalars::{Nullable, U64};
+use kr_protocol::update::{
+    HANDOVER_HOLD_MS, HANDOVER_SETTLE_MS, HandoverStep, HostUpdateHandoverParams,
+    HostUpdateHandoverResult, ReleaseName,
+};
 
 use crate::error::{ControllerError, Result};
 
@@ -587,4 +593,244 @@ fn whoami() -> String {
     std::env::var("USER")
         .or_else(|_| std::env::var("USERNAME"))
         .unwrap_or_else(|_| format!("uid {}", kr_ipc::paths::current_uid()))
+}
+
+/// This daemon's side of an update of the host: its gate to new sessions, the creates under way,
+/// and whether it has been told to stop.
+///
+/// A create passes the gate at its start and is counted until it has settled, and the gate is
+/// closed under the same lock that counts: once a handover closes it, no create begins, and the
+/// ones already under way are the ones a handover waits for. A create settles when its worker has
+/// reported itself or is known not to, so every worker this daemon launched holds its own release
+/// by the time the daemon answers that it has made way.
+///
+/// A closed gate opens again by itself after [`HANDOVER_HOLD_MS`], so a daemon whose updater
+/// stopped between asking it to prepare and telling it to stop goes on starting sessions; a stop
+/// that comes after that is refused, so a daemon is never stopped with its gate open.
+#[derive(Debug)]
+pub(super) struct Handover {
+    gate: std::sync::Mutex<Gate>,
+    /// Signalled whenever a create under way settles.
+    settled: tokio::sync::Notify,
+    /// Whether this daemon has been told to stop.
+    stopping: tokio::sync::watch::Sender<bool>,
+}
+
+/// The gate itself.
+#[derive(Debug, Default)]
+struct Gate {
+    /// The creates admitted and not yet settled.
+    creates: usize,
+    /// Why the gate is closed and until when, while it is.
+    closed: Option<Closed>,
+}
+
+/// A closed gate.
+#[derive(Debug)]
+struct Closed {
+    /// The release the host is being updated to.
+    target: ReleaseName,
+    /// When the gate opens again by itself.
+    until: std::time::Instant,
+}
+
+impl Default for Handover {
+    fn default() -> Self {
+        Self {
+            gate: std::sync::Mutex::default(),
+            settled: tokio::sync::Notify::new(),
+            stopping: tokio::sync::watch::channel(false).0,
+        }
+    }
+}
+
+/// One create admitted through the gate, counted until it is dropped.
+pub(super) struct UnderWay<'a> {
+    handover: &'a Handover,
+}
+
+impl Drop for UnderWay<'_> {
+    fn drop(&mut self) {
+        {
+            let mut gate = self.handover.lock();
+            gate.creates = gate.creates.saturating_sub(1);
+        }
+        self.handover.settled.notify_waiters();
+    }
+}
+
+impl Handover {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Gate> {
+        self.gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Admits one create, counted until the returned value is dropped, or refuses it while the
+    /// gate is closed.
+    ///
+    /// # Errors
+    ///
+    /// `RESOURCE_UNAVAILABLE`, naming the release the host is being updated to, while the gate is
+    /// closed.
+    pub(super) fn admit(&self) -> Result<UnderWay<'_>> {
+        let mut gate = self.lock();
+        if let Some(closed) = &gate.closed {
+            if std::time::Instant::now() < closed.until {
+                return Err(ControllerError::Refused {
+                    code: ErrorCode::ResourceUnavailable,
+                    detail: format!(
+                        "this environment's control daemon is making way for release {} of this \
+                         host, and starts no session meanwhile; create the session again once \
+                         the update has finished",
+                        closed.target
+                    ),
+                });
+            }
+            // The update that closed it did not come back within its hold: the gate is open.
+            gate.closed = None;
+        }
+        gate.creates += 1;
+        Ok(UnderWay { handover: self })
+    }
+
+    /// Closes the gate for `hold`, naming the release the host is being updated to.
+    pub(super) fn close(&self, target: &ReleaseName, hold: std::time::Duration) {
+        self.lock().closed = Some(Closed {
+            target: target.clone(),
+            until: std::time::Instant::now() + hold,
+        });
+    }
+
+    /// Opens the gate.
+    pub(super) fn open(&self) {
+        self.lock().closed = None;
+    }
+
+    /// Waits up to `within` for every create under way to settle, and says how many have not.
+    pub(super) async fn settle(&self, within: std::time::Duration) -> usize {
+        let deadline = tokio::time::Instant::now() + within;
+        loop {
+            // Created before the count is read, so a create that settles between the two is not
+            // missed: the notification reaches a waiter from the moment it is created.
+            let settled = self.settled.notified();
+            let creates = self.lock().creates;
+            if creates == 0 {
+                return 0;
+            }
+            if tokio::time::timeout_at(deadline, settled).await.is_err() {
+                return self.lock().creates;
+            }
+        }
+    }
+
+    /// Tells this daemon to stop, when its gate is closed and has not lapsed.
+    ///
+    /// # Errors
+    ///
+    /// `RESOURCE_UNAVAILABLE` when the gate is open: this daemon was not prepared, or its
+    /// preparation lapsed and it may have started sessions since.
+    pub(super) fn stop(&self) -> Result<()> {
+        let gate = self.lock();
+        match &gate.closed {
+            Some(closed) if std::time::Instant::now() < closed.until => {
+                self.stopping.send_replace(true);
+                Ok(())
+            }
+            _ => Err(ControllerError::Refused {
+                code: ErrorCode::ResourceUnavailable,
+                detail: "this control daemon's gate to new sessions is open: it was not \
+                         prepared for a handover, or the preparation lapsed; prepare it again"
+                    .to_owned(),
+            }),
+        }
+    }
+
+    /// Waits until this daemon has been told to stop.
+    pub(super) async fn stopped(&self) {
+        let mut stopping = self.stopping.subscribe();
+        let _ = stopping.wait_for(|stopping| *stopping).await;
+    }
+}
+
+impl Controller {
+    /// `host.update.handover`: makes way for another installed release, one step at a time.
+    ///
+    /// `prepare` closes the gate to new sessions, waits for the creates under way to settle and
+    /// answers how this daemon was started; `stop` then tells the daemon to stop, and `resume`
+    /// opens the gate again instead. Every step answers the same way, so an updater that lost an
+    /// answer asks again rather than guessing.
+    ///
+    /// # Errors
+    ///
+    /// `RESOURCE_UNAVAILABLE` when the creates under way do not settle within
+    /// [`HANDOVER_SETTLE_MS`] (the gate opens again), or when `stop` finds the gate open.
+    pub(super) async fn update_handover(&self, mutation: &MutationRequest) -> Result<ParamsValue> {
+        let params: HostUpdateHandoverParams = parse(&mutation.params)?;
+        match params.step {
+            HandoverStep::Prepare => {
+                self.handover.close(
+                    &params.target,
+                    std::time::Duration::from_millis(HANDOVER_HOLD_MS),
+                );
+                let unsettled = self
+                    .handover
+                    .settle(std::time::Duration::from_millis(HANDOVER_SETTLE_MS))
+                    .await;
+                if unsettled > 0 {
+                    self.handover.open();
+                    return Err(ControllerError::Refused {
+                        code: ErrorCode::ResourceUnavailable,
+                        detail: format!(
+                            "{unsettled} sessions this control daemon is creating did not finish \
+                             within {} seconds, so it does not make way for release {} now; its \
+                             gate to new sessions is open again",
+                            HANDOVER_SETTLE_MS / 1000,
+                            params.target
+                        ),
+                    });
+                }
+            }
+            HandoverStep::Stop => self.handover.stop()?,
+            HandoverStep::Resume => self.handover.open(),
+        }
+        encode(&self.started_as()?)
+    }
+
+    /// Waits until a prepared handover has told this daemon to stop, which is when the process
+    /// that serves it ends.
+    pub async fn handed_over(&self) {
+        self.handover.stopped().await;
+    }
+
+    /// How this daemon was started: what a daemon of the release that replaces it is started with.
+    fn started_as(&self) -> Result<HostUpdateHandoverResult> {
+        let arguments = std::env::args_os()
+            .skip(1)
+            .map(std::ffi::OsString::into_string)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|_| {
+                ControllerError::InvalidArgument(
+                    "this daemon was started with an argument that is not text, so a daemon of \
+                     another release cannot be started like it"
+                        .to_owned(),
+                )
+            })?;
+        let working_directory = std::env::current_dir()
+            .ok()
+            .and_then(|directory| directory.into_os_string().into_string().ok())
+            .ok_or_else(|| {
+                ControllerError::InvalidArgument(
+                    "this daemon's working directory cannot be read as text, so a daemon of \
+                     another release cannot be started like it"
+                        .to_owned(),
+                )
+            })?;
+        Ok(HostUpdateHandoverResult {
+            release: Nullable(ReleaseName::new(self.release.clone()).ok()),
+            pid: U64::new(u64::from(std::process::id())),
+            arguments,
+            working_directory,
+        })
+    }
 }

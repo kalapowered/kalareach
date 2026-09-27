@@ -531,6 +531,16 @@ impl Controller {
                     ));
                 }
             }
+            // A handover acts on this daemon, which serves the whole environment, not on a session.
+            Method::HostUpdateHandover => {
+                if mutation.target.session_id.as_ref().is_some() {
+                    return Err(ControllerError::InvalidArgument(
+                        "a handover belongs to this environment's daemon, not to one session"
+                            .to_owned(),
+                    ));
+                }
+                let _: kr_protocol::update::HostUpdateHandoverParams = parse(&mutation.params)?;
+            }
             Method::DevicePreviewKeyUpdate => {
                 if mutation.target.session_id.as_ref().is_some() {
                     return Err(ControllerError::InvalidArgument(

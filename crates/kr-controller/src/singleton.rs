@@ -45,6 +45,23 @@ impl SingletonLock {
     /// [`ControllerError::Ipc`] naming the lock file when it cannot be opened or locked for any
     /// other reason.
     pub fn acquire(path: &Path, environment_id: EnvironmentId) -> Result<Self> {
+        let held = Self::hold(path, environment_id)?;
+        // The daemon that holds the environment says which process it is, in the lock file itself:
+        // an update of the host that finds the environment held by a daemon that does not answer
+        // names that process, and how to stop it.
+        held.record_holder()?;
+        Ok(held)
+    }
+
+    /// Takes the environment's lock without advancing its generation or naming a holder.
+    ///
+    /// What an update of the host holds while it reads an environment whose daemon has stopped:
+    /// no daemon can take the environment meanwhile, and nothing about it changes.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`Self::acquire`] returns.
+    pub fn hold(path: &Path, environment_id: EnvironmentId) -> Result<Self> {
         let file = Self::open(path, environment_id)?;
         Self::lock(&file, path, environment_id)?;
         Ok(Self {
@@ -52,6 +69,44 @@ impl SingletonLock {
             path: path.to_path_buf(),
             environment_id,
             generation: ControllerGeneration::new(0),
+        })
+    }
+
+    /// The process a lock file names as the daemon holding its environment, where it names one.
+    ///
+    /// Read only once the lock has been found held: a lock file outlives the daemon that wrote
+    /// it, so what it names says something only while a holder is there to have written it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::Ipc`] naming the file when it cannot be read.
+    pub fn holder(path: &Path) -> Result<Option<u32>> {
+        match std::fs::read_to_string(path) {
+            Ok(text) => Ok(text.trim().parse().ok()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(ControllerError::Ipc(kr_ipc::IpcError::io(
+                "read the singleton lock",
+                path,
+                error,
+            ))),
+        }
+    }
+
+    /// Writes this process's identifier into the lock file, in place of whatever it held.
+    fn record_holder(&self) -> Result<()> {
+        use std::io::{Seek as _, Write as _};
+
+        let recorded = self
+            .file
+            .set_len(0)
+            .and_then(|()| (&self.file).seek(std::io::SeekFrom::Start(0)).map(|_| ()))
+            .and_then(|()| writeln!(&self.file, "{}", std::process::id()));
+        recorded.map_err(|error| {
+            ControllerError::Ipc(kr_ipc::IpcError::io(
+                "write the singleton lock",
+                &self.path,
+                error,
+            ))
         })
     }
 
@@ -369,5 +424,32 @@ mod tests {
                 .contains(r"C:\environment\singleton.lock"),
             "the failure names the lock file: {refused}"
         );
+    }
+
+    /// The daemon that holds an environment names its process in the lock file, and what an update
+    /// holds the lock with names nobody.
+    #[cfg(unix)]
+    #[test]
+    fn the_daemon_holding_an_environment_names_its_process_in_the_lock() {
+        let host = kr_ipc::testing::TempHost::create();
+        let path = host.environment().singleton_lock();
+        let daemon = SingletonLock::acquire(&path, host.environment_id()).expect("takes it");
+        assert_eq!(
+            SingletonLock::holder(&path).expect("reads"),
+            Some(std::process::id())
+        );
+        drop(daemon);
+        // The control: a hold writes nothing, so what an update holds leaves the file as it was.
+        std::fs::write(&path, b"not a process\n").expect("overwritten");
+        let update = SingletonLock::hold(&path, host.environment_id()).expect("holds it");
+        assert_eq!(SingletonLock::holder(&path).expect("reads"), None);
+        assert!(
+            matches!(
+                SingletonLock::acquire(&path, host.environment_id()),
+                Err(ControllerError::AlreadyRunning { .. })
+            ),
+            "no daemon takes an environment an update holds"
+        );
+        drop(update);
     }
 }
