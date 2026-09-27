@@ -347,6 +347,12 @@ impl Enabling {
     }
 }
 
+/// Each subsystem with work outstanding, and how much.
+pub type Outstanding = Vec<(&'static str, u64)>;
+
+/// Each subsystem that could not answer, with its store's reason.
+pub type Unanswered = Vec<(&'static str, Unavailable)>;
+
 /// Whether privacy mode's cleanup has finished.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Completion {
@@ -370,10 +376,7 @@ pub enum Completion {
 impl Completion {
     /// Builds the answer from what is outstanding and what could not answer.
     #[must_use]
-    pub fn from_parts(
-        outstanding: Vec<(&'static str, u64)>,
-        unavailable: Vec<(&'static str, Unavailable)>,
-    ) -> Self {
+    pub fn from_parts(outstanding: Outstanding, unavailable: Unanswered) -> Self {
         if !unavailable.is_empty() {
             Self::Unavailable {
                 unavailable,
@@ -388,7 +391,7 @@ impl Completion {
 
     /// Returns what is outstanding and what could not answer, which is everything this says.
     #[must_use]
-    pub fn into_parts(self) -> (Vec<(&'static str, u64)>, Vec<(&'static str, Unavailable)>) {
+    pub fn into_parts(self) -> (Outstanding, Unanswered) {
         match self {
             Self::Complete => (Vec::new(), Vec::new()),
             Self::Reconciling { outstanding } => (outstanding, Vec::new()),

@@ -8350,7 +8350,7 @@ async fn a_privacy_fence_raised_mid_upload_stops_everything_not_yet_sent() {
         .run_cleanup(PrivacyGeneration::new(1), TimestampMs::new(13_000))
         .expect("the cleanup runs");
     assert!(host.service.obligations().expect("a read").is_empty());
-    let backup = privacy(&*host.service);
+    let backup = privacy(&host.service);
     let subsystems: Vec<&dyn PrivacySubsystem> = vec![&backup];
     assert!(PrivacyMode::reconcile(&subsystems).is_complete());
 }
