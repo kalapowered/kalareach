@@ -23,8 +23,8 @@
 //! | --- | --- |
 //! | KR-REQ-10.50 | `a_local_caller_under_a_grant_is_drawn_the_live_screen_alone`, `the_local_owner_is_drawn_the_whole_screen_and_a_device_the_live_screen` |
 //! | KR-REQ-10.49 | `a_local_caller_under_a_grant_is_refused_the_retained_history`, `the_local_owner_reads_the_retained_history_on_either_socket`, `a_local_caller_under_a_grant_reads_the_last_command_only_inside_its_scope`, `the_local_owner_reads_the_last_command_on_either_socket` |
-//! | KR-REQ-10.41 | `a_local_caller_under_a_grant_detaches_only_what_its_own_connection_made`, `the_local_owner_detaches_another_windows_attachment_and_a_device_does_not`, `a_detach_refused_for_another_connections_attachment_is_recorded_as_rejected` |
-//! | KR-REQ-10.45 | `a_revision_takes_the_lease_from_a_local_caller_under_a_grant`, `a_revision_takes_a_devices_lease_and_leaves_the_local_owners`, `an_attachment_the_empty_prompt_gesture_detaches_is_no_longer_counted_as_granted` |
+//! | KR-REQ-10.41 | `a_local_caller_under_a_grant_detaches_only_what_its_own_connection_made`, `the_local_owner_detaches_another_windows_attachment_and_a_device_does_not`, `a_detach_refused_for_another_connections_attachment_is_recorded_as_rejected`, `a_detach_whose_succession_fails_after_its_marker_stays_unknown` |
+//! | KR-REQ-10.45 | `a_revision_takes_the_lease_from_a_local_caller_under_a_grant`, `a_revision_takes_a_devices_lease_and_leaves_the_local_owners`, `an_attachment_the_empty_prompt_gesture_detaches_is_no_longer_counted_as_granted`, `the_empty_prompt_gesture_leaves_nothing_of_a_granted_attachment_behind`, `a_granted_attachment_detached_through_the_service_at_the_prompt_is_let_go_at_once` |
 //! | KR-REQ-23.46 | `a_local_caller_under_a_grant_cancels_its_own_intent_and_no_other`, `the_local_owner_cancels_another_actors_intent_and_a_device_does_not` |
 
 mod common;
@@ -1509,6 +1509,79 @@ async fn a_detach_refused_for_another_connections_attachment_is_recorded_as_reje
     wired.close();
 }
 
+/// KR-REQ-10.41, the control: a detach whose effect cannot be established once its dispatch
+/// marker is written stays `unknown`, never a rejection. The attachment that owns the session's
+/// size is detached, and the claim it would hand the size to is one the session's budget refuses
+/// after the attachment has been removed: the attachment is gone and the size did not move, which
+/// is not a refusal decided before anything changed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_detach_whose_succession_fails_after_its_marker_stays_unknown() {
+    let wired = wired("sleep 120").await;
+    let mut proxy = wired.daemon(ControllerConnectionRole::Proxy).await;
+    let owner = the_owner_forwarded();
+    let claiming = |dimensions: Dimensions| SessionAttachParams {
+        claim_geometry: true,
+        dimensions: Nullable::some(dimensions),
+        ..wired.terminal(&[
+            AttachmentCapability::ObserveTerminal,
+            AttachmentCapability::Geometry,
+        ])
+    };
+    let sized: SessionAttachResult = wired
+        .forward(
+            &mut proxy,
+            &owner,
+            &[],
+            Method::SessionAttach,
+            &claiming(Dimensions::new(80, 24)),
+        )
+        .await
+        .expect("the claim is admitted")
+        .to_typed()
+        .expect("an attachment");
+    let sized = sized.attachment.attachment_id;
+    // Valid dimensions, whose two screen buffers the session's budget does not hold: a claim that
+    // does not own the size is admitted without them, and the size is only asked for when the
+    // claim succeeds to it.
+    wired
+        .forward(
+            &mut proxy,
+            &owner,
+            &[],
+            Method::SessionAttach,
+            &claiming(Dimensions::new(2_000, 130)),
+        )
+        .await
+        .expect("a second claim is admitted");
+
+    let action_id = ActionId::new(kr_ipc::new_uuid());
+    let failed = wired
+        .forward_action(
+            &mut proxy,
+            &owner,
+            &[],
+            Method::SessionDetach,
+            &detaching(sized),
+            action_id,
+        )
+        .await
+        .expect_err("the size cannot be handed on");
+    assert_eq!(failed.code, ErrorCode::ResourceUnavailable, "{failed:?}");
+    assert!(
+        !wired.attached(sized),
+        "the attachment is gone all the same"
+    );
+    let receipt = wired.receipt("local:the-owner", action_id);
+    assert_eq!(
+        receipt.state,
+        ReceiptState::Unknown,
+        "a failure after the marker is an outcome nobody can establish: {receipt:?}"
+    );
+
+    drop(proxy);
+    wired.close();
+}
+
 // ---------------------------------------------------------------------------------------------
 // KR-REQ-10.45: whose input lease an authority revision fences
 // ---------------------------------------------------------------------------------------------
@@ -1556,6 +1629,84 @@ async fn an_attachment_the_empty_prompt_gesture_detaches_is_no_longer_counted_as
     assert!(
         !wired.service.holds_granted_attachment(granted),
         "the attachment the gesture detached is no longer counted as made under a grant"
+    );
+
+    drop(proxy);
+    wired.close();
+}
+
+/// KR-REQ-10.45: the empty-prompt gesture detaches an attachment made under a grant inside the
+/// session, and nothing the service holds about that attachment outlives it: it is not left for
+/// the next attach or read to clear.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_empty_prompt_gesture_leaves_nothing_of_a_granted_attachment_behind() {
+    let mut wired = managed().await;
+    let caller = local_under_a_grant(1);
+    let observe_and_type = [
+        AttachmentCapability::ObserveTerminal,
+        AttachmentCapability::Input,
+    ];
+    let mut proxy = wired.daemon(ControllerConnectionRole::Proxy).await;
+    let granted = wired
+        .attach_for(&mut proxy, &caller, WATCH_AND_TYPE, &observe_and_type)
+        .await
+        .attachment
+        .attachment_id;
+    wired
+        .acquire_for(&mut proxy, &caller, WATCH_AND_TYPE, granted)
+        .await;
+    assert!(wired.service.holds_granted_attachment(granted));
+
+    let fence = wired.fence_at_the_prompt().await;
+    assert_eq!(fence.originating_attachment, granted);
+    wired.detach_at_the_prompt(&fence).await;
+    assert!(!wired.attached(granted), "the gesture detached it");
+    assert!(
+        !wired.service.holds_granted_attachment(granted),
+        "and nothing of it is held as an attachment made under a grant"
+    );
+
+    drop(proxy);
+    wired.close();
+}
+
+/// KR-REQ-10.45, the control: an attachment made under a grant that its own connection detaches
+/// through the service at the same prompt, rather than by the gesture, goes from what the service
+/// holds at once, as it always did.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_granted_attachment_detached_through_the_service_at_the_prompt_is_let_go_at_once() {
+    let mut wired = managed().await;
+    let caller = local_under_a_grant(1);
+    let observe_and_type = [
+        AttachmentCapability::ObserveTerminal,
+        AttachmentCapability::Input,
+    ];
+    let mut proxy = wired.daemon(ControllerConnectionRole::Proxy).await;
+    let granted = wired
+        .attach_for(&mut proxy, &caller, WATCH_AND_TYPE, &observe_and_type)
+        .await
+        .attachment
+        .attachment_id;
+    wired
+        .acquire_for(&mut proxy, &caller, WATCH_AND_TYPE, granted)
+        .await;
+    let fence = wired.fence_at_the_prompt().await;
+    assert_eq!(fence.originating_attachment, granted);
+
+    wired
+        .forward(
+            &mut proxy,
+            &caller,
+            &[ActionRight::SessionView],
+            Method::SessionDetach,
+            &detaching(granted),
+        )
+        .await
+        .expect("its own attachment is detached");
+    assert!(!wired.attached(granted));
+    assert!(
+        !wired.service.holds_granted_attachment(granted),
+        "and it is no longer held as made under a grant"
     );
 
     drop(proxy);
