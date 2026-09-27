@@ -56,6 +56,16 @@ count is a lower bound and says "at least". An agent's history goes with it when
 one it was reading ended before its last entries were read. What a package shows arrives on the
 event stream, and a node already held is replaced only by a newer revision of it.
 
+A session has three views: the conversation, the raw terminal and its output. The output view reads
+what the session wrote, as the host keeps it, with `history.page`: from the live end, a page at a
+time with a cursor and a byte bound, towards older output as the reader scrolls up and newer output
+as they scroll down. It holds a bounded run of pages and lets pages go from the far end, and the page
+the reader is looking at stays where it is as pages come and go. It shows the text the session
+printed, decoded across page boundaries, and leaves out what a terminal would act on: colours,
+titles, cursor moves and clipboard writes. Where the host no longer keeps output it says so, and
+why. Each view keeps its own place across a change of view: the conversation and the output return
+the reader to the node or page they were reading, or to the live end if they were following it.
+
 A draft keeps the conversation it was written for: the agent's instance and the binding revision
 the person wrote to. If the agent moves to another conversation while the draft is on screen, the
 draft is conflicted and nothing sends it on; the person chooses whether it goes to the new one. A
