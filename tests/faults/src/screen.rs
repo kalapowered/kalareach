@@ -439,6 +439,45 @@ struct Cell {
     hyperlink: Option<String>,
 }
 
+/// The cell of `line` that covers `column`: the column it starts at (the one before, for the right
+/// half of a wide character), its text with any zero-width scalars after it, its rendition and its
+/// link. Nothing for a blank cell in the plain rendition outside a link.
+#[must_use]
+pub fn cell_at(line: &Line, column: u64) -> Option<(u64, String, CellRendition, Option<String>)> {
+    let mut found: Option<Cell> = None;
+    for run in &line.runs {
+        let mut at = run.column;
+        for scalar in run.text.chars() {
+            let mut buffer = [0_u8; 4];
+            let encoded: &str = scalar.encode_utf8(&mut buffer);
+            if kr_term::unicode::is_zero_width(scalar) {
+                if let Some(cell) = found.as_mut() {
+                    cell.text.push(scalar);
+                }
+                continue;
+            }
+            if found.is_some() {
+                break;
+            }
+            let width = u64::try_from(kr_term::unicode::cells_for(encoded)).unwrap_or(1);
+            if at <= column && column < at.saturating_add(width) {
+                found = Some(Cell {
+                    column: at,
+                    width,
+                    text: scalar.to_string(),
+                    rendition: run.rendition,
+                    hyperlink: run.hyperlink.clone(),
+                });
+            }
+            at = at.saturating_add(width);
+        }
+        if found.is_some() {
+            break;
+        }
+    }
+    found.map(|cell| (cell.column, cell.text, cell.rendition, cell.hyperlink))
+}
+
 /// Runs of cells, rewritten so that two lines a person reads the same way hold the same runs.
 ///
 /// Each run is split into its cells by the profile's own width model; a blank cell in the plain
