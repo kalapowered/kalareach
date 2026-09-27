@@ -10,27 +10,43 @@
 //! * **Each installation is its own environment authority.** Enrolling one here grants this host
 //!   nothing inside it, and a grouped listing keeps every identity distinct.
 //!
-//! The daemon these run against starts no workers, so nothing here needs a session. The
-//! environment tree is a temporary one on the internal disk and goes when the test does.
+//! A fourth follows from section 25: the scoped channel a bridge establishes belongs to the record
+//! it was opened for, so the answer to a refresh is one record's, whatever another client does to
+//! the record while the bridge is open.
+//!
+//! The daemon most of these run against starts no workers, so nothing here needs a session. The
+//! environment tree is a temporary one on the internal disk and goes when the test does. The
+//! fourth runs this build's daemon program with a stand-in for `wsl.exe` first on its path, from a
+//! copy on the internal disk.
 
 #![cfg(unix)]
 
 mod net_support;
 
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+
+use kr_ipc::client::LocalClient;
 use kr_protocol::actor::ActorIngress;
 use kr_protocol::authority::AuthorityDecision;
-use kr_protocol::envelope::ActionTarget;
-use kr_protocol::error::ErrorCode;
+use kr_protocol::envelope::{ActionTarget, ControlFrame, Outcome, ParamsValue, Response};
+use kr_protocol::error::{ErrorCode, ProtocolError};
+use kr_protocol::frame::{FrameCodec, StreamKind};
+use kr_protocol::hello::{ActionWindow, PROTOCOL_VERSION};
 use kr_protocol::identity::{
+    BootIdentity, BootIdentitySource, BridgeFrame, BridgeHelloAck, BridgeVerification,
     EnvironmentAccess, EnvironmentEnrolParams, EnvironmentEnrolResult, EnvironmentEnrolment,
     EnvironmentForgetParams, EnvironmentForgetResult, EnvironmentInventoryParams,
-    EnvironmentInventoryResult, EnvironmentPresence, EnvironmentRefreshParams,
-    EnvironmentRefreshResult, ObservationSource,
+    EnvironmentInventoryResult, EnvironmentInventoryRow, EnvironmentPresence, EnvironmentReadiness,
+    EnvironmentRefreshParams, EnvironmentRefreshResult, ObservationSource,
 };
-use kr_protocol::ids::{ActionId, EnvironmentId};
+use kr_protocol::ids::{
+    ActionId, ActionWindowId, BootEpoch, ConnectionId, EnvironmentId, RequestId,
+};
+use kr_protocol::local::{LocalClientKind, LocalRole};
 use kr_protocol::method::{Method, MethodVersion};
 use kr_protocol::rights::ActionRight;
-use kr_protocol::scalars::{Nullable, TimestampMs, Uuid};
+use kr_protocol::scalars::{Bytes, DurationMs, Nullable, TimestampMs, U64, Uuid};
 
 use net_support::{Host, build};
 
@@ -529,4 +545,619 @@ fn a_wsl_environment_works_with_no_native_installation_of_this_product() {
     // host keeps so it can find the distribution, and this side has none.
     let store_path = environment.state_dir().join("environments.json");
     assert!(!store_path.exists());
+}
+
+/// The distribution the stand-in for `wsl.exe` reports as running.
+const FIXTURE_TARGET: &str = "Ubuntu-Fixture";
+
+/// The helper a record names when it is first approved.
+const FIRST_HELPER: &str = "/usr/local/bin/kr";
+
+/// The helper the record that replaces it names instead.
+const MOVED_HELPER: &str = "/opt/kalareach/kr";
+
+/// What the stand-in's destination says when it refuses a bridge.
+const REFUSAL: &str = "the destination refuses this bridge";
+
+/// What `wsl.exe --list --verbose` prints on the machine the stand-in describes.
+const LISTING: &str = "  NAME              STATE           VERSION\n\
+                       * Ubuntu-Fixture    Running         2\n";
+
+/// The text of the stand-in for `wsl.exe`, which keeps its control files in `fixture`.
+///
+/// It records the argument vector of every invocation on a line of its own. It answers a listing
+/// with [`LISTING`], and a bridge with the frames the test wrote for that bridge's helper. When the
+/// test has asked for a bridge to be held, the stand-in marks it open once it has started, which is
+/// after the refresh that opened it has read its row, and waits for the test to release it before
+/// it answers. The wait has a bound of its own, longer than the silence the invoker allows, so a
+/// stand-in whose test has gone does not outlive it by much.
+fn stand_in(fixture: &Path) -> String {
+    let fixture = fixture.to_str().expect("a temporary path is text");
+    assert!(
+        !fixture.contains('\''),
+        "the stand-in quotes its directory with single quotes: {fixture}"
+    );
+    format!(
+        r##"#!/bin/sh
+fixture='{fixture}'
+line="$(printf '%s\t' "$@")"
+printf '%s\n' "$line" >>"$fixture/invocations"
+case "$1" in
+  --list)
+    cat "$fixture/listing"
+    exit 0
+    ;;
+  --distribution)
+    key="$(printf '%s' "$6" | tr '/' '-')"
+    if [ -e "$fixture/$key.hold" ]; then
+      : >"$fixture/$key.opened"
+      waited=0
+      while [ ! -e "$fixture/$key.release" ] && [ "$waited" -lt 600 ]; do
+        sleep 0.05
+        waited=$((waited + 1))
+      done
+    fi
+    cat "$fixture/$key.answer"
+    exec cat >/dev/null
+    ;;
+esac
+echo "the stand-in for wsl.exe has no answer for: $*" >&2
+exit 2
+"##
+    )
+}
+
+/// This build's control daemon, started as the program a person runs, with the stand-in for
+/// `wsl.exe` first on its path.
+///
+/// Everything it touches is on the internal disk: it runs from a copy there, in an environment tree
+/// of its own, and so does the stand-in. It keeps its keys in that tree rather than in a keychain.
+struct FixtureDaemon {
+    tree: kr_ipc::testing::TempHost,
+    fixture: PathBuf,
+    log: PathBuf,
+    child: std::process::Child,
+}
+
+impl FixtureDaemon {
+    fn start() -> Self {
+        let tree = kr_ipc::testing::TempHost::create();
+        let fixture = tree.root().join("fixture");
+        let bin = fixture.join("bin");
+        std::fs::create_dir_all(&bin).expect("the stand-in's directories");
+        std::fs::write(fixture.join("listing"), LISTING).expect("the listing");
+        // The stand-in is placed rather than written in place, like every program a test starts:
+        // a descriptor open for writing, handed to a child another thread was starting, would stop
+        // it from starting.
+        let text = fixture.join("wsl.exe.text");
+        std::fs::write(&text, stand_in(&fixture)).expect("the stand-in's text");
+        kr_ipc::testing::place_program(&text, &bin.join("wsl.exe"));
+        let program = tree.root().join("kr-controller");
+        kr_ipc::testing::place_program(Path::new(env!("CARGO_BIN_EXE_kr-controller")), &program);
+
+        let mut path = std::ffi::OsString::from(bin.as_os_str());
+        if let Some(inherited) = std::env::var_os("PATH") {
+            path.push(":");
+            path.push(inherited);
+        }
+        let log = tree.root().join("daemon.log");
+        let output = std::fs::File::create(&log).expect("the daemon's log");
+        let child = std::process::Command::new(&program)
+            // On the internal disk, never the checkout: a copied program is a new one to the
+            // operating system's privacy rules.
+            .current_dir(tree.root())
+            .arg("--runtime-dir")
+            .arg(tree.root().join("r"))
+            .arg("--state-dir")
+            .arg(tree.root().join("s"))
+            .arg("--worker")
+            .arg(tree.root().join("no-such-worker"))
+            .arg("--secret-store")
+            .arg("file")
+            .env("PATH", path)
+            .stdin(Stdio::null())
+            .stdout(output.try_clone().expect("the log again"))
+            .stderr(output)
+            .spawn()
+            .expect("the daemon starts");
+        Self {
+            tree,
+            fixture,
+            log,
+            child,
+        }
+    }
+
+    /// The daemon's own environment.
+    fn environment_id(&self) -> EnvironmentId {
+        self.tree.environment_id()
+    }
+
+    /// Connects one local client, once the daemon answers.
+    async fn client(&self) -> LocalClient {
+        let endpoint = self
+            .tree
+            .environment()
+            .controller_endpoint()
+            .expect("an endpoint");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        loop {
+            if let Ok(client) = LocalClient::connect(&endpoint, LocalClientKind::Cli, build()).await
+            {
+                return client;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the daemon did not answer, and its log says: {}",
+                std::fs::read_to_string(&self.log).unwrap_or_default()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    /// The name the stand-in files a helper's control files under.
+    fn key(helper: &str) -> String {
+        helper.replace('/', "-")
+    }
+
+    /// Sets the frames a bridge to `helper` answers with.
+    fn answer(&self, helper: &str, frames: &[BridgeFrame]) {
+        let codec = FrameCodec::new(StreamKind::Control);
+        let mut bytes = Vec::new();
+        for frame in frames {
+            bytes.extend(codec.encode_message(frame).expect("a bridge frame encodes"));
+        }
+        std::fs::write(
+            self.fixture.join(format!("{}.answer", Self::key(helper))),
+            bytes,
+        )
+        .expect("the answer is written");
+    }
+
+    /// Holds the next bridge to `helper` open once its helper has started.
+    fn hold(&self, helper: &str) {
+        let key = Self::key(helper);
+        for stale in ["opened", "release"] {
+            let _ = std::fs::remove_file(self.fixture.join(format!("{key}.{stale}")));
+        }
+        std::fs::write(self.fixture.join(format!("{key}.hold")), b"").expect("the hold is set");
+    }
+
+    /// Waits until a held bridge to `helper` has started.
+    async fn opened(&self, helper: &str) {
+        let marker = self.fixture.join(format!("{}.opened", Self::key(helper)));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !marker.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no bridge to {helper} was opened, and the daemon's log says: {}",
+                std::fs::read_to_string(&self.log).unwrap_or_default()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Lets a held bridge to `helper` answer, and holds none after it.
+    fn release(&self, helper: &str) {
+        let key = Self::key(helper);
+        std::fs::write(self.fixture.join(format!("{key}.release")), b"")
+            .expect("the release is written");
+        let _ = std::fs::remove_file(self.fixture.join(format!("{key}.hold")));
+    }
+
+    /// Every argument vector the stand-in was started with, in order.
+    fn invocations(&self) -> Vec<Vec<String>> {
+        std::fs::read_to_string(self.fixture.join("invocations"))
+            .unwrap_or_default()
+            .lines()
+            .map(|line| {
+                line.strip_suffix('\t')
+                    .unwrap_or(line)
+                    .split('\t')
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .collect()
+    }
+}
+
+impl Drop for FixtureDaemon {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// A WSL record for the fixture's distribution, as the owner approves it.
+fn fixture_record(environment_id: EnvironmentId, helper: &str) -> EnvironmentEnrolment {
+    EnvironmentEnrolment {
+        environment_id,
+        access: EnvironmentAccess::WslDistribution,
+        label: "fixture".to_owned(),
+        target: FIXTURE_TARGET.to_owned(),
+        os_user: "kala".to_owned(),
+        helper_path: helper.to_owned(),
+        clipboard_destination: Nullable::null(),
+        approved_at_ms: TimestampMs::new(0),
+    }
+}
+
+/// The acknowledgement the fixture's destination gives, and its answer to the one read a refresh
+/// carries.
+fn answered_as(environment_id: EnvironmentId) -> Vec<BridgeFrame> {
+    let connection_id = ConnectionId::new(Uuid::from_bytes([0x5c; 16]));
+    vec![
+        BridgeFrame::HelloAck(Box::new(BridgeHelloAck {
+            protocol_version: PROTOCOL_VERSION,
+            environment_id,
+            os_user: "kala".to_owned(),
+            role: LocalRole::Controller,
+            connection_id,
+            boot_identity: BootIdentity {
+                source: BootIdentitySource::LinuxBootId,
+                value: Bytes::new(b"fixture-boot".to_vec()),
+            },
+            max_frame_len: U64::new(65_536),
+            action_window: ActionWindow {
+                action_window_id: ActionWindowId::new("w-fixture").expect("a window"),
+                connection_id,
+                boot_epoch: BootEpoch::new(1),
+                issued_at_ms: TimestampMs::new(100),
+                valid_for_ms: DurationMs::new(120_000),
+            },
+        })),
+        BridgeFrame::Control(Box::new(ControlFrame::Response(Response {
+            request_id: RequestId::new(1),
+            outcome: Outcome::Ok(ParamsValue::empty()),
+        }))),
+    ]
+}
+
+/// What a refresh reports of an acknowledgement from [`answered_as`].
+fn verified_as(environment_id: EnvironmentId) -> BridgeVerification {
+    BridgeVerification {
+        environment_id,
+        os_user: "kala".to_owned(),
+        role: LocalRole::Controller,
+        protocol_version: PROTOCOL_VERSION,
+        max_frame_len: U64::new(65_536),
+    }
+}
+
+async fn enrol_as(
+    client: &mut LocalClient,
+    host_environment: EnvironmentId,
+    record: EnvironmentEnrolment,
+) -> EnvironmentEnrolment {
+    let enrolled: EnvironmentEnrolResult = client
+        .mutate(
+            Method::EnvironmentEnrol,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(host_environment),
+            &EnvironmentEnrolParams { enrolment: record },
+        )
+        .await
+        .expect("the daemon answers")
+        .expect("the owner may enrol an environment")
+        .to_typed()
+        .expect("an enrolment result");
+    enrolled.row.enrolment
+}
+
+async fn refresh_as(
+    client: &mut LocalClient,
+    host_environment: EnvironmentId,
+    environment_id: EnvironmentId,
+) -> EnvironmentRefreshResult {
+    client
+        .mutate(
+            Method::EnvironmentRefresh,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(host_environment),
+            &EnvironmentRefreshParams {
+                environment_id,
+                start: false,
+            },
+        )
+        .await
+        .expect("the daemon answers")
+        .expect("the owner may refresh an environment")
+        .to_typed()
+        .expect("a refresh result")
+}
+
+/// What the second client does to the record while the first client's bridge is open.
+#[derive(Clone, Copy, Debug)]
+enum Change {
+    Forgotten,
+    Replaced,
+}
+
+/// How the bridge that was held open ends.
+#[derive(Clone, Copy, Debug)]
+enum Ending {
+    Answered,
+    Refused,
+}
+
+/// A refreshed row of the fixture's distribution, observed running at `observed_at_ms`.
+fn refreshed_row(
+    enrolment: EnvironmentEnrolment,
+    observed_at_ms: TimestampMs,
+    readiness: EnvironmentReadiness,
+) -> EnvironmentInventoryRow {
+    EnvironmentInventoryRow {
+        enrolment,
+        last_observed_at_ms: observed_at_ms,
+        status: EnvironmentPresence::Running,
+        observation: ObservationSource::Refresh,
+        readiness,
+    }
+}
+
+/// Readiness that records both halves of the integration.
+fn both_recorded() -> EnvironmentReadiness {
+    EnvironmentReadiness {
+        helper_enrolled: true,
+        channel_scoped: true,
+        detail: "the helper and the scoped channel are both recorded".to_owned(),
+    }
+}
+
+/// A refresh whose bridge answered for the record that is approved now.
+fn established(
+    enrolment: EnvironmentEnrolment,
+    observed_at_ms: TimestampMs,
+) -> EnvironmentRefreshResult {
+    let environment_id = enrolment.environment_id;
+    EnvironmentRefreshResult {
+        row: refreshed_row(enrolment, observed_at_ms, both_recorded()),
+        started: false,
+        verification: Nullable::some(verified_as(environment_id)),
+        connection: format!(
+            "environment {environment_id} answered as kala over its own local channel"
+        ),
+    }
+}
+
+fn now_ms() -> u64 {
+    u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the clock is past 1970")
+            .as_millis(),
+    )
+    .expect("milliseconds fit")
+}
+
+/// One bridge held open across a change to the record it was opened for.
+///
+/// The first client establishes the channel for the record, then opens a second bridge and holds
+/// it once the refresh behind it has read that ready row. While it is held, the second client
+/// forgets the record, or approves a replacement and establishes the replacement's own channel.
+/// Then the held bridge ends as the case says. Its reply is asserted whole: the record it was
+/// opened for, observed running, claiming neither half of the integration and saying why, with
+/// the destination's answer where there was one. The inventory afterwards holds exactly what the
+/// second client left.
+async fn held_across(
+    daemon: &FixtureDaemon,
+    first: &mut LocalClient,
+    second: &mut LocalClient,
+    environment_id: EnvironmentId,
+    change: Change,
+    ending: Ending,
+) {
+    let case = format!("{change:?} while the bridge was open, then {ending:?}");
+    let host = daemon.environment_id();
+    let approved = enrol_as(first, host, fixture_record(environment_id, FIRST_HELPER)).await;
+
+    daemon.answer(FIRST_HELPER, &answered_as(environment_id));
+    let ready = refresh_as(first, host, environment_id).await;
+    assert_eq!(
+        ready,
+        established(approved.clone(), ready.row.last_observed_at_ms),
+        "{case}: a bridge that answered for the approved record establishes its channel"
+    );
+
+    daemon.hold(FIRST_HELPER);
+    let held = refresh_as(first, host, environment_id);
+    let meanwhile = async {
+        daemon.opened(FIRST_HELPER).await;
+        let replacement = match change {
+            Change::Forgotten => {
+                let forgotten: EnvironmentForgetResult = second
+                    .mutate(
+                        Method::EnvironmentForget,
+                        ActionId::new(kr_ipc::new_uuid()),
+                        ActionTarget::environment(host),
+                        &EnvironmentForgetParams { environment_id },
+                    )
+                    .await
+                    .expect("the daemon answers")
+                    .expect("the owner may forget an environment")
+                    .to_typed()
+                    .expect("a removal");
+                assert!(
+                    forgotten.forgotten,
+                    "{case}: the record was there to forget"
+                );
+                None
+            }
+            Change::Replaced => {
+                let replacement =
+                    enrol_as(second, host, fixture_record(environment_id, MOVED_HELPER)).await;
+                // The replacement's own bridge answers while the first is still held, and what it
+                // establishes is the replacement's.
+                daemon.answer(MOVED_HELPER, &answered_as(environment_id));
+                let its_own = refresh_as(second, host, environment_id).await;
+                assert_eq!(
+                    its_own,
+                    established(replacement.clone(), its_own.row.last_observed_at_ms),
+                    "{case}: the replacement's own bridge establishes its channel"
+                );
+                Some((replacement, its_own.row.last_observed_at_ms))
+            }
+        };
+        daemon.answer(
+            FIRST_HELPER,
+            &match ending {
+                Ending::Answered => answered_as(environment_id),
+                Ending::Refused => vec![BridgeFrame::Refused(ProtocolError::new(
+                    ErrorCode::PermissionDenied,
+                    REFUSAL,
+                ))],
+            },
+        );
+        daemon.release(FIRST_HELPER);
+        replacement
+    };
+    let (reply, replacement) = tokio::time::timeout(std::time::Duration::from_secs(120), async {
+        tokio::join!(held, meanwhile)
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "{case}: the held refresh did not come back, and the daemon's log says: {}",
+            std::fs::read_to_string(&daemon.log).unwrap_or_default()
+        )
+    });
+
+    let observed = reply.row.last_observed_at_ms;
+    assert!(
+        ready.row.last_observed_at_ms <= observed && observed.get() <= now_ms(),
+        "{case}: observed at {observed:?}"
+    );
+    let detail = match change {
+        Change::Forgotten => {
+            "this environment was forgotten while the bridge was open; enrol it again to reach it"
+        }
+        Change::Replaced => {
+            "this environment's record was replaced while the bridge was open; refresh it again to \
+             reach what is recorded now"
+        }
+    };
+    let (verification, connection) = match ending {
+        Ending::Answered => (
+            Nullable::some(verified_as(environment_id)),
+            "this environment's record changed while the bridge was open, so what answered says \
+             nothing about what is recorded now"
+                .to_owned(),
+        ),
+        Ending::Refused => (
+            Nullable::null(),
+            format!("the destination refused the bridge: {REFUSAL}"),
+        ),
+    };
+    assert_eq!(
+        reply,
+        EnvironmentRefreshResult {
+            row: refreshed_row(
+                approved,
+                observed,
+                EnvironmentReadiness {
+                    helper_enrolled: false,
+                    channel_scoped: false,
+                    detail: detail.to_owned(),
+                },
+            ),
+            started: false,
+            verification,
+            connection,
+        },
+        "{case}: the reply is the held record's alone"
+    );
+
+    // A listing asks the platform nothing. The earlier cases' records are still there, and each
+    // case reads its own.
+    let before = daemon.invocations().len();
+    let rows: Vec<EnvironmentInventoryRow> = inventory(second)
+        .await
+        .rows
+        .into_iter()
+        .filter(|row| row.enrolment.environment_id == environment_id)
+        .collect();
+    assert_eq!(
+        daemon.invocations().len(),
+        before,
+        "{case}: the listing started something"
+    );
+    match replacement {
+        None => assert!(rows.is_empty(), "{case}: {rows:?}"),
+        Some((replacement, observed_at_ms)) => assert_eq!(
+            rows,
+            vec![EnvironmentInventoryRow {
+                observation: ObservationSource::Cache,
+                ..refreshed_row(replacement, observed_at_ms, both_recorded())
+            }],
+            "{case}: the replacement keeps what its own bridge established"
+        ),
+    }
+}
+
+/// KR-REQ-25.26, through KR-REQ-03.15's bridge. The scoped channel a helper registers belongs to
+/// the record the bridge was opened for, and the answer to a refresh is that one record's: a
+/// bridge held open while a second client forgets the record, or approves a replacement and
+/// establishes the replacement's own channel, answers for the record it was opened for and claims
+/// neither half of the integration for it, whether it then answers or is refused, and the
+/// replacement keeps its own channel. The daemon is this build's program, reaching the stand-in
+/// for `wsl.exe` through its own path with the argument vector section 3 writes out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_bridge_held_open_while_another_client_changes_the_record_answers_for_its_own_record() {
+    let daemon = FixtureDaemon::start();
+    let mut first = daemon.client().await;
+    let mut second = daemon.client().await;
+    for (byte, change, ending) in [
+        (0x21, Change::Forgotten, Ending::Answered),
+        (0x22, Change::Forgotten, Ending::Refused),
+        (0x23, Change::Replaced, Ending::Answered),
+        (0x24, Change::Replaced, Ending::Refused),
+    ] {
+        held_across(
+            &daemon,
+            &mut first,
+            &mut second,
+            EnvironmentId::new(Uuid::from_bytes([byte; 16])),
+            change,
+            ending,
+        )
+        .await;
+    }
+
+    // Every process the daemon started was the stand-in, with an argument vector it built: the
+    // listing it observes a distribution with, and the bridge, whose helper is each record's own.
+    let bridge = |helper: &str| {
+        [
+            "--distribution",
+            FIXTURE_TARGET,
+            "--user",
+            "kala",
+            "--exec",
+            helper,
+            "bridge",
+            "--stdio",
+        ]
+        .map(str::to_owned)
+        .to_vec()
+    };
+    let listing = ["--list", "--verbose"].map(str::to_owned).to_vec();
+    let invocations = daemon.invocations();
+    for invocation in &invocations {
+        assert!(
+            *invocation == listing
+                || *invocation == bridge(FIRST_HELPER)
+                || *invocation == bridge(MOVED_HELPER),
+            "the daemon started the stand-in with {invocation:?}"
+        );
+    }
+    // Two refreshes of each first record and one of each replacement, each observing once and
+    // opening one bridge.
+    let count = |wanted: &Vec<String>| {
+        invocations
+            .iter()
+            .filter(|invocation| *invocation == wanted)
+            .count()
+    };
+    assert_eq!(count(&listing), 10, "{invocations:?}");
+    assert_eq!(count(&bridge(FIRST_HELPER)), 8, "{invocations:?}");
+    assert_eq!(count(&bridge(MOVED_HELPER)), 2, "{invocations:?}");
 }
