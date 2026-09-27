@@ -114,8 +114,7 @@ export function NewSession({
       cwd,
       dimensions: null,
       worker_profile: host.default_worker_profile,
-      // A session created from this application takes the environment of the host's own
-      // execution context, never this device's.
+      // None of this device's environment is sent: the host decides what the session starts with.
       environment_snapshot: [],
       palette: null,
       launch_profile: {

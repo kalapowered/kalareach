@@ -124,9 +124,10 @@ failures, and offers nothing to decide. Elapsed time is reported as elapsed time
   input each WebView already maps to them. `capture` opens the camera; an image filter opens the
   photo library; no filter opens the file browser. A picked file is uploaded, not held in the
   screen: the page hands its bytes to native code, which sends them through the transfer service,
-  and the file stays on the draft, uploading, uploaded or failed, until the person removes it. A
-  prompt sent from the phone carries its text inline and cannot carry the file, so a draft that
-  holds one is not sent until the person removes it.
+  and the file stays on the draft, uploading, uploaded or failed, until the person removes it. The
+  phone takes a picked file of up to 1,020 KB, what its connection carries in one chunk; a larger
+  one is refused with that reason. A prompt sent from the phone carries its text inline and cannot
+  carry the file, so a draft that holds one is not sent until the person removes it.
 - **The accessory row** carries the keys a software keyboard buries: escape, tab, control, alt, the
   arrows, home, end and the punctuation a shell needs. A modifier has three states (off, held for
   one key, and held) and says which one it is in rather than leaving it to a colour. A tap on a key

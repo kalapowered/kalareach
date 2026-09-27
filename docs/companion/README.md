@@ -72,19 +72,25 @@ the session's own size, and declares the entries this device's filter withheld, 
 and the ranges the host no longer kept. The recording holds each screen the raw terminal view drew
 while it was open, when it drew it and at the size it drew it, and plays back at the last size. A
 screen is written as positions and colours, never as the bytes the session printed. The recording
-keeps at most 2,000 screens and 8 MiB, and declares the earlier screens it let go and the screens
-drawn at another size. Before the terminal view has drawn, there is no recording to export.
+keeps at most 2,000 screens and 8 MiB of drawing, counted in bytes of UTF-8, and declares the
+earlier screens it let go, a screen larger than all of that, and the screens drawn at another size.
+Every colour is drawn as the view resolved it through the session's palette; the cursor's shape and
+colour, and underline styles other than single and double, are declared rather than drawn, because
+a player draws those in its own. Before the terminal view has drawn, there is no recording to
+export.
 
 A session is created from the session list, in a directory the person names, with its shell chosen
 first. A managed shell is the host's qualified package: Ctrl-D at an empty prompt detaches the view,
-launch buttons start an agent at the prompt, and the host reads the shell's editor, so it knows
-when the prompt is empty. A stock shell is the system's own, for compatibility: Ctrl-D does what
-the shell does and can close the session, launch buttons show the command to type and start
-nothing, and the editor is not read. Attaching, detaching, closing, file transfer, agents and the
-terminal work in both. The creation sheet shows the two side by side before anything exists, and a
-stock shell is labelled in the session list, the session's header and settings, and the phone's
-list. A managed shell the host cannot qualify is refused with the host's reason; a stock shell is
-created only when the person chooses one.
+and the host reads the shell's editor, so it knows when the prompt is empty. A stock shell is the
+system's own, for compatibility: Ctrl-D does what the shell does and can close the session, and the
+editor is not read. Where the host describes a session's launch surface, a managed shell's launch
+buttons start an agent at the prompt, and a stock shell's show the command to type and start
+nothing. Attaching, detaching, closing, file transfer, agents and the terminal work in both. The
+creation sheet shows the two side by side before anything exists, and a stock shell is labelled in
+the session list, the session's header and settings, and the phone's list. A managed shell the host
+cannot qualify is refused with the host's reason; a stock shell is created only when the person
+chooses one. The creation sends none of this device's environment: the host decides what the
+session starts with.
 
 A draft keeps the conversation it was written for: the agent's instance and the binding revision the
 person wrote to. If the agent moves to another conversation while the draft is on screen, the draft
