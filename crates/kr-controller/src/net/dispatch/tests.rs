@@ -1335,3 +1335,220 @@ async fn a_worker_that_does_not_read_scopes_is_sent_none_and_serves_the_next_rea
     );
     world.serving.abort();
 }
+
+/// A device whose grant lets it close and read every session.
+fn closing_and_viewing(
+    controller: &crate::service::Controller,
+    byte: u8,
+) -> crate::service::net::devices::DeviceRecord {
+    use kr_protocol::rights::ActionRight;
+
+    paired(controller, byte, |grant| {
+        grant.actions = [ActionRight::SessionView, ActionRight::SessionClose]
+            .into_iter()
+            .collect();
+    })
+}
+
+/// Closes a session through the daemon for a device, as its connection's close does, and returns
+/// what the close settled as.
+async fn close_for_a_device(
+    world: &crate::service::a_close_a_worker_never_answers::Silent,
+    connection: &super::RemoteConnection,
+    close: &MutationRequest,
+    rights: &[kr_protocol::rights::ActionRight],
+) -> crate::service::net::ClosedRemotely {
+    let rights: CanonicalSet<_> = rights.iter().copied().collect();
+    let envelope = connection.envelope(world.controller.policy().authority_revision());
+    let (answer, answered) = tokio::sync::oneshot::channel();
+    // Nothing holds the link for a delivery: the acceptance is taken as delivered at once.
+    let (_, delivered) = tokio::sync::oneshot::channel();
+    world
+        .controller
+        .close_remote_session(
+            close,
+            crate::service::net::proxy::Vouched {
+                actor: &envelope,
+                grant_rights: &rights,
+            },
+            world.accepted,
+            &connection.expiry_observer(),
+            answer,
+            delivered,
+        )
+        .await;
+    answered
+        .await
+        .expect("the close settles")
+        .expect("the worker answers the close")
+}
+
+/// KR-REQ-23.34: a daemon that replaced the one a device's close went through, and admitted the
+/// session's worker without a description, answers the device's exact retry of that close from
+/// the receipt the worker kept, and settles that answer as it settles one given now. Once the
+/// worker stops answering, a read is answered closing from the description the kept acceptance
+/// carried, and a list includes the session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replacement_daemon_settles_a_devices_retried_close_from_the_workers_receipt() {
+    use kr_protocol::envelope::{ControlFrame, Outcome, Response};
+    use kr_protocol::session::{SessionCloseResult, SessionState};
+
+    use crate::service::a_close_a_worker_never_answers as fake;
+    use crate::service::a_read_that_meets_a_worker_on_its_way_out::{self as scripted, Scripted};
+
+    let script = Scripted::new();
+    let world = scripted::scripted(&script).await;
+    script.refuse_reads(true);
+    let world = scripted::restarted(world).await;
+    let controller = &world.controller;
+    let connection =
+        super::RemoteConnection::for_test(controller, closing_and_viewing(controller, 21));
+    // The close went through the daemon this one replaced: its route is on record, and the
+    // worker kept the acceptance it gave.
+    let close = fake::close_request(world.environment_id, world.session_id);
+    assert!(
+        connection
+            .claim_route(&close, Some(world.session_id))
+            .is_ok(),
+        "the route of the close is on record"
+    );
+    let accepted = script.acceptance(world.session_id);
+    script.kept(
+        close.action_id,
+        ParamsValue::from_typed(&accepted).expect("encodes"),
+    );
+
+    let answered = connection
+        .answer(ControlFrame::Mutation(Box::new(close)))
+        .await
+        .expect("the retry is answered");
+    let ControlFrame::Response(Response {
+        outcome: Outcome::Ok(value),
+        ..
+    }) = answered.frame()
+    else {
+        panic!(
+            "the retry is answered with the kept acceptance: {:?}",
+            answered.frame()
+        );
+    };
+    assert_eq!(
+        value
+            .to_typed::<SessionCloseResult>()
+            .expect("a close answer"),
+        accepted
+    );
+
+    let (_arrived, go) = script.end_at_next_read();
+    drop(go);
+    let answer = scripted::read(&world)
+        .await
+        .expect("a closing session is answered from the acceptance the worker kept");
+    assert_eq!(Some(answer.session), accepted.session);
+    assert_eq!(
+        scripted::list(&world, false).await,
+        vec![(world.session_id, SessionState::Closing)]
+    );
+    assert!(!scripted::recorded(&world).await);
+    world.serving.abort();
+}
+
+/// KR-REQ-23.34: the same for a device's close dispatched again, which the worker answers from
+/// what it kept: the daemon passes the kept answer on as it came and settles it on the way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replacement_daemon_settles_a_close_the_worker_answers_again_from_what_it_kept() {
+    use kr_protocol::rights::ActionRight;
+    use kr_protocol::session::{SessionCloseResult, SessionState};
+
+    use crate::service::a_close_a_worker_never_answers as fake;
+    use crate::service::a_read_that_meets_a_worker_on_its_way_out::{self as scripted, Scripted};
+
+    let script = Scripted::new();
+    let world = scripted::scripted(&script).await;
+    script.refuse_reads(true);
+    let world = scripted::restarted(world).await;
+    let controller = &world.controller;
+    let connection =
+        super::RemoteConnection::for_test(controller, closing_and_viewing(controller, 22));
+    let close = fake::close_request(world.environment_id, world.session_id);
+    let accepted = script.acceptance(world.session_id);
+    script.kept(
+        close.action_id,
+        ParamsValue::from_typed(&accepted).expect("encodes"),
+    );
+
+    let closed = close_for_a_device(
+        &world,
+        &connection,
+        &close,
+        &[ActionRight::SessionView, ActionRight::SessionClose],
+    )
+    .await;
+    assert!(closed.retained, "the worker answered from what it kept");
+    assert_eq!(
+        closed
+            .value
+            .to_typed::<SessionCloseResult>()
+            .expect("a close answer"),
+        accepted,
+        "and the kept answer is passed on as it came"
+    );
+
+    let (_arrived, go) = script.end_at_next_read();
+    drop(go);
+    let answer = scripted::read(&world)
+        .await
+        .expect("a closing session is answered from the acceptance the worker kept");
+    assert_eq!(Some(answer.session), accepted.session);
+    assert_eq!(
+        scripted::list(&world, false).await,
+        vec![(world.session_id, SessionState::Closing)]
+    );
+    world.serving.abort();
+}
+
+/// KR-REQ-23.34: the daemon keeps the description a worker's acceptance of a device's close
+/// carries whatever the device may read. What the device is shown of it is decided where its
+/// answer is written; what the daemon keeps is what it answers a read with once the worker has
+/// stopped answering.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_devices_close_is_kept_by_the_daemon_whatever_the_device_may_read() {
+    use kr_protocol::rights::ActionRight;
+    use kr_protocol::session::{SessionCloseResult, SessionState};
+
+    use crate::service::a_close_a_worker_never_answers as fake;
+    use crate::service::a_read_that_meets_a_worker_on_its_way_out::{self as scripted, Scripted};
+
+    let script = Scripted::new();
+    let world = scripted::scripted(&script).await;
+    script.refuse_reads(true);
+    let world = scripted::restarted(world).await;
+    let controller = &world.controller;
+    let closer = paired(controller, 23, |grant| {
+        grant.actions = [ActionRight::SessionClose].into_iter().collect();
+    });
+    let connection = super::RemoteConnection::for_test(controller, closer);
+
+    let closed = close_for_a_device(
+        &world,
+        &connection,
+        &fake::close_request(world.environment_id, world.session_id),
+        &[ActionRight::SessionClose],
+    )
+    .await;
+    assert!(!closed.retained);
+    let accepted: SessionCloseResult = closed.value.to_typed().expect("a close answer");
+    assert_eq!(accepted.state, SessionState::Closing);
+    assert!(
+        accepted.session.is_some(),
+        "the worker's acceptance reaches the daemon with its description"
+    );
+
+    let (_arrived, go) = script.end_at_next_read();
+    drop(go);
+    let answer = scripted::read(&world)
+        .await
+        .expect("a closing session is answered from the acceptance");
+    assert_eq!(Some(answer.session), accepted.session);
+    world.serving.abort();
+}

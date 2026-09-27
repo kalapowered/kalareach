@@ -6,6 +6,7 @@
 //! it to. Its process is this test's own, so the kernel says it is running throughout, and the
 //! registry names that process as the session's worker, as it names a real one.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -13,12 +14,14 @@ use std::time::Duration;
 use kr_ipc::endpoint::Listener;
 use kr_ipc::framed::split;
 use kr_ipc::verify::WorkerIdentity;
-use kr_protocol::envelope::{ControlFrame, Outcome, ParamsValue, Response};
+use kr_protocol::envelope::{ControlFrame, Outcome, ParamsValue, Request, Response};
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::frame::StreamKind;
 use kr_protocol::identity::WorkerProfile;
-use kr_protocol::ids::{AuthorityRevision, ConnectionId, RequestId, SessionEpoch, SessionId};
-use kr_protocol::method::Method;
+use kr_protocol::ids::{
+    ActionId, AuthorityRevision, ConnectionId, RequestId, SessionEpoch, SessionId,
+};
+use kr_protocol::method::{Method, MethodVersion};
 use kr_protocol::root::{CwdRevision, PromptGeneration, RootCommandBlockParams};
 use kr_protocol::scalars::{Nullable, U64};
 use kr_protocol::session::{
@@ -29,21 +32,25 @@ use kr_protocol::session::{
 use tokio::sync::{Notify, oneshot};
 
 use super::a_close_a_worker_never_answers::{self as fake, Silent};
-use crate::registry::WorkerRecord;
+use crate::registry::{LaunchPhase, WorkerRecord};
 use crate::service::Controller;
 
 /// A worker whose session a test moves along, and which goes when the test says so.
 ///
 /// It answers a read with the state a test has put its session in, live to begin with, and
 /// accepts a close by saying the session is closing, as a worker does before it stops
-/// anything. Told to go, it goes the way a worker that has finished its closure goes: at the
-/// next read it is sent, its endpoint stops accepting, and then the connection that read is
-/// waiting on ends unanswered.
-struct Scripted {
+/// anything, with its own description of the session in the acceptance. It keeps the answer to
+/// each close as a worker's journal does, answers an exact retry from it and says so, and
+/// answers `action.read` from it. Told to go, it goes the way a worker that has finished its
+/// closure goes: at the next read it is sent, its endpoint stops accepting, and then the
+/// connection that read is waiting on ends unanswered.
+pub(super) struct Scripted {
     /// The state its session is in.
     state: std::sync::Mutex<SessionState>,
     /// Its session's size.
     dimensions: std::sync::Mutex<Dimensions>,
+    /// When its session was created, which every description of the session says.
+    created_at_ms: kr_protocol::scalars::TimestampMs,
     /// How many reads have reached it.
     reads: AtomicUsize,
     /// Whether it refuses to describe its session.
@@ -54,6 +61,12 @@ struct Scripted {
     going: Notify,
     /// Says the endpoint has stopped accepting.
     gone: Notify,
+    /// Whether it describes its session when it accepts a close, as a worker of this build does.
+    describes_its_close: AtomicBool,
+    /// The session its acceptances describe, where a test has them name another one.
+    names: std::sync::Mutex<Option<SessionId>>,
+    /// The answer it gave each close, by the close's action, as its journal keeps it.
+    answered: std::sync::Mutex<BTreeMap<ActionId, ParamsValue>>,
 }
 
 /// Where a scripted worker goes: at the next read it is sent.
@@ -66,16 +79,131 @@ struct End {
 
 impl Scripted {
     /// A worker whose session is live.
-    fn new() -> Arc<Self> {
+    pub(super) fn new() -> Arc<Self> {
         Arc::new(Self {
             state: std::sync::Mutex::new(SessionState::Live),
             dimensions: std::sync::Mutex::new(INVISIBLE_DEFAULT_DIMENSIONS),
+            created_at_ms: kr_ipc::now_ms(),
             reads: AtomicUsize::new(0),
             refusing: AtomicBool::new(false),
             end: std::sync::Mutex::new(None),
             going: Notify::new(),
             gone: Notify::new(),
+            describes_its_close: AtomicBool::new(true),
+            names: std::sync::Mutex::new(None),
+            answered: std::sync::Mutex::new(BTreeMap::new()),
         })
+    }
+
+    /// Has this worker accept a close as a worker built before the description does: with no
+    /// description of its session in the acceptance.
+    fn built_before_the_description(&self) {
+        self.describes_its_close.store(false, Ordering::Release);
+    }
+
+    /// Has this worker's acceptances describe `session_id` in place of its own session.
+    fn describing(&self, session_id: SessionId) {
+        *self
+            .names
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(session_id);
+    }
+
+    /// What this worker accepts a close of `session_id` with now: the session closing, and its own
+    /// description of the session where it gives one.
+    pub(super) fn acceptance(&self, session_id: SessionId) -> SessionCloseResult {
+        let mut described = self.answer(session_id).session;
+        described.state = SessionState::Closing;
+        if let Some(named) = *self
+            .names
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            described.session_id = named;
+        }
+        SessionCloseResult {
+            session_id,
+            state: SessionState::Closing,
+            durability: Durability::Durable,
+            closure: Nullable::null(),
+            session: self
+                .describes_its_close
+                .load(Ordering::Acquire)
+                .then_some(described),
+        }
+    }
+
+    /// Answers the close `action_id` asks for: from what this worker kept where it answered that
+    /// close before, which the second half says, and otherwise by accepting it and keeping the
+    /// answer.
+    fn close(&self, session_id: SessionId, action_id: ActionId) -> (ParamsValue, bool) {
+        let mut answered = self
+            .answered
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(kept) = answered.get(&action_id) {
+            return (kept.clone(), true);
+        }
+        if self.state() == SessionState::Live {
+            self.set(SessionState::Closing);
+        }
+        let answer = ParamsValue::from_typed(&self.acceptance(session_id)).expect("encodes");
+        answered.insert(action_id, answer.clone());
+        (answer, false)
+    }
+
+    /// Keeps `answer` as this worker's answer to the close `action_id`, as its journal holds the
+    /// answer to a close it accepted before the daemon asking now was started.
+    pub(super) fn kept(&self, action_id: ActionId, answer: ParamsValue) {
+        self.answered
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(action_id, answer);
+    }
+
+    /// How this worker answers `action.read`: the receipt of a close it kept an answer to, with
+    /// that answer, and otherwise a refusal.
+    fn receipt(&self, request: &Request) -> ControlFrame {
+        let kept = request
+            .params
+            .to_typed::<kr_protocol::receipt::ActionReadParams>()
+            .ok()
+            .and_then(|params| {
+                self.answered
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(&params.action_id)
+                    .cloned()
+                    .map(|answer| (params.action_id, answer))
+            });
+        let Some((action_id, answer)) = kept else {
+            return ControlFrame::Response(Response {
+                request_id: request.request_id,
+                outcome: Outcome::Error(ProtocolError::new(
+                    ErrorCode::ResourceUnavailable,
+                    "this worker holds no receipt for that action",
+                )),
+            });
+        };
+        respond(
+            request.request_id,
+            &kr_protocol::receipt::ActionReadResult {
+                receipt: kr_protocol::receipt::Receipt {
+                    action_id,
+                    actor_id: kr_protocol::ids::ActorId::new("device:test").expect("a principal"),
+                    method: Method::SessionClose.into(),
+                    method_version: MethodVersion::V1,
+                    revision: U64::new(2),
+                    state: kr_protocol::receipt::ReceiptState::Applied,
+                    reason: Nullable::null(),
+                    payload_digest: kr_protocol::scalars::Digest256::from_bytes([0; 32]),
+                    accepted_deadline_ms: Nullable::null(),
+                    error: Nullable::null(),
+                    updated_at_ms: kr_ipc::now_ms(),
+                },
+                result: Nullable::some(answer),
+            },
+        )
     }
 
     /// Puts the session in `state`, which every later answer says.
@@ -95,7 +223,7 @@ impl Scripted {
     }
 
     /// Has this worker refuse to describe its session, or answer again.
-    fn refuse_reads(&self, refusing: bool) {
+    pub(super) fn refuse_reads(&self, refusing: bool) {
         self.refusing.store(refusing, Ordering::Release);
     }
 
@@ -114,7 +242,7 @@ impl Scripted {
 
     /// Has this worker go at the next read it is sent. The first half says when that read has
     /// arrived, and the worker goes once the second is sent or dropped.
-    fn end_at_next_read(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+    pub(super) fn end_at_next_read(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
         let (arrived, arrival) = oneshot::channel();
         let (go, going) = oneshot::channel();
         *self
@@ -129,6 +257,7 @@ impl Scripted {
     /// content beside its description.
     fn answer(&self, session_id: SessionId) -> SessionReadResult {
         let mut read = fake::read_result(session_id);
+        read.session.created_at_ms = self.created_at_ms;
         read.session.state = self.state();
         read.session.dimensions = *self
             .dimensions
@@ -242,17 +371,34 @@ fn serve_scripted(
                         (None, ControlFrame::Forwarded(forwarded))
                             if forwarded.mutation.method == Method::SessionClose.into() =>
                         {
-                            if script.state() == SessionState::Live {
-                                script.set(SessionState::Closing);
-                            }
-                            vec![respond(
-                                forwarded.mutation.request_id,
-                                &SessionCloseResult {
+                            let (answer, kept) =
+                                script.close(identity.session_id(), forwarded.mutation.action_id);
+                            let response = Response {
+                                request_id: forwarded.mutation.request_id,
+                                outcome: Outcome::Ok(answer),
+                            };
+                            // A forwarded action this worker has answered before is answered
+                            // from what it kept, and the frame says so, as a journal's answer
+                            // does.
+                            vec![if kept {
+                                ControlFrame::RetainedResponse(Box::new(response))
+                            } else {
+                                ControlFrame::Response(response)
+                            }]
+                        }
+                        (None, ControlFrame::ForwardedRead(forwarded))
+                            if forwarded.request.method == Method::ActionRead.into() =>
+                        {
+                            vec![script.receipt(&forwarded.request)]
+                        }
+                        // It installs a revision it is told of, with nothing to fence, as a
+                        // device's link to it asks it to.
+                        (None, ControlFrame::AuthorityRevision(notice)) => {
+                            vec![ControlFrame::AuthorityRevisionAck(
+                                kr_protocol::worker::AuthorityRevisionAck {
                                     session_id: identity.session_id(),
-                                    state: SessionState::Closing,
-                                    durability: Durability::Durable,
-                                    closure: Nullable::null(),
-                                    session: None,
+                                    revision: notice.revision,
+                                    fence: None,
                                 },
                             )]
                         }
@@ -274,7 +420,7 @@ fn serve_scripted(
 /// A daemon with a scripted worker in its directory, and the registry's own row for that
 /// worker. The row names this test's process, which is the process the kernel is asked about.
 /// The daemon has not heard from the worker yet, as after a start that found it running.
-async fn scripted(script: &Arc<Scripted>) -> Silent {
+pub(super) async fn scripted(script: &Arc<Scripted>) -> Silent {
     let script = Arc::clone(script);
     let world = fake::fake_world(move |listener, identity, endpoint_text| {
         serve_scripted(listener, identity, endpoint_text, script)
@@ -305,7 +451,19 @@ async fn scripted(script: &Arc<Scripted>) -> Silent {
 /// environment, and another has started on it and found the scripted worker still running, the
 /// way a daemon that starts finds its workers, by the descriptor, the registry's row and a
 /// challenge.
-async fn restarted(world: Silent) -> Silent {
+pub(super) async fn restarted(world: Silent) -> Silent {
+    replaced(world, true).await
+}
+
+/// The same world after its daemon was replaced with the worker's descriptor gone: the daemon
+/// that starts finds the worker only by the registry's row and its reservation, and recovers it
+/// by a challenge.
+async fn recovered(world: Silent) -> Silent {
+    replaced(world, false).await
+}
+
+/// The same world after its daemon was replaced, with the worker's descriptor published or gone.
+async fn replaced(world: Silent, descriptor: bool) -> Silent {
     let Silent {
         _temp,
         controller,
@@ -315,8 +473,13 @@ async fn restarted(world: Silent) -> Silent {
         serving,
         ..
     } = world;
-    kr_ipc::descriptor::publish(&_temp.environment(), &worker.descriptor)
-        .expect("publishes the worker's descriptor");
+    if descriptor {
+        kr_ipc::descriptor::publish(&_temp.environment(), &worker.descriptor)
+            .expect("publishes the worker's descriptor");
+    } else {
+        kr_ipc::descriptor::retire(&_temp.environment(), session_id)
+            .expect("the worker's descriptor goes");
+    }
     drop(controller);
     let started = std::time::Instant::now();
     let controller = loop {
@@ -356,8 +519,126 @@ async fn restarted(world: Silent) -> Silent {
     }
 }
 
+/// A daemon that recorded the scripted worker from its own ready report, as a daemon whose create
+/// had stopped waiting for the report does: nothing has read the worker since, and the
+/// reservation the create made is the registry's record of it.
+async fn reported_late(script: &Arc<Scripted>) -> Silent {
+    let temp = kr_ipc::testing::TempHost::create();
+    let environment = temp.environment();
+    let environment_id = temp.environment_id();
+    let controller = Controller::start(fake::setup(&temp))
+        .await
+        .expect("the daemon starts");
+    let reservation = {
+        let mut registry = controller.registry.lock().await;
+        let intent = kr_cbor::to_canonical_vec(&kr_protocol::session::SessionCreateParams {
+            environment_id,
+            presentation: kr_protocol::session::Presentation::Invisible,
+            shell: Nullable::null(),
+            shell_mode: kr_protocol::session::ShellMode::NativeCompat,
+            cwd: Nullable::some("/".to_owned()),
+            dimensions: Nullable::null(),
+            worker_profile: WorkerProfile::HeadlessUser,
+            environment_snapshot: Vec::new(),
+            palette: Nullable::null(),
+            launch_profile: kr_protocol::session::LaunchProfile::default(),
+            terminal: Nullable::null(),
+        })
+        .expect("encodes");
+        let admission = registry
+            .reserve(
+                &kr_protocol::ids::ActorId::new("local:test").expect("a principal"),
+                kr_ipc::new_uuid(),
+                kr_protocol::scalars::Digest256::from_bytes([0x5e; 32]),
+                &intent,
+                kr_ipc::now_ms(),
+            )
+            .expect("reserves");
+        registry
+            .set_phase(admission.reservation.reservation_id, LaunchPhase::Spawned)
+            .expect("spawned");
+        admission.reservation
+    };
+    let session_id = reservation.session_id;
+    let identity = Arc::new(
+        WorkerIdentity::generate(
+            session_id,
+            SessionEpoch::V1,
+            kr_ipc::identity::boot_identity().expect("a boot identity"),
+            kr_ipc::identity::process_start_identity(std::process::id())
+                .expect("this process's start identity"),
+            kr_protocol::hello::PROTOCOL_VERSION,
+        )
+        .expect("generates a worker identity"),
+    );
+    controller
+        .registry
+        .lock()
+        .await
+        .claim_rendezvous(reservation.reservation_id, *identity.public_key())
+        .expect("claims");
+    let endpoint = environment
+        .worker_endpoint(reservation.display_number)
+        .expect("an endpoint");
+    let listener = Listener::bind(&endpoint).expect("binds the worker endpoint");
+    let serving = serve_scripted(
+        listener,
+        Arc::clone(&identity),
+        endpoint.as_text(),
+        Arc::clone(script),
+    );
+    let claim = identity
+        .rendezvous(kr_protocol::worker::ReservationId::new(
+            reservation.reservation_id.get(),
+        ))
+        .expect("a startup claim");
+    let report = kr_protocol::worker::WorkerReady {
+        session_id,
+        endpoint: endpoint.as_text(),
+        root_process: identity.process_start_identity().clone(),
+        shell_path: "/bin/zsh".to_owned(),
+        dimensions: INVISIBLE_DEFAULT_DIMENSIONS,
+        session: script.answer(session_id).session,
+    };
+    controller
+        .record_ready(reservation.reservation_id, &claim, &report)
+        .await
+        .expect("records the worker from its report");
+    fake::acknowledged(&controller, session_id);
+    let worker = controller
+        .directory
+        .lock()
+        .await
+        .get(session_id)
+        .cloned()
+        .expect("the report admits the worker");
+    let actor = crate::service::local_actor(
+        kr_protocol::ids::ActorId::new("local:test").expect("a principal"),
+        ConnectionId::new(kr_ipc::new_uuid()),
+        controller.generation,
+    );
+    let accepted = kr_transport::window::AcceptedDeadline {
+        deadline: controller
+            .clock
+            .now()
+            .checked_add(Duration::from_secs(300))
+            .expect("a deadline five minutes out"),
+        bound: kr_transport::window::DeadlineBound::RequestedTtl,
+    };
+    Silent {
+        _temp: temp,
+        controller,
+        environment_id,
+        session_id,
+        worker,
+        actor,
+        accepted,
+        serving,
+    }
+}
+
 /// Reads the session through the daemon, as a client's `session.read` does.
-async fn read(world: &Silent) -> crate::error::Result<SessionReadResult> {
+pub(super) async fn read(world: &Silent) -> crate::error::Result<SessionReadResult> {
     world
         .controller
         .session_read(
@@ -389,7 +670,7 @@ fn read_in_turn(
 
 /// Lists the sessions through the daemon, as a client's `session.list` does, and returns each
 /// one's identity and state.
-async fn list(world: &Silent, include_closed: bool) -> Vec<(SessionId, SessionState)> {
+pub(super) async fn list(world: &Silent, include_closed: bool) -> Vec<(SessionId, SessionState)> {
     let listed: SessionListResult = world
         .controller
         .session_list(
@@ -427,7 +708,7 @@ async fn close(world: &Silent) -> SessionCloseResult {
 }
 
 /// Whether the registry has a closure recorded for the session.
-async fn recorded(world: &Silent) -> bool {
+pub(super) async fn recorded(world: &Silent) -> bool {
     world
         .controller
         .registry
@@ -784,5 +1065,206 @@ async fn a_read_that_meets_the_end_of_a_worker_never_heard_from_is_refused_for_n
         .expect_err("nothing this daemon holds says what the session is now");
     assert_eq!(refused.code(), ErrorCode::ResourceUnavailable, "{refused}");
     assert!(!recorded(&world).await);
+    world.serving.abort();
+}
+
+/// KR-REQ-23.34: a worker the daemon recorded from a ready report that came after its create had
+/// stopped waiting, and whose close it passed on before anything read the worker, is answered for
+/// from the worker's own words once it stops answering: the session as its acceptance described
+/// it, closing, and a list that includes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_worker_recorded_from_a_late_report_that_accepts_a_close_and_goes_is_answered_closing() {
+    let script = Scripted::new();
+    let world = reported_late(&script).await;
+    let accepted = close(&world).await;
+    assert_eq!(accepted.state, SessionState::Closing);
+    assert_eq!(script.reads(), 0, "nothing has read the worker");
+
+    let (_arrived, go) = script.end_at_next_read();
+    drop(go);
+    let answer = read(&world)
+        .await
+        .expect("a closing session is answered from the worker's own words");
+    assert_eq!(
+        Some(answer.session),
+        accepted.session,
+        "the session as its worker described it when it accepted the close"
+    );
+    assert!(answer.endpoint.0.is_none());
+    assert!(answer.last_command_block.0.is_none());
+    assert_eq!(
+        list(&world, false).await,
+        vec![(world.session_id, SessionState::Closing)]
+    );
+    assert!(!recorded(&world).await);
+    world.serving.abort();
+}
+
+/// KR-REQ-23.34: the same for a worker a daemon finds at its start and admits without a
+/// description, which accepts a close and goes before anything reads it: its acceptance carries
+/// what the start did not hear.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_worker_admitted_at_a_start_without_a_description_that_accepts_a_close_and_goes_is_answered_closing()
+ {
+    let script = Scripted::new();
+    let world = scripted(&script).await;
+    script.refuse_reads(true);
+    let world = restarted(world).await;
+    assert_eq!(
+        script.reads(),
+        1,
+        "the start asked for a description and got none"
+    );
+    let accepted = close(&world).await;
+
+    let (_arrived, go) = script.end_at_next_read();
+    drop(go);
+    let answer = read(&world)
+        .await
+        .expect("a closing session is answered from the acceptance");
+    assert_eq!(Some(answer.session), accepted.session);
+    assert_eq!(
+        list(&world, false).await,
+        vec![(world.session_id, SessionState::Closing)]
+    );
+    world.serving.abort();
+}
+
+/// KR-REQ-23.34: the same for a worker a replacement daemon recovers from the registry's row
+/// without a description, its descriptor gone: a close passed through the replacement supplies
+/// what the replacement never heard when it admitted the worker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_worker_a_replacement_daemon_recovers_without_a_description_that_accepts_a_close_and_goes_is_answered_closing()
+ {
+    let script = Scripted::new();
+    let world = reported_late(&script).await;
+    script.refuse_reads(true);
+    let world = recovered(world).await;
+    assert!(
+        world
+            .controller
+            .directory
+            .lock()
+            .await
+            .get(world.session_id)
+            .is_some(),
+        "the replacement recovers the worker from the registry's row"
+    );
+    assert_eq!(
+        script.reads(),
+        1,
+        "and asks it for a description, which it refuses"
+    );
+    let accepted = close(&world).await;
+
+    let (_arrived, go) = script.end_at_next_read();
+    drop(go);
+    let answer = read(&world)
+        .await
+        .expect("a closing session is answered from the acceptance");
+    assert_eq!(Some(answer.session), accepted.session);
+    assert_eq!(
+        list(&world, false).await,
+        vec![(world.session_id, SessionState::Closing)]
+    );
+    world.serving.abort();
+}
+
+/// An answer that puts the session earlier in its lifecycle than an acceptance does not take the
+/// description back: it is one an earlier moment gave, and the acceptance overtook it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_later_live_answer_does_not_take_back_what_an_acceptance_described() {
+    let script = Scripted::new();
+    let world = scripted(&script).await;
+    script.resize(Dimensions::new(100, 30));
+    let accepted = close(&world).await;
+    // An answer from before the close, arriving after the acceptance.
+    script.set(SessionState::Live);
+    script.resize(Dimensions::new(90, 20));
+    assert_eq!(
+        read(&world)
+            .await
+            .expect("the worker answers")
+            .session
+            .state,
+        SessionState::Live,
+        "the worker's own answer is passed on as it stands"
+    );
+
+    let (_arrived, go) = script.end_at_next_read();
+    drop(go);
+    let answer = read(&world)
+        .await
+        .expect("the acceptance is still what this daemon answers from");
+    assert_eq!(Some(answer.session), accepted.session);
+    world.serving.abort();
+}
+
+/// KR-REQ-23.34: a worker recorded from a late report that accepts no close is still read from
+/// itself, and once it stops answering nothing this daemon holds says its session is ending: its
+/// report and its last answer both say it is live, so the read is refused as one to try again and
+/// a list leaves the session out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_worker_recorded_from_a_late_report_that_goes_without_a_close_is_refused_for_now() {
+    let script = Scripted::new();
+    let world = reported_late(&script).await;
+    let live = read(&world).await.expect("the worker answers");
+    assert_eq!(live.session.state, SessionState::Live);
+    assert_eq!(script.reads(), 1, "the read reached the worker");
+
+    let (_arrived, go) = script.end_at_next_read();
+    drop(go);
+    let refused = read(&world)
+        .await
+        .expect_err("nothing this daemon holds says the session is ending");
+    assert_eq!(refused.code(), ErrorCode::ResourceUnavailable, "{refused}");
+    assert_eq!(list(&world, false).await, Vec::new());
+    world.serving.abort();
+}
+
+/// An acceptance from a worker built before the description gives this daemon none: a worker it
+/// admitted without one, which then goes, is refused for now rather than described from anything
+/// its worker did not say.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_acceptance_without_a_description_leaves_a_worker_admitted_without_one_undescribed() {
+    let script = Scripted::new();
+    let world = scripted(&script).await;
+    script.refuse_reads(true);
+    script.built_before_the_description();
+    let world = restarted(world).await;
+    let accepted = close(&world).await;
+    assert_eq!(accepted.state, SessionState::Closing);
+    assert_eq!(
+        accepted.session, None,
+        "a worker of that build describes nothing"
+    );
+
+    let (_arrived, go) = script.end_at_next_read();
+    drop(go);
+    let refused = read(&world)
+        .await
+        .expect_err("nothing the worker said describes the session");
+    assert_eq!(refused.code(), ErrorCode::ResourceUnavailable, "{refused}");
+    world.serving.abort();
+}
+
+/// A description that names another session is not kept as this one's: a worker admitted
+/// without a description, whose acceptance describes another session and which then goes, is
+/// refused for now rather than answered with the other session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_acceptance_that_describes_another_session_is_not_kept() {
+    let script = Scripted::new();
+    let world = scripted(&script).await;
+    script.refuse_reads(true);
+    script.describing(SessionId::new(kr_ipc::new_uuid()));
+    let world = restarted(world).await;
+    let _ = close(&world).await;
+
+    let (_arrived, go) = script.end_at_next_read();
+    drop(go);
+    let refused = read(&world)
+        .await
+        .expect_err("no description of this session reached the daemon");
+    assert_eq!(refused.code(), ErrorCode::ResourceUnavailable, "{refused}");
     world.serving.abort();
 }
