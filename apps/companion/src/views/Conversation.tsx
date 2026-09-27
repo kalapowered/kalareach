@@ -400,16 +400,24 @@ export function Conversation({
         // The file is on the draft from the moment it is dropped, so no prompt is sent without it
         // while it uploads, and it stays until the person removes it whatever the upload does.
         const localId = `file-${Date.now()}-${Math.random()}`
-        const settle = (change: Partial<DraftAttachment>) => {
-          update((current) => ({
-            ...current,
-            draft: {
-              ...current.draft,
-              attachments: current.draft.attachments.map((attachment) =>
-                attachment.localId === localId ? { ...attachment, ...change } : attachment
-              )
+        // Settles the file with what its upload said, and answers whether it is still on the
+        // draft: one the person removed meanwhile is gone, and nothing is said about it.
+        const settle = (change: Partial<DraftAttachment>): boolean => {
+          let present = false
+          update((current) => {
+            present = current.draft.attachments.some((attachment) => attachment.localId === localId)
+            if (!present) return current
+            return {
+              ...current,
+              draft: {
+                ...current.draft,
+                attachments: current.draft.attachments.map((attachment) =>
+                  attachment.localId === localId ? { ...attachment, ...change } : attachment
+                )
+              }
             }
-          }))
+          })
+          return present
         }
         update((current) => ({
           ...current,
@@ -434,7 +442,7 @@ export function Conversation({
           .attachmentUpload(path, subject)
           .then((handle) => {
             // The upload is done and the handle is verified.
-            settle({
+            const kept = settle({
               transferId: handle.transfer_id,
               name: handle.original_file_name,
               byteLen: Number(handle.byte_len),
@@ -442,12 +450,13 @@ export function Conversation({
               presentedAsImage: handle.presented_as_image,
               upload: 'uploaded'
             })
+            if (!kept) return
             setInsertion(
               `${handle.original_file_name} is uploaded and kept with this draft. A prompt sent from here cannot carry it: type its path in the terminal to give it to the agent, or remove it to send the text on its own.`
             )
           })
           .catch((error: unknown) => {
-            settle({ upload: 'failed' })
+            if (!settle({ upload: 'failed' })) return
             setInsertion(`${file.name} was not uploaded: ${failureMessage(error)}`)
           })
       }

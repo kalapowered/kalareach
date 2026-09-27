@@ -416,6 +416,46 @@ describe('the semantic view', () => {
     expect(screen.getByTestId('composer-send')).toBeEnabled()
   })
 
+  it.each([
+    ['succeeds', true],
+    ['fails', false]
+  ])('says nothing about a file the person removed before its upload %s', async (_, succeeds) => {
+    const person = userEvent.setup()
+    const { port, controls } = fakeHost()
+    let finish: () => void = () => undefined
+    render(
+      <AppProvider
+        port={{
+          ...port,
+          attachmentUpload: (path, subject) =>
+            new Promise((resolve, reject) => {
+              finish = () => {
+                if (succeeds) resolve(port.attachmentUpload(path, subject))
+                else reject({ code: 'STORAGE_UNAVAILABLE', message: 'Full.', user_action: 'retry' })
+              }
+            })
+        }}
+        initialPlace={{ view: 'session', sessionId: SESSION_MAIN, pane: 'semantic' }}
+      >
+        <App />
+      </AppProvider>
+    )
+    await screen.findByTestId('composer-queue')
+    controls.dropFiles([
+      { name: 'diagram.png', media_type: 'image/png', byte_len: 10, path: '/tmp/diagram.png' }
+    ])
+    await screen.findByTestId('draft-attachments')
+    await person.click(screen.getByRole('button', { name: 'Remove diagram.png from this draft' }))
+    await act(async () => {
+      finish()
+      await new Promise((resolve) => {
+        setTimeout(resolve, 0)
+      })
+    })
+    expect(screen.queryByTestId('draft-attachments')).toBeNull()
+    expect(screen.queryByTestId('insertion-refusal')).toBeNull()
+  })
+
   it('does not send a file this window was never given', async () => {
     const { port, controls } = fakeHost()
     render(
