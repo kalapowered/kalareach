@@ -754,20 +754,33 @@ impl Snapshot {
     }
 
     /// How many entries could not be read under each root, for each root that has any, in the
-    /// order of the roots: an entry counts under the longest root that is it or holds it. Unlike
+    /// order of the roots, as [`Snapshot::count_by_root`] counts them. Unlike
     /// [`Snapshot::unread`], it names no entry, so it can be said where the person's own file
     /// names must not be.
     #[must_use]
     pub fn unread_by_root(&self) -> Vec<(PathBuf, usize)> {
+        self.count_by_root(self.unread.iter().map(String::as_str))
+    }
+
+    /// How many of `texts`, each an absolute path, alone or followed by ": " and why, lie under
+    /// each root, for each root that has any, in the order of the roots: a text counts under the
+    /// longest root that is its path or holds it, and one under none is not counted. It names no
+    /// path, so it can be said where the person's own file names must not be.
+    #[must_use]
+    pub fn count_by_root<'a>(
+        &self,
+        texts: impl IntoIterator<Item = &'a str>,
+    ) -> Vec<(PathBuf, usize)> {
         let mut counts: Vec<(PathBuf, usize)> =
             self.roots.iter().map(|root| (root.clone(), 0)).collect();
-        for entry in &self.unread {
+        for text in texts {
             let holder = counts
                 .iter_mut()
                 .filter(|(root, _)| {
                     let root = root.display().to_string();
-                    entry.starts_with(&format!("{root}/"))
-                        || entry.starts_with(&format!("{root}: "))
+                    text == root
+                        || text.starts_with(&format!("{root}/"))
+                        || text.starts_with(&format!("{root}: "))
                 })
                 .max_by_key(|(root, _)| root.as_os_str().len());
             if let Some((_, count)) = holder {
@@ -1251,6 +1264,19 @@ mod tests {
             before.unread_by_root(),
             vec![(agent.clone(), 1)],
             "counted under the root that holds it, which names no entry"
+        );
+        let text = |path: &Path| path.display().to_string();
+        assert_eq!(
+            before.count_by_root([
+                text(&agent).as_str(),
+                text(&agent.join("a")).as_str(),
+                format!("{}: why", text(&agent)).as_str(),
+                text(&home.join(".agentx").join("b")).as_str(),
+                text(&home.join(".absent").join("c")).as_str(),
+            ]),
+            vec![(agent.clone(), 3), (home.join(".absent"), 1)],
+            "a root itself, what it holds and a root followed by why count under it; a sibling \
+             whose name only begins like it does not"
         );
         std::fs::write(closed.join("history"), "the person's kr0123").expect("an edit");
         std::fs::write(agent.join("ours"), "kr0123").expect("a marked file");

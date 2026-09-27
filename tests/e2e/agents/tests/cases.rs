@@ -1023,14 +1023,20 @@ fn staged(
                     .to_owned(),
             );
         }
+        // Counted by directory: a file's own name can be the person's, and this text goes into
+        // the record; the part's evidence lists what it may name.
         if !rewrites.is_empty()
             && login
                 .as_ref()
                 .is_some_and(|login| login.account.stop_on_rewrite)
         {
             stop.push(format!(
-                "the agent rewrote files it had before the part: {}",
-                rewrites.join(", ")
+                "the agent rewrote files it had before the part, by directory: {}",
+                rewrites
+                    .iter()
+                    .map(|(root, count)| format!("{} ({count})", root.display()))
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ));
         }
     }
@@ -1157,9 +1163,9 @@ fn hand_over(provenance: &Provenance, run: &Run) {
 /// What a part changed in the person's agent directories since `before`: its own conversations,
 /// the files it created holding its marker or the run's directory, removed, and every other change
 /// reported, with those of the changed files left that hold the marker or the run's directory; the
-/// files it had that were rewritten or changed and too large to compare; and whether the
-/// directories were read whole afterwards. Nothing is removed unless they were, and unless
-/// everything the part started had ended (`settled`).
+/// files it had that were rewritten or changed and too large to compare, counted by the listed
+/// directory they lie in; and whether the directories were read whole afterwards. Nothing is
+/// removed unless they were, and unless everything the part started had ended (`settled`).
 fn person_home_report(
     login: &Login,
     before: &kr_e2e_agents::account::Snapshot,
@@ -1167,7 +1173,7 @@ fn person_home_report(
     mark: &str,
     root: &Path,
     settled: bool,
-) -> (serde_json::Value, Vec<String>, bool, Vec<String>) {
+) -> (serde_json::Value, Vec<(PathBuf, usize)>, bool, Vec<String>) {
     let after = snapshot(&login.person_home, directories, HASH_LIMIT);
     let found = changes(before, &after);
     let root = root.display().to_string();
@@ -1197,10 +1203,13 @@ fn person_home_report(
             })
             .collect()
     };
-    let rewrites: Vec<String> = home(&found.rewritten)
-        .into_iter()
-        .chain(home(&found.changed_uncompared))
-        .collect();
+    let rewrites = before.count_by_root(
+        found
+            .rewritten
+            .iter()
+            .chain(&found.changed_uncompared)
+            .filter_map(|path| path.to_str()),
+    );
     (
         json!({
             "created_and_removed": home(&removed),
