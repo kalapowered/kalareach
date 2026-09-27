@@ -263,8 +263,14 @@ async fn kr_req_12_07_an_integrated_invocation_gets_a_backend_that_exists_before
             .expect("the record is JSON");
     assert_eq!(
         record.as_object().map(|record| record.len()),
-        Some(2),
-        "the record says where to connect and where the credential is, and nothing else: {record}"
+        Some(3),
+        "the record says where to connect, where the credential is and which variables the \
+         package declares, and nothing else: {record}"
+    );
+    assert_eq!(
+        record["variables"],
+        serde_json::json!([]),
+        "Claude Code's integration declares no variable"
     );
     let endpoint = PathBuf::from(record["endpoint"].as_str().expect("an endpoint"));
     assert!(endpoint.exists(), "the endpoint is bound before the answer");
