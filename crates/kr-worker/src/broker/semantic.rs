@@ -690,6 +690,9 @@ mod tests {
     /// An entry number is never given twice, at the end of the numbering as anywhere else: the
     /// log gives the last number it has and refuses the entries after it, recording nothing, and
     /// a reader that consumed the last entry is given nothing again.
+    ///
+    /// KR-REQ-08.72: a semantic snapshot's entry numbers never repeat, so no two entries a reader
+    /// is given share a node number.
     #[test]
     fn an_entry_number_is_never_given_twice_at_the_end_of_the_numbering() {
         let mut log = SemanticLog::new();
