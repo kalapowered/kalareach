@@ -236,8 +236,7 @@
       "history_filter": "not_applicable",
       "idempotency": "action_deduplicated",
       "ingress": [
-        "local_ipc",
-        "paired_device"
+        "local_ipc"
       ],
       "method": "privacy.set",
       "name": "privacy.set",
@@ -254,7 +253,7 @@
       "resource_selectors": [
         "environment"
       ],
-      "summary": "Turn privacy mode on or off for this environment. The change is recorded, and the generation advanced, before any subsystem is touched; the answer says where it stands.",
+      "summary": "Turn privacy mode on or off for this environment, at the host itself: a paired device reads where it stands and changes nothing about the host. The change is recorded, and the generation advanced, before any subsystem is touched; the answer says where it stands.",
       "version": 1
     },
     {

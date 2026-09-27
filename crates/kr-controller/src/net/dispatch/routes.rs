@@ -920,19 +920,18 @@ impl RemoteConnection {
                     Err(error) => failure(mutation.request_id, error.to_protocol_error()),
                 }
             }
-            // Privacy mode and a session's pinned name are this daemon's own effects, each once per
-            // actor's action. The route names this host as the owner of the receipt, the action is
-            // claimed in the daemon's store, and the effect runs on a task that outlives this
-            // connection and keeps what it came to under the claim before it is answered, so a
-            // retry is answered from that record.
-            Method::PrivacySet | Method::SessionRename => {
+            // A session's pinned name is this daemon's own effect, once per actor's action. The
+            // route names this host as the owner of the receipt, the action is claimed in the
+            // daemon's store, and the effect runs on a task that outlives this connection and keeps
+            // what it came to under the claim before it is answered, so a retry is answered from
+            // that record.
+            Method::SessionRename => {
                 if let Err(refusal) = self.claim_route(mutation, None) {
                     return failure(mutation.request_id, refusal.into_error());
                 }
                 let controller = Arc::clone(&self.controller);
                 let mutation = mutation.clone();
                 let request_id = mutation.request_id;
-                let method = entry.method;
                 let carried = crate::authority::AdmittedMutation {
                     connection_id: self.connection_id(),
                     admitted_revision: validated,
@@ -963,30 +962,22 @@ impl RemoteConnection {
                             });
                         }
                     };
-                    let outcome = if method == Method::PrivacySet {
-                        controller.privacy_set(&mutation, carried).await
-                    } else {
-                        match mutation.target.session_id.as_ref().copied() {
-                            Some(session_id) => {
-                                match controller.session_summary(session_id).await {
-                                    Ok(summary) => {
-                                        let reach = crate::describe::HistoryReach::of_grant(
-                                            lower_bound,
-                                            Some(summary.created_at_ms),
-                                        );
-                                        controller
-                                            .session_rename(
-                                                &actor_id, &mutation, summary, reach, carried,
-                                            )
-                                            .await
-                                    }
-                                    Err(error) => Err(error),
-                                }
+                    let outcome = match mutation.target.session_id.as_ref().copied() {
+                        Some(session_id) => match controller.session_summary(session_id).await {
+                            Ok(summary) => {
+                                let reach = crate::describe::HistoryReach::of_grant(
+                                    lower_bound,
+                                    Some(summary.created_at_ms),
+                                );
+                                controller
+                                    .session_rename(&actor_id, &mutation, summary, reach, carried)
+                                    .await
                             }
-                            None => Err(crate::error::ControllerError::InvalidArgument(
-                                "a rename names the session it renames".to_owned(),
-                            )),
-                        }
+                            Err(error) => Err(error),
+                        },
+                        None => Err(crate::error::ControllerError::InvalidArgument(
+                            "a rename names the session it renames".to_owned(),
+                        )),
                     };
                     let kept = controller.settle_claim(&hold, &outcome);
                     drop(hold);

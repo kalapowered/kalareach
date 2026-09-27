@@ -363,13 +363,18 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
     // Section 24 turns privacy mode on and off for the whole environment, and section 23 names no
     // method that does. This build adds a write and a read, both in the host-and-environment group:
     // the switch changes what this host retains, so it asks for host management, and so does the
-    // read, which lists what the environment kept and what had already left it. Both are served on
-    // the local socket and to a paired device, whose grant must carry host management.
-    let privacy = [
-        ("privacy.set", EffectClass::Write),
-        ("privacy.status", EffectClass::Read),
+    // read, which lists what the environment kept and what had already left it. The switch is
+    // served on the local socket only, since a paired device changes nothing about the host; the
+    // read is served to a paired device too, whose grant must carry host management.
+    let privacy: [(&str, EffectClass, &[ActorIngress]); 2] = [
+        ("privacy.set", EffectClass::Write, &[ActorIngress::LocalIpc]),
+        (
+            "privacy.status",
+            EffectClass::Read,
+            &[ActorIngress::LocalIpc, ActorIngress::PairedDevice],
+        ),
     ];
-    for (name, effect) in privacy {
+    for (name, effect, ingress) in privacy {
         let entry = lookup(name).unwrap_or_else(|| panic!("{name} is missing from the registry"));
         assert_eq!(entry.effect, effect, "{name} carries its own effect class");
         assert_eq!(
@@ -377,11 +382,7 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
             MethodGroup::HostAndEnvironment,
             "{name} is a host and environment method"
         );
-        assert_eq!(
-            entry.ingress,
-            &[ActorIngress::LocalIpc, ActorIngress::PairedDevice],
-            "{name} is served on the local socket and to a paired device"
-        );
+        assert_eq!(entry.ingress, ingress, "{name} is served where it says");
         assert_eq!(
             entry.required_rights,
             &[RequiredRight::right(ActionRight::HostManage)],

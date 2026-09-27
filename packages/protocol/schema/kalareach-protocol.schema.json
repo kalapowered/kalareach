@@ -17376,7 +17376,7 @@
         },
         {
           "const": "privacy.set",
-          "description": "Turn privacy mode on or off for this environment. The change is recorded, and the generation advanced, before any subsystem is touched; the answer says where it stands.",
+          "description": "Turn privacy mode on or off for this environment, at the host itself: a paired device reads where it stands and changes nothing about the host. The change is recorded, and the generation advanced, before any subsystem is touched; the answer says where it stands.",
           "type": "string"
         },
         {

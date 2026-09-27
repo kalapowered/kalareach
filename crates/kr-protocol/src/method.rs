@@ -404,12 +404,14 @@ methods! {
           goes when the destination does.";
 
     PrivacySet = "privacy.set", HostAndEnvironment,
-    effect: Write, ingress: [LocalIpc, PairedDevice], rights: [req(HostManage)],
+    effect: Write, ingress: [LocalIpc], rights: [req(HostManage)],
     selectors: [Environment],
     history: NotApplicable, capability: NO_CAPABILITY, freshness: ActionWindow,
     confirmation: None, idempotency: ACTION,
-    doc: "Turn privacy mode on or off for this environment. The change is recorded, and the \
-          generation advanced, before any subsystem is touched; the answer says where it stands.";
+    doc: "Turn privacy mode on or off for this environment, at the host itself: a paired device \
+          reads where it stands and changes nothing about the host. The change is recorded, and \
+          the generation advanced, before any subsystem is touched; the answer says where it \
+          stands.";
 
     PrivacyStatus = "privacy.status", HostAndEnvironment,
     effect: Read, ingress: [LocalIpc, PairedDevice], rights: [req(HostManage)],
