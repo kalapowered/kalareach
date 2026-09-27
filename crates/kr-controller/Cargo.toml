@@ -27,6 +27,10 @@ kr-changeset.workspace = true
 kr-client = { workspace = true, default-features = false }
 kr-crypto.workspace = true
 kr-delivery.workspace = true
+# Session names, pins and generated-description provenance: the environment's session-metadata
+# store and its deterministic titles. No model runtime: this daemon maps none, and a build with no
+# runtime still names every session from metadata.
+kr-describe.workspace = true
 kr-flush.workspace = true
 kr-ipc.workspace = true
 kr-pairing.workspace = true

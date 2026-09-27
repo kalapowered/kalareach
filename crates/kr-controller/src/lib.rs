@@ -31,6 +31,7 @@
 //! | [`project`] | The environment's project service: repositories, workspaces and the restricted Git profile |
 //! | [`changeset`] | The environment's change-set service: immutable versions, materialisations and applies |
 //! | [`push`] | The environment's delivery journal, the gateway client and the notification-preview key |
+//! | [`describe`] | Session names and descriptions, answered from the environment's session-metadata store with no model |
 //! | [`privacy`] | The environment's privacy record, and the composition root that drives each daemon subsystem through privacy mode |
 //! | [`error`] | The failures above, each mapped to one stable protocol error code |
 
@@ -44,6 +45,7 @@ pub mod bridge;
 pub mod catalogue;
 pub mod changeset;
 pub mod config;
+pub mod describe;
 pub mod desktop;
 pub mod directory;
 pub mod error;
