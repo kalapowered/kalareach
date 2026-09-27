@@ -496,6 +496,13 @@ entry, and named clients, which attach and subscribe as the worker's service sub
 waits on a clock. A step that moves time says by how much, and a timer that falls due fires in that
 step, so a race happens in the same order on every run.
 
+The session still decides two things on the host's own clock, which no step moves: a reply to a
+question the application asks while the person's input is inside a paste or a held delimiter waits
+until that closes and is dropped after two seconds, and replies past 256 a second are dropped. The
+replayer refuses a trace that reaches either, so no replay turns on how fast the machine ran it: an
+output that asks a question while the input side holds the reply back, or more than 256 questions in
+all, counted by an engine of the profile reading the same output.
+
 | Step (`do`) | Fields | What happens |
 | --- | --- | --- |
 | `output` | `text` or `hex` | The application writes, and the session reads it as one read |
@@ -517,12 +524,14 @@ step, so a race happens in the same order on every run.
 | `effects` | `client`, `expect` | Every side effect the client's terminal has performed from the live stream: `bell`, `clipboard write: <content>` and so on |
 
 A trace that fails names the file, the step and what was found. `kr_faults::trace::minimise` cuts a
-failing trace down to the fewest steps that still fail at the same step. The steps after that one go
-at once, and delta debugging then removes each run of earlier steps the failure does not need. The
-smaller trace is the one to keep once the race is fixed, with a test of its own in
-`tests/faults/tests/traces.rs`; the suite checks that every kept trace has one. The suite also
-contradicts each expectation of every kept trace, one at a time, and the replay must then stop at
-that step.
+failing trace down until no single step can be taken out and the trace still fail at the same step.
+The steps after that one go at once, and delta debugging then removes each run of earlier steps the
+failure does not need; a smaller trace that fails the same way may still exist, because delta
+debugging does not try every subset. The smaller trace is the one to keep once the race is fixed,
+with a test of its own in `tests/faults/tests/traces.rs`; the suite checks that every kept trace has
+one. The suite also contradicts each field of each expectation of every kept trace, one at a time,
+and the replay must then stop at that step; a planted client that takes the raw output from where it
+arrived must fail a `holds`.
 
 The format is written down here so that a repository that scripts this one as a peer can keep its
 traces in the same format.

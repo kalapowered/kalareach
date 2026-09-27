@@ -875,21 +875,9 @@ impl Stage {
 
     /// Reads byte `point` of the corpus into the session, as the read loop would.
     fn feed(&mut self, point: usize) -> Result<(), String> {
+        debug_assert_eq!(point, self.fed, "a corpus is read in order");
         let byte = [self.bytes[point]];
-        let _ = self.session.ingest_output(&byte);
-        self.fed = point + 1;
-        let mut clients = std::mem::take(&mut self.clients);
-        for client in &mut clients {
-            if client.form == Form::Direct
-                && self.strategy == Strategy::RawFromOffset
-                && client.served == Served::Stream
-            {
-                client.live(&byte, point as u64);
-            }
-            self.pump(client)?;
-        }
-        self.clients = clients;
-        Ok(())
+        self.ingest(&byte)
     }
 
     /// The session's own screen, as a client installed at this moment holds it.
@@ -1037,10 +1025,22 @@ impl Stage {
     }
 
     /// Reads `bytes` into the session as one read of the program's output, and hands every client
-    /// what it was given.
+    /// what it was given. A direct client planted to take the raw output from where it arrived is
+    /// handed these bytes as they are.
     pub(crate) fn ingest(&mut self, bytes: &[u8]) -> Result<(), String> {
         let _ = self.session.ingest_output(bytes);
+        let at = self.fed as u64;
         self.fed += bytes.len();
+        let mut clients = std::mem::take(&mut self.clients);
+        for client in &mut clients {
+            if client.form == Form::Direct
+                && self.strategy == Strategy::RawFromOffset
+                && client.served == Served::Stream
+            {
+                client.live(bytes, at);
+            }
+        }
+        self.clients = clients;
         self.pump_all()
     }
 

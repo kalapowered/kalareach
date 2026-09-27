@@ -12,8 +12,17 @@
 //! whose expectation did not hold. Beside what a trace states, every attach checks the screen the
 //! client is restored to, and no terminal of another size may be handed raw output.
 //!
-//! [`minimise`] takes a failing trace down to the fewest steps that still fail at the same step,
-//! which is the trace worth keeping once the race it shows is fixed.
+//! The session still decides two things on the host's own clock, which a trace does not move: a
+//! reply to a question the application asks while the person's input is inside a paste or a held
+//! delimiter waits until that closes and is dropped after two seconds, and replies past 256 a
+//! second are dropped. A replay could then turn on how fast the machine ran it, so [`replay`]
+//! refuses a trace that reaches either: an output that asks a question while the input side holds
+//! the reply back, or more than 256 questions in all. The questions are counted by an engine of the
+//! profile reading the same output.
+//!
+//! [`minimise`] takes a failing trace down to steps from which no single one can be taken and the
+//! trace still fail at the same step, which is the trace worth keeping once the race it shows is
+//! fixed.
 //!
 //! ```json
 //! {
@@ -37,6 +46,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use kr_protocol::projection::ProjectedBuffer;
+use kr_term::budget::GridSize;
+use kr_term::engine::{Engine, EngineConfig};
 use kr_term::sideeffect::{ClipboardSelection, SideEffectKind};
 use kr_worker::action::time::{Discontinuity, ExpiringObject, Validity};
 use kr_worker::session::InputBatch;
@@ -449,11 +460,21 @@ pub fn replay_with(trace: &Trace, strategy: Strategy) -> Result<(), Stopped> {
         time.worker_sources(),
     )
     .map_err(|what| stopped(None, Cause::Malformed, what))?;
+    let reference = Engine::new(EngineConfig {
+        size: GridSize {
+            cols: u32::from(trace.columns),
+            rows: u32::from(trace.rows),
+        },
+        ..EngineConfig::DEFAULT
+    })
+    .map_err(|error| stopped(None, Cause::Malformed, error.to_string()))?;
     let mut replay = Replay {
         time,
         stage,
         clients: BTreeMap::new(),
         epochs: BTreeMap::new(),
+        reference,
+        questions: 0,
     };
     for (index, step) in trace.steps.iter().enumerate() {
         replay
@@ -471,7 +492,15 @@ struct Replay {
     clients: BTreeMap<String, usize>,
     /// Which client took each lease epoch.
     epochs: BTreeMap<u64, String>,
+    /// An engine of the profile reading the same output, which counts the questions it asks.
+    reference: Engine,
+    /// How many questions the output has asked so far.
+    questions: usize,
 }
+
+/// The most questions a trace may ask: the session drops replies past this many a second of the
+/// host's own clock.
+const MOST_QUESTIONS: usize = 256;
 
 type StepResult = Result<(), (Cause, String)>;
 
@@ -488,6 +517,7 @@ impl Replay {
         match step {
             Step::Output { text, hex } => {
                 let bytes = bytes_of(text.as_deref(), hex.as_deref()).map_err(malformed)?;
+                self.questions_on_the_clock(&bytes)?;
                 self.stage.ingest(&bytes).map_err(malformed)?;
             }
             Step::Settle => self.stage.settle().map_err(malformed)?,
@@ -577,6 +607,41 @@ impl Replay {
                     .join("; "),
             ))
         }
+    }
+
+    /// Refuses an output whose replies the session would decide on the host's own clock.
+    fn questions_on_the_clock(&mut self, bytes: &[u8]) -> StepResult {
+        // The reference answers on a clock that never moves, so its own lane refuses what a moving
+        // one would take later: a question whose reply it refused or dropped is still one asked. A
+        // reply merged into a later one was counted when it was taken.
+        let before = self.reference.lane().degradation();
+        let answered =
+            self.reference.feed(bytes, 0).responses + self.reference.quiesce(0).responses;
+        let after = self.reference.lane().degradation();
+        let refused = (after.over_budget - before.over_budget)
+            + (after.dropped - before.dropped)
+            + (after.oversized - before.oversized);
+        let asked = answered + usize::try_from(refused).unwrap_or(usize::MAX);
+        if asked == 0 {
+            return Ok(());
+        }
+        let session = self.stage.session();
+        if session.paste_open() || session.paste_deadline().is_some() {
+            return Err(malformed(format!(
+                "this output asks {asked} question(s) while the input side holds a paste or a \
+                 delimiter open, and the session keeps the reply until that closes and drops it \
+                 after two seconds of the host's own clock, which a trace does not move"
+            )));
+        }
+        self.questions += asked;
+        if self.questions > MOST_QUESTIONS {
+            return Err(malformed(format!(
+                "the trace has asked {} questions, and the session drops replies past \
+                 {MOST_QUESTIONS} a second of the host's own clock, which a trace does not move",
+                self.questions
+            )));
+        }
+        Ok(())
     }
 
     fn client(&self, name: &str) -> Result<usize, (Cause, String)> {
@@ -886,13 +951,15 @@ pub fn effect_name(kind: &SideEffectKind) -> String {
     }
 }
 
-/// Takes a failing trace down to the fewest steps that still fail at the same step.
+/// Takes a failing trace down to steps from which no single one can be taken and the trace still
+/// fail at the same step.
 ///
 /// The step the trace fails at is kept, and every step after it goes, since a replay stops there.
 /// The steps before it are reduced by delta debugging: a set of them goes whenever the trace
 /// without them still fails at that step because an expectation did not hold, rather than because
 /// it can no longer be run. Taking any one more step out of the result makes it pass, fail at
-/// another step, or stop being runnable.
+/// another step, or stop being runnable; a smaller trace that fails the same way may still exist,
+/// because delta debugging does not search every subset.
 ///
 /// # Errors
 ///

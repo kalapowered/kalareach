@@ -6,7 +6,7 @@
 //! planted failing trace.
 
 use kr_faults::restore::Strategy;
-use kr_faults::trace::{self, Batch, Cause, Step, Trace};
+use kr_faults::trace::{self, Acquired, Batch, Cause, Moved, PasteEdge, Step, Trace};
 use kr_protocol::projection::ProjectedBuffer;
 
 /// The kept traces, each with the test below that replays it.
@@ -85,78 +85,249 @@ fn every_kept_trace_has_a_test_of_its_own() {
     );
 }
 
-/// The same step with its expectation turned into one the product does not meet, or nothing when
-/// the step states none that a trace can contradict.
-fn contradicted(step: &Step) -> Option<Step> {
-    let mut step = step.clone();
-    match &mut step {
+/// Every way of contradicting what the step asserts, one field at a time; nothing for a step that
+/// asserts nothing a trace can contradict.
+fn contradictions(step: &Step) -> Vec<Step> {
+    let mut found = Vec::new();
+    match step {
         Step::Acquire {
+            client,
             expect: Some(expect),
-            ..
-        } => expect.closed_open_paste = !expect.closed_open_paste,
-        Step::Input { refused, .. } => {
-            *refused = match refused {
-                Some(_) => None,
-                None => Some("LEASE_LOST".to_owned()),
+        } => {
+            for changed in [
+                Acquired {
+                    closed_open_paste: !expect.closed_open_paste,
+                    ..*expect
+                },
+                Acquired {
+                    discarded_bytes: expect.discarded_bytes + 1,
+                    ..*expect
+                },
+            ] {
+                found.push(Step::Acquire {
+                    client: client.clone(),
+                    expect: Some(changed),
+                });
+            }
+        }
+        Step::Input {
+            client,
+            text,
+            hex,
+            refused,
+        } => {
+            let refusals = match refused {
+                None => vec![Some("LEASE_LOST".to_owned())],
+                Some(_) => vec![None, Some("SESSION_CLOSED".to_owned())],
             };
+            for refused in refusals {
+                found.push(Step::Input {
+                    client: client.clone(),
+                    text: text.clone(),
+                    hex: hex.clone(),
+                    refused,
+                });
+            }
         }
         Step::TakeInput { expect } => {
-            if expect.pop().is_none() {
-                expect.push(Batch::LeaseChanged);
+            for index in 0..expect.len() {
+                let mut dropped = expect.clone();
+                dropped.remove(index);
+                found.push(Step::TakeInput { expect: dropped });
+                for changed in batch_contradictions(&expect[index]) {
+                    let mut batches = expect.clone();
+                    batches[index] = changed;
+                    found.push(Step::TakeInput { expect: batches });
+                }
             }
+            let mut extra = expect.clone();
+            extra.push(Batch::LeaseChanged);
+            found.push(Step::TakeInput { expect: extra });
         }
         Step::ObserveTime { expect } => {
-            if expect.is_empty() {
-                expect.push(trace::Moved::Suspended);
-            } else {
-                expect.clear();
+            for moved in [Moved::Suspended, Moved::Rebooted, Moved::RolledBack] {
+                let mut toggled = expect.clone();
+                match toggled.iter().position(|was| *was == moved) {
+                    Some(at) => {
+                        toggled.remove(at);
+                    }
+                    None => toggled.push(moved),
+                }
+                found.push(Step::ObserveTime { expect: toggled });
             }
         }
-        Step::Validity { expect, .. } => {
-            *expect = if expect == "valid" {
-                "unproven".to_owned()
-            } else {
-                "valid".to_owned()
-            };
+        Step::Validity { object, expect } => {
+            for decision in [
+                "valid",
+                "expired: continuous_deadline",
+                "expired: trusted_utc_deadline",
+                "unproven",
+                "revalidation owed",
+            ] {
+                if decision != expect {
+                    found.push(Step::Validity {
+                        object: object.clone(),
+                        expect: decision.to_owned(),
+                    });
+                }
+            }
         }
-        Step::Screen { active, .. } => {
-            *active = match active {
+        Step::Screen {
+            active,
+            lines,
+            other,
+        } => {
+            let flipped = match active {
                 ProjectedBuffer::Primary => ProjectedBuffer::Alternate,
                 ProjectedBuffer::Alternate => ProjectedBuffer::Primary,
             };
+            found.push(Step::Screen {
+                active: flipped,
+                lines: lines.clone(),
+                other: other.clone(),
+            });
+            for changed in rows_contradicted(lines) {
+                found.push(Step::Screen {
+                    active: *active,
+                    lines: changed,
+                    other: other.clone(),
+                });
+            }
+            if let Some(other) = other {
+                for changed in rows_contradicted(other) {
+                    found.push(Step::Screen {
+                        active: *active,
+                        lines: lines.clone(),
+                        other: Some(changed),
+                    });
+                }
+            }
         }
-        Step::Effects { expect, .. } => expect.push("bell".to_owned()),
-        _ => return None,
+        Step::Effects { client, expect } => {
+            for changed in rows_contradicted(expect) {
+                found.push(Step::Effects {
+                    client: client.clone(),
+                    expect: changed,
+                });
+            }
+            for index in 0..expect.len() {
+                let mut dropped = expect.clone();
+                dropped.remove(index);
+                found.push(Step::Effects {
+                    client: client.clone(),
+                    expect: dropped,
+                });
+            }
+        }
+        _ => {}
     }
-    Some(step)
+    found
+}
+
+/// Each entry of `rows` changed in turn, and one more entry after them.
+fn rows_contradicted(rows: &[String]) -> Vec<Vec<String>> {
+    let mut found: Vec<Vec<String>> = (0..rows.len())
+        .map(|index| {
+            let mut changed = rows.to_vec();
+            changed[index].push('x');
+            changed
+        })
+        .collect();
+    let mut extra = rows.to_vec();
+    extra.push("x".to_owned());
+    found.push(extra);
+    found
+}
+
+/// Each field of one batch changed in turn.
+fn batch_contradictions(batch: &Batch) -> Vec<Batch> {
+    let changed = |text: &Option<String>, hex: &Option<String>| match (text, hex) {
+        (Some(text), _) => (Some(format!("{text}x")), None),
+        (None, Some(hex)) => (None, Some(format!("{hex}78"))),
+        (None, None) => (Some("x".to_owned()), None),
+    };
+    match batch {
+        Batch::Input {
+            client,
+            text,
+            hex,
+            paste,
+        } => {
+            let (other_text, other_hex) = changed(text, hex);
+            vec![
+                Batch::Input {
+                    client: format!("{client}x"),
+                    text: text.clone(),
+                    hex: hex.clone(),
+                    paste: paste.clone(),
+                },
+                Batch::Input {
+                    client: client.clone(),
+                    text: other_text,
+                    hex: other_hex,
+                    paste: paste.clone(),
+                },
+                Batch::Input {
+                    client: client.clone(),
+                    text: text.clone(),
+                    hex: hex.clone(),
+                    paste: if paste.is_empty() {
+                        vec![PasteEdge::Opens]
+                    } else {
+                        Vec::new()
+                    },
+                },
+            ]
+        }
+        Batch::Reply { text, hex } => {
+            let (text, hex) = changed(text, hex);
+            vec![Batch::Reply { text, hex }]
+        }
+        Batch::LeaseChanged => vec![Batch::Reply {
+            text: Some("x".to_owned()),
+            hex: None,
+        }],
+    }
 }
 
 #[test]
-fn every_expectation_a_kept_trace_states_fails_when_it_is_contradicted() {
+fn every_field_of_every_expectation_a_kept_trace_states_fails_when_it_is_contradicted() {
     for name in KEPT {
         let kept = load(name);
-        let mut contradictions = 0;
+        let mut contradicted = 0;
         for (index, step) in kept.steps.iter().enumerate() {
-            let Some(contradiction) = contradicted(step) else {
-                continue;
-            };
-            let mut planted = kept.clone();
-            planted.steps[index] = contradiction;
-            let stopped = trace::replay(&planted).expect_err(&format!(
-                "trace {name} replayed with step {index} contradicted"
-            ));
-            assert_eq!(
-                (stopped.step, stopped.cause),
-                (Some(index), Cause::Expectation),
-                "{stopped}"
-            );
-            contradictions += 1;
+            for contradiction in contradictions(step) {
+                let mut planted = kept.clone();
+                planted.steps[index] = contradiction.clone();
+                let stopped = trace::replay(&planted).expect_err(&format!(
+                    "trace {name} replayed with step {index} contradicted as {contradiction:?}"
+                ));
+                assert_eq!(
+                    (stopped.step, stopped.cause),
+                    (Some(index), Cause::Expectation),
+                    "{stopped}"
+                );
+                contradicted += 1;
+            }
         }
         assert!(
-            contradictions > 0,
+            contradicted > 0,
             "trace {name} states no expectation a contradiction could test"
         );
     }
+}
+
+#[test]
+fn a_terminal_handed_the_raw_output_from_where_it_arrived_fails_the_next_holds() {
+    let kept = load("attach-inside-a-1049-switch");
+    let stopped =
+        trace::replay_with(&kept, Strategy::RawFromOffset).expect_err("a raw-output terminal");
+    assert_eq!(
+        (stopped.step, stopped.cause),
+        (Some(10), Cause::Expectation),
+        "{stopped}"
+    );
+    assert!(stopped.what.contains("its terminal"), "{stopped}");
 }
 
 #[test]
@@ -249,4 +420,62 @@ fn a_trace_that_replays_or_cannot_be_run_has_nothing_to_minimise() {
         "{stopped}"
     );
     assert!(trace::minimise(&malformed).is_err_and(|error| error.contains("no client nobody")));
+}
+
+/// A trace that turns its input into a bracketed paste and then asks the terminal where its cursor
+/// is, or asks nothing more while the paste is open.
+fn asking(while_pasting: bool) -> Trace {
+    let paste = if while_pasting {
+        r#"{ "do": "input", "client": "a", "text": "\u001b[200~pasted" },"#
+    } else {
+        ""
+    };
+    Trace::parse(&format!(
+        r#"{{
+  "format": "kalareach.trace/1",
+  "name": "asking",
+  "about": "a question asked with the input side open or holding a paste",
+  "columns": 20,
+  "rows": 3,
+  "wall_ms": 1790000000000,
+  "steps": [
+    {{ "do": "output", "text": "\u001b[?2004h$ " }},
+    {{ "do": "attach", "client": "a", "form": "direct" }},
+    {{ "do": "acquire", "client": "a" }},
+    {paste}
+    {{ "do": "output", "text": "\u001b[6n" }}
+  ]
+}}"#
+    ))
+    .unwrap_or_else(|error| panic!("{error}"))
+}
+
+#[test]
+fn a_question_asked_while_a_paste_holds_its_reply_back_is_refused_as_decided_on_the_hosts_clock() {
+    let stopped = trace::replay(&asking(true)).expect_err("the reply waits on the host's clock");
+    assert_eq!(
+        (stopped.step, stopped.cause),
+        (Some(4), Cause::Malformed),
+        "{stopped}"
+    );
+    assert!(stopped.what.contains("host's own clock"), "{stopped}");
+    let open = trace::replay(&asking(false));
+    assert!(open.is_ok(), "{open:?}");
+}
+
+#[test]
+fn a_trace_that_asks_more_questions_than_the_session_answers_in_a_second_is_refused() {
+    let many = "\\u001b[5n".repeat(257);
+    let trace = Trace::parse(&format!(
+        r#"{{"format":"kalareach.trace/1","name":"many","about":"257 questions","columns":20,
+            "rows":3,"wall_ms":1790000000000,"steps":[{{"do":"output","text":"{many}"}}]}}"#
+    ))
+    .unwrap_or_else(|error| panic!("{error}"));
+    let stopped = trace::replay(&trace).expect_err("too many questions");
+    assert_eq!(
+        (stopped.step, stopped.cause),
+        (Some(0), Cause::Malformed),
+        "{stopped}"
+    );
+    assert!(stopped.what.contains("257 questions"), "{stopped}");
 }
