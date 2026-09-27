@@ -72,7 +72,6 @@ const MAX_SPAN_ANSWERS = 16
 interface Span {
   readonly page: OutputPage
   readonly oldest: string
-  readonly end: string
   readonly gap: HistoryGapResult
 }
 
@@ -135,20 +134,31 @@ export function RetainedOutput({
    * Reads the output from `from` up to `upTo`. A host stops an answer short where its memory
    * begins, so the read goes on from where each answer ended until it reaches `upTo`, the host has
    * nothing more, or the host answers from somewhere else. The first answer may begin later than
-   * asked, where the host's output now begins, with what it let go.
+   * asked, where the host's output now begins, with what it let go; it then carries as many bytes
+   * as were asked for from there, which can run past `upTo`, and what runs past is not kept.
    */
   const span = useCallback(
     async (from: bigint, upTo: bigint): Promise<Span> => {
+      /** An answer's bytes, cut at `upTo`, and the cursor after them. */
+      const within = (answer: HistoryPageResult): { bytes: Uint8Array; next: bigint } => {
+        const bytes = base64UrlToBytes(answer.bytes)
+        const start = BigInt(answer.from_cursor)
+        const room = upTo > start ? Number(upTo - start) : 0
+        return bytes.length > room
+          ? { bytes: bytes.subarray(0, room), next: start + BigInt(room) }
+          : { bytes, next: BigInt(answer.next_cursor) }
+      }
       const first = await page(String(from), upTo - from)
-      const parts = [base64UrlToBytes(first.bytes)]
-      let at = BigInt(first.next_cursor)
+      const opening = within(first)
+      const parts = [opening.bytes]
+      let at = opening.next
       let last = first
       for (let answers = 1; at < upTo && answers < MAX_SPAN_ANSWERS; answers += 1) {
         const more = await page(String(at), upTo - at)
-        const bytes = base64UrlToBytes(more.bytes)
-        if (BigInt(more.from_cursor) !== at || bytes.length === 0) break
-        parts.push(bytes)
-        at = BigInt(more.next_cursor)
+        const next = within(more)
+        if (BigInt(more.from_cursor) !== at || next.bytes.length === 0) break
+        parts.push(next.bytes)
+        at = next.next
         last = more
       }
       const joined = new Uint8Array(parts.reduce((total, each) => total + each.length, 0))
@@ -160,7 +170,6 @@ export function RetainedOutput({
       return {
         page: { from: first.from_cursor, next: String(at), bytes: joined },
         oldest: last.oldest_retained_cursor,
-        end: last.next_cursor,
         gap: first.gap ?? last.gap
       }
     },

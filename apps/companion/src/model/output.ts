@@ -130,7 +130,9 @@ export function withNewer(
   if (last !== undefined && page.from !== last.next) {
     if (answer.gap === null || BigInt(page.from) <= BigInt(last.next)) return window
     const again = heard({ ...window, pages: [], anchor: null }, answer)
-    return page.bytes.length === 0 ? again : { ...again, pages: [page] }
+    // With nothing left to read back to, the reader is at the live end, where new output is read
+    // as it comes.
+    return page.bytes.length === 0 ? { ...again, following: true } : { ...again, pages: [page] }
   }
   if (page.bytes.length === 0) return heard(window, answer)
   let pages = [...window.pages, page]

@@ -229,6 +229,63 @@ describe('the retained output (KR-REQ-13.15)', () => {
     })
   })
 
+  it('keeps only what it asked for when the host answers from later than asked and reads past it', async () => {
+    const { port, controls } = recording()
+    openOutput(port, 3000, 9000)
+    await waitFor(() => {
+      expect(held()).toHaveLength(1)
+    })
+    // The host lets output go up to partway through the page before the window's first, so it
+    // answers the next read back from there, as many bytes as were asked for: past the window.
+    const end = controls.records.outputEnd(SESSION_MAIN)
+    controls.records.forgetOutput(SESSION_MAIN, end - 4000n)
+    act(() => {
+      scrollTo(10)
+    })
+    await waitFor(() => {
+      expect(held()).toEqual([String(end - 4000n), String(end - 3000n)])
+    })
+    expect(screen.getByTestId('output-gap')).toHaveTextContent(
+      'Output before this is not kept: it was older than the host keeps output for.'
+    )
+  })
+
+  it('reads on at the live end when the host let go of everything after a reader who had scrolled back', async () => {
+    const { port, controls } = recording()
+    render(
+      <AppProvider port={port}>
+        <RetainedOutput sessionId={SESSION_MAIN} pageBytes={3000} windowBytes={6000} cadenceMs={20} />
+      </AppProvider>
+    )
+    await waitFor(() => {
+      expect(held()).toHaveLength(1)
+    })
+    // Back two pages: the newest page leaves the window, so the reader is no longer at the end.
+    for (const count of [2, 3]) {
+      act(() => {
+        scrollTo(10)
+      })
+      await waitFor(() => {
+        expect(held().length).toBeGreaterThanOrEqual(Math.min(count, 2))
+      })
+    }
+    await waitFor(() => {
+      expect(screen.getByTestId('output-scroll')).toHaveAttribute('data-following', 'false')
+    })
+    // Everything the host kept goes, and then the reader comes back down.
+    controls.records.forgetOutput(SESSION_MAIN, controls.records.outputEnd(SESSION_MAIN))
+    act(() => {
+      scrollTo(900)
+    })
+    await waitFor(() => {
+      expect(held()).toEqual([])
+    })
+    controls.records.appendOutput(SESSION_MAIN, 'written once it had all gone\r\n')
+    await waitFor(() => {
+      expect(screen.getByTestId('output-scroll').textContent).toContain('written once it had all gone')
+    })
+  })
+
   it('keeps reading at the live end of a session that had written nothing, and shows what it writes', async () => {
     const { port, controls } = fakeHost()
     render(
