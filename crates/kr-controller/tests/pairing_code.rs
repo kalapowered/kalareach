@@ -625,6 +625,9 @@ fn secret_forms(secrets: &serde_json::Value) -> Vec<Vec<u8>> {
     let url = kr_protocol::scalars::to_base64url(&direct);
     let standard = format!("{}=", url.replace('-', "+").replace('_', "/"));
     let code = text("code");
+    // A QR text is the unpadded base64url of its payload, which carries the code or the secret
+    // inside it; the standard alphabet is how a careless line would print the same bytes.
+    let standard_of = |url: &str| url.replace('-', "+").replace('_', "/");
     let mut forms = vec![
         text("code_secret").into_bytes(),
         code.clone().into_bytes(),
@@ -634,7 +637,10 @@ fn secret_forms(secrets: &serde_json::Value) -> Vec<Vec<u8>> {
         lower.into_bytes(),
         url.into_bytes(),
         standard.into_bytes(),
+        text("code_qr_text").into_bytes(),
+        standard_of(&text("code_qr_text")).into_bytes(),
         text("direct_qr_text").into_bytes(),
+        standard_of(&text("direct_qr_text")).into_bytes(),
     ];
     forms.sort();
     forms.dedup();
@@ -673,6 +679,13 @@ async fn the_pairings_the_log_check_reads() {
     )
     .await;
     let (origin, code) = code_of(&invited);
+    let kr_protocol::invitation::InviteEntry::Code {
+        qr_text: code_qr_text,
+        ..
+    } = &invited.entry
+    else {
+        panic!("a code invitation is offered as a code");
+    };
     let by_code = Device::create().await;
     let mut candidate = CodeCandidate::start(&host.room, by_code.candidate(), &origin, &code)
         .await
@@ -711,9 +724,16 @@ async fn the_pairings_the_log_check_reads() {
     let secrets = serde_json::json!({
         "code": code,
         "code_secret": &code.replace('-', "")[4..],
+        "code_qr_text": code_qr_text.as_str(),
         "direct_secret": calls::direct_payload(&direct).secret.expose().to_vec(),
         "direct_qr_text": qr_text.as_str(),
     });
+    // The two invitations as the daemon answered the owner, which is where the code and both QR
+    // texts belong: the check's control.
+    let invitations = serde_json::json!([
+        serde_json::to_value(&invited).expect("JSON"),
+        serde_json::to_value(&direct).expect("JSON"),
+    ]);
 
     // The diagnostics: the owner's report, a paired device's, and a support bundle composed from
     // the owner's.
@@ -755,6 +775,7 @@ async fn the_pairings_the_log_check_reads() {
             serde_json::to_value(&devices).expect("JSON"),
         ),
         ("bundle.json", serde_json::to_value(&bundle).expect("JSON")),
+        ("invitations.json", invitations),
     ] {
         std::fs::write(out.join(name), value.to_string()).expect("written");
     }
@@ -778,9 +799,10 @@ async fn the_pairings_the_log_check_reads() {
 /// diagnostics. A real short-code pairing and a real direct pairing run in a process of their own,
 /// whose standard output and error are its log. Afterwards neither the code's six secret
 /// characters, the code as a whole, the direct invitation's secret in any encoding it travels in,
-/// nor the QR text that carries it, is in that log, in the owner's or the paired device's
-/// `host.doctor`, in a support bundle composed from the owner's, or in any file of the host's
-/// own tree.
+/// nor either invitation's QR text, which carries the code or the secret inside it, is in that
+/// log, in the owner's or the paired device's `host.doctor`, in a support bundle composed from
+/// the owner's, or in any file of the host's own tree. The control: the same scan finds the code
+/// and both QR texts in the invitations the daemon answered the owner with, where they belong.
 #[test]
 fn pairing_secrets_reach_no_log_and_no_diagnostics() {
     let directory = tempfile::TempDir::new().expect("a directory on the internal disk");
@@ -823,6 +845,14 @@ fn pairing_secrets_reach_no_log_and_no_diagnostics() {
         "{secrets}"
     );
     let forms = secret_forms(&secrets);
+    let answered = std::fs::read(out.join("invitations.json")).expect("the invitations read");
+    for key in ["code", "code_qr_text", "direct_qr_text"] {
+        let form = secrets[key].as_str().expect("a written secret").as_bytes();
+        assert!(
+            carries(&answered, form),
+            "the scan finds the {key} in the owner's own invitations"
+        );
+    }
     for name in [
         "daemon.log",
         "out/doctor-owner.json",
