@@ -1547,7 +1547,9 @@ of the answer is in it, and an entry larger than that on its own is carried with
 saying how many bytes it left out. The 16 MiB and the node count are spent by one snapshot's parts
 together: for each reader and instance a connection reads, the worker keeps what the parts of that
 snapshot have carried, and a request from where that reader's last part ended is paid for out of
-what is left, while any other request begins a snapshot. The part that would pass the total ends
+what is left, while any other request begins a snapshot. A connection keeps at most 32 such
+readings, lets one go when its snapshot ends and all of them when it loses its authority, and past
+that ceiling lets go of the one continued longest ago. The part that would pass the total ends
 the snapshot with a continuation that names the total, 16 MiB, and the entry it stopped at; asked
 from there, the rest is a snapshot of its own, so a reader that follows every continuation still
 reads the whole history once, in order. An entry's number is never given twice: a history that has

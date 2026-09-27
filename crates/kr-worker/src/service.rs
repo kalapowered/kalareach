@@ -2941,6 +2941,9 @@ impl WorkerService {
         if let Err(error) = self.check_authority(state) {
             state.subscribed = None;
             state.restoration = None;
+            // So is a semantic snapshot it continued: the part is not served, and nothing this
+            // connection reads can be continued under an authority it no longer holds.
+            state.semantic_snapshots = SemanticSnapshots::default();
             return failure(request.request_id, &error.to_protocol_error());
         }
         respond(request.request_id, outcome)
@@ -6508,6 +6511,13 @@ impl ConnectionState {
     }
 }
 
+/// How many semantic snapshots one connection reads at once.
+///
+/// A reader follows its continuations one after another, so it holds one reading for each
+/// instance it reads, and the control daemon's connection carries every paired device's reads.
+/// Past this many a connection is holding snapshots nobody came back for.
+const MAX_SNAPSHOTS_READ: usize = 32;
+
 /// The semantic snapshots one connection is part-way through reading.
 ///
 /// Section 8 bounds a semantic snapshot at 16 MiB across its parts, and a reader asks for each
@@ -6515,11 +6525,17 @@ impl ConnectionState {
 /// until the snapshot ends. A request that asks from exactly where this connection's last part for
 /// that reader and instance ended continues that snapshot and is paid for out of what it has left;
 /// any other request begins a snapshot. The control daemon's connection carries many readers'
-/// reads, so each reader is kept apart. There is at most one entry for each reader and instance,
-/// and every entry goes with the connection.
+/// reads, so each reader is kept apart.
+///
+/// What this holds is bounded: one reading for each reader and instance, let go when its
+/// snapshot ends, when the connection goes or loses its authority, and, past
+/// [`MAX_SNAPSHOTS_READ`], the reading continued longest ago, whose next request then begins a
+/// snapshot of its own.
 #[derive(Debug, Default)]
 struct SemanticSnapshots {
     reading: std::collections::BTreeMap<SnapshotReading, Reading>,
+    /// The order readings were last continued in.
+    continued: u64,
 }
 
 impl SemanticSnapshots {
@@ -6540,11 +6556,23 @@ impl SemanticSnapshots {
     fn after(&mut self, reading: SnapshotReading, part: &crate::broker::SnapshotPart) {
         match (part.carried, part.result.continuation.as_ref()) {
             (Some(carried), Some(continuation)) => {
+                if !self.reading.contains_key(&reading)
+                    && self.reading.len() >= MAX_SNAPSHOTS_READ
+                    && let Some(longest_ago) = self
+                        .reading
+                        .iter()
+                        .min_by_key(|(_, held)| held.continued)
+                        .map(|(held, _)| held.clone())
+                {
+                    self.reading.remove(&longest_ago);
+                }
+                self.continued = self.continued.saturating_add(1);
                 self.reading.insert(
                     reading,
                     Reading {
                         next_node: continuation.from_node.get(),
                         carried,
+                        continued: self.continued,
                     },
                 );
             }
@@ -6580,11 +6608,13 @@ impl SnapshotReader {
     }
 }
 
-/// Where a snapshot's next part starts, and what its parts have carried.
+/// Where a snapshot's next part starts, what its parts have carried, and when it was last
+/// continued.
 #[derive(Clone, Copy, Debug)]
 struct Reading {
     next_node: u64,
     carried: crate::broker::SnapshotCarried,
+    continued: u64,
 }
 
 /// The task delivering a connection's subscription, and how it is told a newer one replaced it.
@@ -7458,10 +7488,125 @@ mod tests {
     use kr_transport::clock::ManualClock;
 
     use super::{
-        ContinuousClock, ContinuousInstant, MAX_OUTPUT_EVENT_BYTES, Outlet, StreamId, Withdrawal,
-        Writing, notification, send_stream, vouched_deadline, write_frame, write_frame_unless,
-        write_within,
+        ContinuousClock, ContinuousInstant, MAX_OUTPUT_EVENT_BYTES, MAX_SNAPSHOTS_READ, Outlet,
+        SemanticSnapshots, SnapshotReader, SnapshotReading, StreamId, Withdrawal, Writing,
+        notification, send_stream, vouched_deadline, write_frame, write_frame_unless, write_within,
     };
+
+    /// One reader's snapshot of the instance numbered `number`.
+    fn reading(reader: &str, number: u8) -> SnapshotReading {
+        SnapshotReading {
+            reader: SnapshotReader {
+                actor_id: kr_protocol::ids::ActorId::new(reader).expect("an actor"),
+                grant_id: None,
+                device_id: None,
+            },
+            application_instance_id: kr_protocol::ids::ApplicationInstanceId::new(
+                kr_protocol::scalars::Uuid::from_bytes([number; 16]),
+            ),
+        }
+    }
+
+    /// A part that stopped at `from_node` with its snapshot still going, having carried `bytes`
+    /// with it; or, with no carried count, a part that ended its snapshot there.
+    fn part(from_node: u64, carried: Option<u64>) -> crate::broker::SnapshotPart {
+        let continuation = kr_protocol::semantic::SemanticContinuation {
+            limit: kr_protocol::semantic::SemanticLimit::Bytes,
+            limit_value: kr_protocol::scalars::U64::new(1_000),
+            from_node: kr_protocol::scalars::U64::new(from_node),
+            nodes: kr_protocol::scalars::U64::new(1),
+            bytes: kr_protocol::scalars::U64::new(900),
+        };
+        crate::broker::SnapshotPart {
+            result: kr_protocol::agent::AgentSnapshotResult {
+                binding: kr_protocol::agent::AgentBindingState {
+                    binding_revision: kr_protocol::ids::AgentBindingRevision::new(1),
+                    thread_id: kr_protocol::scalars::Nullable::null(),
+                    turn_id: kr_protocol::scalars::Nullable::null(),
+                    profile_id: kr_protocol::scalars::Nullable::null(),
+                    mode: kr_protocol::broker::IntegrationMode::Gateway,
+                    rich_mutations_suspended: false,
+                    suspension_reason: kr_protocol::scalars::Nullable::null(),
+                },
+                entries: Vec::new(),
+                continuation: kr_protocol::scalars::Nullable::some(continuation),
+                history_gap: false,
+                withheld_entries: kr_protocol::scalars::U64::new(0),
+            },
+            carried: carried.map(|bytes| crate::broker::SnapshotCarried { nodes: 1, bytes }),
+        }
+    }
+
+    /// A request from exactly where a reader's last part ended continues its snapshot, and any
+    /// other request begins one: another node, another reader and another instance each carry
+    /// nothing, and a part that ends its snapshot lets it go.
+    #[test]
+    fn only_the_node_a_reader_was_given_continues_its_snapshot() {
+        let mut snapshots = SemanticSnapshots::default();
+        snapshots.after(reading("device:a", 1), &part(5, Some(900)));
+        let carried = |snapshots: &SemanticSnapshots, reader: &str, number: u8, from: u64| {
+            snapshots
+                .carried_before(&reading(reader, number), Some(from))
+                .bytes
+        };
+        assert_eq!(carried(&snapshots, "device:a", 1, 5), 900);
+        assert_eq!(carried(&snapshots, "device:a", 1, 4), 0, "another node");
+        assert_eq!(carried(&snapshots, "device:b", 1, 5), 0, "another reader");
+        assert_eq!(carried(&snapshots, "device:a", 2, 5), 0, "another instance");
+        assert_eq!(
+            snapshots
+                .carried_before(&reading("device:a", 1), None)
+                .bytes,
+            0,
+            "a request from the start"
+        );
+        snapshots.after(reading("device:a", 1), &part(9, None));
+        assert_eq!(
+            carried(&snapshots, "device:a", 1, 9),
+            0,
+            "an ended snapshot"
+        );
+        assert!(snapshots.reading.is_empty());
+    }
+
+    /// Past its ceiling a connection lets go of the reading continued longest ago, and keeps the
+    /// ones its readers came back for.
+    #[test]
+    fn the_reading_continued_longest_ago_is_let_go_past_the_ceiling() {
+        let mut snapshots = SemanticSnapshots::default();
+        let readers: Vec<String> = (0..=MAX_SNAPSHOTS_READ)
+            .map(|index| format!("device:{index}"))
+            .collect();
+        for reader in &readers[..MAX_SNAPSHOTS_READ] {
+            snapshots.after(reading(reader, 1), &part(5, Some(900)));
+        }
+        // The first reader comes back, so the second is the one nobody came back for.
+        snapshots.after(reading(&readers[0], 1), &part(6, Some(1_800)));
+        snapshots.after(
+            reading(&readers[MAX_SNAPSHOTS_READ], 1),
+            &part(5, Some(900)),
+        );
+        assert_eq!(snapshots.reading.len(), MAX_SNAPSHOTS_READ);
+        assert_eq!(
+            snapshots
+                .carried_before(&reading(&readers[0], 1), Some(6))
+                .bytes,
+            1_800
+        );
+        assert_eq!(
+            snapshots
+                .carried_before(&reading(&readers[1], 1), Some(5))
+                .bytes,
+            0,
+            "let go"
+        );
+        assert_eq!(
+            snapshots
+                .carried_before(&reading(&readers[MAX_SNAPSHOTS_READ], 1), Some(5))
+                .bytes,
+            900
+        );
+    }
 
     /// Two clocks with one pause between the first reading and the second.
     ///
