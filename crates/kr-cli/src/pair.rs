@@ -1018,6 +1018,9 @@ mod tests {
 
     /// A direct invitation contacts no rendezvous service, so it takes no origin, and a code
     /// invitation's origin is a canonical one.
+    ///
+    /// KR-REQ-10.18: the issuing owner chooses the rendezvous origin a code invitation goes through
+    /// before it is issued.
     #[test]
     fn an_origin_is_named_only_for_a_code_and_only_canonically() {
         let mut direct = arguments(true, None);
@@ -1043,6 +1046,9 @@ mod tests {
 
     /// KR-REQ-10.04: a code invitation is shown as its code beside the origin it is reserved at,
     /// with a QR code that carries both, and the command that approves the device that answers.
+    ///
+    /// KR-REQ-10.18: the issuing screen names the rendezvous origin beside the code, the default
+    /// origin included.
     #[test]
     fn a_code_invitation_is_shown_with_its_origin_and_a_qr_code() {
         let now = 1_764_000_000_000;

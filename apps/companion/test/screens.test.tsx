@@ -591,6 +591,7 @@ describe('the session view reads once it is listening (KR-REQ-13.02, KR-REQ-13.1
 describe('closing a session', () => {
   // KR-REQ-06.11: closing ends the terminal's processes while the conversation stays, and the
   // consequence says so as two separate facts.
+  // KR-REQ-07.54: the consequence of closing is shown when close is chosen, before it is committed.
   it('says what closing does before it is committed, and that history is kept', async () => {
     start({ view: 'session', sessionId: SESSION_MAIN, pane: 'semantic' })
     await userEvent.click(await screen.findByTestId('close-session'))
@@ -614,6 +615,7 @@ describe('closing a session', () => {
   })
 
   // KR-REQ-13.07: a control that commits does so on a completed action, not on the press.
+  // KR-REQ-07.54: with the consequence shown, nothing is closed until the person commits.
   it('commits only on a completed action', async () => {
     start({ view: 'session', sessionId: SESSION_MAIN, pane: 'semantic' })
     await userEvent.click(await screen.findByTestId('close-session'))

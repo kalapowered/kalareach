@@ -488,6 +488,7 @@ test.describe('nothing claimed before the first answer', () => {
 })
 
 test.describe('closing a session', () => {
+  // KR-REQ-07.54: the built application shows what closing does before the close is committed.
   test('says what closing does before it is committed', async ({ page }) => {
     await openSession(page)
     await page.getByTestId('close-session').click()
@@ -2400,6 +2401,8 @@ test.describe('packages', () => {
 })
 
 test.describe('pairing', () => {
+  // KR-REQ-10.18: the code entry names the rendezvous origin, the default one included, with its
+  // change action, before an attempt starts.
   test('pairs from a typed code, shows the value, and names the service first', async ({
     page
   }) => {

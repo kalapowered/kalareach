@@ -363,6 +363,8 @@ describe('pairing with a host', () => {
     expect((await screen.findByTestId('pairing-status')).textContent).toBe('Checking the code')
   })
 
+  // KR-REQ-10.18: the code entry's change action changes the rendezvous origin it names, before
+  // an attempt starts.
   it('changes the service codes go through', async () => {
     start()
     await userEvent.click(await screen.findByTestId('change-service'))
