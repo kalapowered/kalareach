@@ -111,6 +111,77 @@ fn verbose_shows_every_checks_evidence() {
     }
 }
 
+/// Two command integrations as the host reports them: Claude Code's on and resolved on the
+/// daemon's search path, and Gemini CLI's on and unable to launch here.
+fn integrated() -> HostDoctorResult {
+    use kr_protocol::hostinfo::{
+        CommandIntegrationReport, CommandIntegrationState, CommandIntegrationUnavailable,
+    };
+    result().with_command_integrations(vec![
+        CommandIntegrationReport {
+            plugin_id: "kalareach/claude-code".to_owned(),
+            version: Nullable::some("0.4.0".to_owned()),
+            command: Nullable::some("claude".to_owned()),
+            flags: vec![
+                "--dangerously-load-development-channels".to_owned(),
+                "plugin:kalareach-channels@skills-dir".to_owned(),
+            ],
+            variables: Vec::new(),
+            state: CommandIntegrationState::On,
+            unavailable: Nullable::null(),
+            mode: kr_protocol::broker::IntegrationMode::NativeBridge,
+            executable: Nullable::some("/Users/someone/.local/bin/claude".to_owned()),
+            executable_version: Nullable::some("2.1.278".to_owned()),
+            reason: Nullable::null(),
+        },
+        CommandIntegrationReport {
+            plugin_id: "kalareach/gemini-cli".to_owned(),
+            version: Nullable::some("0.4.0".to_owned()),
+            command: Nullable::some("gemini".to_owned()),
+            flags: Vec::new(),
+            variables: vec![kr_protocol::session::EnvironmentVariable {
+                name: "GEMINI_CLI_NO_RELAUNCH".to_owned(),
+                value: "true".to_owned(),
+            }],
+            state: CommandIntegrationState::On,
+            unavailable: Nullable::some(CommandIntegrationUnavailable::NoLauncher),
+            mode: kr_protocol::broker::IntegrationMode::NativeTerminal,
+            executable: Nullable::null(),
+            executable_version: Nullable::null(),
+            reason: Nullable::null(),
+        },
+    ])
+}
+
+/// KR-REQ-07.45: the doctor shows each command integration: the resolved executable, the flags as
+/// the elements they are, the variables, the version and the mode, and why a new session cannot
+/// launch through one where it cannot; the document form carries them all.
+#[test]
+fn the_doctor_shows_each_command_integration() {
+    let text = doctor_lines(&integrated(), false);
+    for shown in [
+        "claude (kalareach/claude-code 0.4.0): on, native_bridge",
+        r#""--dangerously-load-development-channels" "plugin:kalareach-channels@skills-dir""#,
+        "/Users/someone/.local/bin/claude",
+        "2.1.278",
+        "gemini (kalareach/gemini-cli 0.4.0): on, native_terminal",
+        r#"GEMINI_CLI_NO_RELAUNCH="true""#,
+        "no_launcher",
+    ] {
+        assert!(text.contains(shown), "{shown} is missing: {text}");
+    }
+    let document = doctor(&integrated());
+    let reported = document["command_integrations"]
+        .as_array()
+        .expect("the integrations are in the document");
+    assert_eq!(reported.len(), 2);
+    assert_eq!(
+        reported[0]["flags"][1],
+        "plugin:kalareach-channels@skills-dir"
+    );
+    assert_eq!(reported[1]["unavailable"], "no_launcher");
+}
+
 /// KR-REQ-01.23: the summary counts every verdict.
 #[test]
 fn the_summary_counts_each_verdict() {
