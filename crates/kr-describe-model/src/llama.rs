@@ -1,9 +1,9 @@
-//! The llama.cpp runtime, CPU only.
+//! The llama.cpp runtime, CPU only, as the model the description process runs.
 //!
 //! This is the only module that talks to the inference library, and it is deliberately small: the
-//! decisions were all made above it, so what happens here is load a model with zero GPU layers,
-//! build the sampler the profile describes, constrain it with the grammar, and decode at most the
-//! output bound.
+//! decisions were all made above it, so what happens here is check the files, load a model with
+//! zero GPU layers, build the sampler the profile describes, constrain it with the grammar, and
+//! decode at most the output bound.
 //!
 //! # Zero GPU layers
 //!
@@ -29,11 +29,13 @@
 //! time. So the context is built at the start of a job and dropped at the end, and what sits
 //! between jobs is the mapping alone.
 //!
-//! # The deadline and the cancellation token
+//! # The token, the deadline and the ceiling
 //!
-//! Both are checked between tokens, which is the only place a decode loop can be interrupted
-//! without leaving the library in a state nobody can describe. The bound is therefore one token of
-//! work rather than instant, and a job that is cancelled produces nothing.
+//! The job's token is the one the process's control thread sets when the daemon cancels, and it is
+//! checked between tokens with the deadline and, every few tokens, the process's resident set
+//! against the ceiling. Between tokens is the only place a decode loop can be interrupted without
+//! leaving the library in a state nobody can describe, so the bound is one token of work rather
+//! than instant, and a job that is stopped produces nothing.
 
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
@@ -47,19 +49,20 @@ use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{AddBos, LlamaModel};
 use llama_cpp_2::sampling::LlamaSampler;
 
-use kr_describe::budget::ResidentCost;
-use kr_describe::error::{DescribeError, Result};
-use kr_describe::priority::{Applied, Cancellation, background_current_thread};
+use kr_describe::priority::Cancellation;
 use kr_describe::profile::ModelProfile;
-use kr_describe::runtime::{
-    GenerationRequest, InferenceRuntime, LoadOutcome, Produced, RuntimeHandle,
-};
+use kr_describe::serve::{Generating, Job, LoadWork, Loading, Model, own_rss_bytes};
+use kr_describe::wire::{JobEnd, LoadEnd, Phases};
+use kr_protocol::scalars::U64;
 
 /// How many tokens one decode batch carries.
 const BATCH_TOKENS: usize = 512;
 
 /// The buffer one token's bytes are read into. No tokenizer piece in either profile is near it.
 const PIECE_BYTES: usize = 64;
+
+/// How many tokens pass between two readings of the process's resident set.
+const RSS_EVERY_TOKENS: u32 = 8;
 
 /// The process-wide backend.
 ///
@@ -80,107 +83,180 @@ fn position_of(
         / std::mem::size_of::<llama_cpp_2::token::LlamaToken>()
 }
 
-fn backend() -> Result<&'static LlamaBackend> {
+fn backend() -> std::result::Result<&'static LlamaBackend, String> {
     match BACKEND.get_or_init(|| LlamaBackend::init().map_err(|error| error.to_string())) {
         Ok(backend) => Ok(backend),
-        Err(detail) => Err(DescribeError::Runtime {
-            detail: detail.clone(),
-        }),
+        Err(detail) => Err(detail.clone()),
+    }
+}
+
+/// Returns the milliseconds since `started`.
+fn elapsed_ms(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// The model the description process runs: the llama.cpp runtime, once a profile is loaded.
+#[derive(Debug, Default)]
+pub struct Llama {
+    runtime: Option<LlamaRuntime>,
+}
+
+impl Llama {
+    /// Builds a model with nothing loaded.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { runtime: None }
+    }
+
+    /// Wraps a runtime that is already loaded, which is how the benchmark measures its load apart.
+    #[must_use]
+    pub const fn loaded(runtime: LlamaRuntime) -> Self {
+        Self {
+            runtime: Some(runtime),
+        }
+    }
+}
+
+impl Model for Llama {
+    fn load(&mut self, work: &LoadWork<'_>, token: &Cancellation, deadline: Instant) -> Loading {
+        // Each load checks every file against the profile again, from the one handle it reads, so
+        // a file replaced since it was downloaded is refused rather than loaded.
+        for placed in work.assets {
+            let stop = || token.is_cancelled() || Instant::now() >= deadline;
+            match crate::assets::verify_file_unless(&placed.asset, &placed.path, stop) {
+                Ok(true) => {}
+                Ok(false) if token.is_cancelled() => {
+                    return Loading::Ended {
+                        why: LoadEnd::Cancelled,
+                        detail: None,
+                    };
+                }
+                Ok(false) => {
+                    return Loading::Ended {
+                        why: LoadEnd::DeadlineExceeded,
+                        detail: None,
+                    };
+                }
+                Err(error) => {
+                    return Loading::Ended {
+                        why: LoadEnd::Refused,
+                        detail: Some(error.to_string()),
+                    };
+                }
+            }
+        }
+        let Some(weights) = work
+            .assets
+            .iter()
+            .find(|placed| placed.asset.role == "weights")
+        else {
+            return Loading::Ended {
+                why: LoadEnd::Refused,
+                detail: Some(format!(
+                    "{} names no weights file",
+                    work.profile.profile_id()
+                )),
+            };
+        };
+        match LlamaRuntime::load(work.profile, &weights.path, token, deadline) {
+            Ok(runtime) => {
+                self.runtime = Some(runtime);
+                Loading::Loaded
+            }
+            Err((why, detail)) => Loading::Ended { why, detail },
+        }
+    }
+
+    fn generate(&mut self, job: &Job<'_>, token: &Cancellation, deadline: Instant) -> Generating {
+        match self.runtime.as_mut() {
+            Some(runtime) => runtime.generate(job, token, deadline),
+            None => Generating::Ended {
+                why: JobEnd::NotLoaded,
+                detail: None,
+            },
+        }
     }
 }
 
 /// A loaded model, on the processor.
 #[derive(Debug)]
 pub struct LlamaRuntime {
-    handle: RuntimeHandle,
     model: LlamaModel,
-    cost: ResidentCost,
     context_tokens: u32,
     weights_path: PathBuf,
-    priority: Applied,
 }
 
 impl LlamaRuntime {
-    /// Loads a profile's weights from a verified file, observing cancellation and deadline.
+    /// Loads a profile's weights from a verified file, observing the token and the deadline.
     ///
     /// The caller has already verified the file against the profile's recorded size and digest;
     /// this refuses a profile whose execution settings are not the CPU-only ones, which is the
-    /// second of the two places zero GPU layers is enforced. If the cancellation token fires or
-    /// the deadline is exceeded, loading aborts or the loaded model is dropped immediately.
+    /// second of the two places zero GPU layers is enforced. If the token is cancelled or the
+    /// deadline passes, loading aborts or the loaded model is dropped at once.
     ///
     /// # Errors
     ///
-    /// Returns [`DescribeError::ProfileRefused`] when the profile is not CPU-only and
-    /// [`DescribeError::Runtime`] when the library cannot start or the file cannot be loaded.
+    /// Returns why there is no model: refused for a profile that is not CPU-only, cancelled, past
+    /// its deadline, or failed with what the library said.
     pub fn load(
         profile: &ModelProfile,
         weights: &Path,
-        cancellation: &Cancellation,
-        deadline_ms: u64,
-    ) -> Result<LoadOutcome> {
+        token: &Cancellation,
+        deadline: Instant,
+    ) -> std::result::Result<Self, (LoadEnd, Option<String>)> {
         if profile.execution().gpu_layers != 0 {
-            return Err(DescribeError::ProfileRefused {
-                profile: profile.profile_id().to_owned(),
-                why: "GPU layers, where this runtime offloads none",
-            });
+            return Err((
+                LoadEnd::Refused,
+                Some(format!(
+                    "{} states GPU layers, where this runtime offloads none",
+                    profile.profile_id()
+                )),
+            ));
         }
-        if cancellation.is_cancelled() {
-            return Ok(LoadOutcome::Cancelled);
+        if token.is_cancelled() {
+            return Err((LoadEnd::Cancelled, None));
         }
-        if deadline_ms == 0 {
-            return Ok(LoadOutcome::DeadlineExceeded);
+        if Instant::now() >= deadline {
+            return Err((LoadEnd::DeadlineExceeded, None));
         }
-        let backend = backend()?;
-        // The thread that loads the weights is the thread that runs them, so the background class
-        // is applied here rather than per request: applying it per request would leave the caller's
-        // thread demoted afterwards, and applying it nowhere would leave the class a claim.
-        let priority = background_current_thread();
-        let cancellation_cb = cancellation.clone();
-        let started = Instant::now();
+        let backend = backend().map_err(|detail| (LoadEnd::Failed, Some(detail)))?;
+        let watched = token.clone();
         let parameters = LlamaModelParams::default()
             .with_n_gpu_layers(0)
             .with_progress_callback(move |_progress| {
-                if cancellation_cb.is_cancelled() {
-                    return false;
-                }
-                if started.elapsed().as_millis() as u64 >= deadline_ms {
-                    return false;
-                }
-                true
+                !watched.is_cancelled() && Instant::now() < deadline
             });
         let model = match LlamaModel::load_from_file(backend, weights, &parameters) {
             Ok(model) => model,
             Err(error) => {
-                if cancellation.is_cancelled() {
-                    return Ok(LoadOutcome::Cancelled);
+                if token.is_cancelled() {
+                    return Err((LoadEnd::Cancelled, None));
                 }
-                if started.elapsed().as_millis() as u64 >= deadline_ms {
-                    return Ok(LoadOutcome::DeadlineExceeded);
+                if Instant::now() >= deadline {
+                    return Err((LoadEnd::DeadlineExceeded, None));
                 }
-                return Err(DescribeError::Runtime {
-                    detail: format!("{} could not be loaded: {error}", weights.display()),
-                });
+                return Err((
+                    LoadEnd::Failed,
+                    Some(format!(
+                        "{} could not be loaded: {error}",
+                        weights.display()
+                    )),
+                ));
             }
         };
-        if cancellation.is_cancelled() {
+        if token.is_cancelled() {
             drop(model);
-            return Ok(LoadOutcome::Cancelled);
+            return Err((LoadEnd::Cancelled, None));
         }
-        if started.elapsed().as_millis() as u64 >= deadline_ms {
+        if Instant::now() >= deadline {
             drop(model);
-            return Ok(LoadOutcome::DeadlineExceeded);
+            return Err((LoadEnd::DeadlineExceeded, None));
         }
-        Ok(LoadOutcome::Loaded(Box::new(Self {
-            handle: RuntimeHandle {
-                profile_id: profile.profile_id().to_owned(),
-                profile_revision: profile.revision(),
-            },
+        Ok(Self {
             model,
-            cost: profile.execution().resident_estimate,
             context_tokens: profile.execution().context_tokens,
             weights_path: weights.to_path_buf(),
-            priority,
-        })))
+        })
     }
 
     /// Returns the file this model was loaded from.
@@ -189,14 +265,10 @@ impl LlamaRuntime {
         &self.weights_path
     }
 
-    fn sampler(&self, request: &GenerationRequest) -> Result<LlamaSampler> {
-        let grammar =
-            LlamaSampler::grammar(&self.model, request.grammar, "root").map_err(|error| {
-                DescribeError::Runtime {
-                    detail: format!("the description grammar was refused: {error}"),
-                }
-            })?;
-        let sampler = &request.sampler;
+    fn sampler(&self, job: &Job<'_>) -> std::result::Result<LlamaSampler, String> {
+        let grammar = LlamaSampler::grammar(&self.model, job.grammar, "root")
+            .map_err(|error| format!("the description grammar was refused: {error}"))?;
+        let sampler = job.sampler;
         let vocabulary = self.model.n_vocab();
         let mut chain = vec![
             grammar,
@@ -224,26 +296,36 @@ impl LlamaRuntime {
         }
         Ok(LlamaSampler::chain_simple(chain))
     }
-}
 
-impl InferenceRuntime for LlamaRuntime {
-    fn handle(&self) -> RuntimeHandle {
-        self.handle.clone()
+    /// Runs one job: reads the prompt, then samples and decodes at most the output bound.
+    ///
+    /// It ends the job between tokens when the token is cancelled, the deadline passes, or the
+    /// process's resident set passes the job's ceiling.
+    pub fn generate(
+        &mut self,
+        job: &Job<'_>,
+        token: &Cancellation,
+        deadline: Instant,
+    ) -> Generating {
+        match self.run(job, token, deadline) {
+            Ok(generating) => generating,
+            Err(detail) => Generating::Ended {
+                why: JobEnd::Failed,
+                detail: Some(detail),
+            },
+        }
     }
 
-    fn resident_cost(&self) -> ResidentCost {
-        self.cost
-    }
-
-    fn priority(&self) -> Option<Applied> {
-        Some(self.priority)
-    }
-
-    fn generate(&mut self, request: &GenerationRequest) -> Result<Produced> {
-        let started = Instant::now();
+    fn run(
+        &mut self,
+        job: &Job<'_>,
+        token: &Cancellation,
+        deadline: Instant,
+    ) -> std::result::Result<Generating, String> {
+        let stopped = |why: JobEnd| Generating::Ended { why, detail: None };
         let backend = backend()?;
-        let threads = i32::try_from(request.cpu_threads).unwrap_or(1).max(1);
-        let context_tokens = request.context_tokens.min(self.context_tokens).max(1);
+        let threads = i32::try_from(job.cpu_threads).unwrap_or(1).max(1);
+        let context_tokens = job.context_tokens.min(self.context_tokens).max(1);
         let parameters = LlamaContextParams::default()
             .with_n_ctx(NonZeroU32::new(context_tokens))
             .with_n_batch(BATCH_TOKENS as u32)
@@ -257,77 +339,87 @@ impl InferenceRuntime for LlamaRuntime {
         let mut context = self
             .model
             .new_context(backend, parameters)
-            .map_err(|error| DescribeError::Runtime {
-                detail: format!("a context could not be created: {error}"),
-            })?;
+            .map_err(|error| format!("a context could not be created: {error}"))?;
 
         let tokens = self
             .model
-            .str_to_token(&request.prompt, AddBos::Always)
-            .map_err(|error| DescribeError::Runtime {
-                detail: format!("the prompt could not be tokenized: {error}"),
-            })?;
+            .str_to_token(job.prompt, AddBos::Always)
+            .map_err(|error| format!("the prompt could not be tokenized: {error}"))?;
         // The prompt is bounded by construction, but a model with a short context is not this
         // host's to fix: refusing is better than silently describing the tail of a prompt.
-        if tokens.len() + request.max_output_tokens as usize > context_tokens as usize {
-            return Err(DescribeError::Runtime {
-                detail: format!(
-                    "a prompt of {} tokens and {} of output do not fit in {context_tokens}",
-                    tokens.len(),
-                    request.max_output_tokens
-                ),
-            });
+        if tokens.len() + job.max_output_tokens as usize > context_tokens as usize {
+            return Err(format!(
+                "a prompt of {} tokens and {} of output do not fit in {context_tokens}",
+                tokens.len(),
+                job.max_output_tokens
+            ));
         }
 
         // The prompt is decoded in batches of at most the context's own batch size. A single
         // decode of more tokens than that is not a slow path, it is one the library refuses
         // outright, and a prompt long enough to reach it is an ordinary long prompt.
+        let prompt_started = Instant::now();
         let mut batch = LlamaBatch::new(BATCH_TOKENS, 1);
         let last = tokens.len().saturating_sub(1);
         for chunk in tokens.chunks(BATCH_TOKENS) {
-            if request.cancellation.is_cancelled() {
-                return Ok(Produced::Cancelled);
+            if token.is_cancelled() {
+                return Ok(stopped(JobEnd::Cancelled));
             }
-            if started.elapsed().as_millis() as u64 >= request.deadline_ms {
-                return Ok(Produced::DeadlineExceeded);
+            if Instant::now() >= deadline {
+                return Ok(stopped(JobEnd::DeadlineExceeded));
             }
             batch.clear();
             let offset = position_of(&tokens, chunk);
-            for (index, token) in chunk.iter().enumerate() {
+            for (index, piece) in chunk.iter().enumerate() {
                 let position = offset + index;
                 batch
                     .add(
-                        *token,
+                        *piece,
                         i32::try_from(position).unwrap_or(i32::MAX),
                         &[0],
                         position == last,
                     )
-                    .map_err(|error| DescribeError::Runtime {
-                        detail: format!("the prompt could not be batched: {error}"),
-                    })?;
+                    .map_err(|error| format!("the prompt could not be batched: {error}"))?;
             }
             context
                 .decode(&mut batch)
-                .map_err(|error| DescribeError::Runtime {
-                    detail: format!("the prompt could not be decoded: {error}"),
-                })?;
+                .map_err(|error| format!("the prompt could not be decoded: {error}"))?;
         }
+        let prompt_ms = elapsed_ms(prompt_started);
 
-        let mut sampler = self.sampler(request)?;
+        let mut sampler = self.sampler(job)?;
         let mut produced: Vec<u8> = Vec::new();
         let mut position = i32::try_from(tokens.len()).unwrap_or(i32::MAX);
-        for _ in 0..request.max_output_tokens {
-            if request.cancellation.is_cancelled() {
-                return Ok(Produced::Cancelled);
+        let mut sampling_ms = 0_u64;
+        let mut decode_ms = 0_u64;
+        let mut peak_rss_bytes = own_rss_bytes().unwrap_or(0);
+        for step in 0..job.max_output_tokens {
+            if token.is_cancelled() {
+                return Ok(stopped(JobEnd::Cancelled));
             }
-            if started.elapsed().as_millis() as u64 >= request.deadline_ms {
-                return Ok(Produced::DeadlineExceeded);
+            if Instant::now() >= deadline {
+                return Ok(stopped(JobEnd::DeadlineExceeded));
+            }
+            if step % RSS_EVERY_TOKENS == 0 {
+                peak_rss_bytes = peak_rss_bytes.max(own_rss_bytes().unwrap_or(0));
+                if peak_rss_bytes > job.ceiling_bytes {
+                    return Ok(Generating::Ended {
+                        why: JobEnd::MemoryCeiling,
+                        detail: Some(format!(
+                            "the process's resident set of {peak_rss_bytes} bytes passed the \
+                             ceiling of {} bytes",
+                            job.ceiling_bytes
+                        )),
+                    });
+                }
             }
             // `sample` accepts the token itself, which the binding documents. Accepting it again
             // would advance the grammar twice and let a second opening brace empty its stack,
             // which the library ends the process over.
-            let token = sampler.sample(&context, -1);
-            if self.model.is_eog_token(token) {
+            let sampling_started = Instant::now();
+            let chosen = sampler.sample(&context, -1);
+            sampling_ms = sampling_ms.saturating_add(elapsed_ms(sampling_started));
+            if self.model.is_eog_token(chosen) {
                 break;
             }
             // Bytes rather than text, and assembled at the end: one token can be half of a
@@ -335,29 +427,30 @@ impl InferenceRuntime for LlamaRuntime {
             // replacement character in the middle of a name.
             let piece = self
                 .model
-                .token_to_piece_bytes(token, PIECE_BYTES, false, None)
-                .map_err(|error| DescribeError::Runtime {
-                    detail: format!("a token could not be decoded: {error}"),
-                })?;
+                .token_to_piece_bytes(chosen, PIECE_BYTES, false, None)
+                .map_err(|error| format!("a token could not be decoded: {error}"))?;
             produced.extend_from_slice(&piece);
+            let decode_started = Instant::now();
             batch.clear();
             batch
-                .add(token, position, &[0], true)
-                .map_err(|error| DescribeError::Runtime {
-                    detail: format!("a token could not be batched: {error}"),
-                })?;
+                .add(chosen, position, &[0], true)
+                .map_err(|error| format!("a token could not be batched: {error}"))?;
             position = position.saturating_add(1);
             context
                 .decode(&mut batch)
-                .map_err(|error| DescribeError::Runtime {
-                    detail: format!("a token could not be decoded: {error}"),
-                })?;
+                .map_err(|error| format!("a token could not be decoded: {error}"))?;
+            decode_ms = decode_ms.saturating_add(elapsed_ms(decode_started));
         }
-        Ok(Produced::Json(produced))
-    }
-
-    fn unload(&mut self) {
-        // The model is released when this value is dropped, which is what the caller does after
-        // calling this. There is nothing else holding weights: a context lives for one job.
+        peak_rss_bytes = peak_rss_bytes.max(own_rss_bytes().unwrap_or(0));
+        Ok(Generating::Produced {
+            bytes: produced,
+            phases: Phases {
+                prompt_tokens: U64::new(tokens.len() as u64),
+                prompt_ms: U64::new(prompt_ms),
+                sampling_ms: U64::new(sampling_ms),
+                decode_ms: U64::new(decode_ms),
+            },
+            peak_rss_bytes,
+        })
     }
 }

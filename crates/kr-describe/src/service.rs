@@ -1,15 +1,27 @@
-//! The whole of it: offer, admit, dispatch, validate, publish, unload.
+//! The whole of it: offer, admit, load, dispatch, validate, publish, unload.
 //!
 //! Every other module in this crate decides one thing. This one puts them in an order and holds
-//! the state between ticks. The order is fixed and each step can refuse:
+//! the state between calls. It holds no model: the model runs in the description process, and the
+//! host drives this service with two calls.
 //!
-//! 1. **Fenced?** Privacy mode stops everything here, before a reading is taken.
+//! * [`DescriptionService::next`] says what the host does now: load a profile in the process, send
+//!   it a job, cancel the work it is doing, end it, or wait until a given time or until something
+//!   changes.
+//! * [`DescriptionService::finished`] takes the process's answer to one piece of work, and
+//!   [`DescriptionService::process_ended`] takes the news that the process has gone.
+//!
+//! Between the calls the host applies whatever arrived: settled contexts, closures, bindings, pins,
+//! privacy. So a result is judged against the state in force when it arrives, never the state when
+//! its job was sent. The order is fixed and each step can refuse:
+//!
+//! 1. **Fenced?** Privacy mode stops a session's work here, and a fenced job is never sent.
 //! 2. **Admitted?** The resource and power policy decides, and `resource_paused` is its answer.
-//! 3. **Mapped?** One model per environment, unloaded before another is mapped.
-//! 4. **Anything eligible?** The queue decides, under the cooldown and the fairness bound.
-//! 5. **Produced?** The runtime, under the grammar, a deadline measured from *this* point and a
-//!    cancellation token.
-//! 6. **Valid?** [`crate::output::validate`] against what is in force now, not at admission.
+//! 3. **Loaded?** A model loads before any job is taken from the queue, under a deadline of its
+//!    own, so a slow load is paid for by the queue's wait rather than by a job's thirty seconds.
+//! 4. **Anything eligible?** The queue decides, under the cooldown, the cadence and the fairness
+//!    bound.
+//! 5. **Produced?** The process answers, under the grammar and a deadline measured from dequeue.
+//! 6. **Valid?** [`crate::output::validate`] against what is in force now, not at dispatch.
 //! 7. **Published.** Into the store, with its provenance, unless the name is pinned.
 //!
 //! A refusal at any step leaves the session with the label it had, which is a pin, a previous
@@ -18,10 +30,11 @@
 //! # What a crash does
 //!
 //! Section 22: *missing weights, cancellation, load failure or an inference-process crash never
-//! removes metadata titles or verified state. Restart only inference.*
-//! [`DescriptionService::note_inference_crash`] drops the runtime and nothing else. The store, the
-//! pins, the trackers, the queue positions and every session are untouched, and the next tick maps
-//! the model again. There is no path in this module that ends a worker or a session.
+//! removes metadata titles or verified state. Restart only inference.* A process that ends, fails a
+//! job or is ended by the host takes the loaded model with it and nothing else. The store, the pins,
+//! the trackers and every session are untouched; the job it was running is queued again once with
+//! its aging position; and the next load waits a second, doubling to five minutes while failures
+//! repeat, until a description is published.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -34,36 +47,41 @@ use crate::context::{
     DescriptionContext, Observed, SemanticEvent, Settled,
 };
 use crate::environment::{DataAccessChoice, ExecutionEnvironment, ModelMapping, Placement};
-use crate::error::{DescribeError, Result};
+use crate::error::Result;
 use crate::metadata::{
     LabelSource, SessionFacts, SessionLabel, VerifiedStatus, deterministic_title,
 };
 use crate::metrics::LatencyLedger;
 use crate::output::{Expectation, ProducedUnder, Rejection, prompt, validate};
-use crate::priority::{Applied, Cancellation};
+use crate::priority::Cancellation;
 use crate::privacy::{
     CleanupDebt, DescriptionFence, DescriptionPrivacy, InFlight, PublishGate, RunningJob,
 };
 use crate::profile::catalogue::{Catalogue, MetGates, Selection};
 use crate::profile::{DownloadPolicy, ModelProfile, ProfileRevision};
-use crate::queue::{Enqueued, Freshness, NothingToDequeue, Priority, Scheduler, SessionStanding};
+use crate::queue::{Enqueued, Freshness, Priority, QueuedJob, Scheduler, SessionStanding};
 use crate::resource::{
     HostConditions, PauseReason, ResourcePolicy, ResourceSettings, ResourceState,
 };
-use crate::runtime::{GenerationRequest, InferenceRuntime, LoadOutcome, Produced};
 use crate::store::DescriptionStore;
-use crate::time::{JobClock, Reading};
+use crate::time::Reading;
+use crate::wire::{JobEnd, LoadEnd, Phases};
 
 /// How long a host with no sessions keeps the model mapped.
 pub const IDLE_UNLOAD_MS: u64 = 15 * 60 * 1000;
 
-/// Builds a runtime for a profile.
-///
-/// It is a function rather than a trait because a host supplies exactly one and a test supplies
-/// exactly one, and neither needs anything else from the other. A build with no inference runtime
-/// compiled in supplies a factory that refuses, which is a host with deterministic titles and no
-/// model - a supported configuration rather than a broken one.
-pub type RuntimeFactory = Box<dyn FnMut(&ModelProfile, &Cancellation, u64) -> Result<LoadOutcome>>;
+/// How long a load may take. A load is not a job: it happens before any job is dequeued, and a job
+/// always has its whole execution deadline after it.
+pub const LOAD_DEADLINE_MS: u64 = 5 * 60 * 1000;
+
+/// How long the next load waits after the first failure. It doubles with each failure after that.
+pub const RESTART_FIRST_MS: u64 = 1_000;
+
+/// The longest the next load waits after repeated failures.
+pub const RESTART_MOST_MS: u64 = 5 * 60 * 1000;
+
+/// How soon a paused service with work waiting looks at the host's conditions again.
+pub const PAUSE_RECHECK_MS: u64 = 10_000;
 
 /// How the downloading of a selected profile's assets is going.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -118,71 +136,6 @@ pub struct SetupState {
     pub unavailable: Option<String>,
 }
 
-/// What one tick did.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Tick {
-    /// Privacy mode is on. Nothing was admitted, dispatched or published.
-    Fenced,
-    /// The resource or power policy is not admitting inference.
-    ResourcePaused {
-        /// Why.
-        reason: PauseReason,
-        /// Whether a mapped model was unloaded to get here.
-        unloaded: bool,
-    },
-    /// The model was unloaded because this host has had no sessions for long enough.
-    IdleUnloaded {
-        /// How long it had been.
-        idle_ms: u64,
-    },
-    /// Nothing was waiting.
-    Idle {
-        /// Why nothing ran.
-        why: NothingToDequeue,
-    },
-    /// A description was produced and published.
-    Published {
-        /// The session it describes.
-        session_id: SessionId,
-        /// How long it waited in the queue.
-        queue_wait_ms: u64,
-        /// How long it took once dequeued.
-        execution_ms: u64,
-    },
-    /// A job ran and its result was refused.
-    Rejected {
-        /// The session.
-        session_id: SessionId,
-        /// Why.
-        rejection: Rejection,
-    },
-    /// A job was cancelled before it finished.
-    Cancelled {
-        /// The session.
-        session_id: SessionId,
-    },
-    /// A job passed its deadline.
-    DeadlineExceeded {
-        /// The session.
-        session_id: SessionId,
-    },
-    /// The runtime itself failed. Only inference is restarted.
-    InferenceFailed {
-        /// The session whose job was running.
-        session_id: SessionId,
-        /// What the runtime said.
-        detail: String,
-    },
-}
-
-/// What mapping or loading a profile produced.
-#[derive(Debug)]
-enum EnsureMappedOutcome {
-    Mapped,
-    Cancelled,
-    DeadlineExceeded,
-}
-
 /// Where a description service runs.
 ///
 /// The three facts travel together because no one of them decides anything on its own: the
@@ -198,6 +151,340 @@ pub struct HostPlacement {
     pub target: String,
 }
 
+/// One job, as it is sent to the description process.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GenerationRequest {
+    /// The prompt, whose data section holds every piece of project text.
+    pub prompt: String,
+    /// The grammar the sampler is held to.
+    pub grammar: &'static str,
+    /// The context window, in tokens.
+    pub context_tokens: u32,
+    /// The output bound, in tokens.
+    pub max_output_tokens: u32,
+    /// How many processor threads the job may use.
+    pub cpu_threads: u32,
+    /// The execution deadline, from the moment the job was dequeued, which is the moment this was
+    /// built.
+    pub deadline_ms: u64,
+    /// The resident set past which the process ends the job, in bytes.
+    pub ceiling_bytes: u64,
+}
+
+/// Which kind of work an identifier names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Work {
+    /// A load.
+    Load,
+    /// A job.
+    Job,
+}
+
+/// Why the host is to end the description process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnloadReason {
+    /// This host has had no sessions for this long.
+    Idle {
+        /// How long.
+        idle_ms: u64,
+    },
+    /// The resource or power policy paused inference, or the owner turned it off.
+    Paused(PauseReason),
+    /// The process failed, and only inference is restarted.
+    Failed,
+}
+
+impl UnloadReason {
+    /// Returns the stable name this reason is reported under.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle { .. } => "idle",
+            Self::Paused(reason) => reason.as_str(),
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// What the host does now.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Instruction {
+    /// Start the description process if it is not running, and load this profile in it.
+    Load {
+        /// The load's identifier, which its answer repeats.
+        id: u64,
+        /// The profile.
+        profile: Box<ModelProfile>,
+        /// How long the load may take.
+        deadline_ms: u64,
+    },
+    /// Send the process this job.
+    Generate {
+        /// The job's identifier, which its answer repeats.
+        id: u64,
+        /// The session it describes.
+        session_id: SessionId,
+        /// The job.
+        request: GenerationRequest,
+    },
+    /// Cancel the work with this identifier. Its answer still comes, and is still given to
+    /// [`DescriptionService::finished`].
+    Cancel {
+        /// The work.
+        id: u64,
+        /// Which kind of work it is.
+        work: Work,
+    },
+    /// End the description process. The service has already let go of the model.
+    Unload {
+        /// Why.
+        why: UnloadReason,
+    },
+    /// Nothing to do until then, on the continuous clock, or until something changes.
+    Wait {
+        /// When to ask again, when there is a time.
+        until_ms: Option<u64>,
+    },
+}
+
+/// The process's answer to one piece of work.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Answered {
+    /// The model is loaded.
+    Loaded {
+        /// How long the load took in the process.
+        load_ms: u64,
+        /// The process's resident set once it was loaded.
+        rss_bytes: u64,
+    },
+    /// The load ended with no model.
+    LoadEnded {
+        /// Why.
+        why: LoadEnd,
+        /// What the process said.
+        detail: Option<String>,
+    },
+    /// A job produced bytes, not yet trusted.
+    Produced {
+        /// The bytes.
+        bytes: Vec<u8>,
+        /// Where the job's time went.
+        phases: Phases,
+        /// The process's largest resident set during the job.
+        peak_rss_bytes: u64,
+    },
+    /// A job ended with nothing.
+    Ended {
+        /// Why.
+        why: JobEnd,
+        /// What the process said.
+        detail: Option<String>,
+    },
+}
+
+/// How the description process ended, when the host did not end it on this service's word.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ProcessEnd {
+    /// It could not be started.
+    CouldNotStart,
+    /// It exited, or closed its output, on its own.
+    Exited,
+    /// Its output was not whole frames of the wire.
+    BrokenWire,
+    /// It is a build or a wire version this daemon does not speak to.
+    WrongBuild,
+    /// It did not answer the handshake in time.
+    SilentAtStart,
+    /// A load or a job ran past its deadline and the process did not end it.
+    PastDeadline,
+    /// A cancellation went unanswered.
+    CancelUnanswered,
+    /// Its resident set passed the ceiling.
+    MemoryCeiling,
+    /// It stopped reading its requests.
+    NotReading,
+}
+
+impl ProcessEnd {
+    /// Returns the stable name this end is reported under.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CouldNotStart => "could_not_start",
+            Self::Exited => "exited",
+            Self::BrokenWire => "broken_wire",
+            Self::WrongBuild => "wrong_build",
+            Self::SilentAtStart => "silent_at_start",
+            Self::PastDeadline => "past_deadline",
+            Self::CancelUnanswered => "cancel_unanswered",
+            Self::MemoryCeiling => "memory_ceiling",
+            Self::NotReading => "not_reading",
+        }
+    }
+}
+
+/// What one answer, or one end of the process, came to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Outcome {
+    /// A model is loaded, and this is how long it took from asking to the answer.
+    Loaded {
+        /// The cold start, reported apart from any job's execution.
+        cold_start_ms: u64,
+    },
+    /// A load ended with no model.
+    LoadEnded {
+        /// Why.
+        why: LoadEnd,
+        /// What the process said.
+        detail: Option<String>,
+    },
+    /// A description was published.
+    Published {
+        /// The session it describes.
+        session_id: SessionId,
+        /// How long its job waited in the queue.
+        queue_wait_ms: u64,
+        /// How long its job took once dequeued.
+        execution_ms: u64,
+    },
+    /// A job's result was refused.
+    Rejected {
+        /// The session.
+        session_id: SessionId,
+        /// Why.
+        rejection: Rejection,
+    },
+    /// A job was cancelled.
+    Cancelled {
+        /// The session.
+        session_id: SessionId,
+    },
+    /// A job passed its deadline.
+    DeadlineExceeded {
+        /// The session.
+        session_id: SessionId,
+    },
+    /// A job did not finish, and its session's job is queued again with its aging position.
+    Requeued {
+        /// The session.
+        session_id: SessionId,
+    },
+    /// A job failed and is not queued again.
+    Failed {
+        /// The session.
+        session_id: SessionId,
+        /// What went wrong.
+        detail: String,
+    },
+    /// An answer for work nobody is waiting for. It was dropped.
+    Dropped {
+        /// The identifier it carried.
+        id: u64,
+    },
+    /// The description process ended.
+    ProcessEnded {
+        /// How.
+        why: ProcessEnd,
+    },
+}
+
+/// How every job has ended, counted.
+///
+/// Section 22's queue promises that nothing grows under load, and this is how it is shown: every
+/// job ends replaced, cancelled, refused, published, past its deadline, failed or queued again,
+/// and every answer nobody was waiting for is counted as dropped.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct JobCounts {
+    /// Jobs whose content a newer change replaced in the queue.
+    pub replaced: u64,
+    /// Descriptions published.
+    pub published: u64,
+    /// Results refused.
+    pub refused: u64,
+    /// Jobs cancelled, or dropped from the queue by privacy mode.
+    pub cancelled: u64,
+    /// Jobs past their deadline.
+    pub deadline_exceeded: u64,
+    /// Jobs that failed and were not queued again.
+    pub failed: u64,
+    /// Jobs queued again after they did not finish.
+    pub requeued: u64,
+    /// Answers for work nobody was waiting for.
+    pub dropped_answers: u64,
+}
+
+/// What the description process has.
+#[derive(Clone, Debug)]
+enum Model {
+    /// Nothing, as far as this service knows.
+    Absent,
+    /// A load is running.
+    Loading {
+        id: u64,
+        profile: Box<ModelProfile>,
+        asked_ms: u64,
+        cancel_sent: bool,
+    },
+    /// A model is loaded.
+    Resident { profile: Box<ModelProfile> },
+}
+
+/// Why work in flight is being stopped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Stop {
+    /// Its token was cancelled: privacy mode, or a caller.
+    Cancelled,
+    /// Its session closed.
+    Closed,
+    /// Inference paused, or was turned off.
+    Paused,
+}
+
+impl Stop {
+    /// Returns whether the job is still wanted, and goes back in the queue.
+    const fn requeues(self) -> bool {
+        matches!(self, Self::Paused)
+    }
+}
+
+/// The job the description process has.
+#[derive(Clone, Debug)]
+struct Dispatched {
+    id: u64,
+    job: QueuedJob,
+    produced_under: ProducedUnder,
+    dequeued_ms: u64,
+    queue_wait_ms: u64,
+    cancellation: Cancellation,
+    stopping: Option<Stop>,
+    requeued_before: bool,
+}
+
+/// Restarts after failures: when the next load may happen, and whether the service is paused
+/// until then.
+#[derive(Clone, Copy, Debug, Default)]
+struct Restart {
+    failures: u32,
+    not_before_ms: u64,
+    pause: Option<PauseReason>,
+}
+
+impl Restart {
+    fn failed(&mut self, now: Reading, pause: Option<PauseReason>) {
+        self.failures = self.failures.saturating_add(1);
+        let doublings = self.failures.saturating_sub(1).min(20);
+        let wait_ms = RESTART_FIRST_MS
+            .saturating_mul(1_u64 << doublings)
+            .min(RESTART_MOST_MS);
+        self.not_before_ms = now.monotonic_ms().saturating_add(wait_ms);
+        self.pause = pause;
+    }
+
+    fn succeeded(&mut self) {
+        *self = Self::default();
+    }
+}
+
 /// The description service for one execution environment.
 pub struct DescriptionService {
     environment: ExecutionEnvironment,
@@ -209,13 +496,12 @@ pub struct DescriptionService {
     mapping: ModelMapping,
     scheduler: Scheduler,
     policy: ResourcePolicy,
+    state: ResourceState,
     store: DescriptionStore,
     fence: DescriptionFence,
     in_flight: InFlight,
     running: RunningJob,
     debt: CleanupDebt,
-    factory: RuntimeFactory,
-    runtime: Option<Box<dyn InferenceRuntime>>,
     trackers: BTreeMap<SessionId, ContextTracker>,
     bindings: BTreeMap<SessionId, ContextBinding>,
     epochs: BTreeMap<SessionId, SessionEpoch>,
@@ -227,20 +513,14 @@ pub struct DescriptionService {
     inference_restarts: u64,
     progress: DownloadProgress,
     settings: ResourceSettings,
-    job_clock: JobClock,
-}
-
-struct ActiveJobGuard {
-    running: RunningJob,
-    in_flight: InFlight,
-    session_id: SessionId,
-}
-
-impl Drop for ActiveJobGuard {
-    fn drop(&mut self) {
-        self.running.finished();
-        self.in_flight.reconciled(&self.session_id);
-    }
+    next_id: u64,
+    model: Model,
+    job: Option<Dispatched>,
+    unload_owed: Option<UnloadReason>,
+    restart: Restart,
+    counts: JobCounts,
+    /// Sessions whose job failed once and is queued again: a second failure is not retried.
+    retried: BTreeSet<SessionId>,
 }
 
 impl std::fmt::Debug for DescriptionService {
@@ -250,7 +530,7 @@ impl std::fmt::Debug for DescriptionService {
             .field("environment", &self.environment)
             .field("selection", &self.selection)
             .field("queued", &self.scheduler.queued())
-            .field("state", &self.policy.state())
+            .field("state", &self.state)
             .field("mapped", &self.mapping.mapped(self.environment.id()))
             .field("in_flight", &self.in_flight.total())
             .field("inference_restarts", &self.inference_restarts)
@@ -271,7 +551,6 @@ impl DescriptionService {
         met: MetGates,
         settings: ResourceSettings,
         store: DescriptionStore,
-        factory: RuntimeFactory,
     ) -> Self {
         let HostPlacement {
             environment,
@@ -280,6 +559,7 @@ impl DescriptionService {
         } = host;
         let selection = catalogue.select(&target, &met);
         let budgets = Budgets::DEFAULTS;
+        let policy = ResourcePolicy::new(settings, budgets);
         Self {
             environment,
             choice,
@@ -289,14 +569,13 @@ impl DescriptionService {
             selection,
             mapping: ModelMapping::new(),
             scheduler: Scheduler::new(budgets),
-            policy: ResourcePolicy::new(settings, budgets),
+            state: policy.state(),
+            policy,
             store,
             fence: DescriptionFence::new(),
             in_flight: InFlight::new(),
             running: RunningJob::new(),
             debt: CleanupDebt::new(),
-            factory,
-            runtime: None,
             trackers: BTreeMap::new(),
             bindings: BTreeMap::new(),
             epochs: BTreeMap::new(),
@@ -308,7 +587,13 @@ impl DescriptionService {
             inference_restarts: 0,
             progress: DownloadProgress::NotStarted,
             settings,
-            job_clock: JobClock::monotonic(),
+            next_id: 0,
+            model: Model::Absent,
+            job: None,
+            unload_owed: None,
+            restart: Restart::default(),
+            counts: JobCounts::default(),
+            retried: BTreeSet::new(),
         }
     }
 
@@ -337,9 +622,12 @@ impl DescriptionService {
     }
 
     /// Returns the resource state, whose paused form is section 22's `resource_paused`.
+    ///
+    /// It is the state [`Self::next`] last found, which includes the pause a process past its
+    /// memory ceiling leaves until the next load may happen.
     #[must_use]
     pub const fn resource_state(&self) -> ResourceState {
-        self.policy.state()
+        self.state
     }
 
     /// Returns the fence privacy mode raises.
@@ -354,43 +642,19 @@ impl DescriptionService {
         self.in_flight.total()
     }
 
-    /// Returns the background priority this host applied to its inference, when a model is loaded.
-    ///
-    /// It is the runtime's own answer rather than this service's: the thread that loads a model is
-    /// the thread that runs it, and that is the thread the class was applied to.
-    #[must_use]
-    pub fn background_priority(&self) -> Option<Applied> {
-        self.runtime.as_ref().and_then(|runtime| runtime.priority())
-    }
-
-    /// Returns the handle that cancels the job the runtime is executing.
-    ///
-    /// It is shared, so a caller on another thread can cancel the job this service is inside. A
-    /// caller on *this* thread cannot: [`Self::tick`] holds the service for the whole of a
-    /// synchronous generation, and a host that needs to interrupt one runs the service on a thread
-    /// of its own.
+    /// Returns the handle that cancels the job the process is running.
     #[must_use]
     pub const fn running_job(&self) -> &RunningJob {
         &self.running
     }
 
-    /// Cancels a running job for this session if one is running, and returns whether it stopped one.
+    /// Cancels the running job for this session if one is running, and returns whether it stopped
+    /// one. The next [`Self::next`] tells the host to cancel it in the process.
     ///
     /// A job whose description had already reached the store is past cancelling, and this returns
     /// false for it rather than reporting work it did not take back.
     pub fn cancel_running(&self, session_id: &SessionId) -> bool {
         self.running.cancel(session_id)
-    }
-
-    /// Returns the clock used to measure the execution deadline.
-    #[must_use]
-    pub const fn job_clock(&self) -> &JobClock {
-        &self.job_clock
-    }
-
-    /// Sets the clock used to measure the execution deadline, which a test drives by hand.
-    pub fn set_job_clock(&mut self, clock: JobClock) {
-        self.job_clock = clock;
     }
 
     /// Returns what cleanup privacy mode is still owed.
@@ -399,10 +663,16 @@ impl DescriptionService {
         &self.debt
     }
 
-    /// Returns how many times inference has been restarted.
+    /// Returns how many times inference has been restarted after a failure.
     #[must_use]
     pub const fn inference_restarts(&self) -> u64 {
         self.inference_restarts
+    }
+
+    /// Returns how every job has ended, counted.
+    #[must_use]
+    pub const fn counts(&self) -> JobCounts {
+        self.counts
     }
 
     /// Returns the published latency figures.
@@ -423,7 +693,7 @@ impl DescriptionService {
         &self.store
     }
 
-    /// Returns whether a model is mapped in this environment.
+    /// Returns whether a model is loaded in this environment.
     #[must_use]
     pub fn is_mapped(&self) -> bool {
         self.mapping.mapped(self.environment.id()).is_some()
@@ -434,6 +704,16 @@ impl DescriptionService {
     #[must_use]
     pub fn mapped_environments(&self) -> usize {
         self.mapping.mapped_environments()
+    }
+
+    /// Returns the next load's earliest time after a failure, when one is waiting.
+    #[must_use]
+    pub const fn restart_not_before_ms(&self) -> Option<u64> {
+        if self.restart.failures == 0 {
+            None
+        } else {
+            Some(self.restart.not_before_ms)
+        }
     }
 
     /// Returns privacy mode's hook over one session's queue position, context and store row.
@@ -511,16 +791,13 @@ impl DescriptionService {
 
     /// Turns descriptions on or off.
     ///
-    /// There is one setting and it is the policy's, so turning descriptions off stops admission and
-    /// dispatch as well as unloading what is mapped, and turning them on again lets the next tick
-    /// map a model. A flag that only changed what a setup surface displayed would be a switch that
-    /// did not switch anything.
+    /// There is one setting and it is the policy's, so turning descriptions off stops admission
+    /// and dispatch, cancels the work in flight and ends the process, and turning them on again
+    /// lets the next load happen. A flag that only changed what a setup surface displayed would be
+    /// a switch that did not switch anything.
     pub fn set_enabled(&mut self, enabled: bool) {
         self.settings.enabled = enabled;
         self.policy = ResourcePolicy::new(self.settings, Budgets::DEFAULTS);
-        if !enabled {
-            self.unload();
-        }
     }
 
     /// Records that a session exists, with the epoch it was addressed in.
@@ -562,7 +839,7 @@ impl DescriptionService {
     ///
     /// The pin and the provenance stay in the store, which is the whole of section 24's *metadata
     /// and pins survive closure*. What goes is the live tracking: a closed session has no context
-    /// to advance and no job to queue.
+    /// to advance and no job to queue, and a job of its that is running is cancelled.
     pub fn session_closed(&mut self, session_id: &SessionId, now: Reading) {
         self.trackers.remove(session_id);
         self.bindings.remove(session_id);
@@ -625,6 +902,12 @@ impl DescriptionService {
     }
 
     /// Advances a session's revision when its debounce has elapsed, and queues a job when it does.
+    ///
+    /// A session whose job is in the process does not advance: its changes wait, pending, until the
+    /// job has ended, and then become one revision. Advancing under a running job would refuse its
+    /// result as a changed context, and a session that never stops changing would never be
+    /// described: section 22 coalesces events *so a long active turn can receive useful text
+    /// without invalidating every job*.
     pub fn settle(
         &mut self,
         session_id: &SessionId,
@@ -632,6 +915,13 @@ impl DescriptionService {
         now: Reading,
     ) -> Option<Enqueued> {
         if self.fence.is_fenced(session_id) {
+            return None;
+        }
+        if self
+            .job
+            .as_ref()
+            .is_some_and(|dispatched| dispatched.job.session_id == *session_id)
+        {
             return None;
         }
         let tracker = self.trackers.get_mut(session_id)?;
@@ -657,7 +947,11 @@ impl DescriptionService {
             completion,
             &events,
         );
-        Some(self.scheduler.enqueue(priority, context, now))
+        let enqueued = self.scheduler.enqueue(priority, context, now);
+        if matches!(enqueued, Enqueued::Replaced { .. }) {
+            self.counts.replaced = self.counts.replaced.saturating_add(1);
+        }
+        Some(enqueued)
     }
 
     /// Returns a session's context revision.
@@ -676,7 +970,7 @@ impl DescriptionService {
     ///
     /// # Errors
     ///
-    /// Returns [`DescribeError::Store`] when the store cannot be read.
+    /// Returns [`crate::DescribeError::Store`] when the store cannot be read.
     pub fn freshness(&self, session_id: &SessionId, now: Reading) -> Result<Option<Freshness>> {
         let Some(record) = self.store.generated(session_id)? else {
             return Ok(None);
@@ -696,7 +990,7 @@ impl DescriptionService {
     ///
     /// # Errors
     ///
-    /// Returns [`DescribeError::Store`] when the store cannot be read.
+    /// Returns [`crate::DescribeError::Store`] when the store cannot be read.
     pub fn label(
         &self,
         session_id: &SessionId,
@@ -722,359 +1016,13 @@ impl DescriptionService {
         self.store.label(session_id, facts, status)
     }
 
-    /// Drops the runtime after an inference failure, and nothing else.
-    ///
-    /// Section 22: *restart only inference*. This is the whole of that restart. The store, the
-    /// pins, the provenance, every tracker, every queue position and every session survive it, and
-    /// the next tick maps the model again.
-    pub fn note_inference_crash(&mut self) {
-        self.runtime = None;
-        self.mapping.unload(self.environment.id());
-        self.inference_restarts = self.inference_restarts.saturating_add(1);
-    }
-
-    /// Unloads the model, keeping everything else.
-    pub fn unload(&mut self) {
-        if let Some(runtime) = self.runtime.as_mut() {
-            runtime.unload();
-        }
-        self.runtime = None;
-        self.mapping.unload(self.environment.id());
-    }
-
-    /// Returns what a resident model is costing, when one is resident.
+    /// Returns what the loaded model is costing, when one is loaded.
     #[must_use]
     pub fn resident_cost(&self) -> Option<ResidentCost> {
-        self.runtime.as_ref().map(|runtime| runtime.resident_cost())
-    }
-
-    /// Runs one tick: evaluate, dequeue, produce, validate, publish.
-    ///
-    /// Two things are checked twice on purpose. The fence is read before a job is dequeued and
-    /// again before its result is published, because a session can be made private while its job is
-    /// inside the runtime. The resource policy is told whether a model is *actually* loaded rather
-    /// than inferring it, because inferring it is how a host comes to refuse a load and admit the
-    /// same load a tick later.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`DescribeError::Store`] when the store cannot be read or written, which is the only
-    /// failure a tick propagates: everything else is an outcome in [`Tick`].
-    #[allow(clippy::too_many_lines)]
-    pub fn tick(&mut self, conditions: &HostConditions, now: Reading) -> Result<Tick> {
-        if let Some(idle_since) = self.no_sessions_since_ms
-            && now.since_ms(idle_since) >= IDLE_UNLOAD_MS
-            && self.is_mapped()
-        {
-            self.unload();
-            return Ok(Tick::IdleUnloaded {
-                idle_ms: now.since_ms(idle_since),
-            });
+        match &self.model {
+            Model::Resident { profile } => Some(profile.execution().resident_estimate),
+            Model::Absent | Model::Loading { .. } => None,
         }
-        let Some(profile) = self.selection.profile().cloned() else {
-            return Ok(Tick::Idle {
-                why: NothingToDequeue::Empty,
-            });
-        };
-        // Before a load the model's cost has to come out of the memory this host can see; once it
-        // is loaded it is already out. Which world this is comes from the runtime, not from the
-        // policy's own previous answer.
-        let resident = self.runtime.is_some();
-        let cost = self
-            .resident_cost()
-            .unwrap_or(profile.execution().resident_estimate);
-        let transition = self.policy.evaluate(conditions, &cost, resident);
-        match transition.to {
-            ResourceState::ResourcePaused { reason, unloaded } => {
-                if resident {
-                    self.unload();
-                }
-                return Ok(Tick::ResourcePaused { reason, unloaded });
-            }
-            ResourceState::Ready => {
-                return Ok(Tick::Idle {
-                    why: NothingToDequeue::Empty,
-                });
-            }
-            ResourceState::Admitted => {}
-        }
-        let job = match self.scheduler.dequeue(now) {
-            Ok(job) => job,
-            Err(why) => return Ok(Tick::Idle { why }),
-        };
-        let session_id = job.session_id;
-        // The deadline starts here, at dequeue, which is what section 22 says. Loading a model is
-        // inside it: a job that spent twenty seconds waiting for weights has ten left, not another
-        // thirty.
-        let dequeued_ms = self.job_clock.now_ms();
-        let queue_wait_ms = now.since_ms(job.queued_at_ms);
-        if self.fence.is_fenced(&session_id) {
-            return Ok(Tick::Fenced);
-        }
-        let budgets = self.policy.budgets();
-
-        // Start tracking running job and in-flight work before loading, so a fence raised during
-        // load cancels the load token.
-        let cancellation = self.running.started(session_id);
-        self.in_flight.dispatched(session_id);
-        let _active_guard = ActiveJobGuard {
-            running: self.running.clone(),
-            in_flight: self.in_flight.clone(),
-            session_id,
-        };
-
-        let elapsed_before_load = self.job_clock.now_ms().saturating_sub(dequeued_ms);
-        let remaining_before_load = budgets
-            .execution_deadline_ms
-            .saturating_sub(elapsed_before_load);
-        if elapsed_before_load >= budgets.execution_deadline_ms || remaining_before_load == 0 {
-            return Ok(Tick::DeadlineExceeded { session_id });
-        }
-        if cancellation.is_cancelled() {
-            return Ok(Tick::Cancelled { session_id });
-        }
-
-        match self.ensure_mapped(&profile, &cancellation, remaining_before_load, now) {
-            Ok(EnsureMappedOutcome::Mapped) => {}
-            Ok(EnsureMappedOutcome::Cancelled) => {
-                return Ok(Tick::Cancelled { session_id });
-            }
-            Ok(EnsureMappedOutcome::DeadlineExceeded) => {
-                return Ok(Tick::DeadlineExceeded { session_id });
-            }
-            Err(error) => {
-                return Ok(Tick::InferenceFailed {
-                    session_id,
-                    detail: error.to_string(),
-                });
-            }
-        }
-
-        let generation = self.privacy_generation(&session_id);
-        let produced_under = ProducedUnder {
-            session_epoch: job.context.session_epoch(),
-            binding: job.context.binding().clone(),
-            context_revision: job.context.revision(),
-            cursor: job.context.cursor(),
-            profile_id: profile.profile_id().to_owned(),
-            profile_revision: profile.revision(),
-            generation,
-        };
-        let elapsed_before_gen = self.job_clock.now_ms().saturating_sub(dequeued_ms);
-        let remaining_ms = budgets
-            .execution_deadline_ms
-            .saturating_sub(elapsed_before_gen);
-        if elapsed_before_gen >= budgets.execution_deadline_ms || remaining_ms == 0 {
-            return Ok(Tick::DeadlineExceeded { session_id });
-        }
-        if cancellation.is_cancelled() {
-            return Ok(Tick::Cancelled { session_id });
-        }
-
-        let request = GenerationRequest {
-            prompt: prompt(&job.context),
-            grammar: crate::output::DESCRIPTION_GRAMMAR,
-            // The profile's own figures, bounded by section 22's budgets. A profile that asked for
-            // more threads or a longer answer than the budget allows gets the budget; one that
-            // asked for less gets what it asked for, because that is what it was qualified with.
-            context_tokens: budgets
-                .context_tokens
-                .min(profile.execution().context_tokens),
-            max_output_tokens: budgets
-                .max_output_tokens
-                .min(profile.execution().max_output_tokens),
-            cpu_threads: budgets.cpu_threads.min(profile.execution().cpu_threads),
-            sampler: *profile.sampler(),
-            deadline_ms: remaining_ms,
-            cancellation: cancellation.clone(),
-        };
-
-        let produced = self.runtime.as_mut().map_or_else(
-            || {
-                Err(DescribeError::Runtime {
-                    detail: "no runtime is loaded".to_owned(),
-                })
-            },
-            |runtime| runtime.generate(&request),
-        );
-        let execution_ms = self.job_clock.now_ms().saturating_sub(dequeued_ms);
-        self.scheduler.record_service(execution_ms.max(1));
-        self.latency
-            .record(self.live_sessions.len() as u32, queue_wait_ms, execution_ms);
-
-        let bytes = match produced {
-            Ok(Produced::Json(bytes)) => bytes,
-            Ok(Produced::Cancelled) => return Ok(Tick::Cancelled { session_id }),
-            Ok(Produced::DeadlineExceeded) => return Ok(Tick::DeadlineExceeded { session_id }),
-            Err(error) => {
-                let detail = error.to_string();
-                self.note_inference_crash();
-                return Ok(Tick::InferenceFailed { session_id, detail });
-            }
-        };
-
-        let Some(session_epoch) = self.epochs.get(&session_id).copied() else {
-            // The session closed while its job was running. Nothing is published against a session
-            // this host is no longer tracking.
-            return Ok(Tick::Rejected {
-                session_id,
-                rejection: Rejection::WrongSessionEpoch {
-                    expected: job.context.session_epoch(),
-                    found: job.context.session_epoch(),
-                },
-            });
-        };
-        let expectation = Expectation {
-            session_epoch,
-            revision: self.revision(&session_id).unwrap_or(job.context.revision()),
-            binding: self
-                .bindings
-                .get(&session_id)
-                .cloned()
-                .unwrap_or_else(|| job.context.binding().clone()),
-            profile_id: profile.profile_id().to_owned(),
-            profile_revision: profile.revision(),
-            generation: self.privacy_generation(&session_id),
-            name_pinned: self.store.pinned(&session_id)?.is_some(),
-        };
-        let description = match validate(&bytes, &produced_under, &expectation) {
-            Ok(description) => description,
-            Err(rejection) => {
-                return Ok(Tick::Rejected {
-                    session_id,
-                    rejection,
-                });
-            }
-        };
-
-        match self.fence.publish_under_lock(
-            &self.store,
-            &session_id,
-            &description,
-            now.wall_ms().get(),
-            produced_under.generation,
-            self.privacy_generation(&session_id),
-            &cancellation,
-            &self.job_clock,
-            dequeued_ms,
-            budgets.execution_deadline_ms,
-        )? {
-            PublishGate::Allowed => {
-                self.scheduler.record_success(&session_id, now);
-                let published = Tick::Published {
-                    session_id,
-                    queue_wait_ms,
-                    execution_ms,
-                };
-                // The ceiling is a process figure, so it is checked against the process rather than against
-                // the profile's estimate. A run that has grown past it unloads: section 22's budget is a
-                // bound on what this product costs, not a prediction it is allowed to be wrong about.
-                if let Some(rss) = process_rss_bytes()
-                    && rss > budgets.process_memory_ceiling_bytes
-                {
-                    self.unload();
-                    return Ok(Tick::ResourcePaused {
-                        reason: PauseReason::MemoryPressure,
-                        unloaded: true,
-                    });
-                }
-                Ok(published)
-            }
-            PublishGate::Cancelled => Ok(Tick::Cancelled { session_id }),
-            PublishGate::DeadlineExceeded => Ok(Tick::DeadlineExceeded { session_id }),
-            // A pin committed after validation read none. Nothing was recorded, so nothing is a
-            // success: the queue's last success stays where it was.
-            PublishGate::NamePinned => Ok(Tick::Rejected {
-                session_id,
-                rejection: Rejection::NamePinned,
-            }),
-            PublishGate::Fenced => Ok(Tick::Rejected {
-                session_id,
-                rejection: Rejection::LateGeneration {
-                    expected: self
-                        .fence
-                        .generation(&session_id)
-                        .unwrap_or(PrivacyGeneration::INITIAL),
-                    found: produced_under.generation,
-                },
-            }),
-            PublishGate::LateGeneration { expected, found } => Ok(Tick::Rejected {
-                session_id,
-                rejection: Rejection::LateGeneration { expected, found },
-            }),
-        }
-    }
-
-    /// Loads the profile when it is not loaded, releasing whatever was there first.
-    ///
-    /// The runtime is built *before* the mapping is recorded, so a load that fails leaves no record
-    /// of a model this host does not have.
-    fn ensure_mapped(
-        &mut self,
-        profile: &ModelProfile,
-        cancellation: &Cancellation,
-        remaining_ms: u64,
-        now: Reading,
-    ) -> Result<EnsureMappedOutcome> {
-        if self.runtime.as_ref().is_some_and(|runtime| {
-            let handle = runtime.handle();
-            handle.profile_id == profile.profile_id()
-                && handle.profile_revision == profile.revision()
-        }) && self.is_mapped()
-        {
-            return Ok(EnsureMappedOutcome::Mapped);
-        }
-        // Release before loading. Section 22 states that order, and it is what keeps the process
-        // ceiling a ceiling: two sets of weights resident at once would exceed it for as long as
-        // the changeover took.
-        if let Some(runtime) = self.runtime.as_mut() {
-            runtime.unload();
-        }
-        self.runtime = None;
-        self.mapping.unload(self.environment.id());
-        // Every reason this environment may not run this profile is decided before a byte of it is
-        // read: a WSL distribution with no data-access choice, a mobile device, a target the
-        // profile does not list and a candidate whose gates are outstanding all refuse here, and
-        // loading weights first would be doing the thing the refusal exists to prevent.
-        self.mapping.admits(
-            &self.environment,
-            self.choice.as_ref(),
-            profile,
-            &self.met,
-            &self.target,
-        )?;
-        let outcome = (self.factory)(profile, cancellation, remaining_ms)?;
-        let runtime = match outcome {
-            LoadOutcome::Loaded(runtime) => runtime,
-            LoadOutcome::Cancelled => return Ok(EnsureMappedOutcome::Cancelled),
-            LoadOutcome::DeadlineExceeded => return Ok(EnsureMappedOutcome::DeadlineExceeded),
-        };
-        // And what came back is the profile that was asked for. A runtime that loaded something
-        // else would have every description attributed to a model this host is not running.
-        let handle = runtime.handle();
-        if handle.profile_id != profile.profile_id()
-            || handle.profile_revision != profile.revision()
-        {
-            return Err(DescribeError::Runtime {
-                detail: format!(
-                    "{} revision {} was asked for and {} revision {} was loaded",
-                    profile.profile_id(),
-                    profile.revision().get(),
-                    handle.profile_id,
-                    handle.profile_revision.get()
-                ),
-            });
-        }
-        self.mapping.map(
-            &self.environment,
-            self.choice.as_ref(),
-            profile,
-            &self.met,
-            &self.target,
-            now.wall_ms(),
-        )?;
-        self.runtime = Some(runtime);
-        Ok(EnsureMappedOutcome::Mapped)
     }
 
     /// Returns whether a result produced under a profile revision is still current.
@@ -1089,14 +1037,657 @@ impl DescriptionService {
     pub const fn met_gates(&self) -> &MetGates {
         &self.met
     }
-}
 
-/// Returns this process's resident set, when this platform will say.
-fn process_rss_bytes() -> Option<u64> {
-    let pid = sysinfo::Pid::from_u32(std::process::id());
-    let mut system = sysinfo::System::new();
-    system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
-    system.process(pid).map(sysinfo::Process::memory)
+    /// Says what the host does now.
+    ///
+    /// Work in flight comes first: it is cancelled when it should stop - privacy mode or a caller
+    /// cancelled it, its session closed, inference paused or was turned off, or a load has nothing
+    /// left to be for - and otherwise its answer is waited for. With nothing in flight, an unload
+    /// that is owed, an idle host and a pause each end the process; then a model is loaded when
+    /// work is due and none is loaded; then the next job is dequeued, with its whole execution
+    /// deadline from this moment.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::DescribeError::Store`] when the store cannot be read.
+    pub fn next(&mut self, conditions: &HostConditions, now: Reading) -> Result<Instruction> {
+        if let Some(instruction) = self.stop_in_flight(conditions) {
+            return Ok(instruction);
+        }
+        if self.job.is_some() || matches!(self.model, Model::Loading { .. }) {
+            return Ok(Instruction::Wait { until_ms: None });
+        }
+        let resident = matches!(self.model, Model::Resident { .. });
+        if let Some(why) = self.unload_owed.take() {
+            self.release();
+            return Ok(Instruction::Unload { why });
+        }
+        let Some(profile) = self.selection.profile().cloned() else {
+            return Ok(Instruction::Wait { until_ms: None });
+        };
+        if resident
+            && let Some(idle_since) = self.no_sessions_since_ms
+            && now.since_ms(idle_since) >= IDLE_UNLOAD_MS
+        {
+            self.release();
+            return Ok(Instruction::Unload {
+                why: UnloadReason::Idle {
+                    idle_ms: now.since_ms(idle_since),
+                },
+            });
+        }
+        // Before a load the model's cost has to come out of the memory this host can see; once it
+        // is loaded it is already out. Which world this is comes from what the process answered,
+        // not from the policy's own previous answer.
+        let cost = self
+            .resident_cost()
+            .unwrap_or(profile.execution().resident_estimate);
+        self.state = self.policy.evaluate(conditions, &cost, resident).to;
+        if let ResourceState::ResourcePaused { reason, .. } = self.state {
+            if resident {
+                self.release();
+                return Ok(Instruction::Unload {
+                    why: UnloadReason::Paused(reason),
+                });
+            }
+            return Ok(Instruction::Wait {
+                until_ms: (self.scheduler.queued() > 0)
+                    .then(|| now.monotonic_ms().saturating_add(PAUSE_RECHECK_MS)),
+            });
+        }
+        if !resident {
+            return Ok(self.load_when_due(profile, now));
+        }
+        Ok(self.dispatch(&profile, now))
+    }
+
+    /// Takes the process's answer to one piece of work.
+    ///
+    /// An answer for work that is not in flight is dropped and counted, and changes nothing. A
+    /// job's result is judged against what is in force now: the session's epoch, binding and
+    /// revision, the selected profile, privacy mode's generation and fence, the job's token and
+    /// deadline, and a pin, which the store checks again in the statement that writes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::DescribeError::Store`] when the store cannot be read or written, which is
+    /// the only failure this propagates: everything else is an [`Outcome`].
+    pub fn finished(&mut self, id: u64, answer: Answered, now: Reading) -> Result<Outcome> {
+        if let Model::Loading { id: loading, .. } = &self.model
+            && *loading == id
+        {
+            return Ok(self.finish_load(answer, now));
+        }
+        if self
+            .job
+            .as_ref()
+            .is_some_and(|dispatched| dispatched.id == id)
+        {
+            let dispatched = self
+                .job
+                .take()
+                .unwrap_or_else(|| unreachable!("the job was just found"));
+            return self.finish_job(dispatched, answer, now);
+        }
+        self.counts.dropped_answers = self.counts.dropped_answers.saturating_add(1);
+        Ok(Outcome::Dropped { id })
+    }
+
+    /// Takes the news that the description process ended without this service asking.
+    ///
+    /// The model goes with it and nothing else. The work in flight ends: a job the process was
+    /// cancelling ends cancelled, a job past its deadline ends so, and any other job is queued
+    /// again once with its aging position. The next load waits out the restart delay.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::DescribeError::Store`] only as [`Self::finished`] does; nothing here writes.
+    pub fn process_ended(&mut self, why: ProcessEnd, now: Reading) -> Result<Vec<Outcome>> {
+        let mut outcomes = Vec::new();
+        if let Some(dispatched) = self.job.take() {
+            outcomes.push(self.job_ended_with_process(dispatched, why));
+        }
+        if let Model::Loading { cancel_sent, .. } = &self.model {
+            let load_why = match why {
+                ProcessEnd::PastDeadline => LoadEnd::DeadlineExceeded,
+                ProcessEnd::CancelUnanswered if *cancel_sent => LoadEnd::Cancelled,
+                _ => LoadEnd::Failed,
+            };
+            outcomes.push(Outcome::LoadEnded {
+                why: load_why,
+                detail: Some(format!("the description process ended: {}", why.as_str())),
+            });
+        }
+        self.release();
+        self.inference_restarts = self.inference_restarts.saturating_add(1);
+        self.restart.failed(
+            now,
+            (why == ProcessEnd::MemoryCeiling).then_some(PauseReason::MemoryPressure),
+        );
+        if why == ProcessEnd::MemoryCeiling {
+            self.state = ResourceState::ResourcePaused {
+                reason: PauseReason::MemoryPressure,
+                unloaded: true,
+            };
+        }
+        outcomes.push(Outcome::ProcessEnded { why });
+        Ok(outcomes)
+    }
+
+    /// Decides whether the work in flight stops, and says to cancel it once when it does.
+    fn stop_in_flight(&mut self, conditions: &HostConditions) -> Option<Instruction> {
+        let enabled = self.settings.enabled;
+        if let Some(dispatched) = &self.job {
+            if dispatched.stopping.is_some() {
+                return None;
+            }
+            let session_id = dispatched.job.session_id;
+            let cancelled = dispatched.cancellation.is_cancelled();
+            let stop = if cancelled {
+                Stop::Cancelled
+            } else if !self.live_sessions.contains(&session_id) {
+                Stop::Closed
+            } else if !enabled || self.paused_now(conditions, true) {
+                Stop::Paused
+            } else {
+                return None;
+            };
+            let dispatched = self.job.as_mut()?;
+            dispatched.cancellation.cancel();
+            dispatched.stopping = Some(stop);
+            return Some(Instruction::Cancel {
+                id: dispatched.id,
+                work: Work::Job,
+            });
+        }
+        if !matches!(
+            self.model,
+            Model::Loading {
+                cancel_sent: false,
+                ..
+            }
+        ) {
+            return None;
+        }
+        let stop = !enabled || self.paused_now(conditions, false) || self.scheduler.queued() == 0;
+        if !stop {
+            return None;
+        }
+        let Model::Loading {
+            id, cancel_sent, ..
+        } = &mut self.model
+        else {
+            return None;
+        };
+        *cancel_sent = true;
+        Some(Instruction::Cancel {
+            id: *id,
+            work: Work::Load,
+        })
+    }
+
+    /// Returns whether the policy pauses inference under these conditions.
+    fn paused_now(&mut self, conditions: &HostConditions, resident: bool) -> bool {
+        let cost = self.resident_cost().or_else(|| {
+            self.selection
+                .profile()
+                .map(|profile| profile.execution().resident_estimate)
+        });
+        let Some(cost) = cost else {
+            return false;
+        };
+        self.state = self.policy.evaluate(conditions, &cost, resident).to;
+        matches!(self.state, ResourceState::ResourcePaused { .. })
+    }
+
+    /// Asks for a load when work is due, the restart delay has passed and this environment may
+    /// run the profile.
+    fn load_when_due(&mut self, profile: ModelProfile, now: Reading) -> Instruction {
+        if !self.scheduler.has_eligible(now) {
+            return Instruction::Wait {
+                until_ms: self.scheduler.next_due_ms(now),
+            };
+        }
+        if self.restart.failures > 0 && now.monotonic_ms() < self.restart.not_before_ms {
+            if let Some(reason) = self.restart.pause {
+                self.state = ResourceState::ResourcePaused {
+                    reason,
+                    unloaded: true,
+                };
+            }
+            return Instruction::Wait {
+                until_ms: Some(self.restart.not_before_ms),
+            };
+        }
+        // Every reason this environment may not run this profile is decided before a byte of it is
+        // read: a WSL distribution with no data-access choice, a mobile device, a target the
+        // profile does not list and a candidate whose gates are outstanding all refuse here, and
+        // loading weights first would be doing the thing the refusal exists to prevent.
+        if self
+            .mapping
+            .admits(
+                &self.environment,
+                self.choice.as_ref(),
+                &profile,
+                &self.met,
+                &self.target,
+            )
+            .is_err()
+        {
+            return Instruction::Wait { until_ms: None };
+        }
+        let id = self.take_id();
+        self.model = Model::Loading {
+            id,
+            profile: Box::new(profile.clone()),
+            asked_ms: now.monotonic_ms(),
+            cancel_sent: false,
+        };
+        Instruction::Load {
+            id,
+            profile: Box::new(profile),
+            deadline_ms: LOAD_DEADLINE_MS,
+        }
+    }
+
+    /// Takes the next eligible job, with its whole deadline from now, and says to send it.
+    fn dispatch(&mut self, profile: &ModelProfile, now: Reading) -> Instruction {
+        loop {
+            let job = match self.scheduler.dequeue(now) {
+                Ok(job) => job,
+                Err(_) => {
+                    let idle_unload = self
+                        .no_sessions_since_ms
+                        .map(|since| since.saturating_add(IDLE_UNLOAD_MS));
+                    let until_ms = match (self.scheduler.next_due_ms(now), idle_unload) {
+                        (Some(due), Some(idle)) => Some(due.min(idle)),
+                        (due, idle) => due.or(idle),
+                    };
+                    return Instruction::Wait { until_ms };
+                }
+            };
+            let session_id = job.session_id;
+            // A job of a session made private is never sent. Privacy mode takes it back from the
+            // queue itself; this is the same rule at the last moment it can be applied.
+            if self.fence.is_fenced(&session_id) {
+                self.counts.cancelled = self.counts.cancelled.saturating_add(1);
+                continue;
+            }
+            let budgets = self.policy.budgets();
+            let generation = self.privacy_generation(&session_id);
+            let produced_under = ProducedUnder {
+                session_epoch: job.context.session_epoch(),
+                binding: job.context.binding().clone(),
+                context_revision: job.context.revision(),
+                cursor: job.context.cursor(),
+                profile_id: profile.profile_id().to_owned(),
+                profile_revision: profile.revision(),
+                generation,
+            };
+            let request = GenerationRequest {
+                prompt: prompt(&job.context),
+                grammar: crate::output::DESCRIPTION_GRAMMAR,
+                // The profile's own figures, bounded by section 22's budgets. A profile that asked
+                // for more threads or a longer answer than the budget allows gets the budget; one
+                // that asked for less gets what it asked for, because that is what it was
+                // qualified with.
+                context_tokens: budgets
+                    .context_tokens
+                    .min(profile.execution().context_tokens),
+                max_output_tokens: budgets
+                    .max_output_tokens
+                    .min(profile.execution().max_output_tokens),
+                cpu_threads: budgets.cpu_threads.min(profile.execution().cpu_threads),
+                // The deadline starts here, at dequeue, which is what section 22 says. The model
+                // is already loaded, so the job has the whole of it.
+                deadline_ms: budgets.execution_deadline_ms,
+                ceiling_bytes: budgets.process_memory_ceiling_bytes,
+            };
+            let cancellation = self.running.started(session_id);
+            self.in_flight.dispatched(session_id);
+            let id = self.take_id();
+            let queue_wait_ms = now.since_ms(job.queued_at_ms);
+            let requeued_before = self.retried.remove(&session_id);
+            self.job = Some(Dispatched {
+                id,
+                job,
+                produced_under,
+                dequeued_ms: now.monotonic_ms(),
+                queue_wait_ms,
+                cancellation,
+                stopping: None,
+                requeued_before,
+            });
+            return Instruction::Generate {
+                id,
+                session_id,
+                request,
+            };
+        }
+    }
+
+    /// Takes a load's answer.
+    fn finish_load(&mut self, answer: Answered, now: Reading) -> Outcome {
+        let Model::Loading {
+            profile, asked_ms, ..
+        } = std::mem::replace(&mut self.model, Model::Absent)
+        else {
+            unreachable!("a load is in flight")
+        };
+        match answer {
+            Answered::Loaded { .. } => {
+                // The mapping is recorded only once the process has the model, so a load that
+                // failed leaves no record of a model this host does not have.
+                let _ = self.mapping.map(
+                    &self.environment,
+                    self.choice.as_ref(),
+                    &profile,
+                    &self.met,
+                    &self.target,
+                    now.wall_ms(),
+                );
+                self.model = Model::Resident { profile };
+                Outcome::Loaded {
+                    cold_start_ms: now.since_ms(asked_ms),
+                }
+            }
+            Answered::LoadEnded { why, detail } => {
+                if why != LoadEnd::Cancelled {
+                    self.restart.failed(now, None);
+                }
+                Outcome::LoadEnded { why, detail }
+            }
+            // A job's answer to a load is not an answer to it. The process is not speaking this
+            // wire, and it is ended rather than believed.
+            Answered::Produced { .. } | Answered::Ended { .. } => {
+                self.unload_owed = Some(UnloadReason::Failed);
+                self.restart.failed(now, None);
+                Outcome::LoadEnded {
+                    why: LoadEnd::Failed,
+                    detail: Some("the process answered a load as if it were a job".to_owned()),
+                }
+            }
+        }
+    }
+
+    /// Takes a job's answer.
+    fn finish_job(
+        &mut self,
+        dispatched: Dispatched,
+        answer: Answered,
+        now: Reading,
+    ) -> Result<Outcome> {
+        let session_id = dispatched.job.session_id;
+        let execution_ms = now.since_ms(dispatched.dequeued_ms);
+        self.running.finished();
+        self.in_flight.reconciled(&session_id);
+        let (bytes, peak_rss_bytes) = match answer {
+            Answered::Produced {
+                bytes,
+                peak_rss_bytes,
+                ..
+            } => (bytes, peak_rss_bytes),
+            Answered::Ended { why, detail } => {
+                self.latency.record(
+                    self.live_sessions.len() as u32,
+                    dispatched.queue_wait_ms,
+                    execution_ms,
+                );
+                return Ok(self.job_ended(dispatched, why, detail, now));
+            }
+            // A load's answer to a job is not an answer to it.
+            Answered::Loaded { .. } | Answered::LoadEnded { .. } => {
+                return Ok(self.job_failed(
+                    dispatched,
+                    "the process answered a job as if it were a load".to_owned(),
+                    now,
+                ));
+            }
+        };
+        self.scheduler.record_service(execution_ms.max(1));
+        self.latency.record(
+            self.live_sessions.len() as u32,
+            dispatched.queue_wait_ms,
+            execution_ms,
+        );
+        // A job that was being stopped for a pause or a replaced profile is still wanted, and its
+        // token is cancelled, so what it produced is not published: it goes back in the queue.
+        if dispatched.stopping.is_some_and(Stop::requeues) {
+            return Ok(self.requeue(dispatched, false));
+        }
+        let outcome = self.publish(&dispatched, &bytes, execution_ms, now)?;
+        let ceiling = self.policy.budgets().process_memory_ceiling_bytes;
+        if peak_rss_bytes > ceiling {
+            // The ceiling is a process figure, and the process passed it. The description it
+            // produced stands; the model is unloaded and inference pauses until the restart delay
+            // has passed.
+            self.unload_owed = Some(UnloadReason::Paused(PauseReason::MemoryPressure));
+            self.restart.failed(now, Some(PauseReason::MemoryPressure));
+            self.state = ResourceState::ResourcePaused {
+                reason: PauseReason::MemoryPressure,
+                unloaded: true,
+            };
+        } else if matches!(outcome, Outcome::Published { .. }) {
+            self.restart.succeeded();
+        }
+        Ok(outcome)
+    }
+
+    /// Validates a job's bytes against what is in force now, and publishes them.
+    fn publish(
+        &mut self,
+        dispatched: &Dispatched,
+        bytes: &[u8],
+        execution_ms: u64,
+        now: Reading,
+    ) -> Result<Outcome> {
+        let session_id = dispatched.job.session_id;
+        let produced_under = &dispatched.produced_under;
+        let rejected = |counts: &mut JobCounts, rejection: Rejection| {
+            counts.refused = counts.refused.saturating_add(1);
+            Outcome::Rejected {
+                session_id,
+                rejection,
+            }
+        };
+        if !self.live_sessions.contains(&session_id) {
+            return Ok(rejected(&mut self.counts, Rejection::SessionClosed));
+        }
+        let Some(session_epoch) = self.epochs.get(&session_id).copied() else {
+            return Ok(rejected(&mut self.counts, Rejection::SessionClosed));
+        };
+        let (profile_id, profile_revision) = self.selection.profile().map_or_else(
+            || (String::new(), ProfileRevision::new(0)),
+            |profile| (profile.profile_id().to_owned(), profile.revision()),
+        );
+        let expectation = Expectation {
+            session_epoch,
+            revision: self
+                .revision(&session_id)
+                .unwrap_or(ContextRevision::INITIAL),
+            binding: self
+                .bindings
+                .get(&session_id)
+                .cloned()
+                .unwrap_or_else(|| produced_under.binding.clone()),
+            profile_id,
+            profile_revision,
+            generation: self.privacy_generation(&session_id),
+            name_pinned: self.store.pinned(&session_id)?.is_some(),
+        };
+        let description = match validate(bytes, produced_under, &expectation) {
+            Ok(description) => description,
+            Err(rejection) => return Ok(rejected(&mut self.counts, rejection)),
+        };
+        let gate = self.fence.publish_under_lock(
+            &self.store,
+            &session_id,
+            &description,
+            now.wall_ms().get(),
+            produced_under.generation,
+            self.privacy_generation(&session_id),
+            &dispatched.cancellation,
+            execution_ms,
+            self.policy.budgets().execution_deadline_ms,
+        )?;
+        Ok(match gate {
+            PublishGate::Allowed => {
+                self.scheduler.record_success(&session_id, now);
+                self.counts.published = self.counts.published.saturating_add(1);
+                Outcome::Published {
+                    session_id,
+                    queue_wait_ms: dispatched.queue_wait_ms,
+                    execution_ms,
+                }
+            }
+            PublishGate::Cancelled => {
+                self.counts.cancelled = self.counts.cancelled.saturating_add(1);
+                Outcome::Cancelled { session_id }
+            }
+            PublishGate::DeadlineExceeded => {
+                self.counts.deadline_exceeded = self.counts.deadline_exceeded.saturating_add(1);
+                Outcome::DeadlineExceeded { session_id }
+            }
+            // A pin committed after validation read none. Nothing was recorded, so nothing is a
+            // success: the queue's last success stays where it was.
+            PublishGate::NamePinned => rejected(&mut self.counts, Rejection::NamePinned),
+            PublishGate::Fenced => rejected(
+                &mut self.counts,
+                Rejection::LateGeneration {
+                    expected: self
+                        .fence
+                        .generation(&session_id)
+                        .unwrap_or(PrivacyGeneration::INITIAL),
+                    found: produced_under.generation,
+                },
+            ),
+            PublishGate::LateGeneration { expected, found } => rejected(
+                &mut self.counts,
+                Rejection::LateGeneration { expected, found },
+            ),
+        })
+    }
+
+    /// Takes a job that the process ended with nothing.
+    fn job_ended(
+        &mut self,
+        dispatched: Dispatched,
+        why: JobEnd,
+        detail: Option<String>,
+        now: Reading,
+    ) -> Outcome {
+        let session_id = dispatched.job.session_id;
+        match why {
+            JobEnd::Cancelled => {
+                if dispatched.stopping.is_some_and(Stop::requeues) {
+                    return self.requeue(dispatched, false);
+                }
+                self.counts.cancelled = self.counts.cancelled.saturating_add(1);
+                Outcome::Cancelled { session_id }
+            }
+            JobEnd::DeadlineExceeded => {
+                self.counts.deadline_exceeded = self.counts.deadline_exceeded.saturating_add(1);
+                Outcome::DeadlineExceeded { session_id }
+            }
+            JobEnd::MemoryCeiling => {
+                // The job is not queued again: it is the job that passed the ceiling.
+                self.unload_owed = Some(UnloadReason::Paused(PauseReason::MemoryPressure));
+                self.restart.failed(now, Some(PauseReason::MemoryPressure));
+                self.state = ResourceState::ResourcePaused {
+                    reason: PauseReason::MemoryPressure,
+                    unloaded: true,
+                };
+                self.counts.failed = self.counts.failed.saturating_add(1);
+                Outcome::Failed {
+                    session_id,
+                    detail: detail.unwrap_or_else(|| "the process passed its ceiling".to_owned()),
+                }
+            }
+            JobEnd::NotLoaded | JobEnd::Refused | JobEnd::Failed => self.job_failed(
+                dispatched,
+                detail.unwrap_or_else(|| format!("the job ended {}", why.as_str())),
+                now,
+            ),
+        }
+    }
+
+    /// Takes a job whose process failed it: only inference is restarted, and the job is queued
+    /// again once.
+    fn job_failed(&mut self, dispatched: Dispatched, detail: String, now: Reading) -> Outcome {
+        self.release();
+        self.unload_owed = Some(UnloadReason::Failed);
+        self.inference_restarts = self.inference_restarts.saturating_add(1);
+        self.restart.failed(now, None);
+        if dispatched.requeued_before {
+            self.counts.failed = self.counts.failed.saturating_add(1);
+            return Outcome::Failed {
+                session_id: dispatched.job.session_id,
+                detail,
+            };
+        }
+        self.requeue(dispatched, true)
+    }
+
+    /// Ends the job the process had when it ended.
+    fn job_ended_with_process(&mut self, dispatched: Dispatched, why: ProcessEnd) -> Outcome {
+        let session_id = dispatched.job.session_id;
+        self.running.finished();
+        self.in_flight.reconciled(&session_id);
+        match (why, dispatched.stopping) {
+            (ProcessEnd::PastDeadline, _) => {
+                self.counts.deadline_exceeded = self.counts.deadline_exceeded.saturating_add(1);
+                Outcome::DeadlineExceeded { session_id }
+            }
+            (ProcessEnd::MemoryCeiling, _) => {
+                self.counts.failed = self.counts.failed.saturating_add(1);
+                Outcome::Failed {
+                    session_id,
+                    detail: "the process passed its ceiling".to_owned(),
+                }
+            }
+            (_, Some(stop)) if stop.requeues() => self.requeue(dispatched, false),
+            (_, Some(_)) => {
+                self.counts.cancelled = self.counts.cancelled.saturating_add(1);
+                Outcome::Cancelled { session_id }
+            }
+            (_, None) if dispatched.requeued_before => {
+                self.counts.failed = self.counts.failed.saturating_add(1);
+                Outcome::Failed {
+                    session_id,
+                    detail: format!("the description process ended: {}", why.as_str()),
+                }
+            }
+            (_, None) => self.requeue(dispatched, true),
+        }
+    }
+
+    /// Puts a job back in the queue with its aging position. A job put back after a failure is put
+    /// back once: its session's next failure is not retried.
+    fn requeue(&mut self, dispatched: Dispatched, after_failure: bool) -> Outcome {
+        let session_id = dispatched.job.session_id;
+        if !self.live_sessions.contains(&session_id) || self.fence.is_fenced(&session_id) {
+            self.counts.cancelled = self.counts.cancelled.saturating_add(1);
+            return Outcome::Cancelled { session_id };
+        }
+        if after_failure {
+            self.retried.insert(session_id);
+        }
+        self.scheduler.requeue(dispatched.job);
+        self.counts.requeued = self.counts.requeued.saturating_add(1);
+        Outcome::Requeued { session_id }
+    }
+
+    /// Lets go of the model: this service no longer counts on the process having one.
+    fn release(&mut self) {
+        self.model = Model::Absent;
+        self.mapping.unload(self.environment.id());
+    }
+
+    /// Returns a new identifier for a piece of work.
+    const fn take_id(&mut self) -> u64 {
+        self.next_id = self.next_id.wrapping_add(1);
+        self.next_id
+    }
 }
 
 /// Builds the bounded context one job is described from.

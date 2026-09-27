@@ -135,6 +135,8 @@ pub enum Rejection {
     },
     /// The session's name is pinned. Generated text never overwrites one.
     NamePinned,
+    /// The session closed while its job was running.
+    SessionClosed,
 }
 
 impl Rejection {
@@ -153,6 +155,7 @@ impl Rejection {
             Self::ProvenanceMismatch { .. } => "provenance_mismatch",
             Self::LateGeneration { .. } => "late_generation",
             Self::NamePinned => "name_pinned",
+            Self::SessionClosed => "session_closed",
         }
     }
 }

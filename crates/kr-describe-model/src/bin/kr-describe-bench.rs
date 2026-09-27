@@ -15,22 +15,29 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use kr_describe::budget::{Budgets, ResidentCost};
 use kr_describe::context::{ContextBinding, ContextSignal};
-use kr_describe::environment::{EnvironmentKind, ExecutionEnvironment};
+use kr_describe::environment::{EnvironmentKind, ExecutionEnvironment, build_target};
 use kr_describe::metadata::RepositoryFacts;
 use kr_describe::metrics::{Distribution, LatencyLedger, PUBLISHED_SESSION_COUNTS};
-use kr_describe::priority::Cancellation;
+use kr_describe::priority::{Cancellation, background_current_thread};
 use kr_describe::profile::catalogue::{Catalogue, MetGates};
 use kr_describe::profile::{Asset, ModelProfile};
 use kr_describe::queue::Priority;
-use kr_describe::resource::{ResourceSettings, platform};
-use kr_describe::runtime::LoadOutcome;
-use kr_describe::service::{DescriptionService, HostPlacement, RuntimeFactory, Tick};
+use kr_describe::resource::{
+    HostConditions, PauseReason, ResourceSettings, ResourceState, platform,
+};
+use kr_describe::serve::{Generating, Job, Model};
+use kr_describe::service::{
+    Answered, DescriptionService, HostPlacement, Instruction, LOAD_DEADLINE_MS, Outcome,
+    UnloadReason, Work,
+};
 use kr_describe::store::DescriptionStore;
 use kr_describe::time::Reading;
+use kr_describe::wire::{JobEnd, LoadEnd};
+use kr_describe_model::llama::{Llama, LlamaRuntime};
 use kr_protocol::ids::{EnvironmentId, SessionEpoch, SessionId};
 use kr_protocol::scalars::Uuid;
 use vtparse::{CsiParam, VTActor, VTParser};
@@ -300,20 +307,26 @@ fn run(profile: &ModelProfile, cache: &Path) -> Result<(), String> {
         }
     });
 
+    // The class is applied on the thread that loads and runs the model, before the model starts a
+    // thread of its own, as the description process applies it on its model thread.
+    let applied = background_current_thread();
     let cold = Instant::now();
     let budgets = Budgets::DEFAULTS;
-    let initial_cancellation = Cancellation::new();
-    let load_outcome = kr_describe_model::llama::LlamaRuntime::load(
+    let runtime = LlamaRuntime::load(
         profile,
         &weights,
-        &initial_cancellation,
-        budgets.execution_deadline_ms,
+        &Cancellation::new(),
+        Instant::now() + Duration::from_millis(LOAD_DEADLINE_MS),
     )
-    .map_err(|error| error.to_string())?;
-    let runtime = match load_outcome {
-        LoadOutcome::Loaded(runtime) => runtime,
-        other => return Err(format!("model load did not succeed: {other:?}")),
-    };
+    .map_err(|(why, detail)| {
+        format!(
+            "model load did not succeed: {}{}",
+            why.as_str(),
+            detail
+                .map(|detail| format!(": {detail}"))
+                .unwrap_or_default()
+        )
+    })?;
     let load_ms = cold.elapsed().as_millis() as u64;
 
     load_sampling.store(false, Ordering::Release);
@@ -327,9 +340,6 @@ fn run(profile: &ModelProfile, cache: &Path) -> Result<(), String> {
     let model_cpu = (load_cpu_samples.load(Ordering::Acquire) > 0)
         .then(|| peak_load_cpu.load(Ordering::Acquire));
     println!("cold_start_load_ms: {load_ms} [{machine}]");
-    let applied = runtime
-        .priority()
-        .ok_or_else(|| "the runtime did not say what class it applied".to_owned())?;
     println!(
         "background priority: {} (cpu {}, io {}){} [{machine}]",
         applied.mechanism.as_str(),
@@ -385,19 +395,10 @@ fn run(profile: &ModelProfile, cache: &Path) -> Result<(), String> {
         &mut unmet,
     );
 
-    // One service, one runtime, the real weights. The runtime is moved into the factory, so the
-    // first mapping takes it and a second would be a fault rather than a second set of weights.
-    let held = std::cell::RefCell::new(Some(runtime));
-    let factory: RuntimeFactory = Box::new(
-        move |_profile: &ModelProfile, _cancellation: &Cancellation, _deadline_ms: u64| {
-            held.borrow_mut()
-                .take()
-                .map(LoadOutcome::Loaded)
-                .ok_or_else(|| kr_describe::DescribeError::Runtime {
-                    detail: "this benchmark maps one model once".to_owned(),
-                })
-        },
-    );
+    // One service, one model, the real weights, loaded above and measured apart. The service
+    // drives it here, in this process: its load is answered from the model already loaded, and
+    // each job runs on this thread.
+    let mut model = Llama::loaded(runtime);
     let mut service = DescriptionService::new(
         HostPlacement {
             environment: ExecutionEnvironment::new(
@@ -405,7 +406,7 @@ fn run(profile: &ModelProfile, cache: &Path) -> Result<(), String> {
                 EnvironmentKind::Native,
             ),
             data_access: None,
-            target: current_target().to_owned(),
+            target: build_target().to_owned(),
         },
         Catalogue::builtin().map_err(|error| error.to_string())?,
         MetGates::default(),
@@ -417,7 +418,6 @@ fn run(profile: &ModelProfile, cache: &Path) -> Result<(), String> {
             ..ResourceSettings::default()
         },
         DescriptionStore::open(&cache.join("bench-store")).map_err(|error| error.to_string())?,
-        factory,
     );
 
     // The service selects for itself, from the catalogue and the gates this host has met. A
@@ -557,22 +557,19 @@ fn run(profile: &ModelProfile, cache: &Path) -> Result<(), String> {
         }
         for _ in 0..sessions {
             let started = Instant::now();
-            let now = reading_now();
-            let tick = service
-                .tick(&conditions, now)
-                .map_err(|error| error.to_string())?;
+            let turned = turn(&mut service, &mut model, profile, &conditions, &reading_now)?;
             let elapsed_ms = started.elapsed().as_millis() as u64;
-            match tick {
-                Tick::Published { queue_wait_ms, .. } => {
+            match turned {
+                Turn::Outcome(Outcome::Published { queue_wait_ms, .. }) => {
                     ended.described += 1;
                     ledger.record(sessions, queue_wait_ms, elapsed_ms);
                 }
-                Tick::DeadlineExceeded { .. } => ended.past_deadline += 1,
-                Tick::Rejected { rejection, .. } => {
+                Turn::Outcome(Outcome::DeadlineExceeded { .. }) => ended.past_deadline += 1,
+                Turn::Outcome(Outcome::Rejected { rejection, .. }) => {
                     ended.refused += 1;
                     eprintln!("rejected at {sessions} sessions: {}", rejection.as_str());
                 }
-                Tick::ResourcePaused { reason, .. } => {
+                Turn::Paused(reason) | Turn::Unloaded(UnloadReason::Paused(reason)) => {
                     ended.paused += 1;
                     println!(
                         "resource_paused at {sessions} sessions: {} [{machine}]",
@@ -581,7 +578,7 @@ fn run(profile: &ModelProfile, cache: &Path) -> Result<(), String> {
                 }
                 other => {
                     ended.other += 1;
-                    eprintln!("unexpected tick at {sessions} sessions: {other:?}");
+                    eprintln!("unexpected turn at {sessions} sessions: {other:?}");
                 }
             }
         }
@@ -647,7 +644,7 @@ fn run(profile: &ModelProfile, cache: &Path) -> Result<(), String> {
                 EnvironmentKind::Native,
             ),
             data_access: None,
-            target: current_target().to_owned(),
+            target: build_target().to_owned(),
         },
         Catalogue::builtin().map_err(|error| error.to_string())?,
         MetGates::default(),
@@ -657,13 +654,6 @@ fn run(profile: &ModelProfile, cache: &Path) -> Result<(), String> {
             ..ResourceSettings::default()
         },
         DescriptionStore::in_memory().map_err(|error| error.to_string())?,
-        Box::new(
-            |_profile: &ModelProfile, _cancellation: &Cancellation, _deadline_ms: u64| {
-                Err(kr_describe::DescribeError::Runtime {
-                    detail: "the paused case never maps a model".to_owned(),
-                })
-            },
-        ),
     );
     let session_id = SessionId::new(Uuid::from_bytes([11; 16]));
     let now = reading_now();
@@ -677,10 +667,10 @@ fn run(profile: &ModelProfile, cache: &Path) -> Result<(), String> {
         now,
     );
     strict.settle(&session_id, Priority::Ordinary, now.after_ms(2_000));
-    let paused = strict
-        .tick(&conditions, now.after_ms(3_000))
-        .map_err(|error| error.to_string())?;
-    println!("paused_tick: {paused:?} [{machine}]");
+    let paused = turn(&mut strict, &mut model, profile, &conditions, &|| {
+        now.after_ms(3_000)
+    })?;
+    println!("paused_turn: {paused:?} [{machine}]");
     let label = strict
         .label(
             &session_id,
@@ -696,7 +686,7 @@ fn run(profile: &ModelProfile, cache: &Path) -> Result<(), String> {
         label.title,
         label.source.as_str()
     );
-    if !matches!(paused, Tick::ResourcePaused { .. }) {
+    if !matches!(paused, Turn::Paused(_)) {
         unmet.push(format!("the resource-pause case did not pause: {paused:?}"));
     }
 
@@ -717,6 +707,102 @@ fn run(profile: &ModelProfile, cache: &Path) -> Result<(), String> {
         "{} qualification target(s) were not met on {machine}; the figures above are the run",
         unmet.len()
     ))
+}
+
+/// What one turn of the benchmark's driver came to.
+#[derive(Debug)]
+enum Turn {
+    /// An answer, and what it came to.
+    Outcome(Outcome),
+    /// Inference is paused, and the model was not loaded.
+    Paused(PauseReason),
+    /// The service ended the model.
+    Unloaded(UnloadReason),
+    /// Nothing was due.
+    Idle,
+}
+
+/// Drives the service until it has an answer's outcome, a pause or nothing due, running each job
+/// on the model in this process.
+fn turn(
+    service: &mut DescriptionService,
+    model: &mut Llama,
+    profile: &ModelProfile,
+    conditions: &HostConditions,
+    reading_now: &dyn Fn() -> Reading,
+) -> Result<Turn, String> {
+    loop {
+        let instruction = service
+            .next(conditions, reading_now())
+            .map_err(|error| error.to_string())?;
+        let (id, answer) = match instruction {
+            Instruction::Wait { .. } => {
+                return Ok(match service.resource_state() {
+                    ResourceState::ResourcePaused { reason, .. } => Turn::Paused(reason),
+                    _ => Turn::Idle,
+                });
+            }
+            Instruction::Unload { why } => return Ok(Turn::Unloaded(why)),
+            Instruction::Cancel { id, work } => (
+                id,
+                match work {
+                    Work::Load => Answered::LoadEnded {
+                        why: LoadEnd::Cancelled,
+                        detail: None,
+                    },
+                    Work::Job => Answered::Ended {
+                        why: JobEnd::Cancelled,
+                        detail: None,
+                    },
+                },
+            ),
+            // The model was loaded before the service was built, and measured apart.
+            Instruction::Load { id, .. } => (
+                id,
+                Answered::Loaded {
+                    load_ms: 0,
+                    rss_bytes: 0,
+                },
+            ),
+            Instruction::Generate { id, request, .. } => {
+                let generating = model.generate(
+                    &Job {
+                        prompt: &request.prompt,
+                        grammar: request.grammar,
+                        context_tokens: request.context_tokens,
+                        max_output_tokens: request.max_output_tokens,
+                        cpu_threads: request.cpu_threads,
+                        sampler: profile.sampler(),
+                        ceiling_bytes: request.ceiling_bytes,
+                    },
+                    &Cancellation::new(),
+                    Instant::now() + Duration::from_millis(request.deadline_ms),
+                );
+                (
+                    id,
+                    match generating {
+                        Generating::Produced {
+                            bytes,
+                            phases,
+                            peak_rss_bytes,
+                        } => Answered::Produced {
+                            bytes,
+                            phases,
+                            peak_rss_bytes,
+                        },
+                        Generating::Ended { why, detail } => Answered::Ended { why, detail },
+                    },
+                )
+            }
+        };
+        match service
+            .finished(id, answer, reading_now())
+            .map_err(|error| error.to_string())?
+        {
+            Outcome::Loaded { .. } => {}
+            outcome => return Ok(Turn::Outcome(outcome)),
+        }
+    }
 }
 
 fn verify(asset: &Asset, path: &Path) -> Result<(), String> {
@@ -804,21 +890,6 @@ fn distribution_line(
         distribution.max_ms,
         distribution.samples
     )
-}
-
-/// The target triple this build runs on, which a profile has to list.
-const fn current_target() -> &'static str {
-    if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-        "aarch64-apple-darwin"
-    } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
-        "x86_64-apple-darwin"
-    } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
-        "aarch64-unknown-linux-gnu"
-    } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
-        "x86_64-unknown-linux-gnu"
-    } else {
-        "x86_64-pc-windows-msvc"
-    }
 }
 
 #[cfg(test)]

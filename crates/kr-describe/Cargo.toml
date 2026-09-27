@@ -1,6 +1,6 @@
 [package]
 name = "kr-describe"
-description = "The KalaReach description service: deterministic session titles, the scheduler and resource policy for one shared CPU-only inference process per execution environment, its signed model profiles and inference seam, and the names, pins and provenance store; the model runtime itself is kr-describe-model"
+description = "The KalaReach description service: deterministic session titles, the scheduler and resource policy for one shared CPU-only inference process per execution environment, its signed model profiles, the wire to that process and its serving code, and the names, pins and provenance store; the model runtime itself is kr-describe-model"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

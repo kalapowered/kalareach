@@ -37,6 +37,19 @@ const DIGEST_BLOCK_BYTES: usize = 1 << 20;
 /// file is not the recorded one, and [`DescribeError::AssetUnreadable`] when it cannot be read at
 /// all.
 pub fn verify_file(asset: &Asset, path: &Path) -> Result<()> {
+    verify_file_unless(asset, path, || false).map(|_| ())
+}
+
+/// Verifies a downloaded file as [`verify_file`] does, stopping between blocks when `stop` says to.
+///
+/// It answers `Ok(false)` when it stopped, having decided nothing about the file. A load that is
+/// cancelled while its weights are being checked stops within one block rather than after
+/// gigabytes.
+///
+/// # Errors
+///
+/// As [`verify_file`].
+pub fn verify_file_unless(asset: &Asset, path: &Path, stop: impl Fn() -> bool) -> Result<bool> {
     let unreadable = |error: std::io::Error| DescribeError::AssetUnreadable {
         file: asset.file_name.clone(),
         detail: error.to_string(),
@@ -53,6 +66,9 @@ pub fn verify_file(asset: &Asset, path: &Path) -> Result<()> {
     let mut hasher = Sha256::new();
     let mut block = vec![0_u8; DIGEST_BLOCK_BYTES];
     loop {
+        if stop() {
+            return Ok(false);
+        }
         let read = file.read(&mut block).map_err(unreadable)?;
         if read == 0 {
             break;
@@ -67,7 +83,7 @@ pub fn verify_file(asset: &Asset, path: &Path) -> Result<()> {
             found,
         });
     }
-    Ok(())
+    Ok(true)
 }
 
 /// Renders bytes as lowercase hexadecimal, which is how a profile records a digest.

@@ -635,3 +635,327 @@ fn run_raw(raw: Raw, script: &Script) -> i32 {
         }
     }
 }
+
+/// What the in-process answerer does with the next piece of work, for tests that drive the service
+/// with no process at all.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum Behaviour {
+    /// Produce a well-formed description from the prompt.
+    #[default]
+    WellFormed,
+    /// Produce bytes that are not the object the grammar describes.
+    Malformed,
+    /// Produce an object with a field this product does not know.
+    UnknownField,
+    /// Produce a title with a control character in it.
+    ControlCharacter,
+    /// Produce a title longer than section 22's bound.
+    OverlongTitle,
+    /// Produce activity text longer than section 22's bound.
+    OverlongActivity,
+    /// Produce a description claiming a revision that is not the prompt's.
+    WrongRevision(u64),
+    /// Take this long, so a test can drive the deadline.
+    Slow {
+        /// How long the job takes.
+        duration_ms: u64,
+    },
+    /// Fail, as a runtime whose model file has gone would.
+    Fails {
+        /// What it says.
+        detail: String,
+    },
+    /// Take this long to load.
+    SlowLoad {
+        /// How long the load takes.
+        duration_ms: u64,
+    },
+    /// Fail during load, as a missing or corrupt weights file would.
+    FailsLoad {
+        /// What it says.
+        detail: String,
+    },
+    /// End the load cancelled.
+    CancelDuringLoad,
+    /// Produce a description, and have the job cancelled before its answer is taken.
+    CancelBeforePublish,
+}
+
+impl Behaviour {
+    /// Returns what a job's answer looks like under this behaviour.
+    fn output(&self) -> Output {
+        match self {
+            Self::Malformed => Output::Malformed,
+            Self::UnknownField => Output::UnknownField,
+            Self::ControlCharacter => Output::ControlCharacter,
+            Self::OverlongTitle => Output::OverlongTitle,
+            Self::OverlongActivity => Output::OverlongActivity,
+            Self::WrongRevision(revision) => Output::WrongRevision(*revision),
+            _ => Output::WellFormed,
+        }
+    }
+}
+
+/// A behaviour two owners share: the test that sets it, and the answerer that reads it.
+#[derive(Clone, Debug, Default)]
+pub struct SharedBehaviour(std::sync::Arc<std::sync::Mutex<Behaviour>>);
+
+impl SharedBehaviour {
+    /// Builds a shared behaviour that produces a well-formed description.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets what the next answer looks like.
+    pub fn set(&self, behaviour: Behaviour) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = behaviour;
+    }
+
+    /// Returns what the next answer looks like.
+    #[must_use]
+    pub fn get(&self) -> Behaviour {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+/// What one turn of the in-process driver came to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Tick {
+    /// Nothing was due.
+    Idle,
+    /// Inference is paused, and whether the model was unloaded to get here.
+    ResourcePaused {
+        /// Why.
+        reason: crate::resource::PauseReason,
+        /// Whether a model was unloaded.
+        unloaded: bool,
+    },
+    /// The model was unloaded because the host has had no sessions for this long.
+    IdleUnloaded {
+        /// How long.
+        idle_ms: u64,
+    },
+    /// The process was ended for another reason.
+    Unloaded(crate::service::UnloadReason),
+    /// A load ended with no model.
+    LoadEnded {
+        /// Why.
+        why: crate::wire::LoadEnd,
+    },
+    /// A description was published.
+    Published {
+        /// The session.
+        session_id: kr_protocol::ids::SessionId,
+        /// How long its job waited.
+        queue_wait_ms: u64,
+        /// How long its job took once dequeued.
+        execution_ms: u64,
+    },
+    /// A result was refused.
+    Rejected {
+        /// The session.
+        session_id: kr_protocol::ids::SessionId,
+        /// Why.
+        rejection: crate::output::Rejection,
+    },
+    /// A job was cancelled.
+    Cancelled {
+        /// The session.
+        session_id: kr_protocol::ids::SessionId,
+    },
+    /// A job passed its deadline.
+    DeadlineExceeded {
+        /// The session.
+        session_id: kr_protocol::ids::SessionId,
+    },
+    /// A job did not finish and was queued again.
+    Requeued {
+        /// The session.
+        session_id: kr_protocol::ids::SessionId,
+    },
+    /// A job failed and was not queued again.
+    InferenceFailed {
+        /// The session.
+        session_id: kr_protocol::ids::SessionId,
+        /// What went wrong.
+        detail: String,
+    },
+}
+
+impl From<crate::service::Outcome> for Tick {
+    fn from(outcome: crate::service::Outcome) -> Self {
+        use crate::service::Outcome;
+        match outcome {
+            Outcome::LoadEnded { why, .. } => Self::LoadEnded { why },
+            Outcome::Published {
+                session_id,
+                queue_wait_ms,
+                execution_ms,
+            } => Self::Published {
+                session_id,
+                queue_wait_ms,
+                execution_ms,
+            },
+            Outcome::Rejected {
+                session_id,
+                rejection,
+            } => Self::Rejected {
+                session_id,
+                rejection,
+            },
+            Outcome::Cancelled { session_id } => Self::Cancelled { session_id },
+            Outcome::DeadlineExceeded { session_id } => Self::DeadlineExceeded { session_id },
+            Outcome::Requeued { session_id } => Self::Requeued { session_id },
+            Outcome::Failed { session_id, detail } => Self::InferenceFailed { session_id, detail },
+            Outcome::Loaded { .. } | Outcome::Dropped { .. } | Outcome::ProcessEnded { .. } => {
+                Self::Idle
+            }
+        }
+    }
+}
+
+/// Drives the service through one turn with the in-process answerer: asks what to do, answers it
+/// at once, and says what it came to.
+///
+/// A load and the job after it happen in one turn. A behaviour that takes time moves the reading
+/// the answer arrives at, which is how a deadline is driven without waiting for it.
+///
+/// # Errors
+///
+/// Returns the store failures the service returns.
+pub fn tick(
+    service: &mut crate::service::DescriptionService,
+    behaviour: &SharedBehaviour,
+    conditions: &crate::resource::HostConditions,
+    now: crate::time::Reading,
+) -> crate::Result<Tick> {
+    use crate::service::{Answered, Instruction, LOAD_DEADLINE_MS, Outcome, UnloadReason, Work};
+    use crate::wire::LoadEnd;
+    let mut at = now;
+    loop {
+        match service.next(conditions, at)? {
+            Instruction::Wait { .. } => {
+                return Ok(match service.resource_state() {
+                    crate::resource::ResourceState::ResourcePaused { reason, unloaded } => {
+                        Tick::ResourcePaused { reason, unloaded }
+                    }
+                    _ => Tick::Idle,
+                });
+            }
+            Instruction::Unload { why } => {
+                return Ok(match why {
+                    UnloadReason::Idle { idle_ms } => Tick::IdleUnloaded { idle_ms },
+                    UnloadReason::Paused(reason) => Tick::ResourcePaused {
+                        reason,
+                        unloaded: true,
+                    },
+                    other => Tick::Unloaded(other),
+                });
+            }
+            Instruction::Cancel { id, work } => {
+                let answer = match work {
+                    Work::Load => Answered::LoadEnded {
+                        why: LoadEnd::Cancelled,
+                        detail: None,
+                    },
+                    Work::Job => Answered::Ended {
+                        why: JobEnd::Cancelled,
+                        detail: None,
+                    },
+                };
+                return Ok(Tick::from(service.finished(id, answer, at)?));
+            }
+            Instruction::Load { id, .. } => {
+                let (answer, took_ms) = match behaviour.get() {
+                    Behaviour::SlowLoad { duration_ms } if duration_ms > LOAD_DEADLINE_MS => (
+                        Answered::LoadEnded {
+                            why: LoadEnd::DeadlineExceeded,
+                            detail: None,
+                        },
+                        LOAD_DEADLINE_MS,
+                    ),
+                    Behaviour::SlowLoad { duration_ms } => (
+                        Answered::Loaded {
+                            load_ms: duration_ms,
+                            rss_bytes: 0,
+                        },
+                        duration_ms,
+                    ),
+                    Behaviour::FailsLoad { detail } => (
+                        Answered::LoadEnded {
+                            why: LoadEnd::Failed,
+                            detail: Some(detail),
+                        },
+                        0,
+                    ),
+                    Behaviour::CancelDuringLoad => (
+                        Answered::LoadEnded {
+                            why: LoadEnd::Cancelled,
+                            detail: None,
+                        },
+                        0,
+                    ),
+                    _ => (
+                        Answered::Loaded {
+                            load_ms: 0,
+                            rss_bytes: 0,
+                        },
+                        0,
+                    ),
+                };
+                at = at.after_ms(took_ms);
+                match service.finished(id, answer, at)? {
+                    Outcome::Loaded { .. } => {}
+                    other => return Ok(Tick::from(other)),
+                }
+            }
+            Instruction::Generate {
+                id,
+                session_id,
+                request,
+            } => {
+                let behaviour = behaviour.get();
+                let produced = |output: &Output| Answered::Produced {
+                    bytes: answer_of(&request.prompt, output),
+                    phases: Phases::default(),
+                    peak_rss_bytes: 0,
+                };
+                let (answer, took_ms) = match &behaviour {
+                    Behaviour::Slow { duration_ms } if *duration_ms > request.deadline_ms => (
+                        Answered::Ended {
+                            why: JobEnd::DeadlineExceeded,
+                            detail: None,
+                        },
+                        request.deadline_ms,
+                    ),
+                    Behaviour::Slow { duration_ms } => {
+                        (produced(&Output::WellFormed), *duration_ms)
+                    }
+                    Behaviour::Fails { detail } => (
+                        Answered::Ended {
+                            why: JobEnd::Failed,
+                            detail: Some(detail.clone()),
+                        },
+                        0,
+                    ),
+                    other => (produced(&other.output()), 0),
+                };
+                if behaviour == Behaviour::CancelBeforePublish {
+                    service.cancel_running(&session_id);
+                }
+                return Ok(Tick::from(service.finished(
+                    id,
+                    answer,
+                    at.after_ms(took_ms),
+                )?));
+            }
+        }
+    }
+}

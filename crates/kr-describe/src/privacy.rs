@@ -145,6 +145,9 @@ impl DescriptionFence {
 
     /// Publishes a description under the fence's lock if the session is not fenced, not cancelled,
     /// and has not exceeded its whole-job deadline.
+    ///
+    /// `elapsed_ms` is how long the job has run since it was dequeued, which the caller measures on
+    /// the clock every other interval here is measured on.
     #[allow(clippy::too_many_arguments)]
     pub fn publish_under_lock(
         &self,
@@ -155,8 +158,7 @@ impl DescriptionFence {
         produced_generation: PrivacyGeneration,
         fallback_generation: PrivacyGeneration,
         cancellation: &Cancellation,
-        job_clock: &crate::time::JobClock,
-        dequeued_ms: u64,
+        elapsed_ms: u64,
         deadline_ms: u64,
     ) -> crate::error::Result<PublishGate> {
         let held = self
@@ -183,8 +185,7 @@ impl DescriptionFence {
         if cancellation.is_cancelled() {
             return Ok(PublishGate::Cancelled);
         }
-        let elapsed = job_clock.now_ms().saturating_sub(dequeued_ms);
-        if elapsed > deadline_ms {
+        if elapsed_ms > deadline_ms {
             return Ok(PublishGate::DeadlineExceeded);
         }
         // The fence is held for the write, so a fence raised on another thread waits for it and
@@ -572,7 +573,6 @@ mod tests {
     use crate::metadata::{ActivityText, Title};
     use crate::output::{GeneratedDescription, ProducedUnder};
     use crate::profile::ProfileRevision;
-    use crate::time::JobClock;
     use kr_protocol::ids::{SessionEpoch, SessionId};
     use kr_protocol::scalars::Uuid;
 
@@ -605,7 +605,7 @@ mod tests {
         let session = sample_session(1);
         let desc = sample_description(PrivacyGeneration::INITIAL);
         let cancellation = Cancellation::new();
-        let clock = JobClock::by_hand();
+        let elapsed_ms = 0;
 
         let gate = fence
             .publish_under_lock(
@@ -616,8 +616,7 @@ mod tests {
                 PrivacyGeneration::INITIAL,
                 PrivacyGeneration::INITIAL,
                 &cancellation,
-                &clock,
-                0,
+                elapsed_ms,
                 5000,
             )
             .expect("gate");
@@ -643,7 +642,7 @@ mod tests {
             .expect("pin");
         let desc = sample_description(PrivacyGeneration::INITIAL);
         let cancellation = Cancellation::new();
-        let clock = JobClock::by_hand();
+        let elapsed_ms = 0;
 
         let gate = fence
             .publish_under_lock(
@@ -654,8 +653,7 @@ mod tests {
                 PrivacyGeneration::INITIAL,
                 PrivacyGeneration::INITIAL,
                 &cancellation,
-                &clock,
-                0,
+                elapsed_ms,
                 5000,
             )
             .expect("gate");
@@ -676,7 +674,7 @@ mod tests {
         let desc = sample_description(PrivacyGeneration::INITIAL);
         let cancellation = Cancellation::new();
         cancellation.cancel();
-        let clock = JobClock::by_hand();
+        let elapsed_ms = 0;
 
         let gate = fence
             .publish_under_lock(
@@ -687,8 +685,7 @@ mod tests {
                 PrivacyGeneration::INITIAL,
                 PrivacyGeneration::INITIAL,
                 &cancellation,
-                &clock,
-                0,
+                elapsed_ms,
                 5000,
             )
             .expect("gate");
@@ -704,8 +701,7 @@ mod tests {
         let session = sample_session(1);
         let desc = sample_description(PrivacyGeneration::INITIAL);
         let cancellation = Cancellation::new();
-        let clock = JobClock::by_hand();
-        clock.advance_ms(5001);
+        let elapsed_ms = 5001;
 
         let gate = fence
             .publish_under_lock(
@@ -716,8 +712,7 @@ mod tests {
                 PrivacyGeneration::INITIAL,
                 PrivacyGeneration::INITIAL,
                 &cancellation,
-                &clock,
-                0,
+                elapsed_ms,
                 5000,
             )
             .expect("gate");
@@ -733,7 +728,7 @@ mod tests {
         let session = sample_session(1);
         let desc = sample_description(PrivacyGeneration::INITIAL);
         let cancellation = Cancellation::new();
-        let clock = JobClock::by_hand();
+        let elapsed_ms = 0;
         fence.raise(session, PrivacyGeneration::new(2));
 
         let gate = fence
@@ -745,8 +740,7 @@ mod tests {
                 PrivacyGeneration::INITIAL,
                 PrivacyGeneration::INITIAL,
                 &cancellation,
-                &clock,
-                0,
+                elapsed_ms,
                 5000,
             )
             .expect("gate");
@@ -768,7 +762,7 @@ mod tests {
         let session = sample_session(1);
         let desc = sample_description(PrivacyGeneration::INITIAL);
         let cancellation = Cancellation::new();
-        let clock = JobClock::by_hand();
+        let elapsed_ms = 0;
 
         let gate = fence
             .publish_under_lock(
@@ -779,8 +773,7 @@ mod tests {
                 PrivacyGeneration::INITIAL,
                 PrivacyGeneration::new(3),
                 &cancellation,
-                &clock,
-                0,
+                elapsed_ms,
                 5000,
             )
             .expect("gate");
@@ -802,7 +795,7 @@ mod tests {
         let session = sample_session(1);
         let desc = sample_description(PrivacyGeneration::INITIAL);
         let cancellation = Cancellation::new();
-        let clock = JobClock::by_hand();
+        let elapsed_ms = 0;
         fence.raise(session, PrivacyGeneration::INITIAL);
 
         let gate = fence
@@ -814,8 +807,7 @@ mod tests {
                 PrivacyGeneration::INITIAL,
                 PrivacyGeneration::INITIAL,
                 &cancellation,
-                &clock,
-                0,
+                elapsed_ms,
                 5000,
             )
             .expect("gate");
@@ -837,7 +829,7 @@ mod tests {
             let session_clone = session;
             let desc_clone = desc.clone();
             let cancellation = Cancellation::new();
-            let clock = JobClock::by_hand();
+            let elapsed_ms = 0;
 
             let t_publish = std::thread::spawn(move || {
                 let store_guard = store_clone.lock().unwrap();
@@ -849,8 +841,7 @@ mod tests {
                     PrivacyGeneration::INITIAL,
                     PrivacyGeneration::INITIAL,
                     &cancellation,
-                    &clock,
-                    0,
+                    elapsed_ms,
                     5000,
                 )
             });
@@ -910,7 +901,7 @@ mod tests {
             let desc_clone = desc.clone();
             let cancellation = Cancellation::new();
             let cancellation_clone = cancellation.clone();
-            let clock = JobClock::by_hand();
+            let elapsed_ms = 0;
 
             let t_publish = std::thread::spawn(move || {
                 let store_guard = store_clone.lock().unwrap();
@@ -922,8 +913,7 @@ mod tests {
                     PrivacyGeneration::INITIAL,
                     PrivacyGeneration::INITIAL,
                     &cancellation,
-                    &clock,
-                    0,
+                    elapsed_ms,
                     5000,
                 )
             });
@@ -981,7 +971,7 @@ mod tests {
         let desc = sample_description(PrivacyGeneration::INITIAL);
         let cancellation = Cancellation::new();
         assert!(cancellation.cancel());
-        let clock = JobClock::by_hand();
+        let elapsed_ms = 0;
 
         let gate = fence
             .publish_under_lock(
@@ -992,8 +982,7 @@ mod tests {
                 PrivacyGeneration::INITIAL,
                 PrivacyGeneration::INITIAL,
                 &cancellation,
-                &clock,
-                0,
+                elapsed_ms,
                 5000,
             )
             .expect("gate");

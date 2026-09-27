@@ -378,6 +378,58 @@ impl Scheduler {
         Ok(job)
     }
 
+    /// Returns whether any queued session may be described now.
+    #[must_use]
+    pub fn has_eligible(&self, now: Reading) -> bool {
+        let cadence_ms = self.cadence_ms(now);
+        self.queued
+            .keys()
+            .any(|session_id| self.eligible_under(session_id, now, cadence_ms))
+    }
+
+    /// Returns when the soonest queued session may be described, at the cadence in force now.
+    ///
+    /// It is a time to look again rather than a promise: the cadence moves as sessions come and go
+    /// and as jobs are measured.
+    #[must_use]
+    pub fn next_due_ms(&self, now: Reading) -> Option<u64> {
+        let cadence_ms = self.cadence_ms(now);
+        self.queued
+            .values()
+            .map(|job| {
+                let wait_ms = match job.priority {
+                    Priority::Ordinary => cadence_ms,
+                    Priority::Foreground => self.budgets.session_cooldown_ms,
+                };
+                self.last_dispatch_ms
+                    .get(&job.session_id)
+                    .map_or(now.monotonic_ms(), |dispatched| {
+                        dispatched.saturating_add(wait_ms).max(now.monotonic_ms())
+                    })
+            })
+            .min()
+    }
+
+    /// Puts back a job that was taken and did not finish, keeping its aging position.
+    ///
+    /// The session may be described again at once: the dispatch that failed described nothing, so
+    /// it does not start a cooldown. When the session queued a newer job meanwhile, the newer
+    /// content is kept and takes the older position, which is the position the session has held.
+    pub fn requeue(&mut self, job: QueuedJob) {
+        self.last_dispatch_ms.remove(&job.session_id);
+        match self.queued.get_mut(&job.session_id) {
+            Some(newer) => {
+                newer.queued_at_ms = newer.queued_at_ms.min(job.queued_at_ms);
+                if job.priority == Priority::Foreground {
+                    newer.priority = Priority::Foreground;
+                }
+            }
+            None => {
+                self.queued.insert(job.session_id, job);
+            }
+        }
+    }
+
     /// Returns how many priority jobs have run since an ordinary one did.
     #[must_use]
     pub const fn priority_run(&self) -> u32 {
