@@ -948,6 +948,13 @@ pub enum CommandBypassReason {
     BackendUnavailable,
     /// The session is closing, so nothing new is started inside it.
     SessionClosing,
+    /// The invocation already uses the integration's flags other than as the one whole run the
+    /// integration declares: part of the run, the run out of its order, one of its options with a
+    /// value attached, or the run and another use of one of its options.
+    ///
+    /// An integration adds its flags as one run or not at all and never changes what was typed, so
+    /// the invocation runs exactly as it was typed.
+    FlagsConflict,
 }
 
 impl CommandBypassReason {
@@ -962,6 +969,7 @@ impl CommandBypassReason {
             Self::NotInteractive => "not_interactive",
             Self::BackendUnavailable => "backend_unavailable",
             Self::SessionClosing => "session_closing",
+            Self::FlagsConflict => "flags_conflict",
         }
     }
 }

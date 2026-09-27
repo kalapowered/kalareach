@@ -325,6 +325,156 @@ mod tests {
         assert!(added.is_empty());
     }
 
+    /// The released integrations' shapes: Claude Code's flag and the plugin it names, Gemini CLI's
+    /// no flag at all, and Qoder CLI's `--settings` with its inline value.
+    fn released() -> Vec<CommandIntegration> {
+        let integration = |command: &str, flags: &[&str]| CommandIntegration {
+            command: command.to_owned(),
+            flags: argv(flags),
+            enabled: true,
+        };
+        vec![
+            integration(
+                "claude",
+                &[
+                    "--dangerously-load-development-channels",
+                    "plugin:kalareach-channels@skills-dir",
+                ],
+            ),
+            integration("gemini", &[]),
+            integration("qodercli", &["--settings", r#"{"hooks":{}}"#]),
+        ]
+    }
+
+    /// KR-REQ-12.20: an integration that adds no flag still integrates the invocation, which runs
+    /// exactly as it was typed behind its backend.
+    #[test]
+    fn an_integration_that_adds_no_flag_integrates_the_invocation() {
+        let typed = argv(&["gemini", "--model", "m"]);
+        assert_eq!(
+            resolve(&released(), MANAGED, &typed),
+            Resolution::Integrated {
+                command: "gemini".to_owned(),
+                arguments: typed,
+                added: Vec::new(),
+            }
+        );
+    }
+
+    /// KR-REQ-12.07: the flags are one run, added whole where the options end.
+    #[test]
+    fn the_flags_are_added_as_one_run_where_the_options_end() {
+        let resolved = resolve(
+            &released(),
+            MANAGED,
+            &argv(&["claude", "--resume", "r", "--", "prompt"]),
+        );
+        assert_eq!(
+            resolved,
+            Resolution::Integrated {
+                command: "claude".to_owned(),
+                arguments: argv(&[
+                    "claude",
+                    "--resume",
+                    "r",
+                    "--dangerously-load-development-channels",
+                    "plugin:kalareach-channels@skills-dir",
+                    "--",
+                    "prompt"
+                ]),
+                added: argv(&[
+                    "--dangerously-load-development-channels",
+                    "plugin:kalareach-channels@skills-dir"
+                ]),
+            }
+        );
+    }
+
+    /// The whole run typed in its order before the options end is given: nothing is added, and
+    /// the invocation is integrated as it was typed.
+    #[test]
+    fn a_run_typed_whole_is_given_and_nothing_is_added() {
+        for typed in [
+            argv(&[
+                "claude",
+                "--dangerously-load-development-channels",
+                "plugin:kalareach-channels@skills-dir",
+                "--resume",
+            ]),
+            argv(&["qodercli", "-p", "x", "--settings", r#"{"hooks":{}}"#]),
+        ] {
+            let resolved = resolve(&released(), MANAGED, &typed);
+            let Resolution::Integrated {
+                arguments, added, ..
+            } = &resolved
+            else {
+                panic!("{typed:?} is integrated");
+            };
+            assert_eq!(arguments, &typed, "{typed:?} runs as it was typed");
+            assert!(added.is_empty(), "{typed:?}: nothing is added");
+        }
+    }
+
+    /// KR-REQ-12.07: an invocation that already uses the run's flags any other way runs exactly as
+    /// it was typed, named as a conflict: part of the run, the run out of its order, an option with
+    /// its value attached, or the run and a second use of one of its options.
+    #[test]
+    fn a_conflicting_use_of_the_run_runs_as_typed() {
+        for typed in [
+            argv(&[
+                "claude",
+                "--dangerously-load-development-channels",
+                "plugin:another@skills-dir",
+            ]),
+            argv(&[
+                "claude",
+                "plugin:kalareach-channels@skills-dir",
+                "--dangerously-load-development-channels",
+            ]),
+            argv(&["qodercli", "--settings=/home/someone/mine.json"]),
+            argv(&[
+                "qodercli",
+                "--settings",
+                r#"{"hooks":{}}"#,
+                "--settings",
+                "mine.json",
+            ]),
+        ] {
+            let resolved = resolve(&released(), MANAGED, &typed);
+            let Resolution::Bypassed {
+                arguments, reason, ..
+            } = &resolved
+            else {
+                panic!("{typed:?} conflicts with the run");
+            };
+            assert_eq!(*reason, CommandBypassReason::FlagsConflict, "{typed:?}");
+            assert_eq!(arguments, &typed, "{typed:?} runs as it was typed");
+            assert!(!resolved.establishes_backend());
+        }
+    }
+
+    /// Words after `--` are operands: they neither give the run nor conflict with it.
+    #[test]
+    fn operands_neither_give_the_run_nor_conflict_with_it() {
+        let resolved = resolve(
+            &released(),
+            MANAGED,
+            &argv(&["qodercli", "--", "--settings", "mine.json"]),
+        );
+        assert_eq!(
+            resolved.arguments(),
+            argv(&[
+                "qodercli",
+                "--settings",
+                r#"{"hooks":{}}"#,
+                "--",
+                "--settings",
+                "mine.json"
+            ])
+        );
+        assert!(resolved.establishes_backend());
+    }
+
     #[test]
     fn a_command_block_reports_status_duration_and_directory() {
         use kr_protocol::ids::SessionId;
