@@ -4840,6 +4840,7 @@ dependencies = [
  "hmac 0.13.0",
  "kr-cbor",
  "kr-crypto",
+ "kr-flush",
  "kr-ipc",
  "kr-protocol",
  "portable-pty",

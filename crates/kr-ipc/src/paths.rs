@@ -2375,7 +2375,10 @@ pub fn read_owner_only_file(path: &Path, limit: u64) -> Result<Option<Vec<u8>>> 
 /// Writes a file owner-only, replacing any previous contents atomically.
 ///
 /// The temporary file is created in the destination's own directory so the rename cannot cross a
-/// filesystem boundary, and it carries the final permissions before it holds any content.
+/// filesystem boundary, and it carries the final permissions before it holds any content. On
+/// Windows the rename is tried again while another program holds the file it replaces or the new
+/// one, as [`kr_flush::retry_while_held`] says; nothing about the destination is checked before
+/// it, so there is nothing to check again.
 ///
 /// # Errors
 ///
@@ -2404,7 +2407,7 @@ pub fn write_owner_only_file(path: &Path, contents: &[u8]) -> Result<()> {
         return Err(error);
     }
     drop(file);
-    if let Err(error) = std::fs::rename(&temporary, path) {
+    if let Err(error) = kr_flush::retry_while_held(|| std::fs::rename(&temporary, path)) {
         let _ = std::fs::remove_file(&temporary);
         return Err(IpcError::io("publish", path, error));
     }

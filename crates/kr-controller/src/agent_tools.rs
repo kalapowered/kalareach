@@ -1386,7 +1386,10 @@ impl Installer {
     ///
     /// Nothing is overwritten. Where both names exist they are both left alone, and both keep
     /// counting towards the claims on a shared document. This runs with the installation it
-    /// belongs to, under the same lock, and never during a read.
+    /// belongs to, under the same lock, and never during a read. On Windows another program can
+    /// hold the record for a moment and the move is tried again while it does, so the new name is
+    /// looked at again before every attempt: a record written there while the move waits is left
+    /// alone like any other.
     fn migrate_records(&self, params: &AgentToolsParams) -> Result<()> {
         let path = self.record_path(params);
         if path.exists() {
@@ -1396,9 +1399,20 @@ impl Installer {
         let [only] = legacy.as_slice() else {
             return Ok(());
         };
-        #[cfg(test)]
-        tests::before_attempt();
-        std::fs::rename(only, &path).map_err(storage)?;
+        let mut taken = false;
+        kr_flush::retry_while_held(|| {
+            #[cfg(test)]
+            tests::before_attempt();
+            if path.exists() {
+                taken = true;
+                return Ok(());
+            }
+            std::fs::rename(only, &path)
+        })
+        .map_err(storage)?;
+        if taken {
+            return Ok(());
+        }
         sync_directory(&self.records, NameKind::File)
     }
 

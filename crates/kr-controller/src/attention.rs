@@ -127,6 +127,15 @@ const MAX_RELINK: Duration = Duration::from_secs(30);
 /// How often the store is looked at when no timer is due sooner.
 const MAINTENANCE: Duration = Duration::from_secs(60);
 
+/// How soon the maintenance loop writes again what the time contract must keep, when the last
+/// save could not write it.
+///
+/// A save is made by a reading, and a reading never waits for the file: on Windows another program
+/// can hold it for a moment, and a reading runs in a request, some under the store's lock. So a
+/// refused save stays unwritten until the next reading, and without a request the next is the
+/// loop's own; this brings it forward.
+const SAVE_RETRY: Duration = Duration::from_secs(5);
+
 /// How long the record of an action is kept, after which a repeat is a new request.
 const ACTION_RETENTION_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
 
@@ -650,7 +659,11 @@ impl AttentionModule {
     /// Writes down what the time contract has to keep across a restart, when it has something new.
     ///
     /// One save at a time, from reading the state to recording it as kept: two saves that crossed
-    /// could write an older state over a newer one and still record the newer as kept.
+    /// could write an older state over a newer one and still record the newer as kept. The rename
+    /// is made once and never waited for: on Windows another program can hold the file for a
+    /// moment, and this runs inside readings, some under the store's lock. A refused save leaves
+    /// the state unsaved, and the next reading writes it, the maintenance loop's within
+    /// [`SAVE_RETRY`].
     fn keep_time(&self) {
         #[cfg(test)]
         self.save_entry.wait();
@@ -2301,6 +2314,9 @@ impl AttentionModule {
                     });
                 if !held.origins().unfinished.is_empty() {
                     wait = wait.min(CLOSURE_RETRY);
+                }
+                if held.time.unsaved() {
+                    wait = wait.min(SAVE_RETRY);
                 }
                 // The signal is taken before the module is let go of, so a change that wakes it
                 // cannot fall between the look above and the wait; the module itself is not held

@@ -399,7 +399,9 @@ pub(crate) const PRIVATE: u32 = 0o600;
 ///
 /// The replacement carries the permissions of what it replaces: a document somebody kept private
 /// must not become world-readable because this host rewrote it under its own umask. A file that
-/// did not exist is created with `default_mode`.
+/// did not exist is created with `default_mode`. On Windows the rename is tried again while
+/// another program holds the document or the copy, as [`kr_flush::retry_while_held`] says, and
+/// what the replacement stands on is compared again before every attempt.
 pub(crate) fn write_atomically(path: &Path, bytes: &[u8], default_mode: u32) -> Result<()> {
     use std::io::Write as _;
 
@@ -433,29 +435,50 @@ pub(crate) fn write_atomically(path: &Path, bytes: &[u8], default_mode: u32) -> 
     #[cfg(windows)]
     options.read(true);
     let mut file = options.open(&temporary).map_err(storage)?;
-    // The copy that is about to take an existing file's place, before anything is written into it.
-    // A directory can give what is created in it access, an owner or a group its own files do not
-    // have, and the rename below would hand that to the document being replaced. A check that
-    // cannot be made refuses as one that fails does, and neither leaves the copy behind.
-    let refused = match path.exists().then(|| copy_refusal(&file, &temporary, path)) {
-        None | Some(Ok(None)) => None,
-        Some(Ok(Some(detail))) => Some(ControllerError::PermissionDenied { detail }),
-        Some(Err(error)) => Some(error),
+    // Why the copy may not take the document's place, if it may not. A directory can give what is
+    // created in it access, an owner or a group its own files do not have, and the rename below
+    // would hand that to the document being replaced. A check that cannot be made refuses as one
+    // that fails does.
+    let refusal =
+        |copy: &std::fs::File| match path.exists().then(|| copy_refusal(copy, &temporary, path)) {
+            None | Some(Ok(None)) => None,
+            Some(Ok(Some(detail))) => Some(ControllerError::PermissionDenied { detail }),
+            Some(Err(error)) => Some(error),
+        };
+    // Checked before anything is written into the copy, and again before every attempt at the
+    // rename below. Neither refusal leaves the copy behind.
+    let written = match refusal(&file) {
+        Some(refused) => Err(refused),
+        // The bytes reach the disk before the rename that publishes them, and the directory entry
+        // reaches it before this call returns, so a record written before an effect is on disk
+        // before the effect begins.
+        None => file
+            .write_all(bytes)
+            .and_then(|()| file.sync_all())
+            .map_err(storage)
+            .and_then(|()| {
+                // On Windows another program can hold the document or the copy for a moment, and
+                // the rename is tried again while it does. The document can be replaced, or given
+                // other access, while the rename waits, so the comparison is made again before
+                // every attempt, through the copy's own handle, which the rename leaves open.
+                let mut refused = None;
+                let renamed = kr_flush::retry_while_held(|| {
+                    #[cfg(test)]
+                    tests::before_attempt();
+                    if let Some(error) = refusal(&file) {
+                        refused = Some(error);
+                        return Ok(());
+                    }
+                    std::fs::rename(&temporary, path)
+                });
+                refused.map_or_else(|| renamed.map_err(storage), Err)
+            }),
     };
-    if let Some(refused) = refused {
-        drop(file);
-        let _ = std::fs::remove_file(&temporary);
-        return Err(refused);
-    }
-    file.write_all(bytes).map_err(storage)?;
-    // The bytes reach the disk before the rename that publishes them, and the directory entry
-    // reaches it before this call returns, so a record written before an effect is on disk before
-    // the effect begins.
-    file.sync_all().map_err(storage)?;
     drop(file);
-    #[cfg(test)]
-    tests::before_attempt();
-    std::fs::rename(&temporary, path).map_err(storage)?;
+    if let Err(error) = written {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
     // The rename is not on disk until the directory holding it is. A failure here is reported
     // rather than swallowed: a record that claims durability it does not have is worse than one
     // that says it could not be written.

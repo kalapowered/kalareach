@@ -1004,18 +1004,22 @@ fn replace(path: &Path, expected: &str, contents: &str) -> std::io::Result<()> {
         }
         // The check the rename stands on, taken here rather than before the write: the write, the
         // permissions and the flush are where the time goes, and a check taken before them says
-        // nothing about the file the rename is about to replace.
-        if read_or_empty(&target)? != expected
-            || identity.is_some_and(|identity| stable_identity(&target) != Some(identity))
-        {
-            return Err(std::io::Error::other(
-                "the startup file changed while this entry was being written, so nothing was \
-                 written",
-            ));
-        }
-        #[cfg(test)]
-        tests::before_attempt();
-        std::fs::rename(&temporary, &target)
+        // nothing about the file the rename is about to replace. On Windows another program can
+        // hold the file for a moment and the rename is tried again while it does, so the check is
+        // made again before every attempt: the person can save the file while the rename waits.
+        kr_flush::retry_while_held(|| {
+            #[cfg(test)]
+            tests::before_attempt();
+            if read_or_empty(&target)? != expected
+                || identity.is_some_and(|identity| stable_identity(&target) != Some(identity))
+            {
+                return Err(std::io::Error::other(
+                    "the startup file changed while this entry was being written, so nothing was \
+                     written",
+                ));
+            }
+            std::fs::rename(&temporary, &target)
+        })
     });
     if prepared.is_err() {
         let _ = std::fs::remove_file(&temporary);

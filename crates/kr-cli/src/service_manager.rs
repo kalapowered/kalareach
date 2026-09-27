@@ -599,6 +599,10 @@ impl std::fmt::Debug for Moved {
 
 /// Moves the regular file at `place` to a name of its own beside it, so that what is checked next
 /// is exactly what will be replaced or removed.
+///
+/// On Windows the rename is tried again while another program holds the file, as
+/// [`kr_flush::retry_while_held`] says. The name it is moved to is new and nothing is checked
+/// before the rename, so there is nothing to check again.
 fn move_aside(place: &Place<'_>) -> std::result::Result<Moved, Shown> {
     let path = place.path();
     match std::fs::symlink_metadata(path) {
@@ -618,7 +622,7 @@ fn move_aside(place: &Place<'_>) -> std::result::Result<Moved, Shown> {
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default();
     let aside = path.with_file_name(format!(".{name}.{}.kr-moving", kr_ipc::new_uuid()));
-    match std::fs::rename(path, &aside) {
+    match kr_flush::retry_while_held(|| std::fs::rename(path, &aside)) {
         Ok(()) => Ok(Moved::Aside(aside)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Moved::Nothing),
         Err(error) => Err(shown!(

@@ -1093,6 +1093,11 @@ fn remove_spool_files(directory: &Path, boundary: u64) -> (u64, u64, Option<Stri
 /// follow it, and a spool that deleted its segments over an unpublished boundary would come back
 /// from a restart with no record of where its output had reached. So the answer is returned, and
 /// the caller does not delete what the boundary describes until it is true.
+///
+/// The rename is made once and never waited for, although on Windows another program can hold the
+/// boundary for a moment and refuse it: this runs on the session's output path, under the
+/// session's lock, which must not pause. A refusal keeps every segment, and the next pass writes
+/// the boundary again.
 fn write_boundary(directory: &Path, boundary: u64) -> bool {
     let staging = directory.join("boundary.writing");
     if std::fs::write(&staging, boundary.to_string()).is_err() {
