@@ -38,7 +38,7 @@ import type {
   VoiceClosure,
   Written
 } from './port'
-import { receivedConnection } from './port'
+import { receivedConnection, viewMoveArguments, viewSizeArguments } from './port'
 
 /** The event the backend publishes each host notification on. */
 export const HOST_EVENT = 'kr://event'
@@ -178,20 +178,12 @@ export function tauriPort(): HostPort {
       states.onmessage = listener
       const view = await call<string>('terminal_view_open', {
         sessionId,
-        columns: grid.columns,
-        rows: grid.rows,
+        ...viewSizeArguments(grid),
         onState: states
       })
       return {
-        resize: (next) =>
-          call<undefined>('terminal_view_resize', { view, columns: next.columns, rows: next.rows }),
-        move: (next) =>
-          call<undefined>(
-            'terminal_view_move',
-            'live' in next
-              ? { view, number: next.number, across: 0, down: 0, live: true }
-              : { view, number: next.number, across: next.across, down: next.down, live: false }
-          ),
+        resize: (next) => call<undefined>('terminal_view_resize', { view, ...viewSizeArguments(next) }),
+        move: (next) => call<undefined>('terminal_view_move', { view, ...viewMoveArguments(next) }),
         // The person's input goes in the shape native code reads, and nothing else is sent.
         input: (next) => call<undefined>('terminal_view_input', { view, input: next }),
         close: () => call<undefined>('terminal_view_close', { view })

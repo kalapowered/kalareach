@@ -944,6 +944,30 @@ export type TerminalMove =
   | { readonly number: number; readonly across: number; readonly down: number }
   | { readonly number: number; readonly live: true }
 
+/**
+ * The arguments native code's commands take for a view's size, as the page's port sends them for
+ * `grid`: the opening's and the resize's, beside the session or the view they name.
+ */
+export function viewSizeArguments(grid: TerminalGrid): { readonly columns: number; readonly rows: number } {
+  return { columns: grid.columns, rows: grid.rows }
+}
+
+/**
+ * The arguments native code's command for a move takes, as the page's port sends them for `move`,
+ * beside the view it names. A move that has `live` goes back to the live screen, whatever else it
+ * holds.
+ */
+export function viewMoveArguments(move: TerminalMove): {
+  readonly number: number
+  readonly across: number
+  readonly down: number
+  readonly live: boolean
+} {
+  return 'live' in move
+    ? { number: move.number, across: 0, down: 0, live: true }
+    : { number: move.number, across: move.across, down: move.down, live: false }
+}
+
 /** The part of a session's screen one view shows, as cells, never bytes. */
 export interface TerminalScreen {
   /** The session's own size. */

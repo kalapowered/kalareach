@@ -70,7 +70,7 @@ import type {
   VoiceStartRequest,
   Written
 } from './port'
-import { receivedConnection } from './port'
+import { receivedConnection, viewMoveArguments, viewSizeArguments } from './port'
 import { codeComplete } from '../pairing/words'
 
 const ENVIRONMENT = '3f1a2c40-11aa-4b2c-9d3e-000000000001'
@@ -844,12 +844,20 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
       return Promise.resolve(settledAs('storage.object.delete', 'applied'))
     },
 
-    // Read as native code reads the command: a session identifier and a terminal's size, or nothing
-    // opens.
+    // The command the page's port sends, read as native code reads it: its arguments decoded in
+    // order, then the session identifier parsed and the size checked, or nothing opens.
     openTerminalView: (sessionId, grid, listener) => {
+      const args = { sessionId, ...viewSizeArguments(grid) }
+      const undecoded = undecodable('terminal_view_open', args, [
+        ['sessionId', aString],
+        ['columns', anInteger(U64)],
+        ['rows', anInteger(U64)]
+      ])
+      if (undecoded !== null) return undecoded
       if (!isSessionId(sessionId)) return refused('INVALID_ARGUMENT', 'that is not a session identifier')
-      const size = readTerminalGrid(grid)
-      if (typeof size === 'string') return refused('INVALID_ARGUMENT', size)
+      const refusal = sizeRefusal(args.columns, args.rows)
+      if (refusal !== null) return refused('INVALID_ARGUMENT', refusal)
+      const size = { columns: args.columns, rows: args.rows }
       const view = fakeTerminalView(sessionId, size, listener, terminalPresentation, {
         holdingMoves: holdingTerminalMoves,
         holdingControl: holdingTerminalControl,
@@ -2104,23 +2112,39 @@ function fakeTerminalView(
     publish,
     deliverInFlight: listener,
     handle: {
-      // A size is read as native code reads it, and one it refuses changes nothing.
+      // The size the page's port sends, read as native code reads it: one it refuses changes nothing.
       resize: (next) => {
-        const size = readTerminalGrid(next)
-        if (typeof size === 'string') return refused('INVALID_ARGUMENT', size)
+        const args = viewSizeArguments(next)
+        const undecoded = undecodable('terminal_view_resize', args, [
+          ['columns', anInteger(U64)],
+          ['rows', anInteger(U64)]
+        ])
+        if (undecoded !== null) return undecoded
+        const refusal = sizeRefusal(args.columns, args.rows)
+        if (refusal !== null) return refused('INVALID_ARGUMENT', refusal)
+        const size = { columns: args.columns, rows: args.rows }
         grids.push(size)
         // The host holds the window inside what a window of the new size can reach.
         place = heldInside(sessionId, size, place)
         return Promise.resolve()
       },
-      // A move is read as native code reads it, and one it refuses is neither recorded nor applied.
-      // Native code applies a move, has the host draw the window there, and says the move is
-      // settled with that screen. A view whose moves are held records them and waits for the test;
-      // a view that has ended, or a move not numbered after the last, takes nothing, and a screen
-      // drawn for a view that ends before it is sent is never sent.
+      // The move the page's port sends, read as native code reads it: one it refuses is neither
+      // recorded nor applied. Native code applies a move, has the host draw the window there, and
+      // says the move is settled with that screen. A view whose moves are held records them and
+      // waits for the test; a view that has ended, or a move not numbered after the last, takes
+      // nothing, and a screen drawn for a view that ends before it is sent is never sent.
       move: (next) => {
-        const asked = readTerminalMove(next)
-        if (typeof asked === 'string') return refused('INVALID_ARGUMENT', asked)
+        const args = viewMoveArguments(next)
+        const undecoded = undecodable('terminal_view_move', args, [
+          ['number', anInteger(U64)],
+          ['across', anInteger(I64)],
+          ['down', anInteger(I64)],
+          ['live', aBoolean]
+        ])
+        if (undecoded !== null) return undecoded
+        const asked: TerminalMove = args.live
+          ? { number: args.number, live: true }
+          : { number: args.number, across: args.across, down: args.down }
         moves.push(asked)
         if (!held.holdingMoves && !closed && !ended && asked.number > applied) {
           place = moved(sessionId, grids.at(-1) ?? grid, place, asked)
@@ -2204,9 +2228,90 @@ const MAX_COLUMNS = 2048
 const MAX_ROWS = 1024
 const MAX_CELLS = 262_144
 
-/** A whole number the page can send exactly, from 0. */
-function isCount(value: unknown): value is number {
-  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
+/** One of native code's integer types, by its name and the least and greatest values it holds. */
+interface IntegerType {
+  readonly name: string
+  readonly least: bigint
+  readonly greatest: bigint
+}
+
+const U32: IntegerType = { name: 'u32', least: 0n, greatest: 2n ** 32n - 1n }
+const U64: IntegerType = { name: 'u64', least: 0n, greatest: 2n ** 64n - 1n }
+const I64: IntegerType = { name: 'i64', least: -(2n ** 63n), greatest: 2n ** 63n - 1n }
+
+/** How native code's decoder names a value it did not expect. */
+function unexpected(value: unknown): string {
+  if (typeof value === 'boolean') return `boolean \`${value}\``
+  if (typeof value === 'string') return `string ${JSON.stringify(value)}`
+  if (typeof value === 'number' && Number.isFinite(value)) return `floating point \`${value}\``
+  if (typeof value === 'object' && value !== null) return Array.isArray(value) ? 'sequence' : 'map'
+  return 'null'
+}
+
+/**
+ * Why native code's decoder does not read `value`, sent as JSON, as an integer of `type`, in its
+ * words, or null when it does. JSON writes a number in its shortest decimal form, and the decoder
+ * takes an integer only from digits alone, within the type's range: never from a fraction or an
+ * exponent, and never past the largest integer JavaScript can hold exactly, as long as the type
+ * holds it.
+ */
+function notInteger(type: IntegerType, value: unknown): string | null {
+  const text = typeof value === 'number' ? JSON.stringify(value) : null
+  if (text === null || !/^-?\d+$/.test(text)) return `invalid type: ${unexpected(value)}, expected ${type.name}`
+  const integer = BigInt(text)
+  if (integer < type.least || integer > type.greatest) {
+    return `invalid value: integer \`${text}\`, expected ${type.name}`
+  }
+  return null
+}
+
+/** How the command layer reads one argument: why it cannot, or null when it can. */
+type ArgumentReader = (value: unknown) => string | null
+
+const aString: ArgumentReader = (value) =>
+  typeof value === 'string' ? null : `invalid type: ${unexpected(value)}, expected a string`
+const aBoolean: ArgumentReader = (value) =>
+  typeof value === 'boolean' ? null : `invalid type: ${unexpected(value)}, expected a boolean`
+const anInteger =
+  (type: IntegerType): ArgumentReader =>
+  (value) =>
+    notInteger(type, value)
+
+/**
+ * The command layer's refusal of the first of `command`'s arguments it cannot decode, taken in the
+ * order of the command's parameters, or null when it decodes them all. Native code never sees a
+ * call it refuses, so the refusal is the command layer's own words, a string, and not an error of
+ * the protocol's; an argument the page's port leaves out, as JSON leaves out one it has no value
+ * for, is missing.
+ */
+function undecodable(
+  command: string,
+  args: Readonly<Record<string, unknown>>,
+  parameters: readonly (readonly [string, ArgumentReader])[]
+): Promise<never> | null {
+  for (const [key, read] of parameters) {
+    const value = args[key]
+    const reason =
+      value === undefined ? `command ${command} missing required key ${key}` : read(value)
+    if (reason !== null) {
+      return new Promise((_, reject) => {
+        // eslint-disable-next-line @typescript-eslint/prefer-promise-reject-errors -- the command layer rejects with a string of its own
+        reject(`invalid args \`${key}\` for command \`${command}\`: ${reason}`)
+      })
+    }
+  }
+  return null
+}
+
+/** Native code's check of a view's size, in its words, or null when the size is a terminal's. */
+function sizeRefusal(columns: number, rows: number): string | null {
+  const refusal = "that is not a terminal's size:"
+  if (columns === 0 || columns > MAX_COLUMNS) {
+    return `${refusal} columns ${columns} must be between 1 and ${MAX_COLUMNS}`
+  }
+  if (rows === 0 || rows > MAX_ROWS) return `${refusal} rows ${rows} must be between 1 and ${MAX_ROWS}`
+  if (columns * rows > MAX_CELLS) return `${refusal} cells ${columns * rows} must not exceed ${MAX_CELLS}`
+  return null
 }
 
 /**
@@ -2220,43 +2325,6 @@ export function isSessionId(value: unknown): value is string {
   )
 }
 
-/**
- * A view's grid read as native code reads the size the page's port sends, or why native code
- * refuses it, in its words: whole numbers of columns and rows, then a terminal's bounds of 1 to
- * 2,048 columns, 1 to 1,024 rows and at most 262,144 cells.
- */
-export function readTerminalGrid(value: unknown): TerminalGrid | string {
-  if (typeof value !== 'object' || value === null) return 'a size is a map'
-  const { columns, rows } = value as Record<string, unknown>
-  if (!isCount(columns)) return '`columns` is not a whole number in range'
-  if (!isCount(rows)) return '`rows` is not a whole number in range'
-  const refusal = "that is not a terminal's size:"
-  if (columns === 0 || columns > MAX_COLUMNS) {
-    return `${refusal} columns ${columns} must be between 1 and ${MAX_COLUMNS}`
-  }
-  if (rows === 0 || rows > MAX_ROWS) return `${refusal} rows ${rows} must be between 1 and ${MAX_ROWS}`
-  if (columns * rows > MAX_CELLS) return `${refusal} cells ${columns * rows} must not exceed ${MAX_CELLS}`
-  return { columns, rows }
-}
-
-/**
- * A move read as native code reads the one the page's port sends, or why native code refuses it:
- * the page's number for the move, a whole number from 0, and whole numbers of columns across and
- * rows down, either way. A move that has `live` is sent as a return to the live screen, whatever
- * else it holds, so it is read as one.
- */
-export function readTerminalMove(value: unknown): TerminalMove | string {
-  if (typeof value !== 'object' || value === null) return 'a move is a map'
-  const fields = value as Record<string, unknown>
-  const number = fields['number']
-  if (!isCount(number)) return '`number` is not a whole number in range'
-  if ('live' in fields) return { number, live: true }
-  const across = fields['across']
-  const down = fields['down']
-  if (typeof across !== 'number' || !Number.isSafeInteger(across)) return '`across` is not a whole number'
-  if (typeof down !== 'number' || !Number.isSafeInteger(down)) return '`down` is not a whole number'
-  return { number, across, down }
-}
 
 /**
  * The page's input read as native code reads it, or why it is not the view's input shape: exactly
@@ -2272,9 +2340,10 @@ export function readTerminalInput(value: unknown): TerminalInput | string {
     const missing = names.filter((name) => !(name in fields))
     return missing.length > 0 ? `missing field \`${missing[0] ?? ''}\`` : null
   }
-  const whole = (name: string, highest = Number.MAX_SAFE_INTEGER): number | string => {
+  // A number is read as native code's decoder reads its field's integer type.
+  const whole = (name: string, type: IntegerType = U64): number | string => {
     const number = fields[name]
-    return typeof number === 'number' && Number.isInteger(number) && number >= 0 && number <= highest
+    return typeof number === 'number' && notInteger(type, number) === null
       ? number
       : `\`${name}\` is not a whole number in range`
   }
@@ -2292,8 +2361,8 @@ export function readTerminalInput(value: unknown): TerminalInput | string {
       const wrong = exactly('kind', 'take', 'column', 'line', 'turns', 'shift', 'alt', 'control')
       if (wrong !== null) return wrong
       const take = whole('take')
-      const column = whole('column', 0xffff_ffff)
-      const line = whole('line', 0xffff_ffff)
+      const column = whole('column', U32)
+      const line = whole('line', U32)
       const turns = fields['turns']
       const shift = flag('shift')
       const alt = flag('alt')

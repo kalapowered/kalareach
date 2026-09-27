@@ -117,12 +117,20 @@ describe('the scripted host reads input as native code does (KR-REQ-10.01)', () 
       { kind: 'wheel', take: 1, column: 0, line: 0, turns: 1025, shift: false, alt: false, control: false },
       { kind: 'wheel', take: 1, column: -1, line: 0, turns: 1, shift: false, alt: false, control: false },
       { kind: 'wheel', take: 1, column: 0, line: 0, turns: 1, shift: 'no', alt: false, control: false },
+      // Past what the field's integer type holds: a take's number is a u64, a cell's column a u32.
+      { kind: 'take', number: 2 ** 64 },
+      { kind: 'wheel', take: 1, column: 2 ** 32, line: 0, turns: 1, shift: false, alt: false, control: false },
       null,
       'take'
     ]) {
       expect(typeof readTerminalInput(shape), JSON.stringify(shape)).toBe('string')
     }
     expect(readTerminalInput({ kind: 'release', number: 4 })).toEqual({ kind: 'release', number: 4 })
+    // The largest each type holds, past what JavaScript holds exactly for a u64, is read.
+    expect(readTerminalInput({ kind: 'take', number: 2 ** 53 })).toEqual({ kind: 'take', number: 2 ** 53 })
+    expect(
+      readTerminalInput({ kind: 'wheel', take: 1, column: 2 ** 32 - 1, line: 0, turns: 1, shift: false, alt: false, control: false })
+    ).toMatchObject({ kind: 'wheel', column: 2 ** 32 - 1 })
     expect(
       readTerminalInput({ kind: 'wheel', take: 1, column: 2, line: 3, turns: -1024, shift: true, alt: false, control: false })
     ).toEqual({ kind: 'wheel', take: 1, column: 2, line: 3, turns: -1024, shift: true, alt: false, control: false })
@@ -182,22 +190,32 @@ describe('the scripted host reads input as native code does (KR-REQ-10.01)', () 
 })
 
 describe("the scripted host reads a view's opening, size and moves as native code does", () => {
-  /** A view's grid and move as the page's port could be handed them, wrong in some way. */
-  const wrongGrids: unknown[] = [
-    { columns: 0, rows: 24 },
-    { columns: 2049, rows: 1 },
-    { columns: 80, rows: 0 },
-    { columns: 80, rows: 1025 },
+  /** What the command layer says of an argument it cannot decode, before native code sees the call. */
+  const undecodable = (command: string, key: string) => new RegExp(`^invalid args \`${key}\` for command \`${command}\`: `)
+
+  /** Sizes of whole numbers outside a terminal's bounds, which native code refuses in its words. */
+  const outOfBounds: readonly [{ columns: number; rows: number }, string][] = [
+    [{ columns: 0, rows: 24 }, 'columns 0 must be between 1 and 2048'],
+    [{ columns: 2049, rows: 1 }, 'columns 2049 must be between 1 and 2048'],
+    [{ columns: 80, rows: 0 }, 'rows 0 must be between 1 and 1024'],
+    [{ columns: 80, rows: 1025 }, 'rows 1025 must be between 1 and 1024'],
     // Within each bound on its own, and over the cells a terminal may have.
-    { columns: 1024, rows: 257 },
-    { columns: 80.5, rows: 24 },
-    { columns: -1, rows: 24 },
-    { columns: '80', rows: 24 },
-    { columns: 80 },
-    null
+    [{ columns: 1024, rows: 257 }, 'cells 263168 must not exceed 262144'],
+    // A whole number past what JavaScript holds exactly is still one the decoder reads.
+    [{ columns: 2 ** 53, rows: 1 }, 'columns 9007199254740992 must be between 1 and 2048']
   ]
 
-  it('refuses to open a view native code would not open, and opens none', async () => {
+  /** Sizes the command layer cannot decode, with the argument it names. */
+  const unreadable: readonly [unknown, string][] = [
+    [{ columns: 80.5, rows: 24 }, 'columns'],
+    [{ columns: -1, rows: 24 }, 'columns'],
+    [{ columns: '80', rows: 24 }, 'columns'],
+    [{ columns: 2 ** 64, rows: 24 }, 'columns'],
+    [{ columns: 80, rows: Number.NaN }, 'rows'],
+    [{ columns: 80 }, 'rows']
+  ]
+
+  it('refuses to open a view native code would not open, in the order it reads the call, and opens none', async () => {
     const { port, controls } = fakeHost()
     for (const sessionId of [
       'session-1',
@@ -210,54 +228,73 @@ describe("the scripted host reads a view's opening, size and moves as native cod
         message: 'that is not a session identifier'
       })
     }
-    for (const grid of wrongGrids) {
-      await expect(port.openTerminalView(SESSION_MAIN, grid as never, () => {}), JSON.stringify(grid)).rejects.toMatchObject({
-        code: 'INVALID_ARGUMENT'
+    for (const [grid, words] of outOfBounds) {
+      await expect(port.openTerminalView(SESSION_MAIN, grid, () => {}), JSON.stringify(grid)).rejects.toMatchObject({
+        code: 'INVALID_ARGUMENT',
+        message: `that is not a terminal's size: ${words}`
       })
     }
+    for (const [grid, key] of unreadable) {
+      await expect(port.openTerminalView(SESSION_MAIN, grid as never, () => {}), JSON.stringify(grid)).rejects.toMatch(
+        undecodable('terminal_view_open', key)
+      )
+    }
+    // Every argument is decoded before the session identifier is parsed.
+    await expect(port.openTerminalView('session-1', { columns: 80.5, rows: 24 }, () => {})).rejects.toMatch(
+      undecodable('terminal_view_open', 'columns')
+    )
+    // No size at all: the port cannot read one, as the desktop's cannot, and says so as a refusal.
+    await expect(port.openTerminalView(SESSION_MAIN, null as never, () => {})).rejects.toThrow(TypeError)
     expect(controls.terminalViews).toHaveLength(0)
-    // The largest a terminal may be, 262,144 cells, opens.
+    // The largest a terminal may be, 262,144 cells, opens, and so does an identifier in capitals.
     await port.openTerminalView(SESSION_MAIN, { columns: 2048, rows: 128 }, () => {})
-    expect(controls.terminalViews).toHaveLength(1)
+    await port.openTerminalView(SESSION_MAIN.toUpperCase(), { columns: 80, rows: 8 }, () => {})
+    expect(controls.terminalViews).toHaveLength(2)
   })
 
   it('refuses a size or a move native code would not take, and takes neither', async () => {
     const { port, controls } = fakeHost()
     const view: TerminalView = await port.openTerminalView(SESSION_MAIN, { columns: 80, rows: 8 }, () => {})
-    for (const grid of wrongGrids) {
-      await expect(view.resize(grid as never), JSON.stringify(grid)).rejects.toMatchObject({ code: 'INVALID_ARGUMENT' })
+    for (const [grid, words] of outOfBounds) {
+      await expect(view.resize(grid), JSON.stringify(grid)).rejects.toMatchObject({
+        code: 'INVALID_ARGUMENT',
+        message: `that is not a terminal's size: ${words}`
+      })
     }
-    await expect(view.resize({ columns: 1024, rows: 257 })).rejects.toMatchObject({
-      message: "that is not a terminal's size: cells 263168 must not exceed 262144"
-    })
-    for (const move of [
-      { number: -1, across: 1, down: 0 },
-      { number: 1.5, across: 1, down: 0 },
-      { number: 1, across: 0.5, down: 0 },
-      { number: 1, across: Number.NaN, down: 0 },
-      { number: 1, across: 1 },
-      { number: 1, down: 1 },
-      { across: 1, down: 0 },
-      null
-    ]) {
-      await expect(view.move(move as never), JSON.stringify(move)).rejects.toMatchObject({ code: 'INVALID_ARGUMENT' })
+    for (const [grid, key] of unreadable) {
+      await expect(view.resize(grid as never), JSON.stringify(grid)).rejects.toMatch(undecodable('terminal_view_resize', key))
     }
-    await expect(view.move({ number: 1, across: 0.5, down: 0 })).rejects.toMatchObject({
-      message: expect.stringContaining('across') as string
-    })
+    for (const [move, key] of [
+      [{ number: -1, across: 1, down: 0 }, 'number'],
+      [{ number: 1.5, across: 1, down: 0 }, 'number'],
+      [{ number: 2 ** 64, live: true }, 'number'],
+      [{ across: 1, down: 0 }, 'number'],
+      [{ number: 1, across: 0.5, down: 0 }, 'across'],
+      [{ number: 1, across: Number.NaN, down: 0 }, 'across'],
+      [{ number: 1, across: 2 ** 63, down: 0 }, 'across'],
+      [{ number: 1, down: 1 }, 'across'],
+      [{ number: 1, across: 1 }, 'down']
+    ] as const) {
+      await expect(view.move(move as never), JSON.stringify(move)).rejects.toMatch(undecodable('terminal_view_move', key))
+    }
+    expect(() => view.resize(null as never)).toThrow(TypeError)
+    expect(() => view.move(null as never)).toThrow(TypeError)
     expect(controls.terminalViews[0]?.grids).toEqual([{ columns: 80, rows: 8 }])
     expect(controls.terminalViews[0]?.moves).toEqual([])
-    // What native code takes, the scripted host takes.
+    // What native code takes, the scripted host takes: the largest whole numbers the decoder reads
+    // among them, and a move with `live`, which the port sends as a return to the live screen.
     await view.resize({ columns: 40, rows: 6 })
-    await view.move({ number: 1, across: 0, down: -2 })
-    await view.move({ number: 2, live: true })
+    await view.move({ number: 1, across: 2 ** 53, down: -(2 ** 53) })
+    await view.move({ number: 2 ** 53, live: true })
+    await view.move({ number: 2 ** 53 + 2, across: 3, down: 4, live: false } as never)
     expect(controls.terminalViews[0]?.grids).toEqual([
       { columns: 80, rows: 8 },
       { columns: 40, rows: 6 }
     ])
     expect(controls.terminalViews[0]?.moves).toEqual([
-      { number: 1, across: 0, down: -2 },
-      { number: 2, live: true }
+      { number: 1, across: 2 ** 53, down: -(2 ** 53) },
+      { number: 2 ** 53, live: true },
+      { number: 2 ** 53 + 2, live: true }
     ])
   })
 })
