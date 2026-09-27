@@ -2361,11 +2361,13 @@ async fn kr_req_12_02_a_launch_that_fails_after_its_process_started_leaves_nothi
     let _ = std::fs::remove_dir_all(&directory);
 }
 
-/// A launch profile whose backend forks a process of its own first, writes that process's
-/// identifier into `forked` in its working directory once it has, and waits for it.
+/// A launch profile whose backend forks a process of its own first and writes that process's
+/// identifier into `forked` in its working directory once it has; then it waits for that process,
+/// or, `and_exits`, exits at once and leaves it to be adopted by whatever adopts orphans.
 #[cfg(unix)]
-fn forking_profile() -> kr_protocol::broker::LaunchProfile {
+fn forking_profile(and_exits: bool) -> kr_protocol::broker::LaunchProfile {
     let sleeping = sleeping_profile();
+    let then = if and_exits { "exit 0" } else { "wait" };
     kr_protocol::broker::LaunchProfile {
         binary: kr_protocol::broker::BinaryIdentity {
             resolved_path: "/bin/sh".to_owned(),
@@ -2373,9 +2375,32 @@ fn forking_profile() -> kr_protocol::broker::LaunchProfile {
         },
         arguments: vec![
             "-c".to_owned(),
-            "sleep 600 & echo $! > forked.tmp && mv forked.tmp forked; wait".to_owned(),
+            format!("sleep 600 & echo $! > forked.tmp && mv forked.tmp forked; {then}"),
         ],
         ..sleeping
+    }
+}
+
+/// Returns the process a forking backend forked, when it has written its identifier within
+/// `within`.
+#[cfg(unix)]
+fn forked_within(
+    directory: &std::path::Path,
+    within: std::time::Duration,
+) -> Option<ProcessStartIdentity> {
+    let path = directory.join("forked");
+    let started = std::time::Instant::now();
+    loop {
+        if let Some(pid) = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| text.trim().parse::<u32>().ok())
+        {
+            return kr_ipc::identity::started_process_identity(pid).ok();
+        }
+        if started.elapsed() >= within {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
 }
 
@@ -2437,65 +2462,73 @@ fn stop_recorded(process: &ProcessStartIdentity) {
     }
 }
 
-/// KR-REQ-12.02 and KR-REQ-07.61: a launch that fails after its process started also stops what
-/// that process forked in the meantime, so nothing the failed launch started is left running.
+/// KR-REQ-12.02 and KR-REQ-07.61: a launch that fails after its process started leaves nothing
+/// running that the process could have started. Its backend forks a process as soon as it runs,
+/// and either waits for it or exits and leaves it to be adopted, where nothing can find it by its
+/// parent any more. The launch holds its program until it has committed, so a launch that fails
+/// ends a process that never ran the backend and forked nothing, whichever the backend would do.
 #[cfg(unix)]
 #[tokio::test]
-async fn kr_req_12_02_a_failed_launch_stops_what_its_process_forked() {
-    let directory = private_directory();
-    let broker = broker_for_launch();
-    let occupied = directory.join("registration");
-    std::fs::create_dir(&occupied).expect("the registration's name is taken");
-    std::fs::write(occupied.join("held"), b"held").expect("by a directory that is not empty");
-    let mut gateway = kr_worker::broker::NativeGateway::bind(
-        Arc::clone(&broker),
-        &directory,
-        launch_for(None, None),
-    )
-    .expect("the endpoint binds");
-    let (arrived, release) = gateway.pause_before_cleanup();
-    let intent = broker
-        .prepare_launch(
-            forking_profile(),
-            kr_worker::broker::ForegroundMark::idle(4),
-            None,
+async fn kr_req_12_02_a_failed_launch_leaves_nothing_its_backend_forked() {
+    for and_exits in [false, true] {
+        let directory = private_directory();
+        let broker = broker_for_launch();
+        let occupied = directory.join("registration");
+        std::fs::create_dir(&occupied).expect("the registration's name is taken");
+        std::fs::write(occupied.join("held"), b"held").expect("by a directory that is not empty");
+        let mut gateway = kr_worker::broker::NativeGateway::bind(
+            Arc::clone(&broker),
+            &directory,
+            launch_for(None, None),
         )
-        .expect("the launch is prepared");
-    let launching = std::thread::spawn(move || {
-        let failed = gateway.launch(
-            &intent,
-            &kr_worker::broker::ForegroundMark::idle(4),
-            IntegrationMode::Gateway,
-            TimestampMs::new(1),
-        );
-        (gateway, failed)
-    });
-    arrived
-        .recv_timeout(LIVENESS_DEADLINE)
-        .expect("the failed launch reaches its cleanup");
-    let forked = forked_by_the_backend(&directory);
-    assert_eq!(
-        kr_ipc::identity::process_state(&forked),
-        kr_ipc::identity::ProcessState::Running,
-        "the backend's own process is running when the launch undoes itself"
-    );
+        .expect("the endpoint binds");
+        let (arrived, release) = gateway.pause_before_cleanup();
+        let intent = broker
+            .prepare_launch(
+                forking_profile(and_exits),
+                kr_worker::broker::ForegroundMark::idle(4),
+                None,
+            )
+            .expect("the launch is prepared");
+        let launching = std::thread::spawn(move || {
+            let failed = gateway.launch(
+                &intent,
+                &kr_worker::broker::ForegroundMark::idle(4),
+                IntegrationMode::Gateway,
+                TimestampMs::new(1),
+            );
+            (gateway, failed)
+        });
+        arrived
+            .recv_timeout(LIVENESS_DEADLINE)
+            .expect("the failed launch reaches its cleanup");
+        // A backend that ran forks at once, well inside this.
+        let forked_before = forked_within(&directory, std::time::Duration::from_secs(1));
 
-    release.send(()).expect("the cleanup goes on");
-    let (gateway, failed) = launching.join().expect("the launch returns");
-    failed.expect_err("the registration cannot be published");
-    let started = gateway
-        .last_started()
-        .cloned()
-        .expect("the backend was started before the failure");
-    assert_eq!(
-        kr_ipc::identity::process_state(&started),
-        kr_ipc::identity::ProcessState::Ended,
-        "the backend was stopped"
-    );
-    let stopped = ends(&forked);
-    stop_recorded(&forked);
-    assert!(stopped, "and so was what it forked");
-    let _ = std::fs::remove_dir_all(&directory);
+        release.send(()).expect("the cleanup goes on");
+        let (gateway, failed) = launching.join().expect("the launch returns");
+        failed.expect_err("the registration cannot be published");
+        let started = gateway
+            .last_started()
+            .cloned()
+            .expect("the backend's process was started before the failure");
+        assert_eq!(
+            kr_ipc::identity::process_state(&started),
+            kr_ipc::identity::ProcessState::Ended,
+            "the started process was stopped"
+        );
+        let forked = forked_before
+            .or_else(|| forked_within(&directory, std::time::Duration::from_millis(300)));
+        let left_running = forked.as_ref().filter(|forked| !ends(forked)).cloned();
+        if let Some(forked) = forked.as_ref() {
+            stop_recorded(forked);
+        }
+        assert_eq!(
+            left_running, None,
+            "nothing the backend forked is running (it exits at once: {and_exits})"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
 }
 
 /// KR-REQ-12.02 and KR-REQ-07.61, the control: a launch that succeeds leaves its process, and what
@@ -2515,7 +2548,7 @@ async fn kr_req_12_02_a_successful_launch_leaves_what_its_process_forked_running
     .expect("the endpoint binds");
     let intent = broker
         .prepare_launch(
-            forking_profile(),
+            forking_profile(false),
             kr_worker::broker::ForegroundMark::idle(4),
             None,
         )
