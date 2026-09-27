@@ -296,7 +296,9 @@ pause keeps its place in the queue. A cancellation and a passed deadline publish
 A process that exits, breaks the wire or is ended for breaking a bound takes the model with it and
 nothing else. The store, the pins, the provenance, every session and every deterministic title
 survive. The job it was running is queued again once, with its aging position, and if the next
-process fails it as well it is not retried. The next load waits a second after the first failure,
+process fails it as well it is not retried. A job somebody cancelled is never queued again, even
+when its process ends before the cancellation is answered: a retry would run it under a new token
+that nobody had cancelled. The next load waits a second after the first failure,
 twice as long after each failure that follows, up to five minutes, and a published description
 resets the wait.
 

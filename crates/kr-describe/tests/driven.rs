@@ -472,6 +472,84 @@ fn an_answer_for_work_not_in_flight_is_dropped_and_counted() {
     assert_eq!(service.inference_restarts(), 0);
 }
 
+/// KR-REQ-22.21: a job whose token was cancelled is not queued again when its process ends before
+/// the service has acted on the cancellation. It ends cancelled: queued again, it would run with a
+/// new token that nobody had cancelled. The controls are the same end with nothing cancelled, which
+/// queues the job again once, and a pause, which keeps the job's place.
+#[test]
+fn a_job_cancelled_before_its_process_ends_is_not_retried() {
+    let mut cancelled = service();
+    queue(&mut cancelled, &session(1), "kalareach", at(0));
+    assert!(matches!(
+        loaded(&mut cancelled, at(3_000)),
+        Instruction::Generate { .. }
+    ));
+    assert!(cancelled.cancel_running(&session(1)));
+    assert_eq!(
+        cancelled
+            .process_ended(ProcessEnd::Exited, at(3_100))
+            .expect("the end"),
+        vec![
+            Outcome::Cancelled {
+                session_id: session(1)
+            },
+            Outcome::ProcessEnded {
+                why: ProcessEnd::Exited
+            }
+        ]
+    );
+    assert_eq!(cancelled.scheduler().queued(), 0);
+    assert_eq!(cancelled.counts().requeued, 0);
+    assert_eq!(cancelled.counts().cancelled, 1);
+
+    // The control: nothing cancelled, and the job is queued again.
+    let mut failed = service();
+    queue(&mut failed, &session(1), "kalareach", at(0));
+    assert!(matches!(
+        loaded(&mut failed, at(3_000)),
+        Instruction::Generate { .. }
+    ));
+    assert_eq!(
+        failed
+            .process_ended(ProcessEnd::Exited, at(3_100))
+            .expect("the end")[0],
+        Outcome::Requeued {
+            session_id: session(1)
+        }
+    );
+    assert_eq!(failed.scheduler().queued(), 1);
+
+    // The control: a pause cancels the job's token too, and the job keeps its place.
+    let hot = HostConditions::measured(
+        16 * GIB,
+        12 * GIB,
+        PowerSource::Mains,
+        ThermalState::Critical,
+    );
+    let mut paused = service();
+    queue(&mut paused, &session(1), "kalareach", at(0));
+    let Instruction::Generate { id, .. } = loaded(&mut paused, at(3_000)) else {
+        panic!("the job is sent");
+    };
+    assert_eq!(
+        paused.next(&hot, at(3_050)).expect("an instruction"),
+        Instruction::Cancel {
+            id,
+            work: Work::Job
+        }
+    );
+    assert_eq!(
+        paused
+            .process_ended(ProcessEnd::Exited, at(3_100))
+            .expect("the end")[0],
+        Outcome::Requeued {
+            session_id: session(1)
+        }
+    );
+    assert_eq!(paused.scheduler().queued(), 1);
+    assert_eq!(paused.counts().cancelled, 0);
+}
+
 /// KR-PERF-009: every attempt is measured once, however it ends. Its queue wait and execution go
 /// into the latency ledger, and its execution into the service time the cadence is worked out
 /// from: a job past its deadline, a cancelled job and a job whose process ended count as a

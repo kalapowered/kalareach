@@ -1452,7 +1452,7 @@ impl DescriptionService {
         // A job that was being stopped for a pause is still wanted, and its token is cancelled, so
         // what it produced is not published: it goes back in the queue. So does a job whose
         // answer arrives after descriptions were turned off, which publish nothing new.
-        if dispatched.stopping.is_some_and(Stop::requeues) || !self.settings.enabled {
+        if stopped(&dispatched).is_some_and(Stop::requeues) || !self.settings.enabled {
             return Ok(self.requeue(dispatched, false));
         }
         let outcome = self.publish(&dispatched, &bytes, execution_ms, now)?;
@@ -1593,7 +1593,7 @@ impl DescriptionService {
         let session_id = dispatched.job.session_id;
         match why {
             JobEnd::Cancelled => {
-                if dispatched.stopping.is_some_and(Stop::requeues) {
+                if stopped(&dispatched).is_some_and(Stop::requeues) {
                     return self.requeue(dispatched, false);
                 }
                 self.counts.cancelled = self.counts.cancelled.saturating_add(1);
@@ -1626,20 +1626,13 @@ impl DescriptionService {
     }
 
     /// Takes a job whose process failed it: only inference is restarted, and the job is queued
-    /// again once.
+    /// again once, unless it was being stopped anyway.
     fn job_failed(&mut self, dispatched: Dispatched, detail: String, now: Reading) -> Outcome {
         self.release();
         self.unload_owed = Some(UnloadReason::Failed);
         self.inference_restarts = self.inference_restarts.saturating_add(1);
         self.restart.failed(now, None);
-        if dispatched.requeued_before {
-            self.counts.failed = self.counts.failed.saturating_add(1);
-            return Outcome::Failed {
-                session_id: dispatched.job.session_id,
-                detail,
-            };
-        }
-        self.requeue(dispatched, true)
+        self.retry_or_end(dispatched, detail)
     }
 
     /// Ends the job the process had when it ended.
@@ -1653,31 +1646,45 @@ impl DescriptionService {
         self.running.finished();
         self.in_flight.reconciled(&session_id);
         self.measure(&dispatched, now);
-        match (why, dispatched.stopping) {
-            (ProcessEnd::PastDeadline, _) => {
+        match why {
+            ProcessEnd::PastDeadline => {
                 self.counts.deadline_exceeded = self.counts.deadline_exceeded.saturating_add(1);
                 Outcome::DeadlineExceeded { session_id }
             }
-            (ProcessEnd::MemoryCeiling, _) => {
+            ProcessEnd::MemoryCeiling => {
                 self.counts.failed = self.counts.failed.saturating_add(1);
                 Outcome::Failed {
                     session_id,
                     detail: "the process passed its ceiling".to_owned(),
                 }
             }
-            (_, Some(stop)) if stop.requeues() => self.requeue(dispatched, false),
-            (_, Some(_)) => {
+            _ => self.retry_or_end(
+                dispatched,
+                format!("the description process ended: {}", why.as_str()),
+            ),
+        }
+    }
+
+    /// Decides what a job that did not finish comes to: a job being stopped for a pause goes back
+    /// in the queue, a job being stopped for any other reason, or cancelled by anyone, ends
+    /// cancelled, and any other job is queued again once.
+    ///
+    /// The job's token is read as well as the service's own decision, because a cancellation can
+    /// reach the token before the service has acted on it, and a job queued again would get a new
+    /// token that nothing had cancelled.
+    fn retry_or_end(&mut self, dispatched: Dispatched, detail: String) -> Outcome {
+        let session_id = dispatched.job.session_id;
+        match stopped(&dispatched) {
+            Some(stop) if stop.requeues() => self.requeue(dispatched, false),
+            Some(_) => {
                 self.counts.cancelled = self.counts.cancelled.saturating_add(1);
                 Outcome::Cancelled { session_id }
             }
-            (_, None) if dispatched.requeued_before => {
+            None if dispatched.requeued_before => {
                 self.counts.failed = self.counts.failed.saturating_add(1);
-                Outcome::Failed {
-                    session_id,
-                    detail: format!("the description process ended: {}", why.as_str()),
-                }
+                Outcome::Failed { session_id, detail }
             }
-            (_, None) => self.requeue(dispatched, true),
+            None => self.requeue(dispatched, true),
         }
     }
 
@@ -1708,6 +1715,17 @@ impl DescriptionService {
         self.next_id = self.next_id.wrapping_add(1);
         self.next_id
     }
+}
+
+/// Returns why a job is being stopped: what the service decided, or a cancellation a caller or
+/// privacy mode made that the service has not yet acted on.
+fn stopped(dispatched: &Dispatched) -> Option<Stop> {
+    dispatched.stopping.or_else(|| {
+        dispatched
+            .cancellation
+            .is_cancelled()
+            .then_some(Stop::Cancelled)
+    })
 }
 
 /// Builds the bounded context one job is described from.

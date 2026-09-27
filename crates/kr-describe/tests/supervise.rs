@@ -1153,6 +1153,50 @@ fn a_pause_while_a_job_runs_cancels_it_and_keeps_its_place() {
     assert_eq!(rig.driver.started(), 2);
 }
 
+/// KR-REQ-22.21: a job cancelled while its process crashes under it ends cancelled and is not
+/// queued again: the cancellation reached its token before the service heard of the crash. The
+/// control is the same crash with nothing cancelled, which queues the job again.
+#[test]
+fn a_cancelled_job_whose_process_crashes_is_not_retried() {
+    for cancel in [true, false] {
+        let mut rig = Rig::new(&Script {
+            crash_in_generate: true,
+            ..Script::default()
+        });
+        queue(rig.service(), &session(1), Priority::Ordinary, at(0));
+        rig.job_sent(at(3_000));
+        // The process has ended; the driver has not heard it yet.
+        rig.answer_arrives();
+        if cancel {
+            assert!(rig.driver.service().cancel_running(&session(1)));
+        }
+        let reports = rig.driver.turn(&roomy(), at(3_100)).expect("a turn");
+        let ended = outcomes(&reports);
+        let expected = if cancel {
+            Outcome::Cancelled {
+                session_id: session(1),
+            }
+        } else {
+            Outcome::Requeued {
+                session_id: session(1),
+            }
+        };
+        assert!(
+            ended.contains(&&expected),
+            "cancelled {cancel}: {reports:?}"
+        );
+        assert!(
+            the_process_ended(&reports),
+            "cancelled {cancel}: {reports:?}"
+        );
+        assert_eq!(
+            rig.driver.service().scheduler().queued(),
+            usize::from(!cancel),
+            "cancelled {cancel}"
+        );
+    }
+}
+
 /// KR-REQ-22.16: a change that settles while a job is in the process would refuse its result, so
 /// the service cancels the job there at once rather than wait for an answer it would refuse. The
 /// process stays, and the new revision is described once the session's cooldown has passed. The
