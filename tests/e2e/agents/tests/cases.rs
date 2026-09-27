@@ -1034,7 +1034,10 @@ fn staged(
                 "the agent rewrote files it had before the part, by directory: {}",
                 rewrites
                     .iter()
-                    .map(|(root, count)| format!("{} ({count})", root.display()))
+                    .map(|(root, count)| match root {
+                        Some(root) => format!("{} ({count})", root.display()),
+                        None => format!("outside the listed directories ({count})"),
+                    })
                     .collect::<Vec<_>>()
                     .join(", ")
             ));
@@ -1160,12 +1163,16 @@ fn hand_over(provenance: &Provenance, run: &Run) {
     }
 }
 
+/// How many files lie under each listed directory, `None` for those under none.
+type DirectoryCounts = Vec<(Option<PathBuf>, usize)>;
+
 /// What a part changed in the person's agent directories since `before`: its own conversations,
 /// the files it created holding its marker or the run's directory, removed, and every other change
 /// reported, with those of the changed files left that hold the marker or the run's directory; the
 /// files it had that were rewritten or changed and too large to compare, counted by the listed
-/// directory they lie in; and whether the directories were read whole afterwards. Nothing is
-/// removed unless they were, and unless everything the part started had ended (`settled`).
+/// directory they lie in (`None` for none); and whether the directories were read whole
+/// afterwards. Nothing is removed unless they were, and unless everything the part started had
+/// ended (`settled`).
 fn person_home_report(
     login: &Login,
     before: &kr_e2e_agents::account::Snapshot,
@@ -1173,7 +1180,7 @@ fn person_home_report(
     mark: &str,
     root: &Path,
     settled: bool,
-) -> (serde_json::Value, Vec<(PathBuf, usize)>, bool, Vec<String>) {
+) -> (serde_json::Value, DirectoryCounts, bool, Vec<String>) {
     let after = snapshot(&login.person_home, directories, HASH_LIMIT);
     let found = changes(before, &after);
     let root = root.display().to_string();
@@ -1203,12 +1210,12 @@ fn person_home_report(
             })
             .collect()
     };
-    let rewrites = before.count_by_root(
+    let rewrites = before.count_paths_by_root(
         found
             .rewritten
             .iter()
             .chain(&found.changed_uncompared)
-            .filter_map(|path| path.to_str()),
+            .map(PathBuf::as_path),
     );
     (
         json!({
@@ -5864,11 +5871,17 @@ fn a_session_started_with_a_persons_own_home_keeps_their_login_keychain_as_its_d
         .join("Library")
         .join("Keychains")
         .join("login.keychain-db");
+    // Said without the home's path or the keychain's name, which can be the person's own: this
+    // text goes into the record.
     assert!(
         named.contains(&login.display().to_string()),
-        "a session with the home {} names {named} as its default keychain, not {}",
-        home.display(),
-        login.display()
+        "a session with the person's own home names a default keychain that is not their login \
+         keychain ({})",
+        if named.contains(&home.display().to_string()) {
+            "another keychain in their home"
+        } else {
+            "a keychain outside their home, or none"
+        }
     );
     Outcome::passed(
         "own-home",
