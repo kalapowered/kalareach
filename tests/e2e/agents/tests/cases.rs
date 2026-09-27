@@ -212,13 +212,13 @@ impl Guards {
         self.changed.lock().ok().and_then(|changed| changed.clone())
     }
 
-    /// Records `what` changed and, the first time, ends everything the part started, waiting on
-    /// nothing of the provenance sampler: each probe's process group that runs, under the
-    /// registry's lock; then every process the run recorded, the sessions' root shells, the
-    /// processes each launch found and those the sampler has published, and every process beneath
-    /// them, each stopped (SIGSTOP) before its children are looked for, so none can start another
-    /// or leave its children to the system while the set is gathered ([`freeze`]); then each is
-    /// killed, the run's own close follows, and what still runs half a second later is recorded.
+    /// Records `what` changed and, the first time, ends every process of the part it can reach,
+    /// waiting on nothing of the provenance sampler: each probe's process group that runs, under
+    /// the registry's lock; then it halts the sampler, which from then on kills each process it
+    /// would take, and freezes ([`freeze`]) the run's recorded processes, the sessions' root shells,
+    /// the processes each launch found, those the sampler published, and every process beneath
+    /// them; then it kills each, and records what it stopped, what it could not confirm stopped,
+    /// whether the walk was complete, what ended and what still ran two seconds later.
     fn trip(&self, what: String, run: &Run, provenance: &Provenance) {
         if let Ok(mut changed) = self.changed.lock() {
             changed.get_or_insert(what);
@@ -239,6 +239,7 @@ impl Guards {
                 }
             }
         }
+        let published = provenance.halt();
         let mut roots: Vec<ProcessStartIdentity> = run
             .owned()
             .into_iter()
@@ -251,21 +252,48 @@ impl Guards {
                 .map(|agents| agents.clone())
                 .unwrap_or_default(),
         );
-        roots.extend(provenance.published());
+        roots.extend(published);
         let frozen = freeze(&roots);
-        for identity in &frozen {
+        let targets: Vec<&ProcessStartIdentity> =
+            frozen.stopped.iter().chain(&frozen.unconfirmed).collect();
+        for identity in &targets {
             signal(identity, rustix::process::Signal::KILL);
         }
         run.end_everything();
-        std::thread::sleep(Duration::from_millis(500));
-        let survivors: Vec<u64> = frozen
-            .iter()
-            .filter(|identity| matches!(process_state(identity), ProcessState::Running))
-            .map(|identity| identity.pid.get())
-            .collect();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let states = loop {
+            let states: Vec<ProcessState> = targets
+                .iter()
+                .map(|identity| process_state(identity))
+                .collect();
+            if states
+                .iter()
+                .all(|state| matches!(state, ProcessState::Ended))
+                || std::time::Instant::now() >= deadline
+            {
+                break states;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        let pids_where = |wanted: fn(&ProcessState) -> bool| -> Vec<u64> {
+            targets
+                .iter()
+                .zip(&states)
+                .filter(|(_, state)| wanted(state))
+                .map(|(identity, _)| identity.pid.get())
+                .collect()
+        };
+        let summary = json!({
+            "stopped_confirmed": frozen.stopped.len(),
+            "stop_unconfirmed": frozen.unconfirmed.iter().map(|identity| identity.pid.get()).collect::<Vec<_>>(),
+            "walk_complete": frozen.complete,
+            "walk_failures": frozen.failures,
+            "ended": pids_where(|state| matches!(state, ProcessState::Ended)).len(),
+            "still_running": pids_where(|state| matches!(state, ProcessState::Running)),
+            "state_unknown": pids_where(|state| matches!(state, ProcessState::Unknown { .. })),
+        });
         if let Ok(mut stopped) = self.stopped.lock() {
-            *stopped =
-                Some(json!({ "stopped_and_killed": frozen.len(), "still_running": survivors }));
+            *stopped = Some(summary);
         }
     }
 }
@@ -287,52 +315,139 @@ fn watch_guards(guards: &Guards, run: &Run, provenance: &Provenance, needles: &[
     }
 }
 
-/// Stops each of `roots` that runs and every process beneath them, and returns every process it
-/// stopped: a pass reads the process table once and stops each process found beneath one already
-/// stopped, by its start identity and only when its parent, read under its own identity, is the
-/// stopped process it was found under; passes go on until one finds nothing new, so a process
-/// started before its parent stopped is found beneath it, and none of them can start another
-/// meanwhile. At most fifty passes.
-fn freeze(roots: &[ProcessStartIdentity]) -> Vec<ProcessStartIdentity> {
-    let mut stopped: Vec<ProcessStartIdentity> = Vec::new();
+/// What [`freeze`] stopped: each process confirmed stopped, each it signalled but could not confirm
+/// stopped, why any process could not be looked at or stopped, and whether its walk was complete.
+#[derive(Debug, Default)]
+struct Frozen {
+    stopped: Vec<ProcessStartIdentity>,
+    unconfirmed: Vec<ProcessStartIdentity>,
+    failures: Vec<String>,
+    complete: bool,
+}
+
+/// Stops the process `identity` names, only while that start holds its number, and says whether the
+/// kernel then reports it stopped within a fifth of a second: `Ok(None)` where it had ended.
+fn stop_one(identity: &ProcessStartIdentity) -> Result<Option<bool>, String> {
+    if !matches!(process_state(identity), ProcessState::Running) {
+        return Ok(None);
+    }
+    let pid = i32::try_from(identity.pid.get())
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+        .ok_or_else(|| format!("process {} has no number to signal", identity.pid.get()))?;
+    rustix::process::kill_process(pid, rustix::process::Signal::STOP).map_err(|error| {
+        format!(
+            "process {} could not be stopped: {error}",
+            identity.pid.get()
+        )
+    })?;
+    let started = std::time::Instant::now();
+    loop {
+        match kr_e2e_m1b::run::stopped(identity) {
+            Some(true) => return Ok(Some(true)),
+            None if matches!(process_state(identity), ProcessState::Ended) => return Ok(None),
+            _ if started.elapsed() >= Duration::from_millis(200) => return Ok(Some(false)),
+            _ => std::thread::sleep(Duration::from_millis(10)),
+        }
+    }
+}
+
+/// Stops each of `roots` that runs and, pass by pass, every process beneath one it stopped, each the
+/// moment it is found and confirmed a child of that process under its own start identity, so none
+/// can start another or leave its children to the system while the set is gathered; a pass reads
+/// the process table once, and passes go on until one finds nothing new, at most fifty. A process
+/// found by its number but not confirmed beneath its parent, one that could not be stopped or
+/// looked at, a table that could not be read, and a walk the passes did not finish are each
+/// recorded, and the last three leave the walk incomplete.
+fn freeze(roots: &[ProcessStartIdentity]) -> Frozen {
+    let mut frozen = Frozen {
+        complete: true,
+        ..Frozen::default()
+    };
+    let take = |frozen: &mut Frozen, identity: ProcessStartIdentity| -> bool {
+        match stop_one(&identity) {
+            Ok(Some(true)) => {
+                frozen.stopped.push(identity);
+                true
+            }
+            Ok(Some(false)) => {
+                frozen.failures.push(format!(
+                    "process {} was signalled and not seen stopped",
+                    identity.pid.get()
+                ));
+                frozen.unconfirmed.push(identity);
+                true
+            }
+            Ok(None) => false,
+            Err(why) => {
+                frozen.failures.push(why);
+                frozen.complete = false;
+                false
+            }
+        }
+    };
     for root in roots {
-        if !stopped.contains(root) && matches!(process_state(root), ProcessState::Running) {
-            signal(root, rustix::process::Signal::STOP);
-            stopped.push(root.clone());
+        let known = frozen.stopped.contains(root) || frozen.unconfirmed.contains(root);
+        if !known {
+            let _ = take(&mut frozen, root.clone());
         }
     }
     for _ in 0..50 {
-        let Ok(table) = kr_e2e_m1b::run::process_table() else {
-            break;
+        let table = match kr_e2e_m1b::run::process_table() {
+            Ok(table) => table,
+            Err(why) => {
+                frozen.failures.push(why);
+                frozen.complete = false;
+                return frozen;
+            }
         };
-        let mut new = Vec::new();
-        for parent in &stopped {
+        let parents: Vec<ProcessStartIdentity> = frozen
+            .stopped
+            .iter()
+            .chain(&frozen.unconfirmed)
+            .cloned()
+            .collect();
+        let mut found = false;
+        for parent in &parents {
             let Ok(parent_pid) = u32::try_from(parent.pid.get()) else {
                 continue;
             };
             for entry in table.iter().filter(|entry| entry.parent == parent_pid) {
-                let kr_ipc::identity::ProcessQuery::Present(identity) =
-                    kr_ipc::identity::query_process(entry.pid)
-                else {
-                    continue;
+                let identity = match kr_ipc::identity::query_process(entry.pid) {
+                    kr_ipc::identity::ProcessQuery::Present(identity) => identity,
+                    kr_ipc::identity::ProcessQuery::Gone => continue,
+                    kr_ipc::identity::ProcessQuery::CannotEstablish(error) => {
+                        frozen.failures.push(format!(
+                            "process {} beneath process {parent_pid} could not be identified: \
+                             {error}",
+                            entry.pid
+                        ));
+                        frozen.complete = false;
+                        continue;
+                    }
                 };
-                if stopped.contains(&identity) || new.contains(&identity) {
+                if frozen.stopped.contains(&identity) || frozen.unconfirmed.contains(&identity) {
                     continue;
                 }
-                if matches!(beneath_parent(&identity, parent), Ok(true)) {
-                    new.push(identity);
+                match beneath_parent(&identity, parent) {
+                    Ok(true) => found |= take(&mut frozen, identity),
+                    Ok(false) => {}
+                    Err(why) => {
+                        frozen.failures.push(why);
+                        frozen.complete = false;
+                    }
                 }
             }
         }
-        if new.is_empty() {
-            break;
-        }
-        for identity in new {
-            signal(&identity, rustix::process::Signal::STOP);
-            stopped.push(identity);
+        if !found {
+            return frozen;
         }
     }
-    stopped
+    frozen
+        .failures
+        .push("fifty passes still found new processes".to_owned());
+    frozen.complete = false;
+    frozen
 }
 
 /// Stops the watcher of a part's files when the part's own steps end, however they end.
@@ -5566,33 +5681,93 @@ fn a_small_tree() -> (std::process::Child, ProcessStartIdentity) {
     (child, identity)
 }
 
+/// Kills each of `processes` and waits, five seconds at most, until none runs.
+fn kill_and_wait(processes: &[ProcessStartIdentity]) -> bool {
+    for identity in processes {
+        signal(identity, rustix::process::Signal::KILL);
+    }
+    let started = std::time::Instant::now();
+    while processes
+        .iter()
+        .any(|identity| matches!(process_state(identity), ProcessState::Running))
+    {
+        if started.elapsed() >= Duration::from_secs(5) {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    true
+}
+
 #[test]
 fn a_stop_freezes_a_tree_whole_before_it_is_killed() {
     let (mut child, root) = a_small_tree();
     let frozen = freeze(std::slice::from_ref(&root));
+    assert!(
+        frozen.complete && frozen.failures.is_empty() && frozen.unconfirmed.is_empty(),
+        "{frozen:?}"
+    );
     assert_eq!(
-        frozen.len(),
+        frozen.stopped.len(),
         3,
         "the shell and its two children: {frozen:?}"
     );
-    for identity in &frozen {
-        signal(identity, rustix::process::Signal::KILL);
-    }
-    let _ = child.wait();
-    let ended = std::time::Instant::now();
-    while frozen[1..]
-        .iter()
-        .any(|identity| matches!(process_state(identity), ProcessState::Running))
-        && ended.elapsed() < Duration::from_secs(5)
-    {
-        std::thread::sleep(Duration::from_millis(50));
-    }
     assert!(
-        frozen[1..]
+        frozen
+            .stopped
             .iter()
-            .all(|identity| !matches!(process_state(identity), ProcessState::Running)),
-        "every process of the tree ended"
+            .all(|identity| kr_e2e_m1b::run::stopped(identity) == Some(true)),
+        "each is stopped before anything is killed"
     );
+    assert!(
+        kill_and_wait(&frozen.stopped),
+        "the shell and its children ended"
+    );
+    let _ = child.wait();
+}
+
+#[test]
+fn a_tree_that_keeps_starting_children_is_caught_whole() {
+    // A shell that starts a sleep every hundredth of a second, each marked so it can be found.
+    let mut child = std::process::Command::new("/bin/sh")
+        .args(["-c", "while :; do /bin/sleep 61.25 & /bin/sleep 0.01; done"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("a shell");
+    let kr_ipc::identity::ProcessQuery::Present(root) = kr_ipc::identity::query_process(child.id())
+    else {
+        panic!("the shell's identity");
+    };
+    std::thread::sleep(Duration::from_millis(300));
+    let frozen = freeze(std::slice::from_ref(&root));
+    assert!(frozen.complete, "{frozen:?}");
+    let marked = |table: &[kr_e2e_m1b::run::Entry]| -> Vec<u32> {
+        table
+            .iter()
+            .filter(|entry| entry.command == "/bin/sleep 61.25")
+            .map(|entry| entry.pid)
+            .collect()
+    };
+    let before = marked(&kr_e2e_m1b::run::process_table().expect("the process table"));
+    assert!(
+        before.len() > 2,
+        "the shell started its children: {before:?}"
+    );
+    let caught: Vec<u32> = frozen
+        .stopped
+        .iter()
+        .filter_map(|identity| u32::try_from(identity.pid.get()).ok())
+        .collect();
+    assert!(
+        before.iter().all(|pid| caught.contains(pid)),
+        "every child the frozen shell had is stopped with it: {before:?} against {caught:?}"
+    );
+    assert!(kill_and_wait(&frozen.stopped), "the tree ended");
+    let _ = child.wait();
+    let after = marked(&kr_e2e_m1b::run::process_table().expect("the process table"));
+    assert!(after.is_empty(), "nothing of the tree is left: {after:?}");
 }
 
 #[test]

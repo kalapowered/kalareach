@@ -650,6 +650,32 @@ pub fn signal(identity: &ProcessStartIdentity, signal: rustix::process::Signal) 
     let _ = rustix::process::kill_process(pid, signal);
 }
 
+/// Whether the process `identity` names is stopped, as a stop signal leaves it, read while that
+/// start holds its number: `None` where it has ended or the kernel will not say.
+#[must_use]
+pub fn stopped(identity: &ProcessStartIdentity) -> Option<bool> {
+    #[cfg(target_os = "macos")]
+    {
+        // `SSTOP` in the kernel's process states.
+        const STOPPED: u32 = 4;
+        let pid = i32::try_from(identity.pid.get()).ok()?;
+        if !matches!(process_state(identity), ProcessState::Running) {
+            return None;
+        }
+        let info = libproc::proc_pid::pidinfo::<libproc::bsd_info::BSDInfo>(pid, 0).ok()?;
+        // The number still names the same start after the read, so what was read is its.
+        if !matches!(process_state(identity), ProcessState::Running) {
+            return None;
+        }
+        Some(info.pbi_status == STOPPED)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = identity;
+        None
+    }
+}
+
 /// Waits until a recorded process has ended, and says whether it did within `within`.
 #[must_use]
 pub fn ended_within(identity: &ProcessStartIdentity, within: Duration) -> bool {
