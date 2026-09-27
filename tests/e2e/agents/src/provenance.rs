@@ -151,6 +151,8 @@ struct Seen {
     /// The system's own programs seen running as another user beneath a session, which the kernel
     /// will not describe: by number and the file each runs.
     other_users: Vec<(u32, PathBuf)>,
+    /// Why a look did not find every process beneath the sessions, once for each reason.
+    untracked: Vec<String>,
 }
 
 /// What a stage's sessions ran, checked as they ran it.
@@ -473,6 +475,17 @@ impl Provenance {
         }
     }
 
+    /// Why a look did not find every process beneath the sessions, for the run's closing check to
+    /// fail on as well.
+    #[must_use]
+    pub fn untracked(&self) -> Vec<String> {
+        self.seen
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .untracked
+            .clone()
+    }
+
     /// Notes one of the system's own programs running as another user that another search beneath
     /// the sessions found, so its number goes with the part's evidence too.
     pub fn note_system_program(&self, pid: u32, path: &Path) {
@@ -540,7 +553,7 @@ impl Provenance {
         let table = match table {
             Ok(table) => table,
             Err(why) => {
-                problem(
+                untracked(
                     &mut seen,
                     format!("{NOT_PINNED} the processes could not be listed: {why}"),
                 );
@@ -553,7 +566,7 @@ impl Provenance {
                 ProcessState::Running => {}
                 ProcessState::Ended => continue,
                 ProcessState::Unknown { detail } => {
-                    problem(
+                    untracked(
                         &mut seen,
                         format!(
                             "{NOT_PINNED} whether a watched session's shell runs is not established: {detail}"
@@ -587,7 +600,7 @@ impl Provenance {
                                 if let Some(child) =
                                     table.iter().find(|child| child.parent == entry.pid)
                                 {
-                                    problem(
+                                    untracked(
                                         &mut seen,
                                         format!(
                                             "{NOT_PINNED} the system program {} (process {}) beneath a session started process {}, which cannot be followed back to it",
@@ -600,7 +613,7 @@ impl Provenance {
                                 }
                                 continue;
                             }
-                            problem(
+                            untracked(
                                 &mut seen,
                                 format!(
                                     "{NOT_PINNED} process {} beneath a session could not be identified: {error}",
@@ -619,7 +632,7 @@ impl Provenance {
                             Ok(true) => {}
                             Ok(false) => continue,
                             Err(why) => {
-                                problem(&mut seen, why);
+                                untracked(&mut seen, why);
                                 continue;
                             }
                         }
@@ -736,6 +749,15 @@ fn problem(seen: &mut Seen, why: String) {
     if seen.problem.is_none() {
         seen.problem = Some(why);
     }
+}
+
+/// Records a problem that also leaves the processes beneath the sessions not all found: the run's
+/// closing check has to fail on it as well, since what was not found was not ended either.
+fn untracked(seen: &mut Seen, why: String) {
+    if !seen.untracked.contains(&why) {
+        seen.untracked.push(why.clone());
+    }
+    problem(seen, why);
 }
 
 /// Refuses an image from anywhere but the places the build may run from.
