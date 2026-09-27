@@ -829,7 +829,8 @@ export class ScriptedRecords {
     const read = decodeParams<AgentApprovalRespondParams>(params, AGENT_RESPOND_PARAMS)
     const agent = this.#subjectAgent(read.target.subject)
     // The broker checks the resource before anything else about the answer: whose it is, that it
-    // is still open, that it was interpreted, the instance's suspension, and last the decision.
+    // is still open and was interpreted. Then the admission every mutation takes, suspension,
+    // binding revision and the approval capability, and last the decision.
     const resource = agent.resources.find((each) => each.resource_id === read.resource_id)
     if (resource === undefined) refuse('STALE_SESSION', 'this worker holds no such pending request')
     if (resource.application_instance_id !== read.target.subject.application_instance_id) {
@@ -842,7 +843,7 @@ export class ScriptedRecords {
     if (decoding === undefined) {
       refuse('DRAFT_CONFLICT', `${read.resource_id} has no recorded interpretation to answer`)
     }
-    this.#requireUnsuspended(agent)
+    this.#admit(read.target, 'agent.approval', null)
     if (!decoding.projection.decisions.some((decision) => decision.option_id === read.option_id)) {
       refuse('DRAFT_CONFLICT', `${read.option_id} is not one of the decisions this request offered`)
     }

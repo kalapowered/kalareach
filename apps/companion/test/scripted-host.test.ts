@@ -153,6 +153,11 @@ describe("the scripted host and the agent's methods", () => {
         option_id: 'approved'
       })
     ).rejects.toMatchObject({ code: 'STALE_SESSION' })
+    // An answer is a mutation like any other: prepared at a binding that moved, or where the
+    // approval capability is not usable now, it is refused.
+    await expect(
+      port.approvalRespond({ target: target(main, '3'), resource_id: APPROVAL, option_id: 'approved' })
+    ).rejects.toMatchObject({ code: 'STALE_SESSION' })
     const answered = await port.approvalRespond({
       target: target(main),
       resource_id: APPROVAL,
@@ -162,6 +167,14 @@ describe("the scripted host and the agent's methods", () => {
     await expect(
       port.approvalRespond({ target: target(main), resource_id: APPROVAL, option_id: 'denied' })
     ).rejects.toMatchObject({ code: 'QUESTION_RESOLVED' })
+  })
+
+  it('refuses an answer where the approval capability is not usable now', async () => {
+    const { port, controls } = fakeHost()
+    controls.records.setCapability(SESSION_MAIN, 'agent.approval', 'temporarily_unavailable')
+    await expect(
+      port.approvalRespond({ target: target(main), resource_id: APPROVAL, option_id: 'approved' })
+    ).rejects.toMatchObject({ code: 'UNSUPPORTED_CAPABILITY' })
   })
 
   it('continues a long history in parts, and counts only what each part withheld', async () => {
