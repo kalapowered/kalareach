@@ -30,20 +30,20 @@
 //!
 //! It signs in nowhere and starts no turn. Its home and working directory are inside the run's own
 //! directory, and the home holds a keychain of the run's own as its default one
-//! ([`keychain::RunKeychain`]), so a secret the agent writes stays there and nobody is asked to
+//! (`keychain::RunKeychain`), so a secret the agent writes stays there and nobody is asked to
 //! create a keychain. Every proxy variable names a loopback port nothing listens on, and the
 //! updater and telemetry switches its build entry names are set. Its shell searches only the
 //! run's link to the build, the run's links to the build's runtimes and the system's directories,
 //! and every executable image a process beneath its session runs is recorded with its digest and
-//! must lie in one of those places or the run's own directory ([`provenance::Provenance`]): a part
+//! must lie in one of those places or the run's own directory (`provenance::Provenance`): a part
 //! whose session ran anything else did not test the pinned build, and says so.
 //!
 //! # Inputs
 //!
-//! [`BUILD_VARIABLE`] names a JSON file describing the build ([`build::Build`]),
+//! [`BUILD_VARIABLE`] names a JSON file describing the build (`build::Build`),
 //! [`GENERATION_VARIABLE`] the signed catalogue generation its package is installed from, and
 //! [`RESULT_VARIABLE`] the file each test appends its outcome to, one JSON line
-//! ([`outcome::Outcome`]). Without them a test says `skipping:` and returns, so an ordinary run of
+//! (`outcome::Outcome`). Without them a test says `skipping:` and returns, so an ordinary run of
 //! this workspace stays offline and starts no agent; [`REQUIRE_VARIABLE`] set to `1` turns that
 //! into a failure. `scripts/e2e-agents.sh` in the plugin repository sets all four.
 
