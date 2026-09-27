@@ -109,6 +109,7 @@ impl Host {
                 companion_tauri::commands::plugin_list,
                 companion_tauri::commands::catalogue_list,
                 companion_tauri::commands::history_page,
+                companion_tauri::commands::session_create,
             ])
             .build(tauri::test::mock_context(tauri::test::noop_assets()))
             .expect("an application");
@@ -422,4 +423,53 @@ async fn an_ended_sessions_history_is_the_hosts_to_answer() {
             );
         }
     }
+}
+
+/// KR-REQ-07.21: a creation of a stock shell, written as the page writes it, reaches the host's own
+/// create path. This daemon starts no workers, so what answers is the host's refusal to start one,
+/// which it can only give for a request it read.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stock_shells_creation_reaches_the_host_as_the_page_writes_it() {
+    let host = Host::start().await;
+    let creation = |shell_mode: &str| {
+        json!({
+            "params": {
+                "environment_id": host.environment_id(),
+                "presentation": "invisible",
+                "shell": null,
+                "shell_mode": shell_mode,
+                "cwd": "/",
+                "dimensions": null,
+                "worker_profile": "headless_user",
+                "environment_snapshot": [],
+                "palette": null,
+                "launch_profile": {
+                    "startup": "host_default",
+                    "fenced_launch": false,
+                    "command_integrations": []
+                },
+                "terminal": null
+            },
+            "subject": {}
+        })
+    };
+    let refusal = host
+        .call("session_create", creation("native_compat"))
+        .await
+        .expect_err("this daemon starts no workers");
+    assert!(refused_by_the_host(&refusal), "{refusal}");
+    assert_eq!(refusal["code"], "RESOURCE_UNAVAILABLE", "{refusal}");
+    assert!(
+        refusal["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("this test starts no workers")),
+        "the host went as far as starting the session's worker: {refusal}"
+    );
+
+    // The control: a shell the protocol does not name is refused before anything is sent.
+    let unnamed = host
+        .call("session_create", creation("stock"))
+        .await
+        .expect_err("a shell mode the protocol does not name");
+    assert!(!refused_by_the_host(&unnamed), "{unnamed}");
 }

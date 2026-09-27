@@ -61,6 +61,8 @@ import type {
   ReviewReadParams,
   ReviewReadResult,
   RoleSelection,
+  SessionCreateParams,
+  SessionCreateResult,
   SessionListResult,
   SessionReadResult,
   ShellLaunchResult,
@@ -577,6 +579,15 @@ export interface HostPort {
 
   sessionList(params: unknown): Promise<SessionListResult>
   sessionRead(params: unknown): Promise<SessionReadResult>
+  /**
+   * Creates a session in the environment the parameters name. A managed shell the host cannot
+   * qualify is refused with `SHELL_INTEGRATION_UNSUPPORTED`; the host never starts a stock shell in
+   * its place.
+   */
+  sessionCreate(
+    params: SessionCreateParams,
+    subject: SessionSubject
+  ): Promise<Settled<SessionCreateResult>>
   sessionClose(params: unknown, subject: SessionSubject): Promise<Settled<ClosureRecord>>
 
   /**

@@ -309,6 +309,8 @@ const OUTPUT_OLDEST = 2048n
 export class ScriptedRecords {
   readonly #ids: ScriptedIds
   readonly #agents = new Map<string, ScriptedAgent>()
+  /** The sessions created here, each running a shell with no agent in it yet. */
+  readonly #shells = new Set<string>()
   readonly #output = new Map<string, Uint8Array>()
   #attention: AttentionItem[]
   #revision = 10
@@ -599,7 +601,7 @@ export class ScriptedRecords {
   #agentOf(sessionId: string): ScriptedAgent {
     const agent = this.#agents.get(sessionId)
     if (agent === undefined) {
-      if (sessionId === this.#ids.sessions.offline) {
+      if (sessionId === this.#ids.sessions.offline || this.#shells.has(sessionId)) {
         // A session running a shell and nothing else: its worker is there and has no agent.
         const empty: ScriptedAgent = {
           instances: [],
@@ -1367,6 +1369,11 @@ export class ScriptedRecords {
       this.#agent(instance, [['thread.started', 'Codex started a new conversation.']], false)
     )
     return instance
+  }
+
+  /** Starts a session that runs a shell and nothing else, as a creation does. */
+  startShell(sessionId: string): void {
+    this.#shells.add(sessionId)
   }
 
   /** Records output a session wrote, after what it wrote before. */

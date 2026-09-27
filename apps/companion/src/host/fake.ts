@@ -24,6 +24,8 @@ import type {
   HostInfoResult,
   PresentationReason,
   Receipt,
+  SessionCreateParams,
+  SessionCreateResult,
   SessionListResult,
   SessionReadResult,
   ShellLaunchResult,
@@ -217,6 +219,13 @@ export interface FakeHostControls {
   setConnected(connected: boolean, reason?: string): void
   /** Sets what the connection may do, and says so as native code does. */
   setRights(rights: readonly ActionRight[]): void
+  /**
+   * Takes this host's qualified shell packages away, so a managed creation is refused the way the
+   * host refuses one it cannot qualify: with the reason, and never a stock shell in its place.
+   */
+  withoutQualifiedShell(): void
+  /** Every session creation the interface asked for, as it asked. */
+  readonly sessionCreates: readonly SessionCreateParams[]
   /**
    * Holds every answer to `read` from now on, as a slow backend would, until the test answers it.
    * Each answer is what the host held when the read was made, a refusal included, so a test can
@@ -479,6 +488,11 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
   const listeners = new Set<(event: HostEvent) => void>()
   const dropListeners = new Set<(files: readonly DroppedFile[]) => void>()
   const savedExports: Written[] = []
+  // The sessions created here, after the ones the host starts with, and what each creation asked.
+  const created: SessionSummaryOf[] = []
+  const sessionCreates: SessionCreateParams[] = []
+  let qualifiedShell = true
+  const listed = (): SessionSummaryOf[] => [...sessions().sessions, ...created]
   const exportedArchives: Parameters<HostPort['exportSemanticJson']>[0][] = []
   const exportedCasts: Parameters<HostPort['exportAsciicast']>[0][] = []
   const openedLinks: string[] = []
@@ -634,16 +648,51 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
     sessionList: () =>
       reading('sessionList', () => {
         requireConnection()
-        return sessions()
+        return { sessions: listed() }
       }),
     sessionRead: (params) =>
       reading('sessionRead', () => {
         requireConnection()
         const sessionId = (params as { session_id?: string }).session_id ?? SESSION_MAIN
-        const found = sessions().sessions.find((session) => session.session_id === sessionId)
+        const found = listed().find((session) => session.session_id === sessionId)
         if (!found) refuse('UNKNOWN_SESSION', 'That session is not on this host.')
         return { endpoint: null, session: found } as unknown as SessionReadResult
       }),
+    sessionCreate: (params) => {
+      requireConnection()
+      sessionCreates.push(params)
+      if (!rights.includes('session.create')) {
+        refuse('PERMISSION_DENIED', 'This device may not create sessions on this host.')
+      }
+      if (params.environment_id !== ENVIRONMENT) {
+        refuse('NOT_FOUND', 'This host does not own that environment.')
+      }
+      if (params.launch_profile.command_integrations.length > 0) {
+        refuse('INVALID_ARGUMENT', 'A create request names no command integrations.')
+      }
+      // A managed session runs a qualified package or nothing: the host names what is missing and
+      // never launches a stock shell in its place.
+      if (params.shell_mode === 'managed' && !qualifiedShell) {
+        refuse(
+          'SHELL_INTEGRATION_UNSUPPORTED',
+          'no qualified shell packages are installed; KR_SHELL_PACKAGES names none either'
+        )
+      }
+      const summary = createdSession(params, created.length)
+      created.push(summary)
+      records.startShell(summary.session_id)
+      const result: SessionCreateResult = {
+        deduplicated: false,
+        endpoint: null,
+        presentation_error: null,
+        session: summary
+      }
+      return Promise.resolve({
+        receipt: receipt(nextActionId(), 'applied', 'session.create'),
+        action_id: null,
+        value: result
+      })
+    },
     sessionClose: (params) => {
       requireConnection()
       const sessionId = (params as { session_id?: string }).session_id ?? SESSION_MAIN
@@ -665,10 +714,15 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
       })
     },
 
-    launchSurface: () =>
+    launchSurface: (params) =>
       reading('launchSurface', () => {
         requireConnection()
-        return fakeLaunchSurface(true, String(promptGeneration))
+        // A stock shell's editor is not the host's to see, so its prompt is never verified empty.
+        const sessionId = (params as { session_id?: string } | null)?.session_id
+        const stock = listed().some(
+          (session) => session.session_id === sessionId && session.shell_mode === 'native_compat'
+        )
+        return fakeLaunchSurface(!stock, String(promptGeneration))
       }),
     shellLaunch: (params) => {
       requireConnection()
@@ -1299,6 +1353,10 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
       lostBecause = reason
       for (const listener of connectionListeners) listener(connectionNow())
     },
+    withoutQualifiedShell() {
+      qualifiedShell = false
+    },
+    sessionCreates,
     setRights(next) {
       rights = next
       for (const listener of connectionListeners) listener(connectionNow())
@@ -1747,6 +1805,39 @@ function sessions(): SessionListResult {
       }
     ]
   } as unknown as SessionListResult
+}
+
+/** One session in a listing. */
+type SessionSummaryOf = SessionListResult['sessions'][number]
+
+/**
+ * The session a creation made, as the host reports it: running the shell the mode asked for, in
+ * the directory the request named, with nothing attached yet.
+ */
+function createdSession(params: SessionCreateParams, before: number): SessionSummaryOf {
+  const number = 4 + before
+  return {
+    application_state: 'shell_ready',
+    attachment_count: '0',
+    closure: null,
+    created_at_ms: String(FAKE_NOW_MS),
+    cwd: params.cwd ?? '/',
+    desktop: { bound: true, desktop_session_id: 'd-1' },
+    dimensions: params.dimensions ?? { columns: '120', rows: '40' },
+    display_number: String(number),
+    environment_id: params.environment_id,
+    root_process: { pid: String(5000 + number), started_at_ms: String(FAKE_NOW_MS) },
+    session_epoch: '1',
+    session_id: `8a7b6c50-22bb-4c3d-8e4f-${String(200 + number).padStart(12, '0')}`,
+    shell_mode: params.shell_mode,
+    // A managed session runs the qualified package; a stock one runs the system's own shell.
+    shell_path:
+      params.shell_mode === 'managed'
+        ? '/Users/rs/Library/Application Support/KalaReach/shells/zsh/bin/zsh'
+        : '/bin/zsh',
+    state: 'live',
+    worker_profile: params.worker_profile
+  } as unknown as SessionSummaryOf
 }
 
 function retained(deleted: ReadonlySet<string>): RetainedArtefacts {

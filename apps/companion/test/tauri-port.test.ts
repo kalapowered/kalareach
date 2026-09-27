@@ -11,7 +11,7 @@
 
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import type { GrantCreateParams, RoleSelection } from '@kalareach/protocol'
+import type { GrantCreateParams, RoleSelection, SessionCreateParams } from '@kalareach/protocol'
 
 import type { ConnectionState } from '../src/host/port'
 import { CONNECTION_EVENT, tauriPort } from '../src/host/tauri'
@@ -260,6 +260,28 @@ describe('the desktop port and the published methods', () => {
     expect(shell.invoked[3]?.args).toEqual({ params: review, subject: {} })
     expect(shell.invoked[5]?.args).toEqual({ selection })
     expect(shell.invoked[6]?.args).toEqual({ params: grant, subject: { sessionId: SESSION } })
+  })
+})
+
+describe('the desktop port and a session creation', () => {
+  it('sends the creation to its own command, naming the environment and no session', async () => {
+    const creation: SessionCreateParams = {
+      environment_id: '3f1a2c40-11aa-4b2c-9d3e-000000000001',
+      presentation: 'invisible',
+      shell: null,
+      shell_mode: 'native_compat',
+      cwd: '/Users/rs/work/notes',
+      dimensions: null,
+      worker_profile: 'desktop_bound',
+      environment_snapshot: [],
+      palette: null,
+      launch_profile: { startup: 'host_default', fenced_launch: false, command_integrations: [] },
+      terminal: null
+    }
+    await tauriPort().sessionCreate(creation, {})
+    expect(shell.invoked).toEqual([
+      { command: 'session_create', args: { params: creation, subject: {} } }
+    ])
   })
 })
 

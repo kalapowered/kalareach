@@ -128,6 +128,7 @@ export function tauriPort(): HostPort {
 
     sessionList: (params) => read('session_list', params),
     sessionRead: (params) => read('session_read', params),
+    sessionCreate: (params, subject) => mutate('session_create', params, subject),
     sessionClose: (params, subject) => mutate('session_close', params, subject),
 
     launchSurface: () => noAgreedShape('the launch surface'),
