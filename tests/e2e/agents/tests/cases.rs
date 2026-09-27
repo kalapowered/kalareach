@@ -3388,16 +3388,35 @@ fn a_disconnection_after_the_agent_took_a_prompt_leaves_one_reply_and_no_duplica
                 conversations.display()
             );
         };
-        // The device goes: both its connections close, and nothing it had not received by then can
-        // reach it. Every event it received before that, still queued, is then applied and looked
-        // at the same way; one that cannot be applied leaves the boundary unknown, so reached.
+        // The device goes: both its connections close. The view's reader, which publishes what the
+        // connection received, holds the one reference to its transport besides the connection's
+        // own and lets go of it only once it has stopped; until it has, something it had received
+        // could still reach the view, so a reader that does not stop leaves the boundary unknown.
+        // Every event received before the cutoff, still queued, is then applied and looked at the
+        // same way; one that cannot be applied leaves the boundary unknown too.
         let old = (
             logged.keyboard.attachment_id(),
             logged.keyboard.epoch(),
             logged.keyboard.next_sequence(),
         );
+        let held_with_reader =
+            std::sync::Arc::strong_count(logged.screen.remote.session().transport());
         logged.agent.session.remote.close();
         logged.screen.remote.close();
+        let closing = std::time::Instant::now();
+        let reader_stopped = loop {
+            if held_with_reader >= 2
+                && std::sync::Arc::strong_count(logged.screen.remote.session().transport())
+                    < held_with_reader
+            {
+                break true;
+            }
+            if closing.elapsed() >= Duration::from_secs(5) {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        reached |= !reader_stopped;
         loop {
             match stage.runtime.block_on(
                 logged
@@ -3455,8 +3474,9 @@ fn a_disconnection_after_the_agent_took_a_prompt_leaves_one_reply_and_no_duplica
             let evidence = json!({
                 "account": account_evidence(stage, logged.turns),
                 "conversation": conversation_id(&conversation),
-                "boundary": "an event or output byte the device was sent between the submission and the agent's record of the prompt showed the reply, or the device was sent or asked for a fresh screen in that time",
+                "boundary": "an event or output byte the device was sent between the submission and the agent's record of the prompt showed the reply, the device was sent or asked for a fresh screen in that time, or its reader was not seen to stop once it disconnected",
                 "code_seen": code_seen,
+                "reader_stopped": reader_stopped,
             });
             return Ending::new(
                 Outcome::not_run(
@@ -3534,6 +3554,7 @@ fn a_disconnection_after_the_agent_took_a_prompt_leaves_one_reply_and_no_duplica
             "conversation": conversation_id(&conversation),
             "admission": "the agent's conversation held the prompt, and no screen the device was sent from the submission until it disconnected showed the reply mark or the code in upper case",
             "markers": { "reply_begins": begin, "reply_ends": end, "screen_reply_mark": account.reply_mark, "looked_for": code_start },
+            "cutoff": { "reader_stopped": reader_stopped, "fresh_screens": logged.screen.view.fresh_screens() - fresh_before },
             "reconciled": { "attachment": old.0.to_string(), "epoch": old.1.get(), "next_sequence": old.2, "stale_input": stale.err().map(|refusal| refusal.detail) },
             "after_reconnect": { "prompts": prompts, "finished_replies": replies, "rows": redrawn.iter().filter(|row| row.contains(&end)).collect::<Vec<_>>() },
             "control": { "what": "the same prompt sent again", "breaks_property": true, "prompts": prompts_twice, "finished_replies": replies_twice, "check": control.err() },
