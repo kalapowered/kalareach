@@ -216,7 +216,12 @@ impl Agent {
 /// Links the build, prepares the run's home and returns the session environment.
 fn prepare(stage: &Stage<'_, '_>, prefix: &Path) -> (Installation, Vec<(String, String)>) {
     let installation = Installation::link(stage.run, prefix, &stage.build.runtime);
-    let variables = session_variables(stage.host, stage.shell, stage.build, closed_port());
+    let variables = session_variables(
+        stage.host,
+        stage.shell,
+        &stage.build.environment,
+        closed_port(),
+    );
     prepare_home(stage.host, &variables);
     let home = stage.run.home();
     for (relative, content) in &stage.build.home {

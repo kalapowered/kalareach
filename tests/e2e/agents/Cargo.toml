@@ -11,6 +11,9 @@ publish.workspace = true
 [[test]]
 name = "cases"
 
+[[test]]
+name = "integration"
+
 [dependencies]
 # The host, the paired device, the terminal windows and the process record: the cross-boundary
 # checkpoint's own harness, used as a library.

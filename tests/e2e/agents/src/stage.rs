@@ -34,7 +34,6 @@ use kr_protocol::pairing::SensitiveAction;
 use kr_protocol::recovery::{EventsSnapshotParams, EventsSnapshotResult};
 use kr_protocol::scalars::{CanonicalSet, Nullable};
 
-use crate::build::Build;
 use crate::provenance::{Expected, PATH_FILE, Provenance};
 
 /// The prompt the run's own startup file sets, so a part knows the shell reads.
@@ -199,9 +198,56 @@ pub fn install(
     generation: &Path,
     package: &str,
 ) -> Installed {
+    let copy = enrol_generation(host, owner, runtime, generation);
+    install_package(host, owner, runtime, &copy, package)
+}
+
+/// Enrols a copy of `generation` the way a person's owner device does: the device confirms the
+/// repository's root and the host synchronises it. Returns the copy, which every installation
+/// from it reads its index from.
+///
+/// # Panics
+///
+/// Panics at the first step the host refuses, naming it.
+#[must_use]
+pub fn enrol_generation(
+    host: &Host<'_>,
+    owner: &Owner,
+    runtime: &tokio::runtime::Runtime,
+    generation: &Path,
+) -> PathBuf {
     let copy = host.run().root().join("generation");
     copy_tree(generation, &copy);
     let root = std::fs::read(copy.join("root.json")).expect("the generation's root");
+    let _ = runtime
+        .block_on(enrol(
+            &owner.remote,
+            CATALOGUE,
+            CatalogueKind::Local,
+            &directory_url(&copy.join("metadata")),
+            &directory_url(&copy.join("targets")),
+            &root,
+        ))
+        .unwrap_or_else(|why| panic!("the owner device enrols the generation: {why}"));
+    let _ = host.kr_json(&["plugin", "repo", "sync", CATALOGUE]);
+    copy
+}
+
+/// Installs one package from the enrolled copy of a generation the way a person's owner device
+/// does: the device confirms the exact installation with the capabilities it grants, and the
+/// package is enabled.
+///
+/// # Panics
+///
+/// Panics at the first step the host refuses, naming it.
+#[must_use]
+pub fn install_package(
+    host: &Host<'_>,
+    owner: &Owner,
+    runtime: &tokio::runtime::Runtime,
+    copy: &Path,
+    package: &str,
+) -> Installed {
     let index: serde_json::Value = serde_json::from_slice(
         &std::fs::read(copy.join("targets/index.json")).expect("the generation's index"),
     )
@@ -222,18 +268,6 @@ pub fn install(
         .collect();
     grant.sort();
     grant.dedup();
-
-    let _ = runtime
-        .block_on(enrol(
-            &owner.remote,
-            CATALOGUE,
-            CatalogueKind::Local,
-            &directory_url(&copy.join("metadata")),
-            &directory_url(&copy.join("targets")),
-            &root,
-        ))
-        .unwrap_or_else(|why| panic!("the owner device enrols the generation: {why}"));
-    let _ = host.kr_json(&["plugin", "repo", "sync", CATALOGUE]);
 
     let environment_id = owner.remote.environment_id();
     let listed: CatalogueListResult = runtime
@@ -375,12 +409,12 @@ impl Installation {
 /// run in: the host's own variables for `kr`, the run's PATH ([`session_path`]), the run's home as
 /// the home and the startup directory, every proxy variable at a loopback port nothing listens on
 /// (loopback itself excepted, where a terminal route's own server listens), and the build's own
-/// switches.
+/// switches, `switches`.
 #[must_use]
 pub fn session_variables(
     host: &Host<'_>,
     shell: &ManagedShell,
-    build: &Build,
+    switches: &std::collections::BTreeMap<String, String>,
     closed: u16,
 ) -> Vec<(String, String)> {
     let home = host.run().home().display().to_string();
@@ -420,7 +454,7 @@ pub fn session_variables(
     for name in ["NO_PROXY", "no_proxy"] {
         variables.push((name.to_owned(), "localhost,127.0.0.1,::1".to_owned()));
     }
-    for (name, value) in &build.environment {
+    for (name, value) in switches {
         variables.push((name.clone(), value.clone()));
     }
     variables
