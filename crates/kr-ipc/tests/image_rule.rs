@@ -14,9 +14,10 @@
 //!
 //! A file is passed over only when nothing but test code declares it: every `mod` that names it
 //! is under such a `cfg`, or is in a file that is itself test code. A file any production `mod`
-//! names is read, whatever else names it, and so is a file no `mod` names, a crate's root among
-//! them. A `mod` inside an inline module names its file under that module's directory, as the
-//! compiler places it.
+//! names is read, whatever else names it, and so is a file no `mod` names. A crate's root, as Cargo
+//! lists each target's, is read whatever names it, and the modules it declares live beside it. A
+//! `mod` inside an inline module names its file under that module's directory, as the compiler
+//! places it.
 //!
 //! The reading is by tokens: comments and string and character literals are not code and are
 //! passed over, so a sentence that mentions `current_exe` is not a use of it.
@@ -478,14 +479,53 @@ fn past_item(tokens: &[Located], mut at: usize, end: usize) -> usize {
     at
 }
 
-/// Where the files a file's out-of-line modules live: beside `lib.rs`, `main.rs` and `mod.rs`, and
-/// in the directory of the file's own name otherwise.
-fn module_directory(file: &Path) -> PathBuf {
+/// Where the files a file's out-of-line modules live: beside a crate's root, one of `roots`, and
+/// beside a `mod.rs`, and in the directory of the file's own name otherwise.
+fn module_directory(file: &Path, roots: &BTreeSet<PathBuf>) -> PathBuf {
     let directory = file.parent().unwrap_or_else(|| Path::new("")).to_path_buf();
-    match file.file_name().and_then(|name| name.to_str()) {
-        Some("lib.rs" | "main.rs" | "mod.rs") => directory,
-        _ => directory.join(file.file_stem().unwrap_or_default()),
+    if roots.contains(file) || file.file_name() == Some(std::ffi::OsStr::new("mod.rs")) {
+        directory
+    } else {
+        directory.join(file.file_stem().unwrap_or_default())
     }
+}
+
+/// The root of every target of the workspace's packages, as Cargo lists them.
+fn crate_roots(workspace: &Path) -> BTreeSet<PathBuf> {
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let output = std::process::Command::new(cargo)
+        .args([
+            "metadata",
+            "--no-deps",
+            "--format-version",
+            "1",
+            "--offline",
+        ])
+        .current_dir(workspace)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("cargo metadata runs");
+    assert!(
+        output.status.success(),
+        "cargo metadata: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("cargo metadata's JSON");
+    metadata["packages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|package| package["targets"].as_array().into_iter().flatten())
+        .filter_map(|target| target["src_path"].as_str())
+        .map(|path| {
+            normalise(
+                &Path::new(path)
+                    .canonicalize()
+                    .unwrap_or_else(|_| PathBuf::from(path)),
+            )
+        })
+        .collect()
 }
 
 /// Every `.rs` file under `directory`, in path order.
@@ -516,10 +556,10 @@ fn workspace() -> PathBuf {
 }
 
 /// The directory a declaration inside the inline modules `inline` of `file` names its files from.
-fn inline_directory(file: &Path, inline: &[String]) -> PathBuf {
+fn inline_directory(file: &Path, inline: &[String], roots: &BTreeSet<PathBuf>) -> PathBuf {
     inline
         .iter()
-        .fold(module_directory(file), |directory, part| {
+        .fold(module_directory(file, roots), |directory, part| {
             directory.join(part)
         })
 }
@@ -527,16 +567,20 @@ fn inline_directory(file: &Path, inline: &[String]) -> PathBuf {
 /// The files a declaration of `file` can name: its `#[path]`, relative to the declaring file's
 /// directory outside an inline module and to the inline module's directory inside one, and
 /// otherwise `name.rs` or `name/mod.rs`.
-fn declared_files(file: &Path, declaration: &Declaration) -> Vec<PathBuf> {
+fn declared_files(
+    file: &Path,
+    declaration: &Declaration,
+    roots: &BTreeSet<PathBuf>,
+) -> Vec<PathBuf> {
     match &declaration.path {
         Some(path) if declaration.inline.is_empty() => vec![normalise(
             &file.parent().unwrap_or_else(|| Path::new("")).join(path),
         )],
         Some(path) => vec![normalise(
-            &inline_directory(file, &declaration.inline).join(path),
+            &inline_directory(file, &declaration.inline, roots).join(path),
         )],
         None => {
-            let directory = inline_directory(file, &declaration.inline);
+            let directory = inline_directory(file, &declaration.inline, roots);
             vec![
                 normalise(&directory.join(format!("{}.rs", declaration.name))),
                 normalise(&directory.join(&declaration.name).join("mod.rs")),
@@ -560,11 +604,15 @@ fn normalise(path: &Path) -> PathBuf {
     normal
 }
 
-/// Every production use of [`NAME`] in `sources`, each `(file, text)`, as `(file, line)`.
+/// Every production use of [`NAME`] in `sources`, each `(file, text)`, as `(file, line)`, where
+/// `roots` are the crates' roots.
 ///
-/// A file is production code when no `mod` names it, a crate's root among them, or when a `mod`
+/// A file is production code when it is a crate's root, when no `mod` names it, or when a `mod`
 /// that is not test code names it from a file that is production code; the rest is test code.
-fn production_uses(sources: &[(PathBuf, String)]) -> Vec<(PathBuf, usize)> {
+fn production_uses(
+    sources: &[(PathBuf, String)],
+    roots: &BTreeSet<PathBuf>,
+) -> Vec<(PathBuf, usize)> {
     let readings: BTreeMap<PathBuf, Reading> = sources
         .iter()
         .map(|(file, text)| (normalise(file), read(text)))
@@ -575,12 +623,12 @@ fn production_uses(sources: &[(PathBuf, String)]) -> Vec<(PathBuf, usize)> {
             reading
                 .declarations
                 .iter()
-                .flat_map(|declaration| declared_files(file, declaration))
+                .flat_map(|declaration| declared_files(file, declaration, roots))
         })
         .collect();
     let mut production: BTreeSet<PathBuf> = readings
         .keys()
-        .filter(|file| !named.contains(*file))
+        .filter(|file| roots.contains(*file) || !named.contains(*file))
         .cloned()
         .collect();
     // What production code declares is production code, until nothing more is.
@@ -592,7 +640,7 @@ fn production_uses(sources: &[(PathBuf, String)]) -> Vec<(PathBuf, usize)> {
                     .declarations
                     .iter()
                     .filter(|declaration| !declaration.test_only)
-                    .flat_map(|declaration| declared_files(file, declaration))
+                    .flat_map(|declaration| declared_files(file, declaration, roots))
             })
             .filter(|declared| readings.contains_key(declared) && !production.contains(declared))
             .collect();
@@ -608,8 +656,8 @@ fn production_uses(sources: &[(PathBuf, String)]) -> Vec<(PathBuf, usize)> {
 }
 
 /// Every production use of [`NAME`] under `crates/*/src`, as `(file, line)` relative to the
-/// workspace, and the number of files read.
-fn uses_in(workspace: &Path) -> (Vec<(String, usize)>, usize) {
+/// workspace, the number of files read, and the crates' roots.
+fn uses_in(workspace: &Path) -> (Vec<(String, usize)>, usize, BTreeSet<PathBuf>) {
     let mut files = Vec::new();
     let crates = workspace.join("crates");
     let mut members: Vec<PathBuf> = std::fs::read_dir(&crates)
@@ -631,7 +679,8 @@ fn uses_in(workspace: &Path) -> (Vec<(String, usize)>, usize) {
             )
         })
         .collect();
-    let uses = production_uses(&sources)
+    let roots = crate_roots(workspace);
+    let uses = production_uses(&sources, &roots)
         .into_iter()
         .map(|(file, line)| {
             let relative = file
@@ -642,17 +691,24 @@ fn uses_in(workspace: &Path) -> (Vec<(String, usize)>, usize) {
             (relative, line)
         })
         .collect();
-    (uses, files.len())
+    (uses, files.len(), roots)
 }
 
 /// No production code in the host's crates asks where its program is, but the install module.
 #[test]
 fn only_the_install_module_asks_where_its_program_is() {
-    let (uses, files) = uses_in(&workspace());
+    let workspace = workspace();
+    let (uses, files, roots) = uses_in(&workspace);
     assert!(
         files > 500,
         "the whole of crates/*/src was read, and it was: {files} files"
     );
+    for root in ["crates/kr-ipc/src/lib.rs", "crates/kr-cli/src/bin/kr.rs"] {
+        assert!(
+            roots.contains(&workspace.join(root)),
+            "Cargo lists {root} as a crate's root"
+        );
+    }
     let outside: Vec<String> = uses
         .iter()
         .filter(|(file, _)| file != ALLOWED)
@@ -759,17 +815,25 @@ fn the_reading_tells_code_from_tests_and_from_words() {
             ("helpers", "tests".to_owned(), true),
         ]
     );
-    assert_eq!(
-        module_directory(Path::new("crates/x/src/service.rs")),
-        Path::new("crates/x/src/service")
-    );
+    let roots: BTreeSet<PathBuf> = ["crates/x/src/lib.rs", "crates/x/src/bin/tool.rs"]
+        .into_iter()
+        .map(PathBuf::from)
+        .collect();
+    for (file, directory) in [
+        ("crates/x/src/service.rs", "crates/x/src/service"),
+        ("crates/x/src/lib.rs", "crates/x/src"),
+        ("crates/x/src/bin/tool.rs", "crates/x/src/bin"),
+        ("crates/x/src/service/mod.rs", "crates/x/src/service"),
+    ] {
+        assert_eq!(
+            module_directory(Path::new(file), &roots),
+            Path::new(directory),
+            "{file}"
+        );
+    }
     assert_eq!(
         normalise(Path::new("crates/x/src/../../y/tests/mod.rs")),
         Path::new("crates/y/tests/mod.rs")
-    );
-    assert_eq!(
-        module_directory(Path::new("crates/x/src/lib.rs")),
-        Path::new("crates/x/src")
     );
 }
 
@@ -777,18 +841,20 @@ fn the_reading_tells_code_from_tests_and_from_words() {
 /// inline module names the file the compiler reads for it.
 #[test]
 fn a_file_is_test_code_only_when_nothing_else_declares_it() {
-    let uses = |files: &[(&str, &str)]| {
+    let with_roots = |roots: &[&str], files: &[(&str, &str)]| {
         let sources: Vec<(PathBuf, String)> = files
             .iter()
             .map(|(path, text)| (PathBuf::from(path), (*text).to_owned()))
             .collect();
-        let mut found: Vec<String> = production_uses(&sources)
+        let roots: BTreeSet<PathBuf> = roots.iter().map(PathBuf::from).collect();
+        let mut found: Vec<String> = production_uses(&sources, &roots)
             .into_iter()
             .map(|(file, _)| file.to_string_lossy().replace('\\', "/"))
             .collect();
         found.sort();
         found
     };
+    let uses = |files: &[(&str, &str)]| with_roots(&["src/lib.rs"], files);
     let asks = "pub fn f() { let _ = std::env::current_exe(); }";
     // A file a test module and a production module both load is production code.
     assert_eq!(
@@ -839,5 +905,34 @@ fn a_file_is_test_code_only_when_nothing_else_declares_it() {
             ("src/outer/checks.rs", asks),
         ]),
         vec!["src/checks.rs"]
+    );
+    // A binary's root declares its modules beside itself, as `lib.rs` does, so its production
+    // module is the file a test module of it also loads.
+    assert_eq!(
+        with_roots(
+            &["src/bin/tool.rs"],
+            &[
+                (
+                    "src/bin/tool.rs",
+                    "mod shared;\n#[cfg(test)]\n#[path = \"shared.rs\"]\nmod checks;\nfn main() {}",
+                ),
+                ("src/bin/shared.rs", asks),
+            ],
+        ),
+        vec!["src/bin/shared.rs"]
+    );
+    // And a crate's root is read whatever else declares it.
+    assert_eq!(
+        with_roots(
+            &["src/lib.rs", "src/bin/tool.rs"],
+            &[
+                (
+                    "src/lib.rs",
+                    "#[cfg(test)]\n#[path = \"bin/tool.rs\"]\nmod tool_checks;"
+                ),
+                ("src/bin/tool.rs", asks),
+            ],
+        ),
+        vec!["src/bin/tool.rs"]
     );
 }
