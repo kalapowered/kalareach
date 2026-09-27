@@ -170,6 +170,10 @@ pub struct Provenance {
     seen_path: Mutex<Option<String>>,
     seen: Mutex<Seen>,
     roots: Mutex<Vec<ProcessStartIdentity>>,
+    /// Every process a look found beneath the sessions, published as soon as the look has walked
+    /// the sessions and before it reads their images, under a lock of its own that is held only to
+    /// read or extend it: what a stop reads without waiting on a look.
+    published: Mutex<Vec<ProcessStartIdentity>>,
     stopped: AtomicBool,
 }
 
@@ -210,6 +214,7 @@ impl Provenance {
             seen_path: Mutex::new(None),
             seen: Mutex::new(Seen::default()),
             roots: Mutex::new(Vec::new()),
+            published: Mutex::new(Vec::new()),
             stopped: AtomicBool::new(false),
         }
     }
@@ -492,17 +497,23 @@ impl Provenance {
             .collect()
     }
 
-    /// [`Provenance::identified`], where no look holds the record now; `None` where one does, so a
-    /// caller that may not wait, such as a stop on a guarded change, never waits on a look.
+    /// Every process a look has found beneath the sessions so far, as soon as it walked them, read
+    /// without waiting on a look that is reading images.
     #[must_use]
-    pub fn identified_now(&self) -> Option<Vec<ProcessStartIdentity>> {
-        match self.seen.try_lock() {
-            Ok(seen) => Some(seen.identified.keys().cloned().collect()),
-            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
-                Some(poisoned.into_inner().identified.keys().cloned().collect())
-            }
-            Err(std::sync::TryLockError::WouldBlock) => None,
-        }
+    pub fn published(&self) -> Vec<ProcessStartIdentity> {
+        self.published
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// The sessions' root shells the looks walk from.
+    #[must_use]
+    pub fn watched(&self) -> Vec<ProcessStartIdentity> {
+        self.roots
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// Why a look did not find every process beneath the sessions, for the run's closing check to
@@ -676,6 +687,18 @@ impl Provenance {
                 }
             }
         }
+        // What the walk found goes out before the images are read, which can take a while.
+        {
+            let mut published = self
+                .published
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            for (identity, _) in &found {
+                if !published.contains(identity) {
+                    published.push(identity.clone());
+                }
+            }
+        }
         let pids: Vec<u32> = found
             .iter()
             .filter_map(|(identity, _)| u32::try_from(identity.pid.get()).ok())
@@ -808,7 +831,11 @@ fn elsewhere(executed: &Executed) -> Result<(), String> {
 
 /// Whether `identity` still runs beneath `parent`, which still runs: `Ok(false)` when it has
 /// ended or its number now names a process with another parent.
-fn beneath_parent(
+///
+/// # Errors
+///
+/// Returns why the process or its parent could not be read.
+pub fn beneath_parent(
     identity: &ProcessStartIdentity,
     parent: &ProcessStartIdentity,
 ) -> Result<bool, String> {

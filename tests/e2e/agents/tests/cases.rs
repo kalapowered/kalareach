@@ -39,7 +39,7 @@ use kr_e2e_agents::observe::{
     typed_actions,
 };
 use kr_e2e_agents::outcome::Outcome;
-use kr_e2e_agents::provenance::{Expected, NOT_PINNED, Provenance, StopSampling};
+use kr_e2e_agents::provenance::{Expected, NOT_PINNED, Provenance, StopSampling, beneath_parent};
 use kr_e2e_agents::stage::{
     AgentProcess, Context, Installation, Installed, Keyboard, Owner, PROMPT, Replacement, Session,
     closed_port, default_keychain_of_a_session, events_snapshot, free_port, inode_of, install,
@@ -56,6 +56,7 @@ use kr_e2e_m1b::run::{Run, ended_within, output_within, running, signal};
 use kr_e2e_m1b::shells::{self, ManagedShell};
 use kr_e2e_m1b::view::View;
 use kr_e2e_m1b::window::{Window, answered};
+use kr_ipc::identity::{ProcessState, process_state};
 use kr_protocol::agent::AgentSubject;
 use kr_protocol::error::ErrorCode;
 use kr_protocol::identity::ProcessStartIdentity;
@@ -167,6 +168,8 @@ struct Guards {
     registry: std::sync::Mutex<Registry>,
     /// The agent's processes and its server's, as each launch found them, ended at a change.
     agents: std::sync::Mutex<Vec<ProcessStartIdentity>>,
+    /// What a stop on a change ended, and what still ran after it: for the part's outcome.
+    stopped: std::sync::Mutex<Option<serde_json::Value>>,
 }
 
 /// The probes a part runs, each by its process group, whose leader stays unreaped while it is
@@ -209,12 +212,13 @@ impl Guards {
         self.changed.lock().ok().and_then(|changed| changed.clone())
     }
 
-    /// Records `what` changed and, the first time, ends everything the part started: each probe's
-    /// process group that runs, under the registry's lock; then, from one reading of the process
-    /// table, every process beneath the run's recorded processes, the agent's and its server's, and
-    /// those the provenance sampler has identified where its record can be read without waiting,
-    /// with those roots themselves, twice, so a child started meanwhile goes too; then everything
-    /// the run recorded, its host among them. Nothing here waits on the sampler.
+    /// Records `what` changed and, the first time, ends everything the part started, waiting on
+    /// nothing of the provenance sampler: each probe's process group that runs, under the
+    /// registry's lock; then every process the run recorded, the sessions' root shells, the
+    /// processes each launch found and those the sampler has published, and every process beneath
+    /// them, each stopped (SIGSTOP) before its children are looked for, so none can start another
+    /// or leave its children to the system while the set is gathered ([`freeze`]); then each is
+    /// killed, the run's own close follows, and what still runs half a second later is recorded.
     fn trip(&self, what: String, run: &Run, provenance: &Provenance) {
         if let Ok(mut changed) = self.changed.lock() {
             changed.get_or_insert(what);
@@ -240,20 +244,29 @@ impl Guards {
             .into_iter()
             .map(|owned| owned.identity)
             .collect();
+        roots.extend(provenance.watched());
         roots.extend(
             self.agents
                 .lock()
                 .map(|agents| agents.clone())
                 .unwrap_or_default(),
         );
-        roots.extend(provenance.identified_now().unwrap_or_default());
-        for _ in 0..2 {
-            for identity in tree_of(&roots) {
-                signal(&identity, rustix::process::Signal::KILL);
-            }
-            std::thread::sleep(Duration::from_millis(50));
+        roots.extend(provenance.published());
+        let frozen = freeze(&roots);
+        for identity in &frozen {
+            signal(identity, rustix::process::Signal::KILL);
         }
         run.end_everything();
+        std::thread::sleep(Duration::from_millis(500));
+        let survivors: Vec<u64> = frozen
+            .iter()
+            .filter(|identity| matches!(process_state(identity), ProcessState::Running))
+            .map(|identity| identity.pid.get())
+            .collect();
+        if let Ok(mut stopped) = self.stopped.lock() {
+            *stopped =
+                Some(json!({ "stopped_and_killed": frozen.len(), "still_running": survivors }));
+        }
     }
 }
 
@@ -274,33 +287,52 @@ fn watch_guards(guards: &Guards, run: &Run, provenance: &Provenance, needles: &[
     }
 }
 
-/// `roots` and every process beneath them, from one reading of the process table, each by the
-/// start the kernel reports for its number now; a process that ended meanwhile is left out. Where
-/// the table cannot be read, the roots alone.
-fn tree_of(roots: &[ProcessStartIdentity]) -> Vec<ProcessStartIdentity> {
-    let Ok(table) = kr_e2e_m1b::run::process_table() else {
-        return roots.to_vec();
-    };
-    let mut found = roots.to_vec();
-    let mut under: Vec<u32> = roots
-        .iter()
-        .filter_map(|root| u32::try_from(root.pid.get()).ok())
-        .collect();
-    let mut seen = std::collections::BTreeSet::new();
-    while let Some(parent) = under.pop() {
-        for entry in table.iter().filter(|entry| entry.parent == parent) {
-            if !seen.insert(entry.pid) {
-                continue;
-            }
-            if let kr_ipc::identity::ProcessQuery::Present(identity) =
-                kr_ipc::identity::query_process(entry.pid)
-            {
-                found.push(identity);
-            }
-            under.push(entry.pid);
+/// Stops each of `roots` that runs and every process beneath them, and returns every process it
+/// stopped: a pass reads the process table once and stops each process found beneath one already
+/// stopped, by its start identity and only when its parent, read under its own identity, is the
+/// stopped process it was found under; passes go on until one finds nothing new, so a process
+/// started before its parent stopped is found beneath it, and none of them can start another
+/// meanwhile. At most fifty passes.
+fn freeze(roots: &[ProcessStartIdentity]) -> Vec<ProcessStartIdentity> {
+    let mut stopped: Vec<ProcessStartIdentity> = Vec::new();
+    for root in roots {
+        if !stopped.contains(root) && matches!(process_state(root), ProcessState::Running) {
+            signal(root, rustix::process::Signal::STOP);
+            stopped.push(root.clone());
         }
     }
-    found
+    for _ in 0..50 {
+        let Ok(table) = kr_e2e_m1b::run::process_table() else {
+            break;
+        };
+        let mut new = Vec::new();
+        for parent in &stopped {
+            let Ok(parent_pid) = u32::try_from(parent.pid.get()) else {
+                continue;
+            };
+            for entry in table.iter().filter(|entry| entry.parent == parent_pid) {
+                let kr_ipc::identity::ProcessQuery::Present(identity) =
+                    kr_ipc::identity::query_process(entry.pid)
+                else {
+                    continue;
+                };
+                if stopped.contains(&identity) || new.contains(&identity) {
+                    continue;
+                }
+                if matches!(beneath_parent(&identity, parent), Ok(true)) {
+                    new.push(identity);
+                }
+            }
+        }
+        if new.is_empty() {
+            break;
+        }
+        for identity in new {
+            signal(&identity, rustix::process::Signal::STOP);
+            stopped.push(identity);
+        }
+    }
+    stopped
 }
 
 /// Stops the watcher of a part's files when the part's own steps end, however they end.
@@ -519,6 +551,7 @@ fn staged(
             watching: std::sync::atomic::AtomicBool::new(false),
             registry: std::sync::Mutex::new(Registry::default()),
             agents: std::sync::Mutex::new(Vec::new()),
+            stopped: std::sync::Mutex::new(None),
         });
     let run = Run::start(&format!("part {part}"));
     let root = run.root().to_path_buf();
@@ -552,6 +585,13 @@ fn staged(
     // What the watcher of the person's files found changed while the part ran, where anything did:
     // the agent stops on it, whatever the part's own steps then failed on.
     let guard_change = guards.as_ref().and_then(Guards::changed);
+    let guard_stop = guards.as_ref().and_then(|guards| {
+        guards
+            .stopped
+            .lock()
+            .ok()
+            .and_then(|stopped| stopped.clone())
+    });
     // What the part left is read only once nothing it started still runs: after the closing
     // check, or, after a part that stopped part way, once the run has ended everything and found
     // nothing left. The run's directory is still there then.
@@ -710,8 +750,12 @@ fn staged(
     let mut stop = watched_stop;
     if let Some(what) = &guard_change {
         stop.push(format!(
-            "{GUARD_CHANGED} {what}; when it was seen, the part ended the probe that ran, every \
-             process beneath the run's and the agent's processes and those processes themselves"
+            "{GUARD_CHANGED} {what}; when it was seen the part stopped and killed the probe that \
+             ran, the run's recorded processes, the sessions' shells, the agent's processes and \
+             those the provenance sampler had found, with every process beneath them ({})",
+            guard_stop
+                .as_ref()
+                .map_or_else(|| "no count".to_owned(), ToString::to_string)
         ));
     }
     if let Err(left) = &writers {
@@ -2031,7 +2075,15 @@ fn login_holds(stage: &Stage<'_, '_>, variables: &[(String, String)]) {
 /// answer.
 fn probe_output(
     stage: &Stage<'_, '_>,
+    command: std::process::Command,
+) -> Result<std::process::Output, String> {
+    grouped_output(command, stage.guards.map(|guards| &guards.registry))
+}
+
+/// [`probe_output`] with the registry it lists the probe in, where there is one.
+fn grouped_output(
     mut command: std::process::Command,
+    listing: Option<&std::sync::Mutex<Registry>>,
 ) -> Result<std::process::Output, String> {
     use std::io::Read;
     use std::os::unix::process::CommandExt;
@@ -2049,9 +2101,8 @@ fn probe_output(
         let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
     };
     // Listed, or, after a change, ended at once and refused.
-    let tripped = stage.guards.is_some_and(|guards| {
-        let mut registry = guards
-            .registry
+    let tripped = listing.is_some_and(|registry| {
+        let mut registry = registry
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if registry.tripped {
@@ -2110,9 +2161,8 @@ fn probe_output(
     // The group goes whole while its leader is unreaped, and comes off the list under the same
     // lock a stop takes; only then is the leader reaped.
     {
-        let registry = stage.guards.map(|guards| {
-            guards
-                .registry
+        let registry = listing.map(|registry| {
+            registry
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
         });
@@ -2125,9 +2175,10 @@ fn probe_output(
         .wait()
         .map_err(|error| format!("it could not be reaped: {error}"))?;
     ended?;
+    let handover = std::time::Instant::now() + Duration::from_secs(5);
     let collect = |received: std::sync::mpsc::Receiver<Vec<u8>>| {
         received
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(handover.saturating_duration_since(std::time::Instant::now()))
             .map_err(|_| "it ended and its output stayed open past five seconds".to_owned())
     };
     Ok(std::process::Output {
@@ -5483,4 +5534,92 @@ fn a_session_started_with_a_persons_own_home_keeps_their_login_keychain_as_its_d
         }),
     )
     .append(&result);
+}
+
+/// A shell and two sleeps beneath it, started by this test and ended by it.
+fn a_small_tree() -> (std::process::Child, ProcessStartIdentity) {
+    let child = std::process::Command::new("/bin/sh")
+        .args(["-c", "/bin/sleep 60 & /bin/sleep 60 & wait"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("a shell");
+    let kr_ipc::identity::ProcessQuery::Present(identity) =
+        kr_ipc::identity::query_process(child.id())
+    else {
+        panic!("the shell's identity");
+    };
+    // Its two children start.
+    let started = std::time::Instant::now();
+    while started.elapsed() < Duration::from_secs(5) {
+        let children = kr_e2e_m1b::run::process_table()
+            .expect("the process table")
+            .into_iter()
+            .filter(|entry| entry.parent == child.id())
+            .count();
+        if children == 2 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    (child, identity)
+}
+
+#[test]
+fn a_stop_freezes_a_tree_whole_before_it_is_killed() {
+    let (mut child, root) = a_small_tree();
+    let frozen = freeze(std::slice::from_ref(&root));
+    assert_eq!(
+        frozen.len(),
+        3,
+        "the shell and its two children: {frozen:?}"
+    );
+    for identity in &frozen {
+        signal(identity, rustix::process::Signal::KILL);
+    }
+    let _ = child.wait();
+    let ended = std::time::Instant::now();
+    while frozen[1..]
+        .iter()
+        .any(|identity| matches!(process_state(identity), ProcessState::Running))
+        && ended.elapsed() < Duration::from_secs(5)
+    {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        frozen[1..]
+            .iter()
+            .all(|identity| !matches!(process_state(identity), ProcessState::Running)),
+        "every process of the tree ended"
+    );
+}
+
+#[test]
+fn a_probe_runs_in_a_group_of_its_own_that_goes_whole_and_is_refused_after_a_stop() {
+    let registry = std::sync::Mutex::new(Registry::default());
+    // A probe that leaves a child behind holding its output: the group goes, and so does the
+    // child, so the output closes.
+    let mut command = std::process::Command::new("/bin/sh");
+    command.args(["-c", "echo said; /bin/sleep 30 &"]);
+    let started = std::time::Instant::now();
+    let output = grouped_output(command, Some(&registry)).expect("the probe's output");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "said\n");
+    assert!(output.status.success());
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "the child it left went with its group"
+    );
+    assert!(
+        registry.lock().expect("the registry").probes.is_empty(),
+        "the probe is off the list once it returned"
+    );
+    registry.lock().expect("the registry").tripped = true;
+    let mut refused = std::process::Command::new("/bin/echo");
+    refused.arg("never");
+    assert!(
+        grouped_output(refused, Some(&registry))
+            .is_err_and(|why| why.contains("changed before it could run")),
+        "a probe after a stop is refused"
+    );
 }
