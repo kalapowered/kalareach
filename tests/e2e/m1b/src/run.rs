@@ -176,6 +176,15 @@ impl Run {
         }
     }
 
+    /// The system programs noted under [`Run::note_system_program`], by number and file.
+    #[must_use]
+    pub fn system_programs(&self) -> Vec<(u32, PathBuf)> {
+        self.system_programs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
     /// Records a child this process started, by the number its spawn returned.
     ///
     /// Only for a child that has not been reaped: until it is, its number cannot pass to another
@@ -595,15 +604,21 @@ pub fn system_program_of_another_user(pid: u32, error: &str) -> Option<PathBuf> 
 }
 
 /// Whether the process `pid`, a system program noted under [`Run::note_system_program`], may
-/// still run: only the kernel's own list of every process, read and not naming the number, says
-/// it has ended. A number the list still names, whatever runs under it now, and a list that could
-/// not be read, leave it running, so nothing is taken to have ended without the kernel saying so.
+/// still run: only the kernel's answer that it has no such process (`ESRCH`, to a question about
+/// that one number) says it has ended. Any other answer, a process under that number whatever it
+/// runs now among them, leaves it running, so nothing is taken to have ended without the kernel
+/// saying so.
 #[must_use]
 pub fn system_program_may_run(pid: u32) -> bool {
     #[cfg(target_os = "macos")]
     {
-        libproc::processes::pids_by_type(libproc::processes::ProcFilter::All)
-            .map_or(true, |pids| pids.contains(&pid))
+        let Ok(number) = i32::try_from(pid) else {
+            return true;
+        };
+        match libproc::proc_pid::pidpath(number) {
+            Ok(_) => true,
+            Err(message) => !message.contains("errno = 3,"),
+        }
     }
     #[cfg(not(target_os = "macos"))]
     {

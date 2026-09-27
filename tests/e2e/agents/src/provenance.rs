@@ -473,6 +473,15 @@ impl Provenance {
         }
     }
 
+    /// Notes one of the system's own programs running as another user that another search beneath
+    /// the sessions found, so its number goes with the part's evidence too.
+    pub fn note_system_program(&self, pid: u32, path: &Path) {
+        let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
+        if !seen.other_users.iter().any(|(number, _)| *number == pid) {
+            seen.other_users.push((pid, path.to_path_buf()));
+        }
+    }
+
     /// The system's own programs seen running as another user beneath the sessions, by number and
     /// the file each runs, for the run's closing check to find ended.
     #[must_use]
