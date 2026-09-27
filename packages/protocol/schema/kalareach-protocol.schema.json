@@ -27619,7 +27619,7 @@
     "ReleaseName": {
       "description": "One release of the host: its version and the first twelve hexadecimal digits of its commit.",
       "maxLength": 64,
-      "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\\.[0-9A-Za-z-]+)*)?\\+[0-9a-f]{12}$",
+      "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\+[0-9a-f]{12}$",
       "type": "string"
     },
     "ReleaseOrigin": {
