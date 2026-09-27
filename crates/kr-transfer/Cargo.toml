@@ -28,6 +28,11 @@ libc.workspace = true
 # `FICLONE` ioctl on Linux, both as safe wrappers.
 rustix = { workspace = true, features = ["fs"] }
 
+[features]
+# What this crate's own tests use to act at each step at the end of a directory's removal. It
+# compiles to nothing without this feature, and no shipped build enables it.
+testing = []
+
 [target.'cfg(windows)'.dependencies]
 # The reparse-point attribute of an opened object, which `cap-std` exposes only through this trait.
 cap-primitives = "=4.0.3"
@@ -40,6 +45,9 @@ windows-sys = { workspace = true, features = ["Win32_Security_Authorization"] }
 rustix = { workspace = true, features = ["fs", "mount"] }
 
 [dev-dependencies]
+# This crate's own tests, with the removal's steps reachable: a test stands at each step at the end
+# of a directory's removal, which no timing reaches reliably.
+kr-transfer = { path = ".", features = ["testing"] }
 # The tests act exactly when a held rename was refused, through the retry's own seam.
 kr-flush = { workspace = true, features = ["testing"] }
 # The tests read a file identity the way the service does, through an opened directory.

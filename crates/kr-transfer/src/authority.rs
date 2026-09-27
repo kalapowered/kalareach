@@ -1575,12 +1575,19 @@ fn remove_empty(
     emptied: AuthorisedDirectory,
     reported: &str,
 ) -> Result<(), Escape> {
+    #[cfg(feature = "testing")]
+    testing::reached(testing::RemovalStep::Emptied, reported);
     same_object_at(holder, entry, emptied.identity, reported)?;
     // Windows removes a directory only by its name and only once no handle on it is open, because
     // the handles this host resolves names through are opened so that nothing can rename or
     // delete a directory beneath them. Unix does not mind either way.
     drop(emptied);
-    remove_empty_directory(holder, entry).map_err(|error| entry_failure(reported, &error))
+    #[cfg(feature = "testing")]
+    testing::reached(testing::RemovalStep::Checked, reported);
+    remove_empty_directory(holder, entry).map_err(|error| entry_failure(reported, &error))?;
+    #[cfg(feature = "testing")]
+    testing::reached(testing::RemovalStep::Removed, reported);
+    Ok(())
 }
 
 /// Reads every name one directory holds, closing the listing before returning.
@@ -1688,6 +1695,70 @@ fn remove_empty_directory(directory: &Dir, entry: &OsStr) -> std::io::Result<()>
 #[cfg(windows)]
 fn remove_empty_directory(directory: &Dir, entry: &OsStr) -> std::io::Result<()> {
     directory.remove_dir(entry)
+}
+
+/// What this crate's own tests use to stand at each step at the end of a directory's removal,
+/// where what somebody else does to the directory's name decides what the removal can report.
+///
+/// Compiled only with this crate's `testing` feature, which the crate's own tests enable and no
+/// shipped build does.
+#[cfg(feature = "testing")]
+pub mod testing {
+    use std::cell::RefCell;
+
+    /// A step at the end of removing one directory the removal has emptied.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum RemovalStep {
+        /// Everything in the directory is gone, and its name has not been looked at yet.
+        Emptied,
+        /// Its name was found to hold the directory, and has not been removed yet.
+        Checked,
+        /// Its name has been removed.
+        Removed,
+    }
+
+    /// What a test does at a step: given the step and the directory, named as a removal's refusal
+    /// names it (the tree's own name, or a path beneath it).
+    type Hook = Box<dyn FnMut(RemovalStep, &str)>;
+
+    std::thread_local! {
+        /// The hook the test running on this thread set, if any.
+        static AT_STEP: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    /// Runs `hook` on this thread at each step at the end of every directory a removal on this
+    /// thread takes away, until the returned guard is dropped. A removal runs on its caller's
+    /// thread, so a test's hook sees only its own removals.
+    #[must_use = "the hook is removed when the guard is dropped"]
+    pub fn at_removal_step(hook: impl FnMut(RemovalStep, &str) + 'static) -> AtRemovalStep {
+        AT_STEP.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+        AtRemovalStep(())
+    }
+
+    /// Removes the hook [`at_removal_step`] set, when it is dropped.
+    #[derive(Debug)]
+    pub struct AtRemovalStep(());
+
+    impl Drop for AtRemovalStep {
+        fn drop(&mut self) {
+            AT_STEP.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+
+    /// Runs the hook the test on this thread set, if any. It is taken out while it runs, so a
+    /// removal it makes itself does not run it again.
+    pub(crate) fn reached(step: RemovalStep, directory: &str) {
+        let taken = AT_STEP.with(|slot| slot.borrow_mut().take());
+        if let Some(mut hook) = taken {
+            hook(step, directory);
+            AT_STEP.with(|slot| {
+                let mut slot = slot.borrow_mut();
+                if slot.is_none() {
+                    *slot = Some(hook);
+                }
+            });
+        }
+    }
 }
 
 /// An opened object beneath an authorised directory.
